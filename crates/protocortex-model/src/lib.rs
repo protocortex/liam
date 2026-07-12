@@ -1,0 +1,18 @@
+//! protocortex-model: embedding and reranking for protocortex.
+//!
+//! The store is model-free by design. This crate holds the `Embedder` and
+//! `Reranker` traits plus adapters, so the daemon can embed before writing and
+//! rerank after retrieving without the store ever depending on a model runtime.
+
+pub mod embedder;
+pub mod error;
+pub mod reranker;
+
+pub use embedder::{Embedder, MockEmbedder};
+pub use error::{ModelError, Result};
+pub use reranker::{IdentityReranker, Reranker};
+
+#[cfg(feature = "local")]
+pub use embedder::FastEmbedEmbedder;
+#[cfg(feature = "local")]
+pub use reranker::FastEmbedReranker;

@@ -1,0 +1,17 @@
+# protocortex-daemon configuration. Missing file or key falls back to defaults;
+# unknown keys are rejected. Point elsewhere with PROTOCORTEX_CONFIG=/path.
+
+database_path  = "protocortex.db"
+log_filter     = "info,protocortex=debug"   # RUST_LOG overrides when set
+embedding_dims = 768              # MRL truncation length; fixed at DB creation
+
+[gc]
+episode_retention_days = 30
+interval_hours         = 6
+reclaim                = true
+run_on_start           = false
+
+[embedder]
+provider  = "mock"                       # "mock" (dev) or "local" (in-process)
+model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"
+cache_dir = "~/.protocortex/models"       # pre-populated by the installer

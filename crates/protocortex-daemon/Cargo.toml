@@ -1,0 +1,27 @@
+[package]
+name = "protocortex-daemon"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "MCP server exposing protocortex memory to agents."
+
+[dependencies]
+protocortex-store = { path = "../protocortex-store" }
+protocortex-model = { path = "../protocortex-model" }
+
+async-trait = "0.1"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "1"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+rmcp = { version = "2", features = ["server", "macros", "transport-io"] }
+schemars = "1"
+
+[features]
+default = []
+# Ship with in-process models (fastembed). Without it, the daemon uses the mock
+# embedder and identity reranker, which keeps the base build light for dev.
+local = ["protocortex-model/local"]
