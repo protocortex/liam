@@ -109,7 +109,7 @@ impl<B: Backend> Graph<B> {
     /// with a reserved `supersedes` edge.
     pub async fn supersede(&self, old: &NodeId, node: NewNode) -> Result<NodeId> {
         let now = self.clock.now();
-        if self.exists_as_of(old, now).await? == false {
+        if !self.exists_as_of(old, now).await? {
             return Err(Error::NodeNotFound(old.as_str().to_string()));
         }
         let new_id = NodeId::new();
@@ -377,7 +377,7 @@ impl<B: Backend> Graph<B> {
     async fn exists_as_of(&self, id: &NodeId, as_of: Millis) -> Result<bool> {
         let sql = format!("SELECT 1 FROM nodes WHERE id = ?1 AND {live}", live = live_at("nodes", 2));
         let rows = self.backend.query(&sql, &[id.as_str().into(), as_of.into()]).await?;
-        Ok(rows.is_empty() == false)
+        Ok(!rows.is_empty())
     }
 
     fn check_dims(&self, embedding: &[f32]) -> Result<()> {
