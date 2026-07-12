@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use protocortex_store::{Millis, RetentionPolicy};
+use liam_store::{Millis, RetentionPolicy};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,8 +41,8 @@ pub struct EmbedderConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            database_path: "protocortex.db".into(),
-            log_filter: "info,protocortex=debug".into(),
+            database_path: "liam.db".into(),
+            log_filter: "info,liam=debug".into(),
             embedding_dims: 768,
             gc: GcConfig::default(),
             embedder: EmbedderConfig::default(),
@@ -61,7 +61,7 @@ impl Default for EmbedderConfig {
         Self {
             provider: "mock".into(),
             model: "Qwen/Qwen3-Embedding-0.6B".into(),
-            cache_dir: "~/.protocortex/models".into(),
+            cache_dir: "~/.liam/models".into(),
         }
     }
 }

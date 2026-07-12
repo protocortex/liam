@@ -1,13 +1,17 @@
 [package]
-name = "protocortex-daemon"
+name = "liam-daemon"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "MCP server exposing protocortex memory to agents."
+description = "MCP server exposing liam memory to agents."
+
+[[bin]]
+name = "liamd"
+path = "src/main.rs"
 
 [dependencies]
-protocortex-store = { path = "../protocortex-store" }
-protocortex-model = { path = "../protocortex-model" }
+liam-store = { path = "../liam-store" }
+liam-model = { path = "../liam-model" }
 
 async-trait = "0.1"
 anyhow = "1"
@@ -24,4 +28,4 @@ schemars = "1"
 default = []
 # Ship with in-process models (fastembed). Without it, the daemon uses the mock
 # embedder and identity reranker, which keeps the base build light for dev.
-local = ["protocortex-model/local"]
+local = ["liam-model/local"]

@@ -1,5 +1,5 @@
 [package]
-name = "protocortex-store"
+name = "liam-store"
 version = "0.1.0"
 edition = "2021"
 description = "A bitemporal graph store with hybrid retrieval, generic over libSQL or SQLite."

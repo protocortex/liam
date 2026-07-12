@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use protocortex_model::{Embedder, Reranker};
-use protocortex_store::{DefaultGraph, NewNode, Query};
+use liam_model::{Embedder, Reranker};
+use liam_store::{DefaultGraph, NewNode, Query};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};

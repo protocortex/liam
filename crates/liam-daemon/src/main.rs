@@ -1,6 +1,6 @@
-//! protocortex-daemon: serves protocortex memory to agents over MCP.
+//! liam-daemon: serves liam memory to agents over MCP.
 //!
-//! A thin shell wiring `protocortex-store` (retrieval) and `protocortex-model`
+//! A thin shell wiring `liam-store` (retrieval) and `liam-model`
 //! (embedding, reranking). The embedder is Mock by default; the `local` feature
 //! plus `provider = "local"` loads fastembed in-process (Qwen3 embedder,
 //! cross-encoder reranker), no server.
@@ -11,8 +11,8 @@ mod telemetry;
 
 use std::sync::Arc;
 
-use protocortex_model::{Embedder, IdentityReranker, MockEmbedder, Reranker};
-use protocortex_store::{DefaultGraph, GraphConfig};
+use liam_model::{Embedder, IdentityReranker, MockEmbedder, Reranker};
+use liam_store::{DefaultGraph, GraphConfig};
 
 use config::Config;
 use mcp::MemoryServer;
@@ -51,7 +51,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 }
 
 fn config_path() -> std::path::PathBuf {
-    std::env::var("PROTOCORTEX_CONFIG").unwrap_or_else(|_| "protocortex.toml".to_string()).into()
+    std::env::var("LIAM_CONFIG").unwrap_or_else(|_| "liam.toml".to_string()).into()
 }
 
 /// Choose the embedder and reranker from config. The mock pair keeps the base
@@ -67,7 +67,7 @@ fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn R
 
 #[cfg(feature = "local")]
 fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
-    use protocortex_model::{FastEmbedEmbedder, FastEmbedReranker};
+    use liam_model::{FastEmbedEmbedder, FastEmbedReranker};
     let embedder = Arc::new(FastEmbedEmbedder::load(&config.embedder.model, config.embedding_dims)?);
     let reranker = Arc::new(FastEmbedReranker::load()?);
     Ok((embedder, reranker))
@@ -99,7 +99,7 @@ async fn spawn_gc(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn sweep(store: &DefaultGraph, policy: &protocortex_store::RetentionPolicy) {
+async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
     match store.gc(policy).await {
         Ok(report) => tracing::info!(?report, "gc completed"),
         Err(e) => tracing::warn!(error = %e, "gc failed"),

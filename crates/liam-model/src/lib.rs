@@ -1,4 +1,4 @@
-//! protocortex-model: embedding and reranking for protocortex.
+//! liam-model: embedding and reranking for liam.
 //!
 //! The store is model-free by design. This crate holds the `Embedder` and
 //! `Reranker` traits plus adapters, so the daemon can embed before writing and

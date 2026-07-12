@@ -1,4 +1,4 @@
-# protocortex-store
+# liam-store
 
 A bitemporal graph store with hybrid retrieval. Nothing is overwritten:
 superseded facts stay readable as history. It stores nodes and typed edges,
@@ -93,4 +93,4 @@ Verification boundaries, isolated on purpose:
 - `vector_distance_cos` plus `bm25` running in one connection.
 - The `leiden-rs` membership accessor in `cluster.rs`.
 - The whole rusqlite backend (sync bridge and sqlite-vec `vec0` dialect).
-- The name: confirm `protocortex-store` is free on crates.io before publishing.
+- The name: confirm `liam-store` is free on crates.io before publishing.

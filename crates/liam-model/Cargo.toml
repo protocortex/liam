@@ -1,9 +1,9 @@
 [package]
-name = "protocortex-model"
+name = "liam-model"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "In-process embedding and reranking for protocortex, via fastembed-rs."
+description = "In-process embedding and reranking for liam, via fastembed-rs."
 
 [dependencies]
 async-trait = "0.1"
