@@ -124,11 +124,15 @@ impl<B: Backend> Graph<B> {
             (node_sql, node_params),
             (
                 "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
-                 VALUES (?1, ?2, ?3, 'supersedes', '{}', ?4, ?5)"
+                 VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)"
                     .to_string(),
                 vec![
-                    EdgeId::new().as_str().into(), new_id.as_str().into(), old.as_str().into(),
-                    now.into(), FOREVER.into(),
+                    EdgeId::new().as_str().into(),
+                    new_id.as_str().into(),
+                    old.as_str().into(),
+                    crate::types::relation::SUPERSEDES.into(),
+                    now.into(),
+                    FOREVER.into(),
                 ],
             ),
         ];
@@ -638,5 +642,37 @@ mod tests {
         g.insert(NewNode::now("decision", "keep", "y").with_valid_from(Millis(10 * DAY))).await.unwrap();
         let report = g.gc(&RetentionPolicy::keep("episode", Millis::days(30)).without_reclaim()).await.unwrap();
         assert_eq!(report.nodes_removed, 1);
+    }
+
+    #[test]
+    fn new_node_entity_sets_kind_label_subject() {
+        let n = NewNode::entity("person", "  Ada Lovelace ");
+        assert_eq!(n.kind, "person");
+        assert_eq!(n.label, "  Ada Lovelace ");
+        assert_eq!(n.subject.as_deref(), Some("ada lovelace"));
+    }
+
+    #[tokio::test]
+    async fn entity_mentions_edge_round_trips() {
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let person = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "note", "Ada wrote the first algorithm")).await.unwrap();
+        g.link(NewEdge::new(&person, &fact, crate::types::relation::MENTIONS)).await.unwrap();
+
+        // `Graph::neighbors` traverses edges in either direction without
+        // filtering by type, so it can't isolate a single relation. Assert
+        // directly against the backend that the MENTIONS edge row exists.
+        let rows = g
+            .backend
+            .query(
+                "SELECT dst FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3",
+                &[person.as_str().into(), fact.as_str().into(), crate::types::relation::MENTIONS.into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids_from(&rows).unwrap(), vec![fact]);
     }
 }
