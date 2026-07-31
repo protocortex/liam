@@ -16,10 +16,30 @@ fastembed = { version = "5", features = ["qwen3"], optional = true }
 candle-core = { version = "0.10", optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
 
+# Generative chat model for the Llm trait (feature `local`). Pinned to the
+# candle-core 0.10 line (candle-transformers 0.10.2 depends on candle-core
+# 0.10.2). hf-hub/tokenizers versions match what fastembed 5.17 already pulls
+# in (hf-hub 0.5, tokenizers 0.22), so `local` doesn't duplicate the dep tree.
+candle-transformers = { version = "0.10", optional = true }
+tokenizers = { version = "0.22", optional = true }
+hf-hub = { version = "0.5", optional = true }
+# `candle_chat::Session::load`/`complete` return `anyhow::Result` to keep the
+# version-fragile candle glue's error handling simple; the `Llm` impl converts
+# to `ModelError::Llm` at the trait boundary.
+anyhow = { version = "1", optional = true }
+
 [features]
 default = []
 # The shipped path: fastembed in-process, Qwen3 embedder + cross-encoder reranker.
-local = ["dep:fastembed", "dep:candle-core", "dep:tokio"]
+local = [
+    "dep:fastembed",
+    "dep:candle-core",
+    "dep:tokio",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+    "dep:anyhow",
+]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

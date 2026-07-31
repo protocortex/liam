@@ -353,6 +353,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
 name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -491,6 +506,25 @@ dependencies = [
  "safetensors 0.7.0",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "candle-transformers"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f59d08c89e9f4af9c464e2f3a8e16199e7cc601e6f34538c2cfbb42b623b1783"
+dependencies = [
+ "byteorder",
+ "candle-core",
+ "candle-nn",
+ "fancy-regex",
+ "num-traits",
+ "rand 0.9.5",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serde_plain",
+ "tracing",
 ]
 
 [[package]]
@@ -1057,6 +1091,9 @@ name = "esaxx-rs"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "exr"
@@ -1092,6 +1129,17 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fancy-regex"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
 
 [[package]]
 name = "fastembed"
@@ -1630,16 +1678,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aef3982638978efa195ff11b305f51f1f22f4f0a6cabee7af79b383ebee6a213"
 dependencies = [
  "dirs",
+ "futures",
  "http 1.4.2",
  "indicatif",
  "libc",
  "log",
  "native-tls",
+ "num_cpus",
  "rand 0.9.5",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "ureq",
  "windows-sys 0.61.2",
 ]
@@ -2200,10 +2251,14 @@ dependencies = [
 name = "liam-model"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "candle-core",
+ "candle-transformers",
  "fastembed",
+ "hf-hub",
  "thiserror 2.0.18",
+ "tokenizers",
  "tokio",
 ]
 
@@ -3870,6 +3925,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_plain"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce1fc6db65a611022b23a0dec6975d63fb80a302cb3388835ff02c097258d50"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4249,6 +4313,7 @@ dependencies = [
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.3.4",
+ "indicatif",
  "itertools 0.14.0",
  "log",
  "macro_rules_attribute",

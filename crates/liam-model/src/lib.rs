@@ -17,4 +17,6 @@ pub use reranker::{IdentityReranker, Reranker};
 #[cfg(feature = "local")]
 pub use embedder::FastEmbedEmbedder;
 #[cfg(feature = "local")]
+pub use llm::CandleLlm;
+#[cfg(feature = "local")]
 pub use reranker::FastEmbedReranker;
