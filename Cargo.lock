@@ -2180,6 +2180,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "liam-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "liam-model",
+ "liam-store",
+ "rmcp",
+ "schemars",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "liam-model"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "candle-core",
+ "fastembed",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "liam-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "leiden-rs",
+ "libsql",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sqlite-vec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ulid",
+ "zerocopy 0.8.54",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3068,52 +3114,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "protocortex-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "protocortex-model",
- "protocortex-store",
- "rmcp",
- "schemars",
- "serde",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "protocortex-model"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "candle-core",
- "fastembed",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "protocortex-store"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "leiden-rs",
- "libsql",
- "rusqlite",
- "serde",
- "serde_json",
- "sqlite-vec",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "ulid",
- "zerocopy 0.8.54",
 ]
 
 [[package]]

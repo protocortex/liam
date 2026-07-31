@@ -5,8 +5,8 @@
 # macOS
 .DS_Store
 
-# Local protocortex data / model cache
+# Local liam data / model cache
 *.db
 *.db-shm
 *.db-wal
-/.protocortex/
+/.liam/

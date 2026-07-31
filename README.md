@@ -1,14 +1,14 @@
-# protocortex
+# LIAM
 
-Local-first, bitemporal memory for AI agents. Runs as one process, stores to a
-single file, and speaks the Model Context Protocol (MCP) so an agent reads and
-writes long-term memory with two tools: `remember` and `recall`.
+Layered Intelligent Agent Memory. Local-first and bitemporal, for AI agents. It
+runs as one process, stores to a single file, and speaks the Model Context
+Protocol (MCP) so an agent reads and writes long-term memory with two tools:
+`remember` and `recall`.
 
 ## Why
 
 Agents forget between sessions. The usual fix is a vector database, but that
-loses two things a memory needs: history and contradiction. protocortex keeps
-both.
+loses two things a memory needs: history and contradiction. LIAM keeps both.
 
 Every fact tracks two timelines. Valid time is when the fact is true in the
 world. Transaction time is when the store learned it. Nothing is overwritten, so
@@ -41,18 +41,18 @@ Three crates, each usable on its own.
 
 | Crate | Role |
 |---|---|
-| `protocortex-store` | The core. Bitemporal graph, hybrid retrieval, GC, clustering. Backend-generic over libSQL or SQLite. No ML. |
-| `protocortex-model` | In-process embedding and reranking via `fastembed`, behind the `local` feature. Mock and identity defaults keep dev builds light. |
-| `protocortex-daemon` | The MCP server. Wires store and model, serves `remember` and `recall` over stdio, runs GC in the background. |
+| `liam-store` | The core. Bitemporal graph, hybrid retrieval, GC, clustering. Backend-generic over libSQL or SQLite. No ML. |
+| `liam-model` | In-process embedding and reranking via `fastembed`, behind the `local` feature. Mock and identity defaults keep dev builds light. |
+| `liam-daemon` | The MCP server (binary `liamd`). Wires store and model, serves `remember` and `recall` over stdio, runs GC in the background. |
 
 ```
-agent ──MCP──▶ protocortex-daemon ──embed/rerank──▶ protocortex-model
-                       │
-                       └── store/retrieve ──▶ protocortex-store ──▶ libSQL/SQLite file
+agent ──MCP──▶ liamd ──embed/rerank──▶ liam-model
+                 │
+                 └── store/retrieve ──▶ liam-store ──▶ libSQL/SQLite file
 ```
 
-The store is the reusable part. The daemon is one consumer; a CLI or a web graph
-view would be others.
+The store is the reusable part. The daemon is one consumer; a `liam` CLI or a web
+graph view would be others.
 
 ## Build and test
 
@@ -67,17 +67,18 @@ The base build stays light. The in-process model stack (fastembed, candle, ONNX
 runtime) pulls a large dependency tree and is opt-in:
 
 ```sh
-cargo build -p protocortex-daemon --features local
+cargo build -p liam-daemon --features local
 ```
 
 ## Run
 
 ```sh
-cargo run -p protocortex-daemon
+cargo run -p liam-daemon         # builds and runs the `liamd` binary
 ```
 
 The daemon serves MCP over stdio, so you launch it from an MCP client rather than
-talking to it by hand. Point a client at the binary and it exposes two tools.
+talking to it by hand. Point a client at the `liamd` binary and it exposes two
+tools.
 
 `remember` records a fact.
 
@@ -104,14 +105,14 @@ embeddings.
 
 ## Configuration
 
-The daemon reads `protocortex.toml` from the working directory. Override the path
-with `PROTOCORTEX_CONFIG=/path/to/file`. A missing file or key falls back to the
-default; an unknown key fails loudly.
+The daemon reads `liam.toml` from the working directory. Override the path with
+`LIAM_CONFIG=/path/to/file`. A missing file or key falls back to the default; an
+unknown key fails loudly.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `database_path` | `protocortex.db` | The libSQL file. |
-| `log_filter` | `info,protocortex=debug` | tracing filter. `RUST_LOG` overrides it. |
+| `database_path` | `liam.db` | The libSQL file. |
+| `log_filter` | `info,liam=debug` | tracing filter. `RUST_LOG` overrides it. |
 | `embedding_dims` | `768` | Vector width. Fixed when the DB is created. |
 | `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. |
 | `gc.interval_hours` | `6` | Sweep interval. |
@@ -119,13 +120,13 @@ default; an unknown key fails loudly.
 | `gc.run_on_start` | `false` | Sweep once at boot. |
 | `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. |
 | `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`. |
-| `embedder.cache_dir` | `~/.protocortex/models` | Model files. Sets `FASTEMBED_CACHE_DIR`. |
+| `embedder.cache_dir` | `~/.liam/models` | Model files. Sets `FASTEMBED_CACHE_DIR`. |
 
 Logs go to stderr. Stdout carries the MCP JSON-RPC stream, so it stays clean.
 
 ## Feature flags
 
-`protocortex-store`:
+`liam-store`:
 
 - `backend-libsql` (default): libSQL with native vector search (`F32_BLOB`,
   `vector_distance_cos`).
@@ -133,7 +134,7 @@ Logs go to stderr. Stdout carries the MCP JSON-RPC stream, so it stays clean.
 - `backend-rusqlite`: stock SQLite plus sqlite-vec. Scaffold only; the methods
   are `todo!()` and panic at runtime.
 
-`protocortex-daemon`:
+`liam-daemon`:
 
 - `local`: load fastembed in-process (Qwen3 embedder, cross-encoder reranker).
   Off by default, which keeps the dev build small.
@@ -148,6 +149,10 @@ bundle-in-release (ship the files in the tarball and point `cache_dir` at them).
 
 ## Status
 
+LIAM v1 (MVP). It re-extracts the memory core of the retired v0 (the archived
+`liam-archive` repo, a larger code-intelligence engine), rebuilt smaller with RRF
+fusion and a full bitemporal model.
+
 The workspace compiles on default features and the daemon builds to a binary.
 `cargo test --workspace` is green. The store abstraction, the libSQL backend, and
 the shared graph logic are done.
@@ -161,7 +166,7 @@ rusqlite backend is a scaffold and panics if enabled.
 - Finish the rusqlite backend, or drop the feature until a second backend is
   needed.
 - Confirm the fastembed and rmcp surfaces under a real end-to-end run.
-- Add a CLI and Unix-socket IPC as a second consumer of the store.
+- Add a `liam` CLI and Unix-socket IPC as a second consumer of the store.
 - First tagged release with prebuilt binaries and a Homebrew formula.
 
 ## License
