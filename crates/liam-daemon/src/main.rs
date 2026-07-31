@@ -11,7 +11,7 @@ mod telemetry;
 
 use std::sync::Arc;
 
-use liam_model::{Embedder, IdentityReranker, MockEmbedder, Reranker};
+use liam_model::{Embedder, IdentityReranker, Llm, MockEmbedder, MockLlm, Reranker};
 use liam_store::{DefaultGraph, GraphConfig};
 
 use config::Config;
@@ -38,10 +38,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let store = Arc::new(store);
 
     let (embedder, reranker) = build_models(&config)?;
+    let llm = build_llm(&config)?;
 
     spawn_gc(&config).await?;
 
-    let server = MemoryServer::new(store, embedder, reranker);
+    let server = MemoryServer::new(store, embedder, reranker, llm);
 
     // rmcp stdio serve. Confirm against your pinned rmcp version.
     use rmcp::ServiceExt;
@@ -77,6 +78,27 @@ fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Re
 fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
     tracing::warn!("embedder.provider is 'local' but the daemon was built without the `local` feature; using mock");
     Ok((Arc::new(MockEmbedder::new(config.embedding_dims)), Arc::new(IdentityReranker)))
+}
+
+/// Choose the LLM from config. Mock keeps the base build runnable; the `local`
+/// provider (with the `local` feature) loads a candle chat model in-process.
+fn build_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
+    if config.llm.provider == "local" {
+        return build_local_llm(config);
+    }
+    Ok(Arc::new(MockLlm))
+}
+
+#[cfg(feature = "local")]
+fn build_local_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
+    use liam_model::CandleLlm;
+    Ok(Arc::new(CandleLlm::load(&config.llm.model, &config.llm.gguf_file, &config.llm.cache_dir)?))
+}
+
+#[cfg(not(feature = "local"))]
+fn build_local_llm(_config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
+    tracing::warn!("llm.provider is 'local' but the daemon was built without the `local` feature; using mock");
+    Ok(Arc::new(MockLlm))
 }
 
 /// GC runs on its own store connection so it never contends with requests.

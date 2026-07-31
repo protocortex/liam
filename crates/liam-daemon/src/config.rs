@@ -15,6 +15,7 @@ pub struct Config {
     pub embedding_dims: usize,
     pub gc: GcConfig,
     pub embedder: EmbedderConfig,
+    pub llm: LlmConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -38,6 +39,20 @@ pub struct EmbedderConfig {
     pub cache_dir: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LlmConfig {
+    /// "mock" (dev) or "local" (in-process candle; needs the `local` feature).
+    pub provider: String,
+    /// Hugging Face model id (GGUF repo) for the local provider.
+    pub model: String,
+    /// GGUF filename within the repo (GGUF repos host multiple quant variants,
+    /// so the file must be named explicitly). Consumed by `CandleLlm::load`.
+    pub gguf_file: String,
+    /// Where model files live (offline after first fetch).
+    pub cache_dir: String,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -46,6 +61,7 @@ impl Default for Config {
             embedding_dims: 768,
             gc: GcConfig::default(),
             embedder: EmbedderConfig::default(),
+            llm: LlmConfig::default(),
         }
     }
 }
@@ -61,6 +77,17 @@ impl Default for EmbedderConfig {
         Self {
             provider: "mock".into(),
             model: "Qwen/Qwen3-Embedding-0.6B".into(),
+            cache_dir: "~/.liam/models".into(),
+        }
+    }
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: "mock".into(),
+            model: "Qwen/Qwen2.5-0.5B-Instruct-GGUF".into(),
+            gguf_file: "qwen2.5-0.5b-instruct-q4_k_m.gguf".into(),
             cache_dir: "~/.liam/models".into(),
         }
     }
@@ -97,5 +124,16 @@ impl ReclaimExt for RetentionPolicy {
         } else {
             self.without_reclaim()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llm_defaults_to_mock() {
+        let c = Config::default();
+        assert_eq!(c.llm.provider, "mock");
     }
 }
