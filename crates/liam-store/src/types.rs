@@ -10,6 +10,15 @@ fn empty_attributes() -> Value {
     Value::Object(Map::new())
 }
 
+/// Reserved edge `type` values that carry library meaning. Use these instead of
+/// string literals so provenance/versioning relations stay centralized.
+pub mod relation {
+    /// Links a new node to the prior version it replaced (contradiction handling).
+    pub const SUPERSEDES: &str = "supersedes";
+    /// Provenance: an entity node references a source fact/episode that mentions it.
+    pub const MENTIONS: &str = "mentions";
+}
+
 /// Construction parameters. `embedding_dims` sets the dimension the backend's
 /// vector storage is created with; `rrf_k` tunes reciprocal rank fusion.
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +77,16 @@ impl NewNode {
             subject: None,
             confidence: 1.0,
         }
+    }
+    /// An entity page node. `entity_type` becomes the `kind` (e.g. "person",
+    /// "company", "concept"); `name` is the label and, normalized (trimmed +
+    /// lowercased), the `subject` so re-observing the same entity supersedes
+    /// via `upsert_by` rather than duplicating. Content is empty until M2
+    /// synthesizes the compiled truth.
+    pub fn entity(entity_type: impl Into<String>, name: impl Into<String>) -> Self {
+        let name = name.into();
+        let subject = name.trim().to_lowercase();
+        Self::now(entity_type, name, String::new()).with_subject(subject)
     }
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
         self.embedding = Some(embedding);

@@ -9,6 +9,9 @@ pub enum ModelError {
 
     #[error("reranker: {0}")]
     Rerank(String),
+
+    #[error("llm: {0}")]
+    Llm(String),
 }
 
 pub type Result<T> = std::result::Result<T, ModelError>;

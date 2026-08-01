@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use liam_model::{Embedder, Reranker};
+use liam_model::{Embedder, Llm, Reranker};
 use liam_store::{DefaultGraph, NewNode, Query};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -39,13 +39,23 @@ pub struct MemoryServer {
     store: Arc<DefaultGraph>,
     embedder: Arc<dyn Embedder>,
     reranker: Arc<dyn Reranker>,
+    // Wired in M1; first consumed by synthesis/extraction in M2. The derived
+    // `Clone` impl makes rustc's dead-code pass ignore field reads, so an
+    // otherwise-unused field warns until M2 reads it.
+    #[allow(dead_code)]
+    llm: Arc<dyn Llm>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
 #[tool_router]
 impl MemoryServer {
-    pub fn new(store: Arc<DefaultGraph>, embedder: Arc<dyn Embedder>, reranker: Arc<dyn Reranker>) -> Self {
-        Self { store, embedder, reranker, tool_router: Self::tool_router() }
+    pub fn new(
+        store: Arc<DefaultGraph>,
+        embedder: Arc<dyn Embedder>,
+        reranker: Arc<dyn Reranker>,
+        llm: Arc<dyn Llm>,
+    ) -> Self {
+        Self { store, embedder, reranker, llm, tool_router: Self::tool_router() }
     }
 
     #[tool(description = "Record a durable decision or fact into long-term memory.")]

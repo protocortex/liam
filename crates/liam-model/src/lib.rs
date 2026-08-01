@@ -6,13 +6,17 @@
 
 pub mod embedder;
 pub mod error;
+pub mod llm;
 pub mod reranker;
 
 pub use embedder::{Embedder, MockEmbedder};
 pub use error::{ModelError, Result};
+pub use llm::{Llm, MockLlm};
 pub use reranker::{IdentityReranker, Reranker};
 
 #[cfg(feature = "local")]
 pub use embedder::FastEmbedEmbedder;
+#[cfg(feature = "local")]
+pub use llm::CandleLlm;
 #[cfg(feature = "local")]
 pub use reranker::FastEmbedReranker;

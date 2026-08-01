@@ -25,8 +25,8 @@ pub use error::{Error, Result};
 pub use graph::Graph;
 pub use ids::{EdgeId, Millis, NodeId, FOREVER};
 pub use types::{
-    Change, ExplainedHit, GcReport, GraphConfig, Hit, NewEdge, NewNode, Query, RetentionPolicy,
-    RetentionRule,
+    relation, Change, ExplainedHit, GcReport, GraphConfig, Hit, NewEdge, NewNode, Query,
+    RetentionPolicy, RetentionRule,
 };
 pub use value::{Row, Value};
 
