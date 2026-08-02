@@ -64,7 +64,11 @@ impl<B: Backend> Graph<B> {
         Self::open_with_clock(path, config, Arc::new(SystemClock)).await
     }
 
-    pub async fn open_with_clock(path: &str, config: GraphConfig, clock: Arc<dyn Clock>) -> Result<Self> {
+    pub async fn open_with_clock(
+        path: &str,
+        config: GraphConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         let backend = B::open(path).await?;
         let mut ddl = schema(&config);
         ddl.push_str(&backend.vector_ddl(config.embedding_dims));
@@ -99,7 +103,10 @@ impl<B: Backend> Graph<B> {
             Some(s) => s,
             None => return self.insert(node).await,
         };
-        match self.find_live_by_subject(&subject, node.scope.as_deref()).await? {
+        match self
+            .find_live_by_subject(&subject, node.scope.as_deref())
+            .await?
+        {
             Some(existing) => self.supersede(&existing, node).await,
             None => self.insert(node).await,
         }
@@ -140,7 +147,9 @@ impl<B: Backend> Graph<B> {
 
         if let Some(embedding) = embedding.as_deref() {
             self.check_dims(embedding)?;
-            self.backend.vector_upsert(new_id.as_str(), embedding).await?;
+            self.backend
+                .vector_upsert(new_id.as_str(), embedding)
+                .await?;
         }
         Ok(new_id)
     }
@@ -154,15 +163,25 @@ impl<B: Backend> Graph<B> {
                 "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 &[
-                    id.as_str().into(), edge.src.as_str().into(), edge.dst.as_str().into(),
-                    edge.kind.into(), attrs.into(), now.into(), FOREVER.into(),
+                    id.as_str().into(),
+                    edge.src.as_str().into(),
+                    edge.dst.as_str().into(),
+                    edge.kind.into(),
+                    attrs.into(),
+                    now.into(),
+                    FOREVER.into(),
                 ],
             )
             .await?;
         Ok(id)
     }
 
-    fn node_insert(&self, id: &NodeId, node: &NewNode, now: Millis) -> Result<(String, Vec<Value>)> {
+    fn node_insert(
+        &self,
+        id: &NodeId,
+        node: &NewNode,
+        now: Millis,
+    ) -> Result<(String, Vec<Value>)> {
         let attrs = serde_json::to_string(&node.attributes)?;
         let sql = "INSERT INTO nodes
              (id, kind, label, content, attributes, scope, subject, confidence,
@@ -170,10 +189,18 @@ impl<B: Backend> Graph<B> {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             .to_string();
         let params = vec![
-            id.as_str().into(), node.kind.clone().into(), node.label.clone().into(),
-            node.content.clone().into(), attrs.into(),
-            opt_text(node.scope.clone()), opt_text(node.subject.clone()), Value::Real(node.confidence),
-            node.valid_from.unwrap_or(now).into(), FOREVER.into(), now.into(), FOREVER.into(),
+            id.as_str().into(),
+            node.kind.clone().into(),
+            node.label.clone().into(),
+            node.content.clone().into(),
+            attrs.into(),
+            opt_text(node.scope.clone()),
+            opt_text(node.subject.clone()),
+            Value::Real(node.confidence),
+            node.valid_from.unwrap_or(now).into(),
+            FOREVER.into(),
+            now.into(),
+            FOREVER.into(),
         ];
         Ok((sql, params))
     }
@@ -187,7 +214,12 @@ impl<B: Backend> Graph<B> {
     // ---- read ----
 
     pub async fn query(&self, q: &Query) -> Result<Vec<Hit>> {
-        Ok(self.query_core(q).await?.into_iter().map(|e| e.hit).collect())
+        Ok(self
+            .query_core(q)
+            .await?
+            .into_iter()
+            .map(|e| e.hit)
+            .collect())
     }
 
     /// Like `query`, but each result carries the score components that produced
@@ -207,19 +239,34 @@ impl<B: Backend> Graph<B> {
             None => Vec::new(),
         };
         let vector = match q.embedding.as_deref() {
-            Some(embedding) => self.backend.vector_search(embedding, pool, kind, scope, now).await?,
+            Some(embedding) => {
+                self.backend
+                    .vector_search(embedding, pool, kind, scope, now)
+                    .await?
+            }
             None => Vec::new(),
         };
 
-        let lex_rank: HashMap<String, usize> =
-            lexical.iter().enumerate().map(|(i, id)| (id.as_str().to_string(), i)).collect();
-        let vec_rank: HashMap<String, usize> =
-            vector.iter().enumerate().map(|(i, id)| (id.as_str().to_string(), i)).collect();
+        let lex_rank: HashMap<String, usize> = lexical
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str().to_string(), i))
+            .collect();
+        let vec_rank: HashMap<String, usize> = vector
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str().to_string(), i))
+            .collect();
 
         let mut rrf: HashMap<String, f64> = HashMap::new();
         for (i, id) in lexical.iter().chain(vector.iter()).enumerate() {
-            let rank = if i < lexical.len() { i } else { i - lexical.len() };
-            *rrf.entry(id.as_str().to_string()).or_insert(0.0) += 1.0 / (self.rrf_k + rank as f64 + 1.0);
+            let rank = if i < lexical.len() {
+                i
+            } else {
+                i - lexical.len()
+            };
+            *rrf.entry(id.as_str().to_string()).or_insert(0.0) +=
+                1.0 / (self.rrf_k + rank as f64 + 1.0);
         }
 
         // Seeds: top of the fused list. Expand their neighbours, down-weighted.
@@ -242,14 +289,24 @@ impl<B: Backend> Graph<B> {
             candidates.entry(id).or_insert((floor, true));
         }
 
-        let ids: Vec<NodeId> = candidates.keys().map(|s| NodeId::from_raw(s.clone())).collect();
+        let ids: Vec<NodeId> = candidates
+            .keys()
+            .map(|s| NodeId::from_raw(s.clone()))
+            .collect();
         let rows = self.fetch_candidates(&ids, now, scope).await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for c in rows {
-            let (base, is_expanded) = candidates.get(c.id.as_str()).copied().unwrap_or((floor, true));
+            let (base, is_expanded) = candidates
+                .get(c.id.as_str())
+                .copied()
+                .unwrap_or((floor, true));
             let decay = decay_factor(c.valid_from, now, q.half_life);
-            let weight = if is_expanded { self.expansion_weight } else { 1.0 };
+            let weight = if is_expanded {
+                self.expansion_weight
+            } else {
+                1.0
+            };
             let score = base * c.confidence * decay * weight;
             out.push(ExplainedHit {
                 hit: Hit {
@@ -268,7 +325,12 @@ impl<B: Backend> Graph<B> {
                 expanded: is_expanded,
             });
         }
-        out.sort_by(|a, b| b.hit.score.partial_cmp(&a.hit.score).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.hit
+                .score
+                .partial_cmp(&a.hit.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.truncate(q.k);
         Ok(out)
     }
@@ -285,7 +347,14 @@ impl<B: Backend> Graph<B> {
         ids_from(&rows)
     }
 
-    async fn lexical(&self, text: &str, kind: Option<&str>, scope: Option<&str>, now: Millis, k: usize) -> Result<Vec<NodeId>> {
+    async fn lexical(
+        &self,
+        text: &str,
+        kind: Option<&str>,
+        scope: Option<&str>,
+        now: Millis,
+        k: usize,
+    ) -> Result<Vec<NodeId>> {
         let mut params: Vec<Value> = vec![text.into(), now.into(), (k as i64).into()];
         let mut filters = String::new();
         let mut next = 4;
@@ -313,7 +382,12 @@ impl<B: Backend> Graph<B> {
     /// (missing or expired ids simply don't come back). Chunked to stay under
     /// SQLite's 999 bound-parameter limit; order is not meaningful, callers
     /// look candidates up by id.
-    async fn fetch_candidates(&self, ids: &[NodeId], now: Millis, scope: Option<&str>) -> Result<Vec<Candidate>> {
+    async fn fetch_candidates(
+        &self,
+        ids: &[NodeId],
+        now: Millis,
+        scope: Option<&str>,
+    ) -> Result<Vec<Candidate>> {
         const CHUNK: usize = 512;
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(CHUNK) {
@@ -357,7 +431,11 @@ impl<B: Backend> Graph<B> {
         Ok(out)
     }
 
-    async fn find_live_by_subject(&self, subject: &str, scope: Option<&str>) -> Result<Option<NodeId>> {
+    async fn find_live_by_subject(
+        &self,
+        subject: &str,
+        scope: Option<&str>,
+    ) -> Result<Option<NodeId>> {
         let now = self.clock.now();
         let mut params: Vec<Value> = vec![subject.into(), now.into()];
         let scope_filter = match scope {
@@ -375,12 +453,20 @@ impl<B: Backend> Graph<B> {
             live = live_at("nodes", 2),
         );
         let rows = self.backend.query(&sql, &params).await?;
-        Ok(rows.first().map(|r| NodeId::from_raw(r.get_string(0).unwrap_or_default())))
+        Ok(rows
+            .first()
+            .map(|r| NodeId::from_raw(r.get_string(0).unwrap_or_default())))
     }
 
     async fn exists_as_of(&self, id: &NodeId, as_of: Millis) -> Result<bool> {
-        let sql = format!("SELECT 1 FROM nodes WHERE id = ?1 AND {live}", live = live_at("nodes", 2));
-        let rows = self.backend.query(&sql, &[id.as_str().into(), as_of.into()]).await?;
+        let sql = format!(
+            "SELECT 1 FROM nodes WHERE id = ?1 AND {live}",
+            live = live_at("nodes", 2)
+        );
+        let rows = self
+            .backend
+            .query(&sql, &[id.as_str().into(), as_of.into()])
+            .await?;
         Ok(!rows.is_empty())
     }
 
@@ -388,7 +474,10 @@ impl<B: Backend> Graph<B> {
         if embedding.len() == self.dims {
             return Ok(());
         }
-        Err(Error::Dimension { expected: self.dims, got: embedding.len() })
+        Err(Error::Dimension {
+            expected: self.dims,
+            got: embedding.len(),
+        })
     }
 
     // ---- change cursor ----
@@ -443,9 +532,14 @@ impl<B: Backend> Graph<B> {
             .await?;
         self.backend.vector_sweep_orphans().await?;
         if policy.reclaim {
-            self.backend.execute("PRAGMA incremental_vacuum", &[]).await?;
+            self.backend
+                .execute("PRAGMA incremental_vacuum", &[])
+                .await?;
         }
-        let report = GcReport { nodes_removed, edges_removed };
+        let report = GcReport {
+            nodes_removed,
+            edges_removed,
+        };
         tracing::info!(?report, "gc swept");
         Ok(report)
     }
@@ -462,7 +556,10 @@ impl<B: Backend> Graph<B> {
 
         let rows = self
             .backend
-            .query("SELECT src, dst FROM edges WHERE tx_to = ?1", &[FOREVER.into()])
+            .query(
+                "SELECT src, dst FROM edges WHERE tx_to = ?1",
+                &[FOREVER.into()],
+            )
             .await?;
         for row in &rows {
             let u = intern(&mut index, &mut labels, row.get_string(0)?);
@@ -478,13 +575,21 @@ impl<B: Backend> Graph<B> {
             statements.push((
                 "INSERT INTO node_community (node_id, community, computed_at) VALUES (?1, ?2, ?3)"
                     .to_string(),
-                vec![labels[i].as_str().into(), (*community as i64).into(), now.into()],
+                vec![
+                    labels[i].as_str().into(),
+                    (*community as i64).into(),
+                    now.into(),
+                ],
             ));
         }
         self.backend.execute_atomic(&statements).await?;
 
         let count = assignment.iter().collect::<HashSet<_>>().len();
-        tracing::info!(nodes = labels.len(), communities = count, "communities recomputed");
+        tracing::info!(
+            nodes = labels.len(),
+            communities = count,
+            "communities recomputed"
+        );
         Ok(count)
     }
 
@@ -505,7 +610,9 @@ impl<B: Backend> Graph<B> {
 }
 
 fn ids_from(rows: &[Row]) -> Result<Vec<NodeId>> {
-    rows.iter().map(|r| Ok(NodeId::from_raw(r.get_string(0)?))).collect()
+    rows.iter()
+        .map(|r| Ok(NodeId::from_raw(r.get_string(0)?)))
+        .collect()
 }
 
 fn row_f64(row: &Row, i: usize) -> f64 {
@@ -535,13 +642,17 @@ mod tests {
 
     async fn graph_at(t: Millis) -> DefaultGraph {
         let clock = Arc::new(FixedClock::new(t));
-        DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock).await.unwrap()
+        DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn insert_then_query() {
         let g = graph_at(Millis(1000)).await;
-        g.insert(NewNode::now("decision", "Use libSQL", "single file")).await.unwrap();
+        g.insert(NewNode::now("decision", "Use libSQL", "single file"))
+            .await
+            .unwrap();
         let hits = g.query(&Query::text("libSQL")).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].label, "Use libSQL");
@@ -550,16 +661,29 @@ mod tests {
     #[tokio::test]
     async fn as_of_recovers_superseded_history() {
         let clock = Arc::new(FixedClock::new(Millis(1000)));
-        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone()).await.unwrap();
-        let old = g.insert(NewNode::now("decision", "Deno", "runtime").with_valid_from(Millis(1000))).await.unwrap();
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g
+            .insert(NewNode::now("decision", "Deno", "runtime").with_valid_from(Millis(1000)))
+            .await
+            .unwrap();
         clock.set(Millis(2000));
-        g.supersede(&old, NewNode::now("decision", "Rust", "runtime").with_valid_from(Millis(2000))).await.unwrap();
+        g.supersede(
+            &old,
+            NewNode::now("decision", "Rust", "runtime").with_valid_from(Millis(2000)),
+        )
+        .await
+        .unwrap();
 
         let now_hits = g.query(&Query::text("runtime")).await.unwrap();
         assert!(now_hits.iter().any(|h| h.label == "Rust"));
         assert!(now_hits.iter().all(|h| h.label != "Deno"));
 
-        let past = g.query(&Query::text("runtime").with_as_of(Millis(1500))).await.unwrap();
+        let past = g
+            .query(&Query::text("runtime").with_as_of(Millis(1500)))
+            .await
+            .unwrap();
         assert!(past.iter().any(|h| h.label == "Deno"));
         assert!(past.iter().all(|h| h.label != "Rust"));
     }
@@ -571,32 +695,64 @@ mod tests {
         // "live at T" predicate as the lexical path.
         let e = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let clock = Arc::new(FixedClock::new(Millis(1000)));
-        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone()).await.unwrap();
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
         let old = g
-            .insert(NewNode::now("decision", "Deno", "runtime").with_valid_from(Millis(1000)).with_embedding(e.clone()))
+            .insert(
+                NewNode::now("decision", "Deno", "runtime")
+                    .with_valid_from(Millis(1000))
+                    .with_embedding(e.clone()),
+            )
             .await
             .unwrap();
         clock.set(Millis(2000));
-        g.supersede(&old, NewNode::now("decision", "Rust", "runtime").with_valid_from(Millis(2000)).with_embedding(e.clone()))
-            .await
-            .unwrap();
+        g.supersede(
+            &old,
+            NewNode::now("decision", "Rust", "runtime")
+                .with_valid_from(Millis(2000))
+                .with_embedding(e.clone()),
+        )
+        .await
+        .unwrap();
 
         let now_hits = g.query(&Query::vector(e.clone())).await.unwrap();
-        assert!(now_hits.iter().any(|h| h.label == "Rust"), "current: Rust live");
-        assert!(now_hits.iter().all(|h| h.label != "Deno"), "current: Deno superseded");
+        assert!(
+            now_hits.iter().any(|h| h.label == "Rust"),
+            "current: Rust live"
+        );
+        assert!(
+            now_hits.iter().all(|h| h.label != "Deno"),
+            "current: Deno superseded"
+        );
 
-        let past = g.query(&Query::vector(e.clone()).with_as_of(Millis(1500))).await.unwrap();
-        assert!(past.iter().any(|h| h.label == "Deno"), "as-of 1500: Deno was live");
-        assert!(past.iter().all(|h| h.label != "Rust"), "as-of 1500: Rust not yet recorded");
+        let past = g
+            .query(&Query::vector(e.clone()).with_as_of(Millis(1500)))
+            .await
+            .unwrap();
+        assert!(
+            past.iter().any(|h| h.label == "Deno"),
+            "as-of 1500: Deno was live"
+        );
+        assert!(
+            past.iter().all(|h| h.label != "Rust"),
+            "as-of 1500: Rust not yet recorded"
+        );
     }
 
     #[tokio::test]
     async fn upsert_by_supersedes_same_subject() {
         let clock = Arc::new(FixedClock::new(Millis(1000)));
-        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone()).await.unwrap();
-        g.upsert_by(NewNode::now("fact", "v1", "price is 10").with_subject("price")).await.unwrap();
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        g.upsert_by(NewNode::now("fact", "v1", "price is 10").with_subject("price"))
+            .await
+            .unwrap();
         clock.set(Millis(2000));
-        g.upsert_by(NewNode::now("fact", "v2", "price is 20").with_subject("price")).await.unwrap();
+        g.upsert_by(NewNode::now("fact", "v2", "price is 20").with_subject("price"))
+            .await
+            .unwrap();
 
         let hits = g.query(&Query::text("price")).await.unwrap();
         assert_eq!(hits.len(), 1, "only the current version is live");
@@ -606,19 +762,42 @@ mod tests {
     #[tokio::test]
     async fn upsert_by_supersedes_newest_competitor_deterministically() {
         let clock = Arc::new(FixedClock::new(Millis(1000)));
-        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone()).await.unwrap();
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
         // Two live nodes share a subject (via `insert`, which does not dedup).
-        g.insert(NewNode::now("fact", "old", "price 10").with_subject("price").with_valid_from(Millis(1000))).await.unwrap();
+        g.insert(
+            NewNode::now("fact", "old", "price 10")
+                .with_subject("price")
+                .with_valid_from(Millis(1000)),
+        )
+        .await
+        .unwrap();
         clock.set(Millis(2000));
-        g.insert(NewNode::now("fact", "newer", "price 15").with_subject("price").with_valid_from(Millis(2000))).await.unwrap();
+        g.insert(
+            NewNode::now("fact", "newer", "price 15")
+                .with_subject("price")
+                .with_valid_from(Millis(2000)),
+        )
+        .await
+        .unwrap();
         // upsert_by supersedes the newest competitor, deterministically.
         clock.set(Millis(3000));
-        g.upsert_by(NewNode::now("fact", "newest", "price 20").with_subject("price").with_valid_from(Millis(3000))).await.unwrap();
+        g.upsert_by(
+            NewNode::now("fact", "newest", "price 20")
+                .with_subject("price")
+                .with_valid_from(Millis(3000)),
+        )
+        .await
+        .unwrap();
 
         let hits = g.query(&Query::text("price").with_k(10)).await.unwrap();
         let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
         assert!(labels.contains(&"newest"), "new version is live");
-        assert!(!labels.contains(&"newer"), "newest competitor was superseded");
+        assert!(
+            !labels.contains(&"newer"),
+            "newest competitor was superseded"
+        );
         assert!(labels.contains(&"old"), "the older competitor is untouched");
     }
 
@@ -628,7 +807,13 @@ mod tests {
         // query and all must come back.
         let g = graph_at(Millis(1000)).await;
         for i in 0..5 {
-            g.insert(NewNode::now("fact", format!("n{i}"), "shared keyword topic")).await.unwrap();
+            g.insert(NewNode::now(
+                "fact",
+                format!("n{i}"),
+                "shared keyword topic",
+            ))
+            .await
+            .unwrap();
         }
         let hits = g.query(&Query::text("keyword").with_k(10)).await.unwrap();
         assert_eq!(hits.len(), 5);
@@ -638,9 +823,16 @@ mod tests {
     async fn gc_ages_out_by_kind() {
         const DAY: i64 = 86_400_000;
         let g = graph_at(Millis(100 * DAY)).await;
-        g.insert(NewNode::now("episode", "old", "x").with_valid_from(Millis(10 * DAY))).await.unwrap();
-        g.insert(NewNode::now("decision", "keep", "y").with_valid_from(Millis(10 * DAY))).await.unwrap();
-        let report = g.gc(&RetentionPolicy::keep("episode", Millis::days(30)).without_reclaim()).await.unwrap();
+        g.insert(NewNode::now("episode", "old", "x").with_valid_from(Millis(10 * DAY)))
+            .await
+            .unwrap();
+        g.insert(NewNode::now("decision", "keep", "y").with_valid_from(Millis(10 * DAY)))
+            .await
+            .unwrap();
+        let report = g
+            .gc(&RetentionPolicy::keep("episode", Millis::days(30)).without_reclaim())
+            .await
+            .unwrap();
         assert_eq!(report.nodes_removed, 1);
     }
 
@@ -659,8 +851,21 @@ mod tests {
             .await
             .unwrap();
         let person = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
-        let fact = g.insert(NewNode::now("fact", "note", "Ada wrote the first algorithm")).await.unwrap();
-        g.link(NewEdge::new(&person, &fact, crate::types::relation::MENTIONS)).await.unwrap();
+        let fact = g
+            .insert(NewNode::now(
+                "fact",
+                "note",
+                "Ada wrote the first algorithm",
+            ))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(
+            &person,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
 
         // `Graph::neighbors` traverses edges in either direction without
         // filtering by type, so it can't isolate a single relation. Assert
@@ -669,7 +874,11 @@ mod tests {
             .backend
             .query(
                 "SELECT dst FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3",
-                &[person.as_str().into(), fact.as_str().into(), crate::types::relation::MENTIONS.into()],
+                &[
+                    person.as_str().into(),
+                    fact.as_str().into(),
+                    crate::types::relation::MENTIONS.into(),
+                ],
             )
             .await
             .unwrap();

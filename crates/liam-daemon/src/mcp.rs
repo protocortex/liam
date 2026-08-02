@@ -55,7 +55,13 @@ impl MemoryServer {
         reranker: Arc<dyn Reranker>,
         llm: Arc<dyn Llm>,
     ) -> Self {
-        Self { store, embedder, reranker, llm, tool_router: Self::tool_router() }
+        Self {
+            store,
+            embedder,
+            reranker,
+            llm,
+            tool_router: Self::tool_router(),
+        }
     }
 
     #[tool(description = "Record a durable decision or fact into long-term memory.")]
@@ -99,7 +105,11 @@ impl MemoryServer {
             return "no relevant memory".to_string();
         }
         let docs: Vec<String> = hits.iter().map(|h| h.content.clone()).collect();
-        let order = self.reranker.order(&args.query, &docs).await.unwrap_or_else(|_| (0..hits.len()).collect());
+        let order = self
+            .reranker
+            .order(&args.query, &docs)
+            .await
+            .unwrap_or_else(|_| (0..hits.len()).collect());
         order
             .iter()
             .map(|&i| format!("[{}] {}\n{}", hits[i].kind, hits[i].label, hits[i].content))

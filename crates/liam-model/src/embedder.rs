@@ -71,7 +71,10 @@ impl FastEmbedEmbedder {
             truncate_dims,
         )
         .map_err(|e| crate::error::ModelError::Embed(e.to_string()))?;
-        Ok(Self { model: std::sync::Arc::new(std::sync::Mutex::new(model)), dims: truncate_dims })
+        Ok(Self {
+            model: std::sync::Arc::new(std::sync::Mutex::new(model)),
+            dims: truncate_dims,
+        })
     }
 }
 
@@ -85,7 +88,9 @@ impl Embedder for FastEmbedEmbedder {
         let model = self.model.clone();
         let query = format!("query: {text}");
         let out = tokio::task::spawn_blocking(move || {
-            let m = model.lock().map_err(|_| crate::error::ModelError::Embed("model lock poisoned".into()))?;
+            let m = model
+                .lock()
+                .map_err(|_| crate::error::ModelError::Embed("model lock poisoned".into()))?;
             let vecs = m
                 .embed(&[query.as_str()])
                 .map_err(|e| crate::error::ModelError::Embed(e.to_string()))?;

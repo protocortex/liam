@@ -32,7 +32,11 @@ pub struct GraphConfig {
 
 impl GraphConfig {
     pub fn new(embedding_dims: usize) -> Self {
-        Self { embedding_dims, rrf_k: 60.0, expansion_weight: 0.5 }
+        Self {
+            embedding_dims,
+            rrf_k: 60.0,
+            expansion_weight: 0.5,
+        }
     }
     pub fn with_rrf_k(mut self, k: f64) -> Self {
         self.rrf_k = k;
@@ -65,7 +69,11 @@ pub struct NewNode {
 }
 
 impl NewNode {
-    pub fn now(kind: impl Into<String>, label: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn now(
+        kind: impl Into<String>,
+        label: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Self {
             kind: kind.into(),
             label: label.into(),
@@ -125,7 +133,12 @@ pub struct NewEdge {
 
 impl NewEdge {
     pub fn new(src: &NodeId, dst: &NodeId, kind: impl Into<String>) -> Self {
-        Self { src: src.clone(), dst: dst.clone(), kind: kind.into(), attributes: empty_attributes() }
+        Self {
+            src: src.clone(),
+            dst: dst.clone(),
+            kind: kind.into(),
+            attributes: empty_attributes(),
+        }
     }
     pub fn with_attributes(mut self, attributes: Value) -> Self {
         self.attributes = attributes;
@@ -155,7 +168,15 @@ impl Query {
         Self::empty().with_embedding(embedding)
     }
     fn empty() -> Self {
-        Self { text: None, embedding: None, kind: None, scope: None, k: 8, as_of: None, half_life: None }
+        Self {
+            text: None,
+            embedding: None,
+            kind: None,
+            scope: None,
+            k: 8,
+            as_of: None,
+            half_life: None,
+        }
     }
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
@@ -235,10 +256,19 @@ pub struct RetentionPolicy {
 
 impl RetentionPolicy {
     pub fn keep(kind: impl Into<String>, max_age: Millis) -> Self {
-        Self { rules: vec![RetentionRule { kind: kind.into(), max_age }], reclaim: true }
+        Self {
+            rules: vec![RetentionRule {
+                kind: kind.into(),
+                max_age,
+            }],
+            reclaim: true,
+        }
     }
     pub fn and_keep(mut self, kind: impl Into<String>, max_age: Millis) -> Self {
-        self.rules.push(RetentionRule { kind: kind.into(), max_age });
+        self.rules.push(RetentionRule {
+            kind: kind.into(),
+            max_age,
+        });
         self
     }
     pub fn without_reclaim(mut self) -> Self {

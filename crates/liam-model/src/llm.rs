@@ -42,7 +42,9 @@ impl CandleLlm {
     pub fn load(model_id: &str, gguf_file: &str, cache_dir: &str) -> Result<Self> {
         let session = candle_chat::Session::load(model_id, gguf_file, cache_dir)
             .map_err(|e| crate::error::ModelError::Llm(e.to_string()))?;
-        Ok(Self { inner: std::sync::Arc::new(std::sync::Mutex::new(session)) })
+        Ok(Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(session)),
+        })
     }
 }
 
@@ -114,7 +116,12 @@ mod candle_chat {
                 .or_else(|| tokenizer.token_to_id("</s>"))
                 .ok_or_else(|| anyhow::anyhow!("tokenizer has no recognizable EOS token"))?;
 
-            Ok(Self { model, tokenizer, device, eos_token })
+            Ok(Self {
+                model,
+                tokenizer,
+                device,
+                eos_token,
+            })
         }
 
         /// Greedy (argmax) generation: encode the prompt, run the prefill

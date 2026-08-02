@@ -22,11 +22,16 @@ pub fn detect(node_count: usize, edges: &[Edge]) -> Vec<usize> {
     let Ok(graph) = builder.build() else {
         return singletons(node_count);
     };
-    let config = LeidenConfig { seed: Some(42), ..Default::default() };
+    let config = LeidenConfig {
+        seed: Some(42),
+        ..Default::default()
+    };
     let Ok(result) = Leiden::new(config).run(&graph) else {
         return singletons(node_count);
     };
-    (0..node_count).map(|i| result.partition.community_of(i)).collect()
+    (0..node_count)
+        .map(|i| result.partition.community_of(i))
+        .collect()
 }
 
 fn singletons(node_count: usize) -> Vec<usize> {
