@@ -12,15 +12,16 @@ thiserror = "2"
 # In-process local models (embedder + reranker). No server, offline after the
 # model is present. Confirm the fastembed v5 API surface with `cargo add fastembed`.
 fastembed = { version = "5", features = ["qwen3"], optional = true }
-# Pinned to fastembed 5.17's candle line; 0.11 has incompatible Device/DType types.
-candle-core = { version = "0.10", optional = true }
+# Tracks the candle-core 0.11 line; fastembed 5.17.3+ itself moved onto
+# candle-core 0.11, so this stays in lockstep with what fastembed resolves.
+candle-core = { version = "0.11", optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
 
-# Generative chat model for the Llm trait (feature `local`). Pinned to the
-# candle-core 0.10 line (candle-transformers 0.10.2 depends on candle-core
-# 0.10.2). hf-hub/tokenizers versions match what fastembed 5.17 already pulls
+# Generative chat model for the Llm trait (feature `local`). Tracks the
+# candle-core 0.11 line (candle-transformers 0.11 depends on candle-core
+# 0.11). hf-hub/tokenizers versions match what fastembed 5.17 already pulls
 # in (hf-hub 0.5, tokenizers 0.22), so `local` doesn't duplicate the dep tree.
-candle-transformers = { version = "0.10", optional = true }
+candle-transformers = { version = "0.11", optional = true }
 tokenizers = { version = "0.22", optional = true }
 hf-hub = { version = "0.5", optional = true }
 # `candle_chat::Session::load`/`complete` return `anyhow::Result` to keep the
