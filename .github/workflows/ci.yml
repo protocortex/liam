@@ -58,6 +58,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          command: check
+          tool: cargo-deny
+      # Check the shipped default feature set. Avoids the action's --all-features
+      # default, which pulls the heavy optional `local`/candle/ort tree (its own
+      # unmaintained-crate + exotic-license supply chain), and its musl container
+      # that trips over rust-toolchain.toml.
+      - run: cargo deny check
