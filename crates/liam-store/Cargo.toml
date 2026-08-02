@@ -14,7 +14,10 @@ thiserror = "2"
 ulid = "2"
 tracing = "0.1"
 
-libsql = { version = "0.9", optional = true }
+# Local-only: drop default replication/remote/sync/tls features, which pull the
+# hyper-rustls -> rustls-webpki -> webpki-roots stack (unused by this local-first
+# store and the source of several RUSTSEC advisories + a CDLA license).
+libsql = { version = "0.9", optional = true, default-features = false, features = ["core"] }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 sqlite-vec = { version = "0.1", optional = true }
 zerocopy = { version = "0.8", optional = true }
