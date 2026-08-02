@@ -16,7 +16,11 @@ pub trait Reranker: Send + Sync {
     async fn order(&self, query: &str, docs: &[String]) -> Result<Vec<usize>> {
         let scores = self.scores(query, docs).await?;
         let mut idx: Vec<usize> = (0..docs.len()).collect();
-        idx.sort_by(|a, b| scores[*b].partial_cmp(&scores[*a]).unwrap_or(std::cmp::Ordering::Equal));
+        idx.sort_by(|a, b| {
+            scores[*b]
+                .partial_cmp(&scores[*a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(idx)
     }
 }
@@ -48,7 +52,9 @@ impl FastEmbedReranker {
     pub fn load() -> Result<Self> {
         let model = fastembed::TextRerank::try_new(Default::default())
             .map_err(|e| crate::error::ModelError::Rerank(e.to_string()))?;
-        Ok(Self { model: std::sync::Arc::new(std::sync::Mutex::new(model)) })
+        Ok(Self {
+            model: std::sync::Arc::new(std::sync::Mutex::new(model)),
+        })
     }
 }
 
@@ -61,7 +67,9 @@ impl Reranker for FastEmbedReranker {
         let docs = docs.to_vec();
         let n = docs.len();
         let results = tokio::task::spawn_blocking(move || {
-            let mut m = model.lock().map_err(|_| crate::error::ModelError::Rerank("model lock poisoned".into()))?;
+            let mut m = model
+                .lock()
+                .map_err(|_| crate::error::ModelError::Rerank("model lock poisoned".into()))?;
             let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
             m.rerank(query.as_str(), refs, false, None)
                 .map_err(|e| crate::error::ModelError::Rerank(e.to_string()))

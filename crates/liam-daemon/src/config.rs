@@ -68,7 +68,12 @@ impl Default for Config {
 
 impl Default for GcConfig {
     fn default() -> Self {
-        Self { episode_retention_days: 30, interval_hours: 6, reclaim: true, run_on_start: false }
+        Self {
+            episode_retention_days: 30,
+            interval_hours: 6,
+            reclaim: true,
+            run_on_start: false,
+        }
     }
 }
 

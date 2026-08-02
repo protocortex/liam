@@ -34,7 +34,11 @@ fn main() -> anyhow::Result<()> {
 async fn run(config: Config) -> anyhow::Result<()> {
     telemetry::init(&config.log_filter);
 
-    let store = DefaultGraph::open(&config.database_path, GraphConfig::new(config.embedding_dims)).await?;
+    let store = DefaultGraph::open(
+        &config.database_path,
+        GraphConfig::new(config.embedding_dims),
+    )
+    .await?;
     let store = Arc::new(store);
 
     let (embedder, reranker) = build_models(&config)?;
@@ -52,7 +56,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
 }
 
 fn config_path() -> std::path::PathBuf {
-    std::env::var("LIAM_CONFIG").unwrap_or_else(|_| "liam.toml".to_string()).into()
+    std::env::var("LIAM_CONFIG")
+        .unwrap_or_else(|_| "liam.toml".to_string())
+        .into()
 }
 
 /// Choose the embedder and reranker from config. The mock pair keeps the base
@@ -63,13 +69,19 @@ fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn R
         // FASTEMBED_CACHE_DIR is set in `main` before the runtime starts.
         return build_local(config);
     }
-    Ok((Arc::new(MockEmbedder::new(config.embedding_dims)), Arc::new(IdentityReranker)))
+    Ok((
+        Arc::new(MockEmbedder::new(config.embedding_dims)),
+        Arc::new(IdentityReranker),
+    ))
 }
 
 #[cfg(feature = "local")]
 fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
     use liam_model::{FastEmbedEmbedder, FastEmbedReranker};
-    let embedder = Arc::new(FastEmbedEmbedder::load(&config.embedder.model, config.embedding_dims)?);
+    let embedder = Arc::new(FastEmbedEmbedder::load(
+        &config.embedder.model,
+        config.embedding_dims,
+    )?);
     let reranker = Arc::new(FastEmbedReranker::load()?);
     Ok((embedder, reranker))
 }
@@ -77,7 +89,10 @@ fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Re
 #[cfg(not(feature = "local"))]
 fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
     tracing::warn!("embedder.provider is 'local' but the daemon was built without the `local` feature; using mock");
-    Ok((Arc::new(MockEmbedder::new(config.embedding_dims)), Arc::new(IdentityReranker)))
+    Ok((
+        Arc::new(MockEmbedder::new(config.embedding_dims)),
+        Arc::new(IdentityReranker),
+    ))
 }
 
 /// Choose the LLM from config. Mock keeps the base build runnable; the `local`
@@ -92,18 +107,28 @@ fn build_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
 #[cfg(feature = "local")]
 fn build_local_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     use liam_model::CandleLlm;
-    Ok(Arc::new(CandleLlm::load(&config.llm.model, &config.llm.gguf_file, &config.llm.cache_dir)?))
+    Ok(Arc::new(CandleLlm::load(
+        &config.llm.model,
+        &config.llm.gguf_file,
+        &config.llm.cache_dir,
+    )?))
 }
 
 #[cfg(not(feature = "local"))]
 fn build_local_llm(_config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
-    tracing::warn!("llm.provider is 'local' but the daemon was built without the `local` feature; using mock");
+    tracing::warn!(
+        "llm.provider is 'local' but the daemon was built without the `local` feature; using mock"
+    );
     Ok(Arc::new(MockLlm))
 }
 
 /// GC runs on its own store connection so it never contends with requests.
 async fn spawn_gc(config: &Config) -> anyhow::Result<()> {
-    let store = DefaultGraph::open(&config.database_path, GraphConfig::new(config.embedding_dims)).await?;
+    let store = DefaultGraph::open(
+        &config.database_path,
+        GraphConfig::new(config.embedding_dims),
+    )
+    .await?;
     let policy = config.gc_policy();
     let interval = config.gc_interval();
     let run_on_start = config.gc.run_on_start;

@@ -89,11 +89,18 @@ impl Backend for LibsqlBackend {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
-        self.conn.execute(sql, libsql::params_from_iter(bind(params))).await.map_err(err)
+        self.conn
+            .execute(sql, libsql::params_from_iter(bind(params)))
+            .await
+            .map_err(err)
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-        let rows = self.conn.query(sql, libsql::params_from_iter(bind(params))).await.map_err(err)?;
+        let rows = self
+            .conn
+            .query(sql, libsql::params_from_iter(bind(params)))
+            .await
+            .map_err(err)?;
         read_rows(rows).await
     }
 
@@ -104,7 +111,9 @@ impl Backend for LibsqlBackend {
     async fn execute_atomic(&self, statements: &[(String, Vec<Value>)]) -> Result<()> {
         let tx = self.conn.transaction().await.map_err(err)?;
         for (sql, params) in statements {
-            tx.execute(sql, libsql::params_from_iter(bind(params))).await.map_err(err)?;
+            tx.execute(sql, libsql::params_from_iter(bind(params)))
+                .await
+                .map_err(err)?;
         }
         tx.commit().await.map_err(err)
     }
@@ -179,9 +188,15 @@ impl Backend for LibsqlBackend {
                AND n.valid_from <= ?2 AND n.valid_until > ?2{filters}
              ORDER BY vector_distance_cos(v.embedding, vector(?1)) LIMIT ?3"
         );
-        let rows = self.conn.query(&sql, libsql::params_from_iter(params)).await.map_err(err)?;
+        let rows = self
+            .conn
+            .query(&sql, libsql::params_from_iter(params))
+            .await
+            .map_err(err)?;
         let rows = read_rows(rows).await?;
-        rows.iter().map(|r| Ok(NodeId::from_raw(r.get_string(0)?))).collect()
+        rows.iter()
+            .map(|r| Ok(NodeId::from_raw(r.get_string(0)?)))
+            .collect()
     }
 
     async fn vector_sweep_orphans(&self) -> Result<u64> {
