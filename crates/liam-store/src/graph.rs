@@ -356,7 +356,16 @@ impl<B: Backend> Graph<B> {
         now: Millis,
         k: usize,
     ) -> Result<Vec<NodeId>> {
-        let mut params: Vec<Value> = vec![text.into(), now.into(), (k as i64).into()];
+        // FTS5 parses the MATCH value as its own query expression, so a raw
+        // question (`?`, apostrophes, bare operators) is a syntax error that
+        // aborts the whole hybrid query. Sanitize to a term-quoted literal.
+        let match_query = fts5_query(text);
+        if !match_query.chars().any(|c| c.is_alphanumeric()) {
+            // Nothing searchable (empty or all-punctuation); skip the lexical
+            // leg so the vector leg, if present, still runs.
+            return Ok(Vec::new());
+        }
+        let mut params: Vec<Value> = vec![match_query.into(), now.into(), (k as i64).into()];
         let mut filters = String::new();
         let mut next = 4;
         if let Some(kind) = kind {
@@ -622,6 +631,22 @@ fn row_f64(row: &Row, i: usize) -> f64 {
         Some(Value::Int(v)) => *v as f64,
         _ => 1.0,
     }
+}
+
+/// Turn arbitrary user text into a safe FTS5 MATCH string. FTS5 parses the
+/// *value* of a MATCH parameter as its own query language, so a natural-language
+/// question (`?`, `'`, `:`, leading `-`, bare `AND`/`OR`/`NOT`, parentheses)
+/// raises a syntax error and aborts the whole hybrid query. Wrapping each
+/// whitespace token in double quotes (embedded `"` doubled) makes every operator
+/// character match literally while preserving implicit-AND multi-term matching;
+/// the tokenizer still stems inside each quoted phrase. Single-token quoting is
+/// equivalent to a bare term under the tokenizer, so well-formed queries are
+/// unchanged; only previously-erroring inputs now return results.
+fn fts5_query(text: &str) -> String {
+    text.split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(feature = "cluster")]
@@ -903,5 +928,28 @@ mod tests {
         // Assert
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].valid_from, Millis(1234));
+    }
+
+    #[tokio::test]
+    async fn lexical_query_tolerates_question_punctuation() {
+        // FTS5 parses a raw MATCH value as its own query language; a natural
+        // question's trailing `?` previously raised "fts5: syntax error" and
+        // aborted the whole hybrid query. The terms must still match. Regression
+        // pin for the ask tool's primary input shape.
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now(
+            "fact",
+            "Storage",
+            "the gadget uses libsql for storage",
+        ))
+        .await
+        .unwrap();
+
+        // Act: a question-shaped query whose terms appear in the content.
+        let hits = g.query(&Query::text("storage gadget?")).await.unwrap();
+
+        // Assert
+        assert!(hits.iter().any(|h| h.label == "Storage"));
     }
 }
