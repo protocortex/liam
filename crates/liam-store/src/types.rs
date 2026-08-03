@@ -228,6 +228,9 @@ pub struct ExplainedHit {
     pub rrf: f64,
     pub confidence: f64,
     pub decay: f64,
+    /// The raw "known since" instant `decay` was computed from, so callers
+    /// (e.g. the daemon's `ask` tool) can render a date instead of a factor.
+    pub valid_from: Millis,
     pub expanded: bool,
 }
 
