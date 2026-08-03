@@ -16,6 +16,8 @@ pub struct Config {
     pub gc: GcConfig,
     pub embedder: EmbedderConfig,
     pub llm: LlmConfig,
+    /// Wall-clock cap on `ask` synthesis before falling back to ranked evidence.
+    pub ask_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +64,7 @@ impl Default for Config {
             gc: GcConfig::default(),
             embedder: EmbedderConfig::default(),
             llm: LlmConfig::default(),
+            ask_timeout_secs: 30,
         }
     }
 }
