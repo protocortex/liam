@@ -23,6 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 rmcp = { version = "2", features = ["server", "macros", "transport-io"] }
 schemars = "1"
+time = "0.3"
 
 [features]
 default = []

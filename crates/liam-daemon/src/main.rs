@@ -5,6 +5,7 @@
 //! plus `provider = "local"` loads fastembed in-process (Qwen3 embedder,
 //! cross-encoder reranker), no server.
 
+mod ask;
 mod config;
 mod mcp;
 mod telemetry;
