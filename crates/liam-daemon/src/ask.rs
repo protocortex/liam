@@ -39,9 +39,13 @@ pub fn truncate(s: &str, max: usize) -> String {
 
 /// Render epoch-ms as an ISO-8601 UTC date (YYYY-MM-DD). WHY manual y-m-d: keeps
 /// the `time` dep at default features. Out-of-range falls back to the raw
-/// integer string so a bad timestamp can never panic the answer.
+/// integer string so a bad timestamp can never panic the answer. WHY
+/// `div_euclid`: truncating division rounds toward zero, so a pre-1970
+/// instant with a sub-second remainder (e.g. -500ms) would floor to the wrong
+/// day (1970-01-01 instead of 1969-12-31); `div_euclid` always floors toward
+/// negative infinity, matching calendar semantics.
 pub fn fmt_millis(ms: i64) -> String {
-    match time::OffsetDateTime::from_unix_timestamp(ms / 1000) {
+    match time::OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000)) {
         Ok(dt) => format!(
             "{:04}-{:02}-{:02}",
             dt.year(),
@@ -183,11 +187,16 @@ mod tests {
 
     #[test]
     fn fmt_millis_falls_back_on_out_of_range_without_panicking() {
-        // Arrange / Act
-        let out = fmt_millis(i64::MAX);
+        // Arrange / Act / Assert: out-of-range renders as the raw integer
+        // string, never panics.
+        assert_eq!(fmt_millis(i64::MAX), i64::MAX.to_string());
+    }
 
-        // Assert
-        assert!(!out.is_empty());
+    #[test]
+    fn fmt_millis_floors_pre_1970_toward_negative_infinity() {
+        // Arrange / Act / Assert: -500ms is 0.5s before the epoch, which must
+        // floor into the prior day, not truncate up to 1970-01-01 (guards C3).
+        assert_eq!(fmt_millis(-500), "1969-12-31");
     }
 
     #[test]
@@ -214,6 +223,21 @@ mod tests {
 
         // Assert
         assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn truncate_is_char_boundary_safe_on_multi_byte_content() {
+        // Arrange: multi-byte (CJK + emoji) chars where a naive byte-index
+        // slice would land mid-codepoint and panic; `truncate` counts chars.
+        let text = "你好世界🎉🎊🎈абвгд".repeat(3);
+
+        // Act
+        let out = truncate(&text, 5);
+
+        // Assert: doesn't panic, is a valid shortened String, and carries the
+        // truncation marker (guards the documented char-boundary safety).
+        assert!(out.chars().count() < text.chars().count());
+        assert!(out.contains("[truncated]"));
     }
 
     #[test]

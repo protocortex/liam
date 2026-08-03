@@ -18,6 +18,29 @@ use serde::Deserialize;
 
 use crate::ask::{self, build_ask_prompt, fallback_answer, format_answer};
 
+/// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
+/// handlers apply the same k/embedding/kind/scope shape to a `Query`; keeping
+/// it in one place means a future filter only needs to change here.
+fn build_query(
+    text: &str,
+    k: Option<usize>,
+    kind: Option<String>,
+    scope: Option<String>,
+    embedding: Option<Vec<f32>>,
+) -> Query {
+    let mut q = Query::text(text.to_string()).with_k(k.unwrap_or(8));
+    if let Some(e) = embedding {
+        q = q.with_embedding(e);
+    }
+    if let Some(kind) = kind {
+        q = q.with_kind(kind);
+    }
+    if let Some(scope) = scope {
+        q = q.with_scope(scope);
+    }
+    q
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RememberArgs {
     /// decision | fact | symbol | episode (opaque to the store).
@@ -100,16 +123,7 @@ impl MemoryServer {
     #[tool(description = "Retrieve relevant long-term memory, reranked for precision.")]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let embedding = self.embedder.embed(&args.query).await.ok();
-        let mut q = Query::text(args.query.clone()).with_k(args.k.unwrap_or(8));
-        if let Some(e) = embedding {
-            q = q.with_embedding(e);
-        }
-        if let Some(kind) = args.kind {
-            q = q.with_kind(kind);
-        }
-        if let Some(scope) = args.scope {
-            q = q.with_scope(scope);
-        }
+        let q = build_query(&args.query, args.k, args.kind, args.scope, embedding);
         let hits = match self.store.query(&q).await {
             Ok(h) => h,
             Err(e) => return format!("recall failed: {e}"),
@@ -133,16 +147,7 @@ impl MemoryServer {
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
     async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
         let embedding = self.embedder.embed(&args.question).await.ok();
-        let mut q = Query::text(args.question.clone()).with_k(args.k.unwrap_or(8));
-        if let Some(e) = embedding {
-            q = q.with_embedding(e);
-        }
-        if let Some(kind) = args.kind {
-            q = q.with_kind(kind);
-        }
-        if let Some(scope) = args.scope {
-            q = q.with_scope(scope);
-        }
+        let q = build_query(&args.question, args.k, args.kind, args.scope, embedding);
         let hits = match self.store.query_explained(&q).await {
             Ok(h) => h,
             Err(e) => return format!("ask failed: {e}"),
@@ -168,7 +173,7 @@ impl MemoryServer {
         .await;
         match synth {
             Ok(Ok(a)) if !a.trim().is_empty() => format_answer(&a, &evidence),
-            _ => format_answer(&fallback_answer(&evidence), &evidence),
+            _ => fallback_answer(&evidence),
         }
     }
 }
@@ -206,9 +211,41 @@ mod tests {
         }
     }
 
-    /// Fresh in-memory server wired with the given reranker/llm. Dims 8 to
-    /// match `MockEmbedder::new(8)`.
+    /// Sleeps past any short test timeout, so `ask` must fall back instead of
+    /// waiting on synthesis. Used to exercise the `tokio::time::timeout` arm
+    /// without a real 30s test.
+    struct SlowLlm;
+    #[async_trait::async_trait]
+    impl liam_model::Llm for SlowLlm {
+        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok("too late".to_string())
+        }
+    }
+
+    /// Succeeds but with a blank answer, so `ask` must fall back to evidence
+    /// instead of returning whitespace as if it were a real synthesis.
+    struct EmptyLlm;
+    #[async_trait::async_trait]
+    impl liam_model::Llm for EmptyLlm {
+        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+            Ok("   ".to_string())
+        }
+    }
+
+    /// Fresh in-memory server wired with the given reranker/llm and a 30s ask
+    /// timeout. Dims 8 to match `MockEmbedder::new(8)`.
     async fn server_with(reranker: Arc<dyn Reranker>, llm: Arc<dyn Llm>) -> MemoryServer {
+        server_with_timeout(reranker, llm, 30).await
+    }
+
+    /// Fresh in-memory server wired with the given reranker/llm/ask timeout.
+    /// Dims 8 to match `MockEmbedder::new(8)`.
+    async fn server_with_timeout(
+        reranker: Arc<dyn Reranker>,
+        llm: Arc<dyn Llm>,
+        ask_timeout_secs: u64,
+    ) -> MemoryServer {
         let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
             .await
             .expect("open in-memory store");
@@ -217,7 +254,7 @@ mod tests {
             Arc::new(liam_model::MockEmbedder::new(8)),
             reranker,
             llm,
-            30,
+            ask_timeout_secs,
         )
     }
 
@@ -254,7 +291,7 @@ mod tests {
         // Act
         let answer = server
             .ask(Parameters(AskArgs {
-                question: "What storage engine the zorbnax gadget uses".to_string(),
+                question: "What storage engine does the zorbnax gadget use?".to_string(),
                 kind: None,
                 scope: None,
                 k: None,
@@ -263,7 +300,8 @@ mod tests {
 
         // Assert: the evidence content rode through MockLlm's echo into the
         // prompt, proving the built prompt reached `complete`, and the answer
-        // carries the pinned `Sources:` section.
+        // carries the pinned `Sources:` section. The `?`-terminated question
+        // also proves the FTS5 fix flows through `ask` end-to-end.
         assert!(
             answer.contains("The zorbnax gadget uses libSQL for storage."),
             "answer missing evidence content: {answer}"
@@ -271,6 +309,10 @@ mod tests {
         assert!(
             answer.contains("Sources:"),
             "answer missing sources: {answer}"
+        );
+        assert!(
+            !answer.contains("(synthesis unavailable"),
+            "expected synthesized path, got fallback: {answer}"
         );
     }
 
@@ -310,6 +352,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_falls_back_on_timeout() {
+        // Arrange: a 1s ask timeout against an llm that sleeps 30s, so the
+        // test must return promptly (~1s) via the fallback path, not wait for
+        // the slow completion.
+        let server =
+            server_with_timeout(Arc::new(liam_model::IdentityReranker), Arc::new(SlowLlm), 1).await;
+        seed(
+            &server,
+            "fact",
+            "Deadline",
+            "The gizmo deadline slipped to next quarter.",
+        )
+        .await;
+
+        // Act
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "When did the gizmo deadline slip".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+            }))
+            .await;
+
+        // Assert: the timeout fired before `SlowLlm::complete` resolved, so
+        // the answer is the evidence-backed fallback.
+        assert!(
+            answer.contains("(synthesis unavailable"),
+            "answer missing fallback marker: {answer}"
+        );
+        assert!(
+            answer.contains("The gizmo deadline slipped to next quarter."),
+            "answer missing evidence content: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_falls_back_on_empty_answer() {
+        // Arrange: llm "succeeds" but returns only whitespace.
+        let server = server_with(Arc::new(liam_model::IdentityReranker), Arc::new(EmptyLlm)).await;
+        seed(
+            &server,
+            "fact",
+            "Weather",
+            "It rained on the picnic in Brooklyn.",
+        )
+        .await;
+
+        // Act
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "What happened at the picnic".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+            }))
+            .await;
+
+        // Assert: a blank successful answer is treated as no synthesis, so
+        // the answer is the evidence-backed fallback.
+        assert!(
+            answer.contains("(synthesis unavailable"),
+            "answer missing fallback marker: {answer}"
+        );
+        assert!(
+            answer.contains("It rained on the picnic in Brooklyn."),
+            "answer missing evidence content: {answer}"
+        );
+    }
+
+    #[tokio::test]
     async fn ask_survives_reranker_failure() {
         // Arrange
         let server = server_with(Arc::new(FailingReranker), Arc::new(liam_model::MockLlm)).await;
@@ -333,11 +446,15 @@ mod tests {
 
         // Assert: a failing `scores` makes `order` return `Err`, which the
         // handler catches with `unwrap_or_else` into identity order — no panic,
-        // still a real answer.
+        // still a real answer, and the evidence isn't silently dropped.
         assert!(!answer.is_empty());
         assert!(
             answer.contains("Sources:"),
             "answer missing sources: {answer}"
+        );
+        assert!(
+            answer.contains("The team mascot is a wombat named Pixel."),
+            "answer missing evidence content: {answer}"
         );
     }
 
