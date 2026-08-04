@@ -322,6 +322,7 @@ impl<B: Backend> Graph<B> {
                 rrf: base,
                 confidence: c.confidence,
                 decay,
+                valid_from: c.valid_from,
                 expanded: is_expanded,
             });
         }
@@ -883,5 +884,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids_from(&rows).unwrap(), vec![fact]);
+    }
+
+    #[tokio::test]
+    async fn query_explained_carries_valid_from() {
+        // The daemon's `ask` tool renders `valid_from` as a date, so
+        // `ExplainedHit` must carry the raw instant, not just the decay
+        // computed from it.
+        // Arrange
+        let g = graph_at(Millis(5000)).await;
+        g.insert(NewNode::now("fact", "label", "body").with_valid_from(Millis(1234)))
+            .await
+            .unwrap();
+
+        // Act
+        let hits = g.query_explained(&Query::text("body")).await.unwrap();
+
+        // Assert
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].valid_from, Millis(1234));
     }
 }
