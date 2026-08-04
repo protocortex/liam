@@ -18,6 +18,13 @@ use serde::Deserialize;
 
 use crate::ask::{self, build_ask_prompt, fallback_answer, format_answer};
 
+/// Upper bound on evidence items `ask` feeds the LLM. WHY: caller-supplied `k`
+/// is otherwise unbounded and each item can be `MAX_EVIDENCE_CHARS` long, so an
+/// unclamped `k` would blow a small local model's context. The per-item
+/// truncate caps size; this caps count. `recall` is unbounded (it never calls
+/// an LLM), so the clamp lives in `ask`, not `build_query`.
+const MAX_ASK_EVIDENCE: usize = 32;
+
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope shape to a `Query`; keeping
 /// it in one place means a future filter only needs to change here.
@@ -147,7 +154,8 @@ impl MemoryServer {
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
     async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
         let embedding = self.embedder.embed(&args.question).await.ok();
-        let q = build_query(&args.question, args.k, args.kind, args.scope, embedding);
+        let k = args.k.unwrap_or(8).min(MAX_ASK_EVIDENCE);
+        let q = build_query(&args.question, Some(k), args.kind, args.scope, embedding);
         let hits = match self.store.query_explained(&q).await {
             Ok(h) => h,
             Err(e) => return format!("ask failed: {e}"),
@@ -167,12 +175,14 @@ impl MemoryServer {
             .collect();
         let (system, user) = build_ask_prompt(&args.question, &evidence);
         let synth = tokio::time::timeout(
-            Duration::from_secs(self.ask_timeout_secs),
+            // max(1) guards against an operator typo of `ask_timeout_secs = 0`,
+            // which would otherwise make every call time out immediately.
+            Duration::from_secs(self.ask_timeout_secs.max(1)),
             self.llm.complete(&system, &user),
         )
         .await;
         match synth {
-            Ok(Ok(a)) if !a.trim().is_empty() => format_answer(&a, &evidence),
+            Ok(Ok(a)) if !a.trim().is_empty() => format_answer(a.trim(), &evidence),
             _ => fallback_answer(&evidence),
         }
     }

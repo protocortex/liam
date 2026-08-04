@@ -190,6 +190,8 @@ mod tests {
         // Arrange / Act / Assert: out-of-range renders as the raw integer
         // string, never panics.
         assert_eq!(fmt_millis(i64::MAX), i64::MAX.to_string());
+        // Negative-side boundary that div_euclid specifically targets.
+        assert_eq!(fmt_millis(i64::MIN), i64::MIN.to_string());
     }
 
     #[test]
