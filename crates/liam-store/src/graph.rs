@@ -951,5 +951,9 @@ mod tests {
 
         // Assert
         assert!(hits.iter().any(|h| h.label == "Storage"));
+
+        // A punctuation-only query hits the "no searchable term" guard: it must
+        // return Ok (empty), never an FTS5 syntax error.
+        assert!(g.query(&Query::text("???")).await.unwrap().is_empty());
     }
 }
