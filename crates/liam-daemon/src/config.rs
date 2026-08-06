@@ -98,9 +98,13 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             provider: "mock".into(),
-            model: "Qwen/Qwen2.5-0.5B-Instruct-GGUF".into(),
-            gguf_file: "qwen2.5-0.5b-instruct-q4_k_m.gguf".into(),
-            tokenizer_model: "Qwen/Qwen2.5-0.5B-Instruct".into(),
+            // Chosen by measurement, not by size: on the grounding eval
+            // (crates/liam-daemon/src/eval.rs) 1.5B scored 3/4 judged cases at
+            // ~4.8s per answer, against 2/4 for 0.5B, 3/4 for Gemma-3-1B at ~9.3s,
+            // and 2/4 for Qwen3-1.7B. Apache-2.0 at this size (the 3B is not).
+            model: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".into(),
+            gguf_file: "qwen2.5-1.5b-instruct-q4_k_m.gguf".into(),
+            tokenizer_model: "Qwen/Qwen2.5-1.5B-Instruct".into(),
             cache_dir: "~/.liam/models".into(),
         }
     }
@@ -159,7 +163,7 @@ mod tests {
         let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../liam.toml"));
         let c = Config::load(path).expect("shipped liam.toml must parse");
         assert_eq!(c.ask_timeout_secs, 30);
-        assert_eq!(c.llm.tokenizer_model, "Qwen/Qwen2.5-0.5B-Instruct");
+        assert_eq!(c.llm.tokenizer_model, "Qwen/Qwen2.5-1.5B-Instruct");
     }
 
     #[test]

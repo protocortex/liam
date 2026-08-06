@@ -19,7 +19,9 @@ cache_dir = "~/.liam/models"       # pre-populated by the installer
 
 [llm]
 provider        = "mock"                            # "mock" (dev) or "local" (in-process candle)
-model           = "Qwen/Qwen2.5-0.5B-Instruct-GGUF" # weights repo (quant files only)
-gguf_file       = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
-tokenizer_model = "Qwen/Qwen2.5-0.5B-Instruct"      # base repo: GGUF repos ship no tokenizer.json
+model           = "Qwen/Qwen2.5-1.5B-Instruct-GGUF" # weights repo (quant files only)
+gguf_file       = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+tokenizer_model = "Qwen/Qwen2.5-1.5B-Instruct"      # base repo: GGUF repos ship no tokenizer.json
+# Architecture is auto-detected from the GGUF metadata: qwen2, qwen3, gemma/2/3,
+# llama, mistral, phi3 all work. See crates/liam-daemon/src/eval.rs for scores.
 cache_dir       = "~/.liam/models"
