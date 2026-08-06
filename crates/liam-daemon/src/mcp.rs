@@ -177,8 +177,22 @@ impl MemoryServer {
         )
         .await;
         match synth {
-            Ok(Ok(a)) if !a.trim().is_empty() => format_answer(a.trim(), &evidence),
-            _ => fallback_answer(&evidence),
+            Ok(Ok(a)) if !a.trim().is_empty() => {
+                let answer = a.trim();
+                // Last line of defence against prompt injection and free-running
+                // fabrication: an answer that shares almost no vocabulary with the
+                // evidence is not a synthesis of it, whatever the model intended.
+                // Unlike the prompt rules, this does not depend on the model
+                // cooperating. See `ask::is_grounded`.
+                if ask::is_grounded(answer, &args.question, &evidence) {
+                    format_answer(answer, &evidence)
+                } else {
+                    fallback_answer("the answer was not grounded in the evidence", &evidence)
+                }
+            }
+            Ok(Ok(_)) => fallback_answer("the model returned an empty answer", &evidence),
+            Ok(Err(_)) => fallback_answer("the model failed", &evidence),
+            Err(_) => fallback_answer("synthesis timed out", &evidence),
         }
     }
 }
@@ -225,6 +239,59 @@ mod tests {
         async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
             tokio::time::sleep(Duration::from_secs(30)).await;
             Ok("too late".to_string())
+        }
+    }
+
+    /// Records what reached the model and replies with a canned answer. WHY not
+    /// `MockLlm` for the synthesized-path tests: its echo repeats the system
+    /// rules, which `ask::is_grounded` correctly rejects as not derived from the
+    /// evidence. Recording the prompt asserts prompt delivery directly instead of
+    /// inferring it from an echo.
+    struct RecordingLlm {
+        reply: &'static str,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingLlm {
+        fn new(reply: &'static str) -> Self {
+            Self {
+                reply,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn last_prompt(&self) -> String {
+            self.seen
+                .lock()
+                .expect("prompt log")
+                .last()
+                .cloned()
+                .expect("the llm was never called")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl liam_model::Llm for RecordingLlm {
+        async fn complete(&self, system: &str, prompt: &str) -> liam_model::Result<String> {
+            self.seen
+                .lock()
+                .expect("prompt log")
+                .push(format!("{system}\n{prompt}"));
+            Ok(self.reply.to_string())
+        }
+    }
+
+    /// Answers with fluent text that shares nothing with the evidence: what a
+    /// model does when it answers from its own priors instead of the retrieved
+    /// facts.
+    struct UngroundedLlm;
+    #[async_trait::async_trait]
+    impl liam_model::Llm for UngroundedLlm {
+        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+            Ok(
+                "Kubernetes clusters orchestrate containerized microservice deployments."
+                    .to_string(),
+            )
         }
     }
 
@@ -299,11 +366,62 @@ mod tests {
 
     #[tokio::test]
     async fn ask_synthesizes_with_sources() {
-        // Arrange: a single node with a distinctive phrase, MockEmbedder
-        // (lexical + vector both fire) and MockLlm (echoes the prompt back).
+        // Arrange: a single node with a distinctive phrase, MockEmbedder (lexical
+        // + vector both fire) and a recording llm whose canned reply is grounded
+        // in that phrase.
+        let llm = Arc::new(RecordingLlm::new(
+            "The zorbnax gadget uses libSQL for storage [1].",
+        ));
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        seed(
+            &server,
+            "decision",
+            "Storage engine",
+            "The zorbnax gadget uses libSQL for storage.",
+        )
+        .await;
+
+        // Act
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "What storage engine does the zorbnax gadget use?".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+            }))
+            .await;
+
+        // Assert: the evidence reached the model, and its answer came back
+        // formatted with the pinned `Sources:` section rather than as a fallback.
+        // The `?`-terminated question also proves the FTS5 fix flows through
+        // `ask` end-to-end.
+        assert!(
+            llm.last_prompt()
+                .contains("The zorbnax gadget uses libSQL for storage."),
+            "prompt missing evidence content: {}",
+            llm.last_prompt()
+        );
+        assert!(
+            answer.starts_with("The zorbnax gadget uses libSQL for storage [1]."),
+            "answer is not the model's: {answer}"
+        );
+        assert!(
+            answer.contains("Sources:"),
+            "answer missing sources: {answer}"
+        );
+        assert!(
+            !answer.contains("(synthesis unavailable"),
+            "expected synthesized path, got fallback: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_falls_back_when_the_answer_is_not_grounded() {
+        // Arrange: the model answers from its own priors, sharing no vocabulary
+        // with what was retrieved.
         let server = server_with(
             Arc::new(liam_model::IdentityReranker),
-            Arc::new(liam_model::MockLlm),
+            Arc::new(UngroundedLlm),
         )
         .await;
         seed(
@@ -324,21 +442,19 @@ mod tests {
             }))
             .await;
 
-        // Assert: the evidence content rode through MockLlm's echo into the
-        // prompt, proving the built prompt reached `complete`, and the answer
-        // carries the pinned `Sources:` section. The `?`-terminated question
-        // also proves the FTS5 fix flows through `ask` end-to-end.
+        // Assert: the fabrication never reaches the caller as an answer; they get
+        // the evidence and a stated reason instead.
+        assert!(
+            answer.contains("not grounded in the evidence"),
+            "fabricated answer was returned as a synthesis: {answer}"
+        );
+        assert!(
+            !answer.contains("Kubernetes"),
+            "fabricated text surfaced in the answer: {answer}"
+        );
         assert!(
             answer.contains("The zorbnax gadget uses libSQL for storage."),
             "answer missing evidence content: {answer}"
-        );
-        assert!(
-            answer.contains("Sources:"),
-            "answer missing sources: {answer}"
-        );
-        assert!(
-            !answer.contains("(synthesis unavailable"),
-            "expected synthesized path, got fallback: {answer}"
         );
     }
 
@@ -451,7 +567,10 @@ mod tests {
     #[tokio::test]
     async fn ask_survives_reranker_failure() {
         // Arrange
-        let server = server_with(Arc::new(FailingReranker), Arc::new(liam_model::MockLlm)).await;
+        let llm = Arc::new(RecordingLlm::new(
+            "The team mascot is a wombat named Pixel [1].",
+        ));
+        let server = server_with(Arc::new(FailingReranker), llm.clone()).await;
         seed(
             &server,
             "fact",
@@ -472,15 +591,18 @@ mod tests {
 
         // Assert: a failing `scores` makes `order` return `Err`, which the
         // handler catches with `unwrap_or_else` into identity order — no panic,
-        // still a real answer, and the evidence isn't silently dropped.
+        // still a real answer, and the evidence isn't silently dropped on the way
+        // to the model.
         assert!(!answer.is_empty());
         assert!(
             answer.contains("Sources:"),
             "answer missing sources: {answer}"
         );
         assert!(
-            answer.contains("The team mascot is a wombat named Pixel."),
-            "answer missing evidence content: {answer}"
+            llm.last_prompt()
+                .contains("The team mascot is a wombat named Pixel."),
+            "prompt missing evidence content: {}",
+            llm.last_prompt()
         );
     }
 
@@ -649,8 +771,13 @@ mod tests {
     #[tokio::test]
     async fn ask_respects_k() {
         // Arrange: three matching nodes, but the caller wants one piece of
-        // evidence.
-        let server = plain_server().await;
+        // evidence. The canned reply is grounded so the synthesized path (and
+        // therefore the `Sources:` index this asserts on) is the one taken.
+        let server = server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(RecordingLlm::new("The zorbnax report says one [1].")),
+        )
+        .await;
         seed(&server, "fact", "One", "zorbnax report one").await;
         seed(&server, "fact", "Two", "zorbnax report two").await;
         seed(&server, "fact", "Three", "zorbnax report three").await;
