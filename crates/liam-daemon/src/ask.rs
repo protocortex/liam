@@ -23,8 +23,7 @@ const MAX_ASK_EVIDENCE: usize = 32;
 /// fact answer, which reads as a claim about the memory rather than about the
 /// argument.
 pub fn clamp_ask_k(k: Option<usize>) -> usize {
-    k.unwrap_or(DEFAULT_ASK_EVIDENCE)
-        .clamp(1, MAX_ASK_EVIDENCE)
+    k.unwrap_or(DEFAULT_ASK_EVIDENCE).clamp(1, MAX_ASK_EVIDENCE)
 }
 
 /// Fence opener/closer wrapping each evidence block. WHY: `kind`, `label`, and

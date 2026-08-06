@@ -510,7 +510,13 @@ mod tests {
         // Arrange: two nodes sharing a rare term so both match the query text,
         // differing only in kind.
         let server = plain_server().await;
-        seed(&server, "decision", "Alpha", "the zorbnax rollout is approved").await;
+        seed(
+            &server,
+            "decision",
+            "Alpha",
+            "the zorbnax rollout is approved",
+        )
+        .await;
         seed(&server, "fact", "Beta", "the zorbnax rollout costs money").await;
 
         // Act
@@ -632,7 +638,10 @@ mod tests {
         // only ever sees evidence the caller asked for.
         assert!(answer.contains("ships in June"), "missing match: {answer}");
         assert!(!answer.contains("ships in July"), "kind leaked: {answer}");
-        assert!(!answer.contains("ships in August"), "scope leaked: {answer}");
+        assert!(
+            !answer.contains("ships in August"),
+            "scope leaked: {answer}"
+        );
     }
 
     #[tokio::test]
