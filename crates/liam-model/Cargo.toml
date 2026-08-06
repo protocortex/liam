@@ -15,7 +15,9 @@ fastembed = { version = "5", features = ["qwen3"], optional = true }
 # Tracks the candle-core 0.11 line; fastembed 5.17.3+ itself moved onto
 # candle-core 0.11, so this stays in lockstep with what fastembed resolves.
 candle-core = { version = "0.11", optional = true }
-tokio = { version = "1", features = ["rt"], optional = true }
+# "rt" for spawn_blocking (the decode loop), "sync" for the async mutex that
+# serializes the single chat session without blocking a runtime thread.
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
 
 # Generative chat model for the Llm trait (feature `local`). Tracks the
 # candle-core 0.11 line (candle-transformers 0.11 depends on candle-core
