@@ -293,7 +293,7 @@ impl<B: Backend> Graph<B> {
             .keys()
             .map(|s| NodeId::from_raw(s.clone()))
             .collect();
-        let rows = self.fetch_candidates(&ids, now, scope).await?;
+        let rows = self.fetch_candidates(&ids, now, scope, kind).await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for c in rows {
@@ -397,12 +397,13 @@ impl<B: Backend> Graph<B> {
         ids: &[NodeId],
         now: Millis,
         scope: Option<&str>,
+        kind: Option<&str>,
     ) -> Result<Vec<Candidate>> {
         const CHUNK: usize = 512;
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(CHUNK) {
-            // `?1` is the live-at instant; `?2..` are the ids; scope, if any,
-            // is the final parameter.
+            // `?1` is the live-at instant; `?2..` are the ids; the scope and
+            // kind filters, if any, take the parameters after those.
             let mut params: Vec<Value> = vec![now.into()];
             let placeholders = chunk
                 .iter()
@@ -413,16 +414,22 @@ impl<B: Backend> Graph<B> {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            let scope_filter = match scope {
-                Some(s) => {
-                    params.push(s.into());
-                    format!(" AND scope = ?{}", chunk.len() + 2)
+            // Both filters are applied HERE, not only on the retrieval paths:
+            // graph expansion adds a seed's neighbours to the candidate set
+            // without consulting the query at all, so a neighbour of another
+            // kind or scope would otherwise ride along and break the filter the
+            // caller asked for.
+            let mut filters = String::new();
+            for (column, value) in [("scope", scope), ("kind", kind)] {
+                if let Some(v) = value {
+                    params.push(v.into());
+                    // Just-pushed value sits at the 1-based position `len()`.
+                    filters.push_str(&format!(" AND {column} = ?{}", params.len()));
                 }
-                None => String::new(),
-            };
+            }
             let sql = format!(
                 "SELECT id, kind, label, content, attributes, confidence, valid_from
-                 FROM nodes WHERE id IN ({placeholders}) AND {live}{scope_filter}",
+                 FROM nodes WHERE id IN ({placeholders}) AND {live}{filters}",
                 live = live_at("nodes", 1),
             );
             let rows = self.backend.query(&sql, &params).await?;
@@ -682,6 +689,87 @@ mod tests {
         let hits = g.query(&Query::text("libSQL")).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].label, "Use libSQL");
+    }
+
+    #[tokio::test]
+    async fn kind_filter_holds_for_graph_expanded_neighbours() {
+        // Arrange: a matching `decision` linked to an `episode` that the query
+        // text does not match. The episode enters the candidate set only through
+        // graph expansion off the seed.
+        let g = graph_at(Millis(1000)).await;
+        let seed = g
+            .insert(NewNode::now(
+                "decision",
+                "Rollout",
+                "zorbnax rollout approved",
+            ))
+            .await
+            .unwrap();
+        let neighbour = g
+            .insert(NewNode::now(
+                "episode",
+                "Chatter",
+                "unrelated standup notes",
+            ))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&seed, &neighbour, "mentions"))
+            .await
+            .unwrap();
+
+        // Act
+        let hits = g
+            .query(&Query::text("zorbnax rollout").with_kind("decision"))
+            .await
+            .unwrap();
+
+        // Assert: `with_kind` is a filter on the result set, not merely on the
+        // retrieval paths, so an expanded neighbour of another kind must not ride
+        // along.
+        let kinds: Vec<&str> = hits.iter().map(|h| h.kind.as_str()).collect();
+        assert!(
+            hits.iter().all(|h| h.kind == "decision"),
+            "kind filter leaked expanded neighbours: {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_filter_holds_for_graph_expanded_neighbours() {
+        // Arrange: same shape as the kind test, partitioned by scope instead.
+        // This one guards behaviour that already held, so the shared filter
+        // refactor cannot regress it silently.
+        let g = graph_at(Millis(1000)).await;
+        let seed = g
+            .insert(
+                NewNode::now("decision", "Rollout", "zorbnax rollout approved")
+                    .with_scope("proj-a"),
+            )
+            .await
+            .unwrap();
+        let neighbour = g
+            .insert(NewNode::now("decision", "Chatter", "unrelated notes").with_scope("proj-b"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&seed, &neighbour, "mentions"))
+            .await
+            .unwrap();
+
+        // Act
+        let hits = g
+            .query(&Query::text("zorbnax rollout").with_scope("proj-a"))
+            .await
+            .unwrap();
+
+        // Assert
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert!(
+            hits.iter().all(|h| h.label != "Chatter"),
+            "scope filter leaked expanded neighbours: {labels:?}"
+        );
+        assert!(
+            hits.iter().any(|h| h.label == "Rollout"),
+            "in-scope match missing: {labels:?}"
+        );
     }
 
     #[tokio::test]
