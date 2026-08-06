@@ -16,14 +16,7 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::ask::{self, build_ask_prompt, fallback_answer, format_answer};
-
-/// Upper bound on evidence items `ask` feeds the LLM. WHY: caller-supplied `k`
-/// is otherwise unbounded and each item can be `MAX_EVIDENCE_CHARS` long, so an
-/// unclamped `k` would blow a small local model's context. The per-item
-/// truncate caps size; this caps count. `recall` is unbounded (it never calls
-/// an LLM), so the clamp lives in `ask`, not `build_query`.
-const MAX_ASK_EVIDENCE: usize = 32;
+use crate::ask::{self, build_ask_prompt, clamp_ask_k, fallback_answer, format_answer};
 
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope shape to a `Query`; keeping
@@ -154,7 +147,7 @@ impl MemoryServer {
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
     async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
         let embedding = self.embedder.embed(&args.question).await.ok();
-        let k = args.k.unwrap_or(8).min(MAX_ASK_EVIDENCE);
+        let k = clamp_ask_k(args.k);
         let q = build_query(&args.question, Some(k), args.kind, args.scope, embedding);
         let hits = match self.store.query_explained(&q).await {
             Ok(h) => h,
@@ -269,16 +262,37 @@ mod tests {
     }
 
     async fn seed(server: &MemoryServer, kind: &str, label: &str, content: &str) {
+        seed_scoped(server, kind, label, content, None).await;
+    }
+
+    async fn seed_scoped(
+        server: &MemoryServer,
+        kind: &str,
+        label: &str,
+        content: &str,
+        scope: Option<&str>,
+    ) {
         let out = server
             .remember(Parameters(RememberArgs {
                 kind: kind.to_string(),
                 label: label.to_string(),
                 content: content.to_string(),
-                scope: None,
+                scope: scope.map(str::to_string),
                 subject: None,
             }))
             .await;
         assert!(out.starts_with("remembered "), "seed failed: {out}");
+    }
+
+    /// Server with the neutral doubles used by the filter tests: identity rerank
+    /// (so ordering is the store's) and the echo llm (so `ask`'s answer contains
+    /// whatever evidence reached the prompt, which is what they assert on).
+    async fn plain_server() -> MemoryServer {
+        server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -489,6 +503,166 @@ mod tests {
 
         // Assert
         assert_eq!(answer, "no relevant memory");
+    }
+
+    #[tokio::test]
+    async fn recall_filters_by_kind() {
+        // Arrange: two nodes sharing a rare term so both match the query text,
+        // differing only in kind.
+        let server = plain_server().await;
+        seed(&server, "decision", "Alpha", "the zorbnax rollout is approved").await;
+        seed(&server, "fact", "Beta", "the zorbnax rollout costs money").await;
+
+        // Act
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax rollout".to_string(),
+                kind: Some("decision".to_string()),
+                scope: None,
+                k: None,
+            }))
+            .await;
+
+        // Assert: only the requested kind comes back.
+        assert!(out.contains("[decision] Alpha"), "missing match: {out}");
+        assert!(!out.contains("costs money"), "kind filter leaked: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_filters_by_scope() {
+        // Arrange: same kind and overlapping text, partitioned by scope.
+        let server = plain_server().await;
+        seed_scoped(
+            &server,
+            "fact",
+            "In scope",
+            "the zorbnax build runs nightly",
+            Some("proj-a"),
+        )
+        .await;
+        seed_scoped(
+            &server,
+            "fact",
+            "Out of scope",
+            "the zorbnax build runs weekly",
+            Some("proj-b"),
+        )
+        .await;
+
+        // Act
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax build".to_string(),
+                kind: None,
+                scope: Some("proj-a".to_string()),
+                k: None,
+            }))
+            .await;
+
+        // Assert: the other partition is invisible, which is the isolation
+        // guarantee `scope` exists for.
+        assert!(out.contains("runs nightly"), "missing match: {out}");
+        assert!(!out.contains("runs weekly"), "scope filter leaked: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_respects_k() {
+        // Arrange: three nodes all matching the query term.
+        let server = plain_server().await;
+        seed(&server, "fact", "One", "zorbnax note one").await;
+        seed(&server, "fact", "Two", "zorbnax note two").await;
+        seed(&server, "fact", "Three", "zorbnax note three").await;
+
+        // Act
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax note".to_string(),
+                kind: None,
+                scope: None,
+                k: Some(1),
+            }))
+            .await;
+
+        // Assert: exactly one block (blocks are joined by a blank line). WHY not
+        // assert *which* one: with mock scoring the three are near-tied, and the
+        // contract under test is the count.
+        assert_eq!(out.split("\n\n").count(), 1, "expected 1 block: {out}");
+    }
+
+    #[tokio::test]
+    async fn ask_filters_by_kind_and_scope() {
+        // Arrange: one node matches both filters, three others miss one each.
+        let server = plain_server().await;
+        seed_scoped(
+            &server,
+            "decision",
+            "Wanted",
+            "the zorbnax gizmo ships in June",
+            Some("proj-a"),
+        )
+        .await;
+        seed_scoped(
+            &server,
+            "fact",
+            "Wrong kind",
+            "the zorbnax gizmo ships in July",
+            Some("proj-a"),
+        )
+        .await;
+        seed_scoped(
+            &server,
+            "decision",
+            "Wrong scope",
+            "the zorbnax gizmo ships in August",
+            Some("proj-b"),
+        )
+        .await;
+
+        // Act
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "When does the zorbnax gizmo ship?".to_string(),
+                kind: Some("decision".to_string()),
+                scope: Some("proj-a".to_string()),
+                k: None,
+            }))
+            .await;
+
+        // Assert: filters reach the store on the `ask` path too, so the model
+        // only ever sees evidence the caller asked for.
+        assert!(answer.contains("ships in June"), "missing match: {answer}");
+        assert!(!answer.contains("ships in July"), "kind leaked: {answer}");
+        assert!(!answer.contains("ships in August"), "scope leaked: {answer}");
+    }
+
+    #[tokio::test]
+    async fn ask_respects_k() {
+        // Arrange: three matching nodes, but the caller wants one piece of
+        // evidence.
+        let server = plain_server().await;
+        seed(&server, "fact", "One", "zorbnax report one").await;
+        seed(&server, "fact", "Two", "zorbnax report two").await;
+        seed(&server, "fact", "Three", "zorbnax report three").await;
+
+        // Act
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "What do the zorbnax reports say?".to_string(),
+                kind: None,
+                scope: None,
+                k: Some(1),
+            }))
+            .await;
+
+        // Assert on the `Sources:` index rather than the body: the echo llm
+        // repeats the prompt, so the body would contain evidence markers either
+        // way. One source line means one evidence item was cited.
+        let sources = answer
+            .split_once("Sources:\n")
+            .map(|(_, s)| s.to_string())
+            .unwrap_or_else(|| panic!("answer has no sources section: {answer}"));
+        assert_eq!(sources.lines().count(), 1, "expected 1 source: {sources}");
+        assert!(sources.starts_with("[1] fact/"), "sources: {sources}");
     }
 
     #[tokio::test]

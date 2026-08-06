@@ -7,6 +7,26 @@
 /// must not blow a small local model's context window.
 const MAX_EVIDENCE_CHARS: usize = 2000;
 
+/// Default and upper bound on the number of evidence items `ask` feeds the LLM.
+/// WHY the cap: caller-supplied `k` is otherwise unbounded and each item can be
+/// `MAX_EVIDENCE_CHARS` long, so a large `k` would blow a small local model's
+/// context. The per-item `truncate` caps size; this caps count. `recall` stays
+/// unbounded (it never calls an LLM), so the clamp lives here, not in the shared
+/// query builder.
+const DEFAULT_ASK_EVIDENCE: usize = 8;
+const MAX_ASK_EVIDENCE: usize = 32;
+
+/// Resolve the caller's `k` into the usable range: absent means
+/// `DEFAULT_ASK_EVIDENCE`, and anything else is clamped to
+/// `1..=MAX_ASK_EVIDENCE`. WHY clamp the bottom too: `k = 0` retrieves nothing,
+/// so `ask` would answer "no relevant memory" for a question the store can in
+/// fact answer, which reads as a claim about the memory rather than about the
+/// argument.
+pub fn clamp_ask_k(k: Option<usize>) -> usize {
+    k.unwrap_or(DEFAULT_ASK_EVIDENCE)
+        .clamp(1, MAX_ASK_EVIDENCE)
+}
+
 /// Fence opener/closer wrapping each evidence block. WHY: `kind`, `label`, and
 /// `content` are all whatever an agent wrote through `remember`, i.e. untrusted.
 /// Without an explicit delimiter, remembered text shaped like the next block
@@ -188,6 +208,24 @@ mod tests {
                 || system.contains("[1]")
                 || system_lower.contains("brackets")
         );
+    }
+
+    #[test]
+    fn clamp_ask_k_defaults_and_bounds_the_evidence_count() {
+        // Arrange / Act / Assert
+        assert_eq!(clamp_ask_k(None), DEFAULT_ASK_EVIDENCE, "absent k defaults");
+        assert_eq!(clamp_ask_k(Some(4)), 4, "in-range k passes through");
+        assert_eq!(
+            clamp_ask_k(Some(MAX_ASK_EVIDENCE)),
+            MAX_ASK_EVIDENCE,
+            "the cap itself is allowed"
+        );
+        assert_eq!(
+            clamp_ask_k(Some(10_000)),
+            MAX_ASK_EVIDENCE,
+            "oversized k is capped, not passed to the model"
+        );
+        assert_eq!(clamp_ask_k(Some(0)), 1, "k=0 retrieves one item, not none");
     }
 
     #[test]
