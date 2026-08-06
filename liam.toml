@@ -4,6 +4,7 @@
 database_path  = "liam.db"
 log_filter     = "info,liam=debug"   # RUST_LOG overrides when set
 embedding_dims = 768              # MRL truncation length; fixed at DB creation
+ask_timeout_secs = 30             # ask falls back to ranked evidence past this
 
 [gc]
 episode_retention_days = 30
@@ -15,3 +16,10 @@ run_on_start           = false
 provider  = "mock"                       # "mock" (dev) or "local" (in-process)
 model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"
 cache_dir = "~/.liam/models"       # pre-populated by the installer
+
+[llm]
+provider        = "mock"                            # "mock" (dev) or "local" (in-process candle)
+model           = "Qwen/Qwen2.5-0.5B-Instruct-GGUF" # weights repo (quant files only)
+gguf_file       = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+tokenizer_model = "Qwen/Qwen2.5-0.5B-Instruct"      # base repo: GGUF repos ship no tokenizer.json
+cache_dir       = "~/.liam/models"
