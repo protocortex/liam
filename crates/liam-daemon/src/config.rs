@@ -51,6 +51,10 @@ pub struct LlmConfig {
     /// GGUF filename within the repo (GGUF repos host multiple quant variants,
     /// so the file must be named explicitly). Consumed by `CandleLlm::load`.
     pub gguf_file: String,
+    /// Repo holding `tokenizer.json`. Separate from `model` because GGUF repos
+    /// ship weights only: fetching the tokenizer from the `-GGUF` repo 404s, so
+    /// this points at the base instruct repo.
+    pub tokenizer_model: String,
     /// Where model files live (offline after first fetch).
     pub cache_dir: String,
 }
@@ -96,6 +100,7 @@ impl Default for LlmConfig {
             provider: "mock".into(),
             model: "Qwen/Qwen2.5-0.5B-Instruct-GGUF".into(),
             gguf_file: "qwen2.5-0.5b-instruct-q4_k_m.gguf".into(),
+            tokenizer_model: "Qwen/Qwen2.5-0.5B-Instruct".into(),
             cache_dir: "~/.liam/models".into(),
         }
     }
@@ -143,5 +148,30 @@ mod tests {
     fn llm_defaults_to_mock() {
         let c = Config::default();
         assert_eq!(c.llm.provider, "mock");
+    }
+
+    #[test]
+    fn shipped_liam_toml_parses() {
+        // WHY: `deny_unknown_fields` plus TOML's table scoping (a top-level key
+        // written after a `[table]` header belongs to that table) make it easy to
+        // ship a config the daemon rejects at startup. Parsing the real file in
+        // CI catches that before an operator does.
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../liam.toml"));
+        let c = Config::load(path).expect("shipped liam.toml must parse");
+        assert_eq!(c.ask_timeout_secs, 30);
+        assert_eq!(c.llm.tokenizer_model, "Qwen/Qwen2.5-0.5B-Instruct");
+    }
+
+    #[test]
+    fn llm_tokenizer_defaults_to_a_repo_that_ships_one() {
+        // The weights repo is a `-GGUF` mirror, which hosts quant files only, so
+        // the tokenizer must come from the base repo or loading 404s.
+        let c = Config::default();
+        assert!(c.llm.model.ends_with("-GGUF"), "model: {}", c.llm.model);
+        assert!(
+            !c.llm.tokenizer_model.ends_with("-GGUF"),
+            "tokenizer_model must not be the GGUF repo: {}",
+            c.llm.tokenizer_model
+        );
     }
 }

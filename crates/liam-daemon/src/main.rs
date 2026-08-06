@@ -7,6 +7,9 @@
 
 mod ask;
 mod config;
+/// Grounding eval for `ask`; test-only, see the module docs to run it.
+#[cfg(test)]
+mod eval;
 mod mcp;
 mod telemetry;
 
@@ -111,6 +114,7 @@ fn build_local_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     Ok(Arc::new(CandleLlm::load(
         &config.llm.model,
         &config.llm.gguf_file,
+        &config.llm.tokenizer_model,
         &config.llm.cache_dir,
     )?))
 }

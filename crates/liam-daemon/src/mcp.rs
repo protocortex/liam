@@ -144,8 +144,10 @@ impl MemoryServer {
             .join("\n\n")
     }
 
+    // `pub(crate)` so the grounding eval (see `eval.rs`) drives the same code
+    // path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
-    async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
+    pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
         let embedding = self.embedder.embed(&args.question).await.ok();
         let k = clamp_ask_k(args.k);
         let q = build_query(&args.question, Some(k), args.kind, args.scope, embedding);

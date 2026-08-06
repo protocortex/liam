@@ -98,9 +98,17 @@ pub struct CandleLlm {
 impl CandleLlm {
     /// Load a quantized instruct model by HF id and GGUF filename (e.g.
     /// `Qwen/Qwen2.5-0.5B-Instruct-GGUF`, `qwen2.5-0.5b-instruct-q4_k_m.gguf`),
-    /// caching weights under `cache_dir`.
-    pub fn load(model_id: &str, gguf_file: &str, cache_dir: &str) -> Result<Self> {
-        let session = candle_chat::Session::load(model_id, gguf_file, cache_dir)
+    /// caching weights under `cache_dir`. `tokenizer_id` is the repo holding
+    /// `tokenizer.json`: GGUF repos usually ship only weights (the tokenizer is
+    /// embedded in the GGUF metadata, which this loader does not read), so it is
+    /// normally the base instruct repo, e.g. `Qwen/Qwen2.5-0.5B-Instruct`.
+    pub fn load(
+        model_id: &str,
+        gguf_file: &str,
+        tokenizer_id: &str,
+        cache_dir: &str,
+    ) -> Result<Self> {
+        let session = candle_chat::Session::load(model_id, gguf_file, tokenizer_id, cache_dir)
             .map_err(|e| crate::error::ModelError::Llm(e.to_string()))?;
         Ok(Self {
             inner: std::sync::Arc::new(tokio::sync::Mutex::new(session)),
@@ -163,14 +171,25 @@ mod candle_chat {
         /// tokenizer, mirroring `FastEmbedEmbedder::load`'s explicit
         /// download-then-construct pattern so the cache lives under
         /// `cache_dir` rather than the default HF cache.
-        pub fn load(model_id: &str, gguf_file: &str, cache_dir: &str) -> anyhow::Result<Self> {
+        pub fn load(
+            model_id: &str,
+            gguf_file: &str,
+            tokenizer_id: &str,
+            cache_dir: &str,
+        ) -> anyhow::Result<Self> {
             let api = hf_hub::api::sync::ApiBuilder::new()
                 .with_cache_dir(std::path::PathBuf::from(cache_dir))
                 .build()?;
-            let repo = api.model(model_id.to_string());
 
-            let weights_path = repo.get(gguf_file)?;
-            let tokenizer_path = repo.get("tokenizer.json")?;
+            let weights_path = api.model(model_id.to_string()).get(gguf_file)?;
+            // Separate repo on purpose: a `-GGUF` repo typically hosts quant
+            // variants only, so asking it for tokenizer.json 404s.
+            let tokenizer_path = api
+                .model(tokenizer_id.to_string())
+                .get("tokenizer.json")
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to fetch tokenizer.json from {tokenizer_id}: {e}")
+                })?;
 
             let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
                 .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
