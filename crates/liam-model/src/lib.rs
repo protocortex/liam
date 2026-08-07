@@ -6,6 +6,9 @@
 
 pub mod embedder;
 pub mod error;
+/// SPIKE: llama.cpp provider, see the module docs. Not wired into the daemon.
+#[cfg(feature = "llama")]
+pub mod llama;
 pub mod llm;
 pub mod reranker;
 
@@ -16,6 +19,8 @@ pub use reranker::{IdentityReranker, Reranker};
 
 #[cfg(feature = "local")]
 pub use embedder::FastEmbedEmbedder;
+#[cfg(feature = "llama")]
+pub use llama::LlamaCppLlm;
 #[cfg(feature = "local")]
 pub use llm::CandleLlm;
 #[cfg(feature = "local")]

@@ -37,3 +37,5 @@ local = ["liam-model/local"]
 # Opt-in NVIDIA support; needs the CUDA toolkit at build time. Apple GPU support
 # is automatic on macOS, see liam-model's target-specific dependencies.
 cuda = ["liam-model/cuda"]
+# SPIKE: the llama.cpp provider, for the engine comparison in eval.rs.
+llama = ["liam-model/llama-metal"]

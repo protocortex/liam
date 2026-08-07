@@ -319,12 +319,48 @@ mod run {
         std::env::var(key).unwrap_or_else(|_| default.to_string())
     }
 
+    /// SPIKE: swap in llama.cpp when `LIAM_EVAL_PROVIDER=llamacpp`, so both
+    /// engines run the same five cases over byte-identical weights.
+    /// `LIAM_EVAL_GGUF_PATH` points at the file candle already cached.
+    #[cfg(feature = "llama")]
+    fn load_llama() -> Option<Arc<dyn Llm>> {
+        if env_or("LIAM_EVAL_PROVIDER", "candle") != "llamacpp" {
+            return None;
+        }
+        let path = std::env::var("LIAM_EVAL_GGUF_PATH")
+            .expect("LIAM_EVAL_GGUF_PATH is required for the llamacpp provider");
+        println!("loading llama.cpp from {path}");
+        let started = Instant::now();
+        let llm = liam_model::LlamaCppLlm::load(&path).expect("load llama.cpp model");
+        println!(
+            "model ready in {:?} on {}",
+            started.elapsed(),
+            llm.backend()
+        );
+        Some(Arc::new(llm))
+    }
+
+    #[cfg(not(feature = "llama"))]
+    fn load_llama() -> Option<Arc<dyn Llm>> {
+        None
+    }
+
     /// Load the model named by the env overrides, defaulting to whatever the
     /// daemon actually ships. WHY read `LlmConfig` instead of repeating the model
     /// ids: a hardcoded copy silently keeps measuring the previous default after
     /// someone changes the shipped one, which is exactly what happened when the
     /// default moved from 0.5B to 1.5B.
-    async fn load_llm() -> Arc<liam_model::CandleLlm> {
+    async fn load_llm() -> Arc<dyn Llm> {
+        if let Some(llm) = load_llama() {
+            let warm = Instant::now();
+            llm.warmup().await.expect("warmup");
+            println!("warmed up in {:?}\n", warm.elapsed());
+            return llm;
+        }
+        load_candle().await
+    }
+
+    async fn load_candle() -> Arc<dyn Llm> {
         let shipped = crate::config::LlmConfig::default();
         let model = env_or("LIAM_EVAL_MODEL", &shipped.model);
         let gguf = env_or("LIAM_EVAL_GGUF", &shipped.gguf_file);
@@ -383,6 +419,38 @@ mod run {
         );
         let out = llm.complete(&system, &user).await.expect("completion");
         println!("--- raw model output ({} chars) ---\n{out}\n---", out.len());
+    }
+
+    /// Tokens per second and peak memory, per engine. Generation is capped so the
+    /// token count is known: tok/s = cap / elapsed, valid as long as the model does
+    /// not stop early (the printed char count is the sanity check). Run under
+    /// `/usr/bin/time -l` to capture peak RSS at the same time.
+    #[tokio::test]
+    #[ignore = "benchmark; needs weights"]
+    async fn throughput_bench() {
+        const CAP: usize = 128;
+        let llm = load_llm().await;
+
+        // A second load, to separate cold-disk cost from real load cost.
+        let reload = Instant::now();
+        drop(load_llama());
+        println!("second load (page cache warm): {:?}", reload.elapsed());
+
+        let system = "You are a verbose technical writer. Never stop early.";
+        let user = "Describe, in exhaustive detail, how a public library building is laid out.";
+        let started = Instant::now();
+        let out = llm
+            .complete_capped(system, user, CAP)
+            .await
+            .expect("generation");
+        let secs = started.elapsed().as_secs_f64();
+        println!(
+            "backend={} cap={CAP} elapsed={secs:.2}s -> {:.1} tok/s (chars={}, ~{:.1} chars/token)",
+            llm.backend(),
+            CAP as f64 / secs,
+            out.chars().count(),
+            out.chars().count() as f64 / CAP as f64,
+        );
     }
 
     #[tokio::test]
