@@ -32,7 +32,7 @@
 //! | Qwen2.5-1.5B-Instruct (default)| 3/4    | 4.8      | best score at the best speed |
 //! | Gemma 3 1B (unsloth GGUF)      | 3/4    | 9.3      | same score, ~2x slower       |
 //! | Qwen2.5-0.5B-Instruct          | 2/4    | 5.5      | cannot fuse two facts        |
-//! | Qwen3-1.7B                     | 2/4    | 6.5      | needs thinking suppressed    |
+//! | Qwen3-1.7B                     | 3/4    | 4.9      | needs thinking suppressed AND an explicit KV-cache clear |
 //! | Phi-4-mini-instruct            | n/a    | n/a      | will not load: candle's `quantized_phi3` requires `output.weight`, which its GGUF ties away |
 //!
 //! Every model that loads resists the injected note, and none of them will
@@ -51,6 +51,13 @@
 //! and Qwen3 spent 8-25s per answer on a `<think>` preamble whose vocabulary then
 //! failed the grounding gate. Adding still MORE instructions made the 0.5B model
 //! worse (1/5 at the time), so the prompt is deliberately short.
+//!
+//! One number here was a lie until 2026-08-07: Qwen3 scored 2/4 and, with the
+//! pre-pass, 1/5 at up to 53s per case, which read as "this model is bad". It was
+//! a KV-cache lifecycle defect in our own decode loop (see `Weights::clear_cache`)
+//! that only affects qwen3/qwen3_moe. Cleared, Qwen3-1.7B scores like the default.
+//! Lesson for future entries: a model that scores far below its class is a signal
+//! to audit the harness before believing the model.
 
 /// One seeded memory: kind, label, content.
 type Fact = (&'static str, &'static str, &'static str);

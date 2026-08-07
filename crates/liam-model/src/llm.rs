@@ -346,6 +346,28 @@ mod candle_chat {
             })
         }
 
+        /// Drop any KV cache left over from a previous `complete` call. WHY this
+        /// is required and not merely tidy: our decode loop always restarts at
+        /// position 0, and candle's quantized models do NOT agree on what that
+        /// means. `quantized_qwen2`, `quantized_gemma3`, `quantized_llama` and
+        /// `quantized_phi3` reset their own cache when `index_pos == 0`, but
+        /// `quantized_qwen3`/`qwen3_moe` append unconditionally and expect the
+        /// caller to clear. Left uncleared, a Qwen3 model's second call attends
+        /// over the previous call's keys and values while RoPE and the causal mask
+        /// are computed as if the prompt started at zero: silently wrong answers
+        /// that get slower every call. The `ask` sufficiency pre-pass makes two
+        /// calls per question, so this fired on every single question.
+        /// Gemma3 and Phi3 expose no clearing method; they self-reset, so there is
+        /// nothing to call.
+        fn clear_cache(&mut self) {
+            match self {
+                Self::Qwen2(m) => m.clear_kv_cache(),
+                Self::Qwen3(m) => m.clear_kv_cache(),
+                Self::Llama(m) => m.clear_kv_cache(),
+                Self::Gemma3(_) | Self::Phi3(_) => {}
+            }
+        }
+
         fn forward(&mut self, input: &Tensor, pos: usize) -> candle_core::Result<Tensor> {
             match self {
                 Self::Qwen2(m) => m.forward(input, pos),
@@ -464,6 +486,10 @@ mod candle_chat {
             if tokens.is_empty() {
                 anyhow::bail!("empty prompt encoding");
             }
+
+            // Every call is a fresh conversation for us, so start from a clean
+            // cache; see `Weights::clear_cache`.
+            self.model.clear_cache();
 
             let mut logits_processor = LogitsProcessor::from_sampling(42, Sampling::ArgMax);
             let mut generated: Vec<u32> = Vec::new();
