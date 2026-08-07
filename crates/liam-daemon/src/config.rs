@@ -62,6 +62,14 @@ pub struct LlmConfig {
     pub tokenizer_model: String,
     /// Where model files live (offline after first fetch).
     pub cache_dir: String,
+    /// Compute backend: "auto" (default), "metal", "cuda", or "cpu". `auto` takes
+    /// the fastest backend compiled into this binary and falls back to CPU. macOS
+    /// builds include Metal automatically; CUDA needs `--features cuda` at build
+    /// time. See `liam_model::llm::DevicePreference`.
+    pub device: String,
+    /// Generate one throwaway token at startup so the backend's first-call cost
+    /// (on Metal, ~10s of GPU kernel compilation) is paid before a user waits.
+    pub warmup: bool,
 }
 
 impl Default for Config {
@@ -112,6 +120,8 @@ impl Default for LlmConfig {
             gguf_file: "qwen2.5-1.5b-instruct-q4_k_m.gguf".into(),
             tokenizer_model: "Qwen/Qwen2.5-1.5B-Instruct".into(),
             cache_dir: "~/.liam/models".into(),
+            device: "auto".into(),
+            warmup: true,
         }
     }
 }
@@ -171,6 +181,18 @@ mod tests {
         assert_eq!(c.ask_timeout_secs, 30);
         assert!(c.ask_sufficiency_check);
         assert_eq!(c.llm.tokenizer_model, "Qwen/Qwen2.5-1.5B-Instruct");
+    }
+
+    #[test]
+    fn llm_device_default_is_a_value_the_model_crate_accepts() {
+        // The daemon rejects an unparseable device at startup, so the shipped
+        // default must parse. This catches a typo in our own default.
+        let c = Config::default();
+        assert_eq!(
+            liam_model::llm::DevicePreference::parse(&c.llm.device),
+            Some(liam_model::llm::DevicePreference::Auto)
+        );
+        assert!(c.llm.warmup, "warmup should be on by default");
     }
 
     #[test]

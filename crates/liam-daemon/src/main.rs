@@ -47,6 +47,16 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let (embedder, reranker) = build_models(&config)?;
     let llm = build_llm(&config)?;
+    tracing::info!(backend = llm.backend(), "llm ready");
+    if config.llm.warmup {
+        let started = std::time::Instant::now();
+        match llm.warmup().await {
+            Ok(()) => tracing::info!(elapsed = ?started.elapsed(), "llm warmed up"),
+            // A failed warmup is not fatal: the first real call will simply pay
+            // the cost, or fail with a better message than this one would.
+            Err(e) => tracing::warn!(error = %e, "llm warmup failed"),
+        }
+    }
 
     spawn_gc(&config).await?;
 
@@ -118,11 +128,19 @@ fn build_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
 #[cfg(feature = "local")]
 fn build_local_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     use liam_model::CandleLlm;
+    // Reject an unknown device rather than quietly running 5x slower on CPU.
+    let device = liam_model::llm::DevicePreference::parse(&config.llm.device).ok_or_else(|| {
+        anyhow::anyhow!(
+            "llm.device = {:?} is not one of auto, metal, cuda, cpu",
+            config.llm.device
+        )
+    })?;
     Ok(Arc::new(CandleLlm::load(
         &config.llm.model,
         &config.llm.gguf_file,
         &config.llm.tokenizer_model,
         &config.llm.cache_dir,
+        device,
     )?))
 }
 

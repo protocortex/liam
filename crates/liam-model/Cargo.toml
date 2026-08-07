@@ -31,9 +31,23 @@ hf-hub = { version = "0.5", optional = true }
 # to `ModelError::Llm` at the trait boundary.
 anyhow = { version = "1", optional = true }
 
+# Best available backend per host, unioned into the deps above. WHY here and not
+# in `[features]`: this is the only way `--features local` gives a macOS user GPU
+# decode without them passing an extra flag, while a Linux user is not asked for a
+# CUDA toolchain they may not have. Metal and Accelerate are system frameworks on
+# macOS, so this adds no download and no toolchain requirement.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
+candle-transformers = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
+
 [features]
 default = []
 # The shipped path: fastembed in-process, Qwen3 embedder + cross-encoder reranker.
+# GPU decode. Metal needs NO feature: the macOS target block above always builds
+# candle with it, and the code selects it by `cfg(target_os = "macos")`. CUDA is
+# opt-in because it needs the CUDA toolkit and nvcc at BUILD time, which no
+# default build may assume.
+cuda = ["candle-core/cuda", "candle-transformers/cuda"]
 local = [
     "dep:fastembed",
     "dep:candle-core",

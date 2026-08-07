@@ -26,3 +26,5 @@ tokenizer_model = "Qwen/Qwen2.5-1.5B-Instruct"      # base repo: GGUF repos ship
 # Architecture is auto-detected from the GGUF metadata: qwen2, qwen3, gemma/2/3,
 # llama, mistral, phi3 all work. See crates/liam-daemon/src/eval.rs for scores.
 cache_dir       = "~/.liam/models"
+device          = "auto"   # auto | metal | cuda | cpu; auto = fastest compiled in, else cpu
+warmup          = true     # pay Metal's ~10s first-call kernel compile at startup

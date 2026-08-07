@@ -20,7 +20,19 @@
 //! CPU), which turns the eval into a timeout test.
 //!
 //! Env overrides: `LIAM_EVAL_MODEL`, `LIAM_EVAL_GGUF`, `LIAM_EVAL_TOKENIZER`,
-//! `LIAM_EVAL_CACHE_DIR`.
+//! `LIAM_EVAL_CACHE_DIR`, `LIAM_EVAL_DEVICE`.
+//!
+//! # Hardware (2026-08-07, Apple Silicon, Qwen2.5-1.5B Q4_K_M, same code, A/B)
+//!
+//! | device                        | load | warmup | answer  | refusal | score |
+//! |-------------------------------|------|--------|---------|---------|-------|
+//! | `metal` (automatic on macOS)  | 2.3s | 0.14s  | 1.8-2.1s| 0.5-0.6s| 5/5   |
+//! | `cpu`                         | 1.6s | 0.85s  | 7.3-7.9s| 2.5-2.7s| 5/5   |
+//!
+//! So the GPU is worth ~4x on answers and ~5x on refusals at identical quality.
+//! Warmup matters more than it looks: without it the FIRST generation in a process
+//! pays ~10s of Metal kernel compilation, which on a short-lived process is the
+//! only generation there is. Set `LIAM_EVAL_DEVICE=cpu` to re-run the A/B.
 //!
 //! # Measured baseline (2026-08-07, this prompt, greedy decode, CPU, Q4_K_M)
 //!
@@ -312,7 +324,7 @@ mod run {
     /// ids: a hardcoded copy silently keeps measuring the previous default after
     /// someone changes the shipped one, which is exactly what happened when the
     /// default moved from 0.5B to 1.5B.
-    fn load_llm() -> Arc<liam_model::CandleLlm> {
+    async fn load_llm() -> Arc<liam_model::CandleLlm> {
         let shipped = crate::config::LlmConfig::default();
         let model = env_or("LIAM_EVAL_MODEL", &shipped.model);
         let gguf = env_or("LIAM_EVAL_GGUF", &shipped.gguf_file);
@@ -320,11 +332,25 @@ mod run {
         let cache_dir = expand_home(&env_or("LIAM_EVAL_CACHE_DIR", &shipped.cache_dir));
         println!("loading {model} / {gguf} (tokenizer {tokenizer}) from {cache_dir}");
         let started = Instant::now();
+        // `LIAM_EVAL_DEVICE` exists so a run can be A/B'd against CPU on the same
+        // machine; without it the eval measures whatever the daemon would use.
+        let device_name = env_or("LIAM_EVAL_DEVICE", &shipped.device);
+        let device = liam_model::llm::DevicePreference::parse(&device_name)
+            .expect("LIAM_EVAL_DEVICE must be auto, metal, cuda or cpu");
         let llm = Arc::new(
-            liam_model::CandleLlm::load(&model, &gguf, &tokenizer, &cache_dir)
+            liam_model::CandleLlm::load(&model, &gguf, &tokenizer, &cache_dir, device)
                 .expect("load local model"),
         );
-        println!("model ready in {:?}\n", started.elapsed());
+        println!(
+            "model ready in {:?} on {}",
+            started.elapsed(),
+            llm.backend()
+        );
+        // Warm up exactly as the daemon does, so the first case is not inflated by
+        // one-time kernel compilation and the per-case numbers mean something.
+        let warm = Instant::now();
+        llm.warmup().await.expect("warmup");
+        println!("warmed up in {:?}\n", warm.elapsed());
         llm
     }
 
@@ -345,7 +371,7 @@ mod run {
     #[tokio::test]
     #[ignore = "downloads model weights; diagnostic, prints instead of asserting"]
     async fn raw_completion_smoke() {
-        let llm = load_llm();
+        let llm = load_llm().await;
         let (system, user) = crate::ask::build_ask_prompt(
             "Which storage engine does LIAM use?",
             &[crate::ask::Evidence {
@@ -377,7 +403,7 @@ mod run {
                 .expect("seed corpus item");
         }
 
-        let llm = load_llm();
+        let llm = load_llm().await;
 
         let server = MemoryServer::new(
             store,

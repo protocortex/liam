@@ -25,6 +25,19 @@ pub trait Llm: Send + Sync {
         let _ = max_new_tokens;
         self.complete(system, prompt).await
     }
+
+    /// Backend this provider runs on, for startup logs: "mock", "metal", "cuda",
+    /// or "cpu". A silent fallback from GPU to CPU is a ~5x latency difference, so
+    /// it has to be visible.
+    fn backend(&self) -> &'static str {
+        "mock"
+    }
+
+    /// Pay a provider's one-time initialization cost before serving traffic.
+    /// Default: nothing to do. See `CandleLlm`'s impl for why this exists.
+    async fn warmup(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Deterministic echo LLM for the base build and tests: no model, stable output.
@@ -127,6 +140,47 @@ pub fn strip_reasoning(s: &str) -> &str {
         Some(end) => s[end + CLOSE.len()..].trim(),
         None if s.contains(OPEN) => "",
         None => s.trim(),
+    }
+}
+
+/// Which compute backend to run generation on. Parsed from config, so it lives
+/// outside the `local` feature and is testable without a model.
+///
+/// `Auto` takes the fastest backend COMPILED INTO this binary and falls back to
+/// CPU when the hardware or driver is missing at runtime. What is compiled in is
+/// per platform on purpose: macOS builds get Metal and Accelerate automatically
+/// (system frameworks, no toolchain cost), while CUDA is opt-in because it needs
+/// nvcc at build time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DevicePreference {
+    #[default]
+    Auto,
+    Metal,
+    Cuda,
+    Cpu,
+}
+
+impl DevicePreference {
+    /// Parse a config value. `None` means the operator wrote something we do not
+    /// recognize, which the caller should reject loudly rather than silently
+    /// running on the slowest backend.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "metal" | "gpu" => Some(Self::Metal),
+            "cuda" => Some(Self::Cuda),
+            "cpu" => Some(Self::Cpu),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+            Self::Cpu => "cpu",
+        }
     }
 }
 
@@ -242,6 +296,10 @@ impl ChatArch {
 #[cfg(feature = "local")]
 pub struct CandleLlm {
     inner: std::sync::Arc<tokio::sync::Mutex<candle_chat::Session>>,
+    /// Backend actually in use after resolution and fallback, for the daemon to
+    /// log. An operator debugging latency needs to know whether the GPU was
+    /// really picked up, and a silent fallback to CPU is a 5x difference.
+    device_label: &'static str,
 }
 
 #[cfg(feature = "local")]
@@ -257,12 +315,21 @@ impl CandleLlm {
         gguf_file: &str,
         tokenizer_id: &str,
         cache_dir: &str,
+        device: DevicePreference,
     ) -> Result<Self> {
-        let session = candle_chat::Session::load(model_id, gguf_file, tokenizer_id, cache_dir)
-            .map_err(|e| crate::error::ModelError::Llm(e.to_string()))?;
+        let session =
+            candle_chat::Session::load(model_id, gguf_file, tokenizer_id, cache_dir, device)
+                .map_err(|e| crate::error::ModelError::Llm(e.to_string()))?;
+        let device_label = session.device_label();
         Ok(Self {
             inner: std::sync::Arc::new(tokio::sync::Mutex::new(session)),
+            device_label,
         })
+    }
+
+    /// Backend in use, after fallback: "metal", "cuda", or "cpu".
+    pub fn device_label(&self) -> &'static str {
+        self.device_label
     }
 }
 
@@ -281,6 +348,21 @@ impl Llm for CandleLlm {
         max_new_tokens: usize,
     ) -> Result<String> {
         self.generate(system, prompt, max_new_tokens.max(1)).await
+    }
+
+    fn backend(&self) -> &'static str {
+        self.device_label
+    }
+
+    /// Generate one token and throw it away, to pay the backend's first-call cost
+    /// before a user is waiting. WHY: on Metal the first generation in a process
+    /// compiles GPU kernels, measured at ~10s against ~1.7s for every call after
+    /// it. Without this, the first question of every daemon lifetime is the slow
+    /// one, and on a short-lived process it is the ONLY one.
+    async fn warmup(&self) -> Result<()> {
+        self.generate("You are a warmup probe.", "ok", 1)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -419,6 +501,48 @@ mod candle_chat {
         device: Device,
         eos_token: u32,
         arch: ChatArch,
+        device_label: &'static str,
+    }
+
+    /// Resolve a preference into a real device, falling back to CPU rather than
+    /// failing: a machine without the GPU the operator asked for should still
+    /// answer questions, just slower. The label records what actually happened so
+    /// the fallback is visible instead of mysterious.
+    fn resolve_device(pref: super::DevicePreference) -> (Device, &'static str) {
+        use super::DevicePreference as P;
+        match pref {
+            P::Cpu => (Device::Cpu, "cpu"),
+            P::Metal => try_metal().unwrap_or((Device::Cpu, "cpu (metal unavailable)")),
+            P::Cuda => try_cuda().unwrap_or((Device::Cpu, "cpu (cuda unavailable)")),
+            // Order is fastest-first among what is compiled in.
+            P::Auto => try_metal()
+                .or_else(try_cuda)
+                .unwrap_or((Device::Cpu, "cpu")),
+        }
+    }
+
+    // Gated on the PLATFORM, not on a feature: the macOS target block in
+    // Cargo.toml already builds candle with `metal`, so on macOS the backend is
+    // always compiled in and there is no flag for a user to forget. Anywhere else
+    // `Device::new_metal` does not exist, so the stub is the only valid arm.
+    #[cfg(target_os = "macos")]
+    fn try_metal() -> Option<(Device, &'static str)> {
+        Device::new_metal(0).ok().map(|d| (d, "metal"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn try_metal() -> Option<(Device, &'static str)> {
+        None
+    }
+
+    #[cfg(feature = "cuda")]
+    fn try_cuda() -> Option<(Device, &'static str)> {
+        Device::new_cuda(0).ok().map(|d| (d, "cuda"))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn try_cuda() -> Option<(Device, &'static str)> {
+        None
     }
 
     impl Session {
@@ -431,6 +555,7 @@ mod candle_chat {
             gguf_file: &str,
             tokenizer_id: &str,
             cache_dir: &str,
+            device_pref: super::DevicePreference,
         ) -> anyhow::Result<Self> {
             let api = hf_hub::api::sync::ApiBuilder::new()
                 .with_cache_dir(std::path::PathBuf::from(cache_dir))
@@ -449,7 +574,7 @@ mod candle_chat {
             let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
                 .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
-            let device = Device::Cpu;
+            let (device, device_label) = resolve_device(device_pref);
             let mut file = std::fs::File::open(&weights_path)?;
             let content = gguf_file::Content::read(&mut file)
                 .map_err(|e| e.with_path(weights_path.display().to_string()))?;
@@ -489,7 +614,12 @@ mod candle_chat {
                 device,
                 eos_token,
                 arch,
+                device_label,
             })
+        }
+
+        pub fn device_label(&self) -> &'static str {
+            self.device_label
         }
 
         /// Greedy (argmax) generation: encode the prompt, run the prefill
@@ -602,6 +732,59 @@ mod tests {
 
         // Assert
         assert!(flag.is_cancelled(), "drop did not signal cancellation");
+    }
+
+    #[test]
+    fn device_preference_parses_config_values_and_rejects_typos() {
+        // Arrange / Act / Assert
+        assert_eq!(
+            DevicePreference::parse("auto"),
+            Some(DevicePreference::Auto)
+        );
+        assert_eq!(
+            DevicePreference::parse(" AUTO "),
+            Some(DevicePreference::Auto)
+        );
+        assert_eq!(
+            DevicePreference::parse("metal"),
+            Some(DevicePreference::Metal)
+        );
+        assert_eq!(
+            DevicePreference::parse("gpu"),
+            Some(DevicePreference::Metal)
+        );
+        assert_eq!(
+            DevicePreference::parse("cuda"),
+            Some(DevicePreference::Cuda)
+        );
+        assert_eq!(DevicePreference::parse("cpu"), Some(DevicePreference::Cpu));
+        // A typo must not silently degrade to the slowest backend.
+        assert_eq!(DevicePreference::parse("metl"), None);
+        assert_eq!(DevicePreference::parse(""), None);
+        assert_eq!(DevicePreference::default(), DevicePreference::Auto);
+    }
+
+    #[test]
+    fn device_preference_round_trips_through_its_string_form() {
+        for pref in [
+            DevicePreference::Auto,
+            DevicePreference::Metal,
+            DevicePreference::Cuda,
+            DevicePreference::Cpu,
+        ] {
+            assert_eq!(DevicePreference::parse(pref.as_str()), Some(pref));
+        }
+    }
+
+    #[test]
+    fn mock_llm_reports_a_backend_and_warms_up_without_error() {
+        // The daemon logs `backend()` and calls `warmup()` for every provider, so
+        // the mock must answer both rather than panic in a dev setup.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(MockLlm.backend(), "mock");
+        rt.block_on(async { MockLlm.warmup().await.expect("mock warmup") });
     }
 
     #[test]
