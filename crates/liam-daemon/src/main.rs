@@ -50,7 +50,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     spawn_gc(&config).await?;
 
-    let server = MemoryServer::new(store, embedder, reranker, llm, config.ask_timeout_secs);
+    let server = MemoryServer::new(
+        store,
+        embedder,
+        reranker,
+        llm,
+        config.ask_timeout_secs,
+        config.ask_sufficiency_check,
+    );
 
     // rmcp stdio serve. Confirm against your pinned rmcp version.
     use rmcp::ServiceExt;

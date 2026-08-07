@@ -18,6 +18,11 @@ use serde::Deserialize;
 
 use crate::ask::{self, build_ask_prompt, clamp_ask_k, fallback_answer, format_answer};
 
+/// Token budget for the sufficiency pre-pass. Only "YES"/"NO" is wanted, with a
+/// little slack for models that add punctuation or a stray word; anything longer
+/// is not a verdict and `ask::parse_sufficiency` rejects it anyway.
+const SUFFICIENCY_MAX_TOKENS: usize = 8;
+
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope shape to a `Query`; keeping
 /// it in one place means a future filter only needs to change here.
@@ -78,6 +83,9 @@ pub struct MemoryServer {
     /// Wall-clock cap on `ask` synthesis before falling back to ranked
     /// evidence; see `config::Config::ask_timeout_secs`.
     ask_timeout_secs: u64,
+    /// Whether `ask` runs the yes/no sufficiency pre-pass before synthesizing;
+    /// see `config::Config::ask_sufficiency_check`.
+    ask_sufficiency_check: bool,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -89,6 +97,7 @@ impl MemoryServer {
         reranker: Arc<dyn Reranker>,
         llm: Arc<dyn Llm>,
         ask_timeout_secs: u64,
+        ask_sufficiency_check: bool,
     ) -> Self {
         Self {
             store,
@@ -96,6 +105,7 @@ impl MemoryServer {
             reranker,
             llm,
             ask_timeout_secs,
+            ask_sufficiency_check,
             tool_router: Self::tool_router(),
         }
     }
@@ -168,6 +178,30 @@ impl MemoryServer {
             .iter()
             .map(|&i| ask::Evidence::from_hit(&hits[i]))
             .collect();
+        // Sufficiency pre-pass: ask whether the evidence answers the question at
+        // all, and refuse outright if it does not. See
+        // `ask::build_sufficiency_prompt` for why this is a separate call.
+        if self.ask_sufficiency_check {
+            let (system, user) = ask::build_sufficiency_prompt(&args.question, &evidence);
+            let verdict = tokio::time::timeout(
+                Duration::from_secs(self.ask_timeout_secs.max(1)),
+                // Capped hard: the verdict is one word, and an uncapped pre-pass
+                // let a rambling model spend 50s per question (see eval.rs).
+                self.llm
+                    .complete_capped(&system, &user, SUFFICIENCY_MAX_TOKENS),
+            )
+            .await;
+            // Only an explicit NO refuses. A timeout, an error, or an
+            // unparseable reply falls through to synthesis: failing closed here
+            // would turn any model hiccup into "I don't know" about memory the
+            // store really holds.
+            if let Ok(Ok(reply)) = verdict {
+                if ask::parse_sufficiency(&reply) == Some(false) {
+                    return ask::insufficient_answer(&evidence);
+                }
+            }
+        }
+
         let (system, user) = build_ask_prompt(&args.question, &evidence);
         let synth = tokio::time::timeout(
             // max(1) guards against an operator typo of `ask_timeout_secs = 0`,
@@ -295,6 +329,26 @@ mod tests {
         }
     }
 
+    /// Answers the sufficiency pre-pass and the synthesis call differently, so a
+    /// test can drive one without the other. Told apart by the pre-pass prompt's
+    /// own wording rather than call order, which would break the moment the
+    /// handler reorders its calls.
+    struct SufficiencyLlm {
+        verdict: &'static str,
+        answer: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl liam_model::Llm for SufficiencyLlm {
+        async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
+            if prompt.contains("Reply YES or NO") {
+                Ok(self.verdict.to_string())
+            } else {
+                Ok(self.answer.to_string())
+            }
+        }
+    }
+
     /// Succeeds but with a blank answer, so `ask` must fall back to evidence
     /// instead of returning whitespace as if it were a real synthesis.
     struct EmptyLlm;
@@ -308,7 +362,7 @@ mod tests {
     /// Fresh in-memory server wired with the given reranker/llm and a 30s ask
     /// timeout. Dims 8 to match `MockEmbedder::new(8)`.
     async fn server_with(reranker: Arc<dyn Reranker>, llm: Arc<dyn Llm>) -> MemoryServer {
-        server_with_timeout(reranker, llm, 30).await
+        server_with_timeout(reranker, llm, 30, false).await
     }
 
     /// Fresh in-memory server wired with the given reranker/llm/ask timeout.
@@ -317,6 +371,7 @@ mod tests {
         reranker: Arc<dyn Reranker>,
         llm: Arc<dyn Llm>,
         ask_timeout_secs: u64,
+        ask_sufficiency_check: bool,
     ) -> MemoryServer {
         let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
             .await
@@ -327,6 +382,7 @@ mod tests {
             reranker,
             llm,
             ask_timeout_secs,
+            ask_sufficiency_check,
         )
     }
 
@@ -415,6 +471,126 @@ mod tests {
         );
     }
 
+    /// Server with the sufficiency pre-pass ON (the shipped default), which the
+    /// other handler tests leave off so they exercise synthesis directly.
+    async fn server_with_sufficiency(llm: Arc<dyn Llm>) -> MemoryServer {
+        server_with_timeout(Arc::new(liam_model::IdentityReranker), llm, 30, true).await
+    }
+
+    #[tokio::test]
+    async fn ask_refuses_when_the_pre_pass_says_the_evidence_cannot_answer() {
+        // Arrange
+        let server = server_with_sufficiency(Arc::new(SufficiencyLlm {
+            verdict: "NO",
+            answer: "Dr. Alice Nguyen treats Pixel [1].",
+        }))
+        .await;
+        seed(
+            &server,
+            "fact",
+            "Mascot",
+            "The zorbnax team mascot is a wombat named Pixel.",
+        )
+        .await;
+
+        // Act
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "Who is the veterinarian treating Pixel?".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+            }))
+            .await;
+
+        // Assert: the refusal replaces the answer the model would have invented,
+        // and the caller still sees what was searched.
+        assert!(
+            answer.starts_with("The memory does not contain an answer"),
+            "expected a refusal: {answer}"
+        );
+        assert!(
+            !answer.contains("Alice Nguyen"),
+            "invented answer leaked past the pre-pass: {answer}"
+        );
+        assert!(
+            answer.contains("wombat named Pixel"),
+            "refusal dropped the evidence: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_synthesizes_when_the_pre_pass_says_yes() {
+        // Arrange
+        let server = server_with_sufficiency(Arc::new(SufficiencyLlm {
+            verdict: "YES",
+            answer: "The zorbnax gadget uses libSQL for storage [1].",
+        }))
+        .await;
+        seed(
+            &server,
+            "decision",
+            "Storage engine",
+            "The zorbnax gadget uses libSQL for storage.",
+        )
+        .await;
+
+        // Act
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "What storage engine does the zorbnax gadget use?".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+            }))
+            .await;
+
+        // Assert
+        assert!(
+            answer.starts_with("The zorbnax gadget uses libSQL for storage [1]."),
+            "pre-pass blocked an answerable question: {answer}"
+        );
+        assert!(answer.contains("Sources:"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn ask_synthesizes_when_the_pre_pass_verdict_is_unparseable() {
+        // Arrange: a model that ignores "reply YES or NO" must not be read as a
+        // refusal, or a chatty model would make `ask` deny memory it holds.
+        let server = server_with_sufficiency(Arc::new(SufficiencyLlm {
+            verdict: "Well, it depends on what you mean.",
+            answer: "The zorbnax gadget uses libSQL for storage [1].",
+        }))
+        .await;
+        seed(
+            &server,
+            "decision",
+            "Storage engine",
+            "The zorbnax gadget uses libSQL for storage.",
+        )
+        .await;
+
+        // Act
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "What storage engine does the zorbnax gadget use?".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+            }))
+            .await;
+
+        // Assert: fell through to synthesis rather than refusing.
+        assert!(
+            !answer.contains("does not contain an answer"),
+            "unparseable verdict was treated as a refusal: {answer}"
+        );
+        assert!(
+            answer.starts_with("The zorbnax gadget uses libSQL for storage [1]."),
+            "{answer}"
+        );
+    }
+
     #[tokio::test]
     async fn ask_falls_back_when_the_answer_is_not_grounded() {
         // Arrange: the model answers from its own priors, sharing no vocabulary
@@ -498,8 +674,13 @@ mod tests {
         // Arrange: a 1s ask timeout against an llm that sleeps 30s, so the
         // test must return promptly (~1s) via the fallback path, not wait for
         // the slow completion.
-        let server =
-            server_with_timeout(Arc::new(liam_model::IdentityReranker), Arc::new(SlowLlm), 1).await;
+        let server = server_with_timeout(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(SlowLlm),
+            1,
+            false,
+        )
+        .await;
         seed(
             &server,
             "fact",

@@ -18,6 +18,11 @@ pub struct Config {
     pub llm: LlmConfig,
     /// Wall-clock cap on `ask` synthesis before falling back to ranked evidence.
     pub ask_timeout_secs: u64,
+    /// Whether `ask` runs a yes/no sufficiency pre-pass before synthesizing. On
+    /// by default: without it no local model tested will decline to answer a
+    /// question its evidence cannot answer. Costs one extra short model call per
+    /// `ask`, so turn it off if latency matters more than refusals.
+    pub ask_sufficiency_check: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,6 +74,7 @@ impl Default for Config {
             embedder: EmbedderConfig::default(),
             llm: LlmConfig::default(),
             ask_timeout_secs: 30,
+            ask_sufficiency_check: true,
         }
     }
 }
@@ -163,6 +169,7 @@ mod tests {
         let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../liam.toml"));
         let c = Config::load(path).expect("shipped liam.toml must parse");
         assert_eq!(c.ask_timeout_secs, 30);
+        assert!(c.ask_sufficiency_check);
         assert_eq!(c.llm.tokenizer_model, "Qwen/Qwen2.5-1.5B-Instruct");
     }
 

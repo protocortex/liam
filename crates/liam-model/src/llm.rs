@@ -9,6 +9,22 @@ use crate::error::Result;
 pub trait Llm: Send + Sync {
     /// Generate a completion for `prompt` under `system` guidance.
     async fn complete(&self, system: &str, prompt: &str) -> Result<String>;
+
+    /// Same, but stop after at most `max_new_tokens`. WHY this exists: callers
+    /// that need a word (the daemon's yes/no sufficiency pre-pass) otherwise pay
+    /// for a full-length generation, and a model inclined to ramble turns a
+    /// one-token question into a 50-second one (measured on Qwen3-1.7B, which hit
+    /// the 512-token cap answering "YES or NO"). Providers that cannot cap may
+    /// ignore it, so callers must still treat the reply as untrusted length.
+    async fn complete_capped(
+        &self,
+        system: &str,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<String> {
+        let _ = max_new_tokens;
+        self.complete(system, prompt).await
+    }
 }
 
 /// Deterministic echo LLM for the base build and tests: no model, stable output.
@@ -254,6 +270,24 @@ impl CandleLlm {
 #[async_trait]
 impl Llm for CandleLlm {
     async fn complete(&self, system: &str, prompt: &str) -> Result<String> {
+        self.generate(system, prompt, candle_chat::MAX_NEW_TOKENS)
+            .await
+    }
+
+    async fn complete_capped(
+        &self,
+        system: &str,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<String> {
+        self.generate(system, prompt, max_new_tokens.max(1)).await
+    }
+}
+
+#[cfg(feature = "local")]
+impl CandleLlm {
+    /// Shared decode driver for both trait entry points.
+    async fn generate(&self, system: &str, prompt: &str, max_new_tokens: usize) -> Result<String> {
         let cancel = CancelFlag::new();
         // Dropping this future (the daemon's ask timeout firing, a client going
         // away) drops the guard, which flips the flag; the decode loop below
@@ -271,7 +305,7 @@ impl Llm for CandleLlm {
         let out = tokio::task::spawn_blocking(move || {
             let mut session = guard;
             session
-                .complete(&system, &prompt, &cancel_for_worker)
+                .complete(&system, &prompt, max_new_tokens, &cancel_for_worker)
                 .map_err(|e| crate::error::ModelError::Llm(e.to_string()))
         })
         .await
@@ -296,8 +330,8 @@ mod candle_chat {
 
     use super::ChatArch;
 
-    /// Hard cap on generated tokens so a missing EOS can't hang the caller.
-    const MAX_NEW_TOKENS: usize = 512;
+    /// Default cap on generated tokens so a missing EOS can't hang the caller.
+    pub const MAX_NEW_TOKENS: usize = 512;
 
     /// The loaded weights, one variant per candle quantized model we support.
     /// WHY an enum and not a trait object: each `ModelWeights` is a distinct
@@ -468,6 +502,7 @@ mod candle_chat {
             &mut self,
             system: &str,
             prompt: &str,
+            max_new_tokens: usize,
             cancel: &super::CancelFlag,
         ) -> anyhow::Result<String> {
             // Template comes from the architecture detected at load time. Both
@@ -506,7 +541,7 @@ mod candle_chat {
             pos += tokens.len();
             let mut next_token = logits_processor.sample(&logits)?;
 
-            for _ in 0..MAX_NEW_TOKENS {
+            for _ in 0..max_new_tokens {
                 if next_token == self.eos_token {
                     break;
                 }

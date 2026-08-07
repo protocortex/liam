@@ -5,6 +5,7 @@ database_path  = "liam.db"
 log_filter     = "info,liam=debug"   # RUST_LOG overrides when set
 embedding_dims = 768              # MRL truncation length; fixed at DB creation
 ask_timeout_secs = 30             # ask falls back to ranked evidence past this
+ask_sufficiency_check = true      # extra yes/no pass so ask can refuse; costs one call
 
 [gc]
 episode_retention_days = 30
