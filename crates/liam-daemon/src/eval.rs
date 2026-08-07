@@ -35,7 +35,7 @@
 //! | Qwen2.5-1.5B-Instruct (default)| 5/5    | ~9s / ~2.6s      | both abstention cases pass, no false refusals |
 //! | Qwen2.5-0.5B-Instruct          | 4/5    | ~9s / ~3.2s      | abstains correctly, still cannot fuse two facts |
 //! | Gemma 3 1B (unsloth GGUF)      | 3/5    | ~15s / ~15s      | says YES to questions its evidence cannot answer |
-//! | Qwen3-1.7B                     | PENDING| PENDING          | its old 1/5 was our KV-cache defect, not the model; re-measure |
+//! | Qwen3-1.7B                     | 5/5    | ~8.7s / ~2.5s    | ties the default once its KV cache is cleared |
 //! | Phi-4-mini-instruct            | n/a    | n/a              | will not load: candle's `quantized_phi3` requires `output.weight`, which its GGUF ties away |
 //!
 //! Before the pre-pass existed, and with the KV-cache defect fixed, the same
@@ -430,7 +430,8 @@ mod run {
         let judged = CASES.len() - missed.len();
         println!(
             "\nscore: {}/{judged} judged cases passed ({} retrieval miss(es): {missed:?}) \
-             — baseline 2026-08-07: 1.5B 3/4, gemma3-1b 3/4, 0.5B 2/4, qwen3-1.7b 2/4",
+             — baseline 2026-08-07 with the pre-pass: 1.5B 5/5, qwen3-1.7b 5/5, \
+             0.5B 4/5, gemma3-1b 3/5",
             judged - failed.len(),
             missed.len()
         );
