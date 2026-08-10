@@ -15,25 +15,19 @@ fastembed = { version = "5", features = ["qwen3"], optional = true }
 # Tracks the candle-core 0.11 line; fastembed 5.17.3+ itself moved onto
 # candle-core 0.11, so this stays in lockstep with what fastembed resolves.
 candle-core = { version = "0.11", optional = true }
-# "rt" for spawn_blocking (the decode loop), "sync" for the async mutex that
-# serializes the single chat session without blocking a runtime thread.
+# "rt" for spawn_blocking: the embedder, reranker, and llama.cpp provider all
+# run blocking model calls on it instead of the async runtime.
 tokio = { version = "1", features = ["rt", "sync"], optional = true }
 
-# Generative chat model for the Llm trait (feature `local`). Tracks the
-# candle-core 0.11 line (candle-transformers 0.11 depends on candle-core
-# 0.11). hf-hub/tokenizers versions match what fastembed 5.17 already pulls
-# in (hf-hub 0.5, tokenizers 0.22), so `local` doesn't duplicate the dep tree.
-candle-transformers = { version = "0.11", optional = true }
-tokenizers = { version = "0.22", optional = true }
+# hf-hub downloads GGUF weights for the llama.cpp provider (feature `llama`).
+# anyhow keeps that loader's error handling simple; the `Llm` impl converts to
+# `ModelError::Llm` at the trait boundary. Version matches what fastembed
+# 5.17 already pulls in (hf-hub 0.5), so `llama` doesn't duplicate the dep tree.
 hf-hub = { version = "0.5", optional = true }
-# `candle_chat::Session::load`/`complete` return `anyhow::Result` to keep the
-# version-fragile candle glue's error handling simple; the `Llm` impl converts
-# to `ModelError::Llm` at the trait boundary.
 anyhow = { version = "1", optional = true }
 
-# llama.cpp bindings for the Llm trait (feature `llama`), replacing the
-# hand-written candle text generation above. `encoding_rs` because
-# `token_to_piece` streams bytes through a decoder of that crate's type.
+# llama.cpp bindings for the Llm trait (feature `llama`). `encoding_rs`
+# because `token_to_piece` streams bytes through a decoder of that crate's type.
 llama-cpp-2 = { version = "0.1.154", optional = true, default-features = false, features = ["common"] }
 encoding_rs = { version = "0.8", optional = true }
 
@@ -44,7 +38,6 @@ encoding_rs = { version = "0.8", optional = true }
 # macOS, so this adds no download and no toolchain requirement.
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
-candle-transformers = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
 
 [features]
 default = []
@@ -53,16 +46,8 @@ default = []
 # candle with it, and the code selects it by `cfg(target_os = "macos")`. CUDA is
 # opt-in because it needs the CUDA toolkit and nvcc at BUILD time, which no
 # default build may assume.
-cuda = ["candle-core/cuda", "candle-transformers/cuda"]
-local = [
-    "dep:fastembed",
-    "dep:candle-core",
-    "dep:tokio",
-    "dep:candle-transformers",
-    "dep:tokenizers",
-    "dep:hf-hub",
-    "dep:anyhow",
-]
+cuda = ["candle-core/cuda"]
+local = ["dep:fastembed", "dep:candle-core", "dep:tokio"]
 llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:anyhow", "dep:tokio", "dep:hf-hub"]
 
 [dev-dependencies]

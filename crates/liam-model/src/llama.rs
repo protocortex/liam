@@ -123,10 +123,9 @@ impl LlamaCppLlm {
         Self::load(&weights_path.to_string_lossy(), context_tokens, device)
     }
 
-    /// Render a system and user turn with the template embedded in the GGUF.
-    /// This is what replaces `ChatArch`: the model states its own format
-    /// instead of this crate maintaining a hand-written table per
-    /// architecture.
+    /// Render a system and user turn with the template embedded in the GGUF:
+    /// the model states its own format instead of this crate maintaining a
+    /// hand-written table per architecture.
     fn render_prompt(&self, system: &str, user: &str) -> Result<String> {
         let template = self
             .model
@@ -234,10 +233,9 @@ impl LlamaCppLlm {
         Ok(out)
     }
 
-    /// Shared decode driver for both trait entry points, mirroring
-    /// `CandleLlm::generate`. A `CancelFlag` gives a dropped caller future a
-    /// way to reach into the blocking decode loop, since nothing else can
-    /// stop a blocking thread from outside.
+    /// Shared decode driver for both trait entry points. A `CancelFlag` gives
+    /// a dropped caller future a way to reach into the blocking decode loop,
+    /// since nothing else can stop a blocking thread from outside.
     async fn generate(&self, system: &str, user: &str, max_new_tokens: usize) -> Result<String> {
         let cancel = CancelFlag::new();
         // Dropping this future (the daemon's ask timeout firing, a client

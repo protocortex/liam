@@ -55,7 +55,8 @@ pub struct LlmConfig {
     /// Hugging Face model id (GGUF repo) for the local provider.
     pub model: String,
     /// GGUF filename within the repo (GGUF repos host multiple quant variants,
-    /// so the file must be named explicitly). Consumed by `CandleLlm::load`.
+    /// so the file must be named explicitly). Consumed by the llama.cpp
+    /// provider's loader.
     pub gguf_file: String,
     /// Where model files live (offline after first fetch).
     pub cache_dir: String,
