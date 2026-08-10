@@ -75,6 +75,27 @@ pub fn truncate(s: &str, max: usize) -> String {
     truncated
 }
 
+/// Rough token estimate for text a real model cannot count, i.e. whenever
+/// `Llm::count_tokens` returns `None` (the mock, and any provider without a
+/// tokenizer). WHY divide by 4: a commonly cited average for English subword
+/// tokenizers, good enough because a wrong estimate here only changes a
+/// safety margin, not correctness. The budget that calls this reserves room
+/// for the answer regardless, so over- or under-estimating shifts how much
+/// slack remains, not whether the prompt fits. Prefer `count_tokens` whenever
+/// it returns `Some`; this exists only for the case where it does not.
+///
+/// Counts chars, not bytes: `str::len()` counts UTF-8 bytes, so it over-counts
+/// every non-ASCII character, and remembered notes are user text that may be
+/// full of them. Floors at 1 so an empty or tiny string never reports 0
+/// tokens; a caller that saw 0 could treat the item as free and add it
+/// without bound.
+// `liam-daemon` has no lib target, so an unwired pub fn reads as dead code to
+// the binary build; the next Work Unit calls this from the budget path.
+#[allow(dead_code)]
+pub fn estimate_tokens(text: &str) -> usize {
+    (text.chars().count() / 4).max(1)
+}
+
 /// Render epoch-ms as an ISO-8601 UTC date (YYYY-MM-DD). WHY manual y-m-d: keeps
 /// the `time` dep at default features. Out-of-range falls back to the raw
 /// integer string so a bad timestamp can never panic the answer. WHY
@@ -452,6 +473,54 @@ mod tests {
         // Arrange / Act / Assert: -500ms is 0.5s before the epoch, which must
         // floor into the prior day, not truncate up to 1970-01-01 (guards C3).
         assert_eq!(fmt_millis(-500), "1969-12-31");
+    }
+
+    #[test]
+    fn estimate_tokens_floors_an_empty_string_at_one() {
+        // Arrange
+        let text = "";
+
+        // Act
+        let tokens = estimate_tokens(text);
+
+        // Assert
+        assert_eq!(tokens, 1, "an empty string still costs a token");
+    }
+
+    #[test]
+    fn estimate_tokens_floors_a_short_string_at_one() {
+        // Arrange
+        let text = "abcd";
+
+        // Act
+        let tokens = estimate_tokens(text);
+
+        // Assert
+        assert_eq!(tokens, 1, "a 4-char string rounds down to the floor");
+    }
+
+    #[test]
+    fn estimate_tokens_divides_a_long_string_by_four() {
+        // Arrange
+        let text = "a".repeat(400);
+
+        // Act
+        let tokens = estimate_tokens(&text);
+
+        // Assert
+        assert_eq!(tokens, 100, "a 400-char string divides evenly by four");
+    }
+
+    #[test]
+    fn estimate_tokens_counts_multi_byte_chars_not_bytes() {
+        // Arrange: 4 chars that are 12 bytes in UTF-8; len() would return 3.
+        let text = "日本語で";
+
+        // Act
+        let tokens = estimate_tokens(text);
+
+        // Assert
+        assert_eq!(tokens, 1, "multi-byte chars must count as chars, not bytes");
     }
 
     #[test]
