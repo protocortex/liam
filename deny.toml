@@ -8,7 +8,22 @@ yanked = "deny"
 [licenses]
 version = 2
 # Allowlist tuned to the current dependency tree; extend as `cargo deny check`
-# reports new licenses (candle/ONNX deps may surface additional ones).
+# reports new licenses (llama.cpp / fastembed deps may surface additional ones).
+#
+# This project must never ship GPL, LGPL, or AGPL code. That is a hard
+# constraint from the owner, not a preference.
+#
+# cargo-deny 0.19 has no functional `deny` field for licenses: it was removed
+# because every license not listed in `allow` below is already rejected by
+# default (see the "version" field docs at
+# https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html).
+# Adding a `deny` array to this file fails config validation outright. So the
+# list below is written down for policy intent, for a human reviewer, not as
+# a live schema field: none of GPL-2.0, GPL-3.0, LGPL-2.1, LGPL-3.0,
+# AGPL-3.0, MPL-1.1, or EUPL-1.2 may ever be added to `allow`. The absence
+# from `allow` is what actually enforces this; this comment is the reason a
+# reviewer should reject a PR that tries to add one of them anyway, rather
+# than assuming it is a harmless allowlist extension.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -21,8 +36,20 @@ allow = [
     "Unicode-DFS-2016",
     "MPL-2.0",
     "CC0-1.0",
+    "NCSA",                 # libfuzzer-sys, pulled in via rav1e -> ravif -> image -> fastembed
+    "CDLA-Permissive-2.0",  # webpki-root-certs and webpki-roots, pulled in via ureq -> hf-hub
 ]
 confidence-threshold = 0.9
+
+# cargo-deny reads Cargo metadata only, so it cannot see C or C++ link-time
+# dependencies at all. The vendored llama.cpp/ggml C++ sources, libstdc++,
+# and OpenMP are invisible to every check in this file. Two things therefore
+# need manual review whenever the llama dependency changes, because nothing
+# here or in CI can catch either:
+# - `llama-cpp-2` must always be declared with `default-features = false`.
+#   `openmp` is in ITS default feature set, and enabling it links libgomp
+#   (GPL, with a linking exception) on *-gnu targets.
+# - `static-stdcxx` must never be enabled.
 
 [bans]
 multiple-versions = "warn"
