@@ -15,6 +15,7 @@ mod telemetry;
 
 use std::sync::Arc;
 
+use liam_model::llm::DevicePreference;
 use liam_model::{Embedder, IdentityReranker, Llm, MockEmbedder, MockLlm, Reranker};
 use liam_store::{DefaultGraph, GraphConfig};
 
@@ -47,7 +48,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let (embedder, reranker) = build_models(&config)?;
     let llm = build_llm(&config)?;
-    tracing::info!(backend = llm.backend(), "llm ready");
     if config.llm.warmup {
         let started = std::time::Instant::now();
         match llm.warmup().await {
@@ -116,12 +116,66 @@ fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Re
     ))
 }
 
-/// Choose the LLM from config. Mock keeps the base build runnable; the `local`
-/// provider (with the `local` feature) loads a candle chat model in-process.
+/// Choose the LLM from config. Mock keeps the base build runnable; `llama-cpp`
+/// (with the `llama` feature) loads llama.cpp in-process, and `local` (with the
+/// `local` feature) loads the older candle chat model this Segment has not
+/// deleted yet. Both providers coexist here; the next Segment retires candle.
 fn build_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
-    if config.llm.provider == "local" {
-        return build_local_llm(config);
+    let llm: Arc<dyn Llm> = if config.llm.provider == "llama-cpp" {
+        build_llama_llm(config)?
+    } else if config.llm.provider == "local" {
+        build_local_llm(config)?
+    } else {
+        Arc::new(MockLlm)
+    };
+
+    // An operator debugging latency needs to see which backend actually
+    // came up, not just which provider was configured: `auto` can silently
+    // resolve to a slower one.
+    tracing::info!(backend = llm.backend(), "llm ready");
+
+    // A backend that resolved to CPU on macOS is roughly a 5x slowdown
+    // nobody would notice until a user complains, so it fails startup
+    // instead of serving degraded. `macos_backend_error` exempts an
+    // explicit `device = "cpu"`: that is not a fallback, it is what was
+    // asked for. Any provider that already validated `llm.device` above
+    // guarantees it parses here too, so `unwrap_or_default` only matters
+    // for the mock provider, whose "mock" label never trips the check.
+    #[cfg(target_os = "macos")]
+    {
+        let device = DevicePreference::parse(&config.llm.device).unwrap_or_default();
+        if let Some(message) = macos_backend_error(llm.backend(), device) {
+            anyhow::bail!(message);
+        }
     }
+
+    Ok(llm)
+}
+
+#[cfg(feature = "llama")]
+fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
+    use liam_model::LlamaCppLlm;
+    // Reject an unknown device rather than quietly running 5x slower on CPU.
+    let device = DevicePreference::parse(&config.llm.device).ok_or_else(|| {
+        anyhow::anyhow!(
+            "llm.device = {:?} is not one of auto, metal, cuda, cpu",
+            config.llm.device
+        )
+    })?;
+    Ok(Arc::new(LlamaCppLlm::load_from_hub(
+        &config.llm.model,
+        &config.llm.gguf_file,
+        &config.llm.cache_dir,
+        config.llm.context_tokens as u32,
+        device,
+    )?))
+}
+
+#[cfg(not(feature = "llama"))]
+fn build_llama_llm(_config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
+    tracing::warn!(
+        "llm.provider is 'llama-cpp' but the daemon was built without the `llama` feature; using mock"
+    );
     Ok(Arc::new(MockLlm))
 }
 
@@ -152,6 +206,31 @@ fn build_local_llm(_config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     Ok(Arc::new(MockLlm))
 }
 
+/// Whether a resolved backend label is a macOS startup error. Pure and
+/// platform-independent by design, so this branch is testable on any host;
+/// `build_llm` applies it only under `cfg(target_os = "macos")`.
+///
+/// Matches the label by CONTAINS rather than equality: `runtime_backend` in
+/// `liam_model::llama` appends a parenthetical suffix
+/// ("llama.cpp/cpu (metal unavailable)") when Metal was compiled in but no
+/// device came up at runtime, and that case has to trip this the same as a
+/// plain "cpu" label.
+///
+/// Returns `None` whenever `device` is `DevicePreference::Cpu`: an operator
+/// who asked for CPU explicitly gets exactly what they asked for, silently.
+/// The error exists only to catch `auto` or `metal` RESOLVING to CPU, which
+/// on Apple Silicon means Metal did not come up as expected.
+fn macos_backend_error(backend: &str, device: DevicePreference) -> Option<String> {
+    if device == DevicePreference::Cpu || !backend.contains("cpu") {
+        return None;
+    }
+    Some(format!(
+        "llm backend resolved to {backend:?} but Metal was expected on macOS. \
+         If running on CPU is intentional, set llm.device = \"cpu\" in liam.toml \
+         to silence this error."
+    ))
+}
+
 /// GC runs on its own store connection so it never contends with requests.
 async fn spawn_gc(config: &Config) -> anyhow::Result<()> {
     let store = DefaultGraph::open(
@@ -180,5 +259,71 @@ async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
     match store.gc(policy).await {
         Ok(report) => tracing::info!(?report, "gc completed"),
         Err(e) => tracing::warn!(error = %e, "gc failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_resolving_to_cpu_on_macos_is_a_startup_error() {
+        // Arrange: the backend label reports cpu and the operator asked
+        // for auto, so a CPU result was not what was requested.
+        let backend = "llama.cpp/cpu (metal unavailable)";
+        let device = DevicePreference::Auto;
+
+        // Act
+        let result = macos_backend_error(backend, device);
+
+        // Assert: the error names Metal and the device override that
+        // silences it, so an operator knows what happened and what to do.
+        let message = result.expect("auto resolving to cpu must error");
+        assert!(message.contains("Metal"), "message: {message}");
+        assert!(message.contains("device"), "message: {message}");
+    }
+
+    #[test]
+    fn an_explicit_cpu_choice_is_honoured() {
+        // Arrange: the backend label reports cpu and the operator asked
+        // for cpu explicitly.
+        let backend = "llama.cpp/cpu (metal unavailable)";
+        let device = DevicePreference::Cpu;
+
+        // Act
+        let result = macos_backend_error(backend, device);
+
+        // Assert: an explicit choice is not a silent fallback, so it must
+        // not error.
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn a_metal_backend_passes() {
+        // Arrange: the backend label reports metal and the operator asked
+        // for auto.
+        let backend = "llama.cpp/metal";
+        let device = DevicePreference::Auto;
+
+        // Act
+        let result = macos_backend_error(backend, device);
+
+        // Assert: Metal came up as expected, nothing to report.
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn an_explicit_metal_request_that_resolved_to_cpu_is_an_error() {
+        // Arrange: the backend label reports cpu even though the operator
+        // asked for metal explicitly, so something is broken.
+        let backend = "llama.cpp/cpu (metal unavailable)";
+        let device = DevicePreference::Metal;
+
+        // Act
+        let result = macos_backend_error(backend, device);
+
+        // Assert: only an explicit cpu choice is exempt; an explicit metal
+        // request that fell back to cpu must still error.
+        assert!(result.is_some());
     }
 }

@@ -35,7 +35,7 @@ use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::error::{ModelError, Result};
-use crate::llm::{strip_reasoning, CancelFlag, Llm};
+use crate::llm::{strip_reasoning, CancelFlag, DevicePreference, Llm};
 
 /// Cap on generated tokens so a model with no natural stop token cannot hang a
 /// caller. Matches the candle path's cap so callers see the same behavior
@@ -66,11 +66,24 @@ impl LlamaCppLlm {
     /// sizes prompt trimming: if the two drifted apart, a full-size prompt
     /// would overflow a smaller llama.cpp context and decode would fail. A
     /// caller passing 0 gets a documented floor instead of a panic.
-    pub fn load(gguf_path: &str, context_tokens: u32) -> Result<Self> {
+    ///
+    /// `device` only decides how many layers get offloaded: llama.cpp has no
+    /// per-device selection in this wrapper beyond that, so `Auto` and
+    /// `Metal` both mean "offload everything the compiled backend accepts"
+    /// and only `Cpu` means "offload nothing". A caller that wants CPU has
+    /// to say so explicitly; nothing here probes for a GPU and picks CPU on
+    /// its own.
+    pub fn load(gguf_path: &str, context_tokens: u32, device: DevicePreference) -> Result<Self> {
         let backend = shared_backend()?;
-        // Offload everything the backend will take; with no GPU compiled in
-        // this is ignored and the model stays on CPU.
-        let params = LlamaModelParams::default().with_n_gpu_layers(1000);
+        // With no GPU compiled in, 1000 layers is ignored and the model
+        // stays on CPU regardless; 0 is what makes an explicit CPU request
+        // actually run on CPU even when Metal or CUDA IS compiled in.
+        let n_gpu_layers = if device == DevicePreference::Cpu {
+            0
+        } else {
+            1000
+        };
+        let params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
         let model = LlamaModel::load_from_file(&backend, gguf_path, &params)
             .map_err(|e| ModelError::Llm(format!("load {gguf_path}: {e}")))?;
         let device_label = runtime_backend(&backend);
@@ -82,6 +95,32 @@ impl LlamaCppLlm {
             context_tokens,
             device_label,
         })
+    }
+
+    /// Load a GGUF from a Hugging Face repo instead of a path already on
+    /// disk. This is the piece the config needs and `load` does not have:
+    /// `llm.model` is a repo id, `llm.gguf_file` names one file inside it
+    /// (a GGUF repo usually hosts several quant variants), and `llm.cache_dir`
+    /// is where the daemon wants the download to land. `hf-hub` resolves
+    /// those three to a local path, hitting the network only on a cache
+    /// miss, and this then defers to `load` for everything else so the
+    /// loading logic exists in one place.
+    pub fn load_from_hub(
+        model_id: &str,
+        gguf_file: &str,
+        cache_dir: &str,
+        context_tokens: u32,
+        device: DevicePreference,
+    ) -> Result<Self> {
+        let api = hf_hub::api::sync::ApiBuilder::new()
+            .with_cache_dir(std::path::PathBuf::from(cache_dir))
+            .build()
+            .map_err(|e| ModelError::Llm(format!("hf-hub api for {model_id}: {e}")))?;
+        let weights_path = api
+            .model(model_id.to_string())
+            .get(gguf_file)
+            .map_err(|e| ModelError::Llm(format!("fetch {gguf_file} from {model_id}: {e}")))?;
+        Self::load(&weights_path.to_string_lossy(), context_tokens, device)
     }
 
     /// Render a system and user turn with the template embedded in the GGUF.
