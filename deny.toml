@@ -3,7 +3,17 @@
 [advisories]
 version = 2
 yanked = "deny"
-# ignore = []  # add specific RUSTSEC ids here only with a justification comment
+ignore = [
+    # RUSTSEC-2024-0436: `paste` is unmaintained. This is an unmaintained
+    # advisory, not a known vulnerability. It reaches this project only
+    # transitively, through the optional `local` feature's candle/fastembed
+    # dependency tree; nothing this project calls directly depends on
+    # `paste`. Revisit and drop this ignore once fastembed and its candle
+    # dependencies move off `paste`. The default build (no optional
+    # features) has zero advisories; this ignore only affects the optional
+    # shipped `local` surface.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained, pulled in transitively by the optional local feature's candle/fastembed tree, not used directly" },
+]
 
 [licenses]
 version = 2
