@@ -413,6 +413,7 @@ mod run {
             ASK_TIMEOUT_SECS,
             // Measure what the daemon ships, including the pre-pass.
             crate::config::Config::default().ask_sufficiency_check,
+            crate::config::Config::default().llm.context_tokens,
         );
 
         // Act + score each case, printing as it goes so a slow run is readable.

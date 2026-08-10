@@ -67,6 +67,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         llm,
         config.ask_timeout_secs,
         config.ask_sufficiency_check,
+        config.llm.context_tokens,
     );
 
     // rmcp stdio serve. Confirm against your pinned rmcp version.

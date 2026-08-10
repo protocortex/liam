@@ -89,9 +89,6 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// full of them. Floors at 1 so an empty or tiny string never reports 0
 /// tokens; a caller that saw 0 could treat the item as free and add it
 /// without bound.
-// `liam-daemon` has no lib target, so an unwired pub fn reads as dead code to
-// the binary build; the next Work Unit calls this from the budget path.
-#[allow(dead_code)]
 pub fn estimate_tokens(text: &str) -> usize {
     (text.chars().count() / 4).max(1)
 }
@@ -203,9 +200,6 @@ const ANSWER_TOKEN_RESERVE: usize = 512;
 /// `count` is injected so this stays testable without a model: the real
 /// caller passes `Llm::count_tokens`/`estimate_tokens`, tests pass a plain
 /// closure such as counting characters.
-// `liam-daemon` has no lib target, so an unwired pub fn reads as dead code to
-// the binary build; the next Work Unit calls this from the ask handler.
-#[allow(dead_code)]
 pub fn fit_evidence_to_budget<'a>(
     question: &str,
     evidence: &'a [Evidence],
