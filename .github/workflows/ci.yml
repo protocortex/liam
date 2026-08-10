@@ -62,8 +62,45 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      # Check the shipped default feature set. Avoids the action's --all-features
-      # default, which pulls the heavy optional `local`/candle/ort tree (its own
-      # unmaintained-crate + exotic-license supply chain), and its musl container
-      # that trips over rust-toolchain.toml.
-      - run: cargo deny check
+      # Check the shipped feature set explicitly (local, llama) rather than the
+      # action's --all-features default, which pulls the heavy optional
+      # candle/ort tree (its own unmaintained-crate + exotic-license supply
+      # chain) and uses a musl container that trips over rust-toolchain.toml.
+      # Naming the features here, instead of --all-features, keeps the audit
+      # scoped to what actually ships while still covering llama.cpp's
+      # dependency tree.
+      #
+      # cargo-deny reads Cargo metadata only, so it cannot see the vendored
+      # llama.cpp C++ sources, libgomp, or libstdc++. That C/C++ blind spot is
+      # covered by manual review notes in deny.toml, not by this job.
+      #
+      # `--features` is a global cargo-deny flag, not a `check` subcommand
+      # flag, so it must precede `check` on the command line.
+      #
+      # This change was validated locally at authoring time (org Actions runs
+      # were down): `cargo deny --features local,llama check`.
+      - run: cargo deny --features local,llama check
+
+  build-llama:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # macOS is the target this release supports; Metal is compiled in by
+      # target inside llama-cpp-sys-2's build script, no extra setup needed.
+      #
+      # Building llama-cpp-sys-2 compiles llama.cpp from C++ source via CMake,
+      # which is slow on a cold cache. rust-cache does not cache the CMake
+      # build, so expect a slow first run rather than treating it as stuck.
+      - name: Build (llama feature)
+        run: cargo build -p liam-daemon --features llama
+      # The tests that need model weights are #[ignore]d, so this plain
+      # `cargo test` run does not download a model (no 1GB GGUF fetch) and
+      # does not need a GPU.
+      #
+      # This job was validated locally at authoring time (org Actions runs
+      # were down): `cargo build -p liam-daemon --features llama` and
+      # `cargo test -p liam-daemon --features llama`.
+      - name: Test (llama feature)
+        run: cargo test -p liam-daemon --features llama
