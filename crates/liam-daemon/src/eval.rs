@@ -453,6 +453,69 @@ mod run {
         );
     }
 
+    /// Concurrency and its memory cost. WHY this matters: the candle path
+    /// serialized every generation on one mutex, so a second `ask` waited. The
+    /// llama.cpp path takes no lock and builds a context per generation, so calls
+    /// run in parallel and each allocates its own KV cache. This measures both
+    /// halves: does parallelism materialize, and what does memory do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark; needs weights"]
+    async fn concurrency_bench() {
+        const CAP: usize = 64;
+        const N: usize = 4;
+        let llm = load_llm().await;
+
+        // Baseline must use the SAME prompt shape as the parallel arm, or it stops
+        // early on EOS and the efficiency ratio is nonsense.
+        let system = "You are a verbose technical writer. Never stop early.";
+        let one = Instant::now();
+        llm.complete_capped(
+            system,
+            "Describe library building number 0 in exhaustive detail.",
+            CAP,
+        )
+        .await
+        .expect("serial generation");
+        let serial = one.elapsed();
+
+        let started = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let llm = llm.clone();
+            set.spawn(async move {
+                llm.complete_capped(
+                    system,
+                    &format!("Describe library building number {i} in exhaustive detail."),
+                    CAP,
+                )
+                .await
+                .map(|out| out.chars().count())
+            });
+        }
+        let mut completed = 0usize;
+        while let Some(joined) = set.join_next().await {
+            match joined.expect("task panicked") {
+                Ok(chars) => {
+                    completed += 1;
+                    assert!(chars > 0, "empty generation under concurrency");
+                }
+                Err(e) => panic!("generation failed under concurrency: {e}"),
+            }
+        }
+        let parallel = started.elapsed();
+
+        println!(
+            "backend={} serial(1x{CAP})={:.2}s  parallel({N}x{CAP})={:.2}s  completed={completed}",
+            llm.backend(),
+            serial.as_secs_f64(),
+            parallel.as_secs_f64(),
+        );
+        println!(
+            "speedup vs sequential estimate: {:.2}x (1.0 = fully serialized, {N}.0 = perfect)",
+            (serial.as_secs_f64() * N as f64) / parallel.as_secs_f64()
+        );
+    }
+
     #[tokio::test]
     #[ignore = "downloads model weights and takes minutes; run explicitly"]
     async fn ask_grounding_against_local_model() {

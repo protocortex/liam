@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
@@ -33,6 +33,44 @@ use crate::llm::Llm;
 /// Matches `candle_chat::MAX_NEW_TOKENS` so latency comparisons are apples to
 /// apples.
 const MAX_NEW_TOKENS: usize = 512;
+
+/// Threads to decode with. WHY not `available_parallelism()`: on Apple Silicon the
+/// efficiency cores are markedly slower than the performance cores, so including
+/// them makes every batch wait on the stragglers. `hw.perflevel0.logicalcpu` is
+/// the P-core count (8 of 10 on an M1 Pro). Falls back to all-but-two elsewhere.
+fn generation_threads() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("sysctl")
+            .args(["-n", "hw.perflevel0.logicalcpu"])
+            .output()
+        {
+            if let Ok(n) = String::from_utf8_lossy(&out.stdout).trim().parse::<i32>() {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+    }
+    let all = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4);
+    (all - 2).max(1)
+}
+
+/// SPIKE toggle so one build can A/B each lever independently:
+/// `LIAM_LLAMA_TUNE=0|threads|kv|both` (default `both`).
+///
+/// MEASURED 2026-08-10, M1 Pro, Qwen2.5-1.5B Q4_K_M, 128-token cap, Metal:
+///   defaults 83.9 tok/s | P-core threads 81.7 | Q8_0 KV 76.2 | both 66.3
+/// Both "optimizations" are PESSIMIZATIONS here. Thread count barely matters when
+/// the GPU does the matmuls, and quantized KV adds dequantization to every
+/// attention step, buying memory we do not need at a 4k context. Ship the engine
+/// defaults; this toggle exists only so the finding can be re-verified.
+fn tune_mode() -> String {
+    // Default OFF: the A/B above says the engine defaults win.
+    std::env::var("LIAM_LLAMA_TUNE").unwrap_or_else(|_| "0".to_string())
+}
 
 /// Context window for a generation. Evidence prompts are long (up to 32 items of
 /// 2000 chars), so 4096 is the floor for `ask`.
@@ -108,7 +146,21 @@ impl LlamaCppLlm {
             .str_to_token(&prompt, AddBos::Always)
             .map_err(|e| ModelError::Llm(format!("tokenize: {e}")))?;
 
-        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(N_CTX));
+        let mut ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(N_CTX));
+        let mode = tune_mode();
+        if mode == "threads" || mode == "both" {
+            let threads = generation_threads();
+            ctx_params = ctx_params
+                .with_n_threads(threads)
+                .with_n_threads_batch(threads);
+        }
+        if mode == "kv" || mode == "both" {
+            // Q8_0 KV halves cache memory against F16. Whether that costs speed
+            // is exactly what the A/B measures.
+            ctx_params = ctx_params
+                .with_type_k(KvCacheType::Q8_0)
+                .with_type_v(KvCacheType::Q8_0);
+        }
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
