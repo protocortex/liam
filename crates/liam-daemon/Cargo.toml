@@ -37,3 +37,6 @@ local = ["liam-model/local"]
 # Opt-in NVIDIA support; needs the CUDA toolkit at build time. Apple GPU support
 # is automatic on macOS, see liam-model's target-specific dependencies.
 cuda = ["liam-model/cuda"]
+# llama.cpp text generation, replacing candle. Metal is on by target inside
+# llama-cpp-sys-2's build script for Apple platforms, no cargo feature needed.
+llama = ["liam-model/llama"]
