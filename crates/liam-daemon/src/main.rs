@@ -118,14 +118,17 @@ fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Re
 }
 
 /// Choose the LLM from config. Mock keeps the base build runnable; `llama-cpp`
-/// (with the `llama` feature) loads llama.cpp in-process, and `local` (with the
-/// `local` feature) loads the older candle chat model this Segment has not
-/// deleted yet. Both providers coexist here; the next Segment retires candle.
+/// (with the `llama` feature) loads llama.cpp in-process. `local` named the
+/// retired candle provider: an operator who still has it in their liam.toml
+/// gets an actionable error instead of a silent downgrade to mock.
 fn build_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     let llm: Arc<dyn Llm> = if config.llm.provider == "llama-cpp" {
         build_llama_llm(config)?
     } else if config.llm.provider == "local" {
-        build_local_llm(config)?
+        anyhow::bail!(
+            "llm.provider = \"local\" was removed: the candle provider is gone, \
+             generation now runs on llama.cpp, set llm.provider = \"llama-cpp\" in your liam.toml"
+        );
     } else {
         Arc::new(MockLlm)
     };
@@ -176,33 +179,6 @@ fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
 fn build_llama_llm(_config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     tracing::warn!(
         "llm.provider is 'llama-cpp' but the daemon was built without the `llama` feature; using mock"
-    );
-    Ok(Arc::new(MockLlm))
-}
-
-#[cfg(feature = "local")]
-fn build_local_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
-    use liam_model::CandleLlm;
-    // Reject an unknown device rather than quietly running 5x slower on CPU.
-    let device = liam_model::llm::DevicePreference::parse(&config.llm.device).ok_or_else(|| {
-        anyhow::anyhow!(
-            "llm.device = {:?} is not one of auto, metal, cuda, cpu",
-            config.llm.device
-        )
-    })?;
-    Ok(Arc::new(CandleLlm::load(
-        &config.llm.model,
-        &config.llm.gguf_file,
-        &config.llm.tokenizer_model,
-        &config.llm.cache_dir,
-        device,
-    )?))
-}
-
-#[cfg(not(feature = "local"))]
-fn build_local_llm(_config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
-    tracing::warn!(
-        "llm.provider is 'local' but the daemon was built without the `local` feature; using mock"
     );
     Ok(Arc::new(MockLlm))
 }
@@ -266,6 +242,27 @@ async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_provider_local_is_rejected_with_an_actionable_error() {
+        // Arrange: an old liam.toml still naming the retired candle provider.
+        let mut config = Config::default();
+        config.llm.provider = "local".to_string();
+
+        // Act
+        let result = build_llm(&config);
+
+        // Assert: the error names the removed provider and the fix, so an
+        // operator upgrading with a stale config is told what to change
+        // instead of silently getting a mock that answers nothing useful.
+        // `dyn Llm` is not `Debug`, so this matches instead of `expect_err`.
+        let message = match result {
+            Ok(_) => panic!("removed provider must error, not fall back"),
+            Err(e) => e.to_string(),
+        };
+        assert!(message.contains("local"), "message: {message}");
+        assert!(message.contains("llama-cpp"), "message: {message}");
+    }
 
     #[test]
     fn auto_resolving_to_cpu_on_macos_is_a_startup_error() {
