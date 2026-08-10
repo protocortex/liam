@@ -63,7 +63,7 @@ local = [
     "dep:hf-hub",
     "dep:anyhow",
 ]
-llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:anyhow", "dep:tokio"]
+llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:anyhow", "dep:tokio", "dep:hf-hub"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
