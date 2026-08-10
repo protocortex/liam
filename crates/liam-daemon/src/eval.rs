@@ -8,21 +8,41 @@
 //!
 //! The scorers below are pure and always compiled, so the harness logic itself is
 //! unit-tested in the base build. The model run is a `#[ignore]`d test behind the
-//! `local` feature, because it downloads weights (~400 MB on first run) and takes
+//! `llama` feature, because it downloads weights (~1 GB on first run) and takes
 //! minutes:
 //!
 //! ```text
-//! cargo test --release -p liam-daemon --features local -- --ignored --nocapture grounding
+//! cargo test --release -p liam-daemon --features llama -- --ignored --nocapture grounding
 //! ```
 //!
-//! `--release` is not optional in practice: an unoptimized candle decode loop
-//! runs roughly 30x slower (measured: ~145s vs ~5s for one answer on an M-series
-//! CPU), which turns the eval into a timeout test.
+//! `--release` is not optional for candle, historical: an unoptimized candle
+//! decode loop ran roughly 30x slower (measured: ~145s vs ~5s for one answer on
+//! an M-series CPU), which turned the eval into a timeout test. That was
+//! candle's own interpreter overhead; llama.cpp has not been measured debug vs
+//! release here, but the documented command above still runs release, and there
+//! is no reason to pay for a slower run when a faster one exists.
 //!
-//! Env overrides: `LIAM_EVAL_MODEL`, `LIAM_EVAL_GGUF`, `LIAM_EVAL_TOKENIZER`,
-//! `LIAM_EVAL_CACHE_DIR`, `LIAM_EVAL_DEVICE`.
+//! Env overrides: `LIAM_EVAL_MODEL`, `LIAM_EVAL_GGUF`, `LIAM_EVAL_CACHE_DIR`,
+//! `LIAM_EVAL_DEVICE`. There is no tokenizer override: llama.cpp reads the
+//! tokenizer out of the GGUF itself, so unlike candle there is nothing to name
+//! separately. (Historical: candle needed `LIAM_EVAL_TOKENIZER` because its
+//! tokenizer was a second file from the same repo.)
 //!
-//! # Hardware (2026-08-07, Apple Silicon, Qwen2.5-1.5B Q4_K_M, same code, A/B)
+//! # llama.cpp baseline (2026-08-10 migration spike, Apple Silicon M1 Pro,
+//! # Qwen2.5-1.5B-Instruct Q4_K_M, Metal)
+//!
+//! Measured by the migration spike (`spike/llama-cpp`), not by this eval's own
+//! run: 84 tokens/second decode, 5 of 5 grounding cases judged and passed,
+//! about 1.19 GB resident, 0.81s warm load, 1.2 to 1.3s per answer. Compare the
+//! candle numbers below (historical, superseded): those were CPU-bound and
+//! multi-second per answer even on the faster backend, whereas llama.cpp's
+//! Metal path lands sub-1.5s. `count_tokens` returning real counts (see the
+//! grounding test) means the trimming path is measuring against llama.cpp's
+//! own tokenizer, not the chars/4 estimate either engine falls back to when a
+//! tokenizer call fails.
+//!
+//! # Historical hardware A/B (2026-08-07, candle, Apple Silicon, Qwen2.5-1.5B
+//! # Q4_K_M, same code, A/B)
 //!
 //! | device                        | load | warmup | answer  | refusal | score |
 //! |-------------------------------|------|--------|---------|---------|-------|
@@ -34,7 +54,8 @@
 //! pays ~10s of Metal kernel compilation, which on a short-lived process is the
 //! only generation there is. Set `LIAM_EVAL_DEVICE=cpu` to re-run the A/B.
 //!
-//! # Measured baseline (2026-08-07, this prompt, greedy decode, CPU, Q4_K_M)
+//! # Historical model comparison (2026-08-07, candle, this prompt, greedy
+//! # decode, CPU, Q4_K_M)
 //!
 //! Scores are over *judged* cases: `date_not_drifted` is a retrieval miss for
 //! every model (see `Case::needs_label`), so it scores nobody.
@@ -296,7 +317,7 @@ fn failures(answer: &str, expect: &Expect) -> Vec<String> {
     out
 }
 
-#[cfg(feature = "local")]
+#[cfg(feature = "llama")]
 mod run {
     use std::sync::Arc;
     use std::time::Instant;
@@ -324,13 +345,16 @@ mod run {
     /// ids: a hardcoded copy silently keeps measuring the previous default after
     /// someone changes the shipped one, which is exactly what happened when the
     /// default moved from 0.5B to 1.5B.
-    async fn load_llm() -> Arc<liam_model::CandleLlm> {
+    ///
+    /// There is no tokenizer override here: llama.cpp reads the tokenizer out of
+    /// the GGUF itself, so unlike candle there is nothing to name separately or
+    /// to drift out of sync with the weights.
+    async fn load_llm() -> Arc<liam_model::LlamaCppLlm> {
         let shipped = crate::config::LlmConfig::default();
         let model = env_or("LIAM_EVAL_MODEL", &shipped.model);
         let gguf = env_or("LIAM_EVAL_GGUF", &shipped.gguf_file);
-        let tokenizer = env_or("LIAM_EVAL_TOKENIZER", &shipped.tokenizer_model);
         let cache_dir = expand_home(&env_or("LIAM_EVAL_CACHE_DIR", &shipped.cache_dir));
-        println!("loading {model} / {gguf} (tokenizer {tokenizer}) from {cache_dir}");
+        println!("loading {model} / {gguf} from {cache_dir}");
         let started = Instant::now();
         // `LIAM_EVAL_DEVICE` exists so a run can be A/B'd against CPU on the same
         // machine; without it the eval measures whatever the daemon would use.
@@ -338,8 +362,14 @@ mod run {
         let device = liam_model::llm::DevicePreference::parse(&device_name)
             .expect("LIAM_EVAL_DEVICE must be auto, metal, cuda or cpu");
         let llm = Arc::new(
-            liam_model::CandleLlm::load(&model, &gguf, &tokenizer, &cache_dir, device)
-                .expect("load local model"),
+            liam_model::LlamaCppLlm::load_from_hub(
+                &model,
+                &gguf,
+                &cache_dir,
+                shipped.context_tokens as u32,
+                device,
+            )
+            .expect("load local model"),
         );
         println!(
             "model ready in {:?} on {}",
@@ -367,7 +397,7 @@ mod run {
     /// zero, the fallback path hides the raw text, and the cause (a reasoning
     /// preamble, a copied template, an empty answer) is invisible. Run it when
     /// bringing up a new architecture:
-    /// `cargo test --release -p liam-daemon --features local -- --ignored --nocapture raw_completion`
+    /// `cargo test --release -p liam-daemon --features llama -- --ignored --nocapture raw_completion`
     #[tokio::test]
     #[ignore = "downloads model weights; diagnostic, prints instead of asserting"]
     async fn raw_completion_smoke() {
@@ -404,6 +434,16 @@ mod run {
         }
 
         let llm = load_llm().await;
+
+        // Prove the trimming path in `ask` is exercising llama.cpp's real
+        // tokenizer, not silently falling back to the chars/4 estimate: a
+        // `None` here would mean every case below ran on an approximation
+        // instead of grounding against what the model actually saw.
+        let token_count = llm.count_tokens("hello world");
+        assert!(
+            matches!(token_count, Some(n) if n > 0),
+            "count_tokens fell back to the chars/4 estimate: {token_count:?}"
+        );
 
         let server = MemoryServer::new(
             store,
@@ -456,9 +496,10 @@ mod run {
         // Assert
         let judged = CASES.len() - missed.len();
         println!(
-            "\nscore: {}/{judged} judged cases passed ({} retrieval miss(es): {missed:?}) \
-             — baseline 2026-08-07 with the pre-pass: 1.5B 5/5, qwen3-1.7b 5/5, \
-             0.5B 4/5, gemma3-1b 3/5",
+            "\nscore: {}/{judged} judged cases passed ({} retrieval miss(es): {missed:?}), \
+             llama.cpp baseline (2026-08-10 migration spike, Qwen2.5-1.5B Q4_K_M, \
+             Metal): 5/5. Historical candle baseline (2026-08-07) with the pre-pass: \
+             1.5B 5/5, qwen3-1.7b 5/5, 0.5B 4/5, gemma3-1b 3/5",
             judged - failed.len(),
             missed.len()
         );
