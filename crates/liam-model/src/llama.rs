@@ -14,6 +14,14 @@
 //! The chat template comes from the GGUF file itself, not a hand-written
 //! table. llama.cpp reads the template baked into the model and renders it, so
 //! a new architecture needs no template code here.
+//!
+//! Measured on every local GGUF (Qwen2.5, Qwen3, Gemma 3 1b/4b, Phi-4-mini):
+//! the C API renders each one, with a real system turn and with the system
+//! text folded into the user turn. Gemma does not error on a system role;
+//! llama.cpp folds it into the first user turn itself, the same fold Gemma's
+//! own Jinja template does. `render_prompt` keeps a fallback fold for a
+//! family whose template does reject a system role, but that path is
+//! untested here since no local model needs it.
 
 use async_trait::async_trait;
 use std::num::NonZeroU32;
@@ -90,10 +98,14 @@ impl LlamaCppLlm {
                 .map_err(|e| ModelError::Llm(e.to_string()))
         };
 
-        // Try a real system turn first, then fold the system text into the
-        // user turn. Some families (Gemma) have no system role at all and the
-        // C API just returns an FFI error for it, so one fallback here covers
-        // every architecture instead of a per-family template.
+        // Try a real system turn first, then fall back to folding the system
+        // text into the user turn. This is defensive, not proven needed
+        // here: every local model (Qwen2.5, Qwen3, Gemma 3 1b/4b,
+        // Phi-4-mini) renders fine with a real system turn, and Gemma 3
+        // folds the system text into the first user turn itself rather than
+        // erroring. The one case seen rejecting a system role was Gemma 4
+        // E2B, not available here, so this fallback is currently unexercised
+        // by any local model.
         let with_system = vec![msg("system", system)?, msg("user", user)?];
         if let Ok(rendered) = self
             .model

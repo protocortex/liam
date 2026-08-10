@@ -34,11 +34,8 @@ anyhow = { version = "1", optional = true }
 # llama.cpp bindings for the Llm trait (feature `llama`), replacing the
 # hand-written candle text generation above. `encoding_rs` because
 # `token_to_piece` streams bytes through a decoder of that crate's type.
-# `minijinja` because some GGUF chat templates cannot be rendered by
-# llama.cpp's own C API and we render the model's template ourselves (WU-4).
 llama-cpp-2 = { version = "0.1.154", optional = true, default-features = false, features = ["common"] }
 encoding_rs = { version = "0.8", optional = true }
-minijinja = { version = "2", optional = true }
 
 # Best available backend per host, unioned into the deps above. WHY here and not
 # in `[features]`: this is the only way `--features local` gives a macOS user GPU
@@ -66,7 +63,7 @@ local = [
     "dep:hf-hub",
     "dep:anyhow",
 ]
-llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:minijinja", "dep:anyhow", "dep:tokio"]
+llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:anyhow", "dep:tokio"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
