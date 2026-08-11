@@ -85,8 +85,9 @@ pub struct MemoryServer {
     embedder: Arc<dyn Embedder>,
     reranker: Arc<dyn Reranker>,
     llm: Arc<dyn Llm>,
-    /// Wall-clock cap on `ask` synthesis before falling back to ranked
-    /// evidence; see `config::Config::ask_timeout_secs`.
+    /// Wall-clock deadline for the WHOLE `ask` request, the generation-permit
+    /// acquire, the sufficiency pre-pass, and synthesis together, before
+    /// falling back to ranked evidence; see `config::Config::ask_timeout_secs`.
     ask_timeout_secs: u64,
     /// Whether `ask` runs the yes/no sufficiency pre-pass before synthesizing;
     /// see `config::Config::ask_sufficiency_check`.
@@ -227,6 +228,16 @@ impl MemoryServer {
                     .unwrap_or_else(|| estimate_tokens(s))
             });
 
+        // One deadline for the whole request: the permit acquire, the
+        // sufficiency pre-pass, and synthesis below all race against this
+        // same instant instead of each getting its own fresh
+        // `ask_timeout_secs`, so a slow stage eats into the budget the later
+        // stages get rather than tripling the wall-clock cap. `max(1)` guards
+        // against an operator typo of `ask_timeout_secs = 0`, which would
+        // otherwise make the whole request time out immediately.
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.ask_timeout_secs.max(1));
+
         // Bound concurrent generation before either model call below: both
         // the sufficiency pre-pass and synthesis hit the model, so a permit
         // held only across synthesis would let N sufficiency calls pile onto
@@ -234,8 +245,8 @@ impl MemoryServer {
         // clone of the `Arc` keeps the permit's lifetime independent of any
         // borrow of `self` across the awaits below; it drops, releasing the
         // slot, when `ask` returns.
-        let _generation_permit = match tokio::time::timeout(
-            Duration::from_secs(self.ask_timeout_secs.max(1)),
+        let _generation_permit = match tokio::time::timeout_at(
+            deadline,
             self.generation_permits.clone().acquire_owned(),
         )
         .await
@@ -245,7 +256,10 @@ impl MemoryServer {
             // Without this timeout, the k-th queued caller would wait up to
             // k * ask_timeout_secs before its own generation budget even
             // started, so a queue would turn one slow request into a pile of
-            // requests that each look like a hang.
+            // requests that each look like a hang. The whole request now
+            // shares one deadline, so this bound is what keeps that wait
+            // from silently eating into budget the later stages never get
+            // back.
             Err(_) => return fallback_answer("timed out waiting for a generation slot", evidence),
         };
 
@@ -254,8 +268,8 @@ impl MemoryServer {
         // `ask::build_sufficiency_prompt` for why this is a separate call.
         if self.ask_sufficiency_check {
             let (system, user) = ask::build_sufficiency_prompt(&args.question, evidence);
-            let verdict = tokio::time::timeout(
-                Duration::from_secs(self.ask_timeout_secs.max(1)),
+            let verdict = tokio::time::timeout_at(
+                deadline,
                 // Capped hard: the verdict is one word, and an uncapped pre-pass
                 // let a rambling model spend 50s per question (see eval.rs).
                 self.llm
@@ -274,13 +288,7 @@ impl MemoryServer {
         }
 
         let (system, user) = build_ask_prompt(&args.question, evidence);
-        let synth = tokio::time::timeout(
-            // max(1) guards against an operator typo of `ask_timeout_secs = 0`,
-            // which would otherwise make every call time out immediately.
-            Duration::from_secs(self.ask_timeout_secs.max(1)),
-            self.llm.complete(&system, &user),
-        )
-        .await;
+        let synth = tokio::time::timeout_at(deadline, self.llm.complete(&system, &user)).await;
         match synth {
             Ok(Ok(a)) if !a.trim().is_empty() => {
                 let answer = a.trim();
@@ -966,6 +974,52 @@ mod tests {
         assert!(
             answer.contains("The gizmo deadline slipped to next quarter."),
             "answer missing evidence content: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_bounds_the_whole_request_to_a_single_timeout_budget() {
+        // Arrange: a 1s ask timeout, the sufficiency pre-pass on, and an llm
+        // that blocks in complete() until this test releases it, which it
+        // never does. Both the pre-pass and synthesis call complete() on the
+        // same server, so under the old per-stage timeouts each got its own
+        // fresh 1s budget: at least 2s before falling back. One shared
+        // deadline must fall back in about 1s instead.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm = Arc::new(GatedLlm::new(release));
+        let server =
+            server_with_timeout(Arc::new(liam_model::IdentityReranker), llm, 1, true, 8192).await;
+        seed(
+            &server,
+            "fact",
+            "Deadline",
+            "The gizmo deadline slipped to next quarter.",
+        )
+        .await;
+
+        // Act
+        let start = std::time::Instant::now();
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "When did the gizmo deadline slip".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+            }))
+            .await;
+        let elapsed = start.elapsed();
+
+        // Assert: a fallback, not a synthesized answer, and returned within
+        // one budget rather than the two or three stacked full-length
+        // timeouts the old per-stage timeouts would have needed.
+        assert!(
+            answer.contains("(synthesis unavailable"),
+            "answer missing fallback marker: {answer}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "ask took {elapsed:?} for a 1s budget; stacked per-stage timeouts \
+             would need at least 2s here, not one shared deadline"
         );
     }
 
