@@ -2,7 +2,7 @@
 
 Based on the [Apache Software Foundation Corporate CLA v2.0](https://www.apache.org/licenses/cla-corporate.pdf).
 
-Thank you for your interest in contributing to projects maintained by protocortex ("the Maintainer"). To clarify the intellectual property license granted with Contributions from any entity, the Maintainer requires a Corporate Contributor License Agreement ("CCLA") to be signed by each contributing organisation. This license is for your protection as a contributor as well as the protection of the Maintainer and its users; it does not change your rights to use your own Contributions for any other purpose.
+Thank you for your interest in contributing to projects maintained by igorjs ("the Maintainer"). To clarify the intellectual property license granted with Contributions from any entity, the Maintainer requires a Corporate Contributor License Agreement ("CCLA") to be signed by each contributing organisation. This license is for your protection as a contributor as well as the protection of the Maintainer and its users; it does not change your rights to use your own Contributions for any other purpose.
 
 This CCLA allows an entity (the "Corporation") to submit Contributions to the Maintainer, to authorise Contributions submitted by its designated employees, and to grant copyright and patent licenses thereto.
 
