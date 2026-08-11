@@ -157,9 +157,10 @@ struct Case {
     /// does not surface it, the case says nothing about the model, so it is
     /// reported as a RETRIEVAL MISS and left out of the synthesis score rather
     /// than counted as a model failure. WHY this is needed: with `k` below the
-    /// corpus size, RRF genuinely drops the needed fact for some questions (FTS
-    /// has no stemming, so "ship" does not match "ships"), which silently scored
-    /// as hallucination before.
+    /// corpus size, RRF genuinely drops the needed fact for some questions
+    /// (implicit AND across the question's tokens meant the lexical arm
+    /// returned nothing, so ranking fell to the mock embedder alone), which
+    /// silently scored as hallucination before.
     needs_label: &'static str,
     expect: Expect,
 }

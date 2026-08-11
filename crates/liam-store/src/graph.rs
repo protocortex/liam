@@ -646,15 +646,24 @@ fn row_f64(row: &Row, i: usize) -> f64 {
 /// question (`?`, `'`, `:`, leading `-`, bare `AND`/`OR`/`NOT`, parentheses)
 /// raises a syntax error and aborts the whole hybrid query. Wrapping each
 /// whitespace token in double quotes (embedded `"` doubled) makes every operator
-/// character match literally while preserving implicit-AND multi-term matching;
-/// the tokenizer still stems inside each quoted phrase. Single-token quoting is
-/// equivalent to a bare term under the tokenizer, so well-formed queries are
-/// unchanged; only previously-erroring inputs now return results.
+/// character match literally; the tokenizer still stems inside each quoted
+/// phrase, and single-token quoting is equivalent to a bare term under the
+/// tokenizer, so well-formed single-word queries are unchanged.
+///
+/// The quoted terms are joined with `OR`, not a space. A space is implicit AND
+/// in FTS5, which would require every word of the query to appear in a
+/// document. A stored memory is a statement; a question shares only its
+/// content words with the statement that answers it and adds interrogatives
+/// and auxiliaries ("when", "does") the statement never has, so AND-joining
+/// made the lexical arm return zero hits for any natural-language question.
+/// ORing recovers that recall: BM25 still ranks by inverse document frequency,
+/// so a rare shared term dominates the score while "the" or "when" contribute
+/// almost nothing, and RRF plus the reranker re-sort the fused result anyway.
 fn fts5_query(text: &str) -> String {
     text.split_whitespace()
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" OR ")
 }
 
 #[cfg(feature = "cluster")]
@@ -1022,9 +1031,11 @@ mod tests {
     #[tokio::test]
     async fn lexical_query_tolerates_question_punctuation() {
         // FTS5 parses a raw MATCH value as its own query language; a natural
-        // question's trailing `?` previously raised "fts5: syntax error" and
-        // aborted the whole hybrid query. The terms must still match. Regression
-        // pin for the ask tool's primary input shape.
+        // question's trailing `?` or an embedded apostrophe previously raised
+        // "fts5: syntax error" and aborted the whole hybrid query. The terms
+        // must still match. Regression pin for the ask tool's primary input
+        // shape. Quoting is what protects this, so it must hold regardless of
+        // how the quoted terms are joined.
         // Arrange
         let g = graph_at(Millis(1000)).await;
         g.insert(NewNode::now(
@@ -1041,8 +1052,84 @@ mod tests {
         // Assert
         assert!(hits.iter().any(|h| h.label == "Storage"));
 
+        // An apostrophe also opens FTS5 syntax; a question containing one must
+        // not raise a syntax error either.
+        assert!(g
+            .query(&Query::text("what's the gadget's storage?"))
+            .await
+            .is_ok());
+
         // A punctuation-only query hits the "no searchable term" guard: it must
         // return Ok (empty), never an FTS5 syntax error.
         assert!(g.query(&Query::text("???")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lexical_question_finds_the_statement_that_answers_it() {
+        // Regression pin for the whole bug: a question and the statement it
+        // answers share only content words. The question adds interrogatives
+        // ("when", "does") that a stored statement never contains, so joining
+        // the quoted terms with implicit AND required every word to appear and
+        // always returned zero hits. This fails on the pre-fix separator.
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now(
+            "fact",
+            "Gizmo ship date",
+            "The zorbnax gizmo ships in June 2026.",
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let hits = g
+            .query(&Query::text("When does the zorbnax gizmo ship?"))
+            .await
+            .unwrap();
+
+        // Assert
+        assert!(hits.iter().any(|h| h.label == "Gizmo ship date"));
+    }
+
+    #[tokio::test]
+    async fn lexical_rare_term_still_ranks_first_under_or() {
+        // ORing the quoted terms recovers recall, but recall alone would also
+        // pass if precision at the top were destroyed. This proves BM25's
+        // inverse-document-frequency weighting still does its job: "zorbnax"
+        // appears in only one of three otherwise-similar nodes, so it must
+        // dominate the common words ("the", "ships", "June", "2026") every node
+        // shares.
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now(
+            "fact",
+            "Rare",
+            "the zorbnax gizmo ships in June 2026",
+        ))
+        .await
+        .unwrap();
+        g.insert(NewNode::now(
+            "fact",
+            "Common A",
+            "the gadget ships in June 2026",
+        ))
+        .await
+        .unwrap();
+        g.insert(NewNode::now(
+            "fact",
+            "Common B",
+            "the widget ships in June 2026",
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let hits = g
+            .query(&Query::text("when does the zorbnax gizmo ship"))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(hits[0].label, "Rare");
     }
 }
