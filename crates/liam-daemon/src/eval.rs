@@ -454,6 +454,9 @@ mod run {
             // Measure what the daemon ships, including the pre-pass.
             crate::config::Config::default().ask_sufficiency_check,
             crate::config::Config::default().llm.context_tokens,
+            crate::config::Config::default()
+                .llm
+                .max_concurrent_generations,
         );
 
         // Act + score each case, printing as it goes so a slow run is readable.

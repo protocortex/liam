@@ -15,6 +15,7 @@ use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
 use crate::ask::{
     self, build_ask_prompt, clamp_ask_k, estimate_tokens, fallback_answer, fit_evidence_to_budget,
@@ -93,11 +94,22 @@ pub struct MemoryServer {
     /// built; see `config::LlmConfig::context_tokens`, which this must match so
     /// a full-size prompt never overflows the model's own context window.
     ask_context_tokens: usize,
+    /// Bounds how many `ask` calls may be inside a model call (sufficiency
+    /// pre-pass or synthesis) at once; see
+    /// `config::LlmConfig::max_concurrent_generations`. A semaphore, not a
+    /// lock, so an operator with memory headroom can raise the limit above 1
+    /// instead of every request serializing permanently.
+    generation_permits: Arc<Semaphore>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
 #[tool_router]
 impl MemoryServer {
+    // Each argument is a distinct config field threaded straight through, the
+    // established pattern in this constructor (see `ask_timeout_secs`,
+    // `ask_sufficiency_check`, `ask_context_tokens` above); a config struct
+    // parameter would hide which fields `MemoryServer` actually depends on.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<DefaultGraph>,
         embedder: Arc<dyn Embedder>,
@@ -106,7 +118,21 @@ impl MemoryServer {
         ask_timeout_secs: u64,
         ask_sufficiency_check: bool,
         ask_context_tokens: usize,
+        max_concurrent_generations: usize,
     ) -> Self {
+        // `Semaphore::new(0)` would deadlock every `ask` call forever, since no
+        // permit could ever be issued: clamp a misconfigured 0 up to the
+        // smallest usable value (fully serialized) instead of taking it
+        // literally.
+        let max_concurrent_generations = if max_concurrent_generations == 0 {
+            tracing::warn!(
+                "llm.max_concurrent_generations was 0; clamping to 1, or every ask call would \
+                 deadlock waiting for a permit that could never be issued"
+            );
+            1
+        } else {
+            max_concurrent_generations
+        };
         Self {
             store,
             embedder,
@@ -115,6 +141,7 @@ impl MemoryServer {
             ask_timeout_secs,
             ask_sufficiency_check,
             ask_context_tokens,
+            generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
             tool_router: Self::tool_router(),
         }
     }
@@ -198,6 +225,29 @@ impl MemoryServer {
                     .count_tokens(s)
                     .unwrap_or_else(|| estimate_tokens(s))
             });
+
+        // Bound concurrent generation before either model call below: both
+        // the sufficiency pre-pass and synthesis hit the model, so a permit
+        // held only across synthesis would let N sufficiency calls pile onto
+        // the GPU while only synthesis was bounded. `acquire_owned` on a
+        // clone of the `Arc` keeps the permit's lifetime independent of any
+        // borrow of `self` across the awaits below; it drops, releasing the
+        // slot, when `ask` returns.
+        let _generation_permit = match tokio::time::timeout(
+            Duration::from_secs(self.ask_timeout_secs.max(1)),
+            self.generation_permits.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return fallback_answer("no generation slot is available", evidence),
+            // Without this timeout, the k-th queued caller would wait up to
+            // k * ask_timeout_secs before its own generation budget even
+            // started, so a queue would turn one slow request into a pile of
+            // requests that each look like a hang.
+            Err(_) => return fallback_answer("timed out waiting for a generation slot", evidence),
+        };
+
         // Sufficiency pre-pass: ask whether the evidence answers the question at
         // all, and refuse outright if it does not. See
         // `ask::build_sufficiency_prompt` for why this is a separate call.
@@ -379,6 +429,67 @@ mod tests {
         }
     }
 
+    /// Blocks inside `complete()` on a `Notify` the test controls, so the test
+    /// decides exactly when a call may finish. Tracks the PEAK number of
+    /// concurrent `complete()` calls it has ever seen (fetch_add, compare
+    /// against a running max, fetch_sub on exit), because a final count of 0
+    /// proves nothing: every call reaches 0 eventually whether or not two of
+    /// them were ever in flight together.
+    struct GatedLlm {
+        release: Arc<tokio::sync::Notify>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GatedLlm {
+        fn new(release: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                release,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn in_flight(&self) -> usize {
+            self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl liam_model::Llm for GatedLlm {
+        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+            let now = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.peak
+                .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            self.release.notified().await;
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("the wibbleflux service runs nightly [1].".to_string())
+        }
+    }
+
+    /// Cooperatively yields until `condition()` is true, bounded so a real bug
+    /// panics the test instead of hanging the suite. No sleeps: progress here
+    /// depends only on the single-threaded test runtime getting a chance to
+    /// poll the other spawned task, which `yield_now` grants deterministically
+    /// (no wall-clock wait, real or paused).
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never became true; the two tasks likely deadlocked");
+    }
+
     /// Fresh in-memory server wired with the given reranker/llm, a 30s ask
     /// timeout, and the shipped default 8192-token context budget. Dims 8 to
     /// match `MockEmbedder::new(8)`.
@@ -387,13 +498,36 @@ mod tests {
     }
 
     /// Fresh in-memory server wired with the given reranker/llm/ask
-    /// timeout/context budget. Dims 8 to match `MockEmbedder::new(8)`.
+    /// timeout/context budget, generation capped to 1 concurrent call (the
+    /// shipped default). Dims 8 to match `MockEmbedder::new(8)`.
     async fn server_with_timeout(
         reranker: Arc<dyn Reranker>,
         llm: Arc<dyn Llm>,
         ask_timeout_secs: u64,
         ask_sufficiency_check: bool,
         ask_context_tokens: usize,
+    ) -> MemoryServer {
+        server_with_generation_limit(
+            reranker,
+            llm,
+            ask_timeout_secs,
+            ask_sufficiency_check,
+            ask_context_tokens,
+            1,
+        )
+        .await
+    }
+
+    /// As `server_with_timeout`, plus an explicit `max_concurrent_generations`
+    /// for the tests in this module that exercise the generation semaphore
+    /// itself; every other test goes through `server_with_timeout`'s fixed 1.
+    async fn server_with_generation_limit(
+        reranker: Arc<dyn Reranker>,
+        llm: Arc<dyn Llm>,
+        ask_timeout_secs: u64,
+        ask_sufficiency_check: bool,
+        ask_context_tokens: usize,
+        max_concurrent_generations: usize,
     ) -> MemoryServer {
         let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
             .await
@@ -406,6 +540,7 @@ mod tests {
             ask_timeout_secs,
             ask_sufficiency_check,
             ask_context_tokens,
+            max_concurrent_generations,
         )
     }
 
@@ -829,6 +964,117 @@ mod tests {
         );
         assert!(
             answer.contains("The gizmo deadline slipped to next quarter."),
+            "answer missing evidence content: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_bounds_concurrent_generation_to_the_configured_limit() {
+        // Arrange: max_concurrent_generations = 1, and a gated llm that
+        // blocks inside complete() until this test releases it, recording
+        // the peak number of complete() calls it ever saw in flight together.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm = Arc::new(GatedLlm::new(release.clone()));
+        let server = Arc::new(
+            server_with_generation_limit(
+                Arc::new(liam_model::IdentityReranker),
+                llm.clone(),
+                30,
+                false,
+                8192,
+                1,
+            )
+            .await,
+        );
+        seed(
+            &server,
+            "fact",
+            "Topic",
+            "the wibbleflux service runs nightly.",
+        )
+        .await;
+        let question = || AskArgs {
+            question: "What does the wibbleflux service do?".to_string(),
+            kind: None,
+            scope: None,
+            k: None,
+        };
+
+        // Act: two ask calls in flight at once, contending for the single
+        // permit. The second cannot enter complete() until the first's
+        // permit is dropped, which only happens once its `ask` call returns.
+        let first_server = server.clone();
+        let first = tokio::spawn(async move { first_server.ask(Parameters(question())).await });
+        wait_until(|| llm.in_flight() == 1).await;
+
+        let second_server = server.clone();
+        let second = tokio::spawn(async move { second_server.ask(Parameters(question())).await });
+
+        release.notify_one();
+        wait_until(|| llm.in_flight() == 1).await;
+        release.notify_one();
+
+        let (first_answer, second_answer) = tokio::join!(first, second);
+        first_answer.expect("first ask task panicked");
+        second_answer.expect("second ask task panicked");
+
+        // Assert: the PEAK, not the final count (which is always 0 once both
+        // calls finish and would prove nothing about whether they overlapped).
+        assert_eq!(
+            llm.peak(),
+            1,
+            "peak concurrent generation calls exceeded the configured limit of 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_returns_fallback_when_the_permit_wait_times_out() {
+        // Arrange: a 1s ask timeout and the default 1-slot limit, with a
+        // first caller parked inside generation via the gated llm and never
+        // released, so it holds the sole permit for the rest of the test.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm = Arc::new(GatedLlm::new(release));
+        let server = Arc::new(
+            server_with_generation_limit(
+                Arc::new(liam_model::IdentityReranker),
+                llm.clone(),
+                1,
+                false,
+                8192,
+                1,
+            )
+            .await,
+        );
+        seed(
+            &server,
+            "fact",
+            "Topic",
+            "the wibbleflux service runs nightly.",
+        )
+        .await;
+        let question = || AskArgs {
+            question: "What does the wibbleflux service do?".to_string(),
+            kind: None,
+            scope: None,
+            k: None,
+        };
+
+        let holder = server.clone();
+        let _first = tokio::spawn(async move { holder.ask(Parameters(question())).await });
+        wait_until(|| llm.in_flight() == 1).await;
+
+        // Act: the second call cannot acquire a permit within the 1s ask
+        // timeout, since the first is held for the rest of the test.
+        let answer = server.ask(Parameters(question())).await;
+
+        // Assert: the fallback, not a hang. `_first` is left un-awaited and
+        // un-notified; the test runtime drops it when the test ends.
+        assert!(
+            answer.contains("(synthesis unavailable"),
+            "answer missing fallback marker: {answer}"
+        );
+        assert!(
+            answer.contains("the wibbleflux service runs nightly."),
             "answer missing evidence content: {answer}"
         );
     }
