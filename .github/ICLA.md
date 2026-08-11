@@ -2,7 +2,7 @@
 
 Based on the [Apache Software Foundation Individual CLA v2.0](https://www.apache.org/licenses/icla.pdf).
 
-Thank you for your interest in contributing to projects maintained by protocortex ("the Maintainer"). To clarify the intellectual property license granted with Contributions from any person or entity, the Maintainer requires a Contributor License Agreement ("CLA") on file from each contributor. This license is for your protection as a contributor as well as the protection of the Maintainer and its users; it does not change your rights to use your own Contributions for any other purpose.
+Thank you for your interest in contributing to projects maintained by igorjs ("the Maintainer"). To clarify the intellectual property license granted with Contributions from any person or entity, the Maintainer requires a Contributor License Agreement ("CLA") on file from each contributor. This license is for your protection as a contributor as well as the protection of the Maintainer and its users; it does not change your rights to use your own Contributions for any other purpose.
 
 You accept and agree to the following terms and conditions for Your present and future Contributions submitted to the Maintainer. Except for the license granted herein to the Maintainer and recipients of software distributed by the Maintainer, You reserve all right, title, and interest in and to Your Contributions.
 
