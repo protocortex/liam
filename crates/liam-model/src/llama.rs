@@ -310,6 +310,19 @@ fn compiled_backend() -> &'static str {
     }
 }
 
+/// Decide the runtime label from an already-probed gpu offload result. This
+/// is split out from `runtime_backend` so the fallback branch, a compiled-in
+/// Metal build with no working GPU device, can be driven from a test on any
+/// host, including CI runners where Metal actually works: the test passes
+/// the probe result in rather than depending on real hardware to produce it.
+fn runtime_label(compiled: &'static str, gpu_offload: bool) -> &'static str {
+    if compiled == "llama.cpp/metal" && !gpu_offload {
+        "llama.cpp/cpu (metal unavailable)"
+    } else {
+        compiled
+    }
+}
+
 /// Refine the compile-time label with a runtime check. `compiled_backend` only
 /// knows what llama.cpp was built with; `LlamaBackend::supports_gpu_offload`
 /// (the wrapped `llama_supports_gpu_offload`) asks the ggml backend registry
@@ -319,11 +332,7 @@ fn compiled_backend() -> &'static str {
 /// depends on that: it can only catch a Metal fallback if this label is able
 /// to say cpu.
 fn runtime_backend(backend: &LlamaBackend) -> &'static str {
-    if compiled_backend() == "llama.cpp/metal" && !backend.supports_gpu_offload() {
-        "llama.cpp/cpu (metal unavailable)"
-    } else {
-        compiled_backend()
-    }
+    runtime_label(compiled_backend(), backend.supports_gpu_offload())
 }
 
 #[async_trait]
@@ -395,5 +404,52 @@ mod tests {
         // `BackendAlreadyInitialized` error surfaced from the second call,
         // which is the bug a fresh `LlamaBackend::init()` per call would hit.
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn metal_compiled_in_but_no_gpu_device_present_reports_cpu() {
+        // Arrange: the compiled label claims Metal, but the runtime probe
+        // says no GPU device actually came up. This is the branch a real
+        // machine or CI runner with working Metal can never reach on its
+        // own, which is why the probe result is passed in as a literal.
+        let compiled = "llama.cpp/metal";
+        let gpu_offload = false;
+
+        // Act
+        let label = runtime_label(compiled, gpu_offload);
+
+        // Assert: the daemon's macOS startup assertion matches on the label
+        // containing "cpu", so that is what is checked here too.
+        assert!(label.contains("cpu"));
+    }
+
+    #[test]
+    fn metal_compiled_in_with_a_working_device_reports_metal() {
+        // Arrange: the compiled label claims Metal and the runtime probe
+        // confirms a GPU device is actually available.
+        let compiled = "llama.cpp/metal";
+        let gpu_offload = true;
+
+        // Act
+        let label = runtime_label(compiled, gpu_offload);
+
+        // Assert: no fallback is needed, so the compiled label passes through
+        // unchanged.
+        assert_eq!(label, "llama.cpp/metal");
+    }
+
+    #[test]
+    fn a_cpu_build_stays_cpu_regardless_of_the_probe() {
+        // Arrange: the compiled label already says cpu; the gpu offload
+        // probe result is irrelevant to a build with no Metal compiled in.
+        let compiled = "llama.cpp/cpu";
+        let gpu_offload = true;
+
+        // Act
+        let label = runtime_label(compiled, gpu_offload);
+
+        // Assert: only a compiled Metal label can trigger the fallback
+        // check, so a cpu build reports cpu unconditionally.
+        assert_eq!(label, "llama.cpp/cpu");
     }
 }
