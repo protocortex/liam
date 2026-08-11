@@ -1,0 +1,17 @@
+# osv-scanner configuration. Discovered automatically because it sits next to
+# Cargo.lock, which is what the scanner walks.
+#
+# Keep this list empty unless an entry can justify itself. An ignored advisory
+# is a decision to ship a known issue, so each one states what it is, how it
+# reaches us, and what would let us drop the entry again.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = """
+`paste` is unmaintained. This is an unmaintained advisory, not a known
+vulnerability: the scanner itself reports no fixed version, so there is nothing
+to upgrade to. It reaches this project only transitively, through the optional
+`local` feature's candle and fastembed dependency tree, and nothing here calls
+it directly. Drop this entry once fastembed and its candle dependencies move off
+`paste`. The same advisory is ignored in deny.toml, with the same reasoning.
+"""
