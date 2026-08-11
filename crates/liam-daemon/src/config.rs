@@ -49,17 +49,15 @@ pub struct EmbedderConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
-    /// "mock" (dev) or "local" (in-process candle; needs the `local` feature).
+    /// "mock" (dev) or "llama-cpp" (in-process llama.cpp; needs the `llama`
+    /// feature). "local" was the retired candle provider.
     pub provider: String,
     /// Hugging Face model id (GGUF repo) for the local provider.
     pub model: String,
     /// GGUF filename within the repo (GGUF repos host multiple quant variants,
-    /// so the file must be named explicitly). Consumed by `CandleLlm::load`.
+    /// so the file must be named explicitly). Consumed by the llama.cpp
+    /// provider's loader.
     pub gguf_file: String,
-    /// Repo holding `tokenizer.json`. Separate from `model` because GGUF repos
-    /// ship weights only: fetching the tokenizer from the `-GGUF` repo 404s, so
-    /// this points at the base instruct repo.
-    pub tokenizer_model: String,
     /// Where model files live (offline after first fetch).
     pub cache_dir: String,
     /// Compute backend: "auto" (default), "metal", "cuda", or "cpu". `auto` takes
@@ -70,6 +68,15 @@ pub struct LlmConfig {
     /// Generate one throwaway token at startup so the backend's first-call cost
     /// (on Metal, ~10s of GPU kernel compilation) is paid before a user waits.
     pub warmup: bool,
+    /// The model's context window. Sizes both the llama.cpp context and the
+    /// evidence trimming in `ask`, because those two have to agree: if they
+    /// disagreed a full-size prompt would overflow the context and decode
+    /// would fail.
+    pub context_tokens: usize,
+    /// Generation is serialized by default: each concurrent context costs about
+    /// 110MB of KV cache, while measured parallel throughput on a saturated GPU
+    /// gains only 1.13x. Operators with headroom can raise this.
+    pub max_concurrent_generations: usize,
 }
 
 impl Default for Config {
@@ -118,22 +125,41 @@ impl Default for LlmConfig {
             // and 2/4 for Qwen3-1.7B. Apache-2.0 at this size (the 3B is not).
             model: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".into(),
             gguf_file: "qwen2.5-1.5b-instruct-q4_k_m.gguf".into(),
-            tokenizer_model: "Qwen/Qwen2.5-1.5B-Instruct".into(),
             cache_dir: "~/.liam/models".into(),
             device: "auto".into(),
             warmup: true,
+            context_tokens: 8192,
+            max_concurrent_generations: 1,
         }
     }
 }
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        if path.exists() {
-            let text = std::fs::read_to_string(path)?;
-            Ok(toml::from_str(&text)?)
-        } else {
-            Ok(Self::default())
+        if !path.exists() {
+            return Ok(Self::default());
         }
+        let text = std::fs::read_to_string(path)?;
+
+        // Parse into a permissive `toml::Value` first so we can name a removed
+        // key with a helpful error before the strict parse below rejects it as
+        // just another unknown field. We check the parsed value rather than
+        // matching on toml's error string: error text is not part of the
+        // crate's stability contract, so a string match would silently stop
+        // catching this the next time the `toml` dependency is upgraded.
+        let value: toml::Value = toml::from_str(&text)?;
+        if value
+            .get("llm")
+            .and_then(|llm| llm.get("tokenizer_model"))
+            .is_some()
+        {
+            anyhow::bail!(
+                "llm.tokenizer_model was removed: llama.cpp reads the tokenizer \
+                 from the GGUF, delete this line from your liam.toml"
+            );
+        }
+
+        Ok(toml::from_str(&text)?)
     }
 
     pub fn gc_policy(&self) -> RetentionPolicy {
@@ -164,6 +190,22 @@ impl ReclaimExt for RetentionPolicy {
 mod tests {
     use super::*;
 
+    /// Writes `contents` to a fresh, uniquely-named temp file so tests exercise
+    /// the real `Config::load` file-reading path without touching the repo's
+    /// `liam.toml`. The counter plus pid keeps filenames unique across the
+    /// parallel threads `cargo test` runs within one process.
+    fn write_temp_toml(contents: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "liam-daemon-config-test-{}-{unique}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write temp config fixture");
+        path
+    }
+
     #[test]
     fn llm_defaults_to_mock() {
         let c = Config::default();
@@ -180,7 +222,8 @@ mod tests {
         let c = Config::load(path).expect("shipped liam.toml must parse");
         assert_eq!(c.ask_timeout_secs, 30);
         assert!(c.ask_sufficiency_check);
-        assert_eq!(c.llm.tokenizer_model, "Qwen/Qwen2.5-1.5B-Instruct");
+        assert_eq!(c.llm.context_tokens, 8192);
+        assert_eq!(c.llm.max_concurrent_generations, 1);
     }
 
     #[test]
@@ -196,15 +239,27 @@ mod tests {
     }
 
     #[test]
-    fn llm_tokenizer_defaults_to_a_repo_that_ships_one() {
-        // The weights repo is a `-GGUF` mirror, which hosts quant files only, so
-        // the tokenizer must come from the base repo or loading 404s.
-        let c = Config::default();
-        assert!(c.llm.model.ends_with("-GGUF"), "model: {}", c.llm.model);
+    fn stale_tokenizer_model_key_names_itself_and_the_fix() {
+        let path = write_temp_toml("[llm]\ntokenizer_model = \"Qwen/Qwen2.5-1.5B-Instruct\"\n");
+        let err = Config::load(&path).expect_err("stale tokenizer_model must be rejected");
+        let message = err.to_string();
         assert!(
-            !c.llm.tokenizer_model.ends_with("-GGUF"),
-            "tokenizer_model must not be the GGUF repo: {}",
-            c.llm.tokenizer_model
+            message.contains("llm.tokenizer_model"),
+            "error should name the removed key: {message}"
         );
+        assert!(
+            message.contains("delete"),
+            "error should say to delete the line: {message}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn llm_context_and_concurrency_default_when_absent() {
+        let path = write_temp_toml("[llm]\nprovider = \"mock\"\n");
+        let c = Config::load(&path).expect("config without the new llm keys must still parse");
+        assert_eq!(c.llm.context_tokens, 8192);
+        assert_eq!(c.llm.max_concurrent_generations, 1);
+        let _ = std::fs::remove_file(&path);
     }
 }
