@@ -2,8 +2,8 @@
 # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default: every file requires maintainer review.
-* @protocortex
+* @igorjs
 
 # Workflow and governance files always require maintainer sign-off,
 # even if other paths delegate to additional reviewers in future.
-.github/ @protocortex
+.github/ @igorjs
