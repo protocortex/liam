@@ -197,6 +197,11 @@ fn build_llama_llm(_config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
 /// who asked for CPU explicitly gets exactly what they asked for, silently.
 /// The error exists only to catch `auto` or `metal` RESOLVING to CPU, which
 /// on Apple Silicon means Metal did not come up as expected.
+///
+/// Deliberately compiled on every platform so this branch stays unit-tested
+/// everywhere; only the macOS build actually calls it, so a non-macOS bin
+/// build sees it as unused without the `allow` below.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn macos_backend_error(backend: &str, device: DevicePreference) -> Option<String> {
     if device == DevicePreference::Cpu || !backend.contains("cpu") {
         return None;
