@@ -75,6 +75,27 @@ pub fn truncate(s: &str, max: usize) -> String {
     truncated
 }
 
+/// Rough token estimate for text a real model cannot count, i.e. whenever
+/// `Llm::count_tokens` returns `None` (the mock, and any provider without a
+/// tokenizer). WHY divide by 4: a commonly cited average for English subword
+/// tokenizers, good enough because a wrong estimate here only changes a
+/// safety margin, not correctness. The budget that calls this reserves room
+/// for the answer regardless, so over- or under-estimating shifts how much
+/// slack remains, not whether the prompt fits. Prefer `count_tokens` whenever
+/// it returns `Some`; this exists only for the case where it does not.
+///
+/// Counts chars, not bytes: `str::len()` counts UTF-8 bytes, so it over-counts
+/// every non-ASCII character, and remembered notes are user text that may be
+/// full of them. Floors at 1 so an empty or tiny string never reports 0
+/// tokens; a caller that saw 0 could treat the item as free and add it
+/// without bound.
+// `liam-daemon` has no lib target, so an unwired pub fn reads as dead code to
+// the binary build; the next Work Unit calls this from the budget path.
+#[allow(dead_code)]
+pub fn estimate_tokens(text: &str) -> usize {
+    (text.chars().count() / 4).max(1)
+}
+
 /// Render epoch-ms as an ISO-8601 UTC date (YYYY-MM-DD). WHY manual y-m-d: keeps
 /// the `time` dep at default features. Out-of-range falls back to the raw
 /// integer string so a bad timestamp can never panic the answer. WHY
@@ -151,6 +172,64 @@ pub fn build_ask_prompt(question: &str, evidence: &[Evidence]) -> (String, Strin
         render_evidence(evidence)
     );
     (system, user)
+}
+
+/// Tokens reserved for the model's generated answer inside a context `budget`.
+/// WHY: the context window holds the prompt AND the generated tokens, so
+/// sizing the prompt allowance to the full window would let generation alone
+/// overflow it. 512 matches the engine's `MAX_NEW_TOKENS` cap, but that
+/// constant lives in `liam-model`, a different crate: if it changes, this
+/// only becomes a smaller or larger safety margin, never a correctness bug,
+/// because it is a floor on free space, not a promise about how many tokens
+/// generation actually uses.
+const ANSWER_TOKEN_RESERVE: usize = 512;
+
+/// Trim `evidence` from the tail until the rendered `ask` prompt (system AND
+/// user, both returned by `build_ask_prompt`, so the long fixed system prompt
+/// is counted too, not just the part that varies) plus `ANSWER_TOKEN_RESERVE`
+/// fits inside `budget`, as measured by `count`. Retrieval ranks best-first,
+/// so the tail holds the lowest-ranked items and dropping it first keeps the
+/// strongest evidence.
+///
+/// Never returns an empty slice: if even a single item does not fit the
+/// allowance, that one item is returned anyway. Sending the model a question
+/// with zero evidence is the one input guaranteed to produce an ungrounded
+/// answer, while one oversized item still gives it something real to cite,
+/// and per-item size is already bounded by `truncate`/`MAX_EVIDENCE_CHARS`,
+/// so a single item can never be unbounded. Do not change this to return
+/// nothing when nothing fits; that trades a bounded overflow risk for a
+/// guaranteed ungrounded answer.
+///
+/// `count` is injected so this stays testable without a model: the real
+/// caller passes `Llm::count_tokens`/`estimate_tokens`, tests pass a plain
+/// closure such as counting characters.
+// `liam-daemon` has no lib target, so an unwired pub fn reads as dead code to
+// the binary build; the next Work Unit calls this from the ask handler.
+#[allow(dead_code)]
+pub fn fit_evidence_to_budget<'a>(
+    question: &str,
+    evidence: &'a [Evidence],
+    budget: usize,
+    count: impl Fn(&str) -> usize,
+) -> &'a [Evidence] {
+    let allowance = budget.saturating_sub(ANSWER_TOKEN_RESERVE);
+    let mut kept = evidence.len();
+    while kept > 1 {
+        let (system, user) = build_ask_prompt(question, &evidence[..kept]);
+        if count(&system) + count(&user) <= allowance {
+            break;
+        }
+        kept -= 1;
+    }
+    let dropped = evidence.len() - kept;
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            remaining = kept,
+            "evidence trimmed to fit context budget"
+        );
+    }
+    &evidence[..kept]
 }
 
 /// (system, user) prompt for the sufficiency pre-pass: does this evidence
@@ -455,6 +534,54 @@ mod tests {
     }
 
     #[test]
+    fn estimate_tokens_floors_an_empty_string_at_one() {
+        // Arrange
+        let text = "";
+
+        // Act
+        let tokens = estimate_tokens(text);
+
+        // Assert
+        assert_eq!(tokens, 1, "an empty string still costs a token");
+    }
+
+    #[test]
+    fn estimate_tokens_floors_a_short_string_at_one() {
+        // Arrange
+        let text = "abcd";
+
+        // Act
+        let tokens = estimate_tokens(text);
+
+        // Assert
+        assert_eq!(tokens, 1, "a 4-char string rounds down to the floor");
+    }
+
+    #[test]
+    fn estimate_tokens_divides_a_long_string_by_four() {
+        // Arrange
+        let text = "a".repeat(400);
+
+        // Act
+        let tokens = estimate_tokens(&text);
+
+        // Assert
+        assert_eq!(tokens, 100, "a 400-char string divides evenly by four");
+    }
+
+    #[test]
+    fn estimate_tokens_counts_multi_byte_chars_not_bytes() {
+        // Arrange: 4 chars that are 12 bytes in UTF-8; len() would return 3.
+        let text = "日本語で";
+
+        // Act
+        let tokens = estimate_tokens(text);
+
+        // Assert
+        assert_eq!(tokens, 1, "multi-byte chars must count as chars, not bytes");
+    }
+
+    #[test]
     fn truncate_shortens_and_marks_oversized_content() {
         // Arrange: margin large enough that the appended "…[truncated]" marker
         // itself doesn't outweigh the bytes cut, so the length assertion holds.
@@ -652,5 +779,115 @@ mod tests {
             "What was decided?",
             &items
         ));
+    }
+
+    #[test]
+    fn fit_evidence_to_budget_keeps_everything_when_it_all_fits() {
+        // Arrange: 3 items and a budget far larger than the rendered prompt.
+        let items = vec![
+            evidence("fact", "E1", "one", 0),
+            evidence("fact", "E2", "two", 0),
+            evidence("fact", "E3", "three", 0),
+        ];
+
+        // Act
+        let kept = fit_evidence_to_budget("Q?", &items, 100_000, |s| s.chars().count());
+
+        // Assert: nothing dropped, and original best-first order is preserved.
+        assert_eq!(kept.len(), 3);
+        assert_eq!(
+            kept.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
+            vec!["E1", "E2", "E3"]
+        );
+    }
+
+    #[test]
+    fn fit_evidence_to_budget_drops_the_lowest_ranked_tail_when_over_budget() {
+        // Arrange: 5 items ranked best-first (E1 strongest .. E5 weakest), and a
+        // budget derived from the real rendered prompt for the first 2 so the
+        // test does not hardcode a magic token count.
+        let items = vec![
+            evidence("fact", "E1", "alpha content", 0),
+            evidence("fact", "E2", "bravo content", 0),
+            evidence("fact", "E3", "charlie content", 0),
+            evidence("fact", "E4", "delta content", 0),
+            evidence("fact", "E5", "echo content", 0),
+        ];
+        let count = |s: &str| s.chars().count();
+        let (sys2, usr2) = build_ask_prompt("Q?", &items[..2]);
+        let (sys3, usr3) = build_ask_prompt("Q?", &items[..3]);
+        let tokens_for_2 = count(&sys2) + count(&usr2);
+        let tokens_for_3 = count(&sys3) + count(&usr3);
+        assert!(
+            tokens_for_3 > tokens_for_2,
+            "adding a 3rd item must grow the rendered prompt"
+        );
+        let budget = tokens_for_2 + ANSWER_TOKEN_RESERVE;
+
+        // Act
+        let kept = fit_evidence_to_budget("Q?", &items, budget, count);
+
+        // Assert: exactly the 2 strongest items survive, in their original
+        // order, not merely 2 items of any identity.
+        assert_eq!(kept.len(), 2);
+        assert_eq!(
+            kept.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
+            vec!["E1", "E2"]
+        );
+    }
+
+    #[test]
+    fn fit_evidence_to_budget_keeps_everything_when_it_lands_exactly_on_the_allowance() {
+        // Arrange: the budget is derived from the exact rendered prompt size,
+        // so the boundary check (<=) is exercised precisely, not by luck.
+        let items = vec![
+            evidence("fact", "E1", "alpha content", 0),
+            evidence("fact", "E2", "bravo content", 0),
+            evidence("fact", "E3", "charlie content", 0),
+        ];
+        let count = |s: &str| s.chars().count();
+        let (system, user) = build_ask_prompt("Q?", &items);
+        let exact_tokens = count(&system) + count(&user);
+        let budget = exact_tokens + ANSWER_TOKEN_RESERVE;
+
+        // Act
+        let kept = fit_evidence_to_budget("Q?", &items, budget, count);
+
+        // Assert
+        assert_eq!(kept.len(), 3);
+        assert_eq!(
+            kept.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
+            vec!["E1", "E2", "E3"]
+        );
+    }
+
+    #[test]
+    fn fit_evidence_to_budget_returns_the_single_item_when_it_alone_exceeds_budget() {
+        // Arrange: one item whose rendered prompt is far larger than the budget.
+        let items = vec![evidence("fact", "Solo", &"x".repeat(2000), 0)];
+
+        // Act
+        let kept = fit_evidence_to_budget("Q?", &items, 1, |s| s.chars().count());
+
+        // Assert: the single item is returned, not zero, and nothing panicked.
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].label, "Solo");
+    }
+
+    #[test]
+    fn fit_evidence_to_budget_returns_the_first_item_when_budget_is_below_the_reserve() {
+        // Arrange: a budget smaller than ANSWER_TOKEN_RESERVE itself.
+        let items = vec![
+            evidence("fact", "E1", "alpha", 0),
+            evidence("fact", "E2", "bravo", 0),
+            evidence("fact", "E3", "charlie", 0),
+        ];
+
+        // Act
+        let kept = fit_evidence_to_budget("Q?", &items, 10, |s| s.chars().count());
+
+        // Assert: never zero, never a panic, and it is the best-ranked item.
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].label, "E1");
     }
 }
