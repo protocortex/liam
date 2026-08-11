@@ -1,8 +1,14 @@
 name: CI
 
 on:
+  # No base-branch filter here, on purpose. With `branches: [main]` a pull
+  # request aimed at anything other than main ran zero code checks, so a stack
+  # of PRs got only the governance workflows until each one was retargeted. A
+  # clippy failure that only reproduces on Linux sat unnoticed in such a stack
+  # until the PR was reopened against main. Retargeting alone does not help,
+  # because changing the base fires `pull_request.edited`, which is not a
+  # trigger; checks start on a freshly opened PR or on a push to its branch.
   pull_request:
-    branches: [main]
   push:
     branches: [main]
 
