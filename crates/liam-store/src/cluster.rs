@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Community detection over the edge graph. Pure and database-free: the graph
 //! loads the edges and stores the assignments.
 //!

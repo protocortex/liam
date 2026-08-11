@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Pure prompt/answer formatting for the `ask` tool. Sync + dependency-light so
 //! the synthesis contract (numbered, cited, date-annotated evidence) is unit-
 //! testable without a runtime, store, or model.

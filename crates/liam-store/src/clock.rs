@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Time is a dependency, not an ambient call, so supersession and validity
 //! windows are testable at a chosen instant.
 

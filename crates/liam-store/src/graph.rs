@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The graph handle, generic over a `Backend`. Shared logic (write, read, GC,
 //! clustering) routes through the backend trait; only vector storage and search
 //! differ per backend.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! libSQL backend. Native vector search via `F32_BLOB` and `vector_distance_cos`,
 //! with embeddings in a `node_vectors` table so the search can prefilter against
 //! the live node set in one query.

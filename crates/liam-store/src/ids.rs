@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Opaque identifiers and millisecond time.
 
 use serde::{Deserialize, Serialize};

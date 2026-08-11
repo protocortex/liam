@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! MCP tool surface: `remember`, `recall`, and `ask`, wiring the store and the
 //! model.
 //!

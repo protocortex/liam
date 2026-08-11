@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `Llm` over llama.cpp, behind the `llama` feature.
 //!
 //! The backend is process-global: llama.cpp allows exactly one
