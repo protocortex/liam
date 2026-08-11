@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! All daemon configuration in one TOML file. Missing file or key falls back to
 //! defaults; unknown keys are rejected so typos fail loudly.
 

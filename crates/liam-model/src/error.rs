@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Model-side errors: embedding and reranking failures.
 
 use thiserror::Error;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The backend seam. Everything the shared graph logic needs from storage.
 //!
 //! The design insight: full-text, graph, and CRUD SQL are identical across

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! liam-model: embedding and reranking for liam.
 //!
 //! The store is model-free by design. This crate holds the `Embedder` and
