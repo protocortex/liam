@@ -38,6 +38,15 @@ pub trait Llm: Send + Sync {
     async fn warmup(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Count the tokens `text` would cost this provider, if it can. The daemon
+    /// has to fit a prompt into a fixed context window, and a wrong count
+    /// silently truncates evidence or overflows the window. `None` means this
+    /// provider cannot count, so the caller falls back to a rough estimate on
+    /// purpose instead of trusting a made-up number.
+    fn count_tokens(&self, _text: &str) -> Option<usize> {
+        None
+    }
 }
 
 /// Deterministic echo LLM for the base build and tests: no model, stable output.
@@ -975,5 +984,17 @@ mod tests {
         let b = llm.complete("be terse", "hello").await.unwrap();
         assert_eq!(a, b, "same input yields same output");
         assert!(a.contains("hello"), "output reflects the prompt");
+    }
+
+    #[test]
+    fn mock_llm_that_cannot_tokenize_reports_so() {
+        // Arrange
+        let llm = MockLlm;
+
+        // Act
+        let result = llm.count_tokens("x");
+
+        // Assert
+        assert_eq!(result, None);
     }
 }

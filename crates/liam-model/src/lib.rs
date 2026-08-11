@@ -9,6 +9,9 @@ pub mod error;
 pub mod llm;
 pub mod reranker;
 
+#[cfg(feature = "llama")]
+pub mod llama;
+
 pub use embedder::{Embedder, MockEmbedder};
 pub use error::{ModelError, Result};
 pub use llm::{Llm, MockLlm};
@@ -20,3 +23,6 @@ pub use embedder::FastEmbedEmbedder;
 pub use llm::CandleLlm;
 #[cfg(feature = "local")]
 pub use reranker::FastEmbedReranker;
+
+#[cfg(feature = "llama")]
+pub use llama::LlamaCppLlm;
