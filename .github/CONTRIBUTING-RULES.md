@@ -1,6 +1,6 @@
 # Contribution Rules
 
-These rules apply to all protocortex projects. They cover the legal requirements (DCO + CLA), commit conventions, PR process, and the **code style baseline** that every project shares. Project-specific build commands, runtime requirements, and language-specific style rules live in each project's [README](../README.md) and [CONTRIBUTING.md](../CONTRIBUTING.md).
+These rules apply to all igorjs projects. They cover the legal requirements (DCO + CLA), commit conventions, PR process, and the **code style baseline** that every project shares. Project-specific build commands, runtime requirements, and language-specific style rules live in each project's [README](../README.md) and [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Before You Start
 
@@ -62,7 +62,7 @@ First-time contributors must sign a CLA. This grants the project a license to us
 I have read the CLA Document and I hereby sign the CLA.
 ```
 
-The CLA bot will record your signature in [CONTRIBUTORS.md](CONTRIBUTORS.md). You only need to do this once across all repositories maintained by protocortex.
+The CLA bot will record your signature in [CONTRIBUTORS.md](CONTRIBUTORS.md). You only need to do this once across all repositories maintained by igorjs.
 
 **Corporate contributors:** If you are contributing on behalf of your employer, your organisation must sign the [Corporate CLA](CCLA.md). Email the signed document to security@protocortex.ai. Individual employees listed as Designated Employees do not need to sign the Individual CLA separately.
 
@@ -94,16 +94,16 @@ Always sign commits: `git commit --signoff --gpg-sign`. The `--signoff` is manda
 
 ## Code Style: Baseline
 
-These rules apply to every protocortex project. Language-specific patterns (TypeScript naming, Rust idioms, framework conventions) live in each project's `CONTRIBUTING.md`.
+These rules apply to every igorjs project. Language-specific patterns (TypeScript naming, Rust idioms, framework conventions) live in each project's `CONTRIBUTING.md`.
 
 ### License Header
 
 Every source file must start with an SPDX license header identifying the project's license. The header syntax varies by language:
 
 ```
-// Copyright 2026 protocortex. SPDX-License-Identifier: <PROJECT_LICENSE>          (TypeScript, JavaScript, Rust, C, C++, Go, Java)
-# Copyright 2026 protocortex. SPDX-License-Identifier: <PROJECT_LICENSE>           (bash, Python, Ruby, YAML, Dockerfile)
-<!-- Copyright 2026 protocortex. SPDX-License-Identifier: <PROJECT_LICENSE> -->    (HTML, Markdown, XML)
+// Copyright 2026 igorjs. SPDX-License-Identifier: <PROJECT_LICENSE>          (TypeScript, JavaScript, Rust, C, C++, Go, Java)
+# Copyright 2026 igorjs. SPDX-License-Identifier: <PROJECT_LICENSE>           (bash, Python, Ruby, YAML, Dockerfile)
+<!-- Copyright 2026 igorjs. SPDX-License-Identifier: <PROJECT_LICENSE> -->    (HTML, Markdown, XML)
 ```
 
 Replace `<PROJECT_LICENSE>` with the SPDX identifier from the project's [LICENSE](../LICENSE) file (e.g. `Apache-2.0`, `AGPL-3.0`). The pre-commit hook in each project adds missing headers to new source files automatically.
