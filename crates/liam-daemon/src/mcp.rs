@@ -7,6 +7,8 @@
 //! from 2.x through rmcp 3.1.2, the version pinned in `Cargo.toml`; re-confirm
 //! against the rmcp version you pin before bumping again.
 
+pub mod producer;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +30,14 @@ use crate::ask::{
 /// little slack for models that add punctuation or a stray word; anything longer
 /// is not a verdict and `ask::parse_sufficiency` rejects it anyway.
 const SUFFICIENCY_MAX_TOKENS: usize = 8;
+
+/// Producer id a `MemoryServer` carries until something calls
+/// `with_producer`. That is every stdio connection (`main.rs` never calls
+/// it) and, before WU-8 wires resolution into the accept loop, every socket
+/// connection too. Matches both `config::ProducersConfig::default().unknown_id`
+/// and `liam_store::NewNode`'s own default, so a server nobody has stamped a
+/// producer onto records exactly what it recorded before this field existed.
+const DEFAULT_PRODUCER: &str = "unknown";
 
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope shape to a `Query`; keeping
@@ -103,6 +113,14 @@ pub struct MemoryServer {
     /// lock, so an operator with memory headroom can raise the limit above 1
     /// instead of every request serializing permanently.
     generation_permits: Arc<Semaphore>,
+    /// Producer id stamped on every node this connection's `remember` calls
+    /// write. Per-CONNECTION, unlike every field above it, which is set once
+    /// for the process's whole lifetime: that mismatch is why this is not a
+    /// ninth constructor argument. Instead the accept loop clones an
+    /// already-constructed `MemoryServer` per connection (see `#[derive(Clone)]`
+    /// above) and calls `with_producer` on the clone, so the one process-wide
+    /// construction in `new` stays about process-lifetime dependencies only.
+    producer: String,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -145,8 +163,28 @@ impl MemoryServer {
             ask_sufficiency_check,
             ask_context_tokens,
             generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
+            producer: DEFAULT_PRODUCER.to_string(),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Returns a clone of `self` with `producer` set to `id`, stamped on
+    /// every write the clone's `remember` makes from then on. A builder over
+    /// a clone rather than a mutator or a ninth constructor argument: the
+    /// accept loop (WU-8) resolves a producer once per accepted connection,
+    /// after the one process-lifetime `MemoryServer` this module constructs
+    /// already exists, so `server.clone().with_producer(resolved_id)` is the
+    /// natural shape, and it leaves every other connection's clone
+    /// untouched.
+    ///
+    /// WU-8 is what calls this from the accept loop; until then only the
+    /// test below does, hence `#[allow(dead_code)]` rather than actually
+    /// unused, the same convention `producer::resolve` and
+    /// `transport::socket::bind` use for the same reason.
+    #[allow(dead_code)]
+    pub fn with_producer(mut self, id: impl Into<String>) -> Self {
+        self.producer = id.into();
+        self
     }
 
     #[tool(description = "Record a durable decision or fact into long-term memory.")]
@@ -155,7 +193,9 @@ impl MemoryServer {
             Ok(v) => v,
             Err(e) => return format!("embed failed: {e}"),
         };
-        let mut node = NewNode::now(args.kind, args.label, args.content).with_embedding(embedding);
+        let mut node = NewNode::now(args.kind, args.label, args.content)
+            .with_embedding(embedding)
+            .with_producer(self.producer.clone());
         if let Some(scope) = args.scope {
             node = node.with_scope(scope);
         }
@@ -586,6 +626,77 @@ mod tests {
             Arc::new(liam_model::MockLlm),
         )
         .await
+    }
+
+    /// Self-cleaning temp database path, unique per call so parallel test
+    /// binaries and leftovers from a crashed run never collide. Needed only
+    /// by the producer-stamping test below: every other test in this module
+    /// uses `:memory:`, but that test asserts through a SECOND connection
+    /// (`producer` is deliberately absent from `Hit`, so `recall`/`query`
+    /// cannot see it), and each `:memory:` connection is its own private
+    /// database, so only a file can be read back from outside the server
+    /// that wrote it.
+    fn temp_db_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "liam-daemon-mcp-producer-test-{}-{unique}.db",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn remember_stamps_the_servers_producer_on_the_written_node() {
+        use liam_store::{Backend, DefaultBackend};
+
+        // Given a MemoryServer carrying a producer
+        let db_path = temp_db_path();
+        let db_path_str = db_path.to_str().expect("temp path is valid utf-8");
+        let store = DefaultGraph::open(db_path_str, GraphConfig::new(8))
+            .await
+            .expect("open file-backed store");
+        let server = MemoryServer::new(
+            Arc::new(store),
+            Arc::new(liam_model::MockEmbedder::new(8)),
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            1,
+        )
+        .with_producer("agent-a");
+
+        // When remember writes a node
+        let out = server
+            .remember(Parameters(RememberArgs {
+                kind: "fact".to_string(),
+                label: "label".to_string(),
+                content: "content".to_string(),
+                scope: None,
+                subject: None,
+            }))
+            .await;
+        assert!(out.starts_with("remembered "), "remember failed: {out}");
+
+        // Then the stored row records that producer. Read it back through a
+        // fresh connection to the same file, since `producer` is
+        // deliberately absent from `Hit` and cannot be asserted through
+        // `recall`.
+        let raw = DefaultBackend::open(db_path_str, 1)
+            .await
+            .expect("open a second connection to the same file");
+        let rows = raw
+            .query("SELECT producer FROM nodes", &[])
+            .await
+            .expect("query nodes");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_string(0).unwrap(), "agent-a");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
     }
 
     /// Count rendered evidence blocks in a captured `system\nprompt` pair,
