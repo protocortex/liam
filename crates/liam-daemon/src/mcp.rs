@@ -9,7 +9,7 @@
 
 pub mod producer;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use liam_model::{Embedder, Llm, Reranker};
@@ -31,11 +31,13 @@ use crate::ask::{
 /// is not a verdict and `ask::parse_sufficiency` rejects it anyway.
 const SUFFICIENCY_MAX_TOKENS: usize = 8;
 
-/// Producer id a `MemoryServer` carries until something calls
-/// `with_producer`. That is every stdio connection (`main.rs` never calls
-/// it) and, before WU-8 wires resolution into the accept loop, every socket
-/// connection too. Matches both `config::ProducersConfig::default().unknown_id`
-/// and `liam_store::NewNode`'s own default, so a server nobody has stamped a
+/// Producer id a `MemoryServer` reads until something calls
+/// `with_producer`/`set_producer`. That is every stdio connection
+/// (`main.rs` never calls either) and a socket connection during the brief
+/// window between `serve` returning and the accept loop's post-handshake
+/// `set_producer` call landing (see `producer`'s field doc). Matches both
+/// `config::ProducersConfig::default().unknown_id` and
+/// `liam_store::NewNode`'s own default, so a server nobody has stamped a
 /// producer onto records exactly what it recorded before this field existed.
 const DEFAULT_PRODUCER: &str = "unknown";
 
@@ -117,10 +119,27 @@ pub struct MemoryServer {
     /// write. Per-CONNECTION, unlike every field above it, which is set once
     /// for the process's whole lifetime: that mismatch is why this is not a
     /// ninth constructor argument. Instead the accept loop clones an
-    /// already-constructed `MemoryServer` per connection (see `#[derive(Clone)]`
-    /// above) and calls `with_producer` on the clone, so the one process-wide
-    /// construction in `new` stays about process-lifetime dependencies only.
-    producer: String,
+    /// already-constructed `MemoryServer` per connection (see
+    /// `#[derive(Clone)]` above) and calls `set_producer` on the clone.
+    ///
+    /// An `OnceLock`, not a plain `String`, because of WHEN the accept loop
+    /// (WU-8) learns which producer to stamp: only after the MCP
+    /// `initialize` handshake completes, which happens inside `rmcp`'s
+    /// `serve`. By then this `MemoryServer` is already moved into the `Arc`
+    /// backing the running session and reachable only as `&MemoryServer`
+    /// (`RunningService::service`), never owned again, so the mutation has
+    /// to go through `&self`; `OnceLock::set` is a `&self` method for
+    /// exactly that reason. Each connection's clone still gets its OWN,
+    /// independently empty cell: `OnceLock`'s `Clone` impl allocates a
+    /// fresh, unset lock rather than sharing state, which is the same
+    /// per-connection isolation every other `Clone` field here already
+    /// gets, just via a different mechanism.
+    ///
+    /// Reads (`remember`, through the `producer` method below) fall back to
+    /// `DEFAULT_PRODUCER` while this is unset: every stdio connection
+    /// forever, and a socket connection during the brief window between
+    /// `serve` returning and the accept loop's `set_producer` call landing.
+    producer: OnceLock<String>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -163,28 +182,62 @@ impl MemoryServer {
             ask_sufficiency_check,
             ask_context_tokens,
             generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
-            producer: DEFAULT_PRODUCER.to_string(),
+            producer: OnceLock::new(),
             tool_router: Self::tool_router(),
         }
     }
 
     /// Returns a clone of `self` with `producer` set to `id`, stamped on
     /// every write the clone's `remember` makes from then on. A builder over
-    /// a clone rather than a mutator or a ninth constructor argument: the
-    /// accept loop (WU-8) resolves a producer once per accepted connection,
-    /// after the one process-lifetime `MemoryServer` this module constructs
-    /// already exists, so `server.clone().with_producer(resolved_id)` is the
-    /// natural shape, and it leaves every other connection's clone
-    /// untouched.
+    /// a clone, for the construction-time case: a caller that already owns a
+    /// fresh, not-yet-served `MemoryServer` (this module's own tests, mainly)
+    /// can chain this straight after `new`.
     ///
-    /// WU-8 is what calls this from the accept loop; until then only the
-    /// test below does, hence `#[allow(dead_code)]` rather than actually
-    /// unused, the same convention `producer::resolve` and
-    /// `transport::socket::bind` use for the same reason.
+    /// This is NOT what the socket accept loop (WU-8) calls, even though an
+    /// earlier draft of this comment predicted it would be: by the time a
+    /// connection's client name is known, `rmcp`'s `serve` has already moved
+    /// this value into the `Arc` backing the running session, so the accept
+    /// loop only ever gets `&MemoryServer` back, never an owned one a
+    /// by-value method could consume. See `set_producer` for that call site;
+    /// this method now simply delegates to it.
+    ///
+    /// Only this module's own tests call it (construction-time, no
+    /// transport involved), hence `#[allow(dead_code)]` rather than actually
+    /// unused, the same convention `set_producer`'s neighbours use.
     #[allow(dead_code)]
-    pub fn with_producer(mut self, id: impl Into<String>) -> Self {
-        self.producer = id.into();
+    pub fn with_producer(self, id: impl Into<String>) -> Self {
+        self.set_producer(id);
         self
+    }
+
+    /// Stamps `id` as this connection's producer through `&self`. The
+    /// `&self` receiver, not `self`, is the reason `producer` is an
+    /// `OnceLock` rather than a plain `String` at all: the accept loop
+    /// (WU-8) only learns a connecting client's declared name once `rmcp`'s
+    /// `serve` returns a `RunningService`, and by then the `MemoryServer`
+    /// driving that connection is reachable only as `&MemoryServer`
+    /// (`RunningService::service`). `OnceLock::set` is a `&self` method for
+    /// exactly this reason.
+    ///
+    /// Silently does nothing if `producer` is already set, rather than
+    /// panicking: every caller (this method, and `with_producer` above,
+    /// which delegates to it) sets it at most once per instance, so a failed
+    /// `set` can only mean a caller bug, not a race worth surfacing on the
+    /// hot path. `remember` cannot tell the difference either way; it always
+    /// just reads whatever is there.
+    pub(crate) fn set_producer(&self, id: impl Into<String>) {
+        let _ = self.producer.set(id.into());
+    }
+
+    /// The producer id to stamp on this connection's writes right now:
+    /// whatever `with_producer`/`set_producer` set, or `DEFAULT_PRODUCER` if
+    /// neither has run yet. See `producer`'s field doc for the two windows
+    /// where that fallback applies.
+    fn producer(&self) -> String {
+        self.producer
+            .get()
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_PRODUCER.to_string())
     }
 
     #[tool(description = "Record a durable decision or fact into long-term memory.")]
@@ -195,7 +248,7 @@ impl MemoryServer {
         };
         let mut node = NewNode::now(args.kind, args.label, args.content)
             .with_embedding(embedding)
-            .with_producer(self.producer.clone());
+            .with_producer(self.producer());
         if let Some(scope) = args.scope {
             node = node.with_scope(scope);
         }

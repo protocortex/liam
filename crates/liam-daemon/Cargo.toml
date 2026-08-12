@@ -30,6 +30,11 @@ time = "0.3"
 serde_json = "1"
 # storelock tests need an isolated, disposable directory per test.
 tempfile = "3"
+# WU-8's two-client acceptance test needs a real MCP client to drive the
+# socket from the outside. `client` and `transport-async-rw` are DEV-ONLY:
+# production only ever plays the server role. `cargo tree -e no-dev -p
+# liam-daemon | grep -i rmcp` must show none of this.
+rmcp = { version = "3", features = ["client", "transport-async-rw"] }
 
 [features]
 default = []

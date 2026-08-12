@@ -3,8 +3,11 @@
 //! accept loop that serves `MemoryServer` to however many clients connect.
 //!
 //! Shutdown, including unlinking the socket on the way out, is WU-6c's job;
-//! nothing here hand-rolls it. Producer resolution is WU-7's; nothing here
-//! looks at who is connecting, only that something did.
+//! nothing here hand-rolls it. Producer resolution itself (`producer::resolve`,
+//! a pure client-name-to-id lookup) is WU-7's; what lives here is WU-8's: the
+//! wiring that calls it once per connection, right after the MCP `initialize`
+//! handshake, and stamps the result onto that connection's `MemoryServer`.
+//! See `handle_connection` for exactly where and why.
 
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
@@ -13,6 +16,8 @@ use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
+use crate::config::ProducersConfig;
+use crate::mcp::producer;
 use crate::mcp::MemoryServer;
 use crate::transport::ListenerSource;
 
@@ -161,11 +166,17 @@ fn floor_max_connections(max_connections: usize) -> usize {
 /// Mode dispatch (WU-9) is what calls this from `main`; until then it is
 /// unreachable outside tests, hence `#[allow(dead_code)]` rather than
 /// actually unused.
+///
+/// `producers` is the `[producers]` table each connection's `initialize`
+/// handshake gets resolved against (see `handle_connection`); an `Arc`
+/// because it is shared, read-only, across however many connection tasks
+/// are alive at once, the same reason `server`'s own `Arc` fields are Arcs.
 #[allow(dead_code)]
 pub async fn accept_loop(
     source: ListenerSource,
     server: MemoryServer,
     max_connections: usize,
+    producers: Arc<ProducersConfig>,
 ) -> anyhow::Result<()> {
     let permits = Arc::new(Semaphore::new(floor_max_connections(max_connections)));
 
@@ -179,9 +190,10 @@ pub async fn accept_loop(
             .expect("the semaphore is never closed");
         let (stream, _addr) = listener.accept().await?;
         let server = server.clone();
+        let producers = Arc::clone(&producers);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(stream, server).await {
+            if let Err(error) = handle_connection(stream, server, producers).await {
                 tracing::warn!(error = %error, "mcp session over the socket ended with an error");
             }
         });
@@ -193,9 +205,41 @@ pub async fn accept_loop(
 /// so on) are returned to the caller to log, never panicked on:
 /// `accept_loop` spawns this per connection specifically so one session's
 /// failure stays inside its own task and never reaches another.
-async fn handle_connection(stream: UnixStream, server: MemoryServer) -> anyhow::Result<()> {
+///
+/// This is where WU-8's wiring lives: `serve` does not return a
+/// `RunningService` until the MCP `initialize` handshake is complete (rmcp
+/// 3.1.2's `serve_server_with_ct_inner` sends the initialize response
+/// before constructing it), so the connecting client's declared name is
+/// available the instant `serve` resolves. `producer::resolve` turns that
+/// name into a canonical producer id via `producers`, and
+/// `MemoryServer::set_producer` stamps it on the very `MemoryServer`
+/// instance `rmcp` is about to dispatch every tool call on for this
+/// connection, through `RunningService::service`'s `&MemoryServer`.
+///
+/// RESIDUAL RACE, documented rather than hidden: the MCP protocol forbids a
+/// client from sending a tool call before it receives the initialize
+/// response, so this window is closed in practice, but a client that
+/// pipelines a call immediately after receiving that response could in
+/// principle reach `remember`/`recall` before `set_producer` below runs and
+/// be stamped with the fallback producer instead. Nothing in the spec
+/// requires that window to be closed, and closing it would mean taking a
+/// lock on every tool call, on every connection, forever, to guard a
+/// handshake that happens once. That trade is not made here.
+async fn handle_connection(
+    stream: UnixStream,
+    server: MemoryServer,
+    producers: Arc<ProducersConfig>,
+) -> anyhow::Result<()> {
     use rmcp::ServiceExt;
     let running = server.serve(stream).await?;
+
+    let client_name = running
+        .peer_info()
+        .map(|info| info.client_info.name.clone());
+    running
+        .service()
+        .set_producer(producer::resolve(client_name.as_deref(), &producers));
+
     running.waiting().await?;
     Ok(())
 }
@@ -266,6 +310,37 @@ mod tests {
             8192,
             1,
         )
+    }
+
+    /// Same shape as `test_server`, but FILE-backed at `db_path`. WU-8's
+    /// acceptance tests need this, not `:memory:`: they assert `producer`
+    /// through a second, independent connection to the same database (see
+    /// `node_producers` below), and each `:memory:` connection is its own
+    /// private database, so a second connection would see an empty store.
+    async fn test_server_on(db_path: &Path) -> MemoryServer {
+        let store = liam_store::DefaultGraph::open(
+            db_path.to_str().expect("temp db path is valid utf-8"),
+            liam_store::GraphConfig::new(8),
+        )
+        .await
+        .expect("open file-backed store");
+        MemoryServer::new(
+            Arc::new(store),
+            Arc::new(liam_model::MockEmbedder::new(8)),
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            1,
+        )
+    }
+
+    /// A `[producers]` table with no entries: every connection resolves to
+    /// the fallback id. Good enough for tests that only need the accept loop
+    /// to run, not to assert on a specific producer.
+    fn default_producers() -> Arc<ProducersConfig> {
+        Arc::new(ProducersConfig::default())
     }
 
     #[tokio::test]
@@ -439,7 +514,7 @@ mod tests {
         let server = test_server().await;
 
         // Act
-        let result = handle_connection(server_side, server).await;
+        let result = handle_connection(server_side, server, default_producers()).await;
 
         // Assert: the session ends with an error the accept loop can log,
         // not a panic that would take the whole listener down with it.
@@ -452,7 +527,7 @@ mod tests {
         let path = TestPath::new();
         let source = bind(&path).await.expect("bind");
         let server = test_server().await;
-        tokio::spawn(accept_loop(source, server, 4));
+        tokio::spawn(accept_loop(source, server, 4, default_producers()));
 
         // A client already connected before the drop, standing in for the
         // "other" session the disconnect must not disturb.
@@ -477,5 +552,267 @@ mod tests {
                 .await
                 .expect("the listener must keep accepting after a dropped client"),
         );
+    }
+
+    /// A `[producers]` table mapping two distinct declared MCP client names
+    /// to two distinct, easily-recognised producer ids. Shared by both
+    /// acceptance tests below so the mapping itself is asserted only once,
+    /// here, by construction.
+    fn two_client_producers() -> Arc<ProducersConfig> {
+        Arc::new(ProducersConfig {
+            unknown_id: "unknown".to_string(),
+            clients: [
+                ("alice-app".to_string(), "alice".to_string()),
+                ("bob-app".to_string(), "bob".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        })
+    }
+
+    /// Declares a fixed name at `initialize` and nothing else. WU-8's whole
+    /// point is that the daemon attributes writes to WHICHEVER client made
+    /// them, so the acceptance test needs two clients that are genuinely
+    /// distinguishable at the MCP protocol level, not just two connections.
+    #[derive(Clone)]
+    struct NamedClient {
+        name: &'static str,
+    }
+
+    impl rmcp::ClientHandler for NamedClient {
+        fn get_info(&self) -> rmcp::model::ClientInfo {
+            rmcp::model::InitializeRequestParams::new(
+                rmcp::model::ClientCapabilities::default(),
+                rmcp::model::Implementation::new(self.name, "0.0.0"),
+            )
+        }
+    }
+
+    /// Connects a `NamedClient` to the daemon's socket and completes the MCP
+    /// handshake, returning the running client session.
+    async fn connect(
+        socket_path: &Path,
+        name: &'static str,
+    ) -> rmcp::service::RunningService<rmcp::RoleClient, NamedClient> {
+        use rmcp::ServiceExt;
+        let stream = UnixStream::connect(socket_path)
+            .await
+            .expect("client connects to the daemon's socket");
+        NamedClient { name }
+            .serve(stream)
+            .await
+            .expect("client MCP handshake succeeds")
+    }
+
+    /// Calls `tool` with `arguments` (a JSON object) over `peer` and returns
+    /// the tool's text content, the same shape `remember`/`recall` return.
+    async fn call_tool(
+        peer: &rmcp::service::Peer<rmcp::RoleClient>,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> String {
+        let arguments = match arguments {
+            serde_json::Value::Object(map) => map,
+            other => panic!("tool arguments must be a JSON object, got {other:?}"),
+        };
+        let result = peer
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(arguments),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{tool} call failed: {error}"));
+        result
+            .content
+            .first()
+            .and_then(|block| block.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_else(|| panic!("{tool} result carried no text content"))
+    }
+
+    fn remember_args(label: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "fact",
+            "label": label,
+            "content": content,
+            "scope": null,
+            "subject": null,
+        })
+    }
+
+    fn recall_args(query: &str) -> serde_json::Value {
+        serde_json::json!({
+            "query": query,
+            "kind": null,
+            "scope": null,
+            "k": 10,
+        })
+    }
+
+    /// Reads back every node's `(label, producer)` through a FRESH
+    /// connection to `db_path`. Mirrors `mcp`'s own
+    /// `remember_stamps_the_servers_producer_on_the_written_node` test: the
+    /// daemon's own connection sits behind the write lock, and `producer` is
+    /// deliberately absent from `Hit`, so a raw query through a second
+    /// connection is the only way to assert it from outside.
+    async fn node_producers(db_path: &Path) -> std::collections::HashMap<String, String> {
+        use liam_store::{Backend, DefaultBackend};
+        let raw = DefaultBackend::open(db_path.to_str().expect("utf-8 db path"), 1)
+            .await
+            .expect("open a fresh connection to the same database file");
+        raw.query("SELECT label, producer FROM nodes", &[])
+            .await
+            .expect("query nodes")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get_string(0).expect("label column"),
+                    row.get_string(1).expect("producer column"),
+                )
+            })
+            .collect()
+    }
+
+    /// Best-effort cleanup of a libSQL database file and its WAL sidecars
+    /// (`-wal`, `-shm`), which a plain `TestPath` does not know about.
+    fn remove_db_file(db_path: &Path) {
+        let db_path_str = db_path.to_str().expect("utf-8 db path");
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    /// The milestone's acceptance test: two MCP clients, declaring different
+    /// names, sharing one daemon over one socket. Both write, both read, and
+    /// each node comes back stamped with the producer of whoever actually
+    /// wrote it, not the connection that happens to read it back.
+    #[tokio::test]
+    async fn two_named_clients_share_one_daemon_and_each_write_is_attributed_correctly() {
+        // Given a daemon serving one socket, backed by one file database,
+        // and two MCP clients connected to it declaring different names.
+        let socket_path = TestPath::new();
+        let db_path = TestPath::new();
+        let server = test_server_on(&db_path).await;
+        let source = bind(&socket_path).await.expect("bind");
+        tokio::spawn(accept_loop(source, server, 4, two_client_producers()));
+
+        let alice = connect(&socket_path, "alice-app").await;
+        let bob = connect(&socket_path, "bob-app").await;
+
+        // When both write
+        let alice_write = call_tool(
+            alice.peer(),
+            "remember",
+            remember_args("alice-node", "alice wrote this memory"),
+        )
+        .await;
+        assert!(
+            alice_write.starts_with("remembered "),
+            "alice's write failed: {alice_write}"
+        );
+        let bob_write = call_tool(
+            bob.peer(),
+            "remember",
+            remember_args("bob-node", "bob wrote this memory"),
+        )
+        .await;
+        assert!(
+            bob_write.starts_with("remembered "),
+            "bob's write failed: {bob_write}"
+        );
+
+        // And then both read
+        let alice_view = call_tool(alice.peer(), "recall", recall_args("memory")).await;
+        let bob_view = call_tool(bob.peer(), "recall", recall_args("memory")).await;
+
+        // Then each sees both nodes, from either side of the connection.
+        assert!(
+            alice_view.contains("alice-node") && alice_view.contains("bob-node"),
+            "alice should see both nodes, got: {alice_view}"
+        );
+        assert!(
+            bob_view.contains("alice-node") && bob_view.contains("bob-node"),
+            "bob should see both nodes, got: {bob_view}"
+        );
+
+        // And each node records the producer of whoever actually wrote it,
+        // not "unknown" and not the other client's id. This is the claim
+        // the whole milestone rests on.
+        let producers = node_producers(&db_path).await;
+        assert_eq!(
+            producers.get("alice-node").map(String::as_str),
+            Some("alice"),
+            "alice-node should be attributed to alice, got: {producers:?}"
+        );
+        assert_eq!(
+            producers.get("bob-node").map(String::as_str),
+            Some("bob"),
+            "bob-node should be attributed to bob, got: {producers:?}"
+        );
+
+        remove_db_file(&db_path);
+    }
+
+    /// Given both clients writing at the same time, when all writes
+    /// complete, then none is lost: every label lands exactly once.
+    #[tokio::test]
+    async fn concurrent_writes_from_both_named_clients_are_not_lost() {
+        const PER_CLIENT: usize = 5;
+
+        // Arrange: the same one-daemon, two-client setup as above.
+        let socket_path = TestPath::new();
+        let db_path = TestPath::new();
+        let server = test_server_on(&db_path).await;
+        let source = bind(&socket_path).await.expect("bind");
+        tokio::spawn(accept_loop(source, server, 8, two_client_producers()));
+
+        let alice = connect(&socket_path, "alice-app").await;
+        let bob = connect(&socket_path, "bob-app").await;
+        let alice_peer = alice.peer().clone();
+        let bob_peer = bob.peer().clone();
+
+        // When both clients write concurrently
+        let mut writes = Vec::new();
+        for i in 0..PER_CLIENT {
+            let peer = alice_peer.clone();
+            writes.push(tokio::spawn(async move {
+                call_tool(
+                    &peer,
+                    "remember",
+                    remember_args(&format!("alice-{i}"), "alice wrote this, concurrently"),
+                )
+                .await
+            }));
+            let peer = bob_peer.clone();
+            writes.push(tokio::spawn(async move {
+                call_tool(
+                    &peer,
+                    "remember",
+                    remember_args(&format!("bob-{i}"), "bob wrote this, concurrently"),
+                )
+                .await
+            }));
+        }
+        for write in writes {
+            let outcome = write.await.expect("write task must not panic");
+            assert!(
+                outcome.starts_with("remembered "),
+                "a concurrent write failed: {outcome}"
+            );
+        }
+
+        // Then none is lost: every one of the PER_CLIENT * 2 distinct labels
+        // landed exactly once. A lost write, or two writes colliding onto
+        // the same row, would both show up as fewer than PER_CLIENT * 2
+        // entries here.
+        let producers = node_producers(&db_path).await;
+        assert_eq!(
+            producers.len(),
+            PER_CLIENT * 2,
+            "expected {} nodes, found {}: {producers:?}",
+            PER_CLIENT * 2,
+            producers.len()
+        );
+
+        remove_db_file(&db_path);
     }
 }
