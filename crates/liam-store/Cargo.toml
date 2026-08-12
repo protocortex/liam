@@ -26,10 +26,18 @@ leiden-rs = { version = "0.8", optional = true }
 
 [features]
 default = ["backend-libsql", "cluster"]
-backend-libsql = ["dep:libsql"]
+# `dep:tokio` is wired to backend-libsql too: the read pool and write mutex in
+# `backends/libsql.rs` need `tokio::sync::Mutex`, and that must not depend on
+# libsql's own tokio features happening to pull it in, because that coupling
+# breaks silently the moment libsql's feature set changes.
+backend-libsql = ["dep:libsql", "dep:tokio"]
 backend-rusqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:zerocopy", "dep:tokio"]
 cluster = ["dep:leiden-rs"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+# rt-multi-thread: the concurrent-write test needs writes to actually race
+# from separate OS threads, not just interleave cooperatively.
+# time: the read-during-write test wraps its assertion in a timeout so a
+# regression hangs the test instead of the whole suite.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"

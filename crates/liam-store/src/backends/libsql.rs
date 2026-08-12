@@ -7,8 +7,11 @@
 //! row accessors (`column_count`, `get_value`) are the surface to confirm against
 //! the version you pin.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use async_trait::async_trait;
 use libsql::{Builder, Connection, Database};
+use tokio::sync::Mutex;
 
 use crate::backend::Backend;
 use crate::error::{Error, Result};
@@ -20,18 +23,47 @@ use crate::value::{Row, Value};
 /// correct, not a parameter nobody can set yet.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
-/// Retains the `Database` handle alongside the connection it built, so more
+/// Number of independent connections held for reads on a file-backed
+/// database. Config plumbing for this arrives in WU-5 (daemon side); until
+/// then a named constant is correct here, not a setter nobody calls yet.
+const READ_POOL_SIZE: usize = 4;
+
+/// Whether `path` is the in-memory database this codebase opens (every test
+/// and caller here spells it exactly `:memory:`, the same string SQLite
+/// itself treats specially). Other URI spellings SQLite accepts for
+/// in-memory databases (`file::memory:?...`) are out of scope: nothing in
+/// this codebase produces them.
+fn is_in_memory(path: &str) -> bool {
+    path == ":memory:"
+}
+
+/// Retains the `Database` handle alongside the connections it built, so more
 /// connections can be opened against the same file later. Dropping the
-/// `Database` (as the previous version of this backend did) would leave the
-/// read pool WU-2 adds with no way to open further connections.
+/// `Database` (as an earlier version of this backend did) would leave the
+/// read pool with no way to open further connections.
 pub struct LibsqlBackend {
-    // Not read by production code yet: the read pool WU-2 adds is its first
-    // production reader. Until then this module's own tests read it directly
-    // to prove a second connection can be opened and configured, which is
-    // this Work Unit's Done When.
-    #[allow(dead_code)]
+    /// Read by `open_read_pool` (a file-backed database) or held onto simply
+    /// so more connections COULD be opened later; either way this is no
+    /// longer dead: the read pool is its production reader.
     db: Database,
-    conn: Connection,
+    /// The single write connection, taken by `execute`, `execute_batch`,
+    /// `execute_atomic`, and every vector-writing method. Guarding it with a
+    /// mutex serializes writes at the application level instead of letting
+    /// them race on `SQLITE_BUSY` and hoping `busy_timeout` sorts it out.
+    write: Mutex<Connection>,
+    /// Connections used for reads (`query`, `vector_search`), picked in
+    /// round robin. Reads never take `write`'s lock, so a read completes
+    /// even while a write is in flight; that is the entire reason this pool
+    /// exists separately from `write`.
+    ///
+    /// For an in-memory database this holds exactly one entry: a CLONE of
+    /// the write connection (see `open`), never a second `db.connect()`.
+    /// Each connection to `:memory:` is its own private database, so a
+    /// second `connect()` would silently hand reads an empty store; cloning
+    /// the `Connection` handle (cheap: it wraps an `Arc`) reuses the exact
+    /// same underlying database instead.
+    read_pool: Vec<Connection>,
+    next_reader: AtomicUsize,
 }
 
 fn err(e: libsql::Error) -> Error {
@@ -120,7 +152,7 @@ fn vector_literal(embedding: &[f32]) -> String {
 impl Backend for LibsqlBackend {
     async fn open(path: &str) -> Result<Self> {
         let db = Builder::new_local(path).build().await.map_err(err)?;
-        let conn = db.connect().map_err(err)?;
+        let write_conn = db.connect().map_err(err)?;
         // WAL is persistent in the database file, not the connection, so it
         // is set once here rather than in `configure_connection`. Verified
         // empirically against libsql 0.9.30: issuing `PRAGMA journal_mode =
@@ -132,23 +164,41 @@ impl Backend for LibsqlBackend {
         // journal mode regardless of what is requested), so it runs
         // unconditionally here and its result is asserted only for
         // file-backed paths.
-        conn.query("PRAGMA journal_mode = WAL", ())
+        write_conn
+            .query("PRAGMA journal_mode = WAL", ())
             .await
             .map_err(err)?;
-        configure_connection(&conn).await?;
-        Ok(Self { db, conn })
+        configure_connection(&write_conn).await?;
+
+        // Guard `:memory:` explicitly, before anything opens a second
+        // connection: each connection to an in-memory database is its own
+        // private database, so a pool built the normal way would hand out
+        // several empty stores.
+        let memory_read_conn = is_in_memory(path).then(|| write_conn.clone());
+
+        let mut backend = Self {
+            db,
+            write: Mutex::new(write_conn),
+            read_pool: Vec::new(),
+            next_reader: AtomicUsize::new(0),
+        };
+        backend.read_pool = match memory_read_conn {
+            Some(shared) => vec![shared],
+            None => backend.open_read_pool().await?,
+        };
+        Ok(backend)
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
-        self.conn
-            .execute(sql, libsql::params_from_iter(bind(params)))
+        let conn = self.write.lock().await;
+        conn.execute(sql, libsql::params_from_iter(bind(params)))
             .await
             .map_err(err)
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         let rows = self
-            .conn
+            .reader()
             .query(sql, libsql::params_from_iter(bind(params)))
             .await
             .map_err(err)?;
@@ -156,11 +206,13 @@ impl Backend for LibsqlBackend {
     }
 
     async fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.conn.execute_batch(sql).await.map(|_| ()).map_err(err)
+        let conn = self.write.lock().await;
+        conn.execute_batch(sql).await.map(|_| ()).map_err(err)
     }
 
     async fn execute_atomic(&self, statements: &[(String, Vec<Value>)]) -> Result<()> {
-        let tx = self.conn.transaction().await.map_err(err)?;
+        let conn = self.write.lock().await;
+        let tx = conn.transaction().await.map_err(err)?;
         for (sql, params) in statements {
             tx.execute(sql, libsql::params_from_iter(bind(params)))
                 .await
@@ -179,28 +231,28 @@ impl Backend for LibsqlBackend {
     }
 
     async fn vector_upsert(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO node_vectors (node_id, embedding) VALUES (?1, ?2)
+        let conn = self.write.lock().await;
+        conn.execute(
+            "INSERT INTO node_vectors (node_id, embedding) VALUES (?1, ?2)
                  ON CONFLICT(node_id) DO UPDATE SET embedding = excluded.embedding",
-                libsql::params_from_iter(vec![
-                    libsql::Value::Text(node_id.to_string()),
-                    libsql::Value::Blob(le_bytes(embedding)),
-                ]),
-            )
-            .await
-            .map_err(err)?;
+            libsql::params_from_iter(vec![
+                libsql::Value::Text(node_id.to_string()),
+                libsql::Value::Blob(le_bytes(embedding)),
+            ]),
+        )
+        .await
+        .map_err(err)?;
         Ok(())
     }
 
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "DELETE FROM node_vectors WHERE node_id = ?1",
-                libsql::params_from_iter(vec![libsql::Value::Text(node_id.to_string())]),
-            )
-            .await
-            .map_err(err)?;
+        let conn = self.write.lock().await;
+        conn.execute(
+            "DELETE FROM node_vectors WHERE node_id = ?1",
+            libsql::params_from_iter(vec![libsql::Value::Text(node_id.to_string())]),
+        )
+        .await
+        .map_err(err)?;
         Ok(())
     }
 
@@ -240,7 +292,7 @@ impl Backend for LibsqlBackend {
              ORDER BY vector_distance_cos(v.embedding, vector(?1)) LIMIT ?3"
         );
         let rows = self
-            .conn
+            .reader()
             .query(&sql, libsql::params_from_iter(params))
             .await
             .map_err(err)?;
@@ -251,13 +303,41 @@ impl Backend for LibsqlBackend {
     }
 
     async fn vector_sweep_orphans(&self) -> Result<u64> {
-        self.conn
-            .execute(
-                "DELETE FROM node_vectors WHERE node_id NOT IN (SELECT id FROM nodes)",
-                libsql::params_from_iter(Vec::<libsql::Value>::new()),
-            )
-            .await
-            .map_err(err)
+        let conn = self.write.lock().await;
+        conn.execute(
+            "DELETE FROM node_vectors WHERE node_id NOT IN (SELECT id FROM nodes)",
+            libsql::params_from_iter(Vec::<libsql::Value>::new()),
+        )
+        .await
+        .map_err(err)
+    }
+}
+
+impl LibsqlBackend {
+    /// Opens `READ_POOL_SIZE` fresh connections against `self.db`, each
+    /// configured with the same per-connection pragmas as every other
+    /// connection this backend hands out. Only called for file-backed
+    /// databases: `open`'s `:memory:` branch never reaches this, because a
+    /// second `db.connect()` there would open an unrelated, empty in-memory
+    /// database rather than another handle onto the same one.
+    async fn open_read_pool(&self) -> Result<Vec<Connection>> {
+        let mut pool = Vec::with_capacity(READ_POOL_SIZE);
+        for _ in 0..READ_POOL_SIZE {
+            let conn = self.db.connect().map_err(err)?;
+            configure_connection(&conn).await?;
+            pool.push(conn);
+        }
+        Ok(pool)
+    }
+
+    /// Picks the next read connection in round robin. For a file-backed
+    /// database this spreads reads across `READ_POOL_SIZE` independent
+    /// connections, none of which is `write`, so reads never queue behind a
+    /// write. For `:memory:` it always returns the single shared connection
+    /// `open` built.
+    fn reader(&self) -> &Connection {
+        let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
+        &self.read_pool[idx]
     }
 }
 
@@ -333,6 +413,117 @@ mod tests {
         // Assert: opening and querying succeed. `journal_mode` is
         // deliberately not checked here: WAL does not apply to in-memory
         // databases, so that assertion would be vacuous or wrong.
+        assert_eq!(rows[0].get_i64(0).unwrap(), 1);
+    }
+
+    async fn file_backend_at(name: &str) -> (TempDir, LibsqlBackend) {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join(name);
+        let backend = LibsqlBackend::open(path.to_str().expect("utf8 path"))
+            .await
+            .expect("open file-backed backend");
+        (dir, backend)
+    }
+
+    /// The read-during-write test must prove OVERLAP, not merely that the
+    /// read finished: a read queued behind a single shared connection would
+    /// also "finish" eventually, and that would pin nothing. So the test
+    /// takes the exact same lock `execute` would, on the same task, and
+    /// keeps the guard alive across the read. If `query` routed through
+    /// `write` too, awaiting it here (same task, so the guard can never be
+    /// released) would hang forever; the timeout turns that failure mode
+    /// into a clean test failure instead of a stuck CI job.
+    #[tokio::test]
+    async fn a_read_completes_while_the_caller_holds_the_write_lock() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("overlap.db").await;
+
+        // Act: hold the write mutex ourselves and run a read while it is
+        // still held.
+        let guard = backend.write.lock().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            backend.query("SELECT 1", &[]),
+        )
+        .await;
+
+        // Assert: the read completed, and the guard is still in scope right
+        // here, proving the read did not wait on it.
+        let rows = result
+            .expect("read did not complete while the write lock was held")
+            .expect("query succeeded");
+        assert_eq!(rows[0].get_i64(0).unwrap(), 1);
+        drop(guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_on_a_file_database_all_land_with_no_busy_error() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("concurrent.db").await;
+        backend
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+        let backend = std::sync::Arc::new(backend);
+        const WRITES: i64 = 20;
+
+        // Act: fire N writes concurrently from separate tasks on separate
+        // threads.
+        let handles: Vec<_> = (0..WRITES)
+            .map(|i| {
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    backend
+                        .execute("INSERT INTO t (id) VALUES (?1)", &[Value::Int(i)])
+                        .await
+                })
+            })
+            .collect();
+
+        // Assert: none surfaced an error (SQLITE_BUSY or otherwise), and
+        // every row landed.
+        for handle in handles {
+            handle
+                .await
+                .expect("write task did not panic")
+                .expect("write succeeded");
+        }
+        let rows = backend
+            .query("SELECT COUNT(*) FROM t", &[])
+            .await
+            .expect("count rows");
+        assert_eq!(rows[0].get_i64(0).unwrap(), WRITES);
+    }
+
+    /// Pins the `:memory:` guard: without it, this write and this read would
+    /// land on two SEPARATE, private in-memory databases (a fresh
+    /// `db.connect()` per pool slot each opens its own empty store), and the
+    /// read would come back empty.
+    #[tokio::test]
+    async fn a_memory_backed_write_is_visible_to_a_subsequent_read() {
+        // Arrange
+        let backend = LibsqlBackend::open(":memory:")
+            .await
+            .expect("open in-memory backend");
+        backend
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        // Act
+        backend
+            .execute("INSERT INTO t (id) VALUES (?1)", &[Value::Int(1)])
+            .await
+            .expect("insert");
+        let rows = backend.query("SELECT id FROM t", &[]).await.expect("query");
+
+        // Assert
+        assert_eq!(
+            backend.read_pool.len(),
+            1,
+            "the :memory: pool must be size 1"
+        );
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_i64(0).unwrap(), 1);
     }
 }
