@@ -69,17 +69,11 @@ impl StoreLock {
 
         // WU-9 adds a `liamd proxy` mode that shuttles bytes to a running
         // `serve` process instead of opening the store itself; once it
-        // exists, this message should point a user at it as the fix. It
-        // does not exist yet, so telling a user to run it today would send
-        // them after a command that fails with "not found".
-        file.try_lock().map_err(|source| {
-            anyhow::anyhow!(
-                "could not acquire the store lock at {} ({source}): another \
-                 liamd process already holds this lock file; stop that \
-                 process before starting this one",
-                lock_path.display()
-            )
-        })?;
+        // exists, the WouldBlock message below should point a user at it as
+        // the fix. It does not exist yet, so telling a user to run it today
+        // would send them after a command that fails with "not found".
+        file.try_lock()
+            .map_err(|error| anyhow::anyhow!("{}", lock_failure_message(&lock_path, &error)))?;
 
         Ok(Self(file))
     }
@@ -89,6 +83,43 @@ fn lock_path_for(database_path: &Path) -> PathBuf {
     let mut lock_path = database_path.as_os_str().to_owned();
     lock_path.push(".lock");
     PathBuf::from(lock_path)
+}
+
+/// Explains why `try_lock` failed, in words that fit the actual cause.
+///
+/// [`std::fs::File::try_lock`] fails two different ways and each calls for
+/// a different diagnosis. [`std::fs::TryLockError::WouldBlock`] means the
+/// lock is genuinely held: another process got there first. But
+/// [`std::fs::TryLockError::Error`] means the OS could not take the lock at
+/// all, most often because the filesystem does not support advisory
+/// locking, which network mounts (NFS and similar) frequently do not.
+/// Telling an operator on a network mount to "stop the other liamd
+/// process" sends them looking for a process that does not exist; this
+/// function gives that case its own message instead.
+///
+/// Both branches still refuse to start the store. If we cannot prove no
+/// other process holds it, single-writer safety cannot be guaranteed, so
+/// failing closed is correct either way. Do not change that outcome when
+/// editing this function, only the wording.
+fn lock_failure_message(lock_path: &Path, error: &std::fs::TryLockError) -> String {
+    use std::fs::TryLockError;
+
+    match error {
+        TryLockError::WouldBlock => format!(
+            "could not acquire the store lock at {} ({error}): another \
+             liamd process already holds this lock file; stop that \
+             process before starting this one",
+            lock_path.display()
+        ),
+        TryLockError::Error(source) => format!(
+            "could not acquire the store lock at {} because locking it \
+             failed ({source}): the filesystem may not support advisory \
+             locking, which network mounts frequently do not; the store \
+             is designed to live on a local filesystem, so move it there \
+             or use one that supports flock",
+            lock_path.display()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +187,57 @@ mod tests {
         assert!(
             result.is_ok(),
             "expected the lock to be free again: {result:?}"
+        );
+    }
+
+    #[test]
+    fn would_block_message_names_the_file_and_blames_another_process() {
+        // Arrange: the contention branch, the one a normal filesystem can
+        // actually produce (see `a_held_lock_fails_fast_and_names_the_file_and_the_fix`
+        // for the end-to-end version of this case).
+        let lock_path = PathBuf::from("/tmp/example/liam.db.lock");
+
+        // Act
+        let message = lock_failure_message(&lock_path, &std::fs::TryLockError::WouldBlock);
+
+        // Assert: names the lock file and points at the other process.
+        assert!(
+            message.contains(&lock_path.display().to_string()),
+            "message should name the lock file: {message}"
+        );
+        assert!(
+            message.contains("stop that process before starting this one"),
+            "message should tell the user to stop the other process: {message}"
+        );
+    }
+
+    #[test]
+    fn locking_unsupported_message_names_the_file_and_blames_the_filesystem_not_a_process() {
+        // Arrange: the "locking itself failed" branch. A normal filesystem
+        // never produces this, so it can only be exercised by constructing
+        // the error directly and driving the pure message function.
+        let lock_path = PathBuf::from("/tmp/example/liam.db.lock");
+        let error = std::fs::TryLockError::Error(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "operation not supported on this filesystem",
+        ));
+
+        // Act
+        let message = lock_failure_message(&lock_path, &error);
+
+        // Assert: names the lock file, blames the filesystem rather than a
+        // process, and gives a diagnosis distinct from the contention case.
+        assert!(
+            message.contains(&lock_path.display().to_string()),
+            "message should name the lock file: {message}"
+        );
+        assert!(
+            message.contains("filesystem may not support advisory locking"),
+            "message should name the likely cause: {message}"
+        );
+        assert!(
+            !message.contains("another liamd process"),
+            "message must not claim another process holds the lock: {message}"
         );
     }
 }
