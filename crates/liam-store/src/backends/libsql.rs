@@ -50,19 +50,7 @@ fn is_in_memory(path: &str) -> bool {
     file_part == ":memory:" || query.split('&').any(|param| param == "mode=memory")
 }
 
-/// Retains the `Database` handle alongside the connections it built, so more
-/// connections can be opened against the same file later. Dropping the
-/// `Database` (as an earlier version of this backend did) would leave the
-/// read pool with no way to open further connections.
 pub struct LibsqlBackend {
-    /// Held onto so more connections COULD be opened against the same
-    /// database later. `open` reads a local `Database` binding to build the
-    /// read pool before this field is set, so nothing reads it back out
-    /// afterward; the lint is silenced deliberately rather than by dropping
-    /// the handle, which would leave the read pool with no way to open
-    /// further connections down the line.
-    #[allow(dead_code)]
-    db: Database,
     /// The single write connection, taken by `execute`, `execute_batch`,
     /// `execute_atomic`, and every vector-writing method. Guarding it with a
     /// mutex serializes writes at the application level instead of letting
@@ -215,7 +203,6 @@ impl Backend for LibsqlBackend {
         };
 
         Ok(Self {
-            db,
             write: Mutex::new(write_conn),
             read_pool,
             next_reader: AtomicUsize::new(0),
