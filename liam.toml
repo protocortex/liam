@@ -8,6 +8,7 @@ ask_timeout_secs = 30             # ask falls back to ranked evidence past this
 ask_sufficiency_check = true      # extra yes/no pass so ask can refuse; costs one call
 socket_path    = "~/.liam/liamd.sock"   # multi-client listener; ~ is expanded before binding
 read_pool_size = 4                # independent read connections liam-store holds open
+max_connections = 16              # cap on concurrent socket connections liamd serve holds open
 
 [gc]
 episode_retention_days = 30

@@ -34,6 +34,14 @@ pub struct Config {
     /// doc for why an in-memory database ignores this regardless of what is
     /// configured here.
     pub read_pool_size: usize,
+    /// Ceiling on concurrent Unix-socket connections `transport::socket`'s
+    /// accept loop holds open at once (WU-6). Without a cap, an unbounded
+    /// accept loop can exhaust file descriptors, and each session that ends
+    /// up generating holds its own KV cache (measured around 110MB), so
+    /// this is a real resource bound, not a nicety. `0` is floored to 1 by
+    /// the accept loop rather than silently wedging it: see
+    /// `transport::socket::floor_max_connections`.
+    pub max_connections: usize,
     /// MCP client name to canonical producer id, plus the fallback id for a
     /// client this map does not name (WU-7).
     pub producers: ProducersConfig,
@@ -123,6 +131,7 @@ impl Default for Config {
             ask_sufficiency_check: true,
             socket_path: "~/.liam/liamd.sock".into(),
             read_pool_size: 4,
+            max_connections: 16,
             producers: ProducersConfig::default(),
         }
     }
@@ -292,6 +301,7 @@ mod tests {
         assert_eq!(c.llm.max_concurrent_generations, 1);
         assert_eq!(c.socket_path, "~/.liam/liamd.sock");
         assert_eq!(c.read_pool_size, 4);
+        assert_eq!(c.max_connections, 16);
         assert_eq!(c.producers.unknown_id, "unknown");
         assert!(c.producers.clients.is_empty());
     }

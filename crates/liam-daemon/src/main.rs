@@ -14,6 +14,7 @@ mod eval;
 mod mcp;
 mod storelock;
 mod telemetry;
+mod transport;
 
 use std::path::Path;
 use std::sync::Arc;
