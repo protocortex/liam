@@ -28,13 +28,26 @@ const BUSY_TIMEOUT_MS: i64 = 5000;
 /// then a named constant is correct here, not a setter nobody calls yet.
 const READ_POOL_SIZE: usize = 4;
 
-/// Whether `path` is the in-memory database this codebase opens (every test
-/// and caller here spells it exactly `:memory:`, the same string SQLite
-/// itself treats specially). Other URI spellings SQLite accepts for
-/// in-memory databases (`file::memory:?...`) are out of scope: nothing in
-/// this codebase produces them.
+/// Whether `path` is one of the in-memory database spellings SQLite
+/// accepts: the bare `:memory:`, a `file:` URI whose file part is
+/// `:memory:` (for example `file::memory:?cache=shared`), or any `file:`
+/// URI carrying a `mode=memory` query parameter (for example
+/// `file:name?mode=memory&cache=shared`). `database_path` comes from user
+/// config (`liam.toml`), so a caller can spell "in-memory" more than one
+/// way; missing a spelling here would open `READ_POOL_SIZE` separate,
+/// empty in-memory databases and silently lose every write. Forcing the
+/// pool down to one connection is safe even for `cache=shared`, where
+/// several connections would actually share the same database, so this
+/// errs toward treating a path as in-memory rather than not.
 fn is_in_memory(path: &str) -> bool {
-    path == ":memory:"
+    if path == ":memory:" {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix("file:") else {
+        return false;
+    };
+    let (file_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+    file_part == ":memory:" || query.split('&').any(|param| param == "mode=memory")
 }
 
 /// Retains the `Database` handle alongside the connections it built, so more
@@ -349,6 +362,24 @@ impl LibsqlBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn is_in_memory_matches_every_in_memory_spelling_and_rejects_file_paths() {
+        // Plain spelling, used throughout this codebase.
+        assert!(is_in_memory(":memory:"));
+        // `file:` URI whose file part is `:memory:`, with and without a
+        // trailing query string.
+        assert!(is_in_memory("file::memory:"));
+        assert!(is_in_memory("file::memory:?cache=shared"));
+        // `file:` URI naming a database but requesting `mode=memory`,
+        // regardless of where that parameter falls among others.
+        assert!(is_in_memory("file:memdb1?mode=memory&cache=shared"));
+        assert!(is_in_memory("file:memdb1?cache=shared&mode=memory"));
+        // Ordinary file paths, bare or as a `file:` URI, are not in-memory.
+        assert!(!is_in_memory("liam.db"));
+        assert!(!is_in_memory("file:liam.db"));
+        assert!(!is_in_memory("file:liam.db?mode=rwc"));
+    }
 
     /// `:memory:` cannot stand in for this: WAL is a no-op on an in-memory
     /// database, so the assertion below would be vacuous there. See
