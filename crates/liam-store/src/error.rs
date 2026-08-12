@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! One error type, backend-neutral. Backends map their native error into
 //! `Backend(String)`, so the crate does not depend on any one engine's error.
 

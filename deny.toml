@@ -20,8 +20,16 @@ version = 2
 # Allowlist tuned to the current dependency tree; extend as `cargo deny check`
 # reports new licenses (llama.cpp / fastembed deps may surface additional ones).
 #
-# This project must never ship GPL, LGPL, or AGPL code. That is a hard
-# constraint from the owner, not a preference.
+# This allowlist governs DEPENDENCIES, what LIAM consumes. It is not a
+# statement about LIAM's own license, which is AGPL-3.0-only (see LICENSE).
+# The two point in opposite directions on purpose: LIAM is strong copyleft
+# outbound, and takes no strong copyleft inbound.
+#
+# LIAM must never take a GPL, LGPL, or AGPL DEPENDENCY. That is a hard
+# constraint from the owner, not a preference. The workspace's own crates are
+# AGPL-3.0-only and appear in the dependency graph, so they are listed as
+# explicit exceptions below rather than by widening this allowlist, which
+# would also let a third-party AGPL crate in unnoticed.
 #
 # cargo-deny 0.19 has no functional `deny` field for licenses: it was removed
 # because every license not listed in `allow` below is already rejected by
@@ -49,6 +57,23 @@ allow = [
     "CDLA-Permissive-2.0",  # webpki-root-certs and webpki-roots, pulled in via ureq -> hf-hub
 ]
 confidence-threshold = 0.9
+
+# The workspace's own crates. They are AGPL-3.0-only, which the allowlist above
+# deliberately does NOT contain, because that list is for what LIAM consumes and
+# a third-party AGPL crate must still fail. Naming each of ours here keeps the
+# distinction enforceable rather than relying on a comment: adding AGPL-3.0-only
+# to `allow` would silently permit an AGPL dependency too.
+[[licenses.exceptions]]
+name = "liam-store"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "liam-model"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "liam-daemon"
+allow = ["AGPL-3.0-only"]
 
 # cargo-deny reads Cargo metadata only, so it cannot see C or C++ link-time
 # dependencies at all. The vendored llama.cpp/ggml C++ sources, libstdc++,

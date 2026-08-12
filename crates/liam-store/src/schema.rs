@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The core schema, shared across backends. It has no embedding column: vector
 //! storage is backend-owned and appended via `Backend::vector_ddl`. Open
 //! intervals use the FOREVER sentinel so every currency check is positive.

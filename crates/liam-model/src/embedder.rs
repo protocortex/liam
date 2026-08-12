@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Embedding: turn text into a vector. The store never does this; the caller
 //! (typically the daemon) embeds, then passes vectors into the store.
 

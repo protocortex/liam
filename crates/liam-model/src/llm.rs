@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Generative completion: turn a prompt into text. The store never does this;
 //! the daemon uses it for synthesis (M2) and extraction (M3).
 
