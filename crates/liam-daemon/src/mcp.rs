@@ -32,8 +32,8 @@ use crate::ask::{
 const SUFFICIENCY_MAX_TOKENS: usize = 8;
 
 /// Producer id a `MemoryServer` reads until something calls
-/// `with_producer`/`set_producer`. That is every stdio connection
-/// (`main.rs` never calls either) and a socket connection during the brief
+/// `set_producer`. That is every stdio connection
+/// (`main.rs` never calls it) and a socket connection during the brief
 /// window between `serve` returning and the accept loop's post-handshake
 /// `set_producer` call landing (see `producer`'s field doc). Matches both
 /// `config::ProducersConfig::default().unknown_id` and
@@ -187,29 +187,6 @@ impl MemoryServer {
         }
     }
 
-    /// Returns a clone of `self` with `producer` set to `id`, stamped on
-    /// every write the clone's `remember` makes from then on. A builder over
-    /// a clone, for the construction-time case: a caller that already owns a
-    /// fresh, not-yet-served `MemoryServer` (this module's own tests, mainly)
-    /// can chain this straight after `new`.
-    ///
-    /// This is NOT what the socket accept loop (WU-8) calls, even though an
-    /// earlier draft of this comment predicted it would be: by the time a
-    /// connection's client name is known, `rmcp`'s `serve` has already moved
-    /// this value into the `Arc` backing the running session, so the accept
-    /// loop only ever gets `&MemoryServer` back, never an owned one a
-    /// by-value method could consume. See `set_producer` for that call site;
-    /// this method now simply delegates to it.
-    ///
-    /// Only this module's own tests call it (construction-time, no
-    /// transport involved), hence `#[allow(dead_code)]` rather than actually
-    /// unused, the same convention `set_producer`'s neighbours use.
-    #[allow(dead_code)]
-    pub fn with_producer(self, id: impl Into<String>) -> Self {
-        self.set_producer(id);
-        self
-    }
-
     /// Stamps `id` as this connection's producer through `&self`. The
     /// `&self` receiver, not `self`, is the reason `producer` is an
     /// `OnceLock` rather than a plain `String` at all: the accept loop
@@ -220,19 +197,18 @@ impl MemoryServer {
     /// exactly this reason.
     ///
     /// Silently does nothing if `producer` is already set, rather than
-    /// panicking: every caller (this method, and `with_producer` above,
-    /// which delegates to it) sets it at most once per instance, so a failed
-    /// `set` can only mean a caller bug, not a race worth surfacing on the
-    /// hot path. `remember` cannot tell the difference either way; it always
-    /// just reads whatever is there.
+    /// panicking: every caller sets it at most once per instance, so a
+    /// failed `set` can only mean a caller bug, not a race worth surfacing
+    /// on the hot path. `remember` cannot tell the difference either way; it
+    /// always just reads whatever is there.
     pub(crate) fn set_producer(&self, id: impl Into<String>) {
         let _ = self.producer.set(id.into());
     }
 
     /// The producer id to stamp on this connection's writes right now:
-    /// whatever `with_producer`/`set_producer` set, or `DEFAULT_PRODUCER` if
-    /// neither has run yet. See `producer`'s field doc for the two windows
-    /// where that fallback applies.
+    /// whatever `set_producer` set, or `DEFAULT_PRODUCER` if it has not run
+    /// yet. See `producer`'s field doc for the two windows where that
+    /// fallback applies.
     fn producer(&self) -> String {
         self.producer
             .get()
@@ -718,8 +694,8 @@ mod tests {
             false,
             8192,
             1,
-        )
-        .with_producer("agent-a");
+        );
+        server.set_producer("agent-a");
 
         // When remember writes a node
         let out = server
