@@ -7,6 +7,7 @@
 //! retrieval; it does not own your domain model or your embedding model.
 
 mod graph;
+mod migrate;
 mod schema;
 
 pub mod backend;
