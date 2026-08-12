@@ -28,26 +28,28 @@ const BUSY_TIMEOUT_MS: i64 = 5000;
 /// then a named constant is correct here, not a setter nobody calls yet.
 const READ_POOL_SIZE: usize = 4;
 
-/// Whether `path` is one of the in-memory database spellings SQLite
-/// accepts: the bare `:memory:`, a `file:` URI whose file part is
-/// `:memory:` (for example `file::memory:?cache=shared`), or any `file:`
-/// URI carrying a `mode=memory` query parameter (for example
-/// `file:name?mode=memory&cache=shared`). `database_path` comes from user
-/// config (`liam.toml`), so a caller can spell "in-memory" more than one
-/// way; missing a spelling here would open `READ_POOL_SIZE` separate,
-/// empty in-memory databases and silently lose every write. Forcing the
-/// pool down to one connection is safe even for `cache=shared`, where
-/// several connections would actually share the same database, so this
-/// errs toward treating a path as in-memory rather than not.
-fn is_in_memory(path: &str) -> bool {
-    if path == ":memory:" {
-        return true;
-    }
-    let Some(rest) = path.strip_prefix("file:") else {
-        return false;
-    };
-    let (file_part, query) = rest.split_once('?').unwrap_or((rest, ""));
-    file_part == ":memory:" || query.split('&').any(|param| param == "mode=memory")
+/// Whether `path` can safely back a multi-connection read pool: true only
+/// for a plain filesystem path, one that does not start with `file:` and
+/// is not the bare `:memory:` spelling. `database_path` comes from user
+/// config (`liam.toml`), and libSQL accepts several in-memory spellings
+/// through a `file:` URI: `file::memory:`, a `mode=memory` query
+/// parameter, `vfs=memdb`, and possibly others this crate does not know
+/// about. Each connection to an in-memory database is its own private,
+/// empty database, so pooling one of these paths would hand every read an
+/// empty store while every write lands somewhere no read ever looks.
+///
+/// Rather than enumerate every in-memory spelling and risk missing the
+/// next one (which is exactly how this predicate's predecessor broke on
+/// `vfs=memdb`), this inverts the check: every `file:` URI is treated as
+/// unsafe to pool, full stop, because a `file:` URI can carry `vfs=`,
+/// `mode=`, `cache=`, and other query parameters that change sharing
+/// semantics in ways a string match cannot reliably decide. That includes
+/// a `file:` URI naming an ordinary on-disk file, which could safely pool
+/// but falls back to a single connection anyway. Getting that case wrong
+/// costs a little read concurrency for an exotic-ish path; an
+/// unrecognised spelling must cost performance, never correctness.
+fn can_pool_reads(path: &str) -> bool {
+    path != ":memory:" && !path.starts_with("file:")
 }
 
 pub struct LibsqlBackend {
@@ -61,12 +63,14 @@ pub struct LibsqlBackend {
     /// even while a write is in flight; that is the entire reason this pool
     /// exists separately from `write`.
     ///
-    /// For an in-memory database this holds exactly one entry: a CLONE of
-    /// the write connection (see `open`), never a second `db.connect()`.
-    /// Each connection to `:memory:` is its own private database, so a
-    /// second `connect()` would silently hand reads an empty store; cloning
-    /// the `Connection` handle (cheap: it wraps an `Arc`) reuses the exact
-    /// same underlying database instead.
+    /// For any path `can_pool_reads` does not deem safe to pool (every
+    /// in-memory spelling, and, conservatively, every `file:` URI) this
+    /// holds exactly one entry: a CLONE of the write connection (see
+    /// `open`), never a second `db.connect()`. Each connection to an
+    /// in-memory database is its own private database, so a second
+    /// `connect()` would silently hand reads an empty store; cloning the
+    /// `Connection` handle (cheap: it wraps an `Arc`) reuses the exact same
+    /// underlying database instead.
     read_pool: Vec<Connection>,
     next_reader: AtomicUsize,
 }
@@ -97,10 +101,11 @@ async fn configure_connection(conn: &Connection) -> Result<()> {
 
 /// Opens `READ_POOL_SIZE` fresh connections against `db`, each configured
 /// with the same per-connection pragmas as every other connection this
-/// backend hands out. Only called for file-backed databases: `open`'s
-/// `:memory:` branch never reaches this, because a second `db.connect()`
-/// there would open an unrelated, empty in-memory database rather than
-/// another handle onto the same one.
+/// backend hands out. Only called when `can_pool_reads` judges `path` safe
+/// to pool: `open`'s single-connection branch never reaches this, because
+/// a second `db.connect()` against an in-memory database, or any path this
+/// crate cannot be sure is not one, would open an unrelated, empty
+/// database rather than another handle onto the same one.
 async fn open_read_pool(db: &Database) -> Result<Vec<Connection>> {
     let mut pool = Vec::with_capacity(READ_POOL_SIZE);
     for _ in 0..READ_POOL_SIZE {
@@ -191,13 +196,14 @@ impl Backend for LibsqlBackend {
             .map_err(err)?;
         configure_connection(&write_conn).await?;
 
-        // Guard `:memory:` explicitly, before anything opens a second
-        // connection: each connection to an in-memory database is its own
-        // private database, so a pool built the normal way would hand out
-        // several empty stores.
-        let memory_read_conn = is_in_memory(path).then(|| write_conn.clone());
+        // Guard every path that is not unambiguously poolable, before
+        // anything opens a second connection: each connection to an
+        // in-memory database is its own private database, so a pool built
+        // the normal way would hand out several empty stores for any path
+        // this crate fails to recognise as such.
+        let single_read_conn = (!can_pool_reads(path)).then(|| write_conn.clone());
 
-        let read_pool = match memory_read_conn {
+        let read_pool = match single_read_conn {
             Some(shared) => vec![shared],
             None => open_read_pool(&db).await?,
         };
@@ -334,11 +340,11 @@ impl Backend for LibsqlBackend {
 }
 
 impl LibsqlBackend {
-    /// Picks the next read connection in round robin. For a file-backed
-    /// database this spreads reads across `READ_POOL_SIZE` independent
-    /// connections, none of which is `write`, so reads never queue behind a
-    /// write. For `:memory:` it always returns the single shared connection
-    /// `open` built.
+    /// Picks the next read connection in round robin. For a path
+    /// `can_pool_reads` judges safe this spreads reads across
+    /// `READ_POOL_SIZE` independent connections, none of which is `write`,
+    /// so reads never queue behind a write. Otherwise it always returns the
+    /// single shared connection `open` built.
     fn reader(&self) -> &Connection {
         let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
         &self.read_pool[idx]
@@ -351,21 +357,33 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn is_in_memory_matches_every_in_memory_spelling_and_rejects_file_paths() {
-        // Plain spelling, used throughout this codebase.
-        assert!(is_in_memory(":memory:"));
+    fn can_pool_reads_is_true_only_for_a_plain_filesystem_path() {
+        // Plain `:memory:`, used throughout this codebase.
+        assert!(!can_pool_reads(":memory:"));
         // `file:` URI whose file part is `:memory:`, with and without a
         // trailing query string.
-        assert!(is_in_memory("file::memory:"));
-        assert!(is_in_memory("file::memory:?cache=shared"));
-        // `file:` URI naming a database but requesting `mode=memory`,
-        // regardless of where that parameter falls among others.
-        assert!(is_in_memory("file:memdb1?mode=memory&cache=shared"));
-        assert!(is_in_memory("file:memdb1?cache=shared&mode=memory"));
-        // Ordinary file paths, bare or as a `file:` URI, are not in-memory.
-        assert!(!is_in_memory("liam.db"));
-        assert!(!is_in_memory("file:liam.db"));
-        assert!(!is_in_memory("file:liam.db?mode=rwc"));
+        assert!(!can_pool_reads("file::memory:"));
+        assert!(!can_pool_reads("file::memory:?cache=shared"));
+        // `file:` URI naming a database but requesting `mode=memory`.
+        assert!(!can_pool_reads("file:x?mode=memory"));
+        // `vfs=memdb`: libSQL's other in-memory spelling, the one the old
+        // string-matching `is_in_memory` predicate missed, which is the
+        // exact bug this predicate exists to make impossible to repeat.
+        assert!(!can_pool_reads("file:x?vfs=memdb"));
+        assert!(!can_pool_reads("file:x?cache=shared&vfs=memdb"));
+
+        // Plain filesystem paths, relative or absolute, are the only case
+        // unambiguous enough to pool.
+        assert!(can_pool_reads("liam.db"));
+        assert!(can_pool_reads("/var/lib/liam/liam.db"));
+
+        // A `file:` URI naming an ordinary on-disk file also takes the
+        // single-connection path, even though it could safely pool. This
+        // is deliberate, safe conservatism, not a bug: a `file:` URI can
+        // carry query parameters this predicate does not try to parse, so
+        // every `file:` URI is treated as unsafe to pool rather than
+        // guessing at which parameters matter.
+        assert!(!can_pool_reads("file:liam.db?mode=rwc"));
     }
 
     /// `:memory:` cannot stand in for this: WAL is a no-op on an in-memory
@@ -538,6 +556,48 @@ mod tests {
             backend.read_pool.len(),
             1,
             "the :memory: pool must be size 1"
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_i64(0).unwrap(), 1);
+    }
+
+    /// Regression test for a bug caught in review: the old `is_in_memory`
+    /// predicate matched `:memory:` and `mode=memory` but missed
+    /// `vfs=memdb`, libSQL's other in-memory spelling. `database_path`
+    /// comes from user config, so `file:x?vfs=memdb` is a legitimate
+    /// `liam.toml` value, and with the old predicate it fell through to
+    /// `open_read_pool`, which opened four separate, empty memdb
+    /// databases; every read then missed every write. Confirmed
+    /// empirically before the fix: opening this same URI through the full
+    /// `Graph` API and querying after an insert failed with `no such
+    /// table: nodes_fts`, because the pooled read connection never saw the
+    /// schema the write connection created. `can_pool_reads` closes this
+    /// by treating every `file:` URI as unsafe to pool, so this must keep
+    /// falling back to a single shared connection no matter what other
+    /// in-memory spelling libSQL adds in the future.
+    #[tokio::test]
+    async fn a_vfs_memdb_backed_write_is_visible_to_a_subsequent_read() {
+        // Arrange
+        let backend = LibsqlBackend::open("file:vfs_memdb_regression?vfs=memdb")
+            .await
+            .expect("open vfs=memdb backend");
+        backend
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        // Act
+        backend
+            .execute("INSERT INTO t (id) VALUES (?1)", &[Value::Int(1)])
+            .await
+            .expect("insert");
+        let rows = backend.query("SELECT id FROM t", &[]).await.expect("query");
+
+        // Assert
+        assert_eq!(
+            backend.read_pool.len(),
+            1,
+            "the vfs=memdb pool must fall back to a single shared connection"
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_i64(0).unwrap(), 1);
