@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_connection_created_after_open_gets_the_configured_busy_timeout() {
+    async fn a_read_pool_connection_has_the_configured_busy_timeout() {
         // Arrange
         let dir = TempDir::new().expect("create temp dir");
         let path = dir.path().join("busy.db");
@@ -413,19 +413,13 @@ mod tests {
             .await
             .expect("open file-backed backend");
 
-        // Act: open a further connection the way the read pool (WU-2) will,
-        // routed through the same per-connection pragma helper, and query
-        // its busy_timeout back rather than assuming the call landed.
-        let second = backend
-            .db
-            .connect()
-            .map_err(err)
-            .expect("second connection");
-        configure_connection(&second)
-            .await
-            .expect("configure second connection");
+        // Act: query the pragma on an actual read pool connection, the one
+        // `query` and `vector_search` hand every read to, rather than a
+        // connection this test builds and configures itself. That pins
+        // `open_read_pool` calling `configure_connection`, not merely that
+        // the helper works in isolation.
         let rows = read_rows(
-            second
+            backend.read_pool[0]
                 .query("PRAGMA busy_timeout", ())
                 .await
                 .expect("query busy_timeout"),
