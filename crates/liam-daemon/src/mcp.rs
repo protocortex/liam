@@ -3,8 +3,9 @@
 //! model.
 //!
 //! VERSION CHECK: the rmcp macro surface (`#[tool_router]`, `#[tool]`,
-//! `#[tool_handler]`, `Parameters`) moves across releases. Confirm against the
-//! rmcp version you pin.
+//! `#[tool_handler]`, `Parameters`) moves across releases. Confirmed unchanged
+//! from 2.x through rmcp 3.1.2, the version pinned in `Cargo.toml`; re-confirm
+//! against the rmcp version you pin before bumping again.
 
 use std::sync::Arc;
 use std::time::Duration;
