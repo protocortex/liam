@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Reranking: a precision stage after retrieval. Given the query and candidate
 //! texts, score them so the store's fused order can be refined. This is the
 //! local cross-encoder step; it needs a model, so it lives here, not in the store.

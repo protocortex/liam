@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Structured logging to STDERR. Never stdout: the MCP stdio transport carries
 //! JSON-RPC there, and any stray write corrupts the protocol.
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Grounding eval for the `ask` tool against the real local model.
 //!
 //! The handler tests in `mcp.rs` use `MockLlm`, so they pin the pipeline and the
