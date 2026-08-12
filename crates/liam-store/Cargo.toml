@@ -32,3 +32,4 @@ cluster = ["dep:leiden-rs"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+tempfile = "3"
