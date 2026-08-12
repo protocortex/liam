@@ -67,6 +67,15 @@ pub struct NewNode {
     /// same subject in the same scope are treated as competing versions.
     pub subject: Option<String>,
     pub confidence: f64,
+    /// Who wrote this node: an MCP client identity, a job name, or
+    /// `"unknown"`. Written and stored only; it is deliberately absent from
+    /// `Hit`, `Query`, and every daemon tool surface, since exposing
+    /// provenance on read is M2.6 (tool surface) and M3.5 (scope/identity
+    /// semantics), not this change. It also plays no part in the
+    /// `upsert_by`/`supersede` competitor key: two live nodes for one
+    /// subject differing only by producer is the conflict M3.5 owns, so
+    /// last writer still wins here regardless of who wrote it.
+    pub producer: String,
 }
 
 impl NewNode {
@@ -85,6 +94,7 @@ impl NewNode {
             scope: None,
             subject: None,
             confidence: 1.0,
+            producer: "unknown".to_string(),
         }
     }
     /// An entity page node. `entity_type` becomes the `kind` (e.g. "person",
@@ -119,6 +129,10 @@ impl NewNode {
     }
     pub fn with_confidence(mut self, confidence: f64) -> Self {
         self.confidence = confidence;
+        self
+    }
+    pub fn with_producer(mut self, producer: impl Into<String>) -> Self {
+        self.producer = producer.into();
         self
     }
 }
