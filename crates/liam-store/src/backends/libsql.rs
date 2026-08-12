@@ -23,10 +23,11 @@ use crate::value::{Row, Value};
 /// correct, not a parameter nobody can set yet.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
-/// Number of independent connections held for reads on a file-backed
-/// database. Config plumbing for this arrives in WU-5 (daemon side); until
-/// then a named constant is correct here, not a setter nobody calls yet.
-const READ_POOL_SIZE: usize = 4;
+/// The smallest read pool `open` will ever build. `reader()` computes `%
+/// self.read_pool.len()`, an integer division whose divisor must never be
+/// zero, so a configured `read_pool_size` of 0 is floored to this instead
+/// of producing an empty pool.
+const MIN_READ_POOL_SIZE: usize = 1;
 
 /// Whether `path` can safely back a multi-connection read pool: true only
 /// for a plain filesystem path, one that does not start with `file:` and
@@ -99,16 +100,21 @@ async fn configure_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Opens `READ_POOL_SIZE` fresh connections against `db`, each configured
+/// Opens `read_pool_size` fresh connections against `db`, each configured
 /// with the same per-connection pragmas as every other connection this
 /// backend hands out. Only called when `can_pool_reads` judges `path` safe
 /// to pool: `open`'s single-connection branch never reaches this, because
 /// a second `db.connect()` against an in-memory database, or any path this
 /// crate cannot be sure is not one, would open an unrelated, empty
 /// database rather than another handle onto the same one.
-async fn open_read_pool(db: &Database) -> Result<Vec<Connection>> {
-    let mut pool = Vec::with_capacity(READ_POOL_SIZE);
-    for _ in 0..READ_POOL_SIZE {
+///
+/// Callers must pass a `read_pool_size` of at least 1: `reader()` picks a
+/// connection with `% self.read_pool.len()`, which panics on an empty pool.
+/// `open` enforces that floor before calling this, so it is not repeated
+/// here.
+async fn open_read_pool(db: &Database, read_pool_size: usize) -> Result<Vec<Connection>> {
+    let mut pool = Vec::with_capacity(read_pool_size);
+    for _ in 0..read_pool_size {
         let conn = db.connect().map_err(err)?;
         configure_connection(&conn).await?;
         pool.push(conn);
@@ -176,7 +182,7 @@ fn vector_literal(embedding: &[f32]) -> String {
 
 #[async_trait]
 impl Backend for LibsqlBackend {
-    async fn open(path: &str) -> Result<Self> {
+    async fn open(path: &str, read_pool_size: usize) -> Result<Self> {
         let db = Builder::new_local(path).build().await.map_err(err)?;
         let write_conn = db.connect().map_err(err)?;
         // WAL is persistent in the database file, not the connection, so it
@@ -205,7 +211,9 @@ impl Backend for LibsqlBackend {
 
         let read_pool = match single_read_conn {
             Some(shared) => vec![shared],
-            None => open_read_pool(&db).await?,
+            // Floored here, the only place a pool is actually built: see
+            // `MIN_READ_POOL_SIZE` for why.
+            None => open_read_pool(&db, read_pool_size.max(MIN_READ_POOL_SIZE)).await?,
         };
 
         Ok(Self {
@@ -341,10 +349,10 @@ impl Backend for LibsqlBackend {
 
 impl LibsqlBackend {
     /// Picks the next read connection in round robin. For a path
-    /// `can_pool_reads` judges safe this spreads reads across
-    /// `READ_POOL_SIZE` independent connections, none of which is `write`,
-    /// so reads never queue behind a write. Otherwise it always returns the
-    /// single shared connection `open` built.
+    /// `can_pool_reads` judges safe this spreads reads across the
+    /// configured number of independent connections, none of which is
+    /// `write`, so reads never queue behind a write. Otherwise it always
+    /// returns the single shared connection `open` built.
     fn reader(&self) -> &Connection {
         let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
         &self.read_pool[idx]
@@ -355,6 +363,13 @@ impl LibsqlBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Pool size for tests that only need a working backend and do not care
+    /// how many read connections it holds; the dedicated pool-size tests
+    /// below (`a_read_pool_size_of_zero_is_floored_to_one_connection`,
+    /// `a_configured_read_pool_size_is_honoured_for_a_file_backed_database`)
+    /// use their own explicit, meaningful values instead.
+    const ARBITRARY_POOL_SIZE: usize = 4;
 
     #[test]
     fn can_pool_reads_is_true_only_for_a_plain_filesystem_path() {
@@ -397,7 +412,7 @@ mod tests {
         let path = dir.path().join("wal.db");
 
         // Act
-        let backend = LibsqlBackend::open(path.to_str().expect("utf8 path"))
+        let backend = LibsqlBackend::open(path.to_str().expect("utf8 path"), ARBITRARY_POOL_SIZE)
             .await
             .expect("open file-backed backend");
         let rows = backend
@@ -414,7 +429,7 @@ mod tests {
         // Arrange
         let dir = TempDir::new().expect("create temp dir");
         let path = dir.path().join("busy.db");
-        let backend = LibsqlBackend::open(path.to_str().expect("utf8 path"))
+        let backend = LibsqlBackend::open(path.to_str().expect("utf8 path"), ARBITRARY_POOL_SIZE)
             .await
             .expect("open file-backed backend");
 
@@ -439,7 +454,7 @@ mod tests {
     #[tokio::test]
     async fn memory_backend_opens_and_executes_without_a_wal_assertion() {
         // Arrange & Act
-        let backend = LibsqlBackend::open(":memory:")
+        let backend = LibsqlBackend::open(":memory:", ARBITRARY_POOL_SIZE)
             .await
             .expect("open in-memory backend");
         let rows = backend.query("SELECT 1", &[]).await.expect("query");
@@ -450,10 +465,10 @@ mod tests {
         assert_eq!(rows[0].get_i64(0).unwrap(), 1);
     }
 
-    async fn file_backend_at(name: &str) -> (TempDir, LibsqlBackend) {
+    async fn file_backend_at(name: &str, read_pool_size: usize) -> (TempDir, LibsqlBackend) {
         let dir = TempDir::new().expect("create temp dir");
         let path = dir.path().join(name);
-        let backend = LibsqlBackend::open(path.to_str().expect("utf8 path"))
+        let backend = LibsqlBackend::open(path.to_str().expect("utf8 path"), read_pool_size)
             .await
             .expect("open file-backed backend");
         (dir, backend)
@@ -470,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_completes_while_the_caller_holds_the_write_lock() {
         // Arrange
-        let (_dir, backend) = file_backend_at("overlap.db").await;
+        let (_dir, backend) = file_backend_at("overlap.db", ARBITRARY_POOL_SIZE).await;
 
         // Act: hold the write mutex ourselves and run a read while it is
         // still held.
@@ -493,7 +508,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes_on_a_file_database_all_land_with_no_busy_error() {
         // Arrange
-        let (_dir, backend) = file_backend_at("concurrent.db").await;
+        let (_dir, backend) = file_backend_at("concurrent.db", ARBITRARY_POOL_SIZE).await;
         backend
             .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             .await
@@ -536,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn a_memory_backed_write_is_visible_to_a_subsequent_read() {
         // Arrange
-        let backend = LibsqlBackend::open(":memory:")
+        let backend = LibsqlBackend::open(":memory:", ARBITRARY_POOL_SIZE)
             .await
             .expect("open in-memory backend");
         backend
@@ -578,9 +593,10 @@ mod tests {
     #[tokio::test]
     async fn a_vfs_memdb_backed_write_is_visible_to_a_subsequent_read() {
         // Arrange
-        let backend = LibsqlBackend::open("file:vfs_memdb_regression?vfs=memdb")
-            .await
-            .expect("open vfs=memdb backend");
+        let backend =
+            LibsqlBackend::open("file:vfs_memdb_regression?vfs=memdb", ARBITRARY_POOL_SIZE)
+                .await
+                .expect("open vfs=memdb backend");
         backend
             .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             .await
@@ -601,5 +617,38 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_i64(0).unwrap(), 1);
+    }
+
+    /// A configured `read_pool_size` of 0 must not produce an empty pool:
+    /// `reader()` computes `% self.read_pool.len()`, which panics on divide
+    /// by zero the moment any query runs. `open` floors the size at 1, so
+    /// this proves the floor rather than merely that `open` did not panic.
+    #[tokio::test]
+    async fn a_read_pool_size_of_zero_is_floored_to_one_connection() {
+        // Given a configured read_pool_size of 0
+        let (_dir, backend) = file_backend_at("zero_pool.db", 0).await;
+
+        // Then the pool has at least one connection
+        assert_eq!(backend.read_pool.len(), 1);
+
+        // When a read runs (the operation that divides by the pool length)
+        let rows = backend.query("SELECT 1", &[]).await;
+
+        // Then it succeeds rather than panicking
+        assert_eq!(rows.expect("query must succeed")[0].get_i64(0).unwrap(), 1);
+    }
+
+    /// Pins the plumbing this Work Unit exists for: a configured
+    /// `read_pool_size` must reach `LibsqlBackend::open` and actually size
+    /// the pool, not just parse in `liam.toml` and go nowhere. 7 is
+    /// deliberately not the old hardcoded default (4), so this cannot pass
+    /// by coincidence.
+    #[tokio::test]
+    async fn a_configured_read_pool_size_is_honoured_for_a_file_backed_database() {
+        // Given a configured read_pool_size of 7
+        let (_dir, backend) = file_backend_at("seven_pool.db", 7).await;
+
+        // Then the pool actually has that many connections
+        assert_eq!(backend.read_pool.len(), 7);
     }
 }

@@ -2,6 +2,7 @@
 //! All daemon configuration in one TOML file. Missing file or key falls back to
 //! defaults; unknown keys are rejected so typos fail loudly.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -24,6 +25,18 @@ pub struct Config {
     /// question its evidence cannot answer. Costs one extra short model call per
     /// `ask`, so turn it off if latency matters more than refusals.
     pub ask_sufficiency_check: bool,
+    /// Unix socket path for the multi-client listener (WU-6). `~` is not
+    /// meaningful to the socket API, so resolve it with `expand_tilde`
+    /// before binding rather than passing this literally.
+    pub socket_path: String,
+    /// Independent connections `liam-store` holds open for reads; passed
+    /// straight through to `GraphConfig::read_pool_size`. See that field's
+    /// doc for why an in-memory database ignores this regardless of what is
+    /// configured here.
+    pub read_pool_size: usize,
+    /// MCP client name to canonical producer id, plus the fallback id for a
+    /// client this map does not name (WU-7).
+    pub producers: ProducersConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +93,23 @@ pub struct LlmConfig {
     pub max_concurrent_generations: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProducersConfig {
+    /// Producer id recorded for a connecting MCP client whose name is not a
+    /// key in `clients`. Defaults to "unknown", the same fallback
+    /// `nodes.producer` uses for a database predating producer tracking, so
+    /// an unrecognised client looks the same as a pre-existing row.
+    pub unknown_id: String,
+    /// MCP client name to canonical producer id (WU-7 resolves each
+    /// connection through this). Kept as its own field rather than flattened
+    /// into `ProducersConfig` itself: a free-form map of arbitrary keys
+    /// cannot carry `deny_unknown_fields`, since every key is unknown by
+    /// design, so nesting it under a named key is what lets this struct, and
+    /// every other section, keep that strictness.
+    pub clients: HashMap<String, String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -91,6 +121,18 @@ impl Default for Config {
             llm: LlmConfig::default(),
             ask_timeout_secs: 30,
             ask_sufficiency_check: true,
+            socket_path: "~/.liam/liamd.sock".into(),
+            read_pool_size: 4,
+            producers: ProducersConfig::default(),
+        }
+    }
+}
+
+impl Default for ProducersConfig {
+    fn default() -> Self {
+        Self {
+            unknown_id: "unknown".into(),
+            clients: HashMap::new(),
         }
     }
 }
@@ -132,6 +174,29 @@ impl Default for LlmConfig {
             context_tokens: 8192,
             max_concurrent_generations: 1,
         }
+    }
+}
+
+/// Expands a leading `~` to `home`. A bare `~` becomes `home`; `~/rest`
+/// becomes `{home}/rest`; anything else, including a path with no leading
+/// `~`, is returned unchanged. Takes `home` explicitly rather than reading
+/// `$HOME` itself, so this stays a pure function tests can exercise without
+/// touching the process environment.
+///
+/// `socket_path` defaults to `~/.liam/liamd.sock`, and the socket API has no
+/// notion of `~`, so a caller must resolve it through this (or an
+/// equivalent) before using it as a filesystem path. The listener that does
+/// that binding is WU-6's, not this Work Unit's, so this is unused outside
+/// tests for now; kept and tested here, where the config surface it resolves
+/// is defined.
+#[allow(dead_code)]
+pub(crate) fn expand_tilde(path: &str, home: &str) -> String {
+    if path == "~" {
+        return home.to_string();
+    }
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("{home}/{rest}"),
+        None => path.to_string(),
     }
 }
 
@@ -225,6 +290,10 @@ mod tests {
         assert!(c.ask_sufficiency_check);
         assert_eq!(c.llm.context_tokens, 8192);
         assert_eq!(c.llm.max_concurrent_generations, 1);
+        assert_eq!(c.socket_path, "~/.liam/liamd.sock");
+        assert_eq!(c.read_pool_size, 4);
+        assert_eq!(c.producers.unknown_id, "unknown");
+        assert!(c.producers.clients.is_empty());
     }
 
     #[test]
@@ -262,5 +331,92 @@ mod tests {
         assert_eq!(c.llm.context_tokens, 8192);
         assert_eq!(c.llm.max_concurrent_generations, 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn producers_table_maps_client_names_to_producer_ids() {
+        // Given a config with `[producers]` entries
+        let path = write_temp_toml(
+            "[producers]\n\
+             unknown_id = \"guest\"\n\
+             \n\
+             [producers.clients]\n\
+             claude-code = \"claude\"\n\
+             ai-notetaker = \"notetaker\"\n",
+        );
+
+        // When loaded
+        let c = Config::load(&path).expect("config with producers must parse");
+
+        // Then the mapping is available and maps the names given
+        assert_eq!(c.producers.unknown_id, "guest");
+        assert_eq!(
+            c.producers.clients.get("claude-code").map(String::as_str),
+            Some("claude")
+        );
+        assert_eq!(
+            c.producers.clients.get("ai-notetaker").map(String::as_str),
+            Some("notetaker")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_key_under_producers_still_fails_loudly() {
+        // Given an unknown key directly under `[producers]` (not nested
+        // under `producers.clients`, whose keys are arbitrary by design).
+        // Proves `deny_unknown_fields` still guards `ProducersConfig` even
+        // though `clients` itself accepts any key.
+        let path = write_temp_toml("[producers]\nbogus = \"x\"\n");
+
+        // When loaded
+        let err = Config::load(&path).expect_err("unknown key under [producers] must be rejected");
+
+        // Then it still fails loudly
+        let message = err.to_string();
+        assert!(message.contains("bogus"), "message: {message}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_top_level_key_still_fails_loudly() {
+        // Given an unexpected top-level key
+        let path = write_temp_toml("bogus_top_level_key = true\n");
+
+        // When loaded
+        let err = Config::load(&path).expect_err("unknown top-level key must be rejected");
+
+        // Then it still fails loudly, confirming adding `producers` did not
+        // weaken `deny_unknown_fields` on the rest of the config
+        let message = err.to_string();
+        assert!(
+            message.contains("bogus_top_level_key"),
+            "message: {message}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tilde_prefixed_socket_path_expands_to_the_given_home_directory() {
+        // Given a socket path containing `~`
+        // When resolved (against a home this test controls, not $HOME)
+        // Then it expands to that home directory
+        assert_eq!(
+            expand_tilde("~/.liam/liamd.sock", "/home/alice"),
+            "/home/alice/.liam/liamd.sock"
+        );
+    }
+
+    #[test]
+    fn a_bare_tilde_expands_to_home_itself() {
+        assert_eq!(expand_tilde("~", "/home/alice"), "/home/alice");
+    }
+
+    #[test]
+    fn a_path_without_a_leading_tilde_is_unchanged() {
+        assert_eq!(
+            expand_tilde("/var/run/liamd.sock", "/home/alice"),
+            "/var/run/liamd.sock"
+        );
     }
 }

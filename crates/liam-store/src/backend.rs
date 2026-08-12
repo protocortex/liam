@@ -31,7 +31,12 @@ use crate::value::{Row, Value};
 #[async_trait]
 pub trait Backend: Send + Sync + Sized {
     /// Open (and if needed create) a local database at `path`.
-    async fn open(path: &str) -> Result<Self>;
+    ///
+    /// `read_pool_size` requests that many independent connections be held
+    /// open for reads, when this backend pools them at all; a backend that
+    /// does not pool reads (or, like `LibsqlBackend` on an unpoolable path,
+    /// cannot safely pool the given `path`) MAY ignore it.
+    async fn open(path: &str, read_pool_size: usize) -> Result<Self>;
 
     /// Write. Serializes with every other write; see the trait's
     /// concurrency contract above.

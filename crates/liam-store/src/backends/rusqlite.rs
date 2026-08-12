@@ -32,7 +32,7 @@ pub struct RusqliteBackend {
 
 #[async_trait]
 impl Backend for RusqliteBackend {
-    async fn open(_path: &str) -> Result<Self> {
+    async fn open(_path: &str, _read_pool_size: usize) -> Result<Self> {
         // register sqlite-vec via sqlite3_auto_extension, then Connection::open.
         todo!("rusqlite backend: open + sqlite-vec registration")
     }
