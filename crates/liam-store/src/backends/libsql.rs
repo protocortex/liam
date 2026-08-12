@@ -8,19 +8,54 @@
 //! the version you pin.
 
 use async_trait::async_trait;
-use libsql::{Builder, Connection};
+use libsql::{Builder, Connection, Database};
 
 use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::ids::{Millis, NodeId};
 use crate::value::{Row, Value};
 
+/// Milliseconds a connection waits on `SQLITE_BUSY` before giving up.
+/// Config plumbing for this arrives in WU-5; until then a named constant is
+/// correct, not a parameter nobody can set yet.
+const BUSY_TIMEOUT_MS: i64 = 5000;
+
+/// Retains the `Database` handle alongside the connection it built, so more
+/// connections can be opened against the same file later. Dropping the
+/// `Database` (as the previous version of this backend did) would leave the
+/// read pool WU-2 adds with no way to open further connections.
 pub struct LibsqlBackend {
+    // Not read by production code yet: the read pool WU-2 adds is its first
+    // production reader. Until then this module's own tests read it directly
+    // to prove a second connection can be opened and configured, which is
+    // this Work Unit's Done When.
+    #[allow(dead_code)]
+    db: Database,
     conn: Connection,
 }
 
 fn err(e: libsql::Error) -> Error {
     Error::Backend(e.to_string())
+}
+
+/// Applies the pragmas that describe connection state rather than database
+/// file state. SQLite resets these to their defaults on every new
+/// connection, unlike `journal_mode`, which is persisted in the database
+/// file itself, so this cannot be a one-time call at `open`: every
+/// connection this backend hands out, including the read pool WU-2 adds,
+/// must go through this helper.
+async fn configure_connection(conn: &Connection) -> Result<()> {
+    conn.query(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"), ())
+        .await
+        .map_err(err)?;
+    // NORMAL is the standard companion to WAL: it syncs at checkpoints
+    // rather than on every commit. FULL costs a sync per commit for
+    // durability this workload does not need, since WAL already protects
+    // against corruption on a crash; at worst the last few commits are lost.
+    conn.query("PRAGMA synchronous = NORMAL", ())
+        .await
+        .map_err(err)?;
+    Ok(())
 }
 
 fn to_libsql(v: &Value) -> libsql::Value {
@@ -86,7 +121,22 @@ impl Backend for LibsqlBackend {
     async fn open(path: &str) -> Result<Self> {
         let db = Builder::new_local(path).build().await.map_err(err)?;
         let conn = db.connect().map_err(err)?;
-        Ok(Self { conn })
+        // WAL is persistent in the database file, not the connection, so it
+        // is set once here rather than in `configure_connection`. Verified
+        // empirically against libsql 0.9.30: issuing `PRAGMA journal_mode =
+        // WAL` as the very first statement on the first connection sticks,
+        // confirmed by querying `PRAGMA journal_mode` back on a file-backed
+        // database (see `wal_is_enabled_on_a_file_backed_database` below),
+        // which reports `wal` rather than the default `delete`. It is a
+        // no-op on `:memory:` (SQLite keeps in-memory databases on their own
+        // journal mode regardless of what is requested), so it runs
+        // unconditionally here and its result is asserted only for
+        // file-backed paths.
+        conn.query("PRAGMA journal_mode = WAL", ())
+            .await
+            .map_err(err)?;
+        configure_connection(&conn).await?;
+        Ok(Self { db, conn })
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
@@ -208,5 +258,81 @@ impl Backend for LibsqlBackend {
             )
             .await
             .map_err(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// `:memory:` cannot stand in for this: WAL is a no-op on an in-memory
+    /// database, so the assertion below would be vacuous there. See
+    /// `memory_backend_opens_and_executes_without_a_wal_assertion` for the
+    /// in-memory case this deliberately does not claim.
+    #[tokio::test]
+    async fn wal_is_enabled_on_a_file_backed_database() {
+        // Arrange
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("wal.db");
+
+        // Act
+        let backend = LibsqlBackend::open(path.to_str().expect("utf8 path"))
+            .await
+            .expect("open file-backed backend");
+        let rows = backend
+            .query("PRAGMA journal_mode", &[])
+            .await
+            .expect("query journal_mode");
+
+        // Assert: queried back, not assumed.
+        assert_eq!(rows[0].get_string(0).unwrap(), "wal");
+    }
+
+    #[tokio::test]
+    async fn a_connection_created_after_open_gets_the_configured_busy_timeout() {
+        // Arrange
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("busy.db");
+        let backend = LibsqlBackend::open(path.to_str().expect("utf8 path"))
+            .await
+            .expect("open file-backed backend");
+
+        // Act: open a further connection the way the read pool (WU-2) will,
+        // routed through the same per-connection pragma helper, and query
+        // its busy_timeout back rather than assuming the call landed.
+        let second = backend
+            .db
+            .connect()
+            .map_err(err)
+            .expect("second connection");
+        configure_connection(&second)
+            .await
+            .expect("configure second connection");
+        let rows = read_rows(
+            second
+                .query("PRAGMA busy_timeout", ())
+                .await
+                .expect("query busy_timeout"),
+        )
+        .await
+        .expect("read busy_timeout rows");
+
+        // Assert
+        assert_eq!(rows[0].get_i64(0).unwrap(), BUSY_TIMEOUT_MS);
+    }
+
+    #[tokio::test]
+    async fn memory_backend_opens_and_executes_without_a_wal_assertion() {
+        // Arrange & Act
+        let backend = LibsqlBackend::open(":memory:")
+            .await
+            .expect("open in-memory backend");
+        let rows = backend.query("SELECT 1", &[]).await.expect("query");
+
+        // Assert: opening and querying succeed. `journal_mode` is
+        // deliberately not checked here: WAL does not apply to in-memory
+        // databases, so that assertion would be vacuous or wrong.
+        assert_eq!(rows[0].get_i64(0).unwrap(), 1);
     }
 }
