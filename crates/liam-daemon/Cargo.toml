@@ -28,6 +28,8 @@ time = "0.3"
 [dev-dependencies]
 # Tests construct store `Hit`s directly, whose `attributes` is a JSON value.
 serde_json = "1"
+# storelock tests need an isolated, disposable directory per test.
+tempfile = "3"
 
 [features]
 default = []

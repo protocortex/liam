@@ -10,3 +10,5 @@
 *.db-shm
 *.db-wal
 /.liam/
+.claude/implement/
+.claude/worktrees/

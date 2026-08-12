@@ -12,8 +12,10 @@ mod config;
 #[cfg(test)]
 mod eval;
 mod mcp;
+mod storelock;
 mod telemetry;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use liam_model::llm::DevicePreference;
@@ -39,6 +41,16 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(config: Config) -> anyhow::Result<()> {
     telemetry::init(&config.log_filter);
+
+    // Exclusive per-process lock, taken once, before the first store open.
+    // `spawn_gc` below opens a second CONNECTION to the same database on
+    // purpose; that is not a second process, so the lock is not retaken for
+    // it. Bound to a named variable so it lives for the rest of the process:
+    // `let _ = ...` would drop it immediately and release the lock right
+    // away. See `storelock` for why this is a real advisory `flock` and not
+    // a PID file, and for the contract the future `liamd proxy` mode (which
+    // opens no store) must follow.
+    let _lock = storelock::StoreLock::acquire(Path::new(&config.database_path))?;
 
     let store = DefaultGraph::open(
         &config.database_path,

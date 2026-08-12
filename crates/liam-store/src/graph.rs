@@ -682,12 +682,65 @@ mod tests {
     use super::*;
     use crate::clock::FixedClock;
     use crate::DefaultGraph;
+    use tempfile::TempDir;
 
     async fn graph_at(t: Millis) -> DefaultGraph {
         let clock = Arc::new(FixedClock::new(t));
         DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock)
             .await
             .unwrap()
+    }
+
+    /// `:memory:` cannot stand in for the rest of S1: WAL is a no-op on an
+    /// in-memory database, and every `:memory:` connection is its own private
+    /// database, so a connection pool over it would silently fan out to
+    /// separate empty stores. This opens the same graph on a real file so
+    /// later tests exercise real single-file database semantics. The
+    /// `TempDir` guard is returned alongside the graph, not dropped here,
+    /// because dropping it deletes the database file out from under a graph
+    /// that still holds it open.
+    async fn file_graph_at(t: Millis) -> (TempDir, DefaultGraph) {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("graph.db");
+        let clock = Arc::new(FixedClock::new(t));
+        let g = DefaultGraph::open_with_clock(
+            path.to_str().expect("temp path is valid utf-8"),
+            GraphConfig::new(8),
+            clock,
+        )
+        .await
+        .unwrap();
+        (dir, g)
+    }
+
+    #[tokio::test]
+    async fn file_backed_graph_inserts_and_queries() {
+        // Arrange
+        let (_dir, g) = file_graph_at(Millis(1000)).await;
+
+        // Act
+        g.insert(NewNode::now("decision", "Use libSQL", "single file"))
+            .await
+            .unwrap();
+        let hits = g.query(&Query::text("libSQL")).await.unwrap();
+
+        // Assert
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].label, "Use libSQL");
+    }
+
+    #[tokio::test]
+    async fn file_backed_graph_removes_temp_dir_when_guard_drops() {
+        // Arrange
+        let (dir, g) = file_graph_at(Millis(1000)).await;
+        let dir_path = dir.path().to_path_buf();
+
+        // Act
+        drop(g);
+        drop(dir);
+
+        // Assert
+        assert!(!dir_path.exists());
     }
 
     #[tokio::test]
