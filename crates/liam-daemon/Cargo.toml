@@ -21,7 +21,7 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-rmcp = { version = "2", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3", features = ["server", "macros", "transport-io"] }
 schemars = "1"
 time = "0.3"
 
