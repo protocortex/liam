@@ -74,6 +74,18 @@ impl<B: Backend> Graph<B> {
         let mut ddl = schema(&config);
         ddl.push_str(&backend.vector_ddl(config.embedding_dims));
         backend.execute_batch(&ddl).await?;
+        // `schema()` above is entirely `CREATE TABLE IF NOT EXISTS`, so a
+        // database that already existed before `producer` was added never ran
+        // it and does not have the column. This guarded ALTER TABLE is what
+        // gives it one; a fresh database already has it from the DDL and this
+        // call then no-ops. Both paths end in the same shape.
+        crate::migrate::add_column_if_missing(
+            &backend,
+            "nodes",
+            "producer",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        )
+        .await?;
         Ok(Self {
             backend,
             clock,
@@ -185,15 +197,16 @@ impl<B: Backend> Graph<B> {
     ) -> Result<(String, Vec<Value>)> {
         let attrs = serde_json::to_string(&node.attributes)?;
         let sql = "INSERT INTO nodes
-             (id, kind, label, content, attributes, scope, subject, confidence,
+             (id, kind, label, content, producer, attributes, scope, subject, confidence,
               valid_from, valid_until, tx_from, tx_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             .to_string();
         let params = vec![
             id.as_str().into(),
             node.kind.clone().into(),
             node.label.clone().into(),
             node.content.clone().into(),
+            node.producer.clone().into(),
             attrs.into(),
             opt_text(node.scope.clone()),
             opt_text(node.subject.clone()),
@@ -1184,5 +1197,197 @@ mod tests {
 
         // Assert
         assert_eq!(hits[0].label, "Rare");
+    }
+
+    #[tokio::test]
+    async fn producer_round_trips_through_insert() {
+        // Given a node inserted with a producer
+        let g = graph_at(Millis(1000)).await;
+        let id = g
+            .insert(NewNode::now("fact", "label", "content").with_producer("agent-a"))
+            .await
+            .unwrap();
+
+        // When read back, then the producer round-trips. `producer` is
+        // deliberately absent from `Hit`, so query the `nodes` table
+        // directly through the backend rather than through `query`.
+        let rows = g
+            .backend
+            .query(
+                "SELECT producer FROM nodes WHERE id = ?1",
+                &[id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_string(0).unwrap(), "agent-a");
+    }
+
+    #[tokio::test]
+    async fn producer_defaults_to_unknown_when_not_specified() {
+        // Given a node inserted without specifying a producer
+        let g = graph_at(Millis(1000)).await;
+        let id = g
+            .insert(NewNode::now("fact", "label", "content"))
+            .await
+            .unwrap();
+
+        // When read back, then it is "unknown" rather than empty or null.
+        let rows = g
+            .backend
+            .query(
+                "SELECT producer FROM nodes WHERE id = ?1",
+                &[id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_string(0).unwrap(), "unknown");
+    }
+
+    #[tokio::test]
+    async fn upsert_by_carries_producer_through_supersede() {
+        // Given a live node from producer A
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old_id = g
+            .upsert_by(
+                NewNode::now("fact", "v1", "price is 10")
+                    .with_subject("price")
+                    .with_producer("agent-a"),
+            )
+            .await
+            .unwrap();
+
+        // When producer B supersedes it by subject via upsert_by
+        clock.set(Millis(2000));
+        let new_id = g
+            .upsert_by(
+                NewNode::now("fact", "v2", "price is 20")
+                    .with_subject("price")
+                    .with_producer("agent-b"),
+            )
+            .await
+            .unwrap();
+
+        // Then the new version records B and the superseded version still
+        // records A: history attributes each version to whoever wrote it.
+        let rows = g
+            .backend
+            .query(
+                "SELECT id, producer FROM nodes WHERE id IN (?1, ?2)",
+                &[old_id.as_str().into(), new_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        let producer_of = |id: &str| -> String {
+            rows.iter()
+                .find(|r| r.get_string(0).unwrap() == id)
+                .unwrap()
+                .get_string(1)
+                .unwrap()
+        };
+        assert_eq!(producer_of(old_id.as_str()), "agent-a");
+        assert_eq!(producer_of(new_id.as_str()), "agent-b");
+    }
+
+    #[tokio::test]
+    async fn opening_an_old_schema_database_adds_producer_with_no_data_loss() {
+        // Given a database created with the OLD schema (no `producer` column)
+        // holding a row. Built by executing an explicit old `CREATE TABLE
+        // nodes (...)` statement against a temp-file backend and inserting
+        // directly through it, bypassing `Graph` entirely so the row
+        // genuinely predates the column rather than merely having had it
+        // dropped afterward.
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("old.db");
+        let path_str = path.to_str().expect("temp path is valid utf-8");
+        {
+            let old_backend = crate::DefaultBackend::open(path_str)
+                .await
+                .expect("open old-schema backend");
+            old_backend
+                .execute_batch(
+                    "CREATE TABLE nodes (
+                       rowid       INTEGER PRIMARY KEY,
+                       id          TEXT    NOT NULL UNIQUE,
+                       kind        TEXT    NOT NULL,
+                       label       TEXT    NOT NULL,
+                       content     TEXT    NOT NULL,
+                       attributes  TEXT    NOT NULL DEFAULT '{}',
+                       scope       TEXT,
+                       subject     TEXT,
+                       confidence  REAL    NOT NULL DEFAULT 1.0,
+                       valid_from  INTEGER NOT NULL,
+                       valid_until INTEGER NOT NULL DEFAULT 4102444800000,
+                       tx_from     INTEGER NOT NULL,
+                       tx_to       INTEGER NOT NULL DEFAULT 4102444800000
+                     )",
+                )
+                .await
+                .expect("create old-schema nodes table");
+            old_backend
+                .execute(
+                    "INSERT INTO nodes
+                     (id, kind, label, content, attributes, scope, subject, confidence,
+                      valid_from, valid_until, tx_from, tx_to)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    &[
+                        "pre-existing".into(),
+                        "fact".into(),
+                        "old label".into(),
+                        "old content".into(),
+                        "{}".into(),
+                        "proj-a".into(),
+                        "old-subject".into(),
+                        Value::Real(0.75),
+                        Millis(1000).into(),
+                        FOREVER.into(),
+                        Millis(1000).into(),
+                        FOREVER.into(),
+                    ],
+                )
+                .await
+                .expect("insert pre-existing row");
+        } // old_backend drops here, releasing its connection before reopening.
+
+        // When it is opened with the new code (a fresh `Graph` over the same
+        // path, running the new schema plus the guarded migration).
+        let clock = Arc::new(FixedClock::new(Millis(2000)));
+        let g = DefaultGraph::open_with_clock(path_str, GraphConfig::new(8), clock)
+            .await
+            .expect("open graph over old-schema database");
+
+        // Then the column exists (this SELECT would itself error if it did
+        // not), the pre-existing row reads as "unknown", and every other
+        // field on that row is intact.
+        let rows = g
+            .backend
+            .query(
+                "SELECT producer, kind, label, content, scope, subject, confidence,
+                        valid_from, valid_until, tx_from, tx_to
+                 FROM nodes WHERE id = ?1",
+                &["pre-existing".into()],
+            )
+            .await
+            .expect("query the migrated nodes table");
+        assert_eq!(rows.len(), 1, "the pre-existing row was not lost");
+        let row = &rows[0];
+        assert_eq!(
+            row.get_string(0).unwrap(),
+            "unknown",
+            "producer defaults for rows written before the column existed"
+        );
+        assert_eq!(row.get_string(1).unwrap(), "fact");
+        assert_eq!(row.get_string(2).unwrap(), "old label");
+        assert_eq!(row.get_string(3).unwrap(), "old content");
+        assert_eq!(row.get_string(4).unwrap(), "proj-a");
+        assert_eq!(row.get_string(5).unwrap(), "old-subject");
+        assert!((row_f64(row, 6) - 0.75).abs() < f64::EPSILON);
+        assert_eq!(row.get_i64(7).unwrap(), 1000);
+        assert_eq!(row.get_i64(8).unwrap(), FOREVER.0);
+        assert_eq!(row.get_i64(9).unwrap(), 1000);
+        assert_eq!(row.get_i64(10).unwrap(), FOREVER.0);
     }
 }

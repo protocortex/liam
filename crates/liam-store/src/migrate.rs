@@ -25,12 +25,8 @@ use crate::error::{Error, Result};
 /// Returns an error if `table` does not exist, or if `ALTER TABLE` fails for
 /// any reason other than the column already existing.
 ///
-/// `#[allow(dead_code)]`: this WU builds the helper and its own tests only,
-/// ahead of the column that uses it (WU-4 calls this from `graph.rs` at
-/// open). Until then nothing outside this module's tests calls it, which
-/// `cargo clippy`'s non-test build correctly flags; the same pattern is
-/// already used for `RusqliteBackend`'s scaffold in `backends/rusqlite.rs`.
-#[allow(dead_code)]
+/// Called from `Graph::open_with_clock` to add `producer` to the `nodes`
+/// table on databases that predate that column.
 pub async fn add_column_if_missing<B: Backend>(
     backend: &B,
     table: &str,
@@ -72,10 +68,6 @@ pub async fn add_column_if_missing<B: Backend>(
 /// this check a missing table would look identical to a table that simply
 /// lacks the column, and silently running `ALTER TABLE` against a table that
 /// does not exist would fail confusingly instead of failing clearly here.
-///
-/// `#[allow(dead_code)]`: only called from `add_column_if_missing`, above,
-/// which carries the same allowance and the same reason.
-#[allow(dead_code)]
 async fn column_exists<B: Backend>(backend: &B, table: &str, column: &str) -> Result<bool> {
     let rows = backend
         .query(&format!("PRAGMA table_info({table})"), &[])

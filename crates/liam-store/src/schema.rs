@@ -15,6 +15,12 @@ CREATE TABLE IF NOT EXISTS nodes (
   kind        TEXT    NOT NULL,
   label       TEXT    NOT NULL,
   content     TEXT    NOT NULL,
+  -- DEFAULT 'unknown' is load-bearing, not decoration: it is what lets the
+  -- guarded migration in `migrate::add_column_if_missing` add this column to
+  -- an EXISTING database via ALTER TABLE without a NOT NULL failure on rows
+  -- written before producer existed, so they read back as 'unknown' instead
+  -- of losing data. A fresh database gets the column from this DDL directly.
+  producer    TEXT    NOT NULL DEFAULT 'unknown',
   attributes  TEXT    NOT NULL DEFAULT '{}',
   scope       TEXT,
   subject     TEXT,
