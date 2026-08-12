@@ -67,12 +67,16 @@ impl StoreLock {
                 )
             })?;
 
+        // WU-9 adds a `liamd proxy` mode that shuttles bytes to a running
+        // `serve` process instead of opening the store itself; once it
+        // exists, this message should point a user at it as the fix. It
+        // does not exist yet, so telling a user to run it today would send
+        // them after a command that fails with "not found".
         file.try_lock().map_err(|source| {
             anyhow::anyhow!(
                 "could not acquire the store lock at {} ({source}): another \
-                 liamd process is likely already running against this \
-                 database; point your MCP client at `liamd proxy` instead of \
-                 starting a second store-opening process",
+                 liamd process already holds this lock file; stop that \
+                 process before starting this one",
                 lock_path.display()
             )
         })?;
@@ -105,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn a_held_lock_fails_fast_and_names_the_file_and_the_proxy() {
+    fn a_held_lock_fails_fast_and_names_the_file_and_the_fix() {
         // Arrange: one process (this test) already holds the lock.
         let dir = tempfile::tempdir().expect("temp dir");
         let database_path = dir.path().join("liam.db");
@@ -117,8 +121,9 @@ mod tests {
         // is needed to pin this behaviour.
         let result = StoreLock::acquire(&database_path);
 
-        // Assert: it fails immediately and the error names the lock file and
-        // points at the proxy as the fix.
+        // Assert: it fails immediately, names the lock file, and tells the
+        // user the actionable fix available today (stop the other
+        // process), not a command that does not exist yet.
         let message = result
             .expect_err("a second acquisition must fail")
             .to_string();
@@ -128,8 +133,8 @@ mod tests {
             "message should name the lock file: {message}"
         );
         assert!(
-            message.contains("liamd proxy"),
-            "message should point at the proxy as the fix: {message}"
+            message.contains("stop that process before starting this one"),
+            "message should tell the user to stop the other process: {message}"
         );
     }
 
