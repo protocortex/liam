@@ -42,9 +42,13 @@ fn is_in_memory(path: &str) -> bool {
 /// `Database` (as an earlier version of this backend did) would leave the
 /// read pool with no way to open further connections.
 pub struct LibsqlBackend {
-    /// Read by `open_read_pool` (a file-backed database) or held onto simply
-    /// so more connections COULD be opened later; either way this is no
-    /// longer dead: the read pool is its production reader.
+    /// Held onto so more connections COULD be opened against the same
+    /// database later. `open` reads a local `Database` binding to build the
+    /// read pool before this field is set, so nothing reads it back out
+    /// afterward; the lint is silenced deliberately rather than by dropping
+    /// the handle, which would leave the read pool with no way to open
+    /// further connections down the line.
+    #[allow(dead_code)]
     db: Database,
     /// The single write connection, taken by `execute`, `execute_batch`,
     /// `execute_atomic`, and every vector-writing method. Guarding it with a
@@ -88,6 +92,22 @@ async fn configure_connection(conn: &Connection) -> Result<()> {
         .await
         .map_err(err)?;
     Ok(())
+}
+
+/// Opens `READ_POOL_SIZE` fresh connections against `db`, each configured
+/// with the same per-connection pragmas as every other connection this
+/// backend hands out. Only called for file-backed databases: `open`'s
+/// `:memory:` branch never reaches this, because a second `db.connect()`
+/// there would open an unrelated, empty in-memory database rather than
+/// another handle onto the same one.
+async fn open_read_pool(db: &Database) -> Result<Vec<Connection>> {
+    let mut pool = Vec::with_capacity(READ_POOL_SIZE);
+    for _ in 0..READ_POOL_SIZE {
+        let conn = db.connect().map_err(err)?;
+        configure_connection(&conn).await?;
+        pool.push(conn);
+    }
+    Ok(pool)
 }
 
 fn to_libsql(v: &Value) -> libsql::Value {
@@ -176,17 +196,17 @@ impl Backend for LibsqlBackend {
         // several empty stores.
         let memory_read_conn = is_in_memory(path).then(|| write_conn.clone());
 
-        let mut backend = Self {
+        let read_pool = match memory_read_conn {
+            Some(shared) => vec![shared],
+            None => open_read_pool(&db).await?,
+        };
+
+        Ok(Self {
             db,
             write: Mutex::new(write_conn),
-            read_pool: Vec::new(),
+            read_pool,
             next_reader: AtomicUsize::new(0),
-        };
-        backend.read_pool = match memory_read_conn {
-            Some(shared) => vec![shared],
-            None => backend.open_read_pool().await?,
-        };
-        Ok(backend)
+        })
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
@@ -314,22 +334,6 @@ impl Backend for LibsqlBackend {
 }
 
 impl LibsqlBackend {
-    /// Opens `READ_POOL_SIZE` fresh connections against `self.db`, each
-    /// configured with the same per-connection pragmas as every other
-    /// connection this backend hands out. Only called for file-backed
-    /// databases: `open`'s `:memory:` branch never reaches this, because a
-    /// second `db.connect()` there would open an unrelated, empty in-memory
-    /// database rather than another handle onto the same one.
-    async fn open_read_pool(&self) -> Result<Vec<Connection>> {
-        let mut pool = Vec::with_capacity(READ_POOL_SIZE);
-        for _ in 0..READ_POOL_SIZE {
-            let conn = self.db.connect().map_err(err)?;
-            configure_connection(&conn).await?;
-            pool.push(conn);
-        }
-        Ok(pool)
-    }
-
     /// Picks the next read connection in round robin. For a file-backed
     /// database this spreads reads across `READ_POOL_SIZE` independent
     /// connections, none of which is `write`, so reads never queue behind a
