@@ -24,6 +24,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "3", features = ["server", "macros", "transport-io"] }
 schemars = "1"
 time = "0.3"
+# Mode dispatch (WU-9). Already in the shipped tree, `clap_derive` included, via
+# leiden-rs through liam-store, so this is a direct edge rather than a new crate.
+# Worth using instead of matching on argv by hand because the argument decides
+# whether this process opens the store: a typo like `liamd serv` has to exit 2
+# with a usage error, never fall through to the store-opening default.
+clap = { version = "4", features = ["derive"] }
 # WU-6c's ordered shutdown needs exactly one thing from here:
 # `CancellationToken`, to tell the accept loop to stop taking new connections.
 # Already in the shipped tree via rmcp's `transport-async-rw`, so this is a new

@@ -67,11 +67,6 @@ impl StoreLock {
                 )
             })?;
 
-        // WU-9 adds a `liamd proxy` mode that shuttles bytes to a running
-        // `serve` process instead of opening the store itself; once it
-        // exists, the WouldBlock message below should point a user at it as
-        // the fix. It does not exist yet, so telling a user to run it today
-        // would send them after a command that fails with "not found".
         file.try_lock()
             .map_err(|error| anyhow::anyhow!("{}", lock_failure_message(&lock_path, &error)))?;
 
@@ -107,8 +102,10 @@ fn lock_failure_message(lock_path: &Path, error: &std::fs::TryLockError) -> Stri
     match error {
         TryLockError::WouldBlock => format!(
             "could not acquire the store lock at {} ({error}): another \
-             liamd process already holds this lock file; stop that \
-             process before starting this one",
+             liamd process already holds this lock file. Stop that process, \
+             or if it is the socket daemon, run `liamd proxy` instead: the \
+             proxy shuttles to the running daemon and opens no store of its \
+             own",
             lock_path.display()
         ),
         TryLockError::Error(source) => format!(
@@ -152,9 +149,9 @@ mod tests {
         // is needed to pin this behaviour.
         let result = StoreLock::acquire(&database_path);
 
-        // Assert: it fails immediately, names the lock file, and tells the
-        // user the actionable fix available today (stop the other
-        // process), not a command that does not exist yet.
+        // Assert: it fails immediately, names the lock file, and gives both
+        // actionable fixes: stop the other process, or use the proxy, which
+        // is the right answer when the holder is the socket daemon.
         let message = result
             .expect_err("a second acquisition must fail")
             .to_string();
@@ -164,8 +161,12 @@ mod tests {
             "message should name the lock file: {message}"
         );
         assert!(
-            message.contains("stop that process before starting this one"),
+            message.contains("Stop that process"),
             "message should tell the user to stop the other process: {message}"
+        );
+        assert!(
+            message.contains("liamd proxy"),
+            "message should offer the proxy, the fix when the holder is the daemon: {message}"
         );
     }
 
@@ -200,14 +201,20 @@ mod tests {
         // Act
         let message = lock_failure_message(&lock_path, &std::fs::TryLockError::WouldBlock);
 
-        // Assert: names the lock file and points at the other process.
+        // Assert: names the lock file, points at the other process, and
+        // offers the proxy for the common case where that process is the
+        // socket daemon rather than a stray duplicate.
         assert!(
             message.contains(&lock_path.display().to_string()),
             "message should name the lock file: {message}"
         );
         assert!(
-            message.contains("stop that process before starting this one"),
+            message.contains("Stop that process"),
             "message should tell the user to stop the other process: {message}"
+        );
+        assert!(
+            message.contains("liamd proxy"),
+            "message should offer the proxy as the fix when the daemon holds the lock: {message}"
         );
     }
 
