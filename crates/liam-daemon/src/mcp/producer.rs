@@ -23,15 +23,16 @@ use crate::config::ProducersConfig;
 /// identifies itself as `Claude-Code`; both the configured key and the
 /// connecting client's name are lowercased before comparison.
 ///
-/// Resolution runs once per connection (WU-8 calls this once, at
-/// `initialize`), so logging a warning here on a fallback is naturally
-/// once-per-connection already; no separate throttle is added.
+/// Resolution runs once per connection: `transport::socket::handle_connection`
+/// calls this immediately after the MCP `initialize` handshake, so logging a
+/// warning here on a fallback is naturally once-per-connection already and no
+/// separate throttle is added.
 ///
-/// WU-8 is what calls this from the accept loop's `initialize` handshake;
-/// until then it is unreachable outside tests, hence `#[allow(dead_code)]`
-/// rather than actually unused, the same convention `transport::socket::bind`
-/// uses for the same reason.
-#[allow(dead_code)]
+/// Deliberately carries no `#[allow(dead_code)]`, unlike
+/// `transport::socket::accept_loop`, which still waits on WU-9's mode
+/// dispatch: this is genuinely reachable from the bin target now, so leaving
+/// the lint armed means CI catches it if a later refactor ever unwires
+/// producer resolution from the accept loop.
 pub fn resolve(client_name: Option<&str>, config: &ProducersConfig) -> String {
     let Some(name) = client_name else {
         tracing::warn!(
