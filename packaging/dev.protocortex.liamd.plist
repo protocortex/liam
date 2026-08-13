@@ -74,15 +74,16 @@
     <false/>
 
     <!--
-      Restart only after a crash. A clean exit (a SIGTERM from `launchctl
-      kickstart -k`, or an operator stopping the job) stays stopped, and the
-      next client connection starts it again through the socket above.
+      There is deliberately NO KeepAlive key here, and it must stay that
+      way. Measured against a real launchd job: KeepAlive, even the dict
+      form with SuccessfulExit=false, makes launchd start the job the
+      moment it is bootstrapped, overriding RunAtLoad=false and defeating
+      the on-demand activation above.
+
+      It also buys nothing. Socket activation already covers a crash: the
+      socket outlives the process, so the next client connection starts a
+      fresh daemon. Verified by SIGKILLing the daemon and reconnecting.
     -->
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
 
     <!--
       liamd logs to stderr only, because stdout is the MCP transport in
