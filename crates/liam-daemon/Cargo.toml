@@ -24,11 +24,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "3", features = ["server", "macros", "transport-io"] }
 schemars = "1"
 time = "0.3"
-# WU-6c's ordered shutdown: `CancellationToken` to tell live sessions to stop,
-# `TaskTracker` to wait for them. Already in the shipped tree via rmcp's
-# `transport-async-rw`, so this adds a feature edge, not a new crate. `rt` is
-# what gates `tokio_util::task::TaskTracker`.
-tokio-util = { version = "0.7", features = ["rt"] }
+# WU-6c's ordered shutdown needs exactly one thing from here:
+# `CancellationToken`, to tell the accept loop to stop taking new connections.
+# Already in the shipped tree via rmcp's `transport-async-rw`, so this is a new
+# direct edge, not a new crate. No features: `tokio_util::sync` is ungated, and
+# the drain uses `tokio::task::JoinSet` rather than `TaskTracker` because a
+# tracker can only WAIT for tasks, and the drain has to abort the ones still
+# running when the deadline passes.
+tokio-util = { version = "0.7", default-features = false }
 
 # launchd socket activation (WU-6b). macOS-only BY TARGET, not by cargo feature:
 # `launch_activate_socket` is a libSystem call that exists nowhere else, so a
