@@ -813,6 +813,24 @@ mod tests {
             producers.len()
         );
 
+        // And every one is attributed to the client that actually wrote it.
+        // Counting rows alone would still pass if the two connections'
+        // producers bled into each other under load, which is the one
+        // failure concurrency can introduce here that serial attribution
+        // testing cannot reach.
+        for i in 0..PER_CLIENT {
+            assert_eq!(
+                producers.get(&format!("alice-{i}")).map(String::as_str),
+                Some("alice"),
+                "alice-{i} should be attributed to alice, got: {producers:?}"
+            );
+            assert_eq!(
+                producers.get(&format!("bob-{i}")).map(String::as_str),
+                Some("bob"),
+                "bob-{i} should be attributed to bob, got: {producers:?}"
+            );
+        }
+
         remove_db_file(&db_path);
     }
 }

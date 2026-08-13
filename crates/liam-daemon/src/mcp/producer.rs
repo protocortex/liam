@@ -59,11 +59,20 @@ pub fn resolve(client_name: Option<&str>, config: &ProducersConfig) -> String {
 /// rather than pre-lowercasing into a second map: `config.clients` is
 /// operator-sized (a handful of entries), so building and caching a second
 /// map on every connection would cost more than it ever saves.
+///
+/// Takes the lexicographically smallest matching key rather than the first
+/// one iteration happens to yield. TOML keys are case-sensitive, so an
+/// operator may define both `claude-code` and `Claude-Code`, and both match
+/// here. `HashMap` iteration order is not stable between runs, so a plain
+/// `find` would resolve such a pair to a different producer id from one
+/// daemon restart to the next. Picking a total order makes the answer
+/// depend only on the config.
 fn lookup_case_insensitive(clients: &HashMap<String, String>, name: &str) -> Option<String> {
     let lower = name.to_lowercase();
     clients
         .iter()
-        .find(|(key, _)| key.to_lowercase() == lower)
+        .filter(|(key, _)| key.to_lowercase() == lower)
+        .min_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, id)| id.clone())
 }
 
@@ -128,6 +137,37 @@ mod tests {
         // Then it resolves the same as the exact-case name: matching is
         // documented above as case-insensitive.
         assert_eq!(id, "claude");
+    }
+
+    #[test]
+    fn two_keys_differing_only_by_case_always_resolve_to_the_same_id() {
+        // Given a table where two case-variant keys both match, which TOML
+        // allows because its keys are case-sensitive
+        let cfg = config(
+            "unknown",
+            &[("claude-code", "lowercase"), ("Claude-Code", "titlecase")],
+        );
+
+        // When the same name resolves repeatedly, across freshly built
+        // tables so each one gets its own HashMap iteration order
+        let ids: Vec<String> = (0..64)
+            .map(|_| {
+                let cfg = config(
+                    "unknown",
+                    &[("claude-code", "lowercase"), ("Claude-Code", "titlecase")],
+                );
+                resolve(Some("CLAUDE-CODE"), &cfg)
+            })
+            .collect();
+
+        // Then every answer is the same one, and it is the
+        // lexicographically smallest key's id rather than whichever entry
+        // iteration happened to reach first.
+        assert!(
+            ids.iter().all(|id| id == "titlecase"),
+            "resolution must not depend on HashMap iteration order, got: {ids:?}"
+        );
+        assert_eq!(resolve(Some("claude-code"), &cfg), "titlecase");
     }
 
     #[test]

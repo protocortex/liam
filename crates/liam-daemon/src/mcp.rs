@@ -129,11 +129,18 @@ pub struct MemoryServer {
     /// backing the running session and reachable only as `&MemoryServer`
     /// (`RunningService::service`), never owned again, so the mutation has
     /// to go through `&self`; `OnceLock::set` is a `&self` method for
-    /// exactly that reason. Each connection's clone still gets its OWN,
-    /// independently empty cell: `OnceLock`'s `Clone` impl allocates a
-    /// fresh, unset lock rather than sharing state, which is the same
-    /// per-connection isolation every other `Clone` field here already
-    /// gets, just via a different mechanism.
+    /// exactly that reason. Each connection's clone gets its OWN,
+    /// independently empty cell, which is the same per-connection isolation
+    /// every other `Clone` field here already gets, just via a different
+    /// mechanism.
+    ///
+    /// INVARIANT, and it is load-bearing: the template `MemoryServer` handed
+    /// to `accept_loop` must never be stamped. `OnceLock`'s `Clone` yields a
+    /// fresh unset cell only when the source is unset; cloning an
+    /// already-set lock COPIES the value, and the clone's own `set` then
+    /// fails. Stamp the template and every connection silently inherits that
+    /// one producer, so every write is misattributed. `set_producer` logs on
+    /// a failed set so that mistake surfaces instead of passing silently.
     ///
     /// Reads (`remember`, through the `producer` method below) fall back to
     /// `DEFAULT_PRODUCER` while this is unset: every stdio connection
@@ -196,13 +203,25 @@ impl MemoryServer {
     /// (`RunningService::service`). `OnceLock::set` is a `&self` method for
     /// exactly this reason.
     ///
-    /// Silently does nothing if `producer` is already set, rather than
-    /// panicking: every caller sets it at most once per instance, so a
-    /// failed `set` can only mean a caller bug, not a race worth surfacing
-    /// on the hot path. `remember` cannot tell the difference either way; it
-    /// always just reads whatever is there.
+    /// Warns rather than panicking if `producer` is already set. Every
+    /// caller stamps at most once per instance, so a failed `set` means the
+    /// template `MemoryServer` was stamped before `accept_loop` cloned it
+    /// (see the field doc's invariant), and every connection is now writing
+    /// under one inherited producer. That is a caller bug worth seeing in
+    /// the log: it runs once per connection, never on a request path, so
+    /// the check costs nothing measurable, and staying silent would make
+    /// wholesale misattribution look exactly like correct operation.
     pub(crate) fn set_producer(&self, id: impl Into<String>) {
-        let _ = self.producer.set(id.into());
+        let id = id.into();
+        if let Err(rejected) = self.producer.set(id) {
+            tracing::warn!(
+                already = %self.producer.get().map(String::as_str).unwrap_or(DEFAULT_PRODUCER),
+                rejected = %rejected,
+                "producer was already set on this MemoryServer; the template must never be \
+                 stamped before the accept loop clones it, or every connection inherits one \
+                 producer and its writes are misattributed"
+            );
+        }
     }
 
     /// The producer id to stamp on this connection's writes right now:
