@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job for liamd, the LIAM memory daemon.
+
+  NOT YET USABLE. This job runs `liamd serve`, and mode dispatch (WU-9) is
+  what teaches liamd to parse a subcommand. Until that lands, liamd ignores
+  argv entirely rather than rejecting it, so installing this job now starts
+  the stdio server instead of the socket listener: launchd would hold an
+  activated socket that nothing ever serves, and nothing would report an
+  error. Ship this file now so activation and the plist land together and
+  the tests can pin one against the other; install it after WU-9.
+
+  Install as a LaunchAgent (per user, not system-wide: the database and the
+  socket both live under the user's home directory and carry that user's
+  memories):
+
+    sed "s|__HOME__|$HOME|g" packaging/dev.protocortex.liamd.plist \
+      > ~/Library/LaunchAgents/dev.protocortex.liamd.plist
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.protocortex.liamd.plist
+
+  __HOME__ is a placeholder the command above substitutes. launchd expands
+  neither `~` nor environment variables inside SockPathName, so the path has
+  to be literal by the time launchd reads it.
+
+  The socket name below (Listener) MUST match LAUNCHD_SOCKET_NAME in
+  crates/liam-daemon/src/transport/activation.rs. A test reads this file and
+  asserts that, because a mismatch is silent: launchd would hold a socket
+  nobody serves while liamd binds one nobody connects to.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.protocortex.liamd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/liamd</string>
+        <string>serve</string>
+    </array>
+
+    <!--
+      Socket activation. launchd binds and owns this socket, so it exists
+      before liamd does: the first client to connect is what starts the
+      daemon, and two daemons can never race to bind the same path.
+      liamd detects this socket through launch_activate_socket and never
+      chmods or unlinks a path it does not own.
+    -->
+    <key>Sockets</key>
+    <dict>
+        <key>Listener</key>
+        <dict>
+            <key>SockPathName</key>
+            <string>__HOME__/.liam/liamd.sock</string>
+            <!--
+              384 decimal is 0600 octal, matching SOCKET_MODE in
+              transport/socket.rs. The socket carries full MCP tool access
+              with no further authentication, so owner-only is what makes
+              "can reach the socket" mean "is already this user".
+            -->
+            <key>SockPathMode</key>
+            <integer>384</integer>
+        </dict>
+    </dict>
+
+    <!--
+      Start on demand, then STAY resident. There is deliberately no
+      idle-exit key here: a cold start pays llama.cpp's Metal kernel
+      compile, measured at roughly 10 seconds against a 0.81s warm load, so
+      activation decides when the daemon first starts, never how often it
+      dies.
+    -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!--
+      Restart only after a crash. A clean exit (a SIGTERM from `launchctl
+      kickstart -k`, or an operator stopping the job) stays stopped, and the
+      next client connection starts it again through the socket above.
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!--
+      liamd logs to stderr only, because stdout is the MCP transport in
+      stdio mode and anything written there corrupts the protocol framing.
+    -->
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.liam/liamd.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!--
+      Must stay above the drain deadline in transport/shutdown.rs. launchd
+      sends SIGTERM, waits this long, then SIGKILLs. A drain that outlives
+      the grace period gets killed mid-write instead of finishing.
+    -->
+    <key>ExitTimeOut</key>
+    <integer>20</integer>
+</dict>
+</plist>

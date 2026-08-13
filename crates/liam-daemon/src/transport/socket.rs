@@ -2,23 +2,33 @@
 //! The Unix socket listener: path handling, binding, permissions, and the
 //! accept loop that serves `MemoryServer` to however many clients connect.
 //!
-//! Shutdown, including unlinking the socket on the way out, is WU-6c's job;
-//! nothing here hand-rolls it. Producer resolution itself (`producer::resolve`,
-//! a pure client-name-to-id lookup) is WU-7's; what lives here is WU-8's: the
-//! wiring that calls it once per connection, right after the MCP `initialize`
-//! handshake, and stamps the result onto that connection's `MemoryServer`.
-//! See `handle_connection` for exactly where and why.
+//! Producer resolution itself (`producer::resolve`, a pure
+//! client-name-to-id lookup) lives in `mcp::producer`; the wiring that calls
+//! it once per connection, right after the MCP `initialize` handshake, is
+//! here. See `handle_connection` for exactly where and why.
+//!
+//! Shutdown POLICY lives in `transport::shutdown`, not here: this module
+//! decides when to stop accepting (the cancellation token in `accept_loop`)
+//! and then hands off to `shutdown::drain` and
+//! `shutdown::unlink_owned_socket` for the drain and the unlink. Keeping the
+//! "is this socket ours to delete" decision in one place, behind
+//! `ListenerSource::owned_path`, is what stops a future edit here from
+//! unlinking a path launchd owns.
 
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ProducersConfig;
 use crate::mcp::producer;
 use crate::mcp::MemoryServer;
+use crate::transport::shutdown;
 use crate::transport::ListenerSource;
 
 /// Owner-only file mode set on a freshly bound socket. The socket carries
@@ -41,9 +51,10 @@ const MIN_MAX_CONNECTIONS: usize = 1;
 /// to owner-only. Always returns [`ListenerSource::Bound`]: this process
 /// bound the socket itself, so it is the one that owns the file.
 ///
-/// Mode dispatch (WU-9) is what calls this from `main`; until then it is
-/// unreachable outside tests, hence `#[allow(dead_code)]` rather than
-/// actually unused.
+/// Reached through [`crate::transport::activation::resolve`], which only
+/// calls this when no supervisor handed a socket over. `resolve` in turn
+/// waits on WU-9's mode dispatch to be called from `main`, so this is still
+/// unreachable in the production build, hence the allow.
 #[allow(dead_code)]
 pub async fn bind(path: &Path) -> anyhow::Result<ListenerSource> {
     if let Some(parent) = path.parent() {
@@ -149,11 +160,13 @@ fn floor_max_connections(max_connections: usize) -> usize {
     }
 }
 
-/// Accepts connections forever, cloning `server` onto its own task per
-/// connection so one client's error, or a clean disconnect, never touches
-/// any other session. Only `listener.accept()` itself failing ends this
-/// loop; a session's own error is caught and logged inside its task, never
-/// propagated here.
+/// Accepts connections until `cancel` fires, cloning `server` onto its own
+/// task per connection so one client's error, or a clean disconnect, never
+/// touches any other session. Two things end this loop: cancellation, which
+/// is the ordinary shutdown path, and `listener.accept()` itself failing,
+/// which is not. A session's own error is caught and logged inside its
+/// task, never propagated here. Either way the loop still drains and still
+/// unlinks an owned socket on the way out.
 ///
 /// `max_connections` bounds how many sessions may be open at once: without
 /// it an unbounded accept loop can exhaust file descriptors, and each
@@ -171,32 +184,98 @@ fn floor_max_connections(max_connections: usize) -> usize {
 /// handshake gets resolved against (see `handle_connection`); an `Arc`
 /// because it is shared, read-only, across however many connection tasks
 /// are alive at once, the same reason `server`'s own `Arc` fields are Arcs.
+///
+/// `cancel` is what stops the loop. Cancelling it means "stop accepting",
+/// never "kill the live sessions": those get the drain window in
+/// [`shutdown::drain`] to finish on their own first.
+///
+/// `Ok(())` means the loop stopped because it was asked to, and that the
+/// socket has been unlinked if this process owned it. It does NOT promise
+/// every session finished: a drain that outruns `drain_deadline` aborts
+/// what is left, logs a warning, and still returns `Ok(())`, because being
+/// told to stop is not an error no matter how the sessions ended. Only a
+/// failed `accept` comes back as `Err`.
 #[allow(dead_code)]
 pub async fn accept_loop(
     source: ListenerSource,
     server: MemoryServer,
     max_connections: usize,
     producers: Arc<ProducersConfig>,
+    cancel: CancellationToken,
+    drain_deadline: Duration,
 ) -> anyhow::Result<()> {
     let permits = Arc::new(Semaphore::new(floor_max_connections(max_connections)));
+    let listener = source.listener();
+    match source.owned_path() {
+        Some(path) => {
+            tracing::info!(path = %path.display(), max_connections, "liamd socket listener started")
+        }
+        None => tracing::info!(
+            max_connections,
+            "liamd listener started on an activated socket"
+        ),
+    }
 
-    let ListenerSource::Bound { listener, path } = &source;
-    tracing::info!(path = %path.display(), max_connections, "liamd socket listener started");
+    // Sessions live in a `JoinSet` rather than being detached, so shutdown
+    // can wait for them and, past the deadline, genuinely abort them. A
+    // detached `tokio::spawn` gives no handle to do either.
+    let mut sessions: JoinSet<()> = JoinSet::new();
+    let mut accept_error = None;
 
     loop {
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
-            .await
-            .expect("the semaphore is never closed");
-        let (stream, _addr) = listener.accept().await?;
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            permit = Arc::clone(&permits).acquire_owned() => {
+                permit.expect("the semaphore is never closed")
+            }
+        };
+
+        let accepted = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, _addr) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // The listener itself failed, so this loop cannot continue.
+                // Fall through to the drain rather than returning here: live
+                // sessions still deserve their window, and an owned socket
+                // still needs unlinking.
+                accept_error = Some(error);
+                break;
+            }
+        };
+
         let server = server.clone();
         let producers = Arc::clone(&producers);
-        tokio::spawn(async move {
+        sessions.spawn(async move {
             let _permit = permit;
             if let Err(error) = handle_connection(stream, server, producers).await {
                 tracing::warn!(error = %error, "mcp session over the socket ended with an error");
             }
         });
+
+        // Reap sessions that already finished so the set does not grow for
+        // the life of the daemon.
+        while sessions.try_join_next().is_some() {}
+    }
+
+    // Whether the drain finished on its own or ran out of time is
+    // deliberately not propagated: `drain` already logs the abort, and a
+    // stuck client is not a reason to report the daemon's own shutdown as
+    // failed. See this function's doc for what `Ok(())` does and does not
+    // promise.
+    let _drained = shutdown::drain(&mut sessions, drain_deadline).await;
+    shutdown::unlink_owned_socket(&source);
+
+    match accept_error {
+        Some(error) => Err(anyhow::anyhow!(
+            "socket listener stopped accepting: {error}"
+        )),
+        None => Ok(()),
     }
 }
 
@@ -350,10 +429,13 @@ mod tests {
 
         // When serve starts
         let source = bind(&path).await.expect("bind must succeed");
-        let ListenerSource::Bound {
-            path: bound_path, ..
-        } = &source;
-        assert_eq!(bound_path, &*path);
+        // `bind` always reports a socket this process owns, never an
+        // activated one: activation is resolved before bind is ever reached.
+        assert_eq!(
+            source.owned_path(),
+            Some(&*path),
+            "bind must report the path it owns"
+        );
 
         // Then it binds and the file mode is owner-only, read back rather
         // than assumed from the umask.
@@ -527,7 +609,14 @@ mod tests {
         let path = TestPath::new();
         let source = bind(&path).await.expect("bind");
         let server = test_server().await;
-        tokio::spawn(accept_loop(source, server, 4, default_producers()));
+        tokio::spawn(accept_loop(
+            source,
+            server,
+            4,
+            default_producers(),
+            CancellationToken::new(),
+            shutdown::DEFAULT_DRAIN_DEADLINE,
+        ));
 
         // A client already connected before the drop, standing in for the
         // "other" session the disconnect must not disturb.
@@ -693,7 +782,14 @@ mod tests {
         let db_path = TestPath::new();
         let server = test_server_on(&db_path).await;
         let source = bind(&socket_path).await.expect("bind");
-        tokio::spawn(accept_loop(source, server, 4, two_client_producers()));
+        tokio::spawn(accept_loop(
+            source,
+            server,
+            4,
+            two_client_producers(),
+            CancellationToken::new(),
+            shutdown::DEFAULT_DRAIN_DEADLINE,
+        ));
 
         let alice = connect(&socket_path, "alice-app").await;
         let bob = connect(&socket_path, "bob-app").await;
@@ -763,7 +859,14 @@ mod tests {
         let db_path = TestPath::new();
         let server = test_server_on(&db_path).await;
         let source = bind(&socket_path).await.expect("bind");
-        tokio::spawn(accept_loop(source, server, 8, two_client_producers()));
+        tokio::spawn(accept_loop(
+            source,
+            server,
+            8,
+            two_client_producers(),
+            CancellationToken::new(),
+            shutdown::DEFAULT_DRAIN_DEADLINE,
+        ));
 
         let alice = connect(&socket_path, "alice-app").await;
         let bob = connect(&socket_path, "bob-app").await;
@@ -832,5 +935,89 @@ mod tests {
         }
 
         remove_db_file(&db_path);
+    }
+
+    /// The shutdown path end to end, which neither `shutdown`'s unit tests
+    /// nor the acceptance tests above reach: cancelling the token has to
+    /// stop the accept loop, drain, unlink, and return.
+    #[tokio::test]
+    async fn cancelling_stops_the_accept_loop_and_unlinks_a_bound_socket() {
+        // Given a running listener on a socket this process bound
+        let path = TestPath::new();
+        let source = bind(&path).await.expect("bind");
+        let server = test_server().await;
+        let cancel = CancellationToken::new();
+        let loop_handle = tokio::spawn(accept_loop(
+            source,
+            server,
+            4,
+            default_producers(),
+            cancel.clone(),
+            Duration::from_secs(5),
+        ));
+
+        // and a client that has connected and then gone away, so the drain
+        // has a finished session to reap rather than an empty set.
+        drop(
+            UnixStream::connect(&*path)
+                .await
+                .expect("a client must be able to connect while serving"),
+        );
+        assert!(path.exists(), "the socket must exist while serving");
+
+        // When shutdown is triggered
+        cancel.cancel();
+
+        // Then the loop returns rather than running forever, reports a
+        // clean stop, and takes the socket file with it. The timeout is the
+        // assertion that matters most here: before cancellation existed
+        // this loop had no exit at all.
+        let outcome = tokio::time::timeout(Duration::from_secs(10), loop_handle)
+            .await
+            .expect("the accept loop must stop promptly after cancellation")
+            .expect("the accept loop task must not panic");
+        assert!(
+            outcome.is_ok(),
+            "a cancelled accept loop is a clean stop, got: {outcome:?}"
+        );
+        assert!(
+            !path.exists(),
+            "a Bound socket must be unlinked once the loop stops"
+        );
+    }
+
+    /// The same shutdown, but on a listener standing in for one launchd
+    /// handed over: the path must survive, because the supervisor owns it.
+    #[tokio::test]
+    async fn cancelling_leaves_an_activated_socket_in_place() {
+        // Given a running listener on an activated socket
+        let path = TestPath::new();
+        let listener = UnixListener::bind(&*path).expect("bind");
+        let server = test_server().await;
+        let cancel = CancellationToken::new();
+        let loop_handle = tokio::spawn(accept_loop(
+            ListenerSource::Activated(listener),
+            server,
+            4,
+            default_producers(),
+            cancel.clone(),
+            Duration::from_secs(5),
+        ));
+
+        // When shutdown is triggered
+        cancel.cancel();
+
+        // Then the loop stops cleanly and the socket file is still there:
+        // removing it would leave launchd holding a descriptor for a name
+        // that no longer exists, and on-demand start would stop working.
+        let outcome = tokio::time::timeout(Duration::from_secs(10), loop_handle)
+            .await
+            .expect("the accept loop must stop promptly after cancellation")
+            .expect("the accept loop task must not panic");
+        assert!(outcome.is_ok(), "got: {outcome:?}");
+        assert!(
+            path.exists(),
+            "an Activated socket must survive the accept loop stopping"
+        );
     }
 }
