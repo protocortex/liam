@@ -24,6 +24,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "3", features = ["server", "macros", "transport-io"] }
 schemars = "1"
 time = "0.3"
+# WU-6c's ordered shutdown: `CancellationToken` to tell live sessions to stop,
+# `TaskTracker` to wait for them. Already in the shipped tree via rmcp's
+# `transport-async-rw`, so this adds a feature edge, not a new crate. `rt` is
+# what gates `tokio_util::task::TaskTracker`.
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# launchd socket activation (WU-6b). macOS-only BY TARGET, not by cargo feature:
+# `launch_activate_socket` is a libSystem call that exists nowhere else, so a
+# Linux build must never see this crate. Same pattern liam-model uses for Metal.
+[target.'cfg(target_os = "macos")'.dependencies]
+raunch = "1.0.1"
 
 [dev-dependencies]
 # Tests construct store `Hit`s directly, whose `attributes` is a JSON value.

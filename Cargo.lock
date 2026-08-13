@@ -2272,6 +2272,7 @@ dependencies = [
  "async-trait",
  "liam-model",
  "liam-store",
+ "raunch",
  "rmcp",
  "schemars",
  "serde",
@@ -2279,6 +2280,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -3310,6 +3312,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "raunch"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a67226789ccd419c55f5c826e04f7d58690b0593364f61bc8ed6e7dbbab49c5"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rav1e"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4313,6 +4324,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
