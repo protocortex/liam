@@ -7,7 +7,9 @@
 //! from 2.x through rmcp 3.1.2, the version pinned in `Cargo.toml`; re-confirm
 //! against the rmcp version you pin before bumping again.
 
-use std::sync::Arc;
+pub mod producer;
+
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use liam_model::{Embedder, Llm, Reranker};
@@ -28,6 +30,16 @@ use crate::ask::{
 /// little slack for models that add punctuation or a stray word; anything longer
 /// is not a verdict and `ask::parse_sufficiency` rejects it anyway.
 const SUFFICIENCY_MAX_TOKENS: usize = 8;
+
+/// Producer id a `MemoryServer` reads until something calls
+/// `set_producer`. That is every stdio connection
+/// (`main.rs` never calls it) and a socket connection during the brief
+/// window between `serve` returning and the accept loop's post-handshake
+/// `set_producer` call landing (see `producer`'s field doc). Matches both
+/// `config::ProducersConfig::default().unknown_id` and
+/// `liam_store::NewNode`'s own default, so a server nobody has stamped a
+/// producer onto records exactly what it recorded before this field existed.
+const DEFAULT_PRODUCER: &str = "unknown";
 
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope shape to a `Query`; keeping
@@ -103,6 +115,38 @@ pub struct MemoryServer {
     /// lock, so an operator with memory headroom can raise the limit above 1
     /// instead of every request serializing permanently.
     generation_permits: Arc<Semaphore>,
+    /// Producer id stamped on every node this connection's `remember` calls
+    /// write. Per-CONNECTION, unlike every field above it, which is set once
+    /// for the process's whole lifetime: that mismatch is why this is not a
+    /// ninth constructor argument. Instead the accept loop clones an
+    /// already-constructed `MemoryServer` per connection (see
+    /// `#[derive(Clone)]` above) and calls `set_producer` on the clone.
+    ///
+    /// An `OnceLock`, not a plain `String`, because of WHEN the accept loop
+    /// (WU-8) learns which producer to stamp: only after the MCP
+    /// `initialize` handshake completes, which happens inside `rmcp`'s
+    /// `serve`. By then this `MemoryServer` is already moved into the `Arc`
+    /// backing the running session and reachable only as `&MemoryServer`
+    /// (`RunningService::service`), never owned again, so the mutation has
+    /// to go through `&self`; `OnceLock::set` is a `&self` method for
+    /// exactly that reason. Each connection's clone gets its OWN,
+    /// independently empty cell, which is the same per-connection isolation
+    /// every other `Clone` field here already gets, just via a different
+    /// mechanism.
+    ///
+    /// INVARIANT, and it is load-bearing: the template `MemoryServer` handed
+    /// to `accept_loop` must never be stamped. `OnceLock`'s `Clone` yields a
+    /// fresh unset cell only when the source is unset; cloning an
+    /// already-set lock COPIES the value, and the clone's own `set` then
+    /// fails. Stamp the template and every connection silently inherits that
+    /// one producer, so every write is misattributed. `set_producer` logs on
+    /// a failed set so that mistake surfaces instead of passing silently.
+    ///
+    /// Reads (`remember`, through the `producer` method below) fall back to
+    /// `DEFAULT_PRODUCER` while this is unset: every stdio connection
+    /// forever, and a socket connection during the brief window between
+    /// `serve` returning and the accept loop's `set_producer` call landing.
+    producer: OnceLock<String>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -145,8 +189,50 @@ impl MemoryServer {
             ask_sufficiency_check,
             ask_context_tokens,
             generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
+            producer: OnceLock::new(),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Stamps `id` as this connection's producer through `&self`. The
+    /// `&self` receiver, not `self`, is the reason `producer` is an
+    /// `OnceLock` rather than a plain `String` at all: the accept loop
+    /// (WU-8) only learns a connecting client's declared name once `rmcp`'s
+    /// `serve` returns a `RunningService`, and by then the `MemoryServer`
+    /// driving that connection is reachable only as `&MemoryServer`
+    /// (`RunningService::service`). `OnceLock::set` is a `&self` method for
+    /// exactly this reason.
+    ///
+    /// Warns rather than panicking if `producer` is already set. Every
+    /// caller stamps at most once per instance, so a failed `set` means the
+    /// template `MemoryServer` was stamped before `accept_loop` cloned it
+    /// (see the field doc's invariant), and every connection is now writing
+    /// under one inherited producer. That is a caller bug worth seeing in
+    /// the log: it runs once per connection, never on a request path, so
+    /// the check costs nothing measurable, and staying silent would make
+    /// wholesale misattribution look exactly like correct operation.
+    pub(crate) fn set_producer(&self, id: impl Into<String>) {
+        let id = id.into();
+        if let Err(rejected) = self.producer.set(id) {
+            tracing::warn!(
+                already = %self.producer.get().map(String::as_str).unwrap_or(DEFAULT_PRODUCER),
+                rejected = %rejected,
+                "producer was already set on this MemoryServer; the template must never be \
+                 stamped before the accept loop clones it, or every connection inherits one \
+                 producer and its writes are misattributed"
+            );
+        }
+    }
+
+    /// The producer id to stamp on this connection's writes right now:
+    /// whatever `set_producer` set, or `DEFAULT_PRODUCER` if it has not run
+    /// yet. See `producer`'s field doc for the two windows where that
+    /// fallback applies.
+    fn producer(&self) -> String {
+        self.producer
+            .get()
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_PRODUCER.to_string())
     }
 
     #[tool(description = "Record a durable decision or fact into long-term memory.")]
@@ -155,7 +241,9 @@ impl MemoryServer {
             Ok(v) => v,
             Err(e) => return format!("embed failed: {e}"),
         };
-        let mut node = NewNode::now(args.kind, args.label, args.content).with_embedding(embedding);
+        let mut node = NewNode::now(args.kind, args.label, args.content)
+            .with_embedding(embedding)
+            .with_producer(self.producer());
         if let Some(scope) = args.scope {
             node = node.with_scope(scope);
         }
@@ -586,6 +674,77 @@ mod tests {
             Arc::new(liam_model::MockLlm),
         )
         .await
+    }
+
+    /// Self-cleaning temp database path, unique per call so parallel test
+    /// binaries and leftovers from a crashed run never collide. Needed only
+    /// by the producer-stamping test below: every other test in this module
+    /// uses `:memory:`, but that test asserts through a SECOND connection
+    /// (`producer` is deliberately absent from `Hit`, so `recall`/`query`
+    /// cannot see it), and each `:memory:` connection is its own private
+    /// database, so only a file can be read back from outside the server
+    /// that wrote it.
+    fn temp_db_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "liam-daemon-mcp-producer-test-{}-{unique}.db",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn remember_stamps_the_servers_producer_on_the_written_node() {
+        use liam_store::{Backend, DefaultBackend};
+
+        // Given a MemoryServer carrying a producer
+        let db_path = temp_db_path();
+        let db_path_str = db_path.to_str().expect("temp path is valid utf-8");
+        let store = DefaultGraph::open(db_path_str, GraphConfig::new(8))
+            .await
+            .expect("open file-backed store");
+        let server = MemoryServer::new(
+            Arc::new(store),
+            Arc::new(liam_model::MockEmbedder::new(8)),
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            1,
+        );
+        server.set_producer("agent-a");
+
+        // When remember writes a node
+        let out = server
+            .remember(Parameters(RememberArgs {
+                kind: "fact".to_string(),
+                label: "label".to_string(),
+                content: "content".to_string(),
+                scope: None,
+                subject: None,
+            }))
+            .await;
+        assert!(out.starts_with("remembered "), "remember failed: {out}");
+
+        // Then the stored row records that producer. Read it back through a
+        // fresh connection to the same file, since `producer` is
+        // deliberately absent from `Hit` and cannot be asserted through
+        // `recall`.
+        let raw = DefaultBackend::open(db_path_str, 1)
+            .await
+            .expect("open a second connection to the same file");
+        let rows = raw
+            .query("SELECT producer FROM nodes", &[])
+            .await
+            .expect("query nodes");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_string(0).unwrap(), "agent-a");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
     }
 
     /// Count rendered evidence blocks in a captured `system\nprompt` pair,

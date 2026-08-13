@@ -30,6 +30,15 @@ time = "0.3"
 serde_json = "1"
 # storelock tests need an isolated, disposable directory per test.
 tempfile = "3"
+# WU-8's two-client acceptance test needs a real MCP client to drive the
+# socket from the outside. `client` is the only feature this actually adds:
+# production plays the server role only, and `transport-async-rw` is already
+# enabled by the line-24 entry's feature graph. Resolver v2 (implied by
+# edition 2021) keeps dev-only features out of the production build, so
+# `client` stays out of `liamd`. Verify with:
+#   cargo tree -e no-dev -p liam-daemon -f "{p} {f}" | grep "rmcp v"
+# which must NOT list `client` (plain `cargo tree` will, and should).
+rmcp = { version = "3", features = ["client", "transport-async-rw"] }
 
 [features]
 default = []
