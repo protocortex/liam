@@ -3,6 +3,14 @@
 <!--
   launchd job for liamd, the LIAM memory daemon.
 
+  NOT YET USABLE. This job runs `liamd serve`, and mode dispatch (WU-9) is
+  what teaches liamd to parse a subcommand. Until that lands, liamd ignores
+  argv entirely rather than rejecting it, so installing this job now starts
+  the stdio server instead of the socket listener: launchd would hold an
+  activated socket that nothing ever serves, and nothing would report an
+  error. Ship this file now so activation and the plist land together and
+  the tests can pin one against the other; install it after WU-9.
+
   Install as a LaunchAgent (per user, not system-wide: the database and the
   socket both live under the user's home directory and carry that user's
   memories):

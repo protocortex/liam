@@ -160,11 +160,13 @@ fn floor_max_connections(max_connections: usize) -> usize {
     }
 }
 
-/// Accepts connections forever, cloning `server` onto its own task per
-/// connection so one client's error, or a clean disconnect, never touches
-/// any other session. Only `listener.accept()` itself failing ends this
-/// loop; a session's own error is caught and logged inside its task, never
-/// propagated here.
+/// Accepts connections until `cancel` fires, cloning `server` onto its own
+/// task per connection so one client's error, or a clean disconnect, never
+/// touches any other session. Two things end this loop: cancellation, which
+/// is the ordinary shutdown path, and `listener.accept()` itself failing,
+/// which is not. A session's own error is caught and logged inside its
+/// task, never propagated here. Either way the loop still drains and still
+/// unlinks an owned socket on the way out.
 ///
 /// `max_connections` bounds how many sessions may be open at once: without
 /// it an unbounded accept loop can exhaust file descriptors, and each
@@ -185,9 +187,14 @@ fn floor_max_connections(max_connections: usize) -> usize {
 ///
 /// `cancel` is what stops the loop. Cancelling it means "stop accepting",
 /// never "kill the live sessions": those get the drain window in
-/// [`shutdown::drain`] to finish on their own first. Returning `Ok(())`
-/// means a clean, drained stop; the socket has already been unlinked by
-/// then if this process owned it.
+/// [`shutdown::drain`] to finish on their own first.
+///
+/// `Ok(())` means the loop stopped because it was asked to, and that the
+/// socket has been unlinked if this process owned it. It does NOT promise
+/// every session finished: a drain that outruns `drain_deadline` aborts
+/// what is left, logs a warning, and still returns `Ok(())`, because being
+/// told to stop is not an error no matter how the sessions ended. Only a
+/// failed `accept` comes back as `Err`.
 #[allow(dead_code)]
 pub async fn accept_loop(
     source: ListenerSource,
@@ -256,7 +263,12 @@ pub async fn accept_loop(
         while sessions.try_join_next().is_some() {}
     }
 
-    shutdown::drain(&mut sessions, drain_deadline).await;
+    // Whether the drain finished on its own or ran out of time is
+    // deliberately not propagated: `drain` already logs the abort, and a
+    // stuck client is not a reason to report the daemon's own shutdown as
+    // failed. See this function's doc for what `Ok(())` does and does not
+    // promise.
+    let _drained = shutdown::drain(&mut sessions, drain_deadline).await;
     shutdown::unlink_owned_socket(&source);
 
     match accept_error {
