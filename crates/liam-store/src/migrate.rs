@@ -99,9 +99,13 @@ mod tests {
     /// the rest of S1's file-backed harness and with how `add_column_if_missing`
     /// is actually used (against a real, persistent store).
     async fn file_backend_at(name: &str) -> (TempDir, DefaultBackend) {
+        // This test exercises schema migration, not read pooling, so the
+        // pool size is arbitrary; 1 keeps it minimal rather than implying
+        // some other value matters here.
+        const ARBITRARY_POOL_SIZE: usize = 1;
         let dir = TempDir::new().expect("create temp dir");
         let path = dir.path().join(name);
-        let backend = DefaultBackend::open(path.to_str().expect("utf8 path"))
+        let backend = DefaultBackend::open(path.to_str().expect("utf8 path"), ARBITRARY_POOL_SIZE)
             .await
             .expect("open file-backed backend");
         (dir, backend)

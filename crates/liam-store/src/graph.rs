@@ -70,7 +70,7 @@ impl<B: Backend> Graph<B> {
         config: GraphConfig,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let backend = B::open(path).await?;
+        let backend = B::open(path, config.read_pool_size).await?;
         let mut ddl = schema(&config);
         ddl.push_str(&backend.vector_ddl(config.embedding_dims));
         backend.execute_batch(&ddl).await?;
@@ -1300,11 +1300,15 @@ mod tests {
         // directly through it, bypassing `Graph` entirely so the row
         // genuinely predates the column rather than merely having had it
         // dropped afterward.
+        // This test exercises schema migration, not read pooling, so the
+        // pool size is arbitrary; 1 keeps it minimal rather than implying
+        // some other value matters here.
+        const ARBITRARY_POOL_SIZE: usize = 1;
         let dir = TempDir::new().expect("create temp dir");
         let path = dir.path().join("old.db");
         let path_str = path.to_str().expect("temp path is valid utf-8");
         {
-            let old_backend = crate::DefaultBackend::open(path_str)
+            let old_backend = crate::DefaultBackend::open(path_str, ARBITRARY_POOL_SIZE)
                 .await
                 .expect("open old-schema backend");
             old_backend

@@ -14,6 +14,7 @@ mod eval;
 mod mcp;
 mod storelock;
 mod telemetry;
+mod transport;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -54,7 +55,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let store = DefaultGraph::open(
         &config.database_path,
-        GraphConfig::new(config.embedding_dims),
+        GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size),
     )
     .await?;
     let store = Arc::new(store);
@@ -231,7 +232,7 @@ fn macos_backend_error(backend: &str, device: DevicePreference) -> Option<String
 async fn spawn_gc(config: &Config) -> anyhow::Result<()> {
     let store = DefaultGraph::open(
         &config.database_path,
-        GraphConfig::new(config.embedding_dims),
+        GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size),
     )
     .await?;
     let policy = config.gc_policy();

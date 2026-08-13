@@ -29,6 +29,15 @@ pub struct GraphConfig {
     /// Score multiplier applied to graph-expanded-only hits (0..=1). Keeps an
     /// inferred neighbour from outranking a direct match.
     pub expansion_weight: f64,
+    /// Independent connections a pooling backend holds open for reads;
+    /// passed straight through to `Backend::open`. A backend that cannot
+    /// safely pool the configured path (an in-memory database, for
+    /// `LibsqlBackend`) ignores this and falls back to a single shared
+    /// connection regardless of what is configured here: that fallback is a
+    /// correctness guard against handing concurrent readers an empty,
+    /// private in-memory database, not a tuning knob a config value should
+    /// ever be allowed to override.
+    pub read_pool_size: usize,
 }
 
 impl GraphConfig {
@@ -37,6 +46,7 @@ impl GraphConfig {
             embedding_dims,
             rrf_k: 60.0,
             expansion_weight: 0.5,
+            read_pool_size: 4,
         }
     }
     pub fn with_rrf_k(mut self, k: f64) -> Self {
@@ -45,6 +55,10 @@ impl GraphConfig {
     }
     pub fn with_expansion_weight(mut self, w: f64) -> Self {
         self.expansion_weight = w;
+        self
+    }
+    pub fn with_read_pool_size(mut self, read_pool_size: usize) -> Self {
+        self.read_pool_size = read_pool_size;
         self
     }
 }
