@@ -199,6 +199,39 @@ mod tests {
     }
 
     #[test]
+    fn the_plist_declares_no_keepalive_so_activation_stays_on_demand() {
+        // Given the shipped plist
+        // When it is checked for a KeepAlive key
+        // Then there is none. Measured against a real launchd job:
+        // KeepAlive, including the dict form with SuccessfulExit=false,
+        // starts the job at bootstrap and overrides RunAtLoad=false, which
+        // turns on-demand activation into an eager launch. Socket
+        // activation already restarts the daemon after a crash on the next
+        // connection, so the key buys nothing and costs the behaviour the
+        // whole Work Unit exists for.
+        assert!(
+            !PLIST.contains("<key>KeepAlive</key>"),
+            "the plist must not declare KeepAlive: it overrides RunAtLoad=false and \
+             starts the daemon eagerly instead of on the first client connection"
+        );
+    }
+
+    #[test]
+    fn the_plist_starts_the_daemon_on_demand_rather_than_at_load() {
+        // Given the shipped plist
+        // Then RunAtLoad is false, so launchd waits for a client rather
+        // than starting the daemon when the job is bootstrapped.
+        let after = PLIST
+            .split_once("<key>RunAtLoad</key>")
+            .expect("the plist must set RunAtLoad")
+            .1;
+        assert!(
+            after.trim_start().starts_with("<false/>"),
+            "RunAtLoad must be false, or the socket's on-demand start is bypassed"
+        );
+    }
+
+    #[test]
     fn the_plist_socket_path_matches_the_configured_default() {
         // Given the shipped plist and the built-in config default
         let configured = crate::config::Config::default().socket_path;
