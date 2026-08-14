@@ -22,12 +22,20 @@ tokio = { version = "1", features = ["rt", "sync"], optional = true }
 leiden-rs = { version = "0.8", optional = true }
 
 [features]
-default = ["backend-libsql"]
+default = ["backend-libsql", "cluster"]
 # `dep:tokio` is wired to backend-libsql too: the read pool and write mutex in
 # `backends/libsql.rs` need `tokio::sync::Mutex`, and that must not depend on
 # libsql's own tokio features happening to pull it in, because that coupling
 # breaks silently the moment libsql's feature set changes.
 backend-libsql = ["dep:libsql", "dep:tokio"]
+# Leiden community detection over the edge graph. ON BY DEFAULT and meant to
+# stay that way. `recompute_communities` has no caller yet, which is a reason to
+# WIRE IT UP, not to drop it: the approved design
+# (docs/superpowers/specs/2026-07-23-always-available-clusters-design.md, folded
+# into milestone M5) is to delete this gate entirely so clustering exists in
+# every build, and to run it on the daemon's maintenance tick. Turning it off by
+# default would ship a release with no clustering at all, since liam-daemon
+# takes liam-store's default features.
 cluster = ["dep:leiden-rs"]
 
 [dev-dependencies]

@@ -1394,4 +1394,84 @@ mod tests {
         assert_eq!(row.get_i64(9).unwrap(), 1000);
         assert_eq!(row.get_i64(10).unwrap(), FOREVER.0);
     }
+
+    /// Community detection over the edge graph, which had no test at all
+    /// before this. "Nothing calls it and nothing covers it" was used once as
+    /// an argument for dropping the feature; the approved design
+    /// (`2026-07-23-always-available-clusters-design.md`, folded into M5) says
+    /// the opposite, so this pins the behaviour the daemon will lean on when
+    /// `recompute_communities` moves onto the maintenance tick.
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn communities_separate_two_disconnected_groups_of_nodes() {
+        // Given two clusters of linked nodes with NO edge between them: three
+        // notes about auth that reference each other, and two about billing.
+        let g = graph_at(Millis(1000)).await;
+
+        let mut auth = Vec::new();
+        for label in ["auth: token refresh", "auth: session expiry", "auth: login"] {
+            auth.push(
+                g.insert(NewNode::now("fact", label, "content"))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let mut billing = Vec::new();
+        for label in ["billing: invoices", "billing: dunning"] {
+            billing.push(
+                g.insert(NewNode::now("fact", label, "content"))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        for pair in [(0, 1), (1, 2), (0, 2)] {
+            g.link(NewEdge::new(&auth[pair.0], &auth[pair.1], "mentions"))
+                .await
+                .unwrap();
+        }
+        g.link(NewEdge::new(&billing[0], &billing[1], "mentions"))
+            .await
+            .unwrap();
+
+        // When communities are recomputed
+        let count = g.recompute_communities().await.unwrap();
+
+        // Then every node is assigned, and the two groups land in different
+        // communities: that separation is the whole point, and it is what
+        // makes clusters usable for finding sections nobody declared.
+        // `recompute_communities` returns how many DISTINCT communities it
+        // found, not how many nodes it touched.
+        assert_eq!(count, 2, "the two disconnected groups are two communities");
+        let assignments = g.communities().await.unwrap();
+        assert_eq!(
+            assignments.len(),
+            5,
+            "every node that appears on a live edge should be assigned"
+        );
+
+        let community_of = |id: &NodeId| {
+            assignments
+                .iter()
+                .find(|(n, _)| n == id)
+                .map(|(_, c)| *c)
+                .expect("node must have a community")
+        };
+        let auth_community = community_of(&auth[0]);
+        let billing_community = community_of(&billing[0]);
+
+        assert!(
+            auth.iter().all(|n| community_of(n) == auth_community),
+            "the three linked auth nodes belong together: {assignments:?}"
+        );
+        assert!(
+            billing.iter().all(|n| community_of(n) == billing_community),
+            "the two linked billing nodes belong together: {assignments:?}"
+        );
+        assert_ne!(
+            auth_community, billing_community,
+            "disconnected groups must not be merged into one community: {assignments:?}"
+        );
+    }
 }
