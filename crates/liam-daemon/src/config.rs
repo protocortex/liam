@@ -121,7 +121,7 @@ pub struct ProducersConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            database_path: "liam.db".into(),
+            database_path: "~/.liam/liam.db".into(),
             log_filter: "info,liam=debug".into(),
             embedding_dims: 768,
             gc: GcConfig::default(),
@@ -300,6 +300,10 @@ mod tests {
         assert_eq!(c.llm.context_tokens, 8192);
         assert_eq!(c.llm.max_concurrent_generations, 1);
         assert_eq!(c.socket_path, "~/.liam/liamd.sock");
+        // The SHIPPED liam.toml is the dev config and keeps a relative
+        // database next to the checkout, which is what `cargo run` wants.
+        // The built-in default below is the one an installed daemon uses.
+        assert_eq!(c.database_path, "liam.db");
         assert_eq!(c.read_pool_size, 4);
         assert_eq!(c.max_connections, 16);
         assert_eq!(c.producers.unknown_id, "unknown");
@@ -404,6 +408,23 @@ mod tests {
             "message: {message}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_built_in_database_default_lives_under_the_home_directory() {
+        // Given no config file at all, which is what an installed daemon
+        // gets before anyone writes one
+        let c = Config::default();
+
+        // Then the database lands somewhere stable rather than relative to
+        // whatever directory the process happened to start in. A relative
+        // default scatters a separate store per working directory, and under
+        // a supervisor it resolves against `/`, which is read-only.
+        assert_eq!(c.database_path, "~/.liam/liam.db");
+        assert!(
+            c.database_path.starts_with('~'),
+            "the default must be home-relative so it survives any working directory"
+        );
     }
 
     #[test]

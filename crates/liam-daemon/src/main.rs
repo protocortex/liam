@@ -74,36 +74,35 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
     telemetry::init(&config.log_filter);
 
     if mode == cli::Mode::Proxy {
-        let socket_path = resolved_socket_path(&config)?;
+        let socket_path = resolve_config_path("socket_path", &config.socket_path)?;
         return transport::proxy::run(&socket_path).await;
     }
 
     serve_with_store(mode, config).await
 }
 
-/// The socket path config asks for, with `~` expanded: the socket API has no
-/// notion of a home directory, so a literal `~` would create a directory
-/// named `~` in the working directory.
+/// Expands `~` in a configured path. Nothing below the config layer
+/// understands a home directory: the socket API would create a directory
+/// literally named `~`, and libSQL would create a database inside one.
 ///
 /// A tilde path with no `HOME` set is an error rather than a default,
-/// because the silent version is worse than useless: an empty home expands
-/// `~/.liam/liamd.sock` to `/.liam/liamd.sock`, at the filesystem root,
+/// because the silent version is worse than useless: an empty home turns
+/// `~/.liam/liamd.sock` into `/.liam/liamd.sock`, at the filesystem root,
 /// which fails later with a permission error naming a path the operator
 /// never configured. Sparse environments are a real case here, since a
 /// launchd job only has the variables its plist declares.
-fn resolved_socket_path(config: &Config) -> anyhow::Result<std::path::PathBuf> {
+///
+/// `key` names the config field so the error tells the operator which line
+/// to fix rather than making them guess which path was at fault.
+fn resolve_config_path(key: &str, value: &str) -> anyhow::Result<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() && config.socket_path.starts_with('~') {
+    if home.is_empty() && value.starts_with('~') {
         anyhow::bail!(
-            "socket_path is {:?} but HOME is not set, so `~` cannot be expanded. \
-             Set HOME, or write an absolute socket_path in your config.",
-            config.socket_path
+            "{key} is {value:?} but HOME is not set, so `~` cannot be expanded. \
+             Set HOME, or write an absolute {key} in your config."
         );
     }
-    Ok(std::path::PathBuf::from(config::expand_tilde(
-        &config.socket_path,
-        &home,
-    )))
+    Ok(std::path::PathBuf::from(config::expand_tilde(value, &home)))
 }
 
 /// Everything that needs the store and the models: the stdio server and the
@@ -117,10 +116,23 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
     // away. See `storelock` for why this is a real advisory `flock` and not
     // a PID file, and for the contract the future `liamd proxy` mode (which
     // opens no store) must follow.
-    let _lock = storelock::StoreLock::acquire(Path::new(&config.database_path))?;
+    let database_path = resolve_config_path("database_path", &config.database_path)?;
+    // A fresh install has no ~/.liam yet, and libSQL will not create a parent
+    // directory for the database the way `socket::bind` does for the socket.
+    if let Some(parent) = database_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|source| {
+                anyhow::anyhow!(
+                    "failed to create the database directory {}: {source}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+    let _lock = storelock::StoreLock::acquire(&database_path)?;
 
     let store = DefaultGraph::open(
-        &config.database_path,
+        database_path.to_str().unwrap_or(&config.database_path),
         GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size),
     )
     .await?;
@@ -138,7 +150,7 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
         }
     }
 
-    spawn_gc(&config).await?;
+    spawn_gc(&config, &database_path).await?;
 
     let server = MemoryServer::new(
         store,
@@ -179,7 +191,7 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
 async fn serve_socket(config: &Config, server: MemoryServer) -> anyhow::Result<()> {
     use tokio_util::sync::CancellationToken;
 
-    let socket_path = resolved_socket_path(config)?;
+    let socket_path = resolve_config_path("socket_path", &config.socket_path)?;
     let source = transport::activation::resolve(&socket_path).await?;
     let cancel = CancellationToken::new();
 
@@ -238,13 +250,23 @@ fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Re
     Ok((embedder, reranker))
 }
 
+/// Refuses to start rather than substituting the mock embedder.
+///
+/// Silently downgrading here is the worst possible outcome: mock embeddings
+/// are random, so the vector channel returns noise and `recall` quality
+/// collapses with nothing to show for it. The old warning went to stderr,
+/// which an MCP client never surfaces, so a user would have seen only bad
+/// answers. Failing at startup with the actual fix is what makes a
+/// misconfigured install obvious in the one second it takes to notice.
 #[cfg(not(feature = "local"))]
-fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
-    tracing::warn!("embedder.provider is 'local' but the daemon was built without the `local` feature; using mock");
-    Ok((
-        Arc::new(MockEmbedder::new(config.embedding_dims)),
-        Arc::new(IdentityReranker),
-    ))
+fn build_local(_config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
+    anyhow::bail!(
+        "embedder.provider = \"local\" needs a binary built with the `local` feature, \
+         and this one was not. Either install a release build (they ship with it), \
+         rebuild with `--features local`, or set embedder.provider = \"mock\" if you \
+         actually want the dev embedder. Mock embeddings are random, so recall would \
+         be meaningless."
+    )
 }
 
 /// Choose the LLM from config. Mock keeps the base build runnable; `llama-cpp`
@@ -305,12 +327,22 @@ fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     )?))
 }
 
+/// Refuses to start rather than substituting the mock LLM.
+///
+/// `ask` synthesizes an answer from retrieved evidence, so a mock LLM makes
+/// it produce confident nonsense. The old warning went to stderr, invisible
+/// to an MCP client, which meant a user asking a question got a fabricated
+/// answer with no indication anything was wrong. That is the single worst
+/// failure mode this daemon has, so it is now fatal at startup.
 #[cfg(not(feature = "llama"))]
 fn build_llama_llm(_config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
-    tracing::warn!(
-        "llm.provider is 'llama-cpp' but the daemon was built without the `llama` feature; using mock"
-    );
-    Ok(Arc::new(MockLlm))
+    anyhow::bail!(
+        "llm.provider = \"llama-cpp\" needs a binary built with the `llama` feature, \
+         and this one was not. Either install a release build (they ship with it), \
+         rebuild with `--features llama`, or set llm.provider = \"mock\" if you \
+         actually want the dev model. The mock LLM invents answers, so `ask` would \
+         be worse than useless."
+    )
 }
 
 /// Whether a resolved backend label is a macOS startup error. Pure and
@@ -344,9 +376,9 @@ fn macos_backend_error(backend: &str, device: DevicePreference) -> Option<String
 }
 
 /// GC runs on its own store connection so it never contends with requests.
-async fn spawn_gc(config: &Config) -> anyhow::Result<()> {
+async fn spawn_gc(config: &Config, database_path: &Path) -> anyhow::Result<()> {
     let store = DefaultGraph::open(
-        &config.database_path,
+        database_path.to_str().unwrap_or(&config.database_path),
         GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size),
     )
     .await?;
@@ -377,6 +409,48 @@ async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A build without `local` must refuse `embedder.provider = "local"`
+    /// rather than quietly swapping in the mock. Mock embeddings are random,
+    /// so the substitution used to destroy recall quality while logging only
+    /// to stderr, where an MCP client never sees it.
+    #[cfg(not(feature = "local"))]
+    #[test]
+    fn local_embedder_without_the_feature_fails_instead_of_using_mock() {
+        let mut config = Config::default();
+        config.embedder.provider = "local".to_string();
+
+        let error = build_models(&config)
+            .err()
+            .expect("a local embedder without the feature must not fall back to mock");
+        let message = error.to_string();
+        assert!(
+            message.contains("--features local") || message.contains("`local` feature"),
+            "error should name the feature: {message}"
+        );
+        assert!(
+            message.contains("mock"),
+            "error should say what the alternative is: {message}"
+        );
+    }
+
+    /// Same rule for generation, and it matters more: a mock LLM makes `ask`
+    /// return confident fiction.
+    #[cfg(not(feature = "llama"))]
+    #[test]
+    fn llama_provider_without_the_feature_fails_instead_of_using_mock() {
+        let mut config = Config::default();
+        config.llm.provider = "llama-cpp".to_string();
+
+        let error = build_llm(&config)
+            .err()
+            .expect("llama-cpp without the feature must not fall back to mock");
+        let message = error.to_string();
+        assert!(
+            message.contains("`llama` feature") || message.contains("--features llama"),
+            "error should name the feature: {message}"
+        );
+    }
 
     #[test]
     fn llm_provider_local_is_rejected_with_an_actionable_error() {
