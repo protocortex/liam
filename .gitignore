@@ -9,4 +9,6 @@
 *.db
 *.db-shm
 *.db-wal
+# the store's advisory lock, created next to the database by any local run
+*.db.lock
 /.liam/

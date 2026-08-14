@@ -22,7 +22,7 @@ tokio = { version = "1", features = ["rt", "sync"], optional = true }
 leiden-rs = { version = "0.8", optional = true }
 
 [features]
-default = ["backend-libsql", "cluster"]
+default = ["backend-libsql"]
 # `dep:tokio` is wired to backend-libsql too: the read pool and write mutex in
 # `backends/libsql.rs` need `tokio::sync::Mutex`, and that must not depend on
 # libsql's own tokio features happening to pull it in, because that coupling
