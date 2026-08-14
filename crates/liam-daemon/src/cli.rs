@@ -12,8 +12,9 @@
 //! hand-rolled match would let `liamd serv` fall through to the
 //! store-opening default, so a typo would take the lock and fail the real
 //! daemon's next start. clap turns that into a usage error and exit code 2
-//! for free, and every clap crate is already in the shipped tree via
-//! leiden-rs, so it costs no new dependency.
+//! for free. It is a genuine added dependency now: it used to arrive via
+//! leiden-rs, but `cluster` left the default features, so nothing else
+//! pulls it in.
 
 use std::path::PathBuf;
 
