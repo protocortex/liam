@@ -2,8 +2,8 @@
 //! liam-store: a bitemporal graph store with hybrid retrieval.
 //!
 //! Nothing is overwritten: superseded facts stay readable as history. The store
-//! is generic over its storage engine (libSQL or, via the `backend-rusqlite`
-//! feature, stock SQLite with sqlite-vec). It owns structure, time, and
+//! is generic over its storage engine (libSQL today; see `backends` for why
+//! the trait stays with one implementation). It owns structure, time, and
 //! retrieval; it does not own your domain model or your embedding model.
 
 mod graph;

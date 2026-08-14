@@ -2,7 +2,7 @@
 //! Backend-neutral values and rows. Every backend converts these to and from
 //! its own types, so the shared graph logic speaks one vocabulary. Rows are
 //! materialized (owned), which sidesteps the sync-versus-async streaming
-//! mismatch between rusqlite and libSQL.
+//! mismatch between SQLite bindings and libSQL.
 
 use crate::error::{Error, Result};
 use crate::ids::Millis;

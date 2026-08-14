@@ -26,8 +26,7 @@ use crate::value::{Row, Value};
 /// Routing every connection, read or write, through a single shared
 /// connection would make "concurrent clients" true at the transport layer
 /// and false at the store, which is the whole reason this store gained a
-/// separate read pool. The (unfinished) rusqlite backend must honour the
-/// same contract once it lands.
+/// separate read pool. Any second backend must honour the same contract.
 #[async_trait]
 pub trait Backend: Send + Sync + Sized {
     /// Open (and if needed create) a local database at `path`.
