@@ -11,26 +11,27 @@ embedding model.
 
 ## Backends
 
-One backend feature is enabled at a time.
+One backend ships today.
 
 - `backend-libsql` (default): native vector search via `F32_BLOB` and
   `vector_distance_cos`.
-- `backend-rusqlite`: stock SQLite via rusqlite, with vector search from the
-  sqlite-vec extension. Synchronous rusqlite is bridged to the async API through
-  `spawn_blocking`, which is why this backend pulls in tokio.
 
-The seam is small by design. Full-text, graph, and CRUD SQL are identical on
-both engines and run through `Backend::execute`/`query`. Only vector storage and
-search differ, so those are their own trait methods and each backend owns its
-dialect and physical layout: libSQL keeps embeddings in a `node_vectors` table
-and prefilters against the live set; the rusqlite backend uses a sqlite-vec
-`vec0` virtual table.
+The seam is small by design, and stays even with a single implementation.
+Full-text, graph, and CRUD SQL run through `Backend::execute`/`query`. Only
+vector storage and search are engine-specific, so those are their own trait
+methods and a backend owns its dialect and physical layout: libSQL keeps
+embeddings in a `node_vectors` table and prefilters against the live set.
+
+A rusqlite backend was scaffolded here and removed once it was clear nothing
+built it. The `Backend` trait stays: it is what keeps a second engine cheap
+to add, and dropping it would mean rewriting `Graph<B: Backend>` throughout
+`graph.rs`.
 
 ## SQLite-file compatibility
 
-Whichever backend you choose, the database is a standard SQLite file. The
-`sqlite3` CLI and rusqlite can open a file this crate writes; only the vector
-functions are engine-specific. So "portable, inspectable with SQLite tooling" is
+The database is a standard SQLite file. The `sqlite3` CLI and any SQLite
+binding can open a file this crate writes; only the vector functions are
+engine-specific. So "portable, inspectable with SQLite tooling" is
 true out of the box, with no extra work.
 
 ## Data model
@@ -74,23 +75,20 @@ graph.recompute_communities().await?;
 ## Features
 
 ```
-default          = ["backend-libsql", "cluster"]
-backend-libsql   = ["dep:libsql"]
-backend-rusqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:zerocopy", "dep:tokio"]
-cluster          = ["dep:leiden-rs"]
+default        = ["backend-libsql", "cluster"]
+backend-libsql = ["dep:libsql", "dep:tokio"]
+cluster        = ["dep:leiden-rs"]
 ```
 
 ## Status
 
 The abstraction, the libSQL backend, and the shared graph logic are implemented
-and compile; the rusqlite backend is a scaffold with its bodies flagged (`todo!()`),
-so enabling `backend-rusqlite` panics at runtime. The acceptance gate is
-`cargo test --features backend-libsql`, which is green.
+and compile. The acceptance gate is `cargo test --features backend-libsql`,
+which is green.
 
 Verification boundaries, isolated on purpose:
 - libSQL parameter binding (`params_from_iter`) and row accessors
   (`column_count`, `get_value`) in `backends/libsql.rs`.
 - `vector_distance_cos` plus `bm25` running in one connection.
 - The `leiden-rs` membership accessor in `cluster.rs`.
-- The whole rusqlite backend (sync bridge and sqlite-vec `vec0` dialect).
 - The name: confirm `liam-store` is free on crates.io before publishing.

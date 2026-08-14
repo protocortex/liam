@@ -193,8 +193,6 @@ three: the `.db` file alone can be missing recently committed data.
 - `backend-libsql` (default): libSQL with native vector search (`F32_BLOB`,
   `vector_distance_cos`).
 - `cluster` (default): Leiden community detection.
-- `backend-rusqlite`: stock SQLite plus sqlite-vec. Scaffold only; the methods
-  are `todo!()` and panic at runtime.
 
 `liam-daemon`:
 
@@ -220,15 +218,12 @@ The workspace compiles on default features and the daemon builds to a binary.
 the shared graph logic are done.
 
 Not yet verified against their third-party APIs: the `local` build (fastembed v5
-signatures) and the `cluster` build (the leiden-rs membership accessor). The
-rusqlite backend is a scaffold and panics if enabled.
+signatures) and the `cluster` build (the leiden-rs membership accessor).
 
 ## Roadmap
 
-- Finish the rusqlite backend, or drop the feature until a second backend is
-  needed.
 - Confirm the fastembed and rmcp surfaces under a real end-to-end run.
-- Add a `liam` CLI and Unix-socket IPC as a second consumer of the store.
+- Add a `liam` CLI as a second consumer of the store.
 - First tagged release with prebuilt binaries and a Homebrew formula.
 
 ## License
