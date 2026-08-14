@@ -3,21 +3,18 @@
 <!--
   launchd job for liamd, the LIAM memory daemon.
 
-  NOT YET USABLE. This job runs `liamd serve`, and mode dispatch (WU-9) is
-  what teaches liamd to parse a subcommand. Until that lands, liamd ignores
-  argv entirely rather than rejecting it, so installing this job now starts
-  the stdio server instead of the socket listener: launchd would hold an
-  activated socket that nothing ever serves, and nothing would report an
-  error. Ship this file now so activation and the plist land together and
-  the tests can pin one against the other; install it after WU-9.
-
   Install as a LaunchAgent (per user, not system-wide: the database and the
   socket both live under the user's home directory and carry that user's
   memories):
 
+    mkdir -p ~/.liam ~/.local/bin
+    cp target/release/liamd ~/.local/bin/liamd
     sed "s|__HOME__|$HOME|g" packaging/dev.protocortex.liamd.plist \
       > ~/Library/LaunchAgents/dev.protocortex.liamd.plist
     launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.protocortex.liamd.plist
+
+  `mkdir -p ~/.liam` is not optional. It has to exist before launchd binds
+  the socket inside it and before the job's WorkingDirectory below resolves.
 
   __HOME__ is a placeholder the command above substitutes. launchd expands
   neither `~` nor environment variables inside SockPathName, so the path has
@@ -33,11 +30,33 @@
     <key>Label</key>
     <string>dev.protocortex.liamd</string>
 
+    <!--
+      `--config` is spelled out rather than left to LIAM_CONFIG, because a
+      launchd job inherits none of a login shell's environment: without this
+      liamd looks for liam.toml relative to its working directory, finds
+      nothing, and silently runs on defaults, so an operator's config would
+      be ignored with no error. A config file that does not exist yet is
+      fine, that path falls back to the defaults on purpose.
+    -->
     <key>ProgramArguments</key>
     <array>
         <string>__HOME__/.local/bin/liamd</string>
+        <string>--config</string>
+        <string>__HOME__/.liam/liam.toml</string>
         <string>serve</string>
     </array>
+
+    <!--
+      Required, not tidiness. launchd starts a job with its working
+      directory at `/`, which is read-only under SIP, and `database_path`
+      defaults to the RELATIVE path `liam.db`. Without this the daemon dies
+      on every spawn with "failed to open store lock file liam.db.lock:
+      Read-only file system", launchd keeps retrying, and a connecting
+      client just times out with nothing to explain why. Measured against a
+      real job before this key was added.
+    -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.liam</string>
 
     <!--
       Socket activation. launchd binds and owns this socket, so it exists

@@ -214,6 +214,45 @@ mod tests {
     }
 
     #[test]
+    fn the_plist_sets_a_writable_working_directory() {
+        // Given the shipped plist
+        // Then it sets WorkingDirectory. launchd starts a job at `/`, which
+        // is read-only under SIP, and `database_path` defaults to the
+        // relative `liam.db`, so without this the daemon dies on every
+        // spawn with a read-only filesystem error and a connecting client
+        // only sees a timeout.
+        assert!(
+            PLIST.contains("<key>WorkingDirectory</key>"),
+            "the plist must set WorkingDirectory, or a relative database_path resolves \
+             against / and the daemon cannot start"
+        );
+    }
+
+    #[test]
+    fn the_plist_passes_an_explicit_config_path() {
+        // Given the shipped plist
+        // Then it names --config in ProgramArguments. A launchd job
+        // inherits no shell environment, so relying on LIAM_CONFIG would
+        // leave the daemon silently running on defaults while the
+        // operator's liam.toml sat unread.
+        let args = PLIST
+            .split_once("<key>ProgramArguments</key>")
+            .expect("the plist must declare ProgramArguments")
+            .1
+            .split_once("</array>")
+            .expect("ProgramArguments must be closed")
+            .0;
+        assert!(
+            args.contains("--config"),
+            "ProgramArguments must pass --config, or an operator's liam.toml is ignored: {args}"
+        );
+        assert!(
+            args.contains("serve"),
+            "ProgramArguments must select serve mode: {args}"
+        );
+    }
+
+    #[test]
     fn the_plist_starts_the_daemon_on_demand_rather_than_at_load() {
         // Given the shipped plist
         // Then RunAtLoad is false, so launchd waits for a client rather
