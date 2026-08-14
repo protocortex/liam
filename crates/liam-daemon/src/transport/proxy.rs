@@ -19,6 +19,7 @@
 
 use std::path::Path;
 
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 /// Connects to the daemon at `socket_path` and shuttles bytes between it and
@@ -27,7 +28,7 @@ use tokio::net::UnixStream;
 /// Logs to stderr only, because stdout IS the protocol stream here and
 /// anything else written there corrupts the client's framing.
 pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
-    let mut socket = UnixStream::connect(socket_path).await.map_err(|source| {
+    let socket = UnixStream::connect(socket_path).await.map_err(|source| {
         anyhow::anyhow!(
             "no liam daemon is listening at {}: {source}\n\
              Start one with `liamd serve`, or let launchd start it on demand \
@@ -38,14 +39,56 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
 
     tracing::debug!(path = %socket_path.display(), "proxying stdio to the daemon socket");
 
-    // `stdin`/`stdout` rather than a duplex handle: they are separate
-    // descriptors, and `copy_bidirectional` wants one read-write thing, so
-    // they get joined here.
-    let mut client = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+    shuttle(tokio::io::stdin(), tokio::io::stdout(), socket).await
+}
 
-    match tokio::io::copy_bidirectional(&mut client, &mut socket).await {
-        Ok((to_daemon, to_client)) => {
-            tracing::debug!(to_daemon, to_client, "proxy finished");
+/// Moves bytes between a client's input/output and the daemon `socket`,
+/// returning once the daemon side is done.
+///
+/// Split out from [`run`] so the ending rule can be tested: `run` supplies
+/// this process's real stdin and stdout, which a test cannot drive.
+///
+/// Deliberately NOT `copy_bidirectional`. That waits for BOTH directions,
+/// and a client's stdin never reaches EOF on its own, so when the daemon
+/// exits mid-session the proxy hangs forever holding the client's stdio
+/// open: the client is left with a live proxy that can never answer.
+/// Measured against a real daemon, not theorised.
+async fn shuttle<R, W>(client_in: R, mut client_out: W, socket: UnixStream) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (mut from_daemon, mut to_daemon) = socket.into_split();
+
+    // Client to daemon. On input EOF it half-closes the socket's write side
+    // so the daemon sees the end of input and can finish its last reply,
+    // rather than holding a session open for a client that has gone.
+    let uplink = tokio::spawn(async move {
+        let mut client_in = client_in;
+        let copied = tokio::io::copy(&mut client_in, &mut to_daemon).await;
+        let _ = to_daemon.shutdown().await;
+        copied
+    });
+
+    // Daemon to client. Completes when the daemon closes the socket, whether
+    // because it finished with us or because it exited. Either way nothing
+    // further can arrive, so this direction is what ends the proxy.
+    let result = async {
+        let copied = tokio::io::copy(&mut from_daemon, &mut client_out).await;
+        // Flush before reporting: `copy` can leave the last frame buffered,
+        // and dropping it would lose the client's final response.
+        let _ = client_out.flush().await;
+        copied
+    }
+    .await;
+
+    // The uplink may be parked on a read that never returns. Nothing can
+    // consume what it reads now, so drop it rather than wait.
+    uplink.abort();
+
+    match result {
+        Ok(bytes) => {
+            tracing::debug!(bytes, "proxy finished");
             Ok(())
         }
         // A closed pipe is how this normally ends: the client exits, or the
@@ -135,9 +178,39 @@ mod tests {
         assert!(!is_disconnect(&Error::new(ErrorKind::NotFound, "nope")));
     }
 
-    /// The shuttle itself, over a real socket pair. `run` reads this
-    /// process's stdin, which a test cannot drive, so the copy is exercised
-    /// directly against the same `copy_bidirectional` call.
+    /// The regression pin for the hang this module's `shuttle` exists to
+    /// avoid. Before the split, `copy_bidirectional` waited for BOTH
+    /// directions, so a daemon that exited while the client's input stayed
+    /// open left the proxy running forever. Verified against a real daemon:
+    /// the old shape was still alive 25 seconds after the daemon died, the
+    /// new one exits as soon as the socket closes.
+    #[tokio::test]
+    async fn the_shuttle_ends_when_the_daemon_closes_even_with_client_input_open() {
+        // Given a client whose input never ends and never yields a byte,
+        // which is what an MCP client's stdin looks like while it waits
+        let (client_in, _hold_input_open) = tokio::io::duplex(64);
+        let (client_side, daemon_side) = UnixStream::pair().expect("socket pair");
+
+        let shuttle_task =
+            tokio::spawn(async move { shuttle(client_in, tokio::io::sink(), client_side).await });
+
+        // When the daemon goes away
+        drop(daemon_side);
+
+        // Then the shuttle returns promptly instead of waiting on input
+        // nobody will ever consume. The timeout IS the assertion: without
+        // the fix this never completes.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), shuttle_task)
+            .await
+            .expect("the shuttle must end when the daemon closes, not hang")
+            .expect("the shuttle task must not panic");
+        assert!(
+            outcome.is_ok(),
+            "a daemon closing the session is a normal end, got: {outcome:?}"
+        );
+    }
+
+    /// Bytes cross unchanged, both ways, over a real socket pair.
     #[tokio::test]
     async fn bytes_cross_the_shuttle_verbatim_in_both_directions() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
