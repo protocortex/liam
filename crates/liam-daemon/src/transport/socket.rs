@@ -52,10 +52,7 @@ const MIN_MAX_CONNECTIONS: usize = 1;
 /// bound the socket itself, so it is the one that owns the file.
 ///
 /// Reached through [`crate::transport::activation::resolve`], which only
-/// calls this when no supervisor handed a socket over. `resolve` in turn
-/// waits on WU-9's mode dispatch to be called from `main`, so this is still
-/// unreachable in the production build, hence the allow.
-#[allow(dead_code)]
+/// calls this when no supervisor handed a socket over.
 pub async fn bind(path: &Path) -> anyhow::Result<ListenerSource> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -176,10 +173,6 @@ fn floor_max_connections(max_connections: usize) -> usize {
 /// clients queue in the kernel's own backlog instead of piling up as
 /// accepted-but-unserved connections inside this process.
 ///
-/// Mode dispatch (WU-9) is what calls this from `main`; until then it is
-/// unreachable outside tests, hence `#[allow(dead_code)]` rather than
-/// actually unused.
-///
 /// `producers` is the `[producers]` table each connection's `initialize`
 /// handshake gets resolved against (see `handle_connection`); an `Arc`
 /// because it is shared, read-only, across however many connection tasks
@@ -195,7 +188,6 @@ fn floor_max_connections(max_connections: usize) -> usize {
 /// what is left, logs a warning, and still returns `Ok(())`, because being
 /// told to stop is not an error no matter how the sessions ended. Only a
 /// failed `accept` comes back as `Err`.
-#[allow(dead_code)]
 pub async fn accept_loop(
     source: ListenerSource,
     server: MemoryServer,

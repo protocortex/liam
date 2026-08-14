@@ -31,16 +31,10 @@ use crate::transport::ListenerSource;
 /// `tests::the_drain_deadline_stays_under_the_supervisor_grace_period`
 /// pins that relationship against the shipped plist.
 ///
-/// Mode dispatch (WU-9) is what passes this to `accept_loop` from `main`;
-/// until then it is unreachable outside tests.
-#[allow(dead_code)]
 pub const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Which signal asked the daemon to stop. Carried only so the log line can
 /// name it; both take the identical path.
-///
-/// Unreachable outside tests until WU-9 wires `signal` into `main`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// SIGTERM, what launchd and `kill` send.
@@ -50,7 +44,6 @@ pub enum Trigger {
 }
 
 impl Trigger {
-    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Trigger::Term => "SIGTERM",
@@ -75,8 +68,7 @@ impl Trigger {
 /// one process, so a test that raised SIGTERM would race every other test
 /// in the binary. The orderly shutdown this triggers is tested directly
 /// instead, through `drain` and `unlink_owned_socket`, which is where the
-/// behaviour that can actually break lives. WU-9 wires this into `main`.
-#[allow(dead_code)]
+/// behaviour that can actually break lives.
 pub async fn signal() -> std::io::Result<Trigger> {
     use tokio::signal::unix::{signal as unix_signal, SignalKind};
 

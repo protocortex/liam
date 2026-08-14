@@ -1,5 +1,13 @@
 # liam-daemon configuration. Missing file or key falls back to defaults;
-# unknown keys are rejected. Point elsewhere with LIAM_CONFIG=/path.
+# unknown keys are rejected. Point elsewhere with LIAM_CONFIG=/path, or
+# --config /path, which wins over the environment.
+#
+# All three modes read this file, but they use different parts of it:
+#   liamd          stdio server: everything below except socket_path.
+#   liamd serve    socket daemon: everything, including socket_path.
+#   liamd proxy    stdio-to-socket shuttle: socket_path ONLY. It opens no
+#                  store and loads no model, so database_path, [embedder],
+#                  [llm], and [gc] are all ignored.
 
 database_path  = "liam.db"
 log_filter     = "info,liam=debug"   # RUST_LOG overrides when set

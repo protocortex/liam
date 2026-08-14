@@ -7,6 +7,7 @@
 //! cross-encoder reranker), no server.
 
 mod ask;
+mod cli;
 mod config;
 /// Grounding eval for `ask`; test-only, see the module docs to run it.
 #[cfg(test)]
@@ -27,22 +28,87 @@ use config::Config;
 use mcp::MemoryServer;
 
 fn main() -> anyhow::Result<()> {
-    let config = Config::load(config_path().as_ref())?;
+    // Parse BEFORE anything else touches the filesystem or the environment.
+    // A usage error must exit 2 without having opened the store or taken the
+    // store lock, since a typo like `liamd serv` would otherwise break the
+    // real daemon's next start. `parse` exits the process itself on a usage
+    // error or on --help/--version.
+    let cli = <cli::Cli as clap::Parser>::parse();
+    let mode = cli.mode();
+    let config_path = cli.config_path(std::env::var("LIAM_CONFIG").ok().as_deref());
+
+    let config = Config::load(config_path.as_ref())?;
     // Set fastembed's cache dir before the async runtime starts. Mutating the
     // environment once worker threads exist is a data race on POSIX (and
     // `unsafe` on edition 2024), so it must happen while single-threaded.
-    if config.embedder.provider == "local" {
+    // Skipped for the proxy, which loads no model.
+    if mode != cli::Mode::Proxy && config.embedder.provider == "local" {
         std::env::set_var("FASTEMBED_CACHE_DIR", &config.embedder.cache_dir);
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run(config))
+        .build()?;
+    let result = runtime.block_on(run(mode, config));
+
+    if mode == cli::Mode::Proxy {
+        // The proxy's stdin reader sits in a blocking read that cannot be
+        // cancelled, and dropping a runtime WAITS for blocking tasks that
+        // have already started. So when the daemon closes the session first,
+        // a plain drop here hangs forever on a read for input nobody will
+        // ever consume, which is the whole failure `transport::proxy` works
+        // to avoid. Measured: without this the proxy never exits after the
+        // daemon goes away.
+        //
+        // Safe to drop on the floor precisely because the proxy owns no
+        // state worth unwinding: no store, no lock, no socket of its own.
+        runtime.shutdown_background();
+    }
+
+    result
 }
 
-async fn run(config: Config) -> anyhow::Result<()> {
+/// Dispatches to the selected mode. The proxy branch returns before any
+/// store or model setup on purpose: it must not take the per-process store
+/// lock the daemon it forwards to already holds.
+async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
     telemetry::init(&config.log_filter);
 
+    if mode == cli::Mode::Proxy {
+        let socket_path = resolved_socket_path(&config)?;
+        return transport::proxy::run(&socket_path).await;
+    }
+
+    serve_with_store(mode, config).await
+}
+
+/// The socket path config asks for, with `~` expanded: the socket API has no
+/// notion of a home directory, so a literal `~` would create a directory
+/// named `~` in the working directory.
+///
+/// A tilde path with no `HOME` set is an error rather than a default,
+/// because the silent version is worse than useless: an empty home expands
+/// `~/.liam/liamd.sock` to `/.liam/liamd.sock`, at the filesystem root,
+/// which fails later with a permission error naming a path the operator
+/// never configured. Sparse environments are a real case here, since a
+/// launchd job only has the variables its plist declares.
+fn resolved_socket_path(config: &Config) -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() && config.socket_path.starts_with('~') {
+        anyhow::bail!(
+            "socket_path is {:?} but HOME is not set, so `~` cannot be expanded. \
+             Set HOME, or write an absolute socket_path in your config.",
+            config.socket_path
+        );
+    }
+    Ok(std::path::PathBuf::from(config::expand_tilde(
+        &config.socket_path,
+        &home,
+    )))
+}
+
+/// Everything that needs the store and the models: the stdio server and the
+/// socket daemon. Both take the per-process store lock.
+async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
     // Exclusive per-process lock, taken once, before the first store open.
     // `spawn_gc` below opens a second CONNECTION to the same database on
     // purpose; that is not a second process, so the lock is not retaken for
@@ -85,17 +151,66 @@ async fn run(config: Config) -> anyhow::Result<()> {
         config.llm.max_concurrent_generations,
     );
 
-    // rmcp stdio serve. Confirm against your pinned rmcp version.
-    use rmcp::ServiceExt;
-    let running = server.serve(rmcp::transport::stdio()).await?;
-    running.waiting().await?;
-    Ok(())
+    match mode {
+        cli::Mode::Serve => serve_socket(&config, server).await,
+        // `run` returns on `Proxy` before this function is ever called, and
+        // it must stay that way: reaching here would mean the proxy had
+        // already opened the store and taken the lock held by the daemon it
+        // exists to forward to. Panicking is the point. Folding it in with
+        // `Stdio` would instead give a future refactor a silently wrong
+        // proxy that serves its own stdio session.
+        cli::Mode::Proxy => unreachable!(
+            "proxy mode returns in run() before any store setup; \
+             reaching serve_with_store means that guard was removed"
+        ),
+        cli::Mode::Stdio => {
+            // rmcp stdio serve. Confirm against your pinned rmcp version.
+            use rmcp::ServiceExt;
+            let running = server.serve(rmcp::transport::stdio()).await?;
+            running.waiting().await?;
+            Ok(())
+        }
+    }
 }
 
-fn config_path() -> std::path::PathBuf {
-    std::env::var("LIAM_CONFIG")
-        .unwrap_or_else(|_| "liam.toml".to_string())
-        .into()
+/// The socket daemon: resolve the listener (activated by launchd, or bound
+/// here), serve it, and stop on SIGTERM or SIGINT through the ordered
+/// shutdown in `transport::shutdown`.
+async fn serve_socket(config: &Config, server: MemoryServer) -> anyhow::Result<()> {
+    use tokio_util::sync::CancellationToken;
+
+    let socket_path = resolved_socket_path(config)?;
+    let source = transport::activation::resolve(&socket_path).await?;
+    let cancel = CancellationToken::new();
+
+    // Signals are watched on their own task so the accept loop owns the
+    // main flow. Cancelling the token is all this does; the drain and the
+    // unlink belong to the accept loop's shutdown path.
+    let signal_cancel = cancel.clone();
+    tokio::spawn(async move {
+        match transport::shutdown::signal().await {
+            Ok(trigger) => {
+                tracing::info!(signal = trigger.as_str(), "shutting down");
+                signal_cancel.cancel();
+            }
+            // Without a handler the process would be killed outright on
+            // SIGTERM and lose in-flight work, so this is worth surfacing
+            // rather than logging at debug and moving on.
+            Err(error) => {
+                tracing::error!(error = %error, "failed to install signal handlers; shutdown will not be graceful")
+            }
+        }
+    });
+
+    transport::socket::accept_loop(
+        source,
+        server,
+        config.max_connections,
+        std::sync::Arc::new(config.producers.clone()),
+        cancel,
+        transport::shutdown::DEFAULT_DRAIN_DEADLINE,
+    )
+    .await
 }
 
 /// Choose the embedder and reranker from config. The mock pair keeps the base

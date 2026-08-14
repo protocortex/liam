@@ -8,6 +8,7 @@
 //! yet and this module does not declare it.
 
 pub mod activation;
+pub mod proxy;
 pub mod shutdown;
 pub mod socket;
 
@@ -39,11 +40,7 @@ pub enum ListenerSource {
     /// on purpose: this process must not act on the file, and holding the
     /// path would make it far too easy to.
     ///
-    /// Constructed only by `activation::resolve`, which mode dispatch
-    /// (WU-9) calls from `main`. Until that lands nothing in the production
-    /// build reaches it, hence the allow rather than an actually-unused
-    /// variant. Its behaviour is covered by `shutdown`'s tests.
-    #[allow(dead_code)]
+    /// Constructed only by `activation::resolve`.
     Activated(UnixListener),
 }
 

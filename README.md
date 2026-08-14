@@ -76,9 +76,53 @@ cargo build -p liam-daemon --features local
 cargo run -p liam-daemon         # builds and runs the `liamd` binary
 ```
 
-The daemon serves MCP over stdio, so you launch it from an MCP client rather than
-talking to it by hand. Point a client at the `liamd` binary and it exposes two
-tools.
+`liamd` has three modes. Running it with no subcommand is the original one, so
+existing MCP client configs keep working unchanged.
+
+| Command | What it does | Opens the store |
+|---|---|---|
+| `liamd` | Serves MCP over this process's stdio. One client, one process. | yes |
+| `liamd serve` | The shared daemon: serves many clients over a Unix socket. | yes |
+| `liamd proxy` | Forwards stdio to a running daemon's socket. | no |
+
+`--config PATH` overrides `LIAM_CONFIG` for any of them.
+
+### One daemon, many agents
+
+Running `liamd` per client gives each one its own process, and only one of them
+can hold the database: the others fail to start on the store lock. Use the daemon
+instead when more than one agent needs the same memory.
+
+Start it once:
+
+```sh
+liamd serve
+```
+
+Then point every MCP client at the proxy rather than at `liamd` directly:
+
+```json
+{ "command": "liamd", "args": ["proxy"] }
+```
+
+Each client keeps its own identity through the proxy, because the proxy forwards
+bytes untouched and the daemon reads the name from the client's own MCP
+handshake. Map those names to stable producer ids in `[producers.clients]`, and
+every fact records who wrote it.
+
+On macOS, launchd can own the socket and start the daemon on the first
+connection, so nothing has to run `liamd serve` by hand. See
+`packaging/dev.protocortex.liamd.plist` for the job and its install steps.
+
+### The socket
+
+`socket_path` defaults to `~/.liam/liamd.sock` and is created owner-only (0600).
+It carries full tool access with no further authentication, so anyone who can
+reach the file can act as any client; owner-only is what makes "can reach it"
+mean "is already you". `liamd serve` refuses to start if another daemon is
+already listening, and replaces the socket only when it is stale.
+
+Point a client at `liamd` and it exposes two tools.
 
 `remember` records a fact.
 
@@ -121,8 +165,26 @@ unknown key fails loudly.
 | `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. |
 | `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`. |
 | `embedder.cache_dir` | `~/.liam/models` | Model files. Sets `FASTEMBED_CACHE_DIR`. |
+| `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
+| `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
+| `read_pool_size` | `4` | Read connections. Ignored for an in-memory database. |
+| `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
+| `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
+
+`[producers.clients]` is a plain table, and the ids are what land in the
+`producer` column:
+
+```toml
+[producers.clients]
+claude-code = "claude"
+ai-notetaker = "notetaker"
+```
 
 Logs go to stderr. Stdout carries the MCP JSON-RPC stream, so it stays clean.
+
+The store runs in WAL mode, so libSQL keeps `liam.db-wal` and `liam.db-shm` next
+to the database. Anything that copies or backs up the store by path needs all
+three: the `.db` file alone can be missing recently committed data.
 
 ## Feature flags
 

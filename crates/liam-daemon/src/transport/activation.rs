@@ -44,10 +44,7 @@ pub const LAUNCHD_SOCKET_NAME: &str = "Listener";
 /// and they must keep working exactly as they did before activation
 /// existed.
 ///
-/// Mode dispatch (WU-9) is what calls this from `main`; until then it is
-/// unreachable outside tests, hence `#[allow(dead_code)]` rather than
-/// actually unused, the same convention `socket::bind` uses.
-#[allow(dead_code)]
+/// Called once from `main`'s `serve` dispatch, before the accept loop.
 pub async fn resolve(path: &Path) -> anyhow::Result<ListenerSource> {
     match activated_listener()? {
         Some(listener) => {
