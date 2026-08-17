@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Managed by github.com/protocortex/infra
+# Managed by the terraform-hardened-repo module. Do not edit directly:
 #
 # OSV-Scanner: cross-language vulnerability scan against the GitHub
 # Advisory Database. Auto-detects package manifests at the repo root
