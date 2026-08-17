@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Managed by github.com/protocortex/infra
+# Managed by the terraform-hardened-repo module. Do not edit directly:
 #
 # License compliance gate. Two checks land here:
 #
