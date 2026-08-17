@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Managed by github.com/protocortex/infra
+# Managed by the terraform-hardened-repo module. Do not edit directly:
 name: CLA & DCO
 
 on:
@@ -61,7 +61,7 @@ jobs:
             const missing = [];
             for (const c of commits.data) {
               // Skip bot-authored commits. auto-update-pr.yml,
-              // dependabot, and the igorjs App create merge / sync
+              // dependabot, and the governance App create merge / sync
               // commits via the GitHub API that can't carry a
               // Signed-off-by trailer; gating on them would block
               // every PR the auto-updater touches. Mirrors Probot
