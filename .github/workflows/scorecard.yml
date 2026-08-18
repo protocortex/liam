@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Managed by the terraform-hardened-repo module. Do not edit directly:
+# Managed by the terraform-github-security-repo module. Do not edit directly:
 name: OpenSSF Scorecard
 
 # Publishes the project's OpenSSF Scorecard rating (binary-artifacts,
