@@ -61,6 +61,6 @@ Vulnerabilities in this repository's code, including but not limited to:
 ## Hardening posture
 
 This repository follows a common hardening posture applied as code by the
-[terraform-hardened-repo](https://github.com/protocortex/terraform-hardened-repo)
+[terraform-github-security-repo](https://github.com/protocortex/terraform-github-security-repo)
 module: ruleset-managed branch and tag protection, signed commits, SHA-pinned
 third-party actions, and an App-based bot identity with narrow per-repo scope.
