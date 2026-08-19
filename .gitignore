@@ -12,3 +12,4 @@
 # the store's advisory lock, created next to the database by any local run
 *.db.lock
 /.liam/
+.claude/designs/
