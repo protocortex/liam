@@ -2,7 +2,10 @@
 
 - **Status:** Accepted
 - **Date created:** 2026-08-17
-- **Date modified:** 2026-08-19
+- **Date modified:** 2026-08-20
+- **Supersedes scope:** the clustering cadence, the `cluster` Cargo feature, and the
+  `clusters` tool moved to [ADR-0002](0002-cluster-recompute-cadence.md) on 2026-08-20, after
+  an adversarial review found them bundled here without any alternatives weighed.
 
 ## Context
 
@@ -24,10 +27,14 @@ chains and nothing else.
 
 That has a downstream consequence. `Graph::recompute_communities` (`graph.rs:581`) builds its
 graph from `"SELECT src, dst FROM edges WHERE tx_to = ?1"` (`graph.rs:591`) with no filter on
-`type`. Run today, Leiden would return one community per version chain of a single fact, and
-every node never superseded would receive no community at all, because the node list is built
-only from edge endpoints. The semantic relation `mentions` exists as a constant
-(`types.rs:20`) and is never written.
+`type`. Two things follow, and they differ in how well established they are. **Confirmed** by
+the code and by the existing test `communities_separate_two_disconnected_groups_of_nodes`
+(`graph.rs:1406`): a node never touched by a live edge receives no community at all, because
+the node list is built only from edge endpoints. **Inferred, and covered by no test:** run
+today, Leiden would most likely group each version chain into its own community, so the output
+would read as topics while actually describing version history. No test exercises a
+path-shaped chain, so the second belongs in this record as motivation, not as measurement.
+The semantic relation `mentions` exists as a constant (`types.rs:20`) and is never written.
 
 Three properties of the current code decide how edges can safely be asserted:
 
@@ -48,8 +55,10 @@ clusters work has something real to cluster.
 
 ## Decision Drivers
 
-- **Clustering is inert without semantic edges.** With only `supersedes` in the table,
-  `recompute_communities` (`graph.rs:591`) produces version chains labelled as topics.
+- **Clustering is inert without semantic edges.** With only `supersedes` in the table, the
+  only nodes `recompute_communities` (`graph.rs:591`) can assign at all are those sitting on a
+  version chain; every other node is invisible to it. That much is confirmed. Whether Leiden
+  additionally splits those chains one per community is inferred, not measured.
 - **The addressing scheme is a public contract.** Two consumers will build against it: the
   coding agent and ai-notetaker. M2.6 extends the same surface further, so the shape set here
   propagates.
@@ -83,6 +92,12 @@ clusters work has something real to cluster.
   existing memories and notices a connection has no way to record it, which is precisely the
   case clustering feeds on. Subjects are also optional on nodes, so anything written without
   one is unlinkable forever.
+- A variant, **link at write time by id**, avoids the ambiguity that sinks the subject and
+  label schemes, since ids are unique. It is not an alternative to `relate` and could not
+  replace it, because it still cannot express a link between two memories that already exist,
+  which is the case this record exists to serve. It is a possible later convenience on top of
+  the chosen design, reusing the same liveness check, and is noted here so a future reader
+  sees it was considered rather than missed.
 
 ### Address edges by label or subject (effort: M)
 
@@ -115,6 +130,45 @@ A new `relate` tool takes two node ids and a relation type. `recall` renders eac
 requires a new store method because none exists today and the database will not do it
 (`schema.rs:58`, no `foreign_keys` pragma).
 
+**Liveness and idempotency are enforced inside the write statement, not by a check before
+it.** Both requirements are real. An edge must not point at a node that is no longer live,
+which is the guarantee the unenforced foreign keys were supposed to provide. And a repeated
+assertion must not write a second row: `cluster.rs:11` documents that "A repeated pair raises
+weight", and `detect` calls `builder.add_edge(u, v, 1.0)` once per row, so duplicate rows do
+not merely clutter the table, they weight the graph Leiden reads.
+
+The obvious shape, check first and insert afterwards, is a time-of-check-to-time-of-use race:
+a concurrent `supersede` closes an endpoint in between and the edge still lands. Less
+obviously, **the fix is not "do both inside `execute_atomic`".** That method takes a statement
+list built before the call and returns `Result<()>` (`crates/liam-store/src/backend.rs:53`),
+and the libSQL implementation runs each statement with `execute` rather than `query`
+(`crates/liam-store/src/backends/libsql.rs:247`). Nothing inside that transaction can read a
+row and branch on it. `supersede` is not a precedent for it either: its `exists_as_of` check
+runs before the transaction is built (`graph.rs:132`), and the real race guard is the
+`WHERE id = ?2 AND tx_to = ?3` clause on its UPDATE (`graph.rs:141`), a conditional write that
+becomes a no-op if the row already moved.
+
+So `relate` applies that same principle: one conditional write, guarded by its own `WHERE`.
+
+```sql
+INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
+SELECT ?1, ?2, ?3, ?4, '{}', ?5, ?6
+WHERE EXISTS     (SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?7)
+  AND EXISTS     (SELECT 1 FROM nodes WHERE id = ?3 AND tx_to = ?7)
+  AND NOT EXISTS (SELECT 1 FROM edges
+                  WHERE src = ?2 AND dst = ?3 AND type = ?4 AND tx_to = ?7)
+```
+
+A single statement is atomic by itself, so this needs no new `Backend` capability. `execute`
+returns the affected row count, so zero means the write was refused, and `relate` can then
+issue a plain read purely to tell the client which condition failed. That follow-up read
+races nothing, because it only shapes an error message and never decides whether to write.
+
+Idempotency rests on `NOT EXISTS` rather than on a unique constraint deliberately: `edges`
+declares only `id` as PRIMARY KEY and both its indexes are non-unique (`schema.rs:56`, `:66`,
+`:67`), so `INSERT OR IGNORE` would have nothing to ignore, and adding a UNIQUE index would be
+a migration against stores that may already contain duplicate rows.
+
 Ids are the only identifier in the system guaranteed unique, already minted by
 `branded_id!` (`ids.rs:34`) and already carried on `Hit` (`types.rs:243`). Every other
 candidate handle is either absent, optional, or ambiguous.
@@ -135,10 +189,23 @@ inferred edge cannot be asserted, corrected, or explained by the client that kno
 relationship, and it makes clustering quality depend on the embedder, which is mock by default.
 It remains a reasonable future addition alongside asserted edges, not a replacement for them.
 
-Clustering changes follow from the decision rather than standing alone: `recompute_communities`
-filters `supersedes` out of the graph it builds, the `cluster` Cargo feature is deleted so
-clustering exists in every build, the recompute runs on the existing GC tick, and a `clusters`
-tool exposes assignments.
+### Scope
+
+One clustering change belongs here, because it follows directly from the addressing decision:
+`recompute_communities` filters `supersedes` out of the graph it builds (`graph.rs:591`). If
+`relate` refuses to assert `supersedes` on the grounds that it is structural rather than
+semantic, then the clustering read side cannot keep treating it as semantic. That is the same
+decision seen from the other end.
+
+Three further changes were originally bundled into this record and have been **moved out to
+ADR-0002**: deleting the `cluster` Cargo feature, running the recompute on the GC tick, and
+adding a `clusters` tool. None of them answers "how are edges addressed", none had any
+alternatives weighed against it here, and the cadence question in particular deserves a real
+comparison this record never made. `changes_since` (`graph.rs:516`) already exists and is
+documented for "incremental work (rebuild only new vectors, recompute only changed
+communities)", yet the bundled plan was a full unfiltered scan on a six-hourly tick
+(`config.rs:153`). Choosing between those is its own decision with its own trade-offs, and
+burying it in a record about addressing would have let it ship unargued.
 
 ## Consequences
 
@@ -163,21 +230,46 @@ tool exposes assignments.
   decision turns on. Putting ids into `ask`'s evidence would be a separate decision with real
   eval risk, and this record does not take it.
 - Nodes with no edges get no community at all. `recompute_communities` builds its node list
-  from the endpoints its own query returns (`graph.rs:591`), so `clusters` reports on the
-  linked subset only, and filtering `supersedes` shrinks that subset further: a node whose
-  only edge is a version link drops out entirely. Cluster coverage therefore starts empty and
-  grows only as clients call `relate`.
-- Deleting the `cluster` feature makes `leiden-rs` non-optional. That is the approved intent
-  and it removes the option of a build without it.
-- The community recompute is full, over the whole edge graph, on every GC tick. Sound now,
-  unbounded later, and no measurement exists at any size.
-- `relate` accepts arbitrary relation types beyond the rejected `supersedes`, with no dedup,
-  so clients can write junk that pollutes clusters.
+  from the endpoints its own query returns (`graph.rs:591`), so community assignment covers
+  the linked subset only, and the `supersedes` filter shrinks that subset further: a node
+  whose only edge is a version link drops out entirely. Coverage therefore starts empty on
+  every existing store and grows only as clients call `relate`. Anything built on top of
+  community assignments has to treat "no community" as the normal case, not an error.
+- `relate` accepts any relation type string except the rejected `supersedes`, and the
+  clustering read side excludes only `supersedes` too. So a junk type contributes to community
+  detection exactly as much as `mentions` does. Idempotency (above) stops a client inflating
+  one pair's weight by repetition, but it does nothing about a client inventing types. This is
+  the weakest part of the decision: it trades "clustering is inert" for "clustering follows
+  whatever types clients send", which is better but not obviously good. Constraining the type
+  set is deferred below, and that deferral is a real risk rather than a formality.
+- Exposing raw node ids makes an internal identifier part of the client contract. Ids become
+  something clients may store, log, and send back, which constrains any future change to
+  `NodeId` (`ids.rs:34`).
+- **An asserted edge outlives the liveness of its endpoints.** `relate` refuses to create an
+  edge to a node that is not live, but `supersede` closes only the node row: its statement list
+  updates `nodes` and inserts the new node and the `SUPERSEDES` edge (`graph.rs:139`), and
+  never touches the superseded node's other edges. A `mentions` edge asserted while both ends
+  were live therefore stays `tx_to = FOREVER` and keeps contributing to clustering after one
+  endpoint has been superseded, until `gc` removes the node and sweeps the orphan
+  (`graph.rs:558`). The asymmetry is deliberate rather than overlooked: closing an edge on
+  supersession would silently erase a relationship the client asserted about a fact whose
+  latest version still exists. It is recorded here so the blueprint does not "fix" it by
+  accident.
 
 **Follow-up**
 
 - Whether to constrain relation types to a known set is deferred; `mentions` (`types.rs:20`)
-  is the only semantic constant today.
+  is the only semantic constant today. Deferring it is what leaves the arbitrary-type risk in
+  Consequences open, so it should be settled before, or together with, the clustering cadence
+  in ADR-0002 rather than drifting indefinitely.
+- **How the id appears in `recall`'s output is deliberately not fixed here.** This record
+  settles that recall must expose the id, not the shape it takes. `recall` currently returns
+  one flat human-readable string per hit (`mcp.rs:279`), so the choice between a prefix, a
+  trailing field, or a structured response is a formatting decision for the execution
+  blueprint. It is called out because leaving it implicit invites it to be invented during
+  implementation and never reviewed.
+- Whether `relate` should reject a self-loop (`from == to`) is unresolved. Leiden tolerates
+  one, but it carries no meaning and is most likely a client bug worth reporting back.
 - Turning on `PRAGMA foreign_keys` is deliberately not part of this decision. It would begin
   enforcing every declared constraint at once against databases that may already contain
   violating rows, so it needs its own record and a migration story.
@@ -212,17 +304,21 @@ flowchart TD
     A -->|"recall (now renders id)"| B
     A -->|ask| B
     A -->|"relate(from, to, type)"| B
-    A -->|clusters| B
-    B -->|"validate live, reject supersedes"| C["Graph<br/>graph.rs"]
-    C -->|link| D[("edges")]
+    B -->|"reject supersedes"| C["Graph<br/>graph.rs"]
+    C -->|"ONE transaction:<br/>check both live,<br/>insert if absent"| D[("edges")]
     C -->|supersede| D
-    E["GC tick<br/>spawn_gc in main.rs"] -->|"after sweep"| F["recompute_communities"]
-    F -->|"reads edges<br/>WHERE type != 'supersedes'"| D
+    F["recompute_communities"] -->|"reads edges<br/>WHERE type != 'supersedes'"| D
     F --> G[("node_community")]
-    B -->|clusters reads| G
+    H["cadence, cluster feature,<br/>clusters tool: ADR-0002"] -.-> F
+
+    style H stroke-dasharray: 5 5
 ```
 
-### Asserting and clustering an edge
+### Asserting an edge
+
+There is no separate check step. Liveness and idempotency are conditions on the single INSERT,
+so a concurrent `supersede` cannot slip between a check and a write. The read after a refusal
+exists only to explain which condition failed.
 
 ```mermaid
 sequenceDiagram
@@ -232,19 +328,27 @@ sequenceDiagram
     participant DB as libSQL
 
     Client->>Server: recall("auth")
-    Server-->>Client: hits, each with node id
+    Server-->>Client: hits, each carrying its node id
     Client->>Server: relate(from=id1, to=id2, "mentions")
-    Server->>Graph: check both ids live
-    Graph->>DB: SELECT ... WHERE id IN (?, ?) AND tx_to = FOREVER
-    DB-->>Graph: 2 rows
-    Server->>Graph: link(NewEdge)
-    Graph->>DB: INSERT INTO edges
-    Server-->>Client: related
+    Server->>Server: reject if type == "supersedes"
+    Server->>Server: reject if from == to (open, see Follow-up)
+    Server->>Graph: relate(id1, id2, type)
 
-    Note over Server,DB: later, on the GC tick
-    Server->>Graph: recompute_communities()
-    Graph->>DB: SELECT src, dst FROM edges WHERE tx_to = ? AND type != 'supersedes'
-    Graph->>DB: DELETE + INSERT node_community
-    Client->>Server: clusters()
-    Server-->>Client: community assignments
+    rect rgb(235, 240, 250)
+    Note over Graph,DB: ONE conditional write, no read to race with
+    Graph->>DB: INSERT INTO edges ... SELECT ...<br/>WHERE EXISTS(src live) AND EXISTS(dst live)<br/>AND NOT EXISTS(same src,dst,type)
+    end
+
+    DB-->>Graph: rows affected
+
+    alt 1 row
+        Graph-->>Server: edge id
+        Server-->>Client: related
+    else 0 rows
+        Graph->>DB: read, only to name the reason
+        Graph-->>Server: dead endpoint, or already related
+        Server-->>Client: the specific error
+    end
+
+    Note over Server,DB: clustering reads these edges later, cadence is ADR-0002
 ```
