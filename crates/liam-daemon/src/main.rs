@@ -43,7 +43,18 @@ fn main() -> anyhow::Result<()> {
     // `unsafe` on edition 2024), so it must happen while single-threaded.
     // Skipped for the proxy, which loads no model.
     if mode != cli::Mode::Proxy && config.embedder.provider == "local" {
-        std::env::set_var("FASTEMBED_CACHE_DIR", &config.embedder.cache_dir);
+        // fastembed does not expand `~`, and no std path API does either, so
+        // passing the configured value through raw creates a directory
+        // literally named `~` under the process's working directory. Under
+        // the launchd job that is `WorkingDirectory`, so models the user
+        // already fetched are invisible and get re-downloaded to the wrong
+        // place. `socket_path` and `database_path` were always expanded; the
+        // two model cache dirs were missed, and the shipped mock defaults hid
+        // it because a mock embedder never reads the cache dir at all.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let cache_dir =
+            resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
+        std::env::set_var("FASTEMBED_CACHE_DIR", cache_dir);
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -83,7 +94,8 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
 
 /// Expands `~` in a configured path. Nothing below the config layer
 /// understands a home directory: the socket API would create a directory
-/// literally named `~`, and libSQL would create a database inside one.
+/// literally named `~`, libSQL would create a database inside one, and the
+/// model loaders would download gigabytes into one.
 ///
 /// A tilde path with no `HOME` set is an error rather than a default,
 /// because the silent version is worse than useless: an empty home turns
@@ -96,13 +108,23 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
 /// to fix rather than making them guess which path was at fault.
 fn resolve_config_path(key: &str, value: &str) -> anyhow::Result<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
+    Ok(std::path::PathBuf::from(resolve_path_with_home(
+        key, value, &home,
+    )?))
+}
+
+/// The same rule as `resolve_config_path`, yielding a `String` because the
+/// model loaders take `&str` paths rather than `Path`, and taking `home` as an
+/// argument so it is testable without mutating the process environment (which
+/// would race the other tests in this binary).
+fn resolve_path_with_home(key: &str, value: &str, home: &str) -> anyhow::Result<String> {
     if home.is_empty() && value.starts_with('~') {
         anyhow::bail!(
             "{key} is {value:?} but HOME is not set, so `~` cannot be expanded. \
              Set HOME, or write an absolute {key} in your config."
         );
     }
-    Ok(std::path::PathBuf::from(config::expand_tilde(value, &home)))
+    Ok(config::expand_tilde(value, home))
 }
 
 /// Everything that needs the store and the models: the stdio server and the
@@ -318,10 +340,18 @@ fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
             config.llm.device
         )
     })?;
+    // Same `~` problem as the embedder cache dir above: hf-hub joins this
+    // string as a plain relative path, so an unexpanded `~/.liam/models`
+    // downloads a multi-gigabyte GGUF into a directory named `~`.
+    let cache_dir = resolve_path_with_home(
+        "llm.cache_dir",
+        &config.llm.cache_dir,
+        &std::env::var("HOME").unwrap_or_default(),
+    )?;
     Ok(Arc::new(LlamaCppLlm::load_from_hub(
         &config.llm.model,
         &config.llm.gguf_file,
-        &config.llm.cache_dir,
+        &cache_dir,
         config.llm.context_tokens as u32,
         device,
     )?))
@@ -409,6 +439,53 @@ async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The model cache dirs are the two paths that were NOT being expanded,
+    /// while `socket_path` and `database_path` always were. Left raw, fastembed
+    /// and hf-hub treat `~/.liam/models` as a relative path and download
+    /// gigabytes into a directory named `~`, under the launchd job's
+    /// `WorkingDirectory`. The shipped mock defaults hid this because a mock
+    /// embedder never opens the cache dir.
+    #[test]
+    fn a_tilde_model_cache_dir_expands_to_the_home_directory() {
+        assert_eq!(
+            resolve_path_with_home("embedder.cache_dir", "~/.liam/models", "/home/alice").unwrap(),
+            "/home/alice/.liam/models"
+        );
+        assert_eq!(
+            resolve_path_with_home("llm.cache_dir", "~/.liam/models", "/home/alice").unwrap(),
+            "/home/alice/.liam/models"
+        );
+    }
+
+    /// An absolute cache dir is already correct and must be passed through
+    /// untouched, so an operator can point at a shared model directory.
+    #[test]
+    fn an_absolute_model_cache_dir_is_left_alone() {
+        assert_eq!(
+            resolve_path_with_home("llm.cache_dir", "/opt/liam/models", "/home/alice").unwrap(),
+            "/opt/liam/models"
+        );
+    }
+
+    /// A launchd job only gets the variables its plist declares, so an empty
+    /// HOME is a real case here. Failing names the offending config field,
+    /// because the silent version resolves to `/.liam/models` at the
+    /// filesystem root and fails later with a path the operator never wrote.
+    #[test]
+    fn a_tilde_model_cache_dir_without_home_is_an_error_naming_the_field() {
+        let error = resolve_path_with_home("llm.cache_dir", "~/.liam/models", "")
+            .expect_err("a tilde path with no HOME must not be silently resolved");
+        let message = error.to_string();
+        assert!(
+            message.contains("llm.cache_dir"),
+            "error should name the config field: {message}"
+        );
+        assert!(
+            message.contains("HOME"),
+            "error should say what is missing: {message}"
+        );
+    }
 
     /// A build without `local` must refuse `embedder.provider = "local"`
     /// rather than quietly swapping in the mock. Mock embeddings are random,
