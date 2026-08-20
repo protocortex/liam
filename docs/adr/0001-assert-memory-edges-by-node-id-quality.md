@@ -51,11 +51,22 @@ Self-review only, no independent adversarial pass. What it caught:
 - **Neutralised.** Two rejected alternatives had been credited with "no eval risk" as a
   comparative advantage. With the risk shown to be absent from the chosen option too, that
   advantage was removed from both.
+- **Citations resolved mechanically.** Every `file:line` reference in the record was checked
+  against the tree and all of them hold. `grep -n "\.link("` over
+  `crates/liam-store/src/graph.rs` returns exactly the five lines the record names (792, 829,
+  1052, 1430, 1434), each after `mod tests` at `:694`, which confirms the claim that
+  `Graph::link` has five call sites and all of them are tests. Three references
+  (`crates/liam-daemon/src/mcp.rs:238`, `:260`, `:286`) point at the
+  `#[tool(description = ...)]` attribute rather than the `async fn` one line below it; that
+  attribute is what registers the tool, so the citation stands as a declaration site.
+- **Diagrams validated.** All three Mermaid blocks parse (two flowcharts, one sequence), so
+  none of them will render as an error block on GitHub.
 
 ## Outstanding, to verify when the gate can run
 
-- No independent fact-check of the file:line citations in Context and Decision Drivers.
-  They were written by the same session that self-reviewed them.
+- The citations resolve, but nobody has independently checked the *reasoning* resting on
+  them. A fact-checker asks the further question of whether the cited code means what the
+  record says it means, and that pass has not happened.
 - No adversarial pass on the decision itself: nobody has argued for a simpler option or
   challenged the blast radius from outside the authoring context.
 - No execution blueprint exists yet, so no work-unit dependency graph, file plan, or test
