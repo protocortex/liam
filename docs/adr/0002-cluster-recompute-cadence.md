@@ -180,7 +180,21 @@ transaction as the assignment.
   repeated Leiden runs.
 
 `node_community` cannot hold this: it stores `node_id`, `community`, `computed_at`
-(`graph.rs:607`), and the fingerprint is a property of the run, not of any node.
+(`graph.rs:607`), one row per node, and the fingerprint is a property of the run rather than of
+any node.
+
+`cluster_state` therefore holds exactly one row with four columns, and every consumer of run
+state reads them from here rather than inferring them from `node_community`:
+
+| column | purpose |
+|---|---|
+| `edge_count` | the `COUNT(*)` half of the fingerprint |
+| `max_tx_from` | the `MAX(tx_from)` half |
+| `computed_at` | when the assignment was written, which the 24-hour cold-start rule below reads |
+| `cold_start` | whether that run was seeded or started from singletons, so the rule is decidable after a restart |
+
+`computed_at` is duplicated between here and `node_community`, and that is deliberate: this row
+must be readable in one lookup without scanning an assignment that may hold a row per node.
 
 **The stored fingerprint is the one captured with the graph, never re-queried at commit.** This
 is the subtle part, and getting it backwards silently breaks the whole guarantee. The recompute
@@ -213,9 +227,9 @@ staleness window the tick-only option leaves open.
 **4. A periodic from-scratch run, so warm-starting cannot compound a bad merge.** Leiden's
 local-moving phase is a greedy hill-climb, so seeding every run from the previous one can hold
 a partition in a local optimum a cold start would escape. The recompute therefore ignores the
-seed and starts from singletons whenever the stored assignment is more than 24 hours old, using
-the `computed_at` already written to `cluster_state`, and whenever no assignment exists. That
-keeps the escape hatch on a schedule instead of leaving it as an option nobody triggers.
+seed and starts from singletons whenever `cluster_state.computed_at` is more than 24 hours old,
+and whenever no assignment exists at all. That keeps the escape hatch on a schedule instead of
+leaving it as an option nobody ever triggers.
 
 **Warm start on both paths.** `recompute_communities` seeds Leiden with the stored assignment
 via `run_with_initial_partition` (`leiden-rs` `src/leiden.rs:477`) instead of starting from
@@ -389,7 +403,7 @@ sequenceDiagram
 
     Client->>Server: clusters()
     Server->>Graph: communities()
-    Graph->>DB: SELECT edge_count, max_tx_from FROM cluster_state
+    Graph->>DB: SELECT edge_count, max_tx_from, computed_at FROM cluster_state
     Graph->>DB: SELECT COUNT(*), MAX(tx_from) FROM edges<br/>WHERE tx_to = FOREVER AND type != 'supersedes'
 
     alt fingerprint matches
