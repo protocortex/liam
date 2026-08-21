@@ -39,11 +39,19 @@ jobs:
       # a cold cache and is not cached by rust-cache, so expect a slow run
       # rather than treating it as stuck. Metal is enabled by target inside
       # that build script, so it needs no cargo feature.
-      - name: Build release binary
+      # Builds both binaries the package declares: `liamd`, the daemon, and
+      # `liam`, the CLI that fetches models at install time.
+      - name: Build release binaries
         run: cargo build --release -p liam-daemon --features local,llama
 
-      - name: Verify the binary runs
-        run: ./target/release/liamd --version
+      # Cheapest possible proof that each binary links and starts. Worth
+      # having for `liam` specifically: it is what the install script runs to
+      # fetch weights, so a `liam` that cannot start turns into an install
+      # that fails after the user has already downloaded the tarball.
+      - name: Verify the binaries run
+        run: |
+          ./target/release/liamd --version
+          ./target/release/liam --version
 
       # The repo's liam.toml is the DEV config: both providers are "mock" so a
       # default `cargo build` stays light. Shipping it beside a real binary is
@@ -79,23 +87,48 @@ jobs:
             exit 1
           fi
 
-      # "netinstall" in the README's Packaging sense: binary, config, and docs,
-      # with the model files fetched at install time rather than shipped here.
-      # The companion "bundle" artifact (model files included) is not produced
-      # yet; it needs a model-fetch step, and its size needs measuring against
-      # the 2GB per-asset limit before it is wired up.
+      # "netinstall" in the README's Packaging sense: binaries, config, and
+      # docs, with the weights fetched at install time by `liam fetch-models`
+      # rather than shipped here. That is what install.sh does, and it is why
+      # this artifact stays a few megabytes.
+      #
+      # The companion "bundle" artifact (weights included) is not produced
+      # yet; its size needs measuring against the 2GB per-asset limit before
+      # it is wired up, and the models the default config names come to more
+      # than that together.
+      #
+      # Named `liam-` rather than `liamd-` because the tarball is no longer
+      # just the daemon. No release has ever been published, so nothing
+      # depends on the old name.
       - name: Package netinstall artifact
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
-          NAME="liamd-${VERSION}-aarch64-apple-darwin-netinstall"
+          NAME="liam-${VERSION}-aarch64-apple-darwin-netinstall"
           install -m 0755 target/release/liamd dist/staging/liamd
+          install -m 0755 target/release/liam dist/staging/liam
+          install -m 0755 packaging/install.sh dist/staging/install.sh
           cp README.md LICENSE THIRD-PARTY-NOTICES.md dist/staging/
           cp packaging/dev.protocortex.liamd.plist dist/staging/
           tar -czf "dist/${NAME}.tar.gz" -C dist/staging .
           cd dist
           shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
           cat "${NAME}.tar.gz.sha256"
+
+      # install.sh reads these by name out of its own directory, so a rename
+      # or a dropped `cp` above turns into a failure the user hits after
+      # downloading rather than one this workflow catches. Cheap to assert.
+      - name: Verify the artifact contains what install.sh expects
+        run: |
+          set -euo pipefail
+          NAME="liam-${GITHUB_REF_NAME}-aarch64-apple-darwin-netinstall"
+          listing="$(tar -tzf "dist/${NAME}.tar.gz")"
+          for entry in ./liamd ./liam ./install.sh ./liam.toml ./dev.protocortex.liamd.plist; do
+            echo "${listing}" | grep -Fxq "${entry}" || {
+              echo "release artifact is missing ${entry}" >&2
+              exit 1
+            }
+          done
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2

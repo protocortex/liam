@@ -20,9 +20,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-/// Default config file, used when neither `--config` nor `LIAM_CONFIG` says
-/// otherwise.
-const DEFAULT_CONFIG: &str = "liam.toml";
+use liam_daemon::config::resolve_config_source;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,24 +73,18 @@ impl Cli {
     /// Where to read config from: `--config`, else `LIAM_CONFIG`, else
     /// `liam.toml`.
     ///
-    /// Takes the environment value as an argument rather than reading it
-    /// here, so the precedence is a pure function. Environment variables are
-    /// process-global and `cargo test` runs tests in one process, so a test
-    /// that set `LIAM_CONFIG` would race every other test in the binary.
+    /// Delegates so `liamd` and `liam` cannot drift apart on which file they
+    /// read; the tests below stay here because they pin this binary's
+    /// behaviour, which is what an existing MCP client config depends on.
     pub fn config_path(&self, env_config: Option<&str>) -> PathBuf {
-        if let Some(path) = &self.config {
-            return path.clone();
-        }
-        match env_config {
-            Some(path) if !path.is_empty() => PathBuf::from(path),
-            _ => PathBuf::from(DEFAULT_CONFIG),
-        }
+        resolve_config_source(self.config.as_deref(), env_config)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use liam_daemon::config::DEFAULT_CONFIG;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("arguments must parse")

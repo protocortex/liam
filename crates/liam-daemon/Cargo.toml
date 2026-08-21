@@ -5,9 +5,19 @@ edition = "2021"
 license = "AGPL-3.0-only"
 description = "MCP server exposing liam memory to agents."
 
+# Two binaries, one crate, on purpose. `liamd` is the daemon; `liam` is the
+# CLI a person runs. They must agree exactly on how liam.toml is read and
+# where models are cached, so that shared half lives in this crate's library
+# target (src/lib.rs) where neither can drift from the other. Splitting the
+# CLI into its own crate would not reduce what it links (it would depend on
+# this one regardless) and would add a seam for the two to disagree across.
 [[bin]]
 name = "liamd"
 path = "src/main.rs"
+
+[[bin]]
+name = "liam"
+path = "src/bin/liam.rs"
 
 [dependencies]
 liam-store = { path = "../liam-store" }

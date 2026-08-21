@@ -27,7 +27,7 @@ run_on_start           = false
 [embedder]
 provider  = "mock"                       # "mock" (dev) or "local" (in-process)
 model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"
-cache_dir = "~/.liam/models"       # pre-populated by the installer
+cache_dir = "~/.liam/models"       # reranker only; embedder weights ignore this
 
 [llm]
 provider        = "mock"                            # "mock" (dev) or "llama-cpp" (in-process llama.cpp)

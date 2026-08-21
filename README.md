@@ -164,7 +164,7 @@ unknown key fails loudly.
 | `gc.run_on_start` | `false` | Sweep once at boot. |
 | `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. |
 | `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`. |
-| `embedder.cache_dir` | `~/.liam/models` | Model files. Sets `FASTEMBED_CACHE_DIR`. |
+| `embedder.cache_dir` | `~/.liam/models` | Reranker files; sets `FASTEMBED_CACHE_DIR`. Does **not** move the embedder weights, which fastembed pins to `~/.cache/huggingface/hub`. |
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
 | `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
 | `read_pool_size` | `4` | Read connections. Ignored for an in-memory database. |
@@ -198,14 +198,42 @@ three: the `.db` file alone can be missing recently committed data.
 
 - `local`: load fastembed in-process (Qwen3 embedder, cross-encoder reranker).
   Off by default, which keeps the dev build small.
+- `llama`: llama.cpp text generation, which is what `ask` needs. Metal comes
+  from the macOS target, not from this flag.
+- `cuda`: NVIDIA support. Needs the CUDA toolkit at build time, so it is
+  opt-in; Apple GPU support is automatic and needs nothing.
+
+A release build sets `local,llama`. Without them the daemon refuses to start
+against a config naming those providers, rather than falling back to mocks
+that would return random vectors and invented answers.
 
 ## Packaging
 
-Models run inside the binary, so shipping means putting model files where
-fastembed looks. The installer pre-populates `cache_dir` with the pinned model,
-so first run is offline with no query-time download and no separate server. Two
-options: fetch-on-install (a script pulls the model and checks a checksum) or
-bundle-in-release (ship the files in the tarball and point `cache_dir` at them).
+Models run inside the binary, so shipping means getting weights onto the
+machine before the first query. Releases take the fetch-on-install route: the
+tarball carries `liamd`, `liam`, a config, and `install.sh`, and weighs a few
+megabytes.
+
+```sh
+tar -xzf liam-vX.Y.Z-aarch64-apple-darwin-netinstall.tar.gz -C liam
+cd liam && ./install.sh
+```
+
+`install.sh` copies both binaries to `~/.local/bin`, writes `~/.liam/liam.toml`
+if you do not already have one, runs `liam fetch-models`, and registers the
+launchd agent. Use `--prefix`, `--skip-models`, or `--no-launchd` to change
+that. Running it again is safe.
+
+`liam fetch-models` downloads **and loads** each model. Loading is the point: a
+truncated file downloads happily and only fails when something tries to use it,
+which would otherwise be a user's first `recall`, long after the install.
+
+The models land in two places, and only one is configurable. The reranker goes
+to `embedder.cache_dir`; the embedder weights go to `~/.cache/huggingface/hub`
+regardless of config, because fastembed's Qwen3 loader constructs its hub client
+without a cache directory. That also blocks the bundle-in-release option (ship
+the weights in the tarball), since there is no supported way to point the
+embedder at them.
 
 ## Status
 

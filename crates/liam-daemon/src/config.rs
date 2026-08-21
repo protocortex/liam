@@ -3,7 +3,7 @@
 //! defaults; unknown keys are rejected so typos fail loudly.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use liam_store::{Millis, RetentionPolicy};
@@ -63,8 +63,27 @@ pub struct EmbedderConfig {
     pub provider: String,
     /// Hugging Face model id for the local provider.
     pub model: String,
-    /// Where model files live. The installer pre-populates this so first run is
-    /// offline. Sets FASTEMBED_CACHE_DIR.
+    /// Where the RERANKER's files live. Sets FASTEMBED_CACHE_DIR.
+    ///
+    /// It does NOT place the embedder weights, despite the name, and no
+    /// setting available to us can. fastembed's `Qwen3TextEmbedding::from_hf`
+    /// builds a bare `ApiBuilder::new()` with no cache directory (fastembed
+    /// 5.17.3, `src/models/qwen3.rs:1018`), bypassing fastembed's own
+    /// `pull_from_hf` helper, and hf-hub's `Cache::default` is a hardcoded
+    /// `~/.cache/huggingface/hub` that reads no environment variable at all
+    /// (hf-hub 0.5.0, `src/lib.rs:202`). So neither FASTEMBED_CACHE_DIR nor
+    /// HF_HOME moves the embedder. Verified by running `liam fetch-models`
+    /// and watching the file land in `~/.cache/huggingface/hub`.
+    ///
+    /// The reranker honours this because `TextRerank::try_new` goes through
+    /// `InitOptions::default`, which does read FASTEMBED_CACHE_DIR.
+    ///
+    /// Consequences worth knowing before relying on this field: an operator
+    /// cannot relocate the embedder onto another volume, and a "bundle"
+    /// release artifact cannot pre-place those weights anywhere but the
+    /// hf-hub default. Fixing it needs `Qwen3TextEmbedding::new` plus a
+    /// hand-rolled download, because the config parser it depends on is
+    /// private upstream.
     pub cache_dir: String,
 }
 
@@ -194,11 +213,9 @@ impl Default for LlmConfig {
 ///
 /// `socket_path` defaults to `~/.liam/liamd.sock`, and the socket API has no
 /// notion of `~`, so a caller must resolve it through this (or an
-/// equivalent) before using it as a filesystem path. The listener that does
-/// that binding is WU-6's, not this Work Unit's, so this is unused outside
-/// tests for now; kept and tested here, where the config surface it resolves
-/// is defined.
-#[allow(dead_code)]
+/// equivalent) before using it as a filesystem path. Callers go through
+/// `models::resolve_path_with_home`, which adds the missing-`HOME` check;
+/// this stays the pure string half of that pair.
 pub(crate) fn expand_tilde(path: &str, home: &str) -> String {
     if path == "~" {
         return home.to_string();
@@ -206,6 +223,35 @@ pub(crate) fn expand_tilde(path: &str, home: &str) -> String {
     match path.strip_prefix("~/") {
         Some(rest) => format!("{home}/{rest}"),
         None => path.to_string(),
+    }
+}
+
+/// The config file read when neither `--config` nor `LIAM_CONFIG` says
+/// otherwise.
+pub const DEFAULT_CONFIG: &str = "liam.toml";
+
+/// Which config file to read: an explicit `--config` beats `LIAM_CONFIG`,
+/// which beats `liam.toml` in the working directory.
+///
+/// Lives here, rather than in either binary's argument parser, because
+/// `liamd` and `liam` have to pick the SAME file. A CLI that resolved this
+/// differently would fetch the models one config asks for while the daemon
+/// booted from another, and the only symptom would be a download that
+/// appears to have done nothing.
+///
+/// Takes the environment value as an argument rather than reading it here,
+/// so the precedence stays a pure function. Environment variables are
+/// process-global and `cargo test` runs a binary's tests in one process, so
+/// a test that set `LIAM_CONFIG` would race every other test beside it.
+pub fn resolve_config_source(flag: Option<&Path>, env_config: Option<&str>) -> PathBuf {
+    if let Some(path) = flag {
+        return path.to_path_buf();
+    }
+    match env_config {
+        // An unset shell variable expands to the empty string in a launchd
+        // plist or a wrapper script, so blank means absent, not a path to "".
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(DEFAULT_CONFIG),
     }
 }
 
