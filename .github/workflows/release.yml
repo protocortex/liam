@@ -9,25 +9,97 @@ permissions:
   contents: write
 
 jobs:
+  # v1 targets macOS only, so there is one target and no matrix. This workflow
+  # previously also built x86_64-unknown-linux-gnu and published it, which
+  # shipped an artifact for an unsupported platform.
   release:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Build release
-        run: cargo build --release -p liam-daemon --features local
-      - name: Package
-        run: tar -czf liamd-${{ matrix.target }}.tar.gz -C target/release liamd
+
+      # `local,llama` is not a nicety here, it is what makes the artifact
+      # usable. `local` supplies the real embedder and reranker; `llama`
+      # supplies generation. Built with only one of them the daemon either
+      # refuses to start, when the config names the missing provider (the
+      # `#[cfg(not(feature = ...))]` bails in crates/liam-daemon/src/main.rs),
+      # or silently serves random embeddings and fabricated answers when the
+      # config still says "mock". This workflow used to build `--features
+      # local` alone and hit exactly that.
+      #
+      # Note this combination is compiled NOWHERE in ci.yml: the `test` job
+      # builds `--features local`, `build-llama` builds `--features llama`,
+      # and only `cargo deny` resolves the pair. A break in the combined build
+      # therefore surfaces here first, during a tagged release.
+      #
+      # llama-cpp-sys-2 compiles llama.cpp from C++ via CMake, which is slow on
+      # a cold cache and is not cached by rust-cache, so expect a slow run
+      # rather than treating it as stuck. Metal is enabled by target inside
+      # that build script, so it needs no cargo feature.
+      - name: Build release binary
+        run: cargo build --release -p liam-daemon --features local,llama
+
+      - name: Verify the binary runs
+        run: ./target/release/liamd --version
+
+      # The repo's liam.toml is the DEV config: both providers are "mock" so a
+      # default `cargo build` stays light. Shipping it beside a real binary is
+      # the failure this workflow used to have, and it is silent: the daemon
+      # starts, `recall` returns noise from random vectors, and `ask`
+      # fabricates. Deriving the shipped config from that same file keeps one
+      # source of truth, and the assertions below fail the release rather than
+      # let a bad substitution through.
+      - name: Stage the release config
+        run: |
+          set -euo pipefail
+          mkdir -p dist/staging
+          python3 - <<'PY'
+          import re, pathlib
+          src = pathlib.Path("liam.toml").read_text()
+          # Rewrite `provider` inside [embedder] and [llm] only, leaving every
+          # other section, and all inline comments, untouched.
+          want = {"embedder": "local", "llm": "llama-cpp"}
+          section, out = None, []
+          for line in src.splitlines(keepends=True):
+              header = re.match(r"\s*\[([^\]]+)\]", line)
+              if header:
+                  section = header.group(1)
+              elif section in want and re.match(r"\s*provider\s*=", line):
+                  line = re.sub(r'"mock"', '"%s"' % want[section], line, count=1)
+              out.append(line)
+          pathlib.Path("dist/staging/liam.toml").write_text("".join(out))
+          PY
+          grep -Eq '^provider[[:space:]]*=[[:space:]]*"local"' dist/staging/liam.toml
+          grep -Eq '^provider[[:space:]]*=[[:space:]]*"llama-cpp"' dist/staging/liam.toml
+          if grep -Eq '^provider[[:space:]]*=[[:space:]]*"mock"' dist/staging/liam.toml; then
+            echo "release config still selects a mock provider" >&2
+            exit 1
+          fi
+
+      # "netinstall" in the README's Packaging sense: binary, config, and docs,
+      # with the model files fetched at install time rather than shipped here.
+      # The companion "bundle" artifact (model files included) is not produced
+      # yet; it needs a model-fetch step, and its size needs measuring against
+      # the 2GB per-asset limit before it is wired up.
+      - name: Package netinstall artifact
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          NAME="liamd-${VERSION}-aarch64-apple-darwin-netinstall"
+          install -m 0755 target/release/liamd dist/staging/liamd
+          cp README.md LICENSE THIRD-PARTY-NOTICES.md dist/staging/
+          cp packaging/dev.protocortex.liamd.plist dist/staging/
+          tar -czf "dist/${NAME}.tar.gz" -C dist/staging .
+          cd dist
+          shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          cat "${NAME}.tar.gz.sha256"
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: liamd-${{ matrix.target }}.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
