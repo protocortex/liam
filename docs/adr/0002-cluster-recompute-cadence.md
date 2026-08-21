@@ -106,7 +106,7 @@ of the above.
 
 Adopt **GC tick plus lazy read, both warm-started**.
 
-Three parts, and each one earns its place:
+Four parts, and each one earns its place:
 
 **1. A fingerprint decides whether anything changed.** Both the tick and the read compare
 `SELECT COUNT(*), MAX(tx_from) FROM edges WHERE tx_to = FOREVER AND type != 'supersedes'`
@@ -148,17 +148,17 @@ a sweep deleted edges, find a warm assignment instead of paying to build one. Pl
 the sweep is deliberate, since `gc` is the only deleter and that is precisely the moment the
 edge set changes with no reader present to notice.
 
+**3. The read still checks, so freshness never depends on the tick.** `clusters` runs the same
+comparison and recomputes on a mismatch. This is what makes the design correct under a launchd
+job with no `KeepAlive`, where the tick may never fire, and what closes the up-to-six-hours
+staleness window the tick-only option leaves open.
+
 **4. A periodic from-scratch run, so warm-starting cannot compound a bad merge.** Leiden's
 local-moving phase is a greedy hill-climb, so seeding every run from the previous one can hold
 a partition in a local optimum a cold start would escape. The recompute therefore ignores the
 seed and starts from singletons whenever the stored assignment is more than 24 hours old, using
 the `computed_at` already written to `cluster_state`, and whenever no assignment exists. That
 keeps the escape hatch on a schedule instead of leaving it as an option nobody triggers.
-
-**3. The read still checks, so freshness never depends on the tick.** `clusters` runs the same
-comparison and recomputes on a mismatch. This is what makes the design correct under a launchd
-job with no `KeepAlive`, where the tick may never fire, and what closes the up-to-six-hours
-staleness window the tick-only option leaves open.
 
 **Warm start on both paths.** `recompute_communities` seeds Leiden with the stored assignment
 via `run_with_initial_partition` (`leiden-rs` `src/leiden.rs:477`) instead of starting from
