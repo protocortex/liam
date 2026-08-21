@@ -30,10 +30,10 @@ default = ["backend-libsql", "cluster"]
 backend-libsql = ["dep:libsql", "dep:tokio"]
 # Leiden community detection over the edge graph. ON BY DEFAULT and meant to
 # stay that way. `recompute_communities` has no caller yet, which is a reason to
-# WIRE IT UP, not to drop it: ADR-0001
-# (docs/adr/0001-assert-memory-edges-by-node-id.md, milestone M5) decides this
-# gate is deleted entirely so clustering exists in every build, and that the
-# recompute runs on the daemon's maintenance tick. Turning it off by
+# WIRE IT UP, not to drop it: ADR-0002
+# (docs/adr/0002-cluster-recompute-cadence.md, milestone M5) decides this gate
+# is deleted entirely so clustering exists in every build, and settles when the
+# recompute runs. ADR-0001 supplies the edges it runs over. Turning it off by
 # default would ship a release with no clustering at all, since liam-daemon
 # takes liam-store's default features.
 cluster = ["dep:leiden-rs"]
