@@ -102,9 +102,66 @@ of the above.
 - Trade-offs: two call sites instead of one, and the tick can still do work nothing reads. In
   exchange, reads are fast in the common case and correct in every case.
 
+## Considered alternatives for detecting change
+
+The alternatives above weigh *when* to recompute. They take for granted *how* the system knows
+anything changed, which is a separate question and was not weighed when the fingerprint was
+first written. It is weighed here because the fingerprint is the weakest link in the decision.
+
+The root problem is an asymmetry. `edges` carries `tx_from` and `tx_to` (`schema.rs:56`), the
+same bitemporal columns that make `changes_since` work for nodes, but **nothing ever closes an
+edge**: no `UPDATE edges` exists anywhere in the store, so `tx_to` is written once at insert and
+never moves. Edge creation is therefore observable and edge removal is not, because `gc`
+hard-deletes rows that were never closed (`graph.rs:558`).
+
+### A fingerprint over the current edge set (chosen)
+
+- `COUNT(*)` and `MAX(tx_from)` over the clustering-relevant edges, stored per run.
+- Trade-offs: no new writer discipline and no new subsystem, and it works entirely from data
+  that already exists. But it is a heuristic that infers change from a summary of state rather
+  than observing change itself, which is why it carries the two disclosed gaps below.
+
+### An append-only change ledger (effort: L)
+
+- Every writer to `edges` appends a row to a ledger (`seq`, edge id, endpoints, type, insert or
+  delete) in the same transaction as its write. `cluster_state` stores the last `seq` applied,
+  and staleness is the exact test `MAX(seq) > last_applied_seq`.
+- Trade-offs: **this is the only option that closes both disclosed gaps.** A monotonic sequence
+  is immune to the same-millisecond tie, and an in-place edge mutation would append a row rather
+  than hide behind an unchanged count. It also names *which* endpoints changed, which a summary
+  never can, and it can be pruned safely below the lowest applied cursor so it does not grow
+  without bound. Against it: it is a cross-cutting subsystem, not a clustering feature. It adds
+  a row to every edge write, and it relies on all three writers remembering to append, which is
+  the same discipline the fingerprint depends on, relocated rather than removed. Its natural
+  scope is larger than this record: LIAM already has a node-level change cursor in
+  `changes_since` (`graph.rs:516`) whose doc comment promises incremental work it cannot
+  deliver, and a second concurrent consumer is on the roadmap, so a change feed designed around
+  clustering alone would be designed for the wrong requirements.
+
+### Close edges instead of deleting them (effort: M)
+
+- Make `gc` set `tx_to = now` on swept edges rather than `DELETE`, so edges become symmetric
+  with nodes, and detect change with the same `tx_from > cursor OR tx_to > cursor` predicate
+  `changes_since` already uses.
+- Trade-offs: no new table and no new concept, just using the bitemporal columns the schema
+  already declares for the purpose they were declared for. But it directly opposes what `gc`
+  is for. Retention exists to reclaim space, and tombstones accumulate exactly the rows it was
+  asked to remove, so it needs a second purge pass for closed edges past retention, at which
+  point the deletion becomes invisible again and the problem returns one level down.
+
 ## Decision
 
-Adopt **GC tick plus lazy read, both warm-started**.
+Adopt **GC tick plus lazy read, both warm-started**, with the **fingerprint** as the change
+signal for now.
+
+The ledger is the better mechanism and is deliberately not adopted here. Building it inside a
+record about clustering cadence would repeat the exact mistake that ADR-0001 was split to
+correct: a cross-cutting subsystem, adopted with no requirements of its own, because one
+consumer happened to need it first. The fingerprint is therefore treated as a replaceable seam.
+It lives behind one store method that both callers use, and swapping it for a ledger cursor
+changes that method's body and the contents of `cluster_state`, nothing else. When a change feed
+is designed for its real requirements, clustering becomes one of its consumers rather than its
+author.
 
 Four parts, and each one earns its place:
 
@@ -252,7 +309,9 @@ a release where clustering silently does not exist is the worse outcome.
   consumer discovers only after building on it.
 - No measurement exists at any store size. Both paths must log node and edge counts and elapsed
   time so the ceiling is discovered from real use rather than guessed.
-- The fingerprint is a heuristic with two disclosed gaps. **In-place mutation** would defeat it:
+- The fingerprint is a heuristic with two disclosed gaps, and an append-only ledger would close
+  both. Neither is reachable by the current writers, which is why the simpler mechanism is
+  acceptable now rather than correct forever. **In-place mutation** would defeat it:
   the only writers to `edges` are `link` (insert, `graph.rs:176`), `supersede` (insert,
   filtered out, `graph.rs:146`), and `gc` (delete, `graph.rs:558`), with no `UPDATE edges`
   anywhere, so a future writer that changed `src`, `dst`, or `type` in place would move neither
@@ -263,8 +322,14 @@ a release where clustering silently does not exist is the worse outcome.
 
 **Follow-up**
 
+- **Design a change ledger on its own requirements, not clustering's.** It is the only option
+  that closes both fingerprint gaps, it is what `changes_since` (`graph.rs:516`) already
+  promises and cannot deliver, and a second concurrent consumer is on the roadmap. Whoever
+  writes that record should also decide whether `gc` closing edges rather than deleting them is
+  the cheaper path to the same guarantee. Until then the fingerprint holds the seam.
 - Correct the `changes_since` doc comment (`graph.rs:516`), which promises incremental community
-  recompute its query cannot support.
+  recompute its query cannot support. If the ledger lands, that comment becomes true instead of
+  aspirational.
 - Measure the real gap between a `relate` and the next `clusters` call once there is traffic.
   The tick is justified above on bounding idle-time staleness, not on speeding up the typical
   read. If measurement shows reads almost always follow a write closely, the tick is buying
