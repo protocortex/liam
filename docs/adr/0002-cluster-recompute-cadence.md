@@ -1,6 +1,6 @@
 # ADR-0002: Recompute clusters on the GC tick and lazily on read, warm-started
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date created:** 2026-08-20
 - **Date modified:** 2026-08-21
 - **Split from:** [ADR-0001](0001-assert-memory-edges-by-node-id.md), which bundled these
@@ -24,7 +24,7 @@ Four properties of the current code decide the answer:
 - **Leiden's output is global, but it can be warm-started.** `cluster::detect`
   (`crates/liam-store/src/cluster.rs:15`) calls `Leiden::new(config).run(&graph)`, which starts
   from singletons every time. The pinned `leiden-rs` 0.8.1 also exposes
-  `run_with_initial_partition(&self, data, initial_partition)` (`src/leiden.rs:477`),
+  `run_with_initial_partition(&self, data, initial_partition)` (`src/leiden.rs:478`),
   documented for "Incremental refinement after minor graph changes", with `Partition::from_membership`
   (`src/partition.rs:29`) to build the seed. This is the difference between recomputing from
   scratch and refining the previous answer. It is **not** per-node incremental: the call still
@@ -114,7 +114,7 @@ edge**: no `UPDATE edges` exists anywhere in the store, so `tx_to` is written on
 never moves. Edge creation is therefore observable and edge removal is not, because `gc`
 hard-deletes rows that were never closed (`graph.rs:558`).
 
-### A fingerprint over the current edge set (chosen)
+### A fingerprint over the current edge set (effort: S, chosen)
 
 - `COUNT(*)` and `MAX(tx_from)` over the clustering-relevant edges, stored per run.
 - Trade-offs: no new writer discipline and no new subsystem, and it works entirely from data
@@ -232,7 +232,7 @@ and whenever no assignment exists at all. That keeps the escape hatch on a sched
 leaving it as an option nobody ever triggers.
 
 **Warm start on both paths.** `recompute_communities` seeds Leiden with the stored assignment
-via `run_with_initial_partition` (`leiden-rs` `src/leiden.rs:477`) instead of starting from
+via `run_with_initial_partition` (`leiden-rs` `src/leiden.rs:478`) instead of starting from
 singletons.
 
 The mapping needs care, because the previous assignment is stored per `node_id` while Leiden
@@ -410,7 +410,7 @@ sequenceDiagram
         Graph->>DB: SELECT node_id, community FROM node_community
     else count or max moved, or cluster_state is empty
         Note over Graph,DB: count moves on a gc delete,<br/>max moves on a new relate
-        Graph->>DB: SELECT src, dst FROM edges<br/>WHERE type != 'supersedes' ORDER BY id
+        Graph->>DB: SELECT src, dst FROM edges<br/>WHERE tx_to = FOREVER AND type != 'supersedes'<br/>ORDER BY id
         Note over Graph: keep THIS snapshot's fingerprint.<br/>Never re-query it at commit time.
 
         alt assignment is under 24h old

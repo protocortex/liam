@@ -24,14 +24,14 @@ Accepted, on 2026-08-19, containing a correctness gap and an unargued bundle.
 
 ### Round 1: FAIL, seven findings, three HIGH
 
-1. **Time-of-check-to-time-of-use race.** `relate` as designed checked liveness, then called
+1. **Time-of-check-to-time-of-use race (HIGH).** `relate` as designed checked liveness, then called
    `link`, which is a bare `INSERT` (`graph.rs:170`). A concurrent `supersede` between the two
    steps writes an edge to a node that is no longer live. The record's own Driver 5 treated
    atomicity as load-bearing for `supersedes` and then failed to apply it here.
-2. **Scope creep with no alternatives weighed.** Three of six bundled changes (deleting the
+2. **Scope creep with no alternatives weighed (HIGH).** Three of six bundled changes (deleting the
    `cluster` feature, GC-tick recompute, the `clusters` tool) appeared only in Decision prose,
    never in Drivers or Alternatives.
-3. **Duplicate `relate` biases Leiden.** The record called this "junk that pollutes clusters".
+3. **Duplicate `relate` biases Leiden (HIGH).** The record called this "junk that pollutes clusters".
    `cluster.rs:11` states "A repeated pair raises weight" and `detect` calls `add_edge` once
    per row, so duplicates distort the algorithm's input rather than merely adding noise.
 4. Arbitrary relation types weigh the same as `mentions`, since clustering excludes only

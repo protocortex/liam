@@ -192,10 +192,11 @@ It remains a reasonable future addition alongside asserted edges, not a replacem
 ### Scope
 
 One clustering change belongs here, because it follows directly from the addressing decision:
-`recompute_communities` filters `supersedes` out of the graph it builds (`graph.rs:591`). If
-`relate` refuses to assert `supersedes` on the grounds that it is structural rather than
-semantic, then the clustering read side cannot keep treating it as semantic. That is the same
-decision seen from the other end.
+`recompute_communities` **must start filtering** `supersedes` out of the graph it builds. Today
+it does not, since its query carries no `type` predicate at all (`graph.rs:591`), which is what
+the Context section describes. If `relate` refuses to assert `supersedes` on the grounds that it
+is structural rather than semantic, then the clustering read side cannot keep treating it as
+semantic. That is the same decision seen from the other end.
 
 Three further changes were originally bundled into this record and have been **moved out to
 ADR-0002**: deleting the `cluster` Cargo feature, running the recompute on the GC tick, and
@@ -273,8 +274,11 @@ burying it in a record about addressing would have let it ship unargued.
 - Turning on `PRAGMA foreign_keys` is deliberately not part of this decision. It would begin
   enforcing every declared constraint at once against databases that may already contain
   violating rows, so it needs its own record and a migration story.
-- Inline cluster labels on recall hits, which the 2026-07-23 design wanted, are deferred to
-  avoid compounding the output-format change in one release.
+- Inline cluster labels on recall hits are deferred, to avoid compounding the output-format
+  change in one release. The earlier clusters design wanted each hit to carry the name of the
+  community it belongs to, so a reader could see grouping without a second call. That design
+  predates this record and lives outside the repository, so it is restated here rather than
+  linked.
 
 ## Architecture Diagrams
 
