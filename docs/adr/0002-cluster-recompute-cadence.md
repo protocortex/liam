@@ -1,221 +1,277 @@
-# ADR-0002: Recompute clusters lazily on read, not on a timer
+# ADR-0002: Recompute clusters on the GC tick and lazily on read, warm-started
 
 - **Status:** Proposed
 - **Date created:** 2026-08-20
-- **Date modified:** 2026-08-20
+- **Date modified:** 2026-08-21
 - **Split from:** [ADR-0001](0001-assert-memory-edges-by-node-id.md), which bundled these
   changes into the addressing decision with no alternatives weighed. An adversarial review
-  flagged the bundling, and separating it immediately surfaced that the obvious incremental
-  option does not actually exist (see **Incremental recompute** below).
+  flagged the bundling, and separating it surfaced both the deletion-blind staleness signal
+  and the warm-start API that this record now depends on.
 
 ## Context
 
 ADR-0001 gives clients a way to assert edges, so community detection finally has something
-real to work on. It deliberately leaves three questions open, and they are all one question:
-**when does clustering run, and who can see it?**
+real to work on. It deliberately leaves three questions open, and they are one question:
+**when does clustering run, and who pays for it?**
 
-`Graph::recompute_communities` (`crates/liam-store/src/graph.rs:581`) has no caller anywhere
-in production. It reads every live edge, runs Leiden over the whole graph, then replaces the
-entire assignment table inside one transaction: a `DELETE FROM node_community` followed by one
-`INSERT` per node (`graph.rs:603-616`). There is no partial update path. It is all or nothing,
-by construction.
+`Graph::recompute_communities` (`crates/liam-store/src/graph.rs:581`) has no caller in
+production. It reads every live edge, runs Leiden over the whole graph, then replaces the
+entire assignment table in one transaction: `DELETE FROM node_community` followed by one
+`INSERT` per node (`graph.rs:603-616`).
 
-Three properties of the current code constrain the answer:
+Four properties of the current code decide the answer:
 
-- **Clustering is a whole-graph algorithm as built.** `cluster::detect`
-  (`crates/liam-store/src/cluster.rs:15`) takes a node count and a full edge list, builds a
-  `GraphDataBuilder`, and runs Leiden across it. There is no incremental entry point, so
-  "recompute part of it" is not a smaller version of the same call.
+- **Leiden's output is global, but it can be warm-started.** `cluster::detect`
+  (`crates/liam-store/src/cluster.rs:15`) calls `Leiden::new(config).run(&graph)`, which starts
+  from singletons every time. The pinned `leiden-rs` 0.8.1 also exposes
+  `run_with_initial_partition(&self, data, initial_partition)` (`src/leiden.rs:477`),
+  documented for "Incremental refinement after minor graph changes", with `Partition::from_membership`
+  (`src/partition.rs:29`) to build the seed. This is the difference between recomputing from
+  scratch and refining the previous answer. It is **not** per-node incremental: the call still
+  walks the whole graph, and it requires `initial_partition.len() == data.node_count()`.
 - **No cursor can see an edge write.** `changes_since` (`graph.rs:516`) is documented "for
-  incremental work (rebuild only new vectors, recompute only changed communities)", but its
-  query is `SELECT id, tx_from, tx_to FROM nodes` and `Change` (`types.rs:268`) carries only a
-  node id, a timestamp, and a closed flag. A `relate` call inserts into `edges` and touches no
-  node row, so this cursor returns nothing for exactly the event that changes communities. The
-  doc comment describes an intent the implementation does not support.
-- **`node_community` already records when it was computed.** The insert at `graph.rs:607`
-  writes a `computed_at` column, so staleness is answerable from the database without keeping
-  any in-memory state.
+  incremental work (rebuild only new vectors, recompute only changed communities)", but it
+  queries `SELECT id, tx_from, tx_to FROM nodes` and `Change` (`types.rs:268`) carries only a
+  node id, a timestamp, and a closed flag. A `relate` inserts into `edges` and touches no node
+  row, so this cursor returns nothing for exactly the event that changes communities. The doc
+  comment describes an intent the implementation does not support.
+- **`gc` hard-deletes.** It removes expired nodes (`graph.rs:550`) and then always sweeps
+  orphaned edges in the same call (`graph.rs:558`). Deletion is invisible to any
+  newest-timestamp signal, because deleting rows never advances a maximum.
+- **Writes serialize, reads do not** (`crates/liam-store/src/backend.rs:16`), and reads must
+  not queue behind an in-flight write.
 
 The `cluster` Cargo feature (`crates/liam-store/Cargo.toml:39`) is on by default and gates all
 of the above.
 
 ## Decision Drivers
 
-- **Nothing reads clusters today.** Work done on a timer for a consumer that may never call is
-  pure waste, and it is waste that grows with the store.
-- **No measurement exists at any size.** Neither the original bundled plan nor this record can
-  point at a benchmark. Whatever is chosen must degrade visibly rather than silently.
-- **Staleness is a correctness property here.** A cluster assignment that predates the edge a
-  user just asserted is wrong in the way most likely to be noticed, because the user asserted
-  that edge specifically to affect grouping.
-- **The daemon is local-first and single-user.** There is no fleet to amortise background work
-  across, and the process may be launched on demand by launchd rather than run continuously,
-  so a six-hourly timer may simply never fire (`packaging/dev.protocortex.liamd.plist`
-  declares no `KeepAlive`).
+- **A read should be fast.** `clusters` is a client-facing call. The common case must not pay
+  for a full Leiden run.
+- **Work must not be wasted.** Nothing reads clusters today, so unconditional periodic
+  recomputation burns cycles for a consumer that may never call.
+- **Staleness is a correctness property here.** An assignment that predates the edge a user
+  just asserted is wrong in the way most likely to be noticed, because the user asserted that
+  edge precisely to affect grouping.
+- **The daemon is local-first and may not run continuously.** The launchd job declares no
+  `KeepAlive`, deliberately and with a comment saying so
+  (`packaging/dev.protocortex.liamd.plist:96`), so a periodic tick cannot be the only
+  mechanism or clusters may never be computed at all.
 
 ## Considered Alternatives
 
-### Recompute on the GC tick (effort: S)
+### Recompute on the GC tick only (effort: S)
 
-- Call `recompute_communities` from `spawn_gc` after each sweep, on the existing
-  `gc.interval_hours` schedule, which defaults to 6 (`crates/liam-daemon/src/config.rs:153`).
-- Trade-offs: trivial to wire, and the tick already exists. But it does full-graph work on a
-  timer regardless of whether anything ever reads the result; it leaves an assignment up to six
-  hours stale, so an edge asserted now is invisible until the next tick; and under the launchd
-  job, which declares no `KeepAlive`, a short-lived daemon may exit before a tick ever fires,
-  making clusters permanently empty rather than merely stale. This was the option bundled into
-  ADR-0001 and never compared against anything.
+- Call `recompute_communities` from `spawn_gc` after each sweep, on `gc.interval_hours`,
+  default 6 (`crates/liam-daemon/src/config.rs:153`).
+- Trade-offs: trivial to wire, reads are always cheap. But an edge asserted now stays invisible
+  for up to six hours, which violates the staleness driver; it does full-graph work whether or
+  not anything reads it; and under a job with no `KeepAlive` the daemon may exit before a tick
+  fires, leaving clusters permanently empty rather than merely stale.
+
+### Recompute lazily on read only (effort: M)
+
+- `clusters` checks whether the edge set changed and recomputes if so, otherwise serves the
+  stored assignment.
+- Trade-offs: never wasted, never stale. But the first read after any write pays a full Leiden
+  run, so the cost lands on the client in the least predictable way, and a store that is
+  written to steadily makes almost every read a slow one.
 
 ### Recompute on every `relate` (effort: S)
 
-- Trigger the recompute from the write path, so the assignment is never stale.
-- Trade-offs: always fresh. But an agent asserting a batch of twenty edges pays for twenty
-  full-graph Leiden runs, nineteen of which are immediately superseded, and it puts unbounded
-  work inside a tool call the client is waiting on. Debouncing it turns this back into a timer
-  with extra steps.
+- Trigger from the write path so the assignment is never stale.
+- Trade-offs: always fresh, but an agent asserting twenty edges pays for twenty whole-graph
+  runs, nineteen immediately superseded, inside calls the client is waiting on.
 
-### Incremental recompute from a change cursor (effort: L, and not currently possible)
+### True per-node incremental recompute (effort: L, not available)
 
-- Track what changed since the last run and reassign only the affected part of the graph.
-- Trade-offs: this is the option that sounds obviously right and is not available. It needs two
-  things the codebase does not have. First, a cursor that observes edge writes: `changes_since`
-  (`graph.rs:516`) reads the `nodes` table only, so it cannot see a `relate`. Second, an
-  incremental Leiden: `cluster::detect` (`cluster.rs:15`) runs over a whole `GraphDataBuilder`
-  and `leiden-rs` exposes no partial-update entry point. Community membership is also global by
-  nature, since adding one edge can merge two communities far from it. Worth revisiting only
-  when a measurement shows the full recompute actually hurts.
+- Reassign only the nodes whose neighbourhood changed, leaving the rest untouched.
+- Trade-offs: this is the option that sounds right and cannot be built on the current stack.
+  Community membership is global: adding one edge can merge two communities whose nodes are
+  nowhere near it, so "only the changed nodes" is not a well-defined subproblem.
+  `run_with_initial_partition` is the closest the library offers and it still walks the whole
+  graph. There is also no cursor that can observe an edge write (see Context). Revisit only if
+  a measurement shows a warm-started full pass is genuinely too slow.
 
-### Recompute lazily on read, gated by a staleness check (effort: M)
+### GC tick plus lazy read, both warm-started (effort: M)
 
-- The `clusters` tool compares a cheap fingerprint of the clustering-relevant edge set against
-  the fingerprint recorded when the assignment was last computed, and recomputes only on a
-  mismatch. Otherwise it serves what is already in `node_community`.
-- Trade-offs: no work is ever done for a result nobody reads, and a reader never sees a stale
-  assignment. The cost lands as latency on the `clusters` call, bounded by store size, on a
-  caller explicitly asking for clustering. The fingerprint must itself be cheap, and the first
-  call after a burst of writes pays the full cost.
-- **A timestamp alone is not a sound fingerprint, which is the trap this option has to avoid.**
-  The obvious signal, "is any live edge newer than `computed_at`", silently misses deletion.
-  `gc` hard-deletes edges (`graph.rs:555`:
-  `DELETE FROM edges WHERE src NOT IN (SELECT id FROM nodes) OR dst NOT IN (...)`), so after a
-  sweep `MAX(tx_from)` over live edges can only stay equal or fall. An assignment computed
-  before a gc would keep reporting itself current while describing edges that no longer exist,
-  potentially holding two groups merged that are now disconnected.
+- The tick refreshes the assignment when the edge set has changed, so the common read is a
+  cache hit. The read still checks, and recomputes itself when a write landed since the tick,
+  so freshness never depends on the tick having run. Both paths warm-start from the stored
+  partition.
+- Trade-offs: two call sites instead of one, and the tick can still do work nothing reads. In
+  exchange, reads are fast in the common case and correct in every case.
 
 ## Decision
 
-Adopt **recompute lazily on read, gated by a staleness check**.
+Adopt **GC tick plus lazy read, both warm-started**.
 
-The `clusters` tool computes a fingerprint of the edge set clustering actually reads, namely
-`SELECT COUNT(*), MAX(tx_from) FROM edges WHERE tx_to = FOREVER AND type != 'supersedes'`, and
-compares it against the fingerprint stored when the assignment was last written. On a mismatch
-it recomputes before answering; otherwise it serves `node_community` as it stands.
+Three parts, and each one earns its place:
 
-Both parts are load-bearing:
+**1. A fingerprint decides whether anything changed.** Both the tick and the read compare
+`SELECT COUNT(*), MAX(tx_from) FROM edges WHERE tx_to = FOREVER AND type != 'supersedes'`
+against values stored in a new single-row `cluster_state` table, written in the same
+transaction as the assignment.
 
 - `MAX(tx_from)` catches **insertion**, which is what `relate` does.
 - `COUNT(*)` catches **deletion**, which a timestamp cannot, because `gc` hard-deletes edges
-  (`graph.rs:555`) and deletion never advances a maximum. An insert and a delete inside the
-  same window leaves the count unchanged but still advances the maximum, since the new row is
-  newer than the recorded fingerprint, so the pair covers that case too.
-- Filtering `type != 'supersedes'` keeps the fingerprint aligned with the graph clustering
-  reads. Without it every `supersede` would invalidate an assignment it cannot possibly affect,
-  turning ordinary `remember` traffic into repeated Leiden runs.
+  (`graph.rs:558`) and deletion never advances a maximum. This is the trap the first draft of
+  this record fell into.
+- `type != 'supersedes'` keeps the fingerprint aligned with the graph clustering actually
+  reads. Without it, every ordinary `remember` that updates an existing subject would
+  invalidate an assignment it cannot possibly affect, turning normal write traffic into
+  repeated Leiden runs.
 
-Storing the fingerprint needs somewhere to put it: `node_community` holds only `node_id`,
-`community`, and `computed_at` (`graph.rs:607`), and the value is a property of the run, not of
-any one node. So this adds a single-row `cluster_state` table carrying the computed-at
-timestamp, the edge count, and the max `tx_from`, written in the same transaction that replaces
-the assignment.
+`node_community` cannot hold this: it stores `node_id`, `community`, `computed_at`
+(`graph.rs:607`), and the fingerprint is a property of the run, not of any node.
 
-Keeping that state in the database rather than an in-memory dirty flag matters because launchd
-can start and stop the daemon at will: an in-process flag is lost on every restart and would
-have to assume dirty, which is indistinguishable from recomputing on every call.
+**The stored fingerprint is the one captured with the graph, never re-queried at commit.** This
+is the subtle part, and getting it backwards silently breaks the whole guarantee. The recompute
+reads the edge set, runs Leiden, then writes. If the fingerprint written at the end were a
+fresh `COUNT`/`MAX` taken inside the commit, a `relate` landing during the Leiden run would be
+recorded as included when the assignment never saw it, and the next read would find a matching
+fingerprint and serve an assignment that predates a live edge. Capturing the fingerprint from
+the same read that built the graph makes the failure mode safe instead: the late write leaves
+the stored fingerprint behind the real one, so the next read detects a mismatch and recomputes.
+The same reasoning is what makes two concurrent recomputes merely wasteful rather than
+corrupting.
 
-**Recompute on the GC tick** was rejected because it does full-graph work for a consumer that
-may never call, and because the launchd job declares no `KeepAlive`, so the tick that was
-supposed to keep clusters fresh may never fire at all. It converts a bounded on-demand cost
-into an unbounded recurring one and buys staleness in exchange.
+**2. The GC tick refreshes, which bounds worst-case staleness.** After each sweep, `spawn_gc`
+recomputes if the fingerprint moved, and skips entirely if it did not.
 
-**Recompute on every `relate`** was rejected because it puts whole-graph work inside a
-client-visible write call and repeats it once per edge in a batch.
+Be precise about what this buys, because the tempting claim is wrong. The tick does **not**
+make the typical read fast. At the default six-hour interval (`config.rs:153`), a client that
+asserts an edge and calls `clusters` in the same session moves the fingerprint and takes the
+lazy path regardless of whether a tick ever ran. What the tick actually absorbs is change that
+happens while nobody is reading: the first read of a long-idle store, and the first read after
+a sweep deleted edges, find a warm assignment instead of paying to build one. Placing it after
+the sweep is deliberate, since `gc` is the only deleter and that is precisely the moment the
+edge set changes with no reader present to notice.
 
-**Incremental recompute** was rejected as not currently possible rather than undesirable. It
-needs an edge-aware change cursor and an incremental Leiden, neither of which exists, and the
-`changes_since` doc comment that suggests otherwise is inaccurate and should be corrected.
+**4. A periodic from-scratch run, so warm-starting cannot compound a bad merge.** Leiden's
+local-moving phase is a greedy hill-climb, so seeding every run from the previous one can hold
+a partition in a local optimum a cold start would escape. The recompute therefore ignores the
+seed and starts from singletons whenever the stored assignment is more than 24 hours old, using
+the `computed_at` already written to `cluster_state`, and whenever no assignment exists. That
+keeps the escape hatch on a schedule instead of leaving it as an option nobody triggers.
 
-The `cluster` Cargo feature is deleted, making `leiden-rs` a plain dependency. The feature is
-already on by default (`crates/liam-store/Cargo.toml:25`), so only a build passing
-`--no-default-features` is affected, and shipping a release where clustering silently does not
-exist is a worse outcome than carrying the dependency.
+**3. The read still checks, so freshness never depends on the tick.** `clusters` runs the same
+comparison and recomputes on a mismatch. This is what makes the design correct under a launchd
+job with no `KeepAlive`, where the tick may never fire, and what closes the up-to-six-hours
+staleness window the tick-only option leaves open.
+
+**Warm start on both paths.** `recompute_communities` seeds Leiden with the stored assignment
+via `run_with_initial_partition` (`leiden-rs` `src/leiden.rs:477`) instead of starting from
+singletons.
+
+The mapping needs care, because the previous assignment is stored per `node_id` while Leiden
+works on dense indices. Those indices are built by `intern` over the rows of
+`SELECT src, dst FROM edges` (`graph.rs:588-599`), so they are positional and **not stable
+between runs**. The seed must therefore be built after the new index space exists: for each new
+index `i`, look up `labels[i]` in the stored assignment and reuse its community if present, or
+give it a fresh singleton id if the node is new since the last run. A node that was an endpoint
+last run and is not one now simply has no index, and drops out.
+
+New nodes must take singleton ids drawn from a range **disjoint from every id already in the
+seed**, that is `max(seed ids) + 1 + n`. `Partition::from_membership` (`src/partition.rs:29`)
+groups by raw integer equality and has no notion of a reserved id, so reusing an id that a
+previous community already holds would silently seed an unrelated new node into that community
+and bias the run toward a merge with no basis in the graph.
+
+Warm-starting buys convergence speed, and nothing else should be claimed for it. In particular
+it does **not** stabilise community ids. `run_core` calls `result.renumber()` on its **output**
+(`src/leiden.rs:441`), so the ids reported are assigned by first appearance while walking nodes
+in dense-index order, whatever the seed was labelled. That dense order comes from `intern` over
+the rows of a query with no `ORDER BY` (`graph.rs:591`), and SQL leaves unordered row order
+unspecified. The tick makes this worse rather than better: `gc` runs `PRAGMA incremental_vacuum`
+when `reclaim` is true, which it is by default (`config.rs:154`), immediately before the
+recompute this record schedules after the sweep, and storage reorganisation is exactly what
+perturbs an unordered scan.
+
+Two consequences follow, and both are requirements rather than observations. The edges query
+gains an `ORDER BY` so the dense index is at least a deterministic function of the edge set.
+And `clusters` presents its integer as "these nodes group together in this response", never as
+a handle a client may store and compare against a later call.
+
+This is as close to "only recompute what changed" as the stack allows, and the gap is worth
+stating plainly: the graph is still walked in full. What warm-starting buys is convergence from
+a nearly-correct partition rather than from scratch.
+
+**Recompute on the tick only** was rejected because it violates the staleness driver and
+because a job with no `KeepAlive` may never run it. **Lazy on read only** was rejected because
+it puts a full run in front of the client on the first read after any write. **Recompute on
+every `relate`** was rejected because it repeats whole-graph work once per edge in a batch.
+**True per-node incremental** was rejected as not available rather than undesirable.
+
+The `cluster` Cargo feature is deleted, making `leiden-rs` a plain dependency. It is already
+default-on (`Cargo.toml:25`), so only a `--no-default-features` build is affected, and shipping
+a release where clustering silently does not exist is the worse outcome.
 
 ## Consequences
 
 **Positive**
 
-- No clustering work is performed unless something reads clusters.
-- A reader never sees an assignment older than the newest edge, which removes the staleness
-  window entirely rather than shrinking it.
-- Correct behaviour under an on-demand launchd job, where a periodic tick is unreliable.
-- The decision stays reversible: moving to a timer later is a small change, and the staleness
-  check remains useful either way.
+- A `clusters` call with nothing changed since the last run is a fingerprint comparison plus an
+  indexed read, with no Leiden run at all.
+- A reader never sees an assignment that predates the newest edge, on either path.
+- Correct under an on-demand launchd job, where a periodic tick alone is unreliable.
+- An idle store does no clustering work at all: the tick skips on a matching fingerprint.
 
 **Negative**
 
-- The first `clusters` call after a write burst pays the full recompute, so latency is spiky
-  by design. There is still no measurement at any store size, so the size at which this becomes
-  unacceptable is unknown. It must be logged with node and edge counts so the ceiling is
-  discoverable from real use rather than guessed.
-- One extra aggregate read on every `clusters` call, including the common case where nothing
-  changed.
-- A new `cluster_state` table, so this decision carries a schema migration rather than being
-  pure application logic.
-- The fingerprint is a heuristic, not a proof, and it has two known gaps. Both are disclosed
-  here rather than discovered later.
-  - **In-place mutation would defeat it.** `COUNT` plus `MAX(tx_from)` catches every edge-set
-    change the current writers can produce, because the only three writers to `edges` are
-    `link` (insert, `graph.rs:176`), `supersede` (insert, filtered out, `graph.rs:146`), and
-    `gc` (delete, `graph.rs:558`); there is no `UPDATE edges` anywhere. A future writer that
-    changed a row's `src`, `dst`, or `type` in place would move neither the count nor the max.
-    Any such writer must update this contract too, and that obligation belongs in a comment
-    beside the query.
-  - **A same-millisecond tie can mask one change.** `Millis` is wall-clock millisecond
-    resolution, so if an insert lands in the same millisecond as the edge currently holding
-    the max, while a `gc` sweep removes a different edge in the same window, the count returns
-    to its previous value and the max is unmoved. The window is narrow and the effect is
-    self-healing: the next insert or delete that does not tie triggers a full recompute against
-    the then-current edges. Worth knowing, not worth a monotonic counter at this scale.
-- Deleting the `cluster` feature removes the option of a build without `leiden-rs`.
-- A recompute triggered inside a read path means a read can now write, which is a new shape for
-  this codebase and interacts with the single-writer-per-`Graph` caveat deferred to M3.5.
-  Until M3.5 lands the interim behaviour is deliberate rather than merely acknowledged: the
-  recompute takes the ordinary write path, so it serializes behind the write mutex like any
-  other write (`backend.rs:16`). The fingerprint check is a read, and the same contract
-  requires reads not to queue behind an in-flight write, so a `clusters` call that finds
-  nothing stale never waits on a concurrent `remember`. Only a call that actually recomputes
-  does, and `clusters` is an explicit, infrequent request rather than part of the `recall` or
-  `ask` hot path.
+- Two call sites now recompute, so the invariant "assignment matches fingerprint" is enforced
+  in two places and must not drift. It belongs in one store method both callers use, not
+  duplicated.
+- A read can now write, which is new for this codebase and interacts with the
+  single-writer-per-`Graph` caveat deferred to M3.5. Interim behaviour is deliberate: the
+  recompute takes the ordinary write path and serializes behind the write mutex
+  (`backend.rs:16`), while the fingerprint check is a read and the same contract forbids reads
+  queuing behind writes, so a call that finds nothing stale never waits.
 - **Two concurrent `clusters` calls can both recompute.** Reads do not serialize with each
-  other or with writes (`backend.rs:16`), so both callers can read the same stale fingerprint
-  before either writes, and both then run Leiden. This is wasteful, not corrupting: `detect`
-  is deterministically seeded (`cluster.rs`, `seed: Some(42)`), so both runs produce the same
-  assignment, and each write is all-or-nothing, so the second simply overwrites the first with
-  identical rows. Left unguarded on purpose, because a lock held across a full Leiden run would
-  cost more than the duplicate work it prevents at any store size this design targets.
-- **A failed recompute serves an error, not a stale answer.** Because `execute_atomic` is all
-  or nothing (`backend.rs:50`), a failure part-way leaves the previous assignment intact rather
-  than half-deleted. `clusters` must still surface the failure rather than quietly returning
-  the old assignment, since silently serving stale data is the exact outcome this whole
-  decision exists to prevent.
+  other, so both can observe the same stale fingerprint before either writes. Wasteful, not
+  corrupting: `detect` is deterministically seeded (`cluster.rs`, `seed: Some(42)`) and each
+  write is all-or-nothing, so the second overwrites the first with identical rows. Left
+  unguarded on purpose, since a lock held across a full Leiden run would cost more than the
+  duplicated work it prevents at this scale.
+- **A failed recompute surfaces an error rather than a stale answer.** `execute_atomic` is all
+  or nothing (`backend.rs:50`), so a mid-way failure leaves the previous assignment intact
+  rather than half-deleted. `clusters` must still report the failure, because silently serving
+  stale data is what this decision exists to prevent.
+- A new `cluster_state` table, so this carries a schema migration rather than being pure
+  application logic.
+- Warm-starting makes each run's result depend on the previous one, so the assignment is a
+  function of history rather than of the current graph alone, and reproducing a partition from
+  a database snapshot needs the same starting point. The 24-hour from-scratch rule above bounds
+  how far history can carry a bad merge, but does not remove the dependence.
+- **Community ids are not durable.** `run_with_initial_partition` renumbers the seed
+  (`src/partition.rs:84`) into contiguous ids ordered by first appearance in a membership
+  vector indexed by an unstable dense index (`graph.rs:588-599`), so the integer labelling a
+  group can differ from run to run even when the grouping is unchanged. The `clusters` tool
+  must present these as "which nodes group together in this response", never as an id a client
+  can store and compare against a later call. Getting this wrong is the kind of thing a
+  consumer discovers only after building on it.
+- No measurement exists at any store size. Both paths must log node and edge counts and elapsed
+  time so the ceiling is discovered from real use rather than guessed.
+- The fingerprint is a heuristic with two disclosed gaps. **In-place mutation** would defeat it:
+  the only writers to `edges` are `link` (insert, `graph.rs:176`), `supersede` (insert,
+  filtered out, `graph.rs:146`), and `gc` (delete, `graph.rs:558`), with no `UPDATE edges`
+  anywhere, so a future writer that changed `src`, `dst`, or `type` in place would move neither
+  count nor max. **A same-millisecond tie** can mask one change, since `Millis` is wall-clock
+  millisecond resolution: an insert landing in the same millisecond as the current max, paired
+  with a `gc` deleting a different edge, returns both values to their prior state. Narrow, and
+  self-healing on the next untied change.
 
 **Follow-up**
 
-- Correct the `changes_since` doc comment (`graph.rs:516`), which promises incremental
-  community recompute the query cannot support.
-- Constraining relation types, deferred by ADR-0001, matters more here: clustering excludes
-  only `supersedes`, so any other type a client invents contributes equally to the result.
-- Whether `clusters` should expose community labels rather than opaque integers is unaddressed;
-  `recompute_communities` returns a count and stores integer ids (`graph.rs:618`).
+- Correct the `changes_since` doc comment (`graph.rs:516`), which promises incremental community
+  recompute its query cannot support.
+- Measure the real gap between a `relate` and the next `clusters` call once there is traffic.
+  The tick is justified above on bounding idle-time staleness, not on speeding up the typical
+  read. If measurement shows reads almost always follow a write closely, the tick is buying
+  little and should be reconsidered rather than left in place on assumption.
+- Constraining relation types, deferred by ADR-0001, matters more here: clustering excludes only
+  `supersedes`, so any other type a client invents contributes equally.
+- Whether `clusters` should expose labels rather than opaque integers is unaddressed.
 
 ## Architecture Diagrams
 
@@ -227,7 +283,7 @@ flowchart TD
     B --> C["Graph<br/>graph.rs"]
     C --> D[("edges")]
     F["recompute_communities<br/>graph.rs:581"] -.->|"no caller anywhere"| C
-    F -.-> G[("node_community")]
+    F -.->|"Leiden from singletons"| G[("node_community")]
 
     style F stroke-dasharray: 5 5
     style G stroke-dasharray: 5 5
@@ -241,11 +297,15 @@ flowchart TD
     A -->|clusters| B
     B -->|"assert edge"| C["Graph<br/>graph.rs"]
     C --> D[("edges")]
-    B -->|clusters| S{"fingerprint changed?<br/>COUNT + MAX(tx_from)<br/>over live non-supersedes edges"}
+
+    E["GC tick<br/>spawn_gc"] -->|"after the sweep"| S
+    B -->|"clusters: check first"| S{"fingerprint moved?<br/>COUNT + MAX(tx_from)<br/>over live non-supersedes edges"}
+
     S -->|no| G[("node_community")]
-    S -->|yes| F["recompute_communities"]
+    S -->|yes| F["recompute_communities<br/>warm-started"]
     F -->|"reads WHERE type != 'supersedes'"| D
-    F -->|"DELETE + INSERT + fingerprint,<br/>one transaction"| G
+    F -->|"seed partition"| G
+    F -->|"assignment + fingerprint,<br/>one transaction"| G
     F --> T[("cluster_state")]
     S -.->|"compares against"| T
     G --> B
@@ -260,6 +320,8 @@ sequenceDiagram
     participant Graph as Graph
     participant DB as libSQL
 
+    Note over Graph,DB: the GC tick ran this same check earlier,<br/>so the common case below is a hit
+
     Client->>Server: clusters()
     Server->>Graph: communities()
     Graph->>DB: SELECT edge_count, max_tx_from FROM cluster_state
@@ -267,11 +329,19 @@ sequenceDiagram
 
     alt fingerprint matches
         Graph->>DB: SELECT node_id, community FROM node_community
-    else count or max differs, or cluster_state is empty
-        Note over Graph,DB: count differs on gc deletion,<br/>max differs on a new relate
-        Graph->>DB: SELECT src, dst FROM edges WHERE type != 'supersedes'
-        Note over Graph: Leiden over the whole graph
-        Graph->>DB: DELETE + INSERT node_community,<br/>UPSERT cluster_state (one transaction)
+    else count or max moved, or cluster_state is empty
+        Note over Graph,DB: count moves on a gc delete,<br/>max moves on a new relate
+        Graph->>DB: SELECT src, dst FROM edges<br/>WHERE type != 'supersedes' ORDER BY id
+        Note over Graph: keep THIS snapshot's fingerprint.<br/>Never re-query it at commit time.
+
+        alt assignment is under 24h old
+            Graph->>DB: SELECT node_id, community FROM node_community
+            Note over Graph: seed from_membership, new nodes get<br/>ids above max(seed), then warm start
+        else older than 24h, or absent
+            Note over Graph: cold start from singletons,<br/>so a bad merge cannot compound
+        end
+
+        Graph->>DB: DELETE + INSERT node_community,<br/>UPSERT cluster_state with the captured fingerprint<br/>(one transaction)
     end
 
     Graph-->>Server: assignments

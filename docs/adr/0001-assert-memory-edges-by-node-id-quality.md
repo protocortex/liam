@@ -91,11 +91,48 @@ so any node deletion that matters moves the count.
 - `ask::Evidence::from_hit` (`ask.rs:51`) never reads `Hit::id`, and `eval.rs:470` drives
   `ask`, so rendering ids in `recall` cannot regress the grounding eval.
 
+## ADR-0002 was re-gated after its decision changed
+
+The owner reviewed the passing record and asked for a hybrid: a GC tick as well as the lazy
+read, with only changed work recomputed. That is a materially different decision, so it
+inherited no PASS and went back through the gate.
+
+Investigating it turned up an API the earlier rounds had missed: `leiden-rs` 0.8.1 exposes
+`run_with_initial_partition` (`src/leiden.rs:477`), documented for "Incremental refinement after
+minor graph changes". That makes a real version of the request possible. It is warm-start, not
+per-node incremental: the call still walks the whole graph, and requires
+`initial_partition.len() == data.node_count()`. Community membership is global, so "recompute
+only the changed nodes" is not a well-defined subproblem on any Leiden implementation.
+
+That round returned **FAIL** with five findings, and they were good ones:
+
+1. The claim that warm-starting stabilises community ids is false. `run_core` renumbers its
+   **output** (`src/leiden.rs:441`) by first appearance over dense index order, that order comes
+   from a query with no `ORDER BY` (`graph.rs:591`), and the tick runs `PRAGMA
+   incremental_vacuum` (`reclaim: true` by default, `config.rs:154`) immediately before the
+   recompute, which is exactly what perturbs an unordered scan. The record now requires an
+   `ORDER BY` and states that the integer is response-scoped, never a durable handle.
+2. Fingerprint atomicity was unspecified. If the stored fingerprint were re-queried at commit
+   rather than captured with the graph, an edge asserted during the Leiden run would be recorded
+   as included when the assignment never saw it, and the next read would skip recomputing.
+   Now stated explicitly, with the safe direction spelled out.
+3. New-node singleton ids could collide with an existing community id, since
+   `Partition::from_membership` groups by raw integer equality, silently merging an unrelated
+   node. Now required to come from a disjoint range.
+4. The from-scratch escape hatch had no trigger, so a warm start could compound a bad merge
+   indefinitely. Now on a 24-hour rule keyed to `computed_at`.
+5. The tick's justification was overstated. At a six-hour interval a client that asserts an edge
+   then reads takes the lazy path anyway, so the tick does not speed up the typical read. It is
+   now justified on what it actually does, absorbing change that happens while nothing is
+   reading, with a follow-up to measure the real relate-to-read gap.
+
+Finding 1 was also caught independently while that round was in flight, as was the earlier
+deletion-blind staleness signal. Two separate cases of the author and the reviewer converging.
+
 ## Outstanding
 
-- **ADR-0002 is Status: Proposed and needs owner approval.** It passed the gate, but its
-  central choice, recomputing lazily on read instead of on the GC tick, has not been approved
-  by the person who owns the roadmap.
+- **ADR-0002 is Status: Proposed and needs owner approval**, and has not been re-reviewed since
+  these five fixes. The gate should run once more before it is treated as settled.
 - No execution blueprint exists for either record, so no work-unit graph, file plan, or test
   plan has been reviewed. Test Review is N/A until one does.
 - The fingerprint in ADR-0002 is a documented heuristic with two disclosed gaps, in-place row
