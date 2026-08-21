@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date created:** 2026-08-17
-- **Date modified:** 2026-08-20
+- **Date modified:** 2026-08-22
 - **Supersedes scope:** the clustering cadence, the `cluster` Cargo feature, and the
   `clusters` tool moved to [ADR-0002](0002-cluster-recompute-cadence.md) on 2026-08-20, after
   an adversarial review found them bundled here without any alternatives weighed.
@@ -137,6 +137,10 @@ assertion must not write a second row: `cluster.rs:11` documents that "A repeate
 weight", and `detect` calls `builder.add_edge(u, v, 1.0)` once per row, so duplicate rows do
 not merely clutter the table, they weight the graph Leiden reads.
 
+> **Amended 2026-08-22.** This covers repetition of the same ORDERED triple only. Asserting
+> the same pair in both directions still doubles its clustering weight, and the guard for that
+> lives on the read side. See Amendment 1.
+
 The obvious shape, check first and insert afterwards, is a time-of-check-to-time-of-use race:
 a concurrent `supersede` closes an endpoint in between and the edge still lands. Less
 obviously, **the fix is not "do both inside `execute_atomic`".** That method takes a statement
@@ -239,7 +243,8 @@ burying it in a record about addressing would have let it ship unargued.
 - `relate` accepts any relation type string except the rejected `supersedes`, and the
   clustering read side excludes only `supersedes` too. So a junk type contributes to community
   detection exactly as much as `mentions` does. Idempotency (above) stops a client inflating
-  one pair's weight by repetition, but it does nothing about a client inventing types. This is
+  one pair's weight by repeating the same ordered triple, though not by reversing it (see
+  Amendment 1), and it does nothing about a client inventing types. This is
   the weakest part of the decision: it trades "clustering is inert" for "clustering follows
   whatever types clients send", which is better but not obviously good. Constraining the type
   set is deferred below, and that deferral is a real risk rather than a formality.
@@ -356,3 +361,49 @@ sequenceDiagram
 
     Note over Server,DB: clustering reads these edges later, cadence is ADR-0002
 ```
+
+## Amendments
+
+### Amendment 1: idempotency is per ordered triple, so it does not stop weight doubling (2026-08-22)
+
+Found while building the execution blueprint, before any code was written, and confirmed
+against the `leiden-rs` 0.8.1 source rather than reasoned about.
+
+**The defect.** This record justifies its idempotency clause by pointing at clustering weight:
+`cluster.rs:11` says "A repeated pair raises weight", so a duplicate row biases the partition.
+The mandated guard is `NOT EXISTS (SELECT 1 FROM edges WHERE src = ?2 AND dst = ?3 AND
+type = ?4 AND tx_to = ?7)`, which keys on the triple **in order**.
+
+So `relate(a, b, t)` and `relate(b, a, t)` both insert. That is correct for the edge table:
+edges are directed, and "a causes b" is not "b causes a".
+
+Clustering then reads the directed set as undirected. `build_undirected_csr` sorts by `(u, v)`
+and merges only consecutive exact duplicates, then stores each surviving edge in both
+adjacency lists. `(a,b)` and `(b,a)` are not equal, so both survive, and the pair reaches
+weight 2.0. The bias this clause exists to prevent is reachable by asserting the relation in
+both directions, which is a natural thing for a client to do.
+
+**Where the fix goes.** Not here. The edge table stays directed and `relate` stays idempotent
+on the ordered triple, because that is the right contract for a directed edge. The clustering
+read side collapses each unordered pair to one edge before running Leiden, next to the
+`supersedes` filter that is already there for the same reason. Recorded in
+[ADR-0002](0002-cluster-recompute-cadence.md), Amendment 2.
+
+**What this record got wrong** was not the mechanism but the claim attached to it. The
+`NOT EXISTS` does what it says. It just does not buy the clustering property this record cites
+as its motivation, and no ordered-triple guard could.
+
+### Amendment 2: `relate` checks transaction time, not the codebase's liveness predicate (2026-08-22)
+
+Not a defect, recorded so nobody "fixes" it and silently changes the guarantee.
+
+The mandated `EXISTS (SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?7)` tests one column.
+The store's own liveness predicate, `live_at` (`graph.rs:24-29`), tests four, adding
+`valid_from` and `valid_until`. `exists_as_of`, which `supersede` uses, applies all four.
+
+So `relate` accepts a node whose valid time has ended or has not yet begun, which is a node
+`recall` would not return. Both threats this record actually names are still covered: a
+concurrent `supersede` sets `tx_to`, and `gc` deletes the row, so `EXISTS` fails in both cases.
+
+This is a definitional gap rather than a race. Widening it to `live_at` would be a different
+guarantee, arguably a better one, and it needs deciding rather than assuming.
