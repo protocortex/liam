@@ -513,8 +513,20 @@ impl<B: Backend> Graph<B> {
 
     // ---- change cursor ----
 
-    /// Nodes recorded or closed strictly after `cursor`, for incremental work
-    /// (rebuild only new vectors, recompute only changed communities).
+    /// Nodes recorded or closed strictly after `cursor`, for rebuilding only
+    /// the vectors that changed.
+    ///
+    /// **This cursor cannot see an edge write, so it is useless for clustering.**
+    /// It queries `nodes` only, and `Change` carries a node id, a timestamp and
+    /// a closed flag. A `relate` inserts into `edges` and touches no node row,
+    /// so this returns nothing for exactly the event that changes communities.
+    /// An earlier version of this comment promised "recompute only changed
+    /// communities", which the query has never supported.
+    ///
+    /// Clustering staleness is detected by the edge fingerprint in
+    /// `cluster_state` instead (ADR-0002). Making this cursor able to answer the
+    /// question would take the append-only change ledger that ADR-0002 weighs
+    /// and defers.
     pub async fn changes_since(&self, cursor: Millis) -> Result<Vec<Change>> {
         let rows = self
             .backend
@@ -576,7 +588,6 @@ impl<B: Backend> Graph<B> {
     }
 }
 
-#[cfg(feature = "cluster")]
 impl<B: Backend> Graph<B> {
     pub async fn recompute_communities(&self) -> Result<usize> {
         use crate::cluster::{detect, Edge};
@@ -679,7 +690,6 @@ fn fts5_query(text: &str) -> String {
         .join(" OR ")
 }
 
-#[cfg(feature = "cluster")]
 fn intern(index: &mut HashMap<String, usize>, labels: &mut Vec<String>, id: String) -> usize {
     if let Some(&i) = index.get(&id) {
         return i;
@@ -1395,13 +1405,101 @@ mod tests {
         assert_eq!(row.get_i64(10).unwrap(), FOREVER.0);
     }
 
+    /// `cluster_state` is a new TABLE, not a new column, so it needs no
+    /// `migrate::` call: `schema()` is all `CREATE TABLE IF NOT EXISTS` and
+    /// `open_with_clock` re-runs the whole batch on every open. This pins that,
+    /// because the reasoning is easy to doubt later and the failure would be a
+    /// panic on the first `clusters` call against any pre-existing database.
+    #[tokio::test]
+    async fn opening_a_database_that_predates_cluster_state_creates_it_with_no_data_loss() {
+        // This test exercises schema evolution, not read pooling.
+        const ARBITRARY_POOL_SIZE: usize = 1;
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("no-cluster-state.db");
+        let path_str = path.to_str().expect("temp path is valid utf-8");
+
+        // Given a database whose schema has node_community but NO
+        // cluster_state, which is exactly what a build predating ADR-0002
+        // left behind. Written through a bare backend so the table genuinely
+        // never existed rather than having been dropped.
+        {
+            let old = crate::DefaultBackend::open(path_str, ARBITRARY_POOL_SIZE)
+                .await
+                .expect("open old-schema backend");
+            old.execute_batch(
+                "CREATE TABLE node_community (
+                   node_id     TEXT    NOT NULL PRIMARY KEY,
+                   community   INTEGER NOT NULL,
+                   computed_at INTEGER NOT NULL
+                 );",
+            )
+            .await
+            .expect("create the old cluster tables");
+            old.execute(
+                "INSERT INTO node_community (node_id, community, computed_at)
+                 VALUES (?1, ?2, ?3)",
+                &["pre-existing".into(), Value::Int(7), Millis(1000).into()],
+            )
+            .await
+            .expect("insert a pre-existing assignment");
+        } // dropped, releasing the connection before reopening
+
+        // When it is opened by the new code
+        let clock = Arc::new(FixedClock::new(Millis(2000)));
+        let g = DefaultGraph::open_with_clock(path_str, GraphConfig::new(8), clock)
+            .await
+            .expect("open graph over a database with no cluster_state");
+
+        // Then cluster_state exists. This SELECT errors if it does not, which
+        // is the assertion.
+        let state = g
+            .backend
+            .query("SELECT COUNT(*) FROM cluster_state", &[])
+            .await
+            .expect("cluster_state must exist after opening");
+        assert_eq!(
+            state[0].get_i64(0).unwrap(),
+            0,
+            "a table created by this open starts empty, so the fingerprint \
+             check reads 'no prior run' and forces a cold recompute"
+        );
+
+        // And the assignment that was already there is untouched. Creating a
+        // table must never disturb its neighbour.
+        let kept = g
+            .backend
+            .query(
+                "SELECT community, computed_at FROM node_community WHERE node_id = ?1",
+                &["pre-existing".into()],
+            )
+            .await
+            .expect("query the pre-existing assignment");
+        assert_eq!(kept.len(), 1, "the pre-existing assignment was lost");
+        assert_eq!(kept[0].get_i64(0).unwrap(), 7);
+        assert_eq!(kept[0].get_i64(1).unwrap(), 1000);
+    }
+
+    /// The empty state is the one every store is in on the day ADR-0002 ships,
+    /// so it is worth naming rather than leaving implied.
+    #[tokio::test]
+    async fn a_fresh_database_has_an_empty_cluster_state() {
+        let g = graph_at(Millis(1000)).await;
+
+        let rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM cluster_state", &[])
+            .await
+            .expect("cluster_state must exist on a fresh database");
+
+        assert_eq!(rows[0].get_i64(0).unwrap(), 0);
+    }
+
     /// Community detection over the edge graph, which had no test at all
     /// before this. "Nothing calls it and nothing covers it" was used once as
     /// an argument for dropping the feature; the approved design
     /// (`2026-07-23-always-available-clusters-design.md`, folded into M5) says
     /// the opposite, so this pins the behaviour the daemon will lean on when
     /// `recompute_communities` moves onto the maintenance tick.
-    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn communities_separate_two_disconnected_groups_of_nodes() {
         // Given two clusters of linked nodes with NO edge between them: three

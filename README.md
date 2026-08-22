@@ -192,7 +192,7 @@ three: the `.db` file alone can be missing recently committed data.
 
 - `backend-libsql` (default): libSQL with native vector search (`F32_BLOB`,
   `vector_distance_cos`).
-- `cluster` (default): Leiden community detection.
+Leiden community detection is unconditional; there is no feature to disable it.
 
 `liam-daemon`:
 
@@ -246,7 +246,7 @@ The workspace compiles on default features and the daemon builds to a binary.
 the shared graph logic are done.
 
 Not yet verified against their third-party APIs: the `local` build (fastembed v5
-signatures) and the `cluster` build (the leiden-rs membership accessor).
+signatures) and the leiden-rs membership accessor in `cluster.rs`.
 
 ## Roadmap
 

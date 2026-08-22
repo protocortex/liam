@@ -68,9 +68,21 @@ CREATE INDEX IF NOT EXISTS edges_in  ON edges (dst, type, tx_to);
 ",
     );
 
-    if cfg!(feature = "cluster") {
-        sql.push_str(
-            "
+    // Unconditional since ADR-0002 deleted the `cluster` feature. A database
+    // created by an older build that lacked the feature simply gains these two
+    // tables on its next open, because everything here is
+    // `CREATE TABLE IF NOT EXISTS` and `Graph::open_with_clock` re-runs the
+    // whole batch every time. That is also why neither table needs a
+    // `migrate::` call: `migrate` exists for a COLUMN a fresh database gets
+    // from this schema and an existing one does not, which is a different
+    // problem from a missing table.
+    //
+    // The upgrade is self-healing rather than merely tolerable. An old database
+    // arrives with `node_community` absent and gains it empty, and
+    // `cluster_state` is empty too, so the fingerprint check reads "no prior
+    // run" and forces a cold recompute on the first `clusters` call or GC tick.
+    sql.push_str(
+        "
 CREATE TABLE IF NOT EXISTS node_community (
   node_id     TEXT    NOT NULL PRIMARY KEY REFERENCES nodes(id),
   community   INTEGER NOT NULL,
@@ -78,9 +90,15 @@ CREATE TABLE IF NOT EXISTS node_community (
 );
 
 CREATE INDEX IF NOT EXISTS node_community_by_community ON node_community (community);
+
+CREATE TABLE IF NOT EXISTS cluster_state (
+  edge_count         INTEGER NOT NULL,
+  max_tx_from        INTEGER NOT NULL,
+  computed_at        INTEGER NOT NULL,
+  last_cold_start_at INTEGER NOT NULL
+);
 ",
-        );
-    }
+    );
 
     sql
 }
