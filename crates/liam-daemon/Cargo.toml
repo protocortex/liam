@@ -34,9 +34,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "3", features = ["server", "macros", "transport-io"] }
 schemars = "1"
 time = "0.3"
-# Mode dispatch. This IS a real added dependency: clap used to arrive free via
-# leiden-rs through liam-store, but `cluster` left the default features, so
-# nothing else pulls it now. Still worth it. The argument decides whether this
+# Mode dispatch. Declared directly even though leiden-rs pulls clap in through
+# liam-store anyway, and always will now that ADR-0002 made clustering
+# unconditional: a transitive edge belongs to a crate under no obligation to
+# keep it, and losing argument parsing to someone else's minor release is not a
+# trade worth making. The argument decides whether this
 # process opens the store at all, so a typo like `liamd serv` has to exit 2 with
 # a usage error rather than fall through to the store-opening default and take
 # the lock the real daemon needs. Hand-rolled argv matching gets that wrong by

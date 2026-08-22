@@ -12,9 +12,13 @@
 //! hand-rolled match would let `liamd serv` fall through to the
 //! store-opening default, so a typo would take the lock and fail the real
 //! daemon's next start. clap turns that into a usage error and exit code 2
-//! for free. It is a genuine added dependency now: it used to arrive via
-//! leiden-rs, but `cluster` left the default features, so nothing else
-//! pulls it in.
+//! for free.
+//!
+//! clap does arrive transitively through leiden-rs, and always will now that
+//! ADR-0002 made clustering unconditional. The direct dependency stays anyway:
+//! a transitive edge can disappear on any upgrade of a crate that has no
+//! obligation to keep it, and this binary's argument parsing is not something
+//! to have break from someone else's minor release.
 
 use std::path::PathBuf;
 

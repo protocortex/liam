@@ -13,7 +13,6 @@ mod schema;
 pub mod backend;
 pub mod backends;
 pub mod clock;
-#[cfg(feature = "cluster")]
 pub mod cluster;
 pub mod error;
 pub mod ids;

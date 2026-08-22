@@ -53,7 +53,7 @@ intervals use a `FOREVER` sentinel, so every currency check is positive.
 - The library never embeds; you pass vectors in.
 - Exact vector scan, no ANN, at the scale this targets: filter first, score second.
 - RRF fuses full-text and vector candidates, then a one-hop graph expansion.
-- Communities included (Leiden), behind a default-on `cluster` feature.
+- Communities included (Leiden), in every build. There is no feature to turn it off.
 - An injectable clock, so temporal behaviour is testable at a chosen instant.
 
 ## Surface
@@ -68,16 +68,14 @@ graph.link(NewEdge::new(&next, &id, "references")).await?;
 let hits = graph.query(&Query::text("libSQL").with_k(8)).await?;
 graph.gc(&RetentionPolicy::keep("episode", Millis::days(30))).await?;
 
-#[cfg(feature = "cluster")]
 graph.recompute_communities().await?;
 ```
 
 ## Features
 
 ```
-default        = ["backend-libsql", "cluster"]
+default        = ["backend-libsql"]
 backend-libsql = ["dep:libsql", "dep:tokio"]
-cluster        = ["dep:leiden-rs"]
 ```
 
 ## Status

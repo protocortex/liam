@@ -19,24 +19,33 @@ tracing = "0.1"
 # store and the source of several RUSTSEC advisories + a CDLA license).
 libsql = { version = "0.9", optional = true, default-features = false, features = ["core"] }
 tokio = { version = "1", features = ["rt", "sync"], optional = true }
-leiden-rs = { version = "0.8", optional = true }
+# Leiden community detection. Not optional: ADR-0002 makes clustering part of
+# every build, so there is no longer a feature to gate it behind.
+#
+# Pinned exactly rather than by caret range. ADR-0002 cites specific line
+# numbers in this crate's source (`src/leiden.rs:478` for
+# `run_with_initial_partition`, `src/partition.rs:29` for
+# `Partition::from_membership`, `src/leiden.rs:441` for the renumbering that
+# makes community ids non-durable), and the warm-start design depends on those
+# exact semantics. A caret range lets `cargo update` move them silently, which
+# is the failure this crate's own VERSION CHECK comments exist to prevent.
+leiden-rs = "=0.8.1"
 
 [features]
-default = ["backend-libsql", "cluster"]
+default = ["backend-libsql"]
 # `dep:tokio` is wired to backend-libsql too: the read pool and write mutex in
 # `backends/libsql.rs` need `tokio::sync::Mutex`, and that must not depend on
 # libsql's own tokio features happening to pull it in, because that coupling
 # breaks silently the moment libsql's feature set changes.
 backend-libsql = ["dep:libsql", "dep:tokio"]
-# Leiden community detection over the edge graph. ON BY DEFAULT and meant to
-# stay that way. `recompute_communities` has no caller yet, which is a reason to
-# WIRE IT UP, not to drop it: ADR-0002
-# (docs/adr/0002-cluster-recompute-cadence.md, milestone M5) decides this gate
-# is deleted entirely so clustering exists in every build, and settles when the
-# recompute runs. ADR-0001 supplies the edges it runs over. Turning it off by
-# default would ship a release with no clustering at all, since liam-daemon
-# takes liam-store's default features.
-cluster = ["dep:leiden-rs"]
+# There is deliberately NO `cluster` feature here, and adding one back would be
+# a regression. It was deleted per ADR-0002
+# (docs/adr/0002-cluster-recompute-cadence.md, milestone M5): clustering is part
+# of every build so a release cannot ship without it.
+#
+# `recompute_communities` having had no production caller was the reason to WIRE
+# IT UP, never the reason to gate or drop it. That reading has been made twice
+# and was wrong both times.
 
 [dev-dependencies]
 # rt-multi-thread: the concurrent-write test needs writes to actually race
