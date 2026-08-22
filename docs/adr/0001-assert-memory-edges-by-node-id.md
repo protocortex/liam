@@ -274,6 +274,16 @@ burying it in a record about addressing would have let it ship unargued.
   trailing field, or a structured response is a formatting decision for the execution
   blueprint. It is called out because leaving it implicit invites it to be invented during
   implementation and never reviewed.
+
+  > **Amended 2026-08-22.** Settled: recall renders a 13-character handle inside the kind
+  > bracket, and `relate` resolves any unambiguous prefix. See Amendment 3. A JSON output
+  > format stays open as a later opt-in, tracked below.
+
+- **A machine-readable output format for `recall` is deferred.** Amendment 3 keeps the flat
+  string because both consumers today are model-driven readers, and JSON costs 63 tokens of
+  syntax per 5 hits against 19 for the flat form. If a consumer ever needs to parse the
+  output, add it as an opt-in argument or through MCP's structured-content channel, rather
+  than by changing what the text block contains a second time.
 - Whether `relate` should reject a self-loop (`from == to`) is unresolved. Leiden tolerates
   one, but it carries no meaning and is most likely a client bug worth reporting back.
 - Turning on `PRAGMA foreign_keys` is deliberately not part of this decision. It would begin
@@ -407,3 +417,52 @@ concurrent `supersede` sets `tx_to`, and `gc` deletes the row, so `EXISTS` fails
 
 This is a definitional gap rather than a race. Widening it to `live_at` would be a different
 guarantee, arguably a better one, and it needs deciding rather than assuming.
+
+### Amendment 3: recall renders a 13-character handle, and `relate` resolves any unambiguous prefix (2026-08-22)
+
+Settles two things this record left open, decided while building the S2 blueprint and measured
+rather than estimated. Token counts below are `o200k_base` over a 5-hit response whose payload
+(`kind`, `label`, `content`) is 169 tokens.
+
+**What changes.**
+
+- `recall` renders `[{kind} {handle}] {label}\n{content}`, where `handle` is the first 13
+  characters of the node's ULID.
+- `relate` accepts any prefix of a node id, including the full 26 characters. It resolves the
+  prefix against nodes with `tx_to = FOREVER` and refuses when more than one matches.
+
+**Why a prefix at all.** A full ULID costs 19 tokens, so ids add 95 tokens to that 169-token
+payload, a 56% increase for handles most recalls never use. A 13-character handle costs 9,
+saving 50 tokens per 5-hit response.
+
+**Why 13 and not git's 7.** git abbreviates a SHA, which is uniform random, so 7 hex characters
+spread evenly across the object store. A ULID is not random at the front: its first 10
+characters are a 48-bit millisecond timestamp, so prefixes cluster by write time. Measured, a
+prefix of 7 characters is shared by every node written within 32.8 seconds, 9 characters within
+32 ms, and 10 characters within 1 ms. Below 11 characters the discrimination is entirely
+temporal, and it does not improve as the store grows, because it was never about store size.
+13 characters keeps all 10 timestamp characters and adds 3 from the random half, 15 bits past
+the millisecond. Simulating 8 writes landing in one millisecond: 10 characters collide 100% of
+the time, 11 collide 61%, 13 collide 0.08%. Going from 10 to 13 costs one token.
+
+**Why a collision is refused rather than guessed, and why that differs from labels.** This
+record rejected label addressing because "a wrong guess writes a plausible edge between the
+wrong pair, indistinguishable afterwards from a correct one". That objection is about
+ambiguity being invisible, not about ambiguity existing. A prefix matching two live nodes is
+visible to the server at resolution time, so it errors instead of picking one. No silent wrong
+edge is reachable.
+
+**The refusal must list the full id of every match.** Without that the client is stuck: `recall`
+showed it 13 characters and it has no way to produce a longer prefix on its own. Returning the
+candidates in full is what makes the error recoverable in one retry instead of permanently.
+
+**Resolution uses `GLOB`, not `LIKE`.** SQLite's `LIKE` is case-insensitive for ASCII by
+default, which stops it using an index. Confirmed with `EXPLAIN QUERY PLAN` against the real
+schema: `id LIKE 'p%'` plans as `SCAN`, while `id GLOB 'p*'` plans as `SEARCH` using the
+covering index on `nodes(id)`. Input is upper-cased before matching, because Crockford base32
+is case-insensitive by definition and `GLOB` is not.
+
+**What it costs.** The rendered handle is not the stored id, so a client that caches one holds
+an identifier that can turn ambiguous later as neighbouring nodes are written. git carries the
+same property and it is accepted there. The failure is one error and one retry, never a wrong
+edge.
