@@ -35,10 +35,18 @@ jobs:
       # and only `cargo deny` resolves the pair. A break in the combined build
       # therefore surfaces here first, during a tagged release.
       #
-      # llama-cpp-sys-2 compiles llama.cpp from C++ via CMake, which is slow on
-      # a cold cache and is not cached by rust-cache, so expect a slow run
-      # rather than treating it as stuck. Metal is enabled by target inside
-      # that build script, so it needs no cargo feature.
+      # llama-cpp-sys-2 compiles llama.cpp from C++ via CMake. This is slow on a
+      # cold cache, so expect a slow run rather than treating it as stuck.
+      #
+      # An earlier version of this comment said rust-cache does not cache that
+      # CMake build. It does: measured 2026-08-22 at 9 seconds warm against 121
+      # seconds cold, because llama-cpp-sys-2 is a dependency and rust-cache
+      # keeps dependency build artifacts. A release still tends to run cold,
+      # since it builds a feature combination and a profile that ordinary CI
+      # does not, so its cache key rarely matches one CI just populated.
+      #
+      # Metal is enabled by target inside that build script, so it needs no
+      # cargo feature.
       # Builds both binaries the package declares: `liamd`, the daemon, and
       # `liam`, the CLI that fetches models at install time.
       - name: Build release binaries
