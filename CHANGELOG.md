@@ -4,6 +4,29 @@ All notable changes to LIAM are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `relate` MCP tool, so a client can record a relationship between two memories
+  it already wrote or recalled. Before this, the only edge in the store was the
+  `supersedes` link that version history writes, so the graph half of retrieval
+  carried no real data and clustering had nothing to cluster. `relate` refuses
+  `supersedes`, refuses a self-loop, and refuses an endpoint that is no longer
+  live. Asserting the same relation twice is a no-op rather than a second edge.
+
+### Changed
+
+- `recall` now prints a handle for each hit, as `[kind handle] label`. An agent
+  could read a memory but had no name to pass to anything, so nothing could be
+  linked after the fact. The handle is the first 13 characters of the node id,
+  and `relate` takes either it or the full id. 13 because a node id is a ULID
+  and its first 10 characters are a timestamp, so shorter prefixes collide for
+  everything written in the same moment rather than spreading out.
+- Community detection ignores `supersedes` edges, so a chain of edits to one
+  memory no longer reads as a topic. It also counts a pair of memories once even
+  when a client states the relationship in both directions.
+
 ## [0.1.1] - 2026-08-22
 
 First release with a published artifact. macOS on Apple Silicon only.

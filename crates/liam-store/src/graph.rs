@@ -20,6 +20,11 @@ use crate::types::{
 };
 use crate::value::{Row, Value};
 
+/// How many candidates an ambiguous handle reports back. Bounded so a
+/// one-character handle answers with something a caller can act on instead of
+/// every live node in the store.
+const HANDLE_MATCH_LIMIT: usize = 8;
+
 /// Bitemporal "live at T" predicate over an aliased nodes table. `?{t}` is T.
 fn live_at(alias: &str, t: usize) -> String {
     format!(
@@ -187,6 +192,168 @@ impl<B: Backend> Graph<B> {
             )
             .await?;
         Ok(id)
+    }
+
+    /// Assert a semantic edge between two live nodes, idempotently.
+    ///
+    /// Liveness and idempotency are conditions ON the insert rather than checks
+    /// before it, which is what makes this safe without a new backend
+    /// capability (ADR-0001). Checking first and inserting after would let a
+    /// concurrent `supersede` close an endpoint in the gap, and moving both
+    /// into `execute_atomic` cannot help: that method takes a statement list
+    /// built before the call and runs each with `execute`, never `query`
+    /// (`backend.rs:53`, `backends/libsql.rs:228`), so nothing inside the
+    /// transaction can read a row and branch on it. A single statement is
+    /// atomic by itself, so the guards ride along in its `WHERE`.
+    ///
+    /// The idempotency guard keys on the ORDERED triple, so `relate(a, b, t)`
+    /// and `relate(b, a, t)` both insert. That is correct for a directed edge
+    /// and deliberately does not stop the pair reaching weight 2.0 in
+    /// clustering; that guard lives on the read side, in
+    /// `recompute_communities` (ADR-0001 Amendment 1, ADR-0002 Amendment 2).
+    ///
+    /// Endpoints are tested with `tx_to = FOREVER` alone, not the four-column
+    /// `live_at` predicate this file uses everywhere else. Deliberate, not an
+    /// oversight: see ADR-0001 Amendment 2 before "fixing" it, because widening
+    /// it changes the guarantee rather than tightening it.
+    pub async fn relate(&self, src: &NodeId, dst: &NodeId, kind: &str) -> Result<EdgeId> {
+        let id = EdgeId::new();
+        let now = self.clock.now();
+        let written = self
+            .backend
+            .execute(
+                "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
+                 SELECT ?1, ?2, ?3, ?4, '{}', ?5, ?6
+                 WHERE EXISTS     (SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?7)
+                   AND EXISTS     (SELECT 1 FROM nodes WHERE id = ?3 AND tx_to = ?7)
+                   AND NOT EXISTS (SELECT 1 FROM edges
+                                   WHERE src = ?2 AND dst = ?3 AND type = ?4 AND tx_to = ?7)",
+                &[
+                    id.as_str().into(),
+                    src.as_str().into(),
+                    dst.as_str().into(),
+                    kind.into(),
+                    now.into(),
+                    FOREVER.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await?;
+        if written == 1 {
+            return Ok(id);
+        }
+        Err(self.relate_refusal(src, dst, kind).await)
+    }
+
+    /// Name the guard that refused the write. Runs only after a refusal and
+    /// races nothing, because it never decides whether to write: the write
+    /// already happened, or already did not, and this only shapes the message.
+    async fn relate_refusal(&self, src: &NodeId, dst: &NodeId, kind: &str) -> Error {
+        let rows = self
+            .backend
+            .query(
+                "SELECT
+                   EXISTS(SELECT 1 FROM nodes WHERE id = ?1 AND tx_to = ?3),
+                   EXISTS(SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?3),
+                   EXISTS(SELECT 1 FROM edges
+                          WHERE src = ?1 AND dst = ?2 AND type = ?4 AND tx_to = ?3)",
+                &[
+                    src.as_str().into(),
+                    dst.as_str().into(),
+                    FOREVER.into(),
+                    kind.into(),
+                ],
+            )
+            .await;
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(e) => return e,
+        };
+        let Some(row) = rows.first() else {
+            return Error::RelateRefused("no row explains the refusal".to_string());
+        };
+        // Surface a read fault as itself. `unwrap_or(0)` here would read as
+        // "this guard failed", and since column 0 is tested first, every
+        // backend fault would come back as a dead source node: a specific,
+        // confident, wrong diagnosis that sends the client to re-resolve a
+        // handle that was fine all along.
+        let flags: std::result::Result<Vec<i64>, Error> = (0..3).map(|i| row.get_i64(i)).collect();
+        let flags = match flags {
+            Ok(flags) => flags,
+            Err(e) => return e,
+        };
+        let truthy = |i: usize| flags[i] != 0;
+        if !truthy(0) {
+            return Error::RelateRefused(format!("source node {} is not live", src.as_str()));
+        }
+        if !truthy(1) {
+            return Error::RelateRefused(format!("target node {} is not live", dst.as_str()));
+        }
+        if truthy(2) {
+            return Error::RelateRefused(format!(
+                "{} already relates to {} as '{kind}'",
+                src.as_str(),
+                dst.as_str()
+            ));
+        }
+        // Every guard passes now, so one of them flipped between the insert and
+        // this read. A retry would land.
+        Error::RelateRefused("a concurrent write took the row, retry".to_string())
+    }
+
+    /// Resolve a client-supplied handle to a full node id. A handle is any
+    /// prefix of a ULID, including the whole 26 characters; `recall` renders 13
+    /// (ADR-0001 Amendment 3).
+    ///
+    /// Two matches is an error, never a pick. That is the property that makes
+    /// prefixes acceptable where ADR-0001 rejected addressing by label: a label
+    /// collision is invisible and silently writes a plausible wrong edge, while
+    /// a prefix collision is visible right here. The error carries the
+    /// candidates in full because the caller was only ever shown 13 characters
+    /// and cannot lengthen the handle on its own.
+    pub async fn resolve_handle(&self, handle: &str) -> Result<NodeId> {
+        // Errors quote what the caller actually sent. Echoing the normalised
+        // form back shows a model a string it never wrote, which invites it to
+        // retry against the transformation instead of against its own input.
+        let sent = handle.trim().to_string();
+        // Crockford base32 is case-insensitive by definition, GLOB is not.
+        let handle = sent.to_ascii_uppercase();
+        // `*`, `?` and `[` are GLOB wildcards, so an unfiltered handle could
+        // match far more than its prefix. With a single live node in the store
+        // a bare `*` would even resolve successfully, to an arbitrary node.
+        // Restricting to alphanumerics excludes every metacharacter; it is
+        // wider than the real ULID alphabet, which costs nothing because a
+        // non-ULID character simply matches no row.
+        if handle.is_empty() || !handle.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::HandleNotFound(sent));
+        }
+        // GLOB, not LIKE. SQLite's LIKE is case-insensitive for ASCII by
+        // default, so it cannot use the unique index on `nodes(id)`: measured
+        // with EXPLAIN QUERY PLAN, LIKE plans as SCAN and GLOB as SEARCH.
+        let rows = self
+            .backend
+            .query(
+                "SELECT id FROM nodes WHERE id GLOB ?1 AND tx_to = ?2 ORDER BY id LIMIT ?3",
+                &[
+                    format!("{handle}*").into(),
+                    FOREVER.into(),
+                    (HANDLE_MATCH_LIMIT as i64).into(),
+                ],
+            )
+            .await?;
+        match rows.len() {
+            0 => Err(Error::HandleNotFound(sent)),
+            1 => Ok(NodeId::from_raw(rows[0].get_string(0)?)),
+            // The list is capped, so the message names no count: a truncated
+            // list with a claimed total would be a lie the caller cannot check.
+            _ => Err(Error::AmbiguousHandle {
+                handle: sent,
+                candidates: rows
+                    .iter()
+                    .filter_map(|r| r.get_string(0).ok())
+                    .collect::<Vec<_>>(),
+            }),
+        }
     }
 
     fn node_insert(
@@ -590,24 +757,26 @@ impl<B: Backend> Graph<B> {
 
 impl<B: Backend> Graph<B> {
     pub async fn recompute_communities(&self) -> Result<usize> {
-        use crate::cluster::{detect, Edge};
+        use crate::cluster::detect;
 
-        let mut index: HashMap<String, usize> = HashMap::new();
-        let mut labels: Vec<String> = Vec::new();
-        let mut edges: Vec<Edge> = Vec::new();
-
+        // `supersedes` is excluded because it is structural, not semantic: it
+        // is written only inside `supersede`'s transaction and describes
+        // version history. Leaving it in means a version chain reads as a
+        // topic (ADR-0001, Scope). `relate` refuses to assert it for the same
+        // reason, so this is that decision seen from the other end.
+        //
+        // `ORDER BY id` fixes the row order, which `build_cluster_input` turns
+        // into the dense vertex numbering. Without it the numbering varies run
+        // to run on identical data, and so can Leiden's seeded partition.
         let rows = self
             .backend
             .query(
-                "SELECT src, dst FROM edges WHERE tx_to = ?1",
-                &[FOREVER.into()],
+                "SELECT src, dst, type FROM edges
+                 WHERE tx_to = ?1 AND type != ?2 ORDER BY id",
+                &[FOREVER.into(), crate::types::relation::SUPERSEDES.into()],
             )
             .await?;
-        for row in &rows {
-            let u = intern(&mut index, &mut labels, row.get_string(0)?);
-            let v = intern(&mut index, &mut labels, row.get_string(1)?);
-            edges.push(Edge(u, v));
-        }
+        let (labels, edges) = build_cluster_input(&rows)?;
 
         let assignment = detect(labels.len(), &edges);
         let now = self.clock.now();
@@ -688,6 +857,41 @@ fn fts5_query(text: &str) -> String {
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+/// Turn live edge rows of `(src, dst, type)` into the dense node labels and the
+/// edge list Leiden runs on. Pure, and separate from `recompute_communities` so
+/// the dedup below can be asserted directly. Going through the partition
+/// instead would test it via a heuristic: a count of communities does not
+/// discriminate between a deduped graph and a doubled one, since modularity can
+/// land on the same number of groups either way.
+///
+/// Collapses each unordered pair to one edge. `relate` is idempotent on the
+/// ORDERED triple, so a client asserting both directions writes two rows, which
+/// is right for a directed edge table. `leiden-rs` then merges only consecutive
+/// exact duplicates in `build_undirected_csr`, so `(a,b)` and `(b,a)` both
+/// survive and the pair reaches weight 2.0 (ADR-0002 Amendment 2).
+///
+/// `type` stays in the key on purpose. `relate(a, b, "mentions")` and
+/// `relate(a, b, "causes")` are two independent things a client said about one
+/// pair, and neither collides with the other on the ordered triple, so both are
+/// in the table deliberately. Keying on the pair alone would erase that and
+/// weigh a pair carrying two relations like one carrying a single relation.
+fn build_cluster_input(rows: &[Row]) -> Result<(Vec<String>, Vec<crate::cluster::Edge>)> {
+    use crate::cluster::Edge;
+
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut seen: HashSet<(usize, usize, String)> = HashSet::new();
+    for row in rows {
+        let u = intern(&mut index, &mut labels, row.get_string(0)?);
+        let v = intern(&mut index, &mut labels, row.get_string(1)?);
+        if seen.insert((u.min(v), u.max(v), row.get_string(2)?)) {
+            edges.push(Edge(u, v));
+        }
+    }
+    Ok((labels, edges))
 }
 
 fn intern(index: &mut HashMap<String, usize>, labels: &mut Vec<String>, id: String) -> usize {
@@ -1571,5 +1775,292 @@ mod tests {
             auth_community, billing_community,
             "disconnected groups must not be merged into one community: {assignments:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn version_chains_do_not_form_communities() {
+        // Before the `supersedes` filter, a store holding only version history
+        // still produced communities, and they read as topics while describing
+        // nothing but edit order. `supersede` is the only writer of that edge
+        // type, so a store built purely by `upsert_by` has to cluster to
+        // nothing at all (ADR-0001, Scope).
+        let g = graph_at(Millis(1000)).await;
+        for content in ["first", "second", "third"] {
+            g.upsert_by(NewNode::now("fact", "Rollout status", content).with_subject("rollout"))
+                .await
+                .unwrap();
+        }
+
+        let count = g.recompute_communities().await.unwrap();
+
+        assert_eq!(count, 0, "version history is not a topic");
+        assert!(
+            g.communities().await.unwrap().is_empty(),
+            "no node should be assigned from supersedes edges alone"
+        );
+    }
+
+    /// `(src, dst, type)` rows in the shape `build_cluster_input` reads, so the
+    /// dedup can be checked without a database or a Leiden run.
+    fn edge_rows(triples: &[(&str, &str, &str)]) -> Vec<Row> {
+        triples
+            .iter()
+            .map(|(s, d, t)| {
+                Row(vec![
+                    Value::Text((*s).to_string()),
+                    Value::Text((*d).to_string()),
+                    Value::Text((*t).to_string()),
+                ])
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn asserting_a_pair_in_both_directions_yields_one_edge() {
+        // `relate` is idempotent on the ORDERED triple, so both directions
+        // insert, which is right for a directed edge table. Clustering reads
+        // the set as undirected and `leiden-rs` merges only consecutive exact
+        // duplicates, so without this dedup the pair reaches weight 2.0
+        // (ADR-0002 Amendment 2).
+        //
+        // Asserted on the edge list, NOT on the community count: a count does
+        // not discriminate between the deduped graph and the doubled one, so
+        // the earlier version of this test passed with the dedup deleted.
+        let rows = edge_rows(&[("a", "b", "mentions"), ("b", "a", "mentions")]);
+
+        let (labels, edges) = build_cluster_input(&rows).unwrap();
+
+        assert_eq!(labels.len(), 2, "both endpoints stay in the node set");
+        assert_eq!(
+            edges.len(),
+            1,
+            "the reversed pair must collapse to one edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_relation_types_on_one_pair_stay_two_edges() {
+        // The dedup key carries `type` on purpose, so this pins the OTHER
+        // direction of the same guard. Dropping `type` from the key would weigh
+        // a pair carrying two asserted relations exactly like a pair carrying
+        // one, which is the error ADR-0002 Amendment 2 calls out as second bug.
+        let rows = edge_rows(&[("a", "b", "mentions"), ("a", "b", "causes")]);
+
+        let (_, edges) = build_cluster_input(&rows).unwrap();
+
+        assert_eq!(edges.len(), 2, "distinct types are independent evidence");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_triple_and_a_self_loop_each_collapse_to_one_edge() {
+        // The exact-duplicate case cannot come from `relate`, whose NOT EXISTS
+        // refuses it, but `link` writes rows without that guard and a `gc` can
+        // leave the table in shapes nothing else produces.
+        let repeated = edge_rows(&[("a", "b", "mentions"), ("a", "b", "mentions")]);
+        assert_eq!(build_cluster_input(&repeated).unwrap().1.len(), 1);
+
+        // A self-loop normalises to min == max and survives once.
+        let loops = edge_rows(&[("a", "a", "mentions"), ("a", "a", "mentions")]);
+        let (labels, edges) = build_cluster_input(&loops).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(labels, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_deduped_row_never_drops_a_node_from_the_partition() {
+        // Both endpoints are interned BEFORE the dedup check. A row that
+        // dedupes shares its key with an earlier row, so its endpoints were
+        // already interned and no node can be lost this way. Pinned because the
+        // obvious "optimisation" of skipping the intern on a duplicate would
+        // silently drop nodes out of clustering entirely.
+        let rows = edge_rows(&[
+            ("a", "b", "mentions"),
+            ("b", "a", "mentions"),
+            ("c", "d", "mentions"),
+        ]);
+
+        let (labels, edges) = build_cluster_input(&rows).unwrap();
+
+        assert_eq!(labels.len(), 4, "every endpoint keeps a dense index");
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_dense_numbering_follows_row_order() {
+        // `recompute_communities` orders by edge id so this numbering is a
+        // function of the edge set alone. If it were not, Leiden's seeded
+        // partition could differ run to run on identical data.
+        let rows = edge_rows(&[("z", "y", "mentions"), ("y", "x", "mentions")]);
+
+        let (labels, edges) = build_cluster_input(&rows).unwrap();
+
+        assert_eq!(labels, vec!["z", "y", "x"], "interned in row order");
+        assert_eq!((edges[0].0, edges[0].1), (0, 1));
+        assert_eq!((edges[1].0, edges[1].1), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn relate_writes_a_separate_row_per_relation_type() {
+        // The write-side half: `relate`'s NOT EXISTS keys on the ordered triple
+        // INCLUDING type, so a second type on the same pair is not a duplicate.
+        let g = graph_at(Millis(1000)).await;
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+
+        g.relate(&a, &b, "mentions").await.unwrap();
+        g.relate(&a, &b, "causes").await.unwrap();
+
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2",
+                &[a.as_str().into(), b.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_i64(0).unwrap(), 2, "both types must be stored");
+    }
+
+    #[tokio::test]
+    async fn relate_refuses_an_endpoint_that_is_no_longer_live() {
+        // The guarantee the unenforced foreign keys were supposed to give. The
+        // check rides on the INSERT's own WHERE, so a `supersede` landing
+        // between a caller's decision and this write still wins.
+        let g = graph_at(Millis(1000)).await;
+        let old = g
+            .upsert_by(NewNode::now("fact", "Rollout", "first").with_subject("rollout"))
+            .await
+            .unwrap();
+        let other = g.insert(NewNode::now("fact", "Other", "x")).await.unwrap();
+        g.upsert_by(NewNode::now("fact", "Rollout", "second").with_subject("rollout"))
+            .await
+            .unwrap();
+
+        let err = g.relate(&old, &other, "mentions").await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::RelateRefused(m) if m.contains("source node")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relate_refuses_a_destination_that_is_no_longer_live() {
+        // The mirror of the test above, and not redundant: the two endpoints
+        // are separate EXISTS subqueries binding separate parameters. Swapping
+        // `?3` for `?2` in the second one is an easy slip in a statement that
+        // mentions both four times, and with only the source case covered the
+        // whole suite would stay green while `relate` wrote edges pointing at
+        // superseded nodes.
+        let g = graph_at(Millis(1000)).await;
+        let other = g.insert(NewNode::now("fact", "Other", "x")).await.unwrap();
+        let old = g
+            .upsert_by(NewNode::now("fact", "Rollout", "first").with_subject("rollout"))
+            .await
+            .unwrap();
+        g.upsert_by(NewNode::now("fact", "Rollout", "second").with_subject("rollout"))
+            .await
+            .unwrap();
+
+        let err = g.relate(&other, &old, "mentions").await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::RelateRefused(m) if m.contains("target node")),
+            "{err}"
+        );
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE dst = ?1 AND type = ?2",
+                &[old.as_str().into(), "mentions".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_i64(0).unwrap(), 0, "no edge may have landed");
+    }
+
+    #[tokio::test]
+    async fn relate_is_idempotent_on_the_ordered_triple() {
+        let g = graph_at(Millis(1000)).await;
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+
+        g.relate(&a, &b, "mentions").await.unwrap();
+        let err = g.relate(&a, &b, "mentions").await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::RelateRefused(m) if m.contains("already relates")),
+            "{err}"
+        );
+        // The reverse direction is a different edge and must still land.
+        g.relate(&b, &a, "mentions").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_handle_resolves_and_an_ambiguous_one_reports_its_candidates() {
+        // The whole reason prefixes are acceptable where labels were not: a
+        // collision is visible here, so the store refuses instead of guessing.
+        // The refusal has to carry full ids, because a caller shown 13
+        // characters cannot lengthen the handle on its own.
+        let g = graph_at(Millis(1000)).await;
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+
+        assert_eq!(g.resolve_handle(a.as_str()).await.unwrap(), a);
+        assert_eq!(g.resolve_handle(a.handle()).await.unwrap(), a);
+        // Crockford base32 is case-insensitive, GLOB is not.
+        assert_eq!(
+            g.resolve_handle(&a.handle().to_lowercase()).await.unwrap(),
+            a
+        );
+
+        // Both ids start with `0`, so a one-character handle names neither.
+        let err = g.resolve_handle("0").await.unwrap_err();
+        let Error::AmbiguousHandle { candidates, .. } = &err else {
+            panic!("expected an ambiguous handle, got {err}");
+        };
+        assert!(candidates.contains(&a.as_str().to_string()), "{err}");
+        assert!(candidates.contains(&b.as_str().to_string()), "{err}");
+
+        assert!(matches!(
+            g.resolve_handle("ZZZZZZZZZZZZZ").await.unwrap_err(),
+            Error::HandleNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_handle_never_resolves_even_with_one_live_node() {
+        // With a single live node, an unfiltered `*` would GLOB-match it and
+        // resolve successfully, handing back an arbitrary node the caller never
+        // named. The alphabet check is what stops that.
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now("fact", "only", "x")).await.unwrap();
+
+        for handle in ["*", "?", "[0-9]*", "0*"] {
+            assert!(
+                matches!(
+                    g.resolve_handle(handle).await,
+                    Err(Error::HandleNotFound(_))
+                ),
+                "wildcard {handle:?} resolved"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_superseded_node_is_not_reachable_by_handle() {
+        let g = graph_at(Millis(1000)).await;
+        let old = g
+            .upsert_by(NewNode::now("fact", "Rollout", "first").with_subject("rollout"))
+            .await
+            .unwrap();
+        g.upsert_by(NewNode::now("fact", "Rollout", "second").with_subject("rollout"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            g.resolve_handle(old.as_str()).await.unwrap_err(),
+            Error::HandleNotFound(_)
+        ));
     }
 }

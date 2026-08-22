@@ -17,6 +17,24 @@ pub enum Error {
 
     #[error("node not found: {0}")]
     NodeNotFound(String),
+
+    #[error("no live node matches handle {0}")]
+    HandleNotFound(String),
+
+    /// Two or more live nodes share the prefix the client sent. Carries every
+    /// candidate in full because the client was shown a 13-character handle
+    /// (ADR-0001 Amendment 3) and cannot lengthen it without being told what
+    /// the alternatives are.
+    #[error("handle {handle} matches more than one live node: {}", .candidates.join(", "))]
+    AmbiguousHandle {
+        handle: String,
+        candidates: Vec<String>,
+    },
+
+    /// The conditional INSERT in `Graph::relate` wrote no row. The message
+    /// names which of its three guards refused.
+    #[error("relate refused: {0}")]
+    RelateRefused(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
