@@ -8,9 +8,40 @@ on:
   # until the PR was reopened against main. Retargeting alone does not help,
   # because changing the base fires `pull_request.edited`, which is not a
   # trigger; checks start on a freshly opened PR or on a push to its branch.
+  #
+  # `paths-ignore` skips the whole workflow for changes that cannot affect a
+  # build. Measured 2026-08-22: a CHANGELOG-only pull request compiled Rust on
+  # macOS three times, for 2.1 macOS minutes, to prove a markdown file still
+  # parses. Three docs-only pull requests landed in one day.
+  #
+  # This is only safe because the branch ruleset declares NO
+  # `required_status_checks` rule (verified via
+  # `gh api repos/protocortex/liam/rulesets`). A skipped job never reports, so
+  # with required checks configured this would block every docs PR from merging
+  # forever. Re-check that before adding required checks.
+  #
+  # Deliberately NOT ignored: Cargo.toml, Cargo.lock, deny.toml, rust-toolchain
+  # and anything under .github/workflows. Those change what gets built even
+  # when no .rs file moves.
   pull_request:
+    paths-ignore:
+      # `**.md`, NOT `**/*.md`. GitHub's glob requires a directory separator
+      # for the second form, so `**/*.md` would miss CHANGELOG.md at the repo
+      # root, which is precisely the file that triggered this whole change.
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
   push:
     branches: [main]
+    paths-ignore:
+      # `**.md`, NOT `**/*.md`. GitHub's glob requires a directory separator
+      # for the second form, so `**/*.md` would miss CHANGELOG.md at the repo
+      # root, which is precisely the file that triggered this whole change.
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -18,6 +49,25 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # Save the cache only from main. Measured 2026-08-22: the repo held 43 active
+  # caches totalling 13.7 GB against GitHub's 10 GB per-repo limit, so GitHub
+  # was evicting them LRU and jobs paid cold restores anyway. The cause was
+  # every pull request branch saving its own copy of every job's cache: four
+  # separate 568 MB entries existed for `build-local-Linux-x64` alone.
+  #
+  # With this, main publishes one cache per job and pull requests restore from
+  # it read-only. Total drops to roughly 3 GB, which fits, so restores actually
+  # hit. It also removes a 22 to 26 second save step from every job on every
+  # pull request run, which was costing more than the 10 to 17 second build it
+  # was meant to protect.
+  #
+  # The trade: a long-lived branch that changes dependencies re-does that
+  # dependency build on each run rather than caching its own tree. That is the
+  # documented recommendation from Swatinem/rust-cache, and it is the cheaper
+  # side of the trade here because the alternative evicts everyone's cache.
+  CACHE_SAVE_IF: ${{ github.ref == 'refs/heads/main' }}
 
 jobs:
   lint:
@@ -28,35 +78,35 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.CACHE_SAVE_IF }}
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Linux only. The macOS half of this matrix moved into the `macos` job below,
+  # so the workspace compiles once per platform instead of three times on the
+  # expensive one.
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        # add windows-latest to extend the matrix
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.CACHE_SAVE_IF }}
       - name: Test
         run: cargo test --workspace
 
   build-local:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.CACHE_SAVE_IF }}
       - name: Build (local feature)
         run: cargo build -p liam-daemon --features local
 
@@ -82,31 +132,43 @@ jobs:
       #
       # `--features` is a global cargo-deny flag, not a `check` subcommand
       # flag, so it must precede `check` on the command line.
-      #
-      # This change was validated locally at authoring time (org Actions runs
-      # were down): `cargo deny --features local,llama check`.
       - run: cargo deny --features local,llama check
 
-  build-llama:
+  # ONE macOS job doing what `test (macos-latest)`, `build-local
+  # (macos-latest)` and `build-llama` used to do as three.
+  #
+  # Why: macOS bills at 10.3x Linux ($0.062 vs $0.006 per minute, from the org's
+  # own usage API), and three jobs paid checkout, toolchain install and cache
+  # restore three times over to do 35 seconds of actual work. Worse,
+  # Swatinem/rust-cache keys per job, so each one kept a SEPARATE cache and
+  # compiled liam-store from scratch. Sharing one target directory means the
+  # workspace builds once and both feature sets reuse it.
+  #
+  # The cost is granularity: a test failure and a build failure now surface in
+  # the same job. Steps are named so the log still says which one broke.
+  #
+  # Order matters. `cargo test --workspace` first establishes the shared
+  # dependency graph, then each feature build adds only its own tree on top.
+  macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # macOS is the target this release supports; Metal is compiled in by
-      # target inside llama-cpp-sys-2's build script, no extra setup needed.
-      #
-      # Building llama-cpp-sys-2 compiles llama.cpp from C++ source via CMake,
-      # which is slow on a cold cache. rust-cache does not cache the CMake
-      # build, so expect a slow first run rather than treating it as stuck.
+        with:
+          save-if: ${{ env.CACHE_SAVE_IF }}
+      - name: Test
+        run: cargo test --workspace
+      - name: Build (local feature)
+        run: cargo build -p liam-daemon --features local
+      # Metal is compiled in by target inside llama-cpp-sys-2's build script,
+      # so it needs no extra setup. That build compiles llama.cpp from C++ via
+      # CMake, which rust-cache does NOT cache, so a run whose cache was evicted
+      # pays the full compile. Keeping the repo under the cache quota (see
+      # CACHE_SAVE_IF above) is what keeps that rare.
       - name: Build (llama feature)
         run: cargo build -p liam-daemon --features llama
-      # The tests that need model weights are #[ignore]d, so this plain
-      # `cargo test` run does not download a model (no 1GB GGUF fetch) and
-      # does not need a GPU.
-      #
-      # This job was validated locally at authoring time (org Actions runs
-      # were down): `cargo build -p liam-daemon --features llama` and
-      # `cargo test -p liam-daemon --features llama`.
+      # The tests that need model weights are #[ignore]d, so this does not
+      # download a 1GB GGUF and does not need a GPU.
       - name: Test (llama feature)
         run: cargo test -p liam-daemon --features llama
