@@ -24,7 +24,7 @@ pub use backends::DefaultBackend;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::{Error, Result};
 pub use graph::Graph;
-pub use ids::{EdgeId, Millis, NodeId, FOREVER};
+pub use ids::{EdgeId, Millis, NodeId, FOREVER, HANDLE_LEN};
 pub use types::{
     relation, Change, ExplainedHit, GcReport, GraphConfig, Hit, NewEdge, NewNode, Query,
     RetentionPolicy, RetentionRule,

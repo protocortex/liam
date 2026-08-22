@@ -52,3 +52,28 @@ macro_rules! branded_id {
 
 branded_id!(NodeId);
 branded_id!(EdgeId);
+
+/// Characters of a node id that `recall` renders and `relate` resolves back.
+///
+/// 13, not git's 7, because a ULID is not uniform random at the front: its
+/// first 10 characters are a 48-bit millisecond timestamp, so prefixes cluster
+/// by write time instead of spreading. Measured, 7 characters are shared by
+/// every node written within 32.8 seconds and 10 by every node written within
+/// the same millisecond. 13 keeps all 10 timestamp characters and adds 3 from
+/// the random half, which drops the collision rate for 8 writes landing in one
+/// millisecond from 100% at 10 characters to 0.08%, for one extra token.
+/// ADR-0001 Amendment 3 carries the full measurement.
+pub const HANDLE_LEN: usize = 13;
+
+impl NodeId {
+    /// The client-facing handle for this id.
+    ///
+    /// Counts characters rather than slicing bytes: `from_raw` validates
+    /// nothing, so a non-ASCII id must not panic here.
+    pub fn handle(&self) -> &str {
+        match self.0.char_indices().nth(HANDLE_LEN) {
+            Some((byte, _)) => &self.0[..byte],
+            None => &self.0,
+        }
+    }
+}

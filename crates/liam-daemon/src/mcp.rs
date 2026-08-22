@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! MCP tool surface: `remember`, `recall`, and `ask`, wiring the store and the
-//! model.
+//! MCP tool surface: `remember`, `recall`, `relate`, and `ask`, wiring the
+//! store and the model.
 //!
 //! VERSION CHECK: the rmcp macro surface (`#[tool_router]`, `#[tool]`,
 //! `#[tool_handler]`, `Parameters`) moves across releases. Confirmed unchanged
@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use liam_model::{Embedder, Llm, Reranker};
-use liam_store::{DefaultGraph, NewNode, Query};
+use liam_store::{relation, DefaultGraph, NewNode, Query};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
@@ -82,6 +82,17 @@ pub struct RecallArgs {
     pub kind: Option<String>,
     pub scope: Option<String>,
     pub k: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RelateArgs {
+    /// Handle of the source memory, as shown by `recall`. A full id works too.
+    pub from: String,
+    /// Handle of the target memory, as shown by `recall`. A full id works too.
+    pub to: String,
+    /// Relation type, for example `mentions`. `supersedes` is reserved.
+    #[serde(rename = "type")]
+    pub kind: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -274,11 +285,77 @@ impl MemoryServer {
             .order(&args.query, &docs)
             .await
             .unwrap_or_else(|_| (0..hits.len()).collect());
+        // The handle rides inside the kind bracket so a hit still opens with
+        // one bracketed field. It is here because an agent cannot link what it
+        // recalled without a name for it, which is the gap ADR-0001 exists to
+        // close. 13 characters, not the full 26: see `liam_store::HANDLE_LEN`.
         order
             .iter()
-            .map(|&i| format!("[{}] {}\n{}", hits[i].kind, hits[i].label, hits[i].content))
+            .map(|&i| {
+                format!(
+                    "[{} {}] {}\n{}",
+                    hits[i].kind,
+                    hits[i].id.handle(),
+                    hits[i].label,
+                    hits[i].content
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+
+    #[tool(
+        description = "Record a relationship between two memories, using the handles recall returns."
+    )]
+    async fn relate(&self, Parameters(args): Parameters<RelateArgs>) -> String {
+        // Lower-cased here, at the client boundary, so `Mentions` and
+        // `mentions` are one relation instead of two. The clustering dedup keys
+        // on the type string, so leaving both would let a pair reach weight 2.0
+        // through nothing worse than inconsistent capitalisation, which is the
+        // bias ADR-0002 Amendment 2 exists to remove. Inventing genuinely
+        // different types still inflates a pair, and that risk stays open in
+        // ADR-0001; this only closes the accidental half of it.
+        let kind = args.kind.trim().to_lowercase();
+        if kind.is_empty() {
+            return "relate failed: type must not be empty".to_string();
+        }
+        // `supersedes` is written only inside `Graph::supersede`'s transaction
+        // and carries version history. A client able to assert it could rewrite
+        // what superseded what, so the refusal is at the door (ADR-0001).
+        // Normalising first is what makes this exact comparison enough: the
+        // store keeps types verbatim while the clustering filter matches
+        // `type != 'supersedes'` exactly, so an accepted `SUPERSEDES` would
+        // read as version history in the table and still count as a semantic
+        // edge in every recompute.
+        if kind == relation::SUPERSEDES {
+            return format!(
+                "relate failed: '{}' is reserved for version history",
+                relation::SUPERSEDES
+            );
+        }
+        let (from, to) = match (
+            self.store.resolve_handle(&args.from).await,
+            self.store.resolve_handle(&args.to).await,
+        ) {
+            (Err(e), _) => return format!("relate failed: from: {e}"),
+            (_, Err(e)) => return format!("relate failed: to: {e}"),
+            (Ok(from), Ok(to)) => (from, to),
+        };
+        // Compared after resolution, not before: two different handles can name
+        // the same node, and a self-loop carries no meaning for clustering
+        // while looking exactly like a client bug worth reporting back.
+        if from == to {
+            return format!(
+                "relate failed: from and to are the same node ({})",
+                from.handle()
+            );
+        }
+        // The edge id is dropped rather than echoed. Nothing takes one as
+        // input, and a ULID costs 19 tokens in the reply for no reachable use.
+        match self.store.relate(&from, &to, &kind).await {
+            Ok(_) => format!("related {} -{kind}-> {}", from.handle(), to.handle()),
+            Err(e) => format!("relate failed: {e}"),
+        }
     }
 
     // `pub(crate)` so the grounding eval (see `eval.rs`) drives the same code
@@ -411,7 +488,7 @@ impl ServerHandler for MemoryServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use liam_store::GraphConfig;
+    use liam_store::{GraphConfig, HANDLE_LEN};
 
     /// Always-errors `Llm`, so `ask` must fall back to the retrieved evidence.
     struct FailingLlm;
@@ -642,8 +719,11 @@ mod tests {
         )
     }
 
-    async fn seed(server: &MemoryServer, kind: &str, label: &str, content: &str) {
-        seed_scoped(server, kind, label, content, None).await;
+    /// Returns the written node's id, so a test that needs to name the node
+    /// (`relate`, or pinning recall's handle) does not have to go around the
+    /// tool surface to find it.
+    async fn seed(server: &MemoryServer, kind: &str, label: &str, content: &str) -> String {
+        seed_scoped(server, kind, label, content, None).await
     }
 
     async fn seed_scoped(
@@ -652,7 +732,7 @@ mod tests {
         label: &str,
         content: &str,
         scope: Option<&str>,
-    ) {
+    ) -> String {
         let out = server
             .remember(Parameters(RememberArgs {
                 kind: kind.to_string(),
@@ -663,6 +743,7 @@ mod tests {
             }))
             .await;
         assert!(out.starts_with("remembered "), "seed failed: {out}");
+        out.trim_start_matches("remembered ").to_string()
     }
 
     /// Server with the neutral doubles used by the filter tests: identity rerank
@@ -1417,8 +1498,10 @@ mod tests {
             }))
             .await;
 
-        // Assert: only the requested kind comes back.
-        assert!(out.contains("[decision] Alpha"), "missing match: {out}");
+        // Assert: only the requested kind comes back. The handle between the
+        // kind and the label varies per run, so match around it.
+        assert!(out.contains("[decision "), "missing match: {out}");
+        assert!(out.contains("] Alpha"), "missing match: {out}");
         assert!(!out.contains("costs money"), "kind filter leaked: {out}");
     }
 
@@ -1569,14 +1652,16 @@ mod tests {
 
     #[tokio::test]
     async fn recall_format_is_pinned() {
-        // Regression pin: `recall`'s output shape must stay
-        // `[{kind}] {label}\n{content}`, unchanged by the `ask` addition.
+        // Regression pin: `recall`'s output shape is
+        // `[{kind} {handle}] {label}\n{content}`. The handle was added by
+        // ADR-0001 so an agent can name what it recalled and pass it to
+        // `relate`; before that, `recall` dropped `Hit::id` entirely.
         let server = server_with(
             Arc::new(liam_model::IdentityReranker),
             Arc::new(liam_model::MockLlm),
         )
         .await;
-        seed(&server, "decision", "Use libSQL", "single file db").await;
+        let id = seed(&server, "decision", "Use libSQL", "single file db").await;
 
         let out = server
             .recall(Parameters(RecallArgs {
@@ -1587,6 +1672,213 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(out, "[decision] Use libSQL\nsingle file db");
+        let handle = &id[..HANDLE_LEN];
+        assert_eq!(
+            out,
+            format!("[decision {handle}] Use libSQL\nsingle file db")
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_renders_a_handle_relate_can_resolve() {
+        // The two tools have to agree: whatever `recall` prints must be
+        // something `relate` accepts back verbatim. Pinning the length on both
+        // sides separately would let them drift, so this round-trips it.
+        let server = plain_server().await;
+        seed(
+            &server,
+            "decision",
+            "Alpha",
+            "the zorbnax rollout is approved",
+        )
+        .await;
+        seed(&server, "fact", "Beta", "the zorbnax rollout costs money").await;
+
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax rollout".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+            }))
+            .await;
+
+        let handles: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix('['))
+            .filter_map(|l| l.split_once(']'))
+            .filter_map(|(head, _)| head.split_once(' '))
+            .map(|(_, handle)| handle)
+            .collect();
+        assert_eq!(handles.len(), 2, "expected a handle per hit: {out}");
+        for handle in &handles {
+            assert_eq!(handle.len(), HANDLE_LEN, "{handle}");
+        }
+
+        let related = server
+            .relate(Parameters(RelateArgs {
+                from: handles[0].to_string(),
+                to: handles[1].to_string(),
+                kind: "mentions".to_string(),
+            }))
+            .await;
+        assert!(related.starts_with("related "), "{related}");
+    }
+
+    #[tokio::test]
+    async fn relate_is_registered_with_the_argument_names_clients_send() {
+        // Every other `relate` test calls the method directly, so none of them
+        // would notice the tool missing from the router: a client would just
+        // never see it. The schema check pins `type`, which only reaches the
+        // wire through a serde rename because `type` is a Rust keyword.
+        let server = plain_server().await;
+
+        assert!(server.tool_router.has_route("relate"), "relate not routed");
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "relate")
+            .expect("relate must be listed");
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        for field in ["\"from\"", "\"to\"", "\"type\""] {
+            assert!(schema.contains(field), "{field} missing from {schema}");
+        }
+        assert!(!schema.contains("\"kind\""), "leaked rust name: {schema}");
+    }
+
+    #[tokio::test]
+    async fn relate_refuses_the_reserved_supersedes_type() {
+        // `supersedes` is written only inside `Graph::supersede`'s transaction.
+        // A client able to assert it could rewrite version history, so this
+        // refusal is the guard ADR-0001 puts at the door.
+        let server = plain_server().await;
+        let a = seed(&server, "decision", "Alpha", "first").await;
+        let b = seed(&server, "decision", "Beta", "second").await;
+
+        for kind in ["supersedes", "SUPERSEDES", "  supersedes  "] {
+            let out = server
+                .relate(Parameters(RelateArgs {
+                    from: a.clone(),
+                    to: b.clone(),
+                    kind: kind.to_string(),
+                }))
+                .await;
+            assert!(out.contains("reserved"), "accepted {kind:?}: {out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn relate_refuses_a_self_loop_even_through_two_different_handles() {
+        // A short handle and the full id name the same node, so the check has
+        // to run AFTER resolution. Comparing the raw arguments would let this
+        // pair through and write an edge that carries no meaning.
+        let server = plain_server().await;
+        let a = seed(&server, "decision", "Alpha", "first").await;
+
+        let out = server
+            .relate(Parameters(RelateArgs {
+                from: a[..HANDLE_LEN].to_string(),
+                to: a.clone(),
+                kind: "mentions".to_string(),
+            }))
+            .await;
+
+        assert!(out.contains("same node"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn relate_reports_an_unknown_handle_without_writing() {
+        let server = plain_server().await;
+        let a = seed(&server, "decision", "Alpha", "first").await;
+
+        let out = server
+            .relate(Parameters(RelateArgs {
+                from: a,
+                to: "0000000000000".to_string(),
+                kind: "mentions".to_string(),
+            }))
+            .await;
+
+        assert!(out.starts_with("relate failed: to:"), "{out}");
+        assert!(out.contains("no live node"), "{out}");
+        // The "without writing" half of the name, asserted rather than assumed.
+        // Community detection builds its node set purely from live edges, so a
+        // zero count means nothing landed in the table.
+        assert_eq!(
+            server.store.recompute_communities().await.unwrap(),
+            0,
+            "a refused relate still wrote an edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn relation_types_are_case_normalised_into_one_relation() {
+        // `Mentions` and `mentions` are distinct keys in the clustering dedup,
+        // so leaving both would double the pair's weight on nothing worse than
+        // inconsistent capitalisation. Normalising at this boundary is also
+        // what lets the reserved-word check be an exact comparison.
+        let server = plain_server().await;
+        let a = seed(&server, "decision", "Alpha", "first").await;
+        let b = seed(&server, "decision", "Beta", "second").await;
+        let relate = |kind: &str| {
+            server.relate(Parameters(RelateArgs {
+                from: a.clone(),
+                to: b.clone(),
+                kind: kind.to_string(),
+            }))
+        };
+
+        let first = relate("mentions").await;
+        let second = relate("Mentions").await;
+        let third = relate("  MENTIONS  ").await;
+
+        assert!(first.starts_with("related "), "{first}");
+        assert!(second.contains("already relates"), "{second}");
+        assert!(third.contains("already relates"), "{third}");
+        assert!(
+            first.contains("-mentions->"),
+            "type not normalised: {first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relate_refuses_a_glob_wildcard_instead_of_matching_a_node() {
+        // `*` is a GLOB wildcard, and resolution is the only place a
+        // client-supplied string reaches a pattern. ONE seeded node on purpose:
+        // with two, an unguarded `*` matches both and comes back as an ambiguous
+        // handle, which still starts with "relate failed: from:" and lets the
+        // test pass with the guard deleted. With one node it would resolve
+        // successfully instead, to a node the caller never named.
+        let server = plain_server().await;
+        let only = seed(&server, "decision", "Alpha", "first").await;
+
+        let out = server
+            .relate(Parameters(RelateArgs {
+                from: "*".to_string(),
+                to: only,
+                kind: "mentions".to_string(),
+            }))
+            .await;
+
+        assert!(out.contains("no live node"), "wildcard resolved: {out}");
+    }
+
+    #[tokio::test]
+    async fn relate_is_idempotent_on_the_same_ordered_triple() {
+        let server = plain_server().await;
+        let a = seed(&server, "decision", "Alpha", "first").await;
+        let b = seed(&server, "decision", "Beta", "second").await;
+        let args = || RelateArgs {
+            from: a.clone(),
+            to: b.clone(),
+            kind: "mentions".to_string(),
+        };
+
+        let first = server.relate(Parameters(args())).await;
+        let second = server.relate(Parameters(args())).await;
+
+        assert!(first.starts_with("related "), "{first}");
+        assert!(second.contains("already relates"), "{second}");
     }
 }
