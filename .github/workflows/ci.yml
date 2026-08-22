@@ -162,10 +162,22 @@ jobs:
       - name: Build (local feature)
         run: cargo build -p liam-daemon --features local
       # Metal is compiled in by target inside llama-cpp-sys-2's build script,
-      # so it needs no extra setup. That build compiles llama.cpp from C++ via
-      # CMake, which rust-cache does NOT cache, so a run whose cache was evicted
-      # pays the full compile. Keeping the repo under the cache quota (see
-      # CACHE_SAVE_IF above) is what keeps that rare.
+      # so it needs no extra setup.
+      #
+      # This step compiles llama.cpp from C++ via CMake, and earlier comments
+      # here and in release.yml claimed rust-cache does not cache that. It
+      # does. Measured 2026-08-22: this step takes 9 seconds on a warm cache
+      # and 121 seconds on a cold one. rust-cache caches ./target as
+      # "build artifacts of dependencies" and prunes only workspace crates and
+      # non-dependencies, and llama-cpp-sys-2 is a dependency, so its build
+      # script output survives.
+      #
+      # What made it LOOK uncached was cache eviction: the repo sat at 13.7 GB
+      # against a 10 GB limit, so restores kept missing. That is what
+      # CACHE_SAVE_IF above fixes.
+      #
+      # One real caveat remains. rust-cache drops build artifacts with an mtime
+      # older than a week, so a quiet week does force one full rebuild.
       - name: Build (llama feature)
         run: cargo build -p liam-daemon --features llama
       # The tests that need model weights are #[ignore]d, so this does not
