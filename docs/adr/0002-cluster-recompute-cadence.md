@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date created:** 2026-08-20
-- **Date modified:** 2026-08-21
+- **Date modified:** 2026-08-22
 - **Split from:** [ADR-0001](0001-assert-memory-edges-by-node-id.md), which bundled these
   changes into the addressing decision with no alternatives weighed. An adversarial review
   flagged the bundling, and separating it surfaced both the deletion-blind staleness signal
@@ -190,8 +190,11 @@ state reads them from here rather than inferring them from `node_community`:
 |---|---|
 | `edge_count` | the `COUNT(*)` half of the fingerprint |
 | `max_tx_from` | the `MAX(tx_from)` half |
-| `computed_at` | when the assignment was written, which the 24-hour cold-start rule below reads |
-| `cold_start` | whether that run was seeded or started from singletons, so the rule is decidable after a restart |
+| `computed_at` | when the assignment was written. Observability and logging only; no rule reads it |
+| `last_cold_start_at` | when the last from-singletons run happened, which the 24-hour rule below reads |
+
+> **Amended 2026-08-22.** This table originally carried `computed_at` (read by the
+> cold-start rule) and a `cold_start` boolean. Both were wrong. See Amendment 1.
 
 `computed_at` is duplicated between here and `node_community`, and that is deliberate: this row
 must be readable in one lookup without scanning an assignment that may hold a row per node.
@@ -227,9 +230,13 @@ staleness window the tick-only option leaves open.
 **4. A periodic from-scratch run, so warm-starting cannot compound a bad merge.** Leiden's
 local-moving phase is a greedy hill-climb, so seeding every run from the previous one can hold
 a partition in a local optimum a cold start would escape. The recompute therefore ignores the
-seed and starts from singletons whenever `cluster_state.computed_at` is more than 24 hours old,
-and whenever no assignment exists at all. That keeps the escape hatch on a schedule instead of
-leaving it as an option nobody ever triggers.
+seed and starts from singletons whenever `cluster_state.last_cold_start_at` is more than 24
+hours old, and whenever no assignment exists at all. That keeps the escape hatch on a schedule
+instead of leaving it as an option nobody ever triggers.
+
+`last_cold_start_at` advances **only on a cold run**. Reading `computed_at` here instead, as
+this record first specified, makes the rule dead code on exactly the stores it was written
+for. See Amendment 1.
 
 **Warm start on both paths.** `recompute_communities` seeds Leiden with the stored assignment
 via `run_with_initial_partition` (`leiden-rs` `src/leiden.rs:478`) instead of starting from
@@ -403,26 +410,152 @@ sequenceDiagram
 
     Client->>Server: clusters()
     Server->>Graph: communities()
-    Graph->>DB: SELECT edge_count, max_tx_from, computed_at FROM cluster_state
+    Graph->>DB: SELECT edge_count, max_tx_from, last_cold_start_at FROM cluster_state
     Graph->>DB: SELECT COUNT(*), MAX(tx_from) FROM edges<br/>WHERE tx_to = FOREVER AND type != 'supersedes'
 
     alt fingerprint matches
         Graph->>DB: SELECT node_id, community FROM node_community
     else count or max moved, or cluster_state is empty
         Note over Graph,DB: count moves on a gc delete,<br/>max moves on a new relate
-        Graph->>DB: SELECT src, dst FROM edges<br/>WHERE tx_to = FOREVER AND type != 'supersedes'<br/>ORDER BY id
+        Graph->>DB: SELECT src, dst, type FROM edges<br/>WHERE tx_to = FOREVER AND type != 'supersedes'<br/>ORDER BY id
         Note over Graph: keep THIS snapshot's fingerprint.<br/>Never re-query it at commit time.
 
-        alt assignment is under 24h old
+        alt last cold start is under 24h old
             Graph->>DB: SELECT node_id, community FROM node_community
             Note over Graph: seed from_membership, new nodes get<br/>ids above max(seed), then warm start
-        else older than 24h, or absent
+        else last cold start older than 24h, or no assignment
             Note over Graph: cold start from singletons,<br/>so a bad merge cannot compound
         end
 
-        Graph->>DB: DELETE + INSERT node_community,<br/>UPSERT cluster_state with the captured fingerprint<br/>(one transaction)
+        Graph->>DB: DELETE + INSERT node_community,<br/>DELETE + INSERT cluster_state with the captured fingerprint<br/>(one transaction)
     end
 
     Graph-->>Server: assignments
     Server-->>Client: community per node
 ```
+
+## Amendments
+
+Found on 2026-08-22 while building the execution blueprint, before any code was written.
+Each was confirmed against a source or by running it, not reasoned about in the abstract.
+
+### Amendment 1: the 24-hour cold-start rule could never fire (2026-08-22)
+
+**The defect.** Part 4 started a cold run "whenever `cluster_state.computed_at` is more than
+24 hours old". But `computed_at` was defined as "when the assignment was written", and every
+recompute writes the assignment, warm runs included. On any store that clusters more often
+than daily, `computed_at` is perpetually fresh, so the rule never fires. It fires only on a
+store left idle for over a day, which is exactly the store where a compounded bad merge
+matters least. The mechanism was backwards relative to the reason it exists.
+
+The `cold_start` boolean could not rescue it. Its stated job was making the rule "decidable
+after a restart", but a warm run one minute after a cold one overwrote both `computed_at` and
+`cold_start`, and the time of the last cold start was then unrecoverable. The four columns as
+specified could not express the one fact the rule needed.
+
+**The fix.** `cold_start` is replaced by `last_cold_start_at`, advanced only on a cold run.
+The rule reads that. `computed_at` stays for logging and is read by nothing. The column count
+is unchanged.
+
+**"Roughly daily" means about 30 hours on the default schedule, not 24.** The tick runs every
+6 hours (`config.rs:153`) and the test is strictly greater than 24, so a cold run at t=0 finds
+24 > 24 false at t=24 and fires at t=30 instead. That is inherent to sampling a threshold on
+an interval and is fine for an escape hatch. It is written down so a later reader does not
+file it as an off-by-one and "fix" it into a tighter schedule than the rule needs.
+
+**Why not the alternatives.** Redefining `computed_at` to advance only on cold runs keeps
+four columns but leaves a column whose name says one thing and whose value means another, and
+`computed_at` is genuinely useful in logs. Counting warm runs and forcing a cold one every N
+is a worse schedule: N runs is a different thing from a day, and it drifts with traffic.
+
+### Amendment 2: idempotency does not stop weight doubling, so the read side must dedupe (2026-08-22)
+
+**The defect.** ADR-0001 asserts an edge idempotently on the ORDERED triple
+`(src, dst, type)`. So `relate(a, b, t)` and `relate(b, a, t)` both insert, which is correct:
+edges are directed and "a causes b" is not "b causes a".
+
+Clustering then reads that directed set as undirected. `cluster::detect` calls
+`add_edge(u, v, 1.0)` once per row, and `leiden-rs` `build_undirected_csr` sorts by `(u, v)`
+and merges only consecutive exact duplicates, so `(a,b)` and `(b,a)` survive as two edges and
+each is stored in both adjacency lists. The pair reaches weight 2.0.
+
+That is the outcome ADR-0001's idempotency clause cites `cluster.rs:11` to prevent, and the
+mandated `NOT EXISTS` does not prevent it. A client doubles a pair's pull on the partition by
+asserting the relation in both directions, which is a natural thing to do rather than an abuse.
+
+**The fix, on the read side.** When `recompute_communities` builds the Leiden input,
+deduplicate on the key **`(min(u_idx, v_idx), max(u_idx, v_idx), type)`** before calling
+`add_edge`, where the indices are the dense ones. The edge table is unchanged and stays
+directed.
+
+**`type` is in that key deliberately, and dropping it would be a second bug.** Only the
+direction-reversal is an artifact worth collapsing. `relate(a, b, "mentions")` and
+`relate(a, b, "causes")` are two independent things a client said about the same pair, and
+neither collides with the other on ADR-0001's ordered-triple guard, so both are in the table
+on purpose. Keying the dedup on the pair alone would erase that and weigh a pair with two
+asserted relations exactly like a pair with one, which is the same class of error as the
+doubling this amendment exists to fix, in the other direction.
+
+**This forces one change to the mandated query.** `recompute_communities` selects
+`SELECT src, dst FROM edges ...`; it must now select `type` as well, or the dedup key is not
+constructible. The `WHERE` and the `ORDER BY id` are unchanged.
+
+Two smaller cases, stated so an implementer does not have to decide alone. A self-loop
+(`u == v`) normalises to a key with `min == max` and dedupes to one edge like anything else;
+`relate` rejects self-loops at the tool layer anyway, so this only concerns edges written by
+`link` in tests. And a client can still inflate a pair's weight by inventing several types for
+it. That is not a hole opened here: it is the unconstrained-type risk ADR-0001 already records
+as the weakest part of its decision, with constraining the type set deferred there.
+
+**Why not normalise on write.** Storing `(min(src), max(src))` would make `relate(a, b,
+"causes")` and `relate(b, a, "causes")` the same row, which destroys real meaning for any
+directed relation. The bias is a property of how clustering reads the graph, so the guard
+belongs where the graph is read, next to the `supersedes` filter that is already there for
+the same reason.
+
+This does not make `relate` less idempotent. It stays idempotent on the ordered triple, which
+is the right contract for a directed edge.
+
+### Amendment 3: the fingerprint statement returns NULL on an empty edge set (2026-08-22)
+
+Not a design change. Recorded because the SQL in this record is mandated verbatim and the
+obvious implementation of it fails.
+
+`SELECT COUNT(*), MAX(tx_from) FROM edges WHERE tx_to = FOREVER AND type != 'supersedes'`
+returns `(0, NULL)` when the filtered set is empty. `Row::get_i64` (`value.rs:55`) returns
+`Err` for any value that is not `Value::Int`, and `from_libsql` maps SQL NULL to `Value::Null`.
+So `row.get_i64(1)` fails on every store that has no edges yet, which is every store on the
+day this ships and every store until its first `relate`.
+
+Handle it in Rust: match `row.0.get(1)` and read `Value::Null` as 0. Do not wrap the statement
+in `COALESCE`. The statement's shape is fixed by this record, and the empty case is a property
+of the caller rather than of the query.
+
+**Why 0 is a safe sentinel, given `Millis` is a signed `i64` (`ids.rs:8`) and an edge could in
+principle carry `tx_from = 0`.** It is safe because the fingerprint is a PAIR and `COUNT(*)`
+is never NULL. An empty set reads `(0, 0)`; a single edge written at `tx_from = 0` reads
+`(1, 0)`. The counts differ, so the two states are distinguishable no matter what sentinel the
+`MAX` half collapses to. This holds for any sentinel, which is the point: correctness rests on
+`COUNT(*)`, not on 0 being unreachable.
+
+That matters in tests, where the clock is injected. Production never produces it, since
+`Millis::now` returns epoch milliseconds, but `FixedClock::new(Millis(0))` is legal and a test
+written that way must still behave.
+
+### Amendment 4: the GC tick and a read do not share a write mutex (2026-08-22)
+
+The Consequences section says a recompute "takes the ordinary write path and serializes behind
+the write mutex". That holds inside one `Graph`. It does not hold across the daemon, because
+`spawn_gc` opens a SECOND `DefaultGraph` on the same file, so the two recompute paths this
+record introduces sit behind SQLite's file lock and its 5000 ms busy timeout, not behind the
+in-process mutex.
+
+Two concurrent recomputes stay merely wasteful rather than corrupting, which is what the
+fingerprint argument above establishes and this does not change. The new risk is latency: a
+long assignment write on the GC connection can push a concurrent `clusters` recompute past the
+busy timeout, and this record requires `clusters` to surface that as an error rather than serve
+stale data. So a large store can fail a `clusters` call while a GC tick is committing.
+
+Left as a known limitation rather than fixed here. The honest options are sharing one `Graph`
+between the daemon and its GC task, or having the lazy read fall back to serving the stored
+assignment with an explicit staleness marker. Both are larger than this record.
