@@ -291,9 +291,13 @@ burying it in a record about addressing would have let it ship unargued.
   violating rows, so it needs its own record and a migration story.
 - Inline cluster labels on recall hits are deferred, to avoid compounding the output-format
   change in one release. The earlier clusters design wanted each hit to carry the name of the
-  community it belongs to, so a reader could see grouping without a second call. That design
-  predates this record and lives outside the repository, so it is restated here rather than
-  linked.
+  community it belongs to, so a reader could see grouping without a second call. It is restated
+  here as well as linked, because it predates this record and its assumptions have moved.
+
+  > **Amended 2026-08-22.** That design is now in the repository at
+  > [docs/specs/2026-07-23-always-available-clusters-design.md](../specs/2026-07-23-always-available-clusters-design.md).
+  > It was untracked when this record was written: a global gitignore rule excluded
+  > `docs/superpowers/`, so nothing under it had ever been committed.
 
 ## Architecture Diagrams
 
