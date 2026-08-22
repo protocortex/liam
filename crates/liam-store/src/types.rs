@@ -314,3 +314,30 @@ pub struct GcReport {
     pub nodes_removed: u64,
     pub edges_removed: u64,
 }
+
+/// The change signal clustering uses to decide whether a stored assignment is
+/// still current: how many live semantic edges exist, and the newest
+/// transaction time among them (ADR-0002).
+///
+/// Both halves are needed. `max_tx_from` catches an insertion, which is what
+/// `relate` does. `edge_count` catches a deletion, which a timestamp cannot,
+/// because `gc` hard-deletes edges and removing a row never advances a maximum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fingerprint {
+    pub edge_count: i64,
+    pub max_tx_from: Millis,
+}
+
+/// The single `cluster_state` row: the fingerprint the stored assignment was
+/// computed from, plus the two timestamps.
+///
+/// `computed_at` is for logs and is read by no rule. `last_cold_start_at`
+/// advances ONLY on a from-singletons run, and is what the 24-hour rule reads.
+/// Advancing it on a warm run makes the rule dead code on exactly the stores it
+/// exists for; see ADR-0002 Amendment 1 before changing that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClusterState {
+    pub fingerprint: Fingerprint,
+    pub computed_at: Millis,
+    pub last_cold_start_at: Millis,
+}

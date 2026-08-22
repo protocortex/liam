@@ -16,7 +16,8 @@ use crate::error::{Error, Result};
 use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
 use crate::schema::schema;
 use crate::types::{
-    Change, ExplainedHit, GcReport, GraphConfig, Hit, NewEdge, NewNode, Query, RetentionPolicy,
+    Change, ClusterState, ExplainedHit, Fingerprint, GcReport, GraphConfig, Hit, NewEdge, NewNode,
+    Query, RetentionPolicy,
 };
 use crate::value::{Row, Value};
 
@@ -785,7 +786,95 @@ impl<B: Backend> Graph<B> {
     }
 }
 
+/// The live semantic edge set, as a `WHERE` clause shared by the fingerprint
+/// and the graph read so the two can never drift apart on what they count.
+const LIVE_SEMANTIC_EDGES: &str = "WHERE tx_to = ?1 AND type != ?2";
+
 impl<B: Backend> Graph<B> {
+    /// The cheap half of the staleness check: answer "did anything change"
+    /// without loading the edge set.
+    ///
+    /// The recompute does NOT use this. It takes its fingerprint from the same
+    /// statement that reads the edges, because two separate reads can be
+    /// straddled by a `relate` and leave the stored fingerprint ahead of the
+    /// graph it describes. See `edges_with_fingerprint`.
+    pub async fn edge_fingerprint(&self) -> Result<Fingerprint> {
+        let sql = format!("SELECT COUNT(*), MAX(tx_from) FROM edges {LIVE_SEMANTIC_EDGES}");
+        let rows = self
+            .backend
+            .query(
+                &sql,
+                &[FOREVER.into(), crate::types::relation::SUPERSEDES.into()],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            // An aggregate without GROUP BY always returns one row, so this is
+            // unreachable rather than an empty-store case.
+            return Err(Error::Backend("fingerprint query returned no row".into()));
+        };
+        Ok(Fingerprint {
+            edge_count: row.get_i64(0)?,
+            max_tx_from: max_tx_from_of(row, 1)?,
+        })
+    }
+
+    /// The stored run state, or `None` when this store has never clustered.
+    ///
+    /// `None` is NOT the same as a zero fingerprint and must never be defaulted
+    /// into one. A database written by a build that predates `cluster_state`
+    /// arrives with a populated `node_community` and no state row; if `None`
+    /// read as `(0, 0)` it would match the live fingerprint of an edgeless
+    /// store, and that stale assignment would be served forever.
+    // Wired by WU-9, which is the next PR. Marked rather than left to warn
+    // because CI runs clippy with -D warnings, and this segment lands the
+    // primitives and their caller separately on purpose.
+    #[allow(dead_code)]
+    pub(crate) async fn read_cluster_state(&self) -> Result<Option<ClusterState>> {
+        let rows = self
+            .backend
+            .query(
+                "SELECT edge_count, max_tx_from, computed_at, last_cold_start_at
+                 FROM cluster_state LIMIT 1",
+                &[],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        Ok(Some(ClusterState {
+            fingerprint: Fingerprint {
+                edge_count: row.get_i64(0)?,
+                max_tx_from: Millis(row.get_i64(1)?),
+            },
+            computed_at: Millis(row.get_i64(2)?),
+            last_cold_start_at: Millis(row.get_i64(3)?),
+        }))
+    }
+
+    /// The statement pair that replaces the single `cluster_state` row, for
+    /// appending to the same `execute_atomic` list as the assignment.
+    ///
+    /// The `DELETE` is load-bearing: `cluster_state` declares no PRIMARY KEY or
+    /// UNIQUE, so nothing in the schema stops a second row accumulating.
+    #[allow(dead_code)]
+    fn cluster_state_writes(state: &ClusterState) -> Vec<(String, Vec<Value>)> {
+        vec![
+            ("DELETE FROM cluster_state".to_string(), Vec::new()),
+            (
+                "INSERT INTO cluster_state
+                   (edge_count, max_tx_from, computed_at, last_cold_start_at)
+                 VALUES (?1, ?2, ?3, ?4)"
+                    .to_string(),
+                vec![
+                    state.fingerprint.edge_count.into(),
+                    state.fingerprint.max_tx_from.into(),
+                    state.computed_at.into(),
+                    state.last_cold_start_at.into(),
+                ],
+            ),
+        ]
+    }
+
     pub async fn recompute_communities(&self) -> Result<usize> {
         use crate::cluster::detect;
 
@@ -808,7 +897,7 @@ impl<B: Backend> Graph<B> {
             .await?;
         let (labels, edges) = build_cluster_input(&rows)?;
 
-        let assignment = detect(labels.len(), &edges);
+        let assignment = detect(labels.len(), &edges, None);
         let now = self.clock.now();
         let mut statements: Vec<(String, Vec<Value>)> =
             vec![("DELETE FROM node_community".to_string(), Vec::new())];
@@ -922,6 +1011,80 @@ fn build_cluster_input(rows: &[Row]) -> Result<(Vec<String>, Vec<crate::cluster:
         }
     }
     Ok((labels, edges))
+}
+
+/// Read a `MAX(tx_from)` column, treating SQL NULL as 0.
+///
+/// `MAX()` over zero rows is NULL, which `Row::get_i64` rejects, so every store
+/// would error until its first `relate` if this were a plain `get_i64`. Handled
+/// in Rust rather than with `COALESCE` in the SQL, per ADR-0002 Amendment 3:
+/// the null is real and the code should say so, instead of the query hiding it.
+fn max_tx_from_of(row: &Row, i: usize) -> Result<Millis> {
+    match row.0.get(i) {
+        Some(Value::Int(v)) => Ok(Millis(*v)),
+        Some(Value::Null) | None => Ok(Millis(0)),
+        Some(other) => Err(Error::Backend(format!(
+            "max_tx_from is neither an integer nor null: {other:?}"
+        ))),
+    }
+}
+
+/// Whether the next run must start from singletons rather than from the stored
+/// assignment.
+///
+/// Leiden's local-moving phase is a greedy hill-climb, so seeding every run
+/// from the previous one can hold a partition in a local optimum a cold start
+/// would escape. This is the escape hatch, on a schedule.
+///
+/// Strictly greater, deliberately. On the default six-hour tick a cold run at
+/// t=0 finds `24 > 24` false at t=24 and fires at t=30 instead. That is
+/// inherent to sampling a threshold on an interval, it is fine for an escape
+/// hatch, and ADR-0002 Amendment 1 records it so nobody files it as an
+/// off-by-one and tightens the schedule.
+// Wired by WU-9, which is the next PR. See the note on `read_cluster_state`.
+#[allow(dead_code)]
+fn cold_start_due(last_cold_start_at: Millis, now: Millis) -> bool {
+    now.0 - last_cold_start_at.0 > Millis::days(1).0
+}
+
+/// Map the stored assignment onto the new dense index space, so Leiden can warm
+/// start from it.
+///
+/// Iterates `labels`, never the stored rows, for two reasons that are both
+/// requirements rather than style. The output must be exactly `labels.len()`
+/// long or `run_with_initial_partition` rejects it as an invalid partition. And
+/// a node that was an edge endpoint last run but is not one now simply has no
+/// index this run, so walking the stored rows would produce a seed of the wrong
+/// shape built around nodes that no longer exist.
+///
+/// New nodes take ids strictly above every stored id. Leiden groups by raw
+/// integer equality and has no notion of a reserved id, so reusing one that an
+/// existing community already holds would silently seed an unrelated new node
+/// into that community and bias the run toward a merge with no basis in the
+/// graph. The ids stay dense on purpose: `Partition::renumber` allocates a
+/// vector sized by the LARGEST id, so a hash or a big constant offset would
+/// turn a handful of communities into a huge allocation.
+// Wired by WU-9, which is the next PR. See the note on `read_cluster_state`.
+#[allow(dead_code)]
+fn build_seed(labels: &[String], stored: &[(NodeId, i64)]) -> Vec<usize> {
+    let by_id: HashMap<&str, usize> = stored
+        .iter()
+        .map(|(id, community)| (id.as_str(), (*community).max(0) as usize))
+        .collect();
+    // Stored ids are non-negative and this is their maximum, so every fresh id
+    // below is above all of them.
+    let mut next_fresh = by_id.values().copied().max().map_or(0, |max| max + 1);
+    labels
+        .iter()
+        .map(|label| match by_id.get(label.as_str()) {
+            Some(&community) => community,
+            None => {
+                let fresh = next_fresh;
+                next_fresh += 1;
+                fresh
+            }
+        })
+        .collect()
 }
 
 fn intern(index: &mut HashMap<String, usize>, labels: &mut Vec<String>, id: String) -> usize {
@@ -2179,6 +2342,227 @@ mod tests {
         assert_eq!(
             report.edges_removed, 0,
             "an unrelated rule swept a live edge"
+        );
+    }
+
+    // ---- WU-7: the fingerprint seam ----
+
+    #[tokio::test]
+    async fn the_fingerprint_of_a_store_with_no_edges_is_zero_and_not_an_error() {
+        // `MAX()` over zero rows is SQL NULL, which `Row::get_i64` rejects. A
+        // plain `get_i64` here would fail on every store until its first
+        // `relate`. ADR-0002 Amendment 3.
+        let g = graph_at(Millis(1000)).await;
+
+        let fp = g.edge_fingerprint().await.unwrap();
+
+        assert_eq!(fp.edge_count, 0);
+        assert_eq!(fp.max_tx_from, Millis(0));
+    }
+
+    #[tokio::test]
+    async fn the_fingerprint_ignores_supersedes_edges() {
+        // Without this filter every ordinary `remember` that updates an
+        // existing subject would invalidate an assignment it cannot affect,
+        // turning normal write traffic into repeated Leiden runs.
+        let g = graph_at(Millis(1000)).await;
+        for content in ["first", "second", "third"] {
+            g.upsert_by(NewNode::now("fact", "Rollout", content).with_subject("rollout"))
+                .await
+                .unwrap();
+        }
+
+        let fp = g.edge_fingerprint().await.unwrap();
+
+        assert_eq!(fp.edge_count, 0, "version history is not a semantic edge");
+    }
+
+    #[tokio::test]
+    async fn the_fingerprint_falls_when_gc_sweeps_an_edge() {
+        // The reason COUNT(*) is in the fingerprint at all. `gc` hard-deletes,
+        // and removing a row never advances a maximum, so a timestamp alone
+        // cannot see a deletion. ADR-0002 records this as the trap its first
+        // draft fell into.
+        // The clock has to move: `gc` sweeps `valid_from < now - max_age`, so
+        // with a fixed clock the nodes are never old enough to expire.
+        let t0 = Millis(1_000_000);
+        let clock = Arc::new(FixedClock::new(t0));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+        g.relate(&a, &b, "mentions").await.unwrap();
+        let before = g.edge_fingerprint().await.unwrap();
+        assert_eq!(before.edge_count, 1);
+
+        clock.set(Millis(t0.0 + 10_000));
+        g.gc(&RetentionPolicy::keep("fact", Millis(1)))
+            .await
+            .unwrap();
+
+        let after = g.edge_fingerprint().await.unwrap();
+        assert_eq!(after.edge_count, 0, "a swept edge must lower the count");
+        assert_ne!(before, after, "the fingerprint must notice a deletion");
+    }
+
+    #[tokio::test]
+    async fn the_fingerprint_ignores_an_edge_closed_in_transaction_time() {
+        // Nothing in production closes an edge today, so this goes through the
+        // backend directly. It pins the `tx_to` half of the predicate, which is
+        // otherwise unexercised.
+        let g = graph_at(Millis(1000)).await;
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+        g.relate(&a, &b, "mentions").await.unwrap();
+
+        g.backend
+            .execute("UPDATE edges SET tx_to = ?1", &[Millis(2000).into()])
+            .await
+            .unwrap();
+
+        assert_eq!(g.edge_fingerprint().await.unwrap().edge_count, 0);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_has_never_clustered_reads_as_no_prior_run() {
+        // `None` must never be defaulted into a zero fingerprint. A database
+        // written before `cluster_state` existed arrives with a populated
+        // assignment and no state row, and on an edgeless store a defaulted
+        // `(0, 0)` would MATCH the live fingerprint and serve that stale
+        // assignment forever.
+        let g = graph_at(Millis(1000)).await;
+
+        assert!(g.read_cluster_state().await.unwrap().is_none());
+    }
+
+    // ---- WU-8: warm-start detection and seed construction ----
+
+    #[tokio::test]
+    async fn a_cold_start_is_due_only_strictly_after_twenty_four_hours() {
+        let t0 = Millis(1_000_000);
+        let day = Millis::days(1).0;
+
+        assert!(!cold_start_due(t0, Millis(t0.0 + day - 1)));
+        assert!(
+            !cold_start_due(t0, Millis(t0.0 + day)),
+            "strictly greater, so exactly 24h is not yet due"
+        );
+        assert!(cold_start_due(t0, Millis(t0.0 + day + 1)));
+    }
+
+    #[tokio::test]
+    async fn a_new_node_takes_a_community_id_above_every_id_in_the_seed() {
+        let stored = vec![
+            (NodeId::from_raw("a"), 0),
+            (NodeId::from_raw("b"), 0),
+            (NodeId::from_raw("c"), 1),
+        ];
+        let labels = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+
+        let seed = build_seed(&labels, &stored);
+
+        assert_eq!(seed, vec![0, 0, 1, 2, 3], "fresh ids continue above max");
+    }
+
+    #[tokio::test]
+    async fn no_fresh_id_ever_collides_with_a_stored_community() {
+        // The stored set has a HOLE, which is the case a "fill the gaps" scheme
+        // would get wrong while still passing the contiguous test above.
+        // Reusing id 1 here would seed the new node into b's community.
+        // A contiguous run AND a hole, so a scheme starting anywhere below the
+        // maximum collides with a real community rather than landing in the gap.
+        let stored = vec![
+            (NodeId::from_raw("a"), 0),
+            (NodeId::from_raw("b"), 1),
+            (NodeId::from_raw("c"), 5),
+        ];
+        let labels = ["a", "b", "c", "new1", "new2"].map(String::from).to_vec();
+
+        let seed = build_seed(&labels, &stored);
+
+        let stored_ids: HashSet<usize> = stored.iter().map(|(_, c)| *c as usize).collect();
+        let fresh: Vec<usize> = seed[3..].to_vec();
+        assert!(
+            fresh.iter().all(|f| !stored_ids.contains(f)),
+            "fresh {fresh:?} collides with stored {stored_ids:?}"
+        );
+        // Disjointness alone is satisfied by filling the gaps too, so pin the
+        // rule ADR-0002 actually states: strictly above every stored id. It is
+        // the simpler contract and it keeps the ids dense, which is what bounds
+        // `Partition::renumber`'s allocation.
+        let stored_max = stored_ids.iter().copied().max().unwrap();
+        assert!(
+            fresh.iter().all(|&f| f > stored_max),
+            "fresh {fresh:?} must all exceed the stored maximum {stored_max}"
+        );
+        assert_eq!(&seed[..3], &[0, 1, 5], "known nodes keep their communities");
+    }
+
+    #[tokio::test]
+    async fn a_stored_node_that_no_longer_appears_on_an_edge_drops_out_of_the_seed() {
+        // Walking `stored` instead of `labels` would produce a seed of the
+        // wrong length, which surfaces as an InvalidPartition at runtime rather
+        // than here.
+        let stored = vec![
+            (NodeId::from_raw("a"), 0),
+            (NodeId::from_raw("b"), 1),
+            (NodeId::from_raw("gone1"), 2),
+            (NodeId::from_raw("gone2"), 3),
+        ];
+        let labels = ["a", "b"].map(String::from).to_vec();
+
+        let seed = build_seed(&labels, &stored);
+
+        assert_eq!(seed, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn the_seed_is_exactly_as_long_as_the_label_list() {
+        let stored = vec![(NodeId::from_raw("known"), 7)];
+        let labels = ["new1", "known", "new2"].map(String::from).to_vec();
+
+        let seed = build_seed(&labels, &stored);
+
+        assert_eq!(seed.len(), labels.len(), "one id per label, no skips");
+        assert_eq!(seed[1], 7, "the known node keeps its community");
+    }
+
+    #[tokio::test]
+    async fn an_empty_stored_assignment_seeds_singletons() {
+        let labels = ["a", "b", "c"].map(String::from).to_vec();
+
+        assert_eq!(build_seed(&labels, &[]), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn warm_starting_from_singletons_matches_a_cold_run() {
+        // Pins that both entry points use the same LeidenConfig. A different
+        // seed or resolution on the warm path is otherwise invisible.
+        use crate::cluster::{detect, Edge};
+        let edges = vec![Edge(0, 1), Edge(1, 2), Edge(0, 2)];
+
+        let cold = detect(3, &edges, None);
+        let warm = detect(3, &edges, Some(vec![0, 1, 2]));
+
+        assert_eq!(cold, warm);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_length_seed_falls_back_to_a_cold_run_not_to_singletons() {
+        // A triangle, so the cold answer is ONE community and singletons would
+        // be three. If the warm path degraded to singletons the way the cold
+        // path does, the recompute would persist that alongside a matching
+        // fingerprint and serve it until the next edge write.
+        use crate::cluster::{detect, Edge};
+        let edges = vec![Edge(0, 1), Edge(1, 2), Edge(0, 2)];
+
+        let out = detect(3, &edges, Some(vec![0, 0]));
+
+        assert_eq!(
+            out.iter().collect::<HashSet<_>>().len(),
+            1,
+            "a connected triangle is one community: {out:?}"
         );
     }
 }
