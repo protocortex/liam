@@ -559,3 +559,56 @@ stale data. So a large store can fail a `clusters` call while a GC tick is commi
 Left as a known limitation rather than fixed here. The honest options are sharing one `Graph`
 between the daemon and its GC task, or having the lazy read fall back to serving the stored
 assignment with an explicit staleness marker. Both are larger than this record.
+
+### Amendment 5: the fingerprint and the edge set must come from one statement (2026-08-23)
+
+Found while building the S3 blueprint, before any code was written, and confirmed by running
+the alternative against the real backend rather than reasoning about it.
+
+**The defect.** Part 1 argues the central guarantee as read time versus commit time: capture
+the fingerprint with the graph, never re-query it at commit, so a late write leaves the stored
+value BEHIND the real one and the next check recomputes. That argument is right. But the record
+mandates two separate statements, `SELECT COUNT(*), MAX(tx_from)` and `SELECT src, dst, type`,
+and reads never serialize with writes (`backend.rs`). So a `relate` can land BETWEEN the two
+reads, and which way the error falls is decided by an order this record never fixes:
+
+| order | a `relate` lands between the reads | result |
+|---|---|---|
+| fingerprint, then edges | graph has the edge, stored fingerprint does not | fingerprint is behind, next check mismatches, redundant recompute. Safe. |
+| edges, then fingerprint | stored fingerprint has the edge, graph does not | fingerprint is ahead, next check **matches**, serves an assignment that predates a live edge |
+
+The second row is the exact failure Part 1 exists to prevent, reintroduced one level down. It is
+also the more natural way to write it: read what you are about to cluster, then summarise it.
+
+**The fix, and why it is not an ordering rule.** A rule saying "fingerprint first" would work,
+and would rely on every future reader knowing why. One statement removes the window instead:
+
+```sql
+SELECT src, dst, type, COUNT(*) OVER (), MAX(tx_from) OVER ()
+  FROM edges WHERE tx_to = ?1 AND type != ?2 ORDER BY id
+```
+
+Confirmed working through libSQL, not only `sqlite3`. Two properties come free. An empty edge
+set returns zero rows, which is the fingerprint `(0, 0)`, so the NULL that Amendment 3 handles
+cannot arise on this path at all. And the count describes exactly the rows returned, so the
+"captured with the graph" property is structural rather than a convention.
+
+The standalone `SELECT COUNT(*), MAX(tx_from)` stays, for the cheap check that answers "did
+anything change" without loading the edge set. Amendment 3 applies there and only there.
+
+**Four smaller gaps settled at the same time**, none of them defects in the argument, all of
+them things the record left undecided and an implementer would otherwise decide alone.
+
+1. **A missing `cluster_state` row is not a zero fingerprint.** Defaulting it would make an
+   edgeless store match, and an assignment written by a build predating the table would be
+   served forever. `None` forces a recompute.
+2. **A failed warm run retries cold, never degrades to singletons.** The recompute writes the
+   assignment together with a matching fingerprint, so singletons written after a bad seed
+   would look current until the next edge write.
+3. **A warm run carries `last_cold_start_at` forward.** The column is `NOT NULL` and the write
+   is DELETE plus INSERT, so a warm run must write something. Writing `now` recreates
+   Amendment 1's defect at the write site, with the same symptom.
+4. **"No assignment exists at all" means the stored assignment is empty, as well as the state
+   row being absent.** Numerically it does not matter, since an all-fresh seed renumbers to the
+   identity a cold run builds anyway. It matters for bookkeeping, because only a cold run
+   advances `last_cold_start_at`, and calling a singleton seed warm is a lie in the logs.

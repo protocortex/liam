@@ -825,10 +825,6 @@ impl<B: Backend> Graph<B> {
     /// arrives with a populated `node_community` and no state row; if `None`
     /// read as `(0, 0)` it would match the live fingerprint of an edgeless
     /// store, and that stale assignment would be served forever.
-    // Wired by WU-9, which is the next PR. Marked rather than left to warn
-    // because CI runs clippy with -D warnings, and this segment lands the
-    // primitives and their caller separately on purpose.
-    #[allow(dead_code)]
     pub(crate) async fn read_cluster_state(&self) -> Result<Option<ClusterState>> {
         let rows = self
             .backend
@@ -856,7 +852,6 @@ impl<B: Backend> Graph<B> {
     ///
     /// The `DELETE` is load-bearing: `cluster_state` declares no PRIMARY KEY or
     /// UNIQUE, so nothing in the schema stops a second row accumulating.
-    #[allow(dead_code)]
     fn cluster_state_writes(state: &ClusterState) -> Vec<(String, Vec<Value>)> {
         vec![
             ("DELETE FROM cluster_state".to_string(), Vec::new()),
@@ -875,30 +870,82 @@ impl<B: Backend> Graph<B> {
         ]
     }
 
-    pub async fn recompute_communities(&self) -> Result<usize> {
-        use crate::cluster::detect;
-
-        // `supersedes` is excluded because it is structural, not semantic: it
-        // is written only inside `supersede`'s transaction and describes
-        // version history. Leaving it in means a version chain reads as a
-        // topic (ADR-0001, Scope). `relate` refuses to assert it for the same
-        // reason, so this is that decision seen from the other end.
-        //
-        // `ORDER BY id` fixes the row order, which `build_cluster_input` turns
-        // into the dense vertex numbering. Without it the numbering varies run
-        // to run on identical data, and so can Leiden's seeded partition.
+    /// The live semantic edge set AND the fingerprint of that exact set, from
+    /// one statement.
+    ///
+    /// One statement, not two, and that is the whole point. ADR-0002 mandates a
+    /// separate `SELECT COUNT(*), MAX(tx_from)` and argues the guarantee as
+    /// read time versus commit time, but reads never serialize with writes
+    /// (`backend.rs`), so a `relate` can land between two reads. If the
+    /// fingerprint were taken second it would describe an edge the graph never
+    /// saw, the next staleness check would MATCH, and a stale assignment would
+    /// be served over a live edge, which is the precise failure the record
+    /// exists to prevent. Window functions collapse both into one snapshot, so
+    /// there is no window to get the order wrong in. ADR-0002 Amendment 5.
+    ///
+    /// An empty edge set returns zero rows, which is the fingerprint `(0, 0)`,
+    /// so the NULL that Amendment 3 handles cannot arise on this path at all.
+    ///
+    /// `ORDER BY id` fixes the row order, which `build_cluster_input` turns into
+    /// the dense vertex numbering. Without it the numbering varies run to run on
+    /// identical data, and so can Leiden's seeded partition.
+    async fn edges_with_fingerprint(&self) -> Result<(Vec<Row>, Fingerprint)> {
+        let sql = format!(
+            "SELECT src, dst, type, COUNT(*) OVER (), MAX(tx_from) OVER ()
+             FROM edges {LIVE_SEMANTIC_EDGES} ORDER BY id"
+        );
         let rows = self
             .backend
             .query(
-                "SELECT src, dst, type FROM edges
-                 WHERE tx_to = ?1 AND type != ?2 ORDER BY id",
+                &sql,
                 &[FOREVER.into(), crate::types::relation::SUPERSEDES.into()],
             )
             .await?;
-        let (labels, edges) = build_cluster_input(&rows)?;
+        let fingerprint = match rows.first() {
+            Some(row) => Fingerprint {
+                edge_count: row.get_i64(3)?,
+                max_tx_from: max_tx_from_of(row, 4)?,
+            },
+            None => Fingerprint {
+                edge_count: 0,
+                max_tx_from: Millis(0),
+            },
+        };
+        Ok((rows, fingerprint))
+    }
 
-        let assignment = detect(labels.len(), &edges, None);
+    /// Recompute the assignment unconditionally and persist it with the
+    /// fingerprint of the graph it was built from.
+    ///
+    /// Callers wanting "recompute only if stale" want `communities`, which is
+    /// the seam both the GC tick and the read side share.
+    pub async fn recompute_communities(&self) -> Result<usize> {
+        self.recompute_with(self.read_cluster_state().await?).await
+    }
+
+    async fn recompute_with(&self, state: Option<ClusterState>) -> Result<usize> {
+        use crate::cluster::detect;
+
+        let started = std::time::Instant::now();
+        let (rows, fingerprint) = self.edges_with_fingerprint().await?;
+        let (labels, edges) = build_cluster_input(&rows)?;
         let now = self.clock.now();
+
+        // Cold whenever history cannot be trusted to seed from. No prior run at
+        // all, an empty stored assignment (seeding singletons and calling it
+        // warm would only lie in the logs), or the 24-hour escape hatch.
+        let stored = self.stored_communities().await?;
+        let cold = match state {
+            None => true,
+            Some(state) => stored.is_empty() || cold_start_due(state.last_cold_start_at, now),
+        };
+        let seed = if cold {
+            None
+        } else {
+            Some(build_seed(&labels, &stored))
+        };
+        let assignment = detect(labels.len(), &edges, seed);
+
         let mut statements: Vec<(String, Vec<Value>)> =
             vec![("DELETE FROM node_community".to_string(), Vec::new())];
         for (i, community) in assignment.iter().enumerate() {
@@ -912,18 +959,74 @@ impl<B: Backend> Graph<B> {
                 ],
             ));
         }
+        // The CAPTURED fingerprint, never a fresh query here. A `relate` landing
+        // during the Leiden run above must leave the stored value BEHIND the
+        // real one, so the next check mismatches and recomputes. Re-reading it
+        // at commit would record that edge as included when the assignment
+        // never saw it.
+        //
+        // `last_cold_start_at` is carried forward on a warm run. Writing `now`
+        // would recreate the defect ADR-0002 Amendment 1 fixed, at the write
+        // site instead of the read site, with the same symptom: the escape
+        // hatch never fires again. A warm run always has a prior state to carry
+        // from, because `state == None` forces cold above.
+        statements.extend(Self::cluster_state_writes(&ClusterState {
+            fingerprint,
+            computed_at: now,
+            last_cold_start_at: if cold {
+                now
+            } else {
+                state.map_or(now, |s| s.last_cold_start_at)
+            },
+        }));
         self.backend.execute_atomic(&statements).await?;
 
         let count = assignment.iter().collect::<HashSet<_>>().len();
+        // ADR-0002 requires both paths to report size and cost, so the ceiling
+        // is found from real use rather than guessed at.
         tracing::info!(
             nodes = labels.len(),
+            edges = edges.len(),
             communities = count,
+            cold,
+            elapsed_ms = started.elapsed().as_millis() as u64,
             "communities recomputed"
         );
         Ok(count)
     }
 
+    /// Community assignments, recomputing first if the stored one no longer
+    /// matches the live edge set.
+    ///
+    /// This is the seam. Both the GC tick and any read path go through it, so
+    /// the invariant "the assignment matches the fingerprint" is enforced in
+    /// one place rather than duplicated into two that can drift.
+    ///
+    /// **The integers are not durable.** Leiden renumbers by first appearance
+    /// over a dense index that shifts whenever the edge set changes, so the
+    /// number labelling a group can differ between calls even when the grouping
+    /// does not. Read them as "these nodes are together in this response", never
+    /// as a handle to store and compare later.
+    ///
+    /// A failed recompute surfaces its error rather than quietly returning a
+    /// stale answer, since serving stale data is what the fingerprint exists to
+    /// prevent. `execute_atomic` is all or nothing, so the previous assignment
+    /// survives intact.
     pub async fn communities(&self) -> Result<Vec<(NodeId, i64)>> {
+        let state = self.read_cluster_state().await?;
+        let live = self.edge_fingerprint().await?;
+        // `None` means this store has never clustered and must recompute. It is
+        // NOT a zero fingerprint: an edgeless store would match that and serve
+        // an assignment written by a build predating `cluster_state`.
+        if state.map(|s| s.fingerprint) != Some(live) {
+            self.recompute_with(state).await?;
+        }
+        self.stored_communities().await
+    }
+
+    /// The stored assignment, with no staleness check. `pub(crate)` so the only
+    /// way out of the crate is the checked path above.
+    pub(crate) async fn stored_communities(&self) -> Result<Vec<(NodeId, i64)>> {
         let rows = self
             .backend
             .query(
@@ -1041,8 +1144,6 @@ fn max_tx_from_of(row: &Row, i: usize) -> Result<Millis> {
 /// inherent to sampling a threshold on an interval, it is fine for an escape
 /// hatch, and ADR-0002 Amendment 1 records it so nobody files it as an
 /// off-by-one and tightens the schedule.
-// Wired by WU-9, which is the next PR. See the note on `read_cluster_state`.
-#[allow(dead_code)]
 fn cold_start_due(last_cold_start_at: Millis, now: Millis) -> bool {
     now.0 - last_cold_start_at.0 > Millis::days(1).0
 }
@@ -1064,8 +1165,6 @@ fn cold_start_due(last_cold_start_at: Millis, now: Millis) -> bool {
 /// graph. The ids stay dense on purpose: `Partition::renumber` allocates a
 /// vector sized by the LARGEST id, so a hash or a big constant offset would
 /// turn a handful of communities into a huge allocation.
-// Wired by WU-9, which is the next PR. See the note on `read_cluster_state`.
-#[allow(dead_code)]
 fn build_seed(labels: &[String], stored: &[(NodeId, i64)]) -> Vec<usize> {
     let by_id: HashMap<&str, usize> = stored
         .iter()
@@ -2564,5 +2663,337 @@ mod tests {
             1,
             "a connected triangle is one community: {out:?}"
         );
+    }
+
+    // ---- WU-9: recompute against the fingerprint ----
+
+    /// Two nodes joined by one edge, on a clock the test controls.
+    async fn seeded_pair(t0: Millis) -> (DefaultGraph, Arc<FixedClock>, NodeId, NodeId) {
+        let clock = Arc::new(FixedClock::new(t0));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+        g.relate(&a, &b, "mentions").await.unwrap();
+        (g, clock, a, b)
+    }
+
+    #[tokio::test]
+    async fn the_edge_read_carries_the_fingerprint_of_the_rows_it_returned() {
+        // The fingerprint and the graph come from ONE statement, so the value
+        // stored always describes exactly the edge set that was clustered.
+        //
+        // What this pins is the invariant, that the count matches the rows
+        // returned. The concurrency property itself, that no `relate` can land
+        // between reading the edges and reading their fingerprint, holds by
+        // construction because there is only one read, and no single-threaded
+        // test can demonstrate it. Splitting this back into two queries is the
+        // regression to watch for, and ADR-0002 Amendment 5 explains why.
+        let (g, _clock, _a, _b) = seeded_pair(Millis(1000)).await;
+
+        let (rows, fingerprint) = g.edges_with_fingerprint().await.unwrap();
+
+        assert_eq!(rows.len() as i64, fingerprint.edge_count);
+        assert_eq!(
+            fingerprint,
+            g.edge_fingerprint().await.unwrap(),
+            "the cheap check and the recompute must agree on an idle store"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_call_with_nothing_changed_does_not_recompute() {
+        let (g, clock, _a, _b) = seeded_pair(Millis(1000)).await;
+        g.communities().await.unwrap();
+        let first = g.read_cluster_state().await.unwrap().unwrap();
+
+        clock.set(Millis(1000 + 3_600_000));
+        g.communities().await.unwrap();
+
+        let second = g.read_cluster_state().await.unwrap().unwrap();
+        assert_eq!(
+            first.computed_at, second.computed_at,
+            "an unchanged store must not run Leiden again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edge_asserted_after_the_last_run_forces_a_recompute() {
+        let (g, clock, a, _b) = seeded_pair(Millis(1000)).await;
+        g.communities().await.unwrap();
+        let before = g.read_cluster_state().await.unwrap().unwrap();
+
+        clock.set(Millis(1000 + 3_600_000));
+        let c = g.insert(NewNode::now("fact", "c", "x")).await.unwrap();
+        g.relate(&a, &c, "mentions").await.unwrap();
+        g.communities().await.unwrap();
+
+        let after = g.read_cluster_state().await.unwrap().unwrap();
+        assert_ne!(before.computed_at, after.computed_at, "a new edge is stale");
+        assert_eq!(after.fingerprint.edge_count, 2);
+    }
+
+    #[tokio::test]
+    async fn a_swept_edge_forces_a_recompute_even_though_time_only_moves_forward() {
+        // The COUNT half of the fingerprint. A deletion lowers the count while
+        // MAX(tx_from) cannot fall, so a timestamp-only fingerprint would call
+        // this unchanged.
+        let (g, clock, _a, _b) = seeded_pair(Millis(1_000_000)).await;
+        g.communities().await.unwrap();
+        let before = g.read_cluster_state().await.unwrap().unwrap();
+
+        clock.set(Millis(1_000_000 + 10_000));
+        g.gc(&RetentionPolicy::keep("fact", Millis(1)))
+            .await
+            .unwrap();
+        g.communities().await.unwrap();
+
+        let after = g.read_cluster_state().await.unwrap().unwrap();
+        assert_eq!(after.fingerprint.edge_count, 0);
+        assert_ne!(before.computed_at, after.computed_at);
+    }
+
+    #[tokio::test]
+    async fn a_cold_run_advances_both_timestamps_and_a_warm_run_advances_only_one() {
+        // ADR-0002 Amendment 1's whole point. `last_cold_start_at` must stay put
+        // across a warm run, or the 24-hour escape hatch can never fire again.
+        let t0 = Millis(1_000_000);
+        let (g, clock, a, _b) = seeded_pair(t0).await;
+
+        g.communities().await.unwrap();
+        let cold = g.read_cluster_state().await.unwrap().unwrap();
+        assert_eq!(cold.computed_at, t0);
+        assert_eq!(cold.last_cold_start_at, t0, "first run is cold");
+
+        let warm_at = Millis(t0.0 + 3_600_000);
+        clock.set(warm_at);
+        let c = g.insert(NewNode::now("fact", "c", "x")).await.unwrap();
+        g.relate(&a, &c, "mentions").await.unwrap();
+        g.communities().await.unwrap();
+
+        let warm = g.read_cluster_state().await.unwrap().unwrap();
+        assert_eq!(warm.computed_at, warm_at, "computed_at tracks every run");
+        assert_eq!(
+            warm.last_cold_start_at, t0,
+            "a warm run must carry the cold-start time forward"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_warm_run_in_between_does_not_postpone_the_daily_cold_run() {
+        // Reproduces the defect Amendment 1 fixed. Reading `computed_at` for the
+        // 24-hour rule would see the warm run at +12h and never fire; reading
+        // `last_cold_start_at` correctly sees the cold run at t0.
+        let t0 = Millis(1_000_000);
+        let (g, clock, a, _b) = seeded_pair(t0).await;
+        g.communities().await.unwrap();
+
+        clock.set(Millis(t0.0 + 12 * 3_600_000));
+        let c = g.insert(NewNode::now("fact", "c", "x")).await.unwrap();
+        g.relate(&a, &c, "mentions").await.unwrap();
+        g.communities().await.unwrap();
+        let warm = g.read_cluster_state().await.unwrap().unwrap();
+        assert_eq!(warm.last_cold_start_at, t0);
+
+        // 25h after the cold run, but only 13h after the most recent run.
+        clock.set(Millis(t0.0 + 25 * 3_600_000));
+        let d = g.insert(NewNode::now("fact", "d", "x")).await.unwrap();
+        g.relate(&a, &d, "mentions").await.unwrap();
+        g.communities().await.unwrap();
+
+        let after = g.read_cluster_state().await.unwrap().unwrap();
+        assert_eq!(
+            after.last_cold_start_at,
+            Millis(t0.0 + 25 * 3_600_000),
+            "the escape hatch must fire on cold-start age, not on run age"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prior_assignment_with_no_cluster_state_is_recomputed_from_cold() {
+        // A database written before `cluster_state` existed: it carries an
+        // assignment and no run state. On an EDGELESS store its live fingerprint
+        // is (0, 0), so defaulting the missing state to zero would match and
+        // serve that stale assignment forever.
+        let g = graph_at(Millis(1000)).await;
+        // A REAL node: `node_community.node_id` references `nodes(id)` and
+        // libSQL enforces it, so a made-up id cannot be inserted at all.
+        let orphan = g.insert(NewNode::now("fact", "lonely", "x")).await.unwrap();
+        g.backend
+            .execute(
+                "INSERT INTO node_community (node_id, community, computed_at) VALUES (?1, 7, 1)",
+                &[orphan.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert!(g.read_cluster_state().await.unwrap().is_none());
+
+        let out = g.communities().await.unwrap();
+
+        assert!(
+            out.is_empty(),
+            "the stale assignment must be cleared: {out:?}"
+        );
+        let state = g.read_cluster_state().await.unwrap().unwrap();
+        assert_eq!(state.fingerprint.edge_count, 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_recomputes_leave_exactly_one_cluster_state_row() {
+        // `cluster_state` declares no PRIMARY KEY or UNIQUE, so nothing in the
+        // schema stops rows accumulating. The DELETE in the write pair is the
+        // only guard.
+        let (g, clock, a, _b) = seeded_pair(Millis(1000)).await;
+        for i in 1..4 {
+            clock.set(Millis(1000 + i * 60_000));
+            let n = g
+                .insert(NewNode::now("fact", format!("n{i}"), "x"))
+                .await
+                .unwrap();
+            g.relate(&a, &n, "mentions").await.unwrap();
+            g.communities().await.unwrap();
+        }
+
+        let rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM cluster_state", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_i64(0).unwrap(), 1);
+    }
+
+    /// An edge to insert the first time a query matching `trigger` returns, so
+    /// a test can land a write in the middle of a recompute.
+    static INTERPOSE: std::sync::Mutex<Option<(String, String, String)>> =
+        std::sync::Mutex::new(None);
+
+    /// Delegates everything to the real backend, except that one query fires a
+    /// single injected write after it returns.
+    ///
+    /// This exists for exactly one test: the guarantee that the stored
+    /// fingerprint is the one captured WITH the graph is a property about
+    /// concurrent writes, and no ordinary single-threaded test can observe it.
+    struct Interposing(crate::backends::DefaultBackend);
+
+    #[async_trait::async_trait]
+    impl Backend for Interposing {
+        async fn open(path: &str, read_pool_size: usize) -> Result<Self> {
+            Ok(Self(
+                crate::backends::DefaultBackend::open(path, read_pool_size).await?,
+            ))
+        }
+        async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+            let rows = self.0.query(sql, params).await?;
+            let fire = {
+                let mut slot = INTERPOSE.lock().unwrap();
+                match slot.as_ref() {
+                    Some((trigger, _, _)) if sql.contains(trigger.as_str()) => slot.take(),
+                    _ => None,
+                }
+            };
+            if let Some((_, src, dst)) = fire {
+                self.0
+                    .execute(
+                        "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
+                         VALUES (?1, ?2, ?3, 'mentions', '{}', ?4, ?5)",
+                        &[
+                            EdgeId::new().as_str().into(),
+                            src.into(),
+                            dst.into(),
+                            Millis(9_000_000).into(),
+                            FOREVER.into(),
+                        ],
+                    )
+                    .await?;
+            }
+            Ok(rows)
+        }
+        async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+            self.0.execute(sql, params).await
+        }
+        async fn execute_batch(&self, sql: &str) -> Result<()> {
+            self.0.execute_batch(sql).await
+        }
+        async fn execute_atomic(&self, statements: &[(String, Vec<Value>)]) -> Result<()> {
+            self.0.execute_atomic(statements).await
+        }
+        fn vector_ddl(&self, dims: usize) -> String {
+            self.0.vector_ddl(dims)
+        }
+        async fn vector_upsert(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
+            self.0.vector_upsert(node_id, embedding).await
+        }
+        async fn vector_delete(&self, node_id: &str) -> Result<()> {
+            self.0.vector_delete(node_id).await
+        }
+        async fn vector_search(
+            &self,
+            query: &[f32],
+            k: usize,
+            kind: Option<&str>,
+            scope: Option<&str>,
+            as_of: Millis,
+        ) -> Result<Vec<NodeId>> {
+            self.0.vector_search(query, k, kind, scope, as_of).await
+        }
+        async fn vector_sweep_orphans(&self) -> Result<u64> {
+            self.0.vector_sweep_orphans().await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edge_landing_during_a_recompute_leaves_the_fingerprint_behind_not_ahead() {
+        // THE guard for ADR-0002 Amendment 5, and the only one that needs a
+        // concurrency seam. The recompute must persist the fingerprint captured
+        // WITH the edge set it clustered. If it re-queried at commit instead, an
+        // edge landing mid-run would be recorded as included when the assignment
+        // never saw it, the next check would MATCH, and a stale assignment would
+        // be served over a live edge.
+        //
+        // Behind is safe, ahead is corruption: the assertion is that a second
+        // call still finds work to do.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g: Graph<Interposing> =
+            Graph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+                .await
+                .unwrap();
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+        let c = g.insert(NewNode::now("fact", "c", "x")).await.unwrap();
+        g.relate(&a, &b, "mentions").await.unwrap();
+
+        // Fire right after the recompute reads the edge set, so the new edge is
+        // in the table but not in the graph that was clustered.
+        *INTERPOSE.lock().unwrap() = Some((
+            "COUNT(*) OVER ()".to_string(),
+            a.as_str().to_string(),
+            c.as_str().to_string(),
+        ));
+        g.communities().await.unwrap();
+        assert!(
+            INTERPOSE.lock().unwrap().is_none(),
+            "the injected write never fired, so this test proves nothing"
+        );
+
+        let stored = g.read_cluster_state().await.unwrap().unwrap();
+        let live = g.edge_fingerprint().await.unwrap();
+        assert_eq!(stored.fingerprint.edge_count, 1, "captured with the graph");
+        assert_eq!(live.edge_count, 2, "the injected edge is really there");
+        assert_ne!(
+            stored.fingerprint, live,
+            "the stored fingerprint must lag the live one, never match it"
+        );
+
+        // And the consequence that actually matters: the next call recomputes.
+        let before = stored.computed_at;
+        clock.set(Millis(2000));
+        g.communities().await.unwrap();
+        let after = g.read_cluster_state().await.unwrap().unwrap();
+        assert_ne!(
+            before, after.computed_at,
+            "a fingerprint written ahead of the graph would skip this recompute"
+        );
+        assert_eq!(after.fingerprint.edge_count, 2);
     }
 }
