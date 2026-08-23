@@ -6,6 +6,16 @@ All notable changes to LIAM are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Garbage collection no longer fails on any store that holds a relationship.
+  It deleted memories before the links pointing at them, which the database
+  rejects, so the whole sweep aborted. The daemon logged the failure and carried
+  on, so old memories were never actually removed and the file kept growing. Any
+  store that had ever recorded a memory with a `subject` was affected, because
+  updating one leaves a link behind. If your store has been running a while,
+  the first sweep after this will remove more than usual.
+
 ### Added
 
 - `relate` MCP tool, so a client can record a relationship between two memories

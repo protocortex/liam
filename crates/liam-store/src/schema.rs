@@ -53,6 +53,20 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
   INSERT INTO nodes_fts(rowid, label, content) VALUES (new.rowid, new.label, new.content);
 END;
 
+-- The REFERENCES below are ENFORCED, not decoration. libSQL turns foreign keys
+-- on by default, unlike stock SQLite, and no `PRAGMA foreign_keys` is needed or
+-- present. Anything deleting a `nodes` row must remove the rows referencing it
+-- first, in `edges` (src, dst) and `node_community` (node_id); `Graph::gc` does
+-- exactly that, per retention rule. Getting this backwards fails the delete with
+-- 'FOREIGN KEY constraint failed' rather than leaving a dangling row.
+--
+-- `ON DELETE CASCADE` is the better end state and is deliberately NOT here yet.
+-- Adding it to this DDL would only affect databases created afterwards: every
+-- statement here is `CREATE TABLE IF NOT EXISTS`, so an existing table keeps its
+-- original constraint, and SQLite cannot ALTER one. Confirmed by running it:
+-- re-creating a table with the clause leaves `pragma_foreign_key_list` still
+-- reporting `NO ACTION`. So it would read as fixed on every fresh test database
+-- while leaving real stores broken. It needs a table rebuild and its own record.
 CREATE TABLE IF NOT EXISTS edges (
   id         TEXT    NOT NULL PRIMARY KEY,
   src        TEXT    NOT NULL REFERENCES nodes(id),

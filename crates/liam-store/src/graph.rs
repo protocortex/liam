@@ -719,19 +719,49 @@ impl<B: Backend> Graph<B> {
     // ---- retention ----
 
     pub async fn gc(&self, policy: &RetentionPolicy) -> Result<GcReport> {
+        /// The nodes one retention rule is about to remove. Referenced more
+        /// than once per statement below; SQLite reuses numbered parameters, so
+        /// every use binds the same `kind` and `cutoff`.
+        const DOOMED: &str = "SELECT id FROM nodes WHERE kind = ?1 AND valid_from < ?2";
+
         let now = self.clock.now();
         let mut nodes_removed = 0u64;
+        let mut edges_removed = 0u64;
         for rule in &policy.rules {
             let cutoff = now.0 - rule.max_age.0;
+            let params: Vec<Value> = vec![rule.kind.as_str().into(), cutoff.into()];
+            // Rows that REFERENCE the doomed nodes have to go first.
+            //
+            // libSQL enforces foreign keys by default, which stock SQLite does
+            // not, and `edges.src`, `edges.dst` and `node_community.node_id`
+            // all declare `REFERENCES nodes(id)` (`schema.rs`). Deleting a node
+            // while anything still points at it fails the whole statement with
+            // "FOREIGN KEY constraint failed", and `sweep` in the daemon logs
+            // that and carries on, so retention silently stopped running on any
+            // store holding an edge. The orphan sweep below is still useful for
+            // rows orphaned by another path, but it ran too late to prevent it.
+            edges_removed += self
+                .backend
+                .execute(
+                    &format!("DELETE FROM edges WHERE src IN ({DOOMED}) OR dst IN ({DOOMED})"),
+                    &params,
+                )
+                .await?;
+            self.backend
+                .execute(
+                    &format!("DELETE FROM node_community WHERE node_id IN ({DOOMED})"),
+                    &params,
+                )
+                .await?;
             nodes_removed += self
                 .backend
                 .execute(
                     "DELETE FROM nodes WHERE kind = ?1 AND valid_from < ?2",
-                    &[rule.kind.as_str().into(), cutoff.into()],
+                    &params,
                 )
                 .await?;
         }
-        let edges_removed = self
+        edges_removed += self
             .backend
             .execute(
                 "DELETE FROM edges
@@ -2062,5 +2092,93 @@ mod tests {
             g.resolve_handle(old.as_str()).await.unwrap_err(),
             Error::HandleNotFound(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn gc_sweeps_a_node_that_still_has_an_edge_pointing_at_it() {
+        // Regression. libSQL enforces foreign keys by default, unlike stock
+        // SQLite, and `gc` used to delete nodes before the edges referencing
+        // them. That aborted the whole sweep with "FOREIGN KEY constraint
+        // failed" on ANY store holding an edge, and the daemon's `sweep` logs
+        // the error and continues, so retention silently never ran.
+        let t0 = Millis(1_000_000);
+        let clock = Arc::new(FixedClock::new(t0));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+        g.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+
+        clock.set(Millis(t0.0 + 10_000));
+        let report = g
+            .gc(&RetentionPolicy::keep("fact", Millis(1)))
+            .await
+            .expect("gc must not fail on a store that holds an edge");
+
+        assert_eq!(report.nodes_removed, 2);
+        assert_eq!(report.edges_removed, 1, "the edge goes with its endpoints");
+        let left = g
+            .backend
+            .query("SELECT COUNT(*) FROM edges", &[])
+            .await
+            .unwrap();
+        assert_eq!(left[0].get_i64(0).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn gc_sweeps_a_node_that_still_has_a_community_assignment() {
+        // `node_community.node_id` declares the same REFERENCES, so it is the
+        // second way a doomed node can be pinned. Unreachable from production
+        // today because nothing calls `recompute_communities`, and pinned now
+        // because ADR-0002 is about to wire it to this very tick.
+        let t0 = Millis(1_000_000);
+        let clock = Arc::new(FixedClock::new(t0));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+        g.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+        g.recompute_communities().await.unwrap();
+        assert!(
+            !g.communities().await.unwrap().is_empty(),
+            "assignment seeded"
+        );
+
+        clock.set(Millis(t0.0 + 10_000));
+        g.gc(&RetentionPolicy::keep("fact", Millis(1)))
+            .await
+            .expect("gc must not fail on an assigned node");
+
+        assert!(g.communities().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_leaves_an_edge_whose_endpoints_both_survive() {
+        // The fix deletes edges by rule before the nodes, so it has to stay
+        // scoped to the doomed set. Deleting more would silently destroy the
+        // graph on every tick.
+        let t0 = Millis(1_000_000);
+        let clock = Arc::new(FixedClock::new(t0));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let a = g.insert(NewNode::now("keep", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("keep", "b", "x")).await.unwrap();
+        g.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+
+        clock.set(Millis(t0.0 + 10_000));
+        // A rule for a DIFFERENT kind, so nothing should be swept at all.
+        let report = g
+            .gc(&RetentionPolicy::keep("fact", Millis(1)))
+            .await
+            .unwrap();
+
+        assert_eq!(report.nodes_removed, 0);
+        assert_eq!(
+            report.edges_removed, 0,
+            "an unrelated rule swept a live edge"
+        );
     }
 }
