@@ -48,6 +48,9 @@ Three properties of the current code decide how edges can safely be asserted:
   `src`/`dst` as `REFERENCES nodes(id)`, but SQLite disables enforcement by default and no
   `PRAGMA foreign_keys = ON` exists anywhere in `crates/liam-store/src/`.
 
+  > **Amended 2026-08-23. This is false.** libSQL enforces them by default. The missing pragma
+  > is real, the conclusion drawn from it is not. See Amendment 4.
+
 Edge assertion is already recorded as M2.6 scope in the multi-consumer amendment, which lists
 `remember` as dropping `attributes`, `valid_from`, `confidence`, edge assertion, and read-side
 `as_of`/`half_life`. This decision pulls the edge-assertion piece forward so that the M5
@@ -470,3 +473,54 @@ is case-insensitive by definition and `GLOB` is not.
 an identifier that can turn ambiguous later as neighbouring nodes are written. git carries the
 same property and it is accepted there. The failure is one error and one retry, never a wrong
 edge.
+
+### Amendment 4: the declared foreign keys ARE enforced, and that broke `gc` (2026-08-23)
+
+Found on 2026-08-23 while writing a fingerprint test for S3, and confirmed by running it
+against clean `main` in a throwaway worktree rather than reasoned about.
+
+**The defect.** Context above, and the "Nothing validates a node id" driver, both assert that
+the declared `REFERENCES` are inert because no `PRAGMA foreign_keys = ON` exists. The grep is
+right; the conclusion is wrong. **libSQL enforces foreign keys by default**, unlike stock
+SQLite, which is where the mistake came from. Running `gc` on a store holding one edge returns:
+
+```
+Err(Backend("SQLite failure: `FOREIGN KEY constraint failed`"))
+```
+
+**What it broke, and for how long.** `gc` deleted `nodes` rows first and only then swept edges
+whose endpoints had gone. With enforcement on, the node delete aborts while an edge still
+points at it, so the whole sweep fails. `sweep` in the daemon logs the error and continues, so
+retention silently stopped running and the store grew without bound. This predates `relate` by
+a long way: `supersede` has always written a `supersedes` edge, so any store using `remember`
+with a subject accumulates edges, and the first node to age past retention broke the sweep
+permanently. No test caught it because no `gc` test had ever created an edge first.
+
+**The fix**, landed separately from this record: delete the rows that reference a doomed node
+before the node itself, per retention rule, from `edges` (`src`, `dst`) and `node_community`
+(`node_id`). The orphan sweep stays for rows orphaned by some other path.
+
+**What this changes about this record.** The decision does not move. Validating a node id in
+`relate` is still right, and the single conditional INSERT still works exactly as specified,
+because its `EXISTS` guards refuse before the foreign key ever has an opinion. What changes is
+the reasoning: an unvalidated id would not have written a dangling edge silently, it would have
+failed the write. Being able to answer "that node is not live" beats surfacing a foreign key
+message, so the guard earns its place either way.
+
+The Follow-up below says turning on `PRAGMA foreign_keys` needs its own record and a migration
+story. That question is now moot on libSQL and only applies to a backend that defaults to off,
+which is the stubbed rusqlite one. Any second backend must decide it explicitly rather than
+inherit an assumption from here.
+
+**`ON DELETE CASCADE` is the better end state and is deferred to its own record.** It would let
+the database enforce what `gc` now does by hand, so a future caller that deletes a node cannot
+get it wrong. It cannot simply be added to the DDL: every statement in `schema.rs` is
+`CREATE TABLE IF NOT EXISTS`, so an existing table keeps the constraint it was created with,
+and SQLite cannot `ALTER` one. Confirmed by running it, a re-created table still reports
+`NO ACTION` from `pragma_foreign_key_list` and still fails the delete. Shipping the clause
+alone would therefore fix fresh databases and leave every real store broken, while looking
+correct in tests, which all build fresh in-memory databases. Doing it properly means rebuilding
+`edges` and `node_community` (create, copy, drop, rename, recreate indexes) with foreign keys
+disabled for the rebuild, detected through `pragma_foreign_key_list`. That is a migration
+against live data and deserves the record the Follow-up asks for. Once it lands, the explicit
+deletes in `gc` become redundant belt-and-braces rather than the only guard.
