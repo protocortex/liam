@@ -221,19 +221,9 @@ async fn serve_socket(config: &Config, server: MemoryServer) -> anyhow::Result<(
 }
 
 /// GC and the cluster refresh, on the SAME `Graph` every request handler
-/// uses, not a second connection.
-///
-/// A second connection was the original design and it was wrong: `gc` is not
-/// one long write, each of its statements independently takes and releases
-/// `liam-store`'s in-process write mutex (`Backend::execute`), so nothing
-/// here ever holds that mutex across the whole sweep. Sharing therefore costs
-/// at most one write waiting behind gc's single longest statement, not behind
-/// the sweep. Not sharing does not avoid contention, it relocates it: two
-/// separate write connections on one file contend on SQLite's OWN lock
-/// instead, with a 5 second timeout that surfaces as an opaque
-/// `Error::Backend` string neither this crate nor a client can tell apart
-/// from a real failure. That is worse than the in-process queuing sharing
-/// produces. See ADR-0002 Amendment 4.
+/// uses, not a second connection: a second connection only traded an
+/// in-process wait for an opaque SQLite lock timeout. See ADR-0002
+/// Amendment 4.
 fn spawn_gc(config: &Config, store: Arc<DefaultGraph>) {
     let policy = config.gc_policy();
     let interval = config.gc_interval();
@@ -251,11 +241,9 @@ fn spawn_gc(config: &Config, store: Arc<DefaultGraph>) {
     });
 }
 
-/// Sweep, then refresh clusters if the sweep (or anything else) moved the
-/// edge fingerprint. Runs the refresh regardless of whether the sweep
-/// succeeded: `gc` is a sequence of independent statements, not one
-/// transaction, so a partial sweep still changed whatever it did manage to
-/// delete, and that change deserves the same check a full sweep would get.
+/// Sweep, then refresh clusters if anything moved the edge fingerprint. Runs
+/// the refresh even after a partial sweep, since `gc` is independent
+/// statements rather than one transaction.
 async fn maintenance_tick(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
     sweep(store, policy).await;
     refresh_clusters(store).await;
@@ -269,9 +257,7 @@ async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
 }
 
 /// Not serving stale: the tick serves no one. A skipped or failed refresh
-/// here only means the NEXT read re-runs the same cheap check and recomputes
-/// then, which is exactly the lazy-read guarantee ADR-0002 relies on to make
-/// the tick optional rather than load-bearing.
+/// just means the next read re-runs the check and recomputes then.
 async fn refresh_clusters(store: &DefaultGraph) -> bool {
     match store.refresh_communities().await {
         Ok(true) => {

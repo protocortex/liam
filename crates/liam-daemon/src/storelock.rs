@@ -21,14 +21,11 @@
 //! # Why per process, not per store open
 //!
 //! `spawn_gc` in `main.rs` runs GC and the cluster refresh on the SAME
-//! `Graph` every request handler shares, not a second connection: `gc`'s
-//! statements each take and release `liam-store`'s in-process write mutex
-//! independently, so nothing in GC ever holds it across the whole sweep, and
-//! a second connection bought no real isolation, only a second lock to
-//! reason about (see ADR-0002 Amendment 4). This lock guards against a
-//! second PROCESS, so it is acquired exactly once, in `run`, before the
-//! first `DefaultGraph::open`, and must never be retaken anywhere else in
-//! this process: doing so would have the process deadlock against itself.
+//! `Graph` every request handler shares, not a second connection (ADR-0002
+//! Amendment 4). This lock guards against a second PROCESS, so it is
+//! acquired exactly once, in `run`, before the first `DefaultGraph::open`,
+//! and must never be retaken anywhere else in this process: doing so would
+//! have the process deadlock against itself.
 //!
 //! # Contract for the stdio proxy (WU-9)
 //!
