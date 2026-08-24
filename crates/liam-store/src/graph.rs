@@ -928,29 +928,13 @@ impl<B: Backend> Graph<B> {
         self.recompute_with(self.read_cluster_state().await?).await
     }
 
-    /// The stored state and the live fingerprint, from ONE statement.
+    /// The stored state and the live fingerprint, from ONE statement, so a
+    /// `relate` landing between two separate reads can't make a stale
+    /// assignment look current (ADR-0002 Amendment 6, same fix as
+    /// `edges_with_fingerprint` applies to the recompute path).
     ///
-    /// `communities`'s staleness check used to be two reads, `read_cluster_state`
-    /// then `edge_fingerprint`, on connections that never serialize with a
-    /// writer. A `relate` landing between them can leave the check reading a
-    /// live fingerprint from BEFORE the edge and a stored state from... still
-    /// before the edge too, which sounds safe, except the reverse order is also
-    /// possible: read live first, then a `relate` lands, then read state second
-    /// still sees the OLD state, so the two still compare equal even though an
-    /// edge the live read never saw has since landed. Either read-order leaves
-    /// a window where "safe" is a coincidence of which read happened to run
-    /// first, not a guarantee, which is precisely the failure `edges_with_fingerprint`
-    /// closed on the recompute path (Amendment 5) and reopens here one level up.
-    /// ADR-0002 Amendment 6.
-    ///
-    /// Scalar subqueries, not a join, so an edgeless store still returns exactly
-    /// one row via the aggregate and `cluster_state` being empty shows up as
-    /// four NULLs on that one row rather than zero rows. Confirmed through the
-    /// real backend, not only `sqlite3`.
-    ///
-    /// A new method, not a replacement for `read_cluster_state` or
-    /// `edge_fingerprint`: both have callers of their own (the cheap check, and
-    /// the migration test fixtures) that want exactly one half of this.
+    /// Scalar subqueries, not a join: an edgeless store still returns one row,
+    /// with `cluster_state` empty showing as four NULLs on it.
     async fn staleness_snapshot(&self) -> Result<(Option<ClusterState>, Fingerprint)> {
         let sql = format!(
             "SELECT COUNT(*), MAX(tx_from),
@@ -977,12 +961,9 @@ impl<B: Backend> Graph<B> {
             edge_count: row.get_i64(0)?,
             max_tx_from: max_tx_from_of(row, 1)?,
         };
-        // The four `cluster_state` columns are declared NOT NULL (`schema.rs`),
-        // so they come back either all present (a row exists) or all NULL (it
-        // does not); testing column 2 alone is enough to tell which. Reading a
-        // NULL here as a zero fingerprint would be Defect 2 again: an edgeless
-        // store's live fingerprint IS `(0, 0)`, so a defaulted state would match
-        // it and serve a stale assignment forever.
+        // `cluster_state`'s columns are NOT NULL, so column 2 alone tells
+        // whether the row exists. Defaulting a NULL here to (0, 0) would match
+        // an edgeless store's real fingerprint and serve a stale assignment.
         let state = match row.0.get(2) {
             Some(Value::Null) | None => None,
             _ => Some(ClusterState {
@@ -998,14 +979,8 @@ impl<B: Backend> Graph<B> {
     }
 
     /// Recompute only if the stored assignment no longer matches the live edge
-    /// set; report whether it did.
-    ///
-    /// This, not `recompute_communities`, is the seam both the GC tick and
-    /// `communities` share, so the invariant "the assignment matches the
-    /// fingerprint" lives in one place. `recompute_communities` runs Leiden
-    /// unconditionally and would defeat the tick's whole purpose: ADR-0002's
-    /// own "an idle store does no clustering work at all" only holds if the
-    /// tick can find out nothing changed without paying for a run.
+    /// set; report whether it did. The shared seam for the GC tick and
+    /// `communities`, so "assignment matches fingerprint" lives in one place.
     pub async fn refresh_communities(&self) -> Result<bool> {
         let (state, live) = self.staleness_snapshot().await?;
         if state.as_ref().map(|s| s.fingerprint) == Some(live) {
@@ -2949,13 +2924,9 @@ mod tests {
     static INTERPOSE: std::sync::Mutex<Option<(String, String, String)>> =
         std::sync::Mutex::new(None);
 
-    /// How many issued queries contained a watched substring, independent of
-    /// `INTERPOSE`. Set the substring, run the call under test, read the
-    /// count. Exists for exactly one property that injection cannot show:
-    /// that a staleness check is ONE statement rather than two. `INTERPOSE`
-    /// proves what happens when a write lands between reads; this proves
-    /// there is no "between" to land in, by counting how many reads there
-    /// actually were.
+    /// How many issued queries contained a watched substring. Set the
+    /// substring, run the call under test, read the count: proves a read is
+    /// ONE statement, which `INTERPOSE` (below) can't show.
     static QUERY_MATCH_COUNT: std::sync::Mutex<(String, usize)> =
         std::sync::Mutex::new((String::new(), 0));
 
@@ -3098,22 +3069,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_staleness_check_reads_state_and_live_in_one_statement() {
-        // Amendment 6's guard. `communities()` used to be two reads
-        // (`read_cluster_state` then `edge_fingerprint`), and reads never
-        // serialize with writes, so a `relate` landing between them could
-        // leave the check comparing a live fingerprint from one instant
-        // against a stored state from a different one. Whichever order that
-        // race resolves in, "safe" was a coincidence of which read happened
-        // to run first, not a guarantee.
-        //
-        // `INTERPOSE` (used above) proves what a write landing BETWEEN reads
-        // does. It cannot prove there is no "between" left to land in, only a
-        // literal count of how many reads occurred can. That is what this
-        // pins: exactly one query matches the combined statement's unique
-        // opening, `MAX(tx_from),` with a trailing comma. `edge_fingerprint`'s
-        // own query has no comma there (it goes straight to `FROM`), and
-        // `edges_with_fingerprint`'s uses `OVER ()`, so neither can inflate
-        // this count by accident.
+        // Amendment 6's guard: exactly one query, so there's no "between two
+        // reads" for a write to land in. `MAX(tx_from),` (trailing comma) is
+        // unique to this statement among the store's other fingerprint reads.
         let clock = Arc::new(FixedClock::new(Millis(1000)));
         let g: Graph<Interposing> =
             Graph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
