@@ -16,7 +16,6 @@ mod storelock;
 mod telemetry;
 mod transport;
 
-use std::path::Path;
 use std::sync::Arc;
 
 use liam_store::{DefaultGraph, GraphConfig};
@@ -105,9 +104,9 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
 /// socket daemon. Both take the per-process store lock.
 async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
     // Exclusive per-process lock, taken once, before the first store open.
-    // `spawn_gc` below opens a second CONNECTION to the same database on
-    // purpose; that is not a second process, so the lock is not retaken for
-    // it. Bound to a named variable so it lives for the rest of the process:
+    // `spawn_gc` below shares this same `Graph`, so there is no second
+    // connection to reason about; the lock is not retaken for it regardless.
+    // Bound to a named variable so it lives for the rest of the process:
     // `let _ = ...` would drop it immediately and release the lock right
     // away. See `storelock` for why this is a real advisory `flock` and not
     // a PID file, and for the contract the future `liamd proxy` mode (which
@@ -146,7 +145,7 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
         }
     }
 
-    spawn_gc(&config, &database_path).await?;
+    spawn_gc(&config, Arc::clone(&store));
 
     let server = MemoryServer::new(
         store,
@@ -221,33 +220,135 @@ async fn serve_socket(config: &Config, server: MemoryServer) -> anyhow::Result<(
     .await
 }
 
-/// GC runs on its own store connection so it never contends with requests.
-async fn spawn_gc(config: &Config, database_path: &Path) -> anyhow::Result<()> {
-    let store = DefaultGraph::open(
-        database_path.to_str().unwrap_or(&config.database_path),
-        GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size),
-    )
-    .await?;
+/// GC and the cluster refresh, on the SAME `Graph` every request handler
+/// uses, not a second connection.
+///
+/// A second connection was the original design and it was wrong: `gc` is not
+/// one long write, each of its statements independently takes and releases
+/// `liam-store`'s in-process write mutex (`Backend::execute`), so nothing
+/// here ever holds that mutex across the whole sweep. Sharing therefore costs
+/// at most one write waiting behind gc's single longest statement, not behind
+/// the sweep. Not sharing does not avoid contention, it relocates it: two
+/// separate write connections on one file contend on SQLite's OWN lock
+/// instead, with a 5 second timeout that surfaces as an opaque
+/// `Error::Backend` string neither this crate nor a client can tell apart
+/// from a real failure. That is worse than the in-process queuing sharing
+/// produces. See ADR-0002 Amendment 4.
+fn spawn_gc(config: &Config, store: Arc<DefaultGraph>) {
     let policy = config.gc_policy();
     let interval = config.gc_interval();
     let run_on_start = config.gc.run_on_start;
     tokio::spawn(async move {
         if run_on_start {
-            sweep(&store, &policy).await;
+            maintenance_tick(&store, &policy).await;
         }
         let mut tick = tokio::time::interval(interval);
         tick.tick().await; // drop the immediate first tick
         loop {
             tick.tick().await;
-            sweep(&store, &policy).await;
+            maintenance_tick(&store, &policy).await;
         }
     });
-    Ok(())
+}
+
+/// Sweep, then refresh clusters if the sweep (or anything else) moved the
+/// edge fingerprint. Runs the refresh regardless of whether the sweep
+/// succeeded: `gc` is a sequence of independent statements, not one
+/// transaction, so a partial sweep still changed whatever it did manage to
+/// delete, and that change deserves the same check a full sweep would get.
+async fn maintenance_tick(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
+    sweep(store, policy).await;
+    refresh_clusters(store).await;
 }
 
 async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
     match store.gc(policy).await {
         Ok(report) => tracing::info!(?report, "gc completed"),
         Err(e) => tracing::warn!(error = %e, "gc failed"),
+    }
+}
+
+/// Not serving stale: the tick serves no one. A skipped or failed refresh
+/// here only means the NEXT read re-runs the same cheap check and recomputes
+/// then, which is exactly the lazy-read guarantee ADR-0002 relies on to make
+/// the tick optional rather than load-bearing.
+async fn refresh_clusters(store: &DefaultGraph) -> bool {
+    match store.refresh_communities().await {
+        Ok(true) => {
+            tracing::info!("clusters refreshed");
+            true
+        }
+        Ok(false) => {
+            tracing::debug!("clusters already current");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cluster refresh failed");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liam_store::{FixedClock, GraphConfig, Millis, NewEdge, NewNode, RetentionPolicy};
+
+    async fn seeded_pair(t0: Millis) -> (DefaultGraph, std::sync::Arc<FixedClock>) {
+        let clock = std::sync::Arc::new(FixedClock::new(t0));
+        let store = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let a = store.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = store.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+        store.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+        (store, clock)
+    }
+
+    #[tokio::test]
+    async fn the_tick_refreshes_clusters_after_the_sweep() {
+        let (store, _clock) = seeded_pair(Millis(1000)).await;
+        // Nothing is old enough to sweep under this policy, which isolates the
+        // refresh half of `maintenance_tick` from the sweep half.
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+
+        maintenance_tick(&store, &policy).await;
+
+        assert!(
+            !store.refresh_communities().await.unwrap(),
+            "the tick must have already refreshed; a second call finds nothing to do"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_refresh_runs_after_the_sweep_not_before() {
+        // If the refresh ran BEFORE the sweep, it would capture a fingerprint
+        // of an edge set that still includes the edge the sweep is about to
+        // delete. The next check would then see the swept, edge-free live
+        // state as a MISMATCH against that stale fingerprint and find more
+        // work to do. Refreshing after the sweep, the fingerprint it captures
+        // already reflects the deletion, so a follow-up check finds nothing
+        // left to do.
+        let t0 = Millis(1_000_000);
+        let (store, clock) = seeded_pair(t0).await;
+        clock.set(Millis(t0.0 + 10_000));
+        let policy = RetentionPolicy::keep("fact", Millis(1));
+
+        maintenance_tick(&store, &policy).await;
+
+        assert!(
+            !store.refresh_communities().await.unwrap(),
+            "a refresh that ran before the sweep would leave more work behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_clusters_reports_no_work_on_an_idle_store() {
+        let (store, _clock) = seeded_pair(Millis(1000)).await;
+        assert!(refresh_clusters(&store).await, "first call always has work");
+
+        let did_work = refresh_clusters(&store).await;
+
+        assert!(!did_work, "an unchanged store must report no work");
     }
 }
