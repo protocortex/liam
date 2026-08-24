@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! MCP tool surface: `remember`, `recall`, `relate`, and `ask`, wiring the
-//! store and the model.
+//! MCP tool surface: `remember`, `recall`, `relate`, `ask`, and `clusters`,
+//! wiring the store and the model.
 //!
 //! VERSION CHECK: the rmcp macro surface (`#[tool_router]`, `#[tool]`,
 //! `#[tool_handler]`, `Parameters`) moves across releases. Confirmed unchanged
@@ -25,6 +25,7 @@ use crate::ask::{
     self, build_ask_prompt, clamp_ask_k, estimate_tokens, fallback_answer, fit_evidence_to_budget,
     format_answer,
 };
+use crate::clusters::{narrow_groups, render_clusters};
 
 /// Token budget for the sufficiency pre-pass. Only "YES"/"NO" is wanted, with a
 /// little slack for models that add punctuation or a stray word; anything longer
@@ -103,6 +104,16 @@ pub struct AskArgs {
     pub k: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClustersArgs {
+    /// Number of clusters to show, largest first. Narrows within the token
+    /// budget; cannot widen past it.
+    pub k: Option<usize>,
+    /// Number of memories to show per cluster. Narrows within the token
+    /// budget; cannot widen past it.
+    pub members: Option<usize>,
+}
+
 #[derive(Clone)]
 pub struct MemoryServer {
     store: Arc<DefaultGraph>,
@@ -119,6 +130,8 @@ pub struct MemoryServer {
     /// Token budget `ask` trims retrieved evidence to before either prompt is
     /// built; see `config::LlmConfig::context_tokens`, which this must match so
     /// a full-size prompt never overflows the model's own context window.
+    /// `clusters` reads this too, as one tenth of it (ADR-0002 S4): same
+    /// underlying config value, not an `ask`-only budget despite the name.
     ask_context_tokens: usize,
     /// Bounds how many `ask` calls may be inside a model call (sufficiency
     /// pre-pass or synthesis) at once; see
@@ -356,6 +369,24 @@ impl MemoryServer {
             Ok(_) => format!("related {} -{kind}-> {}", from.handle(), to.handle()),
             Err(e) => format!("relate failed: {e}"),
         }
+    }
+
+    #[tool(description = "List memory clusters found by community detection, largest first.")]
+    async fn clusters(&self, Parameters(args): Parameters<ClustersArgs>) -> String {
+        let groups = match self.store.community_groups().await {
+            Ok(g) => g,
+            Err(e) => return format!("clusters failed: {e}"),
+        };
+        let narrowed = narrow_groups(&groups, args.k, args.members);
+        // One tenth of the configured context (ADR-0002 S4): the operator's
+        // declared "how much text is reasonable on this machine", not a
+        // promise about the MCP client's own context.
+        let budget = self.ask_context_tokens / 10;
+        render_clusters(&narrowed, budget, |s| {
+            self.llm
+                .count_tokens(s)
+                .unwrap_or_else(|| estimate_tokens(s))
+        })
     }
 
     // `pub(crate)` so the grounding eval (see `eval.rs`) drives the same code
@@ -1880,5 +1911,137 @@ mod tests {
 
         assert!(first.starts_with("related "), "{first}");
         assert!(second.contains("already relates"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn clusters_on_an_empty_store_says_so_and_does_not_panic() {
+        let server = plain_server().await;
+
+        let out = server
+            .clusters(Parameters(ClustersArgs {
+                k: None,
+                members: None,
+            }))
+            .await;
+
+        assert_eq!(out, "no clusters yet");
+    }
+
+    #[tokio::test]
+    async fn clusters_budget_is_a_fraction_of_the_configured_context_not_all_of_it() {
+        // Enough groups, each with a label long enough to matter, that the
+        // real (one tenth) budget forces truncation while the full 8192
+        // context would not: catches the handler passing the whole context
+        // through un-scaled.
+        let server = plain_server().await;
+        let pad = "x".repeat(300);
+        for i in 0..15 {
+            let a = seed(&server, "fact", &format!("group{i}a {pad}"), "x").await;
+            let b = seed(&server, "fact", &format!("group{i}b {pad}"), "x").await;
+            server
+                .relate(Parameters(RelateArgs {
+                    from: a,
+                    to: b,
+                    kind: "mentions".to_string(),
+                }))
+                .await;
+        }
+
+        let out = server
+            .clusters(Parameters(ClustersArgs {
+                k: None,
+                members: None,
+            }))
+            .await;
+
+        assert!(out.contains("withheld"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn clusters_reports_a_group_for_two_related_memories() {
+        let server = plain_server().await;
+        let a = seed(&server, "fact", "Rollout plan", "x").await;
+        let b = seed(&server, "fact", "Rollout owner", "y").await;
+        server
+            .relate(Parameters(RelateArgs {
+                from: a.clone(),
+                to: b.clone(),
+                kind: "mentions".to_string(),
+            }))
+            .await;
+
+        let out = server
+            .clusters(Parameters(ClustersArgs {
+                k: None,
+                members: None,
+            }))
+            .await;
+
+        assert!(out.contains("Rollout plan"), "{out}");
+        assert!(out.contains("Rollout owner"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_handle_rendered_by_clusters_resolves_through_relate() {
+        // `clusters` and `recall` must resolve through the same handle
+        // scheme, so a client acting on what `clusters` shows does not need
+        // a second round trip through `recall` first.
+        let server = plain_server().await;
+        let a = seed(&server, "fact", "Rollout plan", "first").await;
+        let b = seed(&server, "fact", "Rollout owner", "second").await;
+        let c = seed(&server, "fact", "Unrelated", "third").await;
+        let related = server
+            .relate(Parameters(RelateArgs {
+                from: a.clone(),
+                to: b.clone(),
+                kind: "mentions".to_string(),
+            }))
+            .await;
+        assert!(related.starts_with("related "), "{related}");
+
+        let rendered = server
+            .clusters(Parameters(ClustersArgs {
+                k: None,
+                members: None,
+            }))
+            .await;
+        let handle = rendered
+            .lines()
+            .find_map(|l| l.strip_prefix("[fact "))
+            .and_then(|rest| rest.split(']').next())
+            .unwrap_or_else(|| panic!("no member line with a handle: {rendered}"))
+            .to_string();
+
+        let linked = server
+            .relate(Parameters(RelateArgs {
+                from: handle,
+                to: c.clone(),
+                kind: "mentions".to_string(),
+            }))
+            .await;
+        assert!(
+            linked.starts_with("related "),
+            "handle did not resolve: {linked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clusters_is_registered_with_the_argument_names_clients_send() {
+        let server = plain_server().await;
+
+        assert!(
+            server.tool_router.has_route("clusters"),
+            "clusters not routed"
+        );
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "clusters")
+            .expect("clusters must be listed");
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        for field in ["\"k\"", "\"members\""] {
+            assert!(schema.contains(field), "{field} missing from {schema}");
+        }
     }
 }
