@@ -21,11 +21,17 @@ Amendment 4 said must trigger its decision.
 The record left this open between sharing a connection and serving stale with a marker.
 Sharing wins, and the reason is a fact about the code rather than a preference.
 
-`gc` is not one long write. It issues five independent `execute` calls plus
-`vector_sweep_orphans`, and `LibsqlBackend::execute` takes the write mutex and drops it when
-the statement returns. Verified by reading it: the guard is a local in `execute`, not held
-across the sweep. So sharing does not queue client writes behind a whole sweep. The longest
-single hold a write can wait on is one statement, `PRAGMA incremental_vacuum`.
+`gc` is not one long write. Per retention rule it issues three independent `execute` calls
+(edges, then `node_community`, then `nodes`, in that order for ADR-0003's cascade ordering),
+plus one more for the orphan-edge sweep, plus `vector_sweep_orphans` (its own single locked
+statement), plus `PRAGMA incremental_vacuum` when reclaim is on. Today's shipped config has
+exactly one rule, so that is six statements end to end, but the count scales with
+`policy.rules.len()`, not a fixed number, since `RetentionPolicy` is a public `Vec<RetentionRule>`
+a future caller could extend. `LibsqlBackend::execute` takes the write mutex and drops it when
+the statement returns, confirmed by reading it: the guard is a local, not held across the sweep.
+So sharing does not queue client writes behind the whole sweep regardless of how many rules are
+configured. The longest single hold a write can wait on is still one statement, whichever one it
+lands on, and `PRAGMA incremental_vacuum` is the most expensive of them.
 
 Reads are untouched either way, because `query` goes through the read pool and never takes the
 write mutex. ADR-0002's "a call that finds nothing stale never waits" survives sharing exactly.
@@ -43,9 +49,14 @@ burned by.
 The `Arc<DefaultGraph>` is already in scope and unmoved before the `spawn_gc` call, so the
 change is passing it in and deleting the second `open`.
 
-**Two comments become false and must be corrected in the same change**, not left to rot: the
-one on `spawn_gc` and the one in `storelock.rs`, both of which claim GC "never contends with
-requests". It always contended, at the file lock. The storelock invariant itself is unaffected.
+**Three comments become false and must be corrected in the same change**, not left to rot:
+`spawn_gc`'s own doc comment and the one in `storelock.rs`, both of which claim GC "never
+contends with requests" — it always contended, at the file lock — and a third in
+`serve_with_store` that explains the per-process lock is not retaken for `spawn_gc` "because it
+opens a second CONNECTION to the same database on purpose." That sentence is the one place the
+two-connection design is stated as deliberate; once sharing lands it is simply wrong, though the
+reasoning around it (the lock guards a second PROCESS, not a second connection) still holds and
+does not need to change. The storelock invariant itself is unaffected by any of this.
 
 ### The tick calls a new `refresh_communities`, not either existing function
 
@@ -79,8 +90,22 @@ gets.
 
 So `clusters` renders groups largest-first while a **token budget** allows, then stops and says
 what it withheld. The budget is one tenth of `llm.context_tokens`. Counting uses
-`Llm::count_tokens` with the same `estimate_tokens` fallback `ask` already uses, so it measures
-the real thing rather than a proxy for it.
+`Llm::count_tokens` (the trait method in `liam-model/src/llm.rs`, backed by `llama.rs`) with the
+`estimate_tokens` chars-over-four fallback from `ask.rs`, the identical count-with-fallback
+closure `mcp.rs` already builds for `ask`. Two crates, not one file: `count_tokens` is model
+crate surface, `estimate_tokens` is the daemon's local fallback, and the daemon wires them
+together at the call site the same way for both tools.
+
+**Never render fewer groups than fit says is best, but never render zero when groups exist,
+either.** `ask.rs` already establishes the rule this has to match:
+`fit_evidence_to_budget_returns_the_single_item_when_it_alone_exceeds_budget` keeps one item even
+when it alone exceeds the budget, rather than returning nothing. `render_clusters` follows the
+same rule: if the budget is smaller than even the single largest group, that group renders
+anyway. The alternative, a header with no groups, is actively misleading, since it reads
+identically to the genuinely-empty-store message and a client cannot tell "nothing to group" from
+"budget too tight to show one." A misconfigured `llm.context_tokens` (an operator typo, or a
+value simply smaller than one machine-sized group) must degrade to "one group, oversized" rather
+than to "no groups, ambiguous why."
 
 Measured with `o200k_base` over 200 nodes in 20 groups:
 
@@ -178,6 +203,16 @@ after the sweep; the refresh runs after the sweep and not before (a swept edge m
 fingerprint settled); an idle store reports no work.
 
 **WU-12a, `community_groups()` (store).** The liveness-filtered join, grouped and ordered.
+Refreshes by calling `refresh_communities()`, not by re-checking the fingerprint itself, so the
+one invariant stays in the one place WU-11a put it.
+
+The dependency on WU-11a is for efficiency, not correctness, worth being honest about: the
+already-shipped `communities()` also triggers a refresh, so `community_groups()` could call that
+today and discard its return value, no new store method required. It would cost one wasted
+`stored_communities()` read per call. Calling `refresh_communities()` avoids that waste, which is
+reason enough to sequence WU-12a after WU-11a as planned, but the ordering is a quality choice
+rather than a hard block, and worth remembering if something ever forces WU-12a to ship first.
+
 Tests: a superseded node appears in no group; an all-superseded group is dropped; ordering is
 largest-first and deterministic; members carry what recall would show; the call refreshes first.
 
@@ -188,10 +223,12 @@ count-with-fallback closure `ask` uses. Optional `k` and `members` narrow within
 Module doc updated to five tools.
 
 Tests: format pinned; a rendered handle resolves through `relate`; the output never exceeds the
-budget; a smaller budget shows fewer groups and a larger one shows more; truncation is announced
-with the count withheld; a budget too small for even one group still returns the header rather
-than an empty string; empty store says so; the tool is registered with the argument names
-clients send; no group identifier is ever emitted.
+budget except for the one-oversized-group floor below; a smaller budget shows fewer groups and a
+larger one shows more; truncation is announced with the count withheld; a budget too small for
+even one group still shows that one group rather than an empty result, matching `ask.rs`'s own
+`fit_evidence_to_budget` precedent; a genuinely empty store says so, distinctly from the
+too-small-budget case; the tool is registered with the argument names clients send; no group
+identifier is ever emitted.
 
 ## Traps
 
