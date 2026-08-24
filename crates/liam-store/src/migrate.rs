@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Guarded, idempotent column migration for existing databases.
+//! Guarded, idempotent migration for existing databases.
 //!
 //! `schema.rs` is entirely `CREATE TABLE IF NOT EXISTS`, so editing a table's
 //! DDL there does nothing for anyone who already has a database: the
-//! statement is skipped wholesale. This is the one mechanism this crate has
-//! for a column that a fresh database gets from the schema but an existing
-//! one does not. It is deliberately not a migration framework: no version
-//! table, no registry, no ordering of multiple migrations. One helper, called
-//! explicitly wherever a column needs to exist on an old database.
+//! statement is skipped wholesale. These helpers are how a fresh database and
+//! an existing one end up with the same shape.
+//!
+//! Still deliberately not a migration framework: no version table, no
+//! registry, no ordering. Each helper detects the state it cares about and
+//! makes it true, so calling it on an already-correct database is a no-op and
+//! the order they run in does not matter.
+//!
+//! Two exist. `add_column_if_missing` handles a column, through `ALTER TABLE`.
+//! `ensure_cascade` handles a CONSTRAINT, which `ALTER TABLE` cannot change at
+//! all, so it rebuilds the table.
 
 use crate::backend::Backend;
 use crate::error::{Error, Result};
@@ -58,6 +64,142 @@ pub async fn add_column_if_missing<B: Backend>(
         Err(Error::Backend(msg)) if msg.contains("duplicate column name") => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Tables whose `REFERENCES nodes(id)` must cascade. Fixed literals, never
+/// caller input, which is what makes interpolating them into SQL below safe.
+const CASCADING_TABLES: [&str; 2] = ["edges", "node_community"];
+
+/// Give every `REFERENCES nodes(id)` on `CASCADING_TABLES` an `ON DELETE
+/// CASCADE`, rebuilding any table that predates the clause (ADR-0003).
+///
+/// A constraint cannot be altered in place: SQLite has no `ALTER TABLE ... ALTER
+/// CONSTRAINT`, and re-running the `CREATE TABLE IF NOT EXISTS` from `schema.rs`
+/// silently skips an existing table. So the only way to reach a database that
+/// already exists is to rebuild the table, and the only way to know whether it
+/// needs one is to ask the database what constraint it currently holds.
+///
+/// Safe to call on every open. A database already carrying the clause is
+/// detected and left alone.
+pub async fn ensure_cascade<B: Backend>(backend: &B) -> Result<()> {
+    for table in CASCADING_TABLES {
+        if cascade_present(backend, table).await? {
+            continue;
+        }
+        rebuild_with_cascade(backend, table).await?;
+    }
+    Ok(())
+}
+
+/// Whether every foreign key on `table` already cascades on delete.
+///
+/// `pragma_foreign_key_list` reports one row per declared constraint with an
+/// `on_delete` column, so this asks the database rather than inferring from a
+/// version number. A table with no foreign keys at all needs nothing, which is
+/// why an empty result is `true` and not `false`.
+async fn cascade_present<B: Backend>(backend: &B, table: &str) -> Result<bool> {
+    let rows = backend
+        .query(
+            &format!("SELECT \"on_delete\" FROM pragma_foreign_key_list('{table}')"),
+            &[],
+        )
+        .await?;
+    for row in &rows {
+        if row.get_string(0)? != "CASCADE" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Rebuild `table` with `ON DELETE CASCADE` on its node references, preserving
+/// rows and explicitly-created indexes.
+///
+/// The new DDL is derived from the table's OWN stored `CREATE` statement rather
+/// than written out here, so a column added later is carried across without
+/// this function knowing about it. `sqlite_master` stores that text with
+/// leading comments and `IF NOT EXISTS` already stripped, confirmed by reading
+/// it back (see `sqlite_master_strips_comments_and_if_not_exists`).
+///
+/// Indexes are filtered to `sql IS NOT NULL`: an index SQLite creates itself
+/// for a PRIMARY KEY or UNIQUE has no SQL and comes back automatically with the
+/// new table, while re-issuing one would be an error.
+async fn rebuild_with_cascade<B: Backend>(backend: &B, table: &str) -> Result<()> {
+    let create = match first_string(
+        backend,
+        &format!("SELECT sql FROM sqlite_master WHERE type='table' AND name='{table}'"),
+    )
+    .await?
+    {
+        Some(sql) => sql,
+        // Nothing to rebuild. A caller that runs this before the schema exists
+        // should not be told the database is broken.
+        None => return Ok(()),
+    };
+    let indexes = all_strings(
+        backend,
+        &format!(
+            "SELECT sql FROM sqlite_master
+             WHERE type='index' AND tbl_name='{table}' AND sql IS NOT NULL"
+        ),
+    )
+    .await?;
+
+    let staging = format!("{table}_cascade_rebuild");
+    let new_create = create.replacen(table, &staging, 1).replace(
+        "REFERENCES nodes(id)",
+        "REFERENCES nodes(id) ON DELETE CASCADE",
+    );
+
+    // `PRAGMA foreign_keys` is a no-op inside a transaction, so the toggles sit
+    // OUTSIDE the BEGIN/COMMIT. Enforcement has to be off for the rebuild
+    // itself, because dropping the old table would otherwise trip the very
+    // constraints being replaced. `Backend::execute_batch` maps to libSQL's
+    // plain batch, which does NOT wrap in a transaction (its
+    // `execute_transactional_batch` is the one that does), so this sequence
+    // survives intact. Confirmed by running it, not from the docs.
+    //
+    // `DROP TABLE IF EXISTS` on the staging name first, so a process that died
+    // mid-rebuild, or lost a race to another process, does not wedge every
+    // later start on a leftover table.
+    let mut batch = String::from("PRAGMA foreign_keys=OFF;\nBEGIN;\n");
+    batch.push_str(&format!("DROP TABLE IF EXISTS {staging};\n"));
+    batch.push_str(&new_create);
+    batch.push_str(";\n");
+    batch.push_str(&format!("INSERT INTO {staging} SELECT * FROM {table};\n"));
+    batch.push_str(&format!("DROP TABLE {table};\n"));
+    batch.push_str(&format!("ALTER TABLE {staging} RENAME TO {table};\n"));
+    for index in &indexes {
+        batch.push_str(index);
+        batch.push_str(";\n");
+    }
+    batch.push_str("COMMIT;\nPRAGMA foreign_keys=ON;\n");
+    backend.execute_batch(&batch).await?;
+
+    // Turns the enforcement-off window from an assumption into a check.
+    // `execute_batch` discards results, so this runs as its own query: a
+    // violation comes back as rows, not as an error.
+    let violations = backend.query("PRAGMA foreign_key_check", &[]).await?;
+    if !violations.is_empty() {
+        return Err(Error::Backend(format!(
+            "cascade rebuild of {table} left {} foreign key violation(s)",
+            violations.len()
+        )));
+    }
+    Ok(())
+}
+
+async fn first_string<B: Backend>(backend: &B, sql: &str) -> Result<Option<String>> {
+    let rows = backend.query(sql, &[]).await?;
+    match rows.first() {
+        Some(row) => Ok(Some(row.get_string(0)?)),
+        None => Ok(None),
+    }
+}
+
+async fn all_strings<B: Backend>(backend: &B, sql: &str) -> Result<Vec<String>> {
+    let rows = backend.query(sql, &[]).await?;
+    rows.iter().map(|row| row.get_string(0)).collect()
 }
 
 /// Whether `table` already has `column`, read from `PRAGMA table_info`.
@@ -291,5 +433,222 @@ mod tests {
 
         // Assert
         assert!(matches!(err, Error::Backend(ref msg) if msg.contains("duplicate column name")));
+    }
+
+    // ---- ensure_cascade (ADR-0003) ----
+
+    /// An "old" database: the shape `schema.rs` produced before ADR-0003, with
+    /// plain REFERENCES, two explicit indexes, and a row to preserve.
+    async fn legacy_shape(backend: &DefaultBackend) {
+        backend
+            .execute_batch(
+                "CREATE TABLE nodes (rowid INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE);
+                 CREATE TABLE edges (
+                   id   TEXT NOT NULL PRIMARY KEY,
+                   src  TEXT NOT NULL REFERENCES nodes(id),
+                   dst  TEXT NOT NULL REFERENCES nodes(id),
+                   type TEXT NOT NULL
+                 );
+                 CREATE INDEX edges_out ON edges (src, type);
+                 CREATE INDEX edges_in  ON edges (dst, type);
+                 CREATE TABLE node_community (
+                   node_id   TEXT NOT NULL PRIMARY KEY REFERENCES nodes(id),
+                   community INTEGER NOT NULL
+                 );
+                 INSERT INTO nodes (id) VALUES ('a'), ('b');
+                 INSERT INTO edges VALUES ('e1', 'a', 'b', 'mentions');
+                 INSERT INTO node_community VALUES ('a', 7);",
+            )
+            .await
+            .expect("legacy schema");
+    }
+
+    async fn on_delete_of(backend: &DefaultBackend, table: &str) -> Vec<String> {
+        backend
+            .query(
+                &format!("SELECT \"on_delete\" FROM pragma_foreign_key_list('{table}')"),
+                &[],
+            )
+            .await
+            .expect("foreign_key_list")
+            .iter()
+            .map(|r| r.get_string(0).expect("on_delete"))
+            .collect()
+    }
+
+    async fn count(backend: &DefaultBackend, sql: &str) -> i64 {
+        backend.query(sql, &[]).await.expect("count")[0]
+            .get_i64(0)
+            .expect("integer")
+    }
+
+    /// Grounds the assumption `rebuild_with_cascade` rests on: the stored
+    /// `CREATE` text has leading comments and `IF NOT EXISTS` already removed,
+    /// so it can be reused directly as the staging table's DDL.
+    #[tokio::test]
+    async fn sqlite_master_strips_comments_and_if_not_exists() {
+        let (_dir, backend) = file_backend_at("master.db").await;
+        backend
+            .execute_batch(
+                "-- a leading comment, as schema.rs has
+                 CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)",
+            )
+            .await
+            .expect("create");
+
+        let sql = first_string(&backend, "SELECT sql FROM sqlite_master WHERE name='t'")
+            .await
+            .expect("query")
+            .expect("one row");
+
+        assert!(sql.starts_with("CREATE TABLE t"), "got: {sql}");
+        assert!(!sql.contains("comment"), "comment leaked into stored sql");
+        assert!(!sql.contains("IF NOT EXISTS"), "IF NOT EXISTS was kept");
+    }
+
+    /// Grounds the index filter: an index SQLite creates for a PRIMARY KEY has
+    /// no SQL and must not be re-issued, while an explicit one does.
+    #[tokio::test]
+    async fn autoindexes_have_no_sql_but_explicit_indexes_do() {
+        let (_dir, backend) = file_backend_at("idx.db").await;
+        backend
+            .execute_batch(
+                "CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT);
+                 CREATE INDEX t_v ON t (v);",
+            )
+            .await
+            .expect("create");
+
+        let explicit = all_strings(
+            &backend,
+            "SELECT sql FROM sqlite_master
+             WHERE type='index' AND tbl_name='t' AND sql IS NOT NULL",
+        )
+        .await
+        .expect("query");
+        let all = count(
+            &backend,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='t'",
+        )
+        .await;
+
+        assert_eq!(explicit.len(), 1, "only the explicit index carries sql");
+        assert_eq!(all, 2, "but both indexes exist");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_database_gains_cascade_keeping_its_rows_and_indexes() {
+        let (_dir, backend) = file_backend_at("legacy.db").await;
+        legacy_shape(&backend).await;
+        assert_eq!(
+            on_delete_of(&backend, "edges").await,
+            ["NO ACTION", "NO ACTION"]
+        );
+
+        ensure_cascade(&backend).await.expect("migrate");
+
+        assert_eq!(
+            on_delete_of(&backend, "edges").await,
+            ["CASCADE", "CASCADE"]
+        );
+        assert_eq!(on_delete_of(&backend, "node_community").await, ["CASCADE"]);
+        assert_eq!(count(&backend, "SELECT COUNT(*) FROM edges").await, 1);
+        assert_eq!(
+            count(&backend, "SELECT COUNT(*) FROM node_community").await,
+            1
+        );
+        assert_eq!(
+            count(
+                &backend,
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND tbl_name='edges' AND sql IS NOT NULL"
+            )
+            .await,
+            2,
+            "both explicit indexes must come back"
+        );
+        // No staging table left behind.
+        assert_eq!(
+            count(
+                &backend,
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_cascade_rebuild'"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn after_migrating_a_node_delete_takes_its_references_with_it() {
+        // The point of the whole exercise: the database enforces the ordering
+        // that `gc` previously had to get right by hand.
+        let (_dir, backend) = file_backend_at("fires.db").await;
+        legacy_shape(&backend).await;
+        ensure_cascade(&backend).await.expect("migrate");
+
+        backend
+            .execute("DELETE FROM nodes WHERE id = 'a'", &[])
+            .await
+            .expect("delete must not fail on a referenced node");
+
+        assert_eq!(count(&backend, "SELECT COUNT(*) FROM edges").await, 0);
+        assert_eq!(
+            count(&backend, "SELECT COUNT(*) FROM node_community").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn running_ensure_cascade_again_changes_nothing() {
+        let (_dir, backend) = file_backend_at("idempotent.db").await;
+        legacy_shape(&backend).await;
+        ensure_cascade(&backend).await.expect("first");
+
+        ensure_cascade(&backend).await.expect("second is a no-op");
+
+        assert_eq!(
+            on_delete_of(&backend, "edges").await,
+            ["CASCADE", "CASCADE"]
+        );
+        assert_eq!(count(&backend, "SELECT COUNT(*) FROM edges").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_column_added_after_this_migration_was_written_still_survives_it() {
+        // The new DDL is derived from the table's own stored CREATE, so a column
+        // this function has never heard of is carried across. Writing the
+        // columns out by hand here would silently drop it.
+        let (_dir, backend) = file_backend_at("extra_col.db").await;
+        legacy_shape(&backend).await;
+        backend
+            .execute(
+                "ALTER TABLE edges ADD COLUMN future_col TEXT DEFAULT 'kept'",
+                &[],
+            )
+            .await
+            .expect("add column");
+
+        ensure_cascade(&backend).await.expect("migrate");
+
+        let names: Vec<String> = column_names(&backend, "edges").await;
+        assert!(names.contains(&"future_col".to_string()), "{names:?}");
+        assert_eq!(
+            backend
+                .query("SELECT future_col FROM edges", &[])
+                .await
+                .expect("select")[0]
+                .get_string(0)
+                .expect("text"),
+            "kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_table_is_not_an_error() {
+        // `ensure_cascade` runs on open, and a caller could reach it before the
+        // schema exists. That should be a no-op, not a failure to start.
+        let (_dir, backend) = file_backend_at("no_tables.db").await;
+
+        ensure_cascade(&backend).await.expect("no tables is fine");
     }
 }

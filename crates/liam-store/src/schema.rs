@@ -55,22 +55,22 @@ END;
 
 -- The REFERENCES below are ENFORCED, not decoration. libSQL turns foreign keys
 -- on by default, unlike stock SQLite, and no `PRAGMA foreign_keys` is needed or
--- present. Anything deleting a `nodes` row must remove the rows referencing it
--- first, in `edges` (src, dst) and `node_community` (node_id); `Graph::gc` does
--- exactly that, per retention rule. Getting this backwards fails the delete with
--- 'FOREIGN KEY constraint failed' rather than leaving a dangling row.
+-- present.
 --
--- `ON DELETE CASCADE` is the better end state and is deliberately NOT here yet.
--- Adding it to this DDL would only affect databases created afterwards: every
--- statement here is `CREATE TABLE IF NOT EXISTS`, so an existing table keeps its
--- original constraint, and SQLite cannot ALTER one. Confirmed by running it:
--- re-creating a table with the clause leaves `pragma_foreign_key_list` still
--- reporting `NO ACTION`. So it would read as fixed on every fresh test database
--- while leaving real stores broken. It needs a table rebuild and its own record.
+-- `ON DELETE CASCADE` puts the delete-ordering rule in the database instead of
+-- in every caller that removes a node (ADR-0003). It reaches EXISTING databases
+-- only through `migrate::ensure_cascade`: every statement here is
+-- `CREATE TABLE IF NOT EXISTS`, so an existing table keeps the constraint it was
+-- created with, and SQLite cannot ALTER one. Adding the clause here alone would
+-- read as fixed on every fresh test database while leaving real stores broken.
+--
+-- `Graph::gc` still deletes referencing rows explicitly, and that is not
+-- redundant: it is the guard on any backend that does not enforce foreign keys,
+-- which includes the stubbed rusqlite one and stock SQLite generally.
 CREATE TABLE IF NOT EXISTS edges (
   id         TEXT    NOT NULL PRIMARY KEY,
-  src        TEXT    NOT NULL REFERENCES nodes(id),
-  dst        TEXT    NOT NULL REFERENCES nodes(id),
+  src        TEXT    NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  dst        TEXT    NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
   type       TEXT    NOT NULL,
   attributes TEXT    NOT NULL DEFAULT '{}',
   tx_from    INTEGER NOT NULL,
@@ -98,7 +98,7 @@ CREATE INDEX IF NOT EXISTS edges_in  ON edges (dst, type, tx_to);
     sql.push_str(
         "
 CREATE TABLE IF NOT EXISTS node_community (
-  node_id     TEXT    NOT NULL PRIMARY KEY REFERENCES nodes(id),
+  node_id     TEXT    NOT NULL PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
   community   INTEGER NOT NULL,
   computed_at INTEGER NOT NULL
 );

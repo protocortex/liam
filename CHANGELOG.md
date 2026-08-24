@@ -6,6 +6,14 @@ All notable changes to LIAM are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Deleting a memory now removes its relationships and cluster assignment
+  automatically, enforced by the database rather than by each caller. Stores
+  created before this are upgraded in place the next time the daemon starts, so
+  no action is needed. The upgrade rebuilds two internal tables and runs once,
+  so the first start after updating takes a little longer on a large store.
+
 ### Fixed
 
 - Garbage collection no longer fails on any store that holds a relationship.
