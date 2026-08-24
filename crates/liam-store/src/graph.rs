@@ -92,6 +92,10 @@ impl<B: Backend> Graph<B> {
             "TEXT NOT NULL DEFAULT 'unknown'",
         )
         .await?;
+        // Gives an existing database the ON DELETE CASCADE that the DDL above
+        // only grants a fresh one, by rebuilding the referencing tables
+        // (ADR-0003). Detects and no-ops on a database that already has it.
+        crate::migrate::ensure_cascade(&backend).await?;
         Ok(Self {
             backend,
             clock,
