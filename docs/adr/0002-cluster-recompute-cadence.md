@@ -612,3 +612,45 @@ them things the record left undecided and an implementer would otherwise decide 
    row being absent.** Numerically it does not matter, since an all-fresh seed renumbers to the
    identity a cold run builds anyway. It matters for bookkeeping, because only a cold run
    advances `last_cold_start_at`, and calling a singleton seed warm is a lie in the logs.
+
+### Amendment 6: the staleness check itself was still two reads (2026-08-24)
+
+Found while blueprinting Segment S4, before any code was written, and confirmed against the
+same read-never-serializes-with-writes fact Amendment 5 already established.
+
+**The defect.** Amendment 5 closed the read window on the recompute path: `edges_with_fingerprint`
+takes the edge set and its fingerprint from one statement, so a `relate` landing mid-read cannot
+leave the stored value ahead of the graph. The **check** path, `communities()`'s own staleness
+comparison, still had the shape Amendment 5 fixed one level down: `read_cluster_state` then
+`edge_fingerprint`, two statements, on connections that never serialize with a writer.
+
+A `relate` landing between them produces the identical failure Amendment 5 exists to prevent,
+reintroduced on the sibling path. Reading live first and state second is the more natural way to
+write it, and is the unsafe order: the live read misses the new edge, the state read (running
+after the edge landed) still reflects the pre-edge assignment, and the two compare equal, so the
+check reports "nothing changed" over a store that just changed. The order the code happened to
+use, state first then live, was safe, but nothing declared that load-bearing and no test pinned
+it. S4 adds the tick as a second caller of this same check, doubling the exposure.
+
+**The fix, same shape as Amendment 5.** One statement, with the stored state as scalar
+subqueries alongside the live aggregate:
+
+```sql
+SELECT COUNT(*), MAX(tx_from),
+       (SELECT edge_count         FROM cluster_state LIMIT 1),
+       (SELECT max_tx_from        FROM cluster_state LIMIT 1),
+       (SELECT computed_at        FROM cluster_state LIMIT 1),
+       (SELECT last_cold_start_at FROM cluster_state LIMIT 1)
+  FROM edges WHERE tx_to = ?1 AND type != ?2
+```
+
+Confirmed through the real backend, not only `sqlite3`: an empty store returns exactly one row,
+`(0, NULL, NULL, NULL, NULL, NULL)`; a populated one returns all six values on that row. The four
+`cluster_state` columns are declared `NOT NULL`, so they come back either all present (a row
+exists) or all NULL (it does not), never a mix, which keeps the `None` test as unambiguous as it
+was before and Defect 2 cannot return through it.
+
+**Not a replacement for the two existing reads.** `edge_fingerprint` keeps its own callers (the
+cheap check that answers "did anything change" without touching `cluster_state` at all) and
+`read_cluster_state` keeps its own (migration test fixtures). The combined read is a third
+method, used only by the staleness check both the tick and `communities()` now share.

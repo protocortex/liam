@@ -8,6 +8,10 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- Clustering's staleness check is now one database read instead of two, closing
+  a window where a relationship recorded at the wrong moment could leave a
+  stale grouping looking current. Recorded as ADR-0002 Amendment 6.
+
 - Deleting a memory now removes its relationships and cluster assignment
   automatically, enforced by the database rather than by each caller. Stores
   created before this are upgraded in place the next time the daemon starts, so
