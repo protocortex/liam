@@ -341,3 +341,13 @@ pub struct ClusterState {
     pub computed_at: Millis,
     pub last_cold_start_at: Millis,
 }
+
+/// One node inside a rendered community group. No community id: the integer
+/// Leiden assigns is not durable across runs, so it must never reach a
+/// client as something to store or compare (ADR-0002).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClusterMember {
+    pub id: NodeId,
+    pub kind: String,
+    pub label: String,
+}

@@ -26,8 +26,8 @@ pub use error::{Error, Result};
 pub use graph::Graph;
 pub use ids::{EdgeId, Millis, NodeId, FOREVER, HANDLE_LEN};
 pub use types::{
-    relation, Change, ClusterState, ExplainedHit, Fingerprint, GcReport, GraphConfig, Hit, NewEdge,
-    NewNode, Query, RetentionPolicy, RetentionRule,
+    relation, Change, ClusterMember, ClusterState, ExplainedHit, Fingerprint, GcReport,
+    GraphConfig, Hit, NewEdge, NewNode, Query, RetentionPolicy, RetentionRule,
 };
 pub use value::{Row, Value};
 

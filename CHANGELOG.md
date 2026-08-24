@@ -41,6 +41,14 @@ All notable changes to LIAM are recorded here. The format follows
   `supersedes`, refuses a self-loop, and refuses an endpoint that is no longer
   live. Asserting the same relation twice is a no-op rather than a second edge.
 
+- `clusters` MCP tool, listing the memory clusters community detection found,
+  largest first, in the same `[kind handle] label` shape `recall` uses so a
+  handle it prints feeds straight into `relate`. Output is bounded by a token
+  budget of one tenth the configured model context rather than a fixed count,
+  so a machine with more memory sees more before it starts withholding groups.
+  No cluster is ever named by its internal number: that number is reassigned
+  on every recompute, so nothing durable would be left to compare it against.
+
 ### Changed
 
 - `recall` now prints a handle for each hit, as `[kind handle] label`. An agent

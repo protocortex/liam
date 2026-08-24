@@ -8,6 +8,7 @@
 
 mod ask;
 mod cli;
+mod clusters;
 /// Grounding eval for `ask`; test-only, see the module docs to run it.
 #[cfg(test)]
 mod eval;

@@ -7,7 +7,7 @@
 //! instant T when it was recorded before T, not yet superseded at T, and true
 //! in the world at T. Passing a past T yields point-in-time recall.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::backend::Backend;
@@ -16,8 +16,8 @@ use crate::error::{Error, Result};
 use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
 use crate::schema::schema;
 use crate::types::{
-    Change, ClusterState, ExplainedHit, Fingerprint, GcReport, GraphConfig, Hit, NewEdge, NewNode,
-    Query, RetentionPolicy,
+    Change, ClusterMember, ClusterState, ExplainedHit, Fingerprint, GcReport, GraphConfig, Hit,
+    NewEdge, NewNode, Query, RetentionPolicy,
 };
 use crate::value::{Row, Value};
 
@@ -1080,6 +1080,39 @@ impl<B: Backend> Graph<B> {
         self.stored_communities().await
     }
 
+    /// Live nodes grouped by community, largest group first, with no
+    /// community id on any member: it isn't durable across runs, so it must
+    /// never look like something a client can store.
+    ///
+    /// Filters on `live_at`, matching what `recall` would show, because
+    /// `node_community` can legitimately hold a superseded node: clustering
+    /// filters edge liveness, not node liveness (ADR-0001).
+    pub async fn community_groups(&self) -> Result<Vec<Vec<ClusterMember>>> {
+        self.refresh_communities().await?;
+        let now = self.clock.now();
+        let sql = format!(
+            "SELECT nc.community, n.id, n.kind, n.label
+               FROM node_community nc JOIN nodes n ON n.id = nc.node_id
+              WHERE {live}
+              ORDER BY nc.community, n.id",
+            live = live_at("n", 1),
+        );
+        let rows = self.backend.query(&sql, &[now.into()]).await?;
+
+        let mut members = Vec::with_capacity(rows.len());
+        for row in &rows {
+            members.push((
+                row.get_i64(0)?,
+                ClusterMember {
+                    id: NodeId::from_raw(row.get_string(1)?),
+                    kind: row.get_string(2)?,
+                    label: row.get_string(3)?,
+                },
+            ));
+        }
+        Ok(group_and_sort_communities(members))
+    }
+
     /// The stored assignment, with no staleness check. `pub(crate)` so the only
     /// way out of the crate is the checked path above.
     pub(crate) async fn stored_communities(&self) -> Result<Vec<(NodeId, i64)>> {
@@ -1102,6 +1135,26 @@ fn ids_from(rows: &[Row]) -> Result<Vec<NodeId>> {
     rows.iter()
         .map(|r| Ok(NodeId::from_raw(r.get_string(0)?)))
         .collect()
+}
+
+/// Groups members by community id, largest group first, tied groups broken by
+/// the first member's id. A free function (not inline in `community_groups`)
+/// so the tie-break is testable against fixed input, independent of what
+/// numeric id Leiden happens to assign.
+fn group_and_sort_communities(members: Vec<(i64, ClusterMember)>) -> Vec<Vec<ClusterMember>> {
+    let mut by_community: BTreeMap<i64, Vec<ClusterMember>> = BTreeMap::new();
+    for (community, member) in members {
+        by_community.entry(community).or_default().push(member);
+    }
+    // No entry in `by_community` is ever empty: it's only created by
+    // `.or_default().push(...)`, which adds a member in the same step.
+    let mut groups: Vec<Vec<ClusterMember>> = by_community.into_values().collect();
+    groups.sort_by(|a, b| {
+        b.len()
+            .cmp(&a.len())
+            .then_with(|| a[0].id.as_str().cmp(b[0].id.as_str()))
+    });
+    groups
 }
 
 fn row_f64(row: &Row, i: usize) -> f64 {
@@ -3152,6 +3205,152 @@ mod tests {
         assert!(
             g.refresh_communities().await.unwrap(),
             "a new edge must be reported as work"
+        );
+    }
+
+    // ---- WU-12a: community_groups ----
+
+    #[tokio::test]
+    async fn a_superseded_node_does_not_appear_in_any_group() {
+        // Clustering filters edge liveness, not node liveness (ADR-0001), so
+        // node_community can legitimately name a superseded node. Rendering
+        // must not surface it.
+        let g = graph_at(Millis(1000)).await;
+        let old = g
+            .upsert_by(NewNode::now("fact", "Rollout", "first").with_subject("rollout"))
+            .await
+            .unwrap();
+        let other = g.insert(NewNode::now("fact", "other", "x")).await.unwrap();
+        g.relate(&old, &other, "mentions").await.unwrap();
+        g.upsert_by(NewNode::now("fact", "Rollout", "second").with_subject("rollout"))
+            .await
+            .unwrap();
+
+        let groups = g.community_groups().await.unwrap();
+
+        let ids: Vec<&str> = groups.iter().flatten().map(|m| m.id.as_str()).collect();
+        assert!(!ids.contains(&old.as_str()), "{ids:?}");
+        assert!(
+            ids.contains(&other.as_str()),
+            "the live neighbour must still appear: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_whose_members_are_all_superseded_is_not_returned() {
+        let g = graph_at(Millis(1000)).await;
+        let a = g
+            .upsert_by(NewNode::now("fact", "A", "first").with_subject("a"))
+            .await
+            .unwrap();
+        let b = g
+            .upsert_by(NewNode::now("fact", "B", "first").with_subject("b"))
+            .await
+            .unwrap();
+        g.relate(&a, &b, "mentions").await.unwrap();
+        g.upsert_by(NewNode::now("fact", "A", "second").with_subject("a"))
+            .await
+            .unwrap();
+        g.upsert_by(NewNode::now("fact", "B", "second").with_subject("b"))
+            .await
+            .unwrap();
+
+        let groups = g.community_groups().await.unwrap();
+
+        assert!(
+            groups.is_empty(),
+            "an all-superseded group must not appear: {groups:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn groups_come_back_largest_first_with_a_deterministic_tie_break() {
+        let g = graph_at(Millis(1000)).await;
+        // A triangle (size 3) plus TWO same-sized pairs, so the sort has both
+        // a real size difference and a real tie to resolve.
+        let mut three = Vec::new();
+        for label in ["t1", "t2", "t3"] {
+            three.push(g.insert(NewNode::now("fact", label, "x")).await.unwrap());
+        }
+        for (u, v) in [(0, 1), (1, 2), (0, 2)] {
+            g.relate(&three[u], &three[v], "mentions").await.unwrap();
+        }
+        let mut pair_a = Vec::new();
+        for label in ["a1", "a2"] {
+            pair_a.push(g.insert(NewNode::now("fact", label, "x")).await.unwrap());
+        }
+        g.relate(&pair_a[0], &pair_a[1], "mentions").await.unwrap();
+        let mut pair_b = Vec::new();
+        for label in ["b1", "b2"] {
+            pair_b.push(g.insert(NewNode::now("fact", label, "x")).await.unwrap());
+        }
+        g.relate(&pair_b[0], &pair_b[1], "mentions").await.unwrap();
+
+        let first = g.community_groups().await.unwrap();
+        let second = g.community_groups().await.unwrap();
+
+        assert_eq!(first[0].len(), 3, "the triangle sorts first: {first:?}");
+        assert_eq!(first[1].len(), 2);
+        assert_eq!(first[2].len(), 2);
+        assert!(
+            first[1][0].id.as_str() < first[2][0].id.as_str(),
+            "tied groups must break on the first member's id: {first:?}"
+        );
+        assert_eq!(first, second, "ordering must be stable across calls");
+    }
+
+    #[test]
+    fn tied_groups_break_on_the_first_members_id_not_on_community_number() {
+        // Community 1 holds the lexicographically LARGER id, community 9 the
+        // smaller one, so a mutant that trusts community-number order instead
+        // of breaking the tie on id gets this backwards on every run: no
+        // dependence on Leiden's actual numbering or on hash order.
+        let member = |id: &str| ClusterMember {
+            id: NodeId::from_raw(id.to_string()),
+            kind: "fact".to_string(),
+            label: "x".to_string(),
+        };
+        let groups =
+            group_and_sort_communities(vec![(1, member("z-member")), (9, member("a-member"))]);
+
+        assert_eq!(groups[0][0].id.as_str(), "a-member", "{groups:?}");
+        assert_eq!(groups[1][0].id.as_str(), "z-member", "{groups:?}");
+    }
+
+    #[tokio::test]
+    async fn every_member_carries_the_kind_and_label_recall_would_show() {
+        let g = graph_at(Millis(1000)).await;
+        let a = g
+            .insert(NewNode::now("decision", "Adopt libSQL", "x"))
+            .await
+            .unwrap();
+        let b = g
+            .insert(NewNode::now("fact", "Metal enabled", "x"))
+            .await
+            .unwrap();
+        g.relate(&a, &b, "mentions").await.unwrap();
+
+        let groups = g.community_groups().await.unwrap();
+
+        let members = &groups[0];
+        assert!(members
+            .iter()
+            .any(|m| m.id == a && m.kind == "decision" && m.label == "Adopt libSQL"));
+        assert!(members
+            .iter()
+            .any(|m| m.id == b && m.kind == "fact" && m.label == "Metal enabled"));
+    }
+
+    #[tokio::test]
+    async fn community_groups_refreshes_before_reading() {
+        let (g, _clock, a, b) = seeded_pair(Millis(1000)).await;
+        let _ = (&a, &b);
+
+        let groups = g.community_groups().await.unwrap();
+
+        assert!(
+            !groups.is_empty(),
+            "a store that has never clustered must still refresh first"
         );
     }
 }
