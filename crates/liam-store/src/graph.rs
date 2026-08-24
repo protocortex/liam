@@ -921,10 +921,98 @@ impl<B: Backend> Graph<B> {
     /// Recompute the assignment unconditionally and persist it with the
     /// fingerprint of the graph it was built from.
     ///
-    /// Callers wanting "recompute only if stale" want `communities`, which is
-    /// the seam both the GC tick and the read side share.
+    /// Callers wanting "recompute only if stale" want `refresh_communities`
+    /// (or `communities`, which wraps it), the seam both the GC tick and the
+    /// read side share.
     pub async fn recompute_communities(&self) -> Result<usize> {
         self.recompute_with(self.read_cluster_state().await?).await
+    }
+
+    /// The stored state and the live fingerprint, from ONE statement.
+    ///
+    /// `communities`'s staleness check used to be two reads, `read_cluster_state`
+    /// then `edge_fingerprint`, on connections that never serialize with a
+    /// writer. A `relate` landing between them can leave the check reading a
+    /// live fingerprint from BEFORE the edge and a stored state from... still
+    /// before the edge too, which sounds safe, except the reverse order is also
+    /// possible: read live first, then a `relate` lands, then read state second
+    /// still sees the OLD state, so the two still compare equal even though an
+    /// edge the live read never saw has since landed. Either read-order leaves
+    /// a window where "safe" is a coincidence of which read happened to run
+    /// first, not a guarantee, which is precisely the failure `edges_with_fingerprint`
+    /// closed on the recompute path (Amendment 5) and reopens here one level up.
+    /// ADR-0002 Amendment 6.
+    ///
+    /// Scalar subqueries, not a join, so an edgeless store still returns exactly
+    /// one row via the aggregate and `cluster_state` being empty shows up as
+    /// four NULLs on that one row rather than zero rows. Confirmed through the
+    /// real backend, not only `sqlite3`.
+    ///
+    /// A new method, not a replacement for `read_cluster_state` or
+    /// `edge_fingerprint`: both have callers of their own (the cheap check, and
+    /// the migration test fixtures) that want exactly one half of this.
+    async fn staleness_snapshot(&self) -> Result<(Option<ClusterState>, Fingerprint)> {
+        let sql = format!(
+            "SELECT COUNT(*), MAX(tx_from),
+               (SELECT edge_count         FROM cluster_state LIMIT 1),
+               (SELECT max_tx_from        FROM cluster_state LIMIT 1),
+               (SELECT computed_at        FROM cluster_state LIMIT 1),
+               (SELECT last_cold_start_at FROM cluster_state LIMIT 1)
+             FROM edges {LIVE_SEMANTIC_EDGES}"
+        );
+        let rows = self
+            .backend
+            .query(
+                &sql,
+                &[FOREVER.into(), crate::types::relation::SUPERSEDES.into()],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            // The aggregate has no GROUP BY, so it always returns one row.
+            return Err(Error::Backend(
+                "staleness snapshot query returned no row".into(),
+            ));
+        };
+        let live = Fingerprint {
+            edge_count: row.get_i64(0)?,
+            max_tx_from: max_tx_from_of(row, 1)?,
+        };
+        // The four `cluster_state` columns are declared NOT NULL (`schema.rs`),
+        // so they come back either all present (a row exists) or all NULL (it
+        // does not); testing column 2 alone is enough to tell which. Reading a
+        // NULL here as a zero fingerprint would be Defect 2 again: an edgeless
+        // store's live fingerprint IS `(0, 0)`, so a defaulted state would match
+        // it and serve a stale assignment forever.
+        let state = match row.0.get(2) {
+            Some(Value::Null) | None => None,
+            _ => Some(ClusterState {
+                fingerprint: Fingerprint {
+                    edge_count: row.get_i64(2)?,
+                    max_tx_from: Millis(row.get_i64(3)?),
+                },
+                computed_at: Millis(row.get_i64(4)?),
+                last_cold_start_at: Millis(row.get_i64(5)?),
+            }),
+        };
+        Ok((state, live))
+    }
+
+    /// Recompute only if the stored assignment no longer matches the live edge
+    /// set; report whether it did.
+    ///
+    /// This, not `recompute_communities`, is the seam both the GC tick and
+    /// `communities` share, so the invariant "the assignment matches the
+    /// fingerprint" lives in one place. `recompute_communities` runs Leiden
+    /// unconditionally and would defeat the tick's whole purpose: ADR-0002's
+    /// own "an idle store does no clustering work at all" only holds if the
+    /// tick can find out nothing changed without paying for a run.
+    pub async fn refresh_communities(&self) -> Result<bool> {
+        let (state, live) = self.staleness_snapshot().await?;
+        if state.as_ref().map(|s| s.fingerprint) == Some(live) {
+            return Ok(false);
+        }
+        self.recompute_with(state).await?;
+        Ok(true)
     }
 
     async fn recompute_with(&self, state: Option<ClusterState>) -> Result<usize> {
@@ -1002,10 +1090,6 @@ impl<B: Backend> Graph<B> {
     /// Community assignments, recomputing first if the stored one no longer
     /// matches the live edge set.
     ///
-    /// This is the seam. Both the GC tick and any read path go through it, so
-    /// the invariant "the assignment matches the fingerprint" is enforced in
-    /// one place rather than duplicated into two that can drift.
-    ///
     /// **The integers are not durable.** Leiden renumbers by first appearance
     /// over a dense index that shifts whenever the edge set changes, so the
     /// number labelling a group can differ between calls even when the grouping
@@ -1017,14 +1101,7 @@ impl<B: Backend> Graph<B> {
     /// prevent. `execute_atomic` is all or nothing, so the previous assignment
     /// survives intact.
     pub async fn communities(&self) -> Result<Vec<(NodeId, i64)>> {
-        let state = self.read_cluster_state().await?;
-        let live = self.edge_fingerprint().await?;
-        // `None` means this store has never clustered and must recompute. It is
-        // NOT a zero fingerprint: an edgeless store would match that and serve
-        // an assignment written by a build predating `cluster_state`.
-        if state.map(|s| s.fingerprint) != Some(live) {
-            self.recompute_with(state).await?;
-        }
+        self.refresh_communities().await?;
         self.stored_communities().await
     }
 
@@ -2872,6 +2949,16 @@ mod tests {
     static INTERPOSE: std::sync::Mutex<Option<(String, String, String)>> =
         std::sync::Mutex::new(None);
 
+    /// How many issued queries contained a watched substring, independent of
+    /// `INTERPOSE`. Set the substring, run the call under test, read the
+    /// count. Exists for exactly one property that injection cannot show:
+    /// that a staleness check is ONE statement rather than two. `INTERPOSE`
+    /// proves what happens when a write lands between reads; this proves
+    /// there is no "between" to land in, by counting how many reads there
+    /// actually were.
+    static QUERY_MATCH_COUNT: std::sync::Mutex<(String, usize)> =
+        std::sync::Mutex::new((String::new(), 0));
+
     /// Delegates everything to the real backend, except that one query fires a
     /// single injected write after it returns.
     ///
@@ -2889,6 +2976,12 @@ mod tests {
         }
         async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
             let rows = self.0.query(sql, params).await?;
+            {
+                let mut watch = QUERY_MATCH_COUNT.lock().unwrap();
+                if !watch.0.is_empty() && sql.contains(watch.0.as_str()) {
+                    watch.1 += 1;
+                }
+            }
             let fire = {
                 let mut slot = INTERPOSE.lock().unwrap();
                 match slot.as_ref() {
@@ -2999,5 +3092,108 @@ mod tests {
             "a fingerprint written ahead of the graph would skip this recompute"
         );
         assert_eq!(after.fingerprint.edge_count, 2);
+    }
+
+    // ---- WU-11a: the shared refresh seam (ADR-0002 Amendment 6) ----
+
+    #[tokio::test]
+    async fn the_staleness_check_reads_state_and_live_in_one_statement() {
+        // Amendment 6's guard. `communities()` used to be two reads
+        // (`read_cluster_state` then `edge_fingerprint`), and reads never
+        // serialize with writes, so a `relate` landing between them could
+        // leave the check comparing a live fingerprint from one instant
+        // against a stored state from a different one. Whichever order that
+        // race resolves in, "safe" was a coincidence of which read happened
+        // to run first, not a guarantee.
+        //
+        // `INTERPOSE` (used above) proves what a write landing BETWEEN reads
+        // does. It cannot prove there is no "between" left to land in, only a
+        // literal count of how many reads occurred can. That is what this
+        // pins: exactly one query matches the combined statement's unique
+        // opening, `MAX(tx_from),` with a trailing comma. `edge_fingerprint`'s
+        // own query has no comma there (it goes straight to `FROM`), and
+        // `edges_with_fingerprint`'s uses `OVER ()`, so neither can inflate
+        // this count by accident.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g: Graph<Interposing> =
+            Graph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+                .await
+                .unwrap();
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+        g.relate(&a, &b, "mentions").await.unwrap();
+
+        *QUERY_MATCH_COUNT.lock().unwrap() = ("MAX(tx_from),".to_string(), 0);
+        g.refresh_communities().await.unwrap();
+
+        assert_eq!(
+            QUERY_MATCH_COUNT.lock().unwrap().1,
+            1,
+            "the staleness check must be one statement, not two"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_cluster_state_row_reads_as_no_prior_run_on_the_combined_read() {
+        // Defect 2, reproduced on the new read path: `None` must never be
+        // defaulted into a zero fingerprint. `cluster_state`'s four columns
+        // are declared NOT NULL, so on an empty table the combined statement's
+        // scalar subqueries all come back NULL on the one aggregate row, and
+        // that NULL group must map to `None`, not to `(0, 0)`.
+        let g = graph_at(Millis(1000)).await;
+
+        let (state, live) = g.staleness_snapshot().await.unwrap();
+
+        assert!(state.is_none());
+        assert_eq!(
+            live.edge_count, 0,
+            "an edgeless store's live side is (0, 0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edgeless_store_with_a_prior_assignment_and_no_state_still_refreshes() {
+        // The same fixture shape as the pre-Amendment-6 migration test,
+        // exercised against the new combined read: a database with a
+        // populated `node_community` and no `cluster_state` row. If `None`
+        // were defaulted to `(0, 0)`, it would MATCH an edgeless store's live
+        // fingerprint and serve that stale assignment forever.
+        let g = graph_at(Millis(1000)).await;
+        let orphan = g.insert(NewNode::now("fact", "lonely", "x")).await.unwrap();
+        g.backend
+            .execute(
+                "INSERT INTO node_community (node_id, community, computed_at) VALUES (?1, 7, 1)",
+                &[orphan.as_str().into()],
+            )
+            .await
+            .unwrap();
+
+        let did_work = g.refresh_communities().await.unwrap();
+
+        assert!(did_work, "a missing cluster_state row must force a refresh");
+        assert!(g.stored_communities().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_work_only_when_there_is_work() {
+        let (g, clock, a, _b) = seeded_pair(Millis(1000)).await;
+
+        assert!(
+            g.refresh_communities().await.unwrap(),
+            "first call on a store that has never clustered must do work"
+        );
+        assert!(
+            !g.refresh_communities().await.unwrap(),
+            "nothing changed since the first call"
+        );
+
+        clock.set(Millis(1000 + 3_600_000));
+        let c = g.insert(NewNode::now("fact", "c", "x")).await.unwrap();
+        g.relate(&a, &c, "mentions").await.unwrap();
+
+        assert!(
+            g.refresh_communities().await.unwrap(),
+            "a new edge must be reported as work"
+        );
     }
 }
