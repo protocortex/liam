@@ -49,14 +49,15 @@ const DEFAULT_PRODUCER: &str = "unknown";
 const MAX_ATTRIBUTES_CHARS: usize = 2000;
 
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
-/// handlers apply the same k/embedding/kind/scope shape to a `Query`; keeping
-/// it in one place means a future filter only needs to change here.
+/// handlers apply the same k/embedding/kind/scope/as_of shape to a `Query`;
+/// keeping it in one place means a future filter only needs to change here.
 fn build_query(
     text: &str,
     k: Option<usize>,
     kind: Option<String>,
     scope: Option<String>,
     embedding: Option<Vec<f32>>,
+    as_of: Option<i64>,
 ) -> Query {
     let mut q = Query::text(text.to_string()).with_k(k.unwrap_or(8));
     if let Some(e) = embedding {
@@ -67,6 +68,9 @@ fn build_query(
     }
     if let Some(scope) = scope {
         q = q.with_scope(scope);
+    }
+    if let Some(as_of) = as_of {
+        q = q.with_as_of(liam_store::Millis(as_of));
     }
     q
 }
@@ -99,6 +103,10 @@ pub struct RecallArgs {
     pub kind: Option<String>,
     pub scope: Option<String>,
     pub k: Option<usize>,
+    /// Optional point-in-time recall, epoch milliseconds. Omitted means
+    /// "now"; a past instant surfaces the version of each subject that was
+    /// live then.
+    pub as_of: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -118,6 +126,10 @@ pub struct AskArgs {
     pub kind: Option<String>,
     pub scope: Option<String>,
     pub k: Option<usize>,
+    /// Optional point-in-time recall, epoch milliseconds. Omitted means
+    /// "now"; a past instant retrieves the version of each subject that was
+    /// live then.
+    pub as_of: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -326,7 +338,14 @@ impl MemoryServer {
     #[tool(description = "Retrieve relevant long-term memory, reranked for precision.")]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let embedding = self.embedder.embed(&args.query).await.ok();
-        let q = build_query(&args.query, args.k, args.kind, args.scope, embedding);
+        let q = build_query(
+            &args.query,
+            args.k,
+            args.kind,
+            args.scope,
+            embedding,
+            args.as_of,
+        );
         let hits = match self.store.query(&q).await {
             Ok(h) => h,
             Err(e) => return format!("recall failed: {e}"),
@@ -437,7 +456,14 @@ impl MemoryServer {
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
         let embedding = self.embedder.embed(&args.question).await.ok();
         let k = clamp_ask_k(args.k);
-        let q = build_query(&args.question, Some(k), args.kind, args.scope, embedding);
+        let q = build_query(
+            &args.question,
+            Some(k),
+            args.kind,
+            args.scope,
+            embedding,
+            args.as_of,
+        );
         let hits = match self.store.query_explained(&q).await {
             Ok(h) => h,
             Err(e) => return format!("ask failed: {e}"),
@@ -561,7 +587,7 @@ impl ServerHandler for MemoryServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use liam_store::{GraphConfig, Millis, HANDLE_LEN};
+    use liam_store::{FixedClock, GraphConfig, Millis, HANDLE_LEN};
     use serde_json::json;
 
     /// Always-errors `Llm`, so `ask` must fall back to the retrieved evidence.
@@ -832,6 +858,49 @@ mod tests {
             Arc::new(liam_model::MockLlm),
         )
         .await
+    }
+
+    /// Server backed by a `FixedClock`-driven store instead of the real
+    /// clock `plain_server`/`server_with_timeout` use. WHY: the `as_of`
+    /// tests need to pin exact millisecond instants across two writes, and a
+    /// real clock on an in-memory store is flaky at that resolution; the
+    /// clock is handed back so a test can `.set()` it between writes. Same
+    /// neutral doubles as `plain_server` otherwise.
+    async fn server_with_clock(clock: Arc<FixedClock>) -> MemoryServer {
+        let store = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock)
+            .await
+            .expect("open in-memory store");
+        MemoryServer::new(
+            Arc::new(store),
+            Arc::new(liam_model::MockEmbedder::new(8)),
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            1,
+        )
+    }
+
+    /// Writes one version of the fixed subject `"price"` for the `as_of`
+    /// tests: a second call with the clock advanced supersedes the first
+    /// instead of inserting a competing live node, mirroring
+    /// `Graph::upsert_by_supersedes_same_subject` at the store layer.
+    async fn remember_version(server: &MemoryServer, label: &str, content: &str) -> String {
+        let out = server
+            .remember(Parameters(RememberArgs {
+                kind: "fact".to_string(),
+                label: label.to_string(),
+                content: content.to_string(),
+                scope: None,
+                subject: Some("price".to_string()),
+                attributes: None,
+                valid_from: None,
+                confidence: None,
+            }))
+            .await;
+        assert!(out.starts_with("remembered "), "seed failed: {out}");
+        out.trim_start_matches("remembered ").to_string()
     }
 
     /// Self-cleaning temp database path, unique per call so parallel test
@@ -1221,6 +1290,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1285,6 +1355,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: Some(5),
+                as_of: None,
             }))
             .await;
 
@@ -1323,6 +1394,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: Some(3),
+                as_of: None,
             }))
             .await;
 
@@ -1364,6 +1436,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1406,6 +1479,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1441,6 +1515,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1479,6 +1554,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1518,6 +1594,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1561,6 +1638,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1604,6 +1682,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
         let elapsed = start.elapsed();
@@ -1652,6 +1731,7 @@ mod tests {
             kind: None,
             scope: None,
             k: None,
+            as_of: None,
         };
 
         // Act: two ask calls in flight at once, contending for the single
@@ -1711,6 +1791,7 @@ mod tests {
             kind: None,
             scope: None,
             k: None,
+            as_of: None,
         };
 
         let holder = server.clone();
@@ -1752,6 +1833,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1789,6 +1871,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1825,6 +1908,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1853,6 +1937,7 @@ mod tests {
                 kind: Some("decision".to_string()),
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1891,6 +1976,7 @@ mod tests {
                 kind: None,
                 scope: Some("proj-a".to_string()),
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1915,6 +2001,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: Some(1),
+                as_of: None,
             }))
             .await;
 
@@ -1960,6 +2047,7 @@ mod tests {
                 kind: Some("decision".to_string()),
                 scope: Some("proj-a".to_string()),
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -1994,6 +2082,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: Some(1),
+                as_of: None,
             }))
             .await;
 
@@ -2027,6 +2116,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -2058,6 +2148,7 @@ mod tests {
                 kind: None,
                 scope: None,
                 k: None,
+                as_of: None,
             }))
             .await;
 
@@ -2370,5 +2461,170 @@ mod tests {
         for field in ["\"k\"", "\"members\""] {
             assert!(schema.contains(field), "{field} missing from {schema}");
         }
+    }
+
+    #[tokio::test]
+    async fn recall_as_of_returns_only_the_version_live_at_that_instant() {
+        // Arrange: two versions of one subject, written at two clock instants.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let server = server_with_clock(clock.clone()).await;
+        remember_version(&server, "v1", "zorbnax price is 10").await;
+        clock.set(Millis(2000));
+        remember_version(&server, "v2", "zorbnax price is 20").await;
+
+        // Act: as_of pinned to the first write's instant.
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax price".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: Some(1000),
+            }))
+            .await;
+
+        // Assert: only the first version was live at t0.
+        assert!(out.contains("] v1"), "missing first version: {out}");
+        assert!(!out.contains("] v2"), "second version leaked: {out}");
+    }
+
+    #[tokio::test]
+    async fn ask_as_of_reflects_only_the_version_live_at_that_instant() {
+        // Arrange: same two-version setup, checked through ask's evidence
+        // rather than recall's rendered text.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let server = server_with_clock(clock.clone()).await;
+        remember_version(&server, "v1", "zorbnax price is 10").await;
+        clock.set(Millis(2000));
+        remember_version(&server, "v2", "zorbnax price is 20").await;
+
+        // Act: as_of pinned to the first write's instant.
+        let answer = server
+            .ask(Parameters(AskArgs {
+                question: "What is the zorbnax price?".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: Some(1000),
+            }))
+            .await;
+
+        // Assert: only the first version's content reached the model as
+        // evidence (the echo llm repeats whatever it was handed).
+        assert!(
+            answer.contains("price is 10"),
+            "missing first version: {answer}"
+        );
+        assert!(
+            !answer.contains("price is 20"),
+            "second version leaked: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_as_of_before_the_first_write_returns_no_hits() {
+        // Arrange: one node written at t0.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let server = server_with_clock(clock).await;
+        remember_version(&server, "v1", "zorbnax price is 10").await;
+
+        // Act: as_of set before the subject existed at all.
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax price".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: Some(500),
+            }))
+            .await;
+
+        // Assert
+        assert_eq!(out, "no relevant memory", "expected zero hits: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_as_of_after_all_writes_returns_only_the_current_version() {
+        // Arrange: two versions of one subject.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let server = server_with_clock(clock.clone()).await;
+        remember_version(&server, "v1", "zorbnax price is 10").await;
+        clock.set(Millis(2000));
+        remember_version(&server, "v2", "zorbnax price is 20").await;
+
+        // Act: as_of well after both writes.
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax price".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: Some(3000),
+            }))
+            .await;
+
+        // Assert: exactly one hit, and it is the current version, not the
+        // superseded one this pins exclusion of.
+        assert_eq!(out.split("\n\n").count(), 1, "expected 1 block: {out}");
+        assert!(out.contains("] v2"), "missing current version: {out}");
+        assert!(!out.contains("] v1"), "superseded version leaked: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_as_of_exactly_at_the_second_writes_valid_from_is_live() {
+        // `live_at` uses `valid_from <= t` and `tx_from <= t`, both
+        // inclusive, so as_of pinned to the exact instant of a write already
+        // sees that write; see `live_at` in `liam-store`'s `graph.rs`.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let server = server_with_clock(clock.clone()).await;
+        remember_version(&server, "v1", "zorbnax price is 10").await;
+        clock.set(Millis(2000));
+        remember_version(&server, "v2", "zorbnax price is 20").await;
+
+        // Act: as_of pinned exactly to the second write's instant.
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax price".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: Some(2000),
+            }))
+            .await;
+
+        // Assert: the boundary instant already counts as live for the
+        // second version, and the first is already superseded by then.
+        assert_eq!(out.split("\n\n").count(), 1, "expected 1 block: {out}");
+        assert!(
+            out.contains("] v2"),
+            "missing current version at boundary: {out}"
+        );
+        assert!(
+            !out.contains("] v1"),
+            "superseded version should not be live: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_without_as_of_behaves_like_no_time_filter() {
+        // Arrange: a single node, as_of omitted.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let server = server_with_clock(clock).await;
+        seed(&server, "fact", "Now", "zorbnax status is stable").await;
+
+        // Act
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax status".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+
+        // Assert: omitting as_of still finds the current version, the same
+        // behavior every pre-WU-2 recall test already pins.
+        assert!(out.contains("] Now"), "missing match: {out}");
     }
 }
