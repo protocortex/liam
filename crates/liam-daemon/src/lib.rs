@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! The internals shared by the two binaries this crate ships.
 //!
 //! `liamd` is the daemon that serves memory over MCP. `liam` is the

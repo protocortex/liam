@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Pure formatting for the `clusters` tool. Sync + dependency-light, like
 //! `ask.rs`, so the budget fit and the format are unit-testable without a
 //! store or model.

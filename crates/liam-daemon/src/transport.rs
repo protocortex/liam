@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! `liamd serve`'s transport: how a listener is obtained and served.
 //!
 //! `socket` owns the listener, the path handling around it, and the accept

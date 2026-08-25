@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Guarded, idempotent migration for existing databases.
 //!
 //! `schema.rs` is entirely `CREATE TABLE IF NOT EXISTS`, so editing a table's

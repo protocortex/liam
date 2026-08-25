@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! liam-store: a bitemporal graph store with hybrid retrieval.
 //!
 //! Nothing is overwritten: superseded facts stay readable as history. The store

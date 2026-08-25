@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! MCP tool surface: `remember`, `recall`, `relate`, `ask`, and `clusters`,
 //! wiring the store and the model.
 //!

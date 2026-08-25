@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Config path resolution and model construction, shared by `liamd` and `liam`.
 //!
 //! The daemon calls these at startup to build what it serves with. The CLI

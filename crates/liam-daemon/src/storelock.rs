@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Exclusive advisory lock so only one process opens the store at a time.
 //!
 //! The plan deliberately keeps plain `liamd` a store-opening stdio server so

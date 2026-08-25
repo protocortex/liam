@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Public value types. Domain-agnostic: `kind`, edge `type`, `scope`, and
 //! `subject` are opaque strings; `attributes` is a JSON bag the library stores
 //! and returns without interpreting.

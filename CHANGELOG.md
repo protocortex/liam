@@ -8,6 +8,9 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- License changed from AGPL-3.0-only to Apache-2.0. Applies going forward only; releases already
+  published under AGPL-3.0-only keep those terms for anyone who already has them.
+
 - Clustering's staleness check is now one database read instead of two, closing
   a window where a relationship recorded at the wrong moment could leave a
   stale grouping looking current. Recorded as ADR-0002 Amendment 6.

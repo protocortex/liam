@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Backend selection. `DefaultBackend` resolves to the enabled backend, and
 //! `DefaultGraph` (in the crate root) is `Graph` over it.
 //!

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! liam-model: embedding and reranking for liam.
 //!
 //! The store is model-free by design. This crate holds the `Embedder` and

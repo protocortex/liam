@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! `liam`: the command line tool a person runs.
 //!
 //! Split from `liamd` because the two serve different moments. `liamd` is

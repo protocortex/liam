@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Backend-neutral values and rows. Every backend converts these to and from
 //! its own types, so the shared graph logic speaks one vocabulary. Rows are
 //! materialized (owned), which sidesteps the sync-versus-async streaming

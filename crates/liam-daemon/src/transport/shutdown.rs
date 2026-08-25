@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Ordered shutdown: what stops the daemon, and in which order.
 //!
 //! The order is the whole point, because with concurrent clients the naive
