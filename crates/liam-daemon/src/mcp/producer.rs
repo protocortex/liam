@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Producer resolution: turn an MCP client's declared name into the
 //! canonical producer id recorded on every node it writes.
 //!

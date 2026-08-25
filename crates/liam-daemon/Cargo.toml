@@ -2,7 +2,7 @@
 name = "liam-daemon"
 version = "0.1.0"
 edition = "2021"
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 description = "MCP server exposing liam memory to agents."
 
 # Two binaries, one crate, on purpose. `liamd` is the daemon; `liam` is the

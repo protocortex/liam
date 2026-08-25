@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! The stdio proxy: a shuttle between this process's stdin/stdout and a
 //! running daemon's Unix socket.
 //!

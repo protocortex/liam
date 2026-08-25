@@ -3,7 +3,7 @@ name = "liam-store"
 version = "0.1.0"
 edition = "2021"
 description = "A bitemporal graph store with hybrid retrieval, generic over libSQL or SQLite."
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 
 # Pin exact versions with `cargo add`. Enable exactly one backend feature.
 [dependencies]

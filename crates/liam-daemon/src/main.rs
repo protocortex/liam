@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! liam-daemon: serves liam memory to agents over MCP.
 //!
 //! A thin shell wiring `liam-store` (retrieval) and `liam-model`

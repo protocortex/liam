@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! The Unix socket listener: path handling, binding, permissions, and the
 //! accept loop that serves `MemoryServer` to however many clients connect.
 //!

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Argument parsing, and the mode it selects.
 //!
 //! Kept in its own module, with the mode as a plain enum, so `main` stays a

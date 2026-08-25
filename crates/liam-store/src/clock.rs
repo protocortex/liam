@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Time is a dependency, not an ambient call, so supersession and validity
 //! windows are testable at a chosen instant.
 

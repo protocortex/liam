@@ -256,9 +256,9 @@ signatures) and the leiden-rs membership accessor in `cluster.rs`.
 
 ## License
 
-AGPL-3.0-only. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).
 
-Dependencies are a separate matter: LIAM takes no strong copyleft dependency. Everything in the
-tree is permissive (MIT, Apache-2.0, BSD, ISC, Zlib, and similar) apart from MPL-2.0, which is
-weak, file-level copyleft. `cargo deny check licenses` enforces that with an allowlist, so a new
-GPL, LGPL, or AGPL dependency fails CI rather than arriving unnoticed.
+Dependencies stay to the same standard: everything in the tree is permissive (MIT, Apache-2.0,
+BSD, ISC, Zlib, and similar) apart from MPL-2.0, which is weak, file-level copyleft.
+`cargo deny check licenses` enforces that with an allowlist, so a new GPL, LGPL, or AGPL
+dependency fails CI rather than arriving unnoticed.

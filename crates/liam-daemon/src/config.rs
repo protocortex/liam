@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! All daemon configuration in one TOML file. Missing file or key falls back to
 //! defaults; unknown keys are rejected so typos fail loudly.
 
