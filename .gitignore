@@ -14,3 +14,5 @@
 /.liam/
 .claude/designs/
 .claude/plans/
+.claude/implement/
+.claude/worktrees/
