@@ -346,14 +346,14 @@ impl MemoryServer {
             embedding,
             args.as_of,
         );
-        let hits = match self.store.query(&q).await {
+        let hits = match self.store.query_explained(&q).await {
             Ok(h) => h,
             Err(e) => return format!("recall failed: {e}"),
         };
         if hits.is_empty() {
             return "no relevant memory".to_string();
         }
-        let docs: Vec<String> = hits.iter().map(|h| h.content.clone()).collect();
+        let docs: Vec<String> = hits.iter().map(|h| h.hit.content.clone()).collect();
         let order = self
             .reranker
             .order(&args.query, &docs)
@@ -363,15 +363,33 @@ impl MemoryServer {
         // one bracketed field. It is here because an agent cannot link what it
         // recalled without a name for it, which is the gap ADR-0001 exists to
         // close. 13 characters, not the full 26: see `liam_store::HANDLE_LEN`.
+        //
+        // Confidence and attributes render as trailing lines instead, never
+        // inside the bracket. ADR-0004 records putting confidence in the
+        // bracket as a rejected alternative: it broke `resolve_handle`'s
+        // alphanumeric-only gate, so the bracket stays `[{kind} {handle}]`
+        // and nothing else, under every combination of these fields.
         order
             .iter()
             .map(|&i| {
+                let hit = &hits[i];
+                let confidence_line = if hit.confidence != 1.0 {
+                    format!("\nconfidence: {:.2}", hit.confidence)
+                } else {
+                    String::new()
+                };
+                let attributes_line = match &hit.hit.attributes {
+                    serde_json::Value::Object(map) if !map.is_empty() => {
+                        format!("\nattributes: {}", hit.hit.attributes)
+                    }
+                    _ => String::new(),
+                };
                 format!(
-                    "[{} {}] {}\n{}",
-                    hits[i].kind,
-                    hits[i].id.handle(),
-                    hits[i].label,
-                    hits[i].content
+                    "[{} {}] {}\n{}{confidence_line}{attributes_line}",
+                    hit.hit.kind,
+                    hit.hit.id.handle(),
+                    hit.hit.label,
+                    hit.hit.content
                 )
             })
             .collect::<Vec<_>>()
@@ -2140,6 +2158,193 @@ mod tests {
             "the zorbnax rollout is approved",
         )
         .await;
+        seed(&server, "fact", "Beta", "the zorbnax rollout costs money").await;
+
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax rollout".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+
+        let handles: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix('['))
+            .filter_map(|l| l.split_once(']'))
+            .filter_map(|(head, _)| head.split_once(' '))
+            .map(|(_, handle)| handle)
+            .collect();
+        assert_eq!(handles.len(), 2, "expected a handle per hit: {out}");
+        for handle in &handles {
+            assert_eq!(handle.len(), HANDLE_LEN, "{handle}");
+        }
+
+        let related = server
+            .relate(Parameters(RelateArgs {
+                from: handles[0].to_string(),
+                to: handles[1].to_string(),
+                kind: "mentions".to_string(),
+            }))
+            .await;
+        assert!(related.starts_with("related "), "{related}");
+    }
+
+    #[tokio::test]
+    async fn recall_shows_confidence_when_not_default() {
+        // Given a hit remembered with a non-default confidence
+        let server = plain_server().await;
+        server
+            .remember(Parameters(RememberArgs {
+                confidence: Some(0.6),
+                ..remember_args("confidence render content")
+            }))
+            .await;
+
+        // When recall retrieves it
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "confidence render content".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+
+        // Then the confidence line renders with two decimal places
+        assert!(out.contains("confidence: 0.60"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn recall_shows_confidence_of_exactly_zero() {
+        // Given a hit remembered with confidence exactly 0.0, the low
+        // boundary, not just any non-default value
+        let server = plain_server().await;
+        server
+            .remember(Parameters(RememberArgs {
+                confidence: Some(0.0),
+                ..remember_args("zero confidence render content")
+            }))
+            .await;
+
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "zero confidence render content".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+
+        assert!(out.contains("confidence: 0.00"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn recall_shows_attributes_when_non_empty() {
+        // Given a hit remembered with a non-empty attributes object
+        let server = plain_server().await;
+        server
+            .remember(Parameters(RememberArgs {
+                attributes: Some(json!({"hue": "blue"})),
+                ..remember_args("attributes render content")
+            }))
+            .await;
+
+        // When recall retrieves it
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "attributes render content".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+
+        // Then the attributes line renders as compact JSON
+        assert!(out.contains(r#"attributes: {"hue":"blue"}"#), "{out}");
+    }
+
+    #[tokio::test]
+    async fn recall_omits_attributes_line_when_empty() {
+        // Given a hit remembered without attributes (the default, an empty
+        // JSON object)
+        let server = plain_server().await;
+        server
+            .remember(Parameters(remember_args("no attributes render content")))
+            .await;
+
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "no attributes render content".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+
+        assert!(!out.contains("attributes:"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn recall_shows_confidence_then_attributes_when_both_present() {
+        // Given a hit remembered with both non-default confidence and
+        // non-empty attributes
+        let server = plain_server().await;
+        server
+            .remember(Parameters(RememberArgs {
+                confidence: Some(0.5),
+                attributes: Some(json!({"hue": "blue"})),
+                ..remember_args("both confidence and attributes content")
+            }))
+            .await;
+
+        let out = server
+            .recall(Parameters(RecallArgs {
+                query: "both confidence and attributes content".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+
+        // Then both lines render, confidence before attributes
+        let confidence_at = out
+            .find("confidence: 0.50")
+            .expect("confidence line missing");
+        let attributes_at = out
+            .find(r#"attributes: {"hue":"blue"}"#)
+            .expect("attributes line missing");
+        assert!(confidence_at < attributes_at, "{out}");
+    }
+
+    #[tokio::test]
+    async fn recall_bracket_stays_kind_and_handle_only_with_confidence_and_attributes_present() {
+        // Two hits, one carrying non-default confidence and attributes, the
+        // other left at defaults: the bracket must stay exactly
+        // `[{kind} {handle}]` for both, no matter which fields the hit
+        // carries. This is the exact defect ADR-0004 records as a rejected
+        // alternative, putting confidence inside the bracket broke handle
+        // resolution against `resolve_handle`'s alphanumeric-only gate.
+        let server = plain_server().await;
+        server
+            .remember(Parameters(RememberArgs {
+                kind: "decision".to_string(),
+                label: "Alpha".to_string(),
+                content: "the zorbnax rollout is approved".to_string(),
+                scope: None,
+                subject: None,
+                attributes: Some(json!({"hue": "blue"})),
+                valid_from: None,
+                confidence: Some(0.4),
+            }))
+            .await;
         seed(&server, "fact", "Beta", "the zorbnax rollout costs money").await;
 
         let out = server
