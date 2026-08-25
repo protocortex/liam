@@ -33,6 +33,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 rmcp = { version = "3", features = ["server", "macros", "transport-io"] }
 schemars = "1"
+# `remember`'s `attributes` argument is a caller-supplied JSON object, passed
+# straight through to `liam_store::NewNode::with_attributes`.
+serde_json = "1"
 time = "0.3"
 # Mode dispatch. Declared directly even though leiden-rs pulls clap in through
 # liam-store anyway, and always will now that ADR-0002 made clustering
@@ -60,8 +63,6 @@ tokio-util = { version = "0.7", default-features = false }
 raunch = "1.0.1"
 
 [dev-dependencies]
-# Tests construct store `Hit`s directly, whose `attributes` is a JSON value.
-serde_json = "1"
 # storelock tests need an isolated, disposable directory per test.
 tempfile = "3"
 # WU-8's two-client acceptance test needs a real MCP client to drive the
