@@ -411,6 +411,8 @@ mod run {
                 label: "Storage engine".to_string(),
                 content: "LIAM stores all memory in libSQL, a single-file SQLite fork.".to_string(),
                 valid_from_ms: 0,
+                confidence: 1.0,
+                attributes: None,
             }],
         );
         let out = llm.complete(&system, &user).await.expect("completion");
@@ -472,6 +474,7 @@ mod run {
                     kind: None,
                     scope: None,
                     k: Some(4),
+                    as_of: None,
                 }))
                 .await;
             let elapsed = started.elapsed().as_secs_f64();

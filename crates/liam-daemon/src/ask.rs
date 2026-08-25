@@ -638,6 +638,29 @@ mod tests {
     }
 
     #[test]
+    fn render_evidence_orders_content_then_confidence_then_attributes() {
+        // Arrange: matches recall's own order (ADR-0004), pinned the same way
+        // recall_shows_confidence_then_attributes_when_both_present pins it.
+        let mut e = evidence("fact", "Sky color", "The sky is blue.", 0);
+        e.confidence = 0.5;
+        e.attributes = Some(r#"{"hue":"blue"}"#.to_string());
+
+        // Act
+        let rendered = render_evidence(&[e]);
+
+        // Assert
+        let content_at = rendered.find("The sky is blue.").expect("content missing");
+        let confidence_at = rendered
+            .find("confidence: 0.50")
+            .expect("confidence line missing");
+        let attributes_at = rendered
+            .find(r#"attributes: {"hue":"blue"}"#)
+            .expect("attributes line missing");
+        assert!(content_at < confidence_at, "{rendered}");
+        assert!(confidence_at < attributes_at, "{rendered}");
+    }
+
+    #[test]
     fn neutralize_fence_leaves_ordinary_text_unchanged() {
         // Arrange / Act / Assert: single and double brackets are common in prose
         // and code (`a << b`, `x >> y`, generics), so only triples are touched.

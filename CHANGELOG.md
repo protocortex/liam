@@ -61,6 +61,21 @@ All notable changes to LIAM are recorded here. The format follows
   memory no longer reads as a topic. It also counts a pair of memories once even
   when a client states the relationship in both directions.
 
+### Added
+
+- `remember` accepts `attributes` (a JSON object), `valid_from` (a backdated instant), and
+  `confidence`, so a client can write the same shape of fact the store has always been able to
+  hold, not just kind, label, and content. `confidence` outside `0.0` to `1.0` and `attributes`
+  that is not a JSON object are rejected rather than silently accepted. Recorded as ADR-0004.
+- `recall` and `ask` accept `as_of`, an epoch-millisecond instant, so a client can ask what was
+  true at a past moment instead of only now. Recorded as ADR-0004.
+
+### Changed
+
+- `recall` and `ask` now show `confidence` and `attributes` on a hit when either was set to
+  something other than the default, as trailing lines after the memory's content. A hit with
+  neither set renders exactly as before. Recorded as ADR-0004.
+
 ## [0.1.1] - 2026-08-22
 
 First release with a published artifact. macOS on Apple Silicon only.
