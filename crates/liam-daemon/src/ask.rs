@@ -134,21 +134,22 @@ fn render_evidence(evidence: &[Evidence]) -> String {
         .enumerate()
         .map(|(i, e)| {
             let n = i + 1;
-            let confidence_line = if e.confidence != 1.0 {
-                format!("confidence: {:.2}\n", e.confidence)
-            } else {
-                String::new()
-            };
-            let attributes_line = match &e.attributes {
-                Some(attrs) => format!("attributes: {attrs}\n"),
-                None => String::new(),
-            };
+            // Content first, then confidence/attributes as trailing lines: the
+            // same order `recall` uses (ADR-0004), so a client reading both
+            // outputs sees one consistent shape.
+            let mut body = vec![e.content.clone()];
+            if e.confidence != 1.0 {
+                body.push(format!("confidence: {:.2}", e.confidence));
+            }
+            if let Some(attrs) = &e.attributes {
+                body.push(format!("attributes: {attrs}"));
+            }
             format!(
-                "{FENCE_OPEN} {n}>>>\n[{n}] ({}) {} — known since {}\n{confidence_line}{attributes_line}{}\n{FENCE_CLOSE} {n}>>>",
+                "{FENCE_OPEN} {n}>>>\n[{n}] ({}) {} — known since {}\n{}\n{FENCE_CLOSE} {n}>>>",
                 e.kind,
                 e.label,
                 fmt_millis(e.valid_from_ms),
-                e.content
+                body.join("\n")
             )
         })
         .collect::<Vec<_>>()
