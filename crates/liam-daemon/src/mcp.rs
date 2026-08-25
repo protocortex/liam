@@ -42,6 +42,12 @@ const SUFFICIENCY_MAX_TOKENS: usize = 8;
 /// producer onto records exactly what it recorded before this field existed.
 const DEFAULT_PRODUCER: &str = "unknown";
 
+/// Cap on serialized `attributes` size for `remember`. Deliberately a
+/// distinct constant from `ask::MAX_EVIDENCE_CHARS`, not a reuse of it:
+/// this bounds write-time input, that bounds a read-time prompt budget.
+/// Same value by consistency, not by coupling.
+const MAX_ATTRIBUTES_CHARS: usize = 2000;
+
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope shape to a `Query`; keeping
 /// it in one place means a future filter only needs to change here.
@@ -75,6 +81,16 @@ pub struct RememberArgs {
     pub scope: Option<String>,
     /// Optional identity; a new value with the same subject supersedes the old.
     pub subject: Option<String>,
+    /// Optional JSON object of extra fields the store returns verbatim.
+    /// Rejected if not an object, or if it serializes past
+    /// `MAX_ATTRIBUTES_CHARS`.
+    pub attributes: Option<serde_json::Value>,
+    /// Optional backdated "true as of" instant, epoch milliseconds. Omitted
+    /// means "now"; unlike `confidence` this takes no range check, since any
+    /// past or future instant is a meaningful valid time.
+    pub valid_from: Option<i64>,
+    /// Optional confidence override in `0.0..=1.0`. Omitted defaults to 1.0.
+    pub confidence: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -261,6 +277,23 @@ impl MemoryServer {
 
     #[tool(description = "Record a durable decision or fact into long-term memory.")]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
+        // Cheap checks first, before the embed call pays for a rejected
+        // request: the `relate` handler establishes this convention.
+        if let Some(c) = args.confidence {
+            if !(0.0..=1.0).contains(&c) {
+                return "remember failed: confidence must be between 0.0 and 1.0".to_string();
+            }
+        }
+        if let Some(v) = &args.attributes {
+            if !v.is_object() {
+                return "remember failed: attributes must be a JSON object".to_string();
+            }
+            if v.to_string().chars().count() > MAX_ATTRIBUTES_CHARS {
+                return format!(
+                    "remember failed: attributes exceeds {MAX_ATTRIBUTES_CHARS} characters"
+                );
+            }
+        }
         let embedding = match self.embedder.embed(&args.content).await {
             Ok(v) => v,
             Err(e) => return format!("embed failed: {e}"),
@@ -270,6 +303,15 @@ impl MemoryServer {
             .with_producer(self.producer());
         if let Some(scope) = args.scope {
             node = node.with_scope(scope);
+        }
+        if let Some(attributes) = args.attributes {
+            node = node.with_attributes(attributes);
+        }
+        if let Some(valid_from) = args.valid_from {
+            node = node.with_valid_from(liam_store::Millis(valid_from));
+        }
+        if let Some(confidence) = args.confidence {
+            node = node.with_confidence(confidence);
         }
         let write = match args.subject {
             Some(subject) => self.store.upsert_by(node.with_subject(subject)).await,
@@ -519,7 +561,8 @@ impl ServerHandler for MemoryServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use liam_store::{GraphConfig, HANDLE_LEN};
+    use liam_store::{GraphConfig, Millis, HANDLE_LEN};
+    use serde_json::json;
 
     /// Always-errors `Llm`, so `ask` must fall back to the retrieved evidence.
     struct FailingLlm;
@@ -771,6 +814,9 @@ mod tests {
                 content: content.to_string(),
                 scope: scope.map(str::to_string),
                 subject: None,
+                attributes: None,
+                valid_from: None,
+                confidence: None,
             }))
             .await;
         assert!(out.starts_with("remembered "), "seed failed: {out}");
@@ -836,6 +882,9 @@ mod tests {
                 content: "content".to_string(),
                 scope: None,
                 subject: None,
+                attributes: None,
+                valid_from: None,
+                confidence: None,
             }))
             .await;
         assert!(out.starts_with("remembered "), "remember failed: {out}");
@@ -857,6 +906,284 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    /// Bare-bones args for tests that only exercise one of `attributes`,
+    /// `valid_from`, or `confidence`; every other field is a fixed, unique
+    /// content string so a test can find its own node with `Query::text`.
+    fn remember_args(content: &str) -> RememberArgs {
+        RememberArgs {
+            kind: "fact".to_string(),
+            label: "label".to_string(),
+            content: content.to_string(),
+            scope: None,
+            subject: None,
+            attributes: None,
+            valid_from: None,
+            confidence: None,
+        }
+    }
+
+    /// A one-key JSON object whose `.to_string()` is exactly `total`
+    /// characters, for pinning `MAX_ATTRIBUTES_CHARS`'s boundary exactly
+    /// rather than guessing at serde_json's compact formatting.
+    fn attributes_of_length(total: usize) -> serde_json::Value {
+        let overhead = json!({"k": ""}).to_string().chars().count();
+        let padding = "a".repeat(total - overhead);
+        json!({ "k": padding })
+    }
+
+    #[tokio::test]
+    async fn remember_with_attributes_round_trips_through_query_explained() {
+        // Given a server and an attributes object to remember
+        let server = plain_server().await;
+
+        // When remember writes the node
+        let out = server
+            .remember(Parameters(RememberArgs {
+                attributes: Some(json!({"k": "v"})),
+                ..remember_args("attributes round trip content")
+            }))
+            .await;
+        assert!(out.starts_with("remembered "), "{out}");
+
+        // Then the store holds exactly the attributes sent
+        let hits = server
+            .store
+            .query_explained(&Query::text("attributes round trip content"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hit.attributes, json!({"k": "v"}));
+    }
+
+    #[tokio::test]
+    async fn remember_with_valid_from_sets_the_stored_instant_not_now() {
+        // Given a server and an explicit backdated valid_from
+        let server = plain_server().await;
+
+        // When remember writes the node
+        let out = server
+            .remember(Parameters(RememberArgs {
+                valid_from: Some(1000),
+                ..remember_args("valid from backdated content")
+            }))
+            .await;
+        assert!(out.starts_with("remembered "), "{out}");
+
+        // Then the store holds that instant, not the store's clock
+        let hits = server
+            .store
+            .query_explained(&Query::text("valid from backdated content"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].valid_from, Millis(1000));
+    }
+
+    #[tokio::test]
+    async fn remember_with_confidence_round_trips_through_query_explained() {
+        // Given a server and an explicit confidence
+        let server = plain_server().await;
+
+        // When remember writes the node
+        let out = server
+            .remember(Parameters(RememberArgs {
+                confidence: Some(0.75),
+                ..remember_args("confidence round trip content")
+            }))
+            .await;
+        assert!(out.starts_with("remembered "), "{out}");
+
+        // Then the store holds exactly that confidence
+        let hits = server
+            .store
+            .query_explained(&Query::text("confidence round trip content"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].confidence, 0.75);
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_out_of_range_confidence_without_writing() {
+        // Given a server, and several confidence values outside 0.0..=1.0
+        let server = plain_server().await;
+        let marker = "confidence boundary marker content";
+
+        for confidence in [-0.1, 1.1, 5.0] {
+            let before = server
+                .store
+                .query_explained(&Query::text(marker))
+                .await
+                .unwrap()
+                .len();
+
+            // When remember is called with that confidence
+            let out = server
+                .remember(Parameters(RememberArgs {
+                    confidence: Some(confidence),
+                    ..remember_args(marker)
+                }))
+                .await;
+
+            // Then it is refused with the exact error text, and no node lands
+            assert_eq!(
+                out, "remember failed: confidence must be between 0.0 and 1.0",
+                "confidence {confidence}: {out}"
+            );
+            let after = server
+                .store
+                .query_explained(&Query::text(marker))
+                .await
+                .unwrap()
+                .len();
+            assert_eq!(
+                after, before,
+                "confidence {confidence} wrote a node despite rejection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_accepts_confidence_at_its_inclusive_bounds() {
+        // Given a server, and confidence at each inclusive bound
+        let server = plain_server().await;
+
+        // Distinct marker words per bound, not a shared phrase: `fts5_query`
+        // ORs quoted terms together, so two contents sharing any word would
+        // each match the other's query too.
+        for (confidence, marker) in [(0.0, "confidencefloor"), (1.0, "confidenceceiling")] {
+            // When remember is called with that confidence
+            let out = server
+                .remember(Parameters(RememberArgs {
+                    confidence: Some(confidence),
+                    ..remember_args(marker)
+                }))
+                .await;
+
+            // Then it is accepted and round-trips exactly
+            assert!(
+                out.starts_with("remembered "),
+                "confidence {confidence}: {out}"
+            );
+            let hits = server
+                .store
+                .query_explained(&Query::text(marker))
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].confidence, confidence);
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_non_object_attributes() {
+        // Given a server, and several non-object attributes shapes
+        let server = plain_server().await;
+
+        for attributes in [json!(["a"]), json!("x"), json!(1), json!(true)] {
+            // When remember is called with that shape
+            let out = server
+                .remember(Parameters(RememberArgs {
+                    attributes: Some(attributes.clone()),
+                    ..remember_args("non object attributes content")
+                }))
+                .await;
+
+            // Then it is refused with the exact error text
+            assert_eq!(
+                out, "remember failed: attributes must be a JSON object",
+                "attributes {attributes:?}: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_attributes_boundary_at_the_max_char_cap() {
+        // Given attributes serialized to exactly MAX_ATTRIBUTES_CHARS
+        let server = plain_server().await;
+        let at_cap = attributes_of_length(MAX_ATTRIBUTES_CHARS);
+        assert_eq!(at_cap.to_string().chars().count(), MAX_ATTRIBUTES_CHARS);
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                attributes: Some(at_cap),
+                ..remember_args("attributes at cap content")
+            }))
+            .await;
+
+        // Then it is accepted
+        assert!(out.starts_with("remembered "), "{out}");
+
+        // Given attributes one character past the cap
+        let over_cap = attributes_of_length(MAX_ATTRIBUTES_CHARS + 1);
+        assert_eq!(
+            over_cap.to_string().chars().count(),
+            MAX_ATTRIBUTES_CHARS + 1
+        );
+        let marker = "attributes over cap content";
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                attributes: Some(over_cap),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused with the exact error text, and no node lands
+        assert_eq!(
+            out,
+            format!("remember failed: attributes exceeds {MAX_ATTRIBUTES_CHARS} characters")
+        );
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            after, before,
+            "over-cap attributes wrote a node despite rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_without_the_new_args_keeps_prior_defaults() {
+        // Given the pre-WU1 call shape: no attributes/valid_from/confidence
+        let server = plain_server().await;
+        let before = Millis::now();
+
+        // When remember writes the node
+        let out = server
+            .remember(Parameters(remember_args("regression pin content")))
+            .await;
+        assert!(out.starts_with("remembered "), "{out}");
+        let after = Millis::now();
+
+        // Then attributes/confidence keep their old defaults, and valid_from
+        // resolves to "now" within the call's own wall-clock window
+        let hits = server
+            .store
+            .query_explained(&Query::text("regression pin content"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hit.attributes, json!({}));
+        assert_eq!(hits[0].confidence, 1.0);
+        assert!(
+            hits[0].valid_from.0 >= before.0 && hits[0].valid_from.0 <= after.0,
+            "valid_from {:?} not within [{before:?}, {after:?}]",
+            hits[0].valid_from
+        );
     }
 
     /// Count rendered evidence blocks in a captured `system\nprompt` pair,
