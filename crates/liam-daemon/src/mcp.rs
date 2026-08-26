@@ -574,10 +574,16 @@ impl MemoryServer {
             Err(e) => return format!("embed failed: {e}"),
         };
         let mut nodes = Vec::with_capacity(1 + fact_count + entity_count);
+        // Cloned once and reused below: an episode's facts and entities
+        // share the top-level fact's scope (there is no per-item
+        // override), so every node built from here on applies the same
+        // `scope`. Cheap to clone at this size: episodes are capped at
+        // `MAX_EPISODE_ITEMS`.
+        let scope = args.scope;
         let mut top = NewNode::now(args.kind, args.label, args.content)
             .with_embedding(embedding)
             .with_producer(self.producer());
-        if let Some(scope) = args.scope {
+        if let Some(scope) = scope.clone() {
             top = top.with_scope(scope);
         }
         if let Some(attributes) = args.attributes {
@@ -602,6 +608,9 @@ impl MemoryServer {
             let mut node = NewNode::now(fact.kind, fact.label, fact.content)
                 .with_embedding(embedding)
                 .with_producer(self.producer());
+            if let Some(scope) = scope.clone() {
+                node = node.with_scope(scope);
+            }
             if let Some(attributes) = fact.attributes {
                 node = node.with_attributes(attributes);
             }
@@ -622,9 +631,12 @@ impl MemoryServer {
         // call: an entity's content is always empty by construction
         // (`NewNode::entity`), so there is nothing to embed.
         for entity in episode.entities {
-            nodes.push(
-                NewNode::entity(entity.entity_type, entity.name).with_producer(self.producer()),
-            );
+            let mut node =
+                NewNode::entity(entity.entity_type, entity.name).with_producer(self.producer());
+            if let Some(scope) = scope.clone() {
+                node = node.with_scope(scope);
+            }
+            nodes.push(node);
         }
 
         let edges: Vec<EpisodeEdge> = episode
@@ -2543,6 +2555,109 @@ mod tests {
                 hits.len(),
                 0,
                 "{marker} wrote a node despite rejection: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_facts_and_entities_inherit_the_top_level_scope() {
+        // Given a top-level fact scoped to "proj-x", plus one nested fact
+        // and one entity in the same episode
+        let server = plain_server().await;
+        let top_marker = "episode scope top content";
+        let fact_marker = "episode scope nested content";
+        let entity_marker = "Zorbnaxia";
+
+        // When remember is called with `scope: Some("proj-x")` on the
+        // top-level args
+        let out = server
+            .remember(Parameters(RememberArgs {
+                scope: Some("proj-x".to_string()),
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact(fact_marker)],
+                    entities: vec![episode_entity("person", entity_marker)],
+                    edges: vec![],
+                }),
+                ..remember_args(top_marker)
+            }))
+            .await;
+
+        // Then it succeeds, and a query scoped to "proj-x" finds every one
+        // of the three nodes: the doc comment on `EpisodeFactArgs` promises
+        // nested facts "share the top-level fact's scope"; this exercises
+        // entities too, which share the same contract. An entity has no
+        // content (`NewNode::entity` always leaves it empty), so its
+        // marker is matched on `label` instead of `content`.
+        assert!(!out.contains("failed"), "{out}");
+        for marker in [top_marker, fact_marker, entity_marker] {
+            let scoped = server
+                .store
+                .query_explained(&Query::text(marker).with_scope("proj-x"))
+                .await
+                .unwrap();
+            assert!(
+                scoped
+                    .iter()
+                    .any(|h| h.hit.content == marker || h.hit.label == marker),
+                "{marker} missing from the proj-x scope: {out}"
+            );
+
+            // And the same marker is invisible to a DIFFERENT scope's
+            // query, the isolation guarantee `scope` exists for. A node
+            // that silently landed unscoped (the bug this fixes) would
+            // leak into every scope's query instead, since
+            // `fetch_candidates`'s scope filter only activates when the
+            // QUERY carries a scope, and an unscoped row never equals a
+            // scoped filter value.
+            let other_scope = server
+                .store
+                .query_explained(&Query::text(marker).with_scope("proj-y"))
+                .await
+                .unwrap();
+            assert!(
+                other_scope.is_empty(),
+                "{marker} leaked into the proj-y scope: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_facts_and_entities_stay_unscoped_when_the_top_level_scope_is_absent(
+    ) {
+        // Given a top-level fact with no `scope` set, plus one nested fact
+        // and one entity, the shape every pre-refinement caller sends
+        let server = plain_server().await;
+        let top_marker = "episode no scope top content";
+        let fact_marker = "episode no scope nested content";
+        let entity_marker = "Quexlorn";
+
+        // When remember is called
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact(fact_marker)],
+                    entities: vec![episode_entity("person", entity_marker)],
+                    edges: vec![],
+                }),
+                ..remember_args(top_marker)
+            }))
+            .await;
+
+        // Then it succeeds, and every node (top-level fact, nested fact,
+        // entity) is invisible to ANY scoped query: an unscoped row's
+        // `scope` column is NULL, which never equals a `scope = ?` filter,
+        // so this stays true whether or not the fix landed and pins
+        // today's no-scope behavior against a regression.
+        assert!(!out.contains("failed"), "{out}");
+        for marker in [top_marker, fact_marker, entity_marker] {
+            let hits = server
+                .store
+                .query_explained(&Query::text(marker).with_scope("some-scope"))
+                .await
+                .unwrap();
+            assert!(
+                hits.is_empty(),
+                "{marker} was visible to a scoped query despite no scope being set: {out}"
             );
         }
     }
