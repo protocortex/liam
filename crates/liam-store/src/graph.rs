@@ -16,8 +16,8 @@ use crate::error::{Error, Result};
 use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
 use crate::schema::schema;
 use crate::types::{
-    Change, ClusterMember, ClusterState, ExplainedHit, Fingerprint, GcReport, GraphConfig, Hit,
-    NewEdge, NewNode, Query, RetentionPolicy,
+    Change, ClusterMember, ClusterState, EpisodeEdge, EpisodeRef, EpisodeResult, ExplainedHit,
+    Fingerprint, GcReport, GraphConfig, Hit, NewEdge, NewNode, Query, RetentionPolicy,
 };
 use crate::value::{Row, Value};
 
@@ -25,6 +25,83 @@ use crate::value::{Row, Value};
 /// one-character handle answers with something a caller can act on instead of
 /// every live node in the store.
 const HANDLE_MATCH_LIMIT: usize = 8;
+
+/// The combined guard `relate` conditions its edge INSERT on, and the
+/// diagnostic `relate_refusal` (and `Graph::ingest_episode`'s mirrored
+/// per-edge check) re-runs to name which of the three failed: source live,
+/// target live, edge already exists. Shared as one literal so the two call
+/// sites, one against `&Backend`, one against an open `BackendTx`, can never
+/// drift apart on the SQL itself. Bind order: src, dst, `FOREVER`, kind.
+const EDGE_REFUSAL_DIAGNOSTIC_SQL: &str = "SELECT
+   EXISTS(SELECT 1 FROM nodes WHERE id = ?1 AND tx_to = ?3),
+   EXISTS(SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?3),
+   EXISTS(SELECT 1 FROM edges
+          WHERE src = ?1 AND dst = ?2 AND type = ?4 AND tx_to = ?3)";
+
+/// The specific refusal message for a failed edge write, given the three
+/// flags `EDGE_REFUSAL_DIAGNOSTIC_SQL` produces. A free function, not a
+/// `Graph` method, since `Graph::ingest_episode` needs it against a
+/// `BackendTx` query result too, not just `&Backend`.
+fn edge_refusal(
+    source_live: bool,
+    target_live: bool,
+    edge_exists: bool,
+    src: &NodeId,
+    dst: &NodeId,
+    kind: &str,
+) -> Error {
+    if !source_live {
+        return Error::RelateRefused(format!("source node {} is not live", src.as_str()));
+    }
+    if !target_live {
+        return Error::RelateRefused(format!("target node {} is not live", dst.as_str()));
+    }
+    if edge_exists {
+        return Error::RelateRefused(format!(
+            "{} already relates to {} as '{kind}'",
+            src.as_str(),
+            dst.as_str()
+        ));
+    }
+    // Every guard passes now, so one of them flipped between the insert and
+    // this read. A retry would land.
+    Error::RelateRefused("a concurrent write took the row, retry".to_string())
+}
+
+/// Parses `EDGE_REFUSAL_DIAGNOSTIC_SQL`'s result rows into the refusal
+/// message they explain. A read fault (an absent row, or a non-integer
+/// column) surfaces as itself: `unwrap_or(0)` here would read as "this guard
+/// failed", and since column 0 is tested first, every backend fault would
+/// come back as a dead source node, a specific, confident, wrong diagnosis.
+fn edge_refusal_from_rows(rows: Vec<Row>, src: &NodeId, dst: &NodeId, kind: &str) -> Result<Error> {
+    let Some(row) = rows.first() else {
+        return Ok(Error::RelateRefused(
+            "no row explains the refusal".to_string(),
+        ));
+    };
+    let flags: std::result::Result<Vec<i64>, Error> = (0..3).map(|i| row.get_i64(i)).collect();
+    let flags = flags?;
+    Ok(edge_refusal(
+        flags[0] != 0,
+        flags[1] != 0,
+        flags[2] != 0,
+        src,
+        dst,
+        kind,
+    ))
+}
+
+/// Resolve an `EpisodeRef` to the node id it names inside one
+/// `ingest_episode` call: the pre-generated id at its index, for `New`, or
+/// the given id, for `Existing`. Every `New` index is validated in bounds
+/// before `ingest_episode` opens a transaction, so indexing here never
+/// panics.
+fn resolve_episode_ref<'a>(r: &'a EpisodeRef, ids: &'a [NodeId]) -> &'a NodeId {
+    match r {
+        EpisodeRef::New(i) => &ids[*i],
+        EpisodeRef::Existing(id) => id,
+    }
+}
 
 /// Bitemporal "live at T" predicate over an aliased nodes table. `?{t}` is T.
 fn live_at(alias: &str, t: usize) -> String {
@@ -257,11 +334,7 @@ impl<B: Backend> Graph<B> {
         let rows = self
             .backend
             .query(
-                "SELECT
-                   EXISTS(SELECT 1 FROM nodes WHERE id = ?1 AND tx_to = ?3),
-                   EXISTS(SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?3),
-                   EXISTS(SELECT 1 FROM edges
-                          WHERE src = ?1 AND dst = ?2 AND type = ?4 AND tx_to = ?3)",
+                EDGE_REFUSAL_DIAGNOSTIC_SQL,
                 &[
                     src.as_str().into(),
                     dst.as_str().into(),
@@ -270,40 +343,133 @@ impl<B: Backend> Graph<B> {
                 ],
             )
             .await;
-        let rows = match rows {
-            Ok(rows) => rows,
-            Err(e) => return e,
-        };
-        let Some(row) = rows.first() else {
-            return Error::RelateRefused("no row explains the refusal".to_string());
-        };
-        // Surface a read fault as itself. `unwrap_or(0)` here would read as
-        // "this guard failed", and since column 0 is tested first, every
-        // backend fault would come back as a dead source node: a specific,
-        // confident, wrong diagnosis that sends the client to re-resolve a
-        // handle that was fine all along.
-        let flags: std::result::Result<Vec<i64>, Error> = (0..3).map(|i| row.get_i64(i)).collect();
-        let flags = match flags {
-            Ok(flags) => flags,
-            Err(e) => return e,
-        };
-        let truthy = |i: usize| flags[i] != 0;
-        if !truthy(0) {
-            return Error::RelateRefused(format!("source node {} is not live", src.as_str()));
+        match rows {
+            Ok(rows) => match edge_refusal_from_rows(rows, src, dst, kind) {
+                Ok(e) | Err(e) => e,
+            },
+            Err(e) => e,
         }
-        if !truthy(1) {
-            return Error::RelateRefused(format!("target node {} is not live", dst.as_str()));
+    }
+
+    /// Write a batch of nodes and the edges between them as one atomic unit:
+    /// a producer submitting several facts, the entities they mention, and
+    /// the edges linking them all lands together or not at all. Edges
+    /// reference their endpoints by `EpisodeRef`, either a fresh node's
+    /// index into `nodes` or an already-existing id, so a caller never needs
+    /// to read back a freshly-inserted node's id before linking it.
+    ///
+    /// No subject-based dedup in this WU: every node is a plain insert. (WU-3
+    /// adds superseding a same-subject competitor on top of this.)
+    pub async fn ingest_episode(
+        &self,
+        nodes: Vec<NewNode>,
+        edges: Vec<EpisodeEdge>,
+    ) -> Result<EpisodeResult> {
+        // A bad `EpisodeRef::New` index must fail before any transaction
+        // opens, not mid-write.
+        for edge in &edges {
+            for r in [&edge.from, &edge.to] {
+                if let EpisodeRef::New(i) = r {
+                    if *i >= nodes.len() {
+                        return Err(Error::InvalidReference(format!(
+                            "new node index {i} is out of bounds: this episode has {} nodes",
+                            nodes.len()
+                        )));
+                    }
+                }
+            }
         }
-        if truthy(2) {
-            return Error::RelateRefused(format!(
-                "{} already relates to {} as '{kind}'",
-                src.as_str(),
-                dst.as_str()
-            ));
+
+        // Pre-generate every node's id (a ULID, no DB round-trip) so edges
+        // can resolve `EpisodeRef::New(i)` to a real id before any row lands.
+        let ids: Vec<NodeId> = nodes.iter().map(|_| NodeId::new()).collect();
+        let now = self.clock.now();
+
+        let mut tx = self.backend.begin().await?;
+
+        for (id, node) in ids.iter().zip(&nodes) {
+            // WU-3 extends this with a per-node `if let Some(old) = ...`
+            // supersede branch, run before the insert below. No dedup yet:
+            // every node here is a plain insert.
+            let (sql, params) = self.node_insert(id, node, now)?;
+            tx.execute(&sql, &params).await?;
         }
-        // Every guard passes now, so one of them flipped between the insert and
-        // this read. A retry would land.
-        Error::RelateRefused("a concurrent write took the row, retry".to_string())
+
+        let mut edge_ids = Vec::with_capacity(edges.len());
+        for edge in &edges {
+            let src = resolve_episode_ref(&edge.from, &ids);
+            let dst = resolve_episode_ref(&edge.to, &ids);
+            let id = EdgeId::new();
+            let attrs = serde_json::to_string(&edge.attributes)?;
+            // The same conditional-INSERT-with-WHERE-EXISTS shape `relate`
+            // uses, checked and written one edge at a time so edge N+1's
+            // NOT EXISTS sees edge N's own insert: never a batch check
+            // followed by a batch write.
+            let written = tx
+                .execute(
+                    "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                     WHERE EXISTS     (SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?8)
+                       AND EXISTS     (SELECT 1 FROM nodes WHERE id = ?3 AND tx_to = ?8)
+                       AND NOT EXISTS (SELECT 1 FROM edges
+                                       WHERE src = ?2 AND dst = ?3 AND type = ?4 AND tx_to = ?8)",
+                    &[
+                        id.as_str().into(),
+                        src.as_str().into(),
+                        dst.as_str().into(),
+                        edge.kind.clone().into(),
+                        attrs.into(),
+                        now.into(),
+                        FOREVER.into(),
+                        FOREVER.into(),
+                    ],
+                )
+                .await?;
+            if written != 1 {
+                // Mirrors `relate_refusal`'s combined check, run against the
+                // still-open transaction instead of `&self.backend`, so it
+                // sees this same call's own writes.
+                let rows = tx
+                    .query(
+                        EDGE_REFUSAL_DIAGNOSTIC_SQL,
+                        &[
+                            src.as_str().into(),
+                            dst.as_str().into(),
+                            FOREVER.into(),
+                            edge.kind.clone().into(),
+                        ],
+                    )
+                    .await?;
+                let err = match edge_refusal_from_rows(rows, src, dst, &edge.kind) {
+                    Ok(e) | Err(e) => e,
+                };
+                // Explicit, not a bare drop: readable at the call site and
+                // does not lean on Drop timing being right for this caller
+                // too, even though WU-1 already proved the implicit-drop
+                // path rolls back correctly.
+                tx.rollback().await?;
+                return Err(err);
+            }
+            edge_ids.push(id);
+        }
+
+        tx.commit().await?;
+
+        // Vector writes stay outside the transaction, exactly where `insert`
+        // and `supersede` already put them: `BackendTx` never grows a
+        // `vector_upsert` method, so nothing about "having a transaction"
+        // moves this call inside one.
+        for (id, node) in ids.iter().zip(&nodes) {
+            if let Some(embedding) = node.embedding.as_deref() {
+                self.check_dims(embedding)?;
+                self.backend.vector_upsert(id.as_str(), embedding).await?;
+            }
+        }
+
+        Ok(EpisodeResult {
+            node_ids: ids,
+            edge_ids,
+        })
     }
 
     /// Resolve a client-supplied handle to a full node id. A handle is any
@@ -3355,5 +3521,375 @@ mod tests {
             !groups.is_empty(),
             "a store that has never clustered must still refresh first"
         );
+    }
+
+    // ---- WU-2: Graph::ingest_episode core (no dedup) ----
+
+    #[tokio::test]
+    async fn two_new_facts_and_an_edge_between_them_commit_together() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let nodes = vec![
+            NewNode::now("fact", "Alpha", "alpha content"),
+            NewNode::now("fact", "Beta", "beta content"),
+        ];
+        let edges = vec![EpisodeEdge {
+            from: EpisodeRef::New(0),
+            to: EpisodeRef::New(1),
+            kind: "mentions".to_string(),
+            attributes: serde_json::json!({}),
+        }];
+
+        // Act
+        let result = g.ingest_episode(nodes, edges).await.unwrap();
+
+        // Assert
+        assert_eq!(result.node_ids.len(), 2);
+        assert_eq!(result.edge_ids.len(), 1);
+        let node_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM nodes WHERE id IN (?1, ?2)",
+                &[
+                    result.node_ids[0].as_str().into(),
+                    result.node_ids[1].as_str().into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(node_rows[0].get_i64(0).unwrap(), 2);
+        let edge_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = 'mentions'",
+                &[
+                    result.node_ids[0].as_str().into(),
+                    result.node_ids[1].as_str().into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(edge_rows[0].get_i64(0).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_edge_can_reference_an_existing_node() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let existing = g
+            .insert(NewNode::now("fact", "Existing", "x"))
+            .await
+            .unwrap();
+        let nodes = vec![NewNode::now("fact", "New", "y")];
+        let edges = vec![EpisodeEdge {
+            from: EpisodeRef::New(0),
+            to: EpisodeRef::Existing(existing.clone()),
+            kind: "mentions".to_string(),
+            attributes: serde_json::json!({}),
+        }];
+
+        // Act
+        let result = g.ingest_episode(nodes, edges).await.unwrap();
+
+        // Assert
+        let rows = g
+            .backend
+            .query(
+                "SELECT dst FROM edges WHERE src = ?1",
+                &[result.node_ids[0].as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_string(0).unwrap(), existing.as_str());
+    }
+
+    #[tokio::test]
+    async fn an_out_of_bounds_new_index_returns_an_error_not_a_panic() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let nodes = vec![NewNode::now("fact", "Only", "x")];
+        let edges = vec![EpisodeEdge {
+            from: EpisodeRef::New(0),
+            to: EpisodeRef::New(5),
+            kind: "mentions".to_string(),
+            attributes: serde_json::json!({}),
+        }];
+
+        // Act
+        let err = g.ingest_episode(nodes, edges).await.unwrap_err();
+
+        // Assert
+        assert!(matches!(err, Error::InvalidReference(_)), "{err}");
+        let rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_i64(0).unwrap(), 0, "nothing must be written");
+    }
+
+    #[tokio::test]
+    async fn an_edge_to_a_stale_existing_endpoint_fails_the_whole_call() {
+        // Arrange: the same setup relate_refuses_an_endpoint_that_is_no_longer_live
+        // uses, so `old` is no longer live by the time ingest_episode runs.
+        let g = graph_at(Millis(1000)).await;
+        let old = g
+            .upsert_by(NewNode::now("fact", "Rollout", "first").with_subject("rollout"))
+            .await
+            .unwrap();
+        g.upsert_by(NewNode::now("fact", "Rollout", "second").with_subject("rollout"))
+            .await
+            .unwrap();
+        let nodes = vec![NewNode::now("fact", "NewFact", "y")];
+        let edges = vec![EpisodeEdge {
+            from: EpisodeRef::New(0),
+            to: EpisodeRef::Existing(old.clone()),
+            kind: "mentions".to_string(),
+            attributes: serde_json::json!({}),
+        }];
+
+        // Act
+        let err = g.ingest_episode(nodes, edges).await.unwrap_err();
+
+        // Assert: matches relate_refusal's exact wording, not a generic message.
+        assert!(
+            matches!(&err, Error::RelateRefused(m)
+                if m.contains("is not live") && m.contains(old.as_str())),
+            "{err}"
+        );
+        let node_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes WHERE label = 'NewFact'", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            node_rows[0].get_i64(0).unwrap(),
+            0,
+            "the new node must not exist"
+        );
+        // Filtered to `mentions`, not just `dst = old`: the setup above
+        // already left a `supersedes` edge pointing at `old`, which is not
+        // what this assertion is about.
+        let edge_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE dst = ?1 AND type = 'mentions'",
+                &[old.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            edge_rows[0].get_i64(0).unwrap(),
+            0,
+            "the mentions edge must not exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_edges_with_the_same_triple_in_one_call_the_second_is_refused_not_duplicated() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let nodes = vec![
+            NewNode::now("fact", "Alpha", "x"),
+            NewNode::now("fact", "Beta", "y"),
+        ];
+        let edges = vec![
+            EpisodeEdge {
+                from: EpisodeRef::New(0),
+                to: EpisodeRef::New(1),
+                kind: "mentions".to_string(),
+                attributes: serde_json::json!({}),
+            },
+            EpisodeEdge {
+                from: EpisodeRef::New(0),
+                to: EpisodeRef::New(1),
+                kind: "mentions".to_string(),
+                attributes: serde_json::json!({}),
+            },
+        ];
+
+        // Act
+        let err = g.ingest_episode(nodes, edges).await.unwrap_err();
+
+        // Assert: the whole call rolls back, so not even the first edge lands.
+        assert!(matches!(&err, Error::RelateRefused(_)), "{err}");
+        let node_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            node_rows[0].get_i64(0).unwrap(),
+            0,
+            "no node from the episode must exist"
+        );
+        let edge_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM edges", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            edge_rows[0].get_i64(0).unwrap(),
+            0,
+            "not even the first edge must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mid_transaction_db_failure_leaves_zero_rows() {
+        // Arrange: fail the SECOND node's insert, after the first has already
+        // run for real inside the transaction.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g: Graph<FailingBackend> =
+            Graph::open_with_clock(":memory:", GraphConfig::new(8), clock)
+                .await
+                .unwrap();
+        g.backend.set_fail_on_execute(1);
+        let nodes = vec![
+            NewNode::now("fact", "One", "x"),
+            NewNode::now("fact", "Two", "y"),
+            NewNode::now("fact", "Three", "z"),
+        ];
+
+        // Act
+        let err = g.ingest_episode(nodes, vec![]).await.unwrap_err();
+
+        // Assert: query the real backend directly (FailingBackend's own query
+        // is a pure passthrough, never intercepted), proving a real rollback
+        // of the first, individually-valid statement.
+        assert!(matches!(err, Error::Backend(_)), "{err}");
+        let rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get_i64(0).unwrap(),
+            0,
+            "no node from this call must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_nodes_and_edges_succeeds_trivially() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let result = g.ingest_episode(vec![], vec![]).await.unwrap();
+
+        // Assert
+        assert!(result.node_ids.is_empty());
+        assert!(result.edge_ids.is_empty());
+    }
+
+    /// Wraps a real `BackendTx`, failing exactly one targeted `execute` call
+    /// while delegating every other call straight through.
+    ///
+    /// `Interposing` (above) wraps `Backend`, not `BackendTx`, and its own
+    /// `begin` just delegates straight through (WU-1), so it never sees a
+    /// transaction-scoped call; this is a separate, transaction-scoped fault
+    /// injector, purpose-built for `a_mid_transaction_db_failure_leaves_zero_rows`.
+    struct FailingTx<'a> {
+        inner: Box<dyn crate::backend::BackendTx + 'a>,
+        /// 0-based count of `execute` calls seen so far.
+        execute_calls: usize,
+        /// The `execute_calls` value (before incrementing) that fails.
+        fail_on_execute: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl<'a> crate::backend::BackendTx for FailingTx<'a> {
+        async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
+            let call = self.execute_calls;
+            self.execute_calls += 1;
+            if call == self.fail_on_execute {
+                return Err(Error::Backend(
+                    "injected mid-transaction failure".to_string(),
+                ));
+            }
+            self.inner.execute(sql, params).await
+        }
+        async fn query(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+            self.inner.query(sql, params).await
+        }
+        async fn commit(self: Box<Self>) -> Result<()> {
+            self.inner.commit().await
+        }
+        async fn rollback(self: Box<Self>) -> Result<()> {
+            self.inner.rollback().await
+        }
+    }
+
+    /// Wraps a real `Backend`; its own `begin` returns a `FailingTx`, unlike
+    /// `Interposing::begin`'s plain pass-through. `fail_on_execute` defaults
+    /// to "never" (`usize::MAX`) so every other test using this type (none,
+    /// today) would see ordinary behavior; the one test that needs a fault
+    /// sets it explicitly after `open`.
+    struct FailingBackend {
+        inner: crate::backends::DefaultBackend,
+        fail_on_execute: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FailingBackend {
+        fn set_fail_on_execute(&self, n: usize) {
+            self.fail_on_execute
+                .store(n, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FailingBackend {
+        async fn open(path: &str, read_pool_size: usize) -> Result<Self> {
+            Ok(Self {
+                inner: crate::backends::DefaultBackend::open(path, read_pool_size).await?,
+                fail_on_execute: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            })
+        }
+        async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+            self.inner.query(sql, params).await
+        }
+        async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+            self.inner.execute(sql, params).await
+        }
+        async fn execute_batch(&self, sql: &str) -> Result<()> {
+            self.inner.execute_batch(sql).await
+        }
+        async fn execute_atomic(&self, statements: &[(String, Vec<Value>)]) -> Result<()> {
+            self.inner.execute_atomic(statements).await
+        }
+        fn vector_ddl(&self, dims: usize) -> String {
+            self.inner.vector_ddl(dims)
+        }
+        async fn vector_upsert(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
+            self.inner.vector_upsert(node_id, embedding).await
+        }
+        async fn vector_delete(&self, node_id: &str) -> Result<()> {
+            self.inner.vector_delete(node_id).await
+        }
+        async fn vector_search(
+            &self,
+            query: &[f32],
+            k: usize,
+            kind: Option<&str>,
+            scope: Option<&str>,
+            as_of: Millis,
+        ) -> Result<Vec<NodeId>> {
+            self.inner.vector_search(query, k, kind, scope, as_of).await
+        }
+        async fn vector_sweep_orphans(&self) -> Result<u64> {
+            self.inner.vector_sweep_orphans().await
+        }
+        async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
+            let inner = self.inner.begin().await?;
+            let fail_on_execute = self
+                .fail_on_execute
+                .load(std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(FailingTx {
+                inner,
+                execute_calls: 0,
+                fail_on_execute,
+            }))
+        }
     }
 }
