@@ -13,6 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use liam_model::{Embedder, Llm, Reranker};
+use liam_store::types::{EpisodeEdge, EpisodeRef};
 use liam_store::{relation, DefaultGraph, NewNode, Query};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -48,6 +49,13 @@ const DEFAULT_PRODUCER: &str = "unknown";
 /// Same value by consistency, not by coupling.
 const MAX_ATTRIBUTES_CHARS: usize = 2000;
 
+/// Cap on `1 + episode.facts.len() + episode.edges.len()` for `remember`'s
+/// `episode` field (the leading `1` is the always-present top-level fact).
+/// Bounds how long `Graph::ingest_episode`'s transaction holds the write
+/// lock; see the plan's Architecture section, "Cost of the transaction
+/// staying open for the whole call."
+const MAX_EPISODE_ITEMS: usize = 100;
+
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope/as_of shape to a `Query`;
 /// keeping it in one place means a future filter only needs to change here.
@@ -75,6 +83,63 @@ fn build_query(
     q
 }
 
+/// Confidence range check shared by `remember`'s top-level field and every
+/// `episode.facts[i]`'s own field: `None` when absent or in `0.0..=1.0`,
+/// otherwise the problem, without the `"remember failed: "`/item prefix a
+/// caller adds.
+fn confidence_problem(confidence: Option<f64>) -> Option<String> {
+    let c = confidence?;
+    if (0.0..=1.0).contains(&c) {
+        None
+    } else {
+        Some("confidence must be between 0.0 and 1.0".to_string())
+    }
+}
+
+/// Attributes shape/size check shared by `remember`'s top-level field and
+/// every `episode.facts[i]`'s own field: `None` when absent or a JSON object
+/// within `MAX_ATTRIBUTES_CHARS`, otherwise the problem.
+fn attributes_problem(attributes: &Option<serde_json::Value>) -> Option<String> {
+    let v = attributes.as_ref()?;
+    if !v.is_object() {
+        return Some("attributes must be a JSON object".to_string());
+    }
+    if v.to_string().chars().count() > MAX_ATTRIBUTES_CHARS {
+        return Some(format!(
+            "attributes exceeds {MAX_ATTRIBUTES_CHARS} characters"
+        ));
+    }
+    None
+}
+
+/// Parses a `"fact:N"` episode edge reference into its combined node index
+/// (0 is the always-present top-level fact, 1..=`fact_count` is
+/// `episode.facts`), if `s` has that shape and `N` is in bounds. `None` for
+/// anything else, including a handle or an unrecognized form (from WU-5 on,
+/// `"entity:N"` too); the caller distinguishes those separately.
+fn parse_fact_ref(s: &str, fact_count: usize) -> Option<usize> {
+    let n: usize = s.strip_prefix("fact:")?.parse().ok()?;
+    (n < 1 + fact_count).then_some(n)
+}
+
+/// The same cheap syntactic pre-check `Graph::resolve_handle` runs before its
+/// real DB read (`graph.rs:332`): non-empty, all-ASCII-alphanumeric. Used
+/// here to recognize a handle-shaped episode edge reference up front,
+/// without paying for the DB read until the reference is actually resolved.
+fn is_handle_shaped(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The real node id an `EpisodeRef` names, once `Graph::ingest_episode` has
+/// returned: the freshly assigned id at its combined index, for `New`, or
+/// the id it already carried, for `Existing`.
+fn resolved_id(r: &EpisodeRef, node_ids: &[liam_store::NodeId]) -> String {
+    match r {
+        EpisodeRef::New(n) => node_ids[*n].as_str().to_string(),
+        EpisodeRef::Existing(id) => id.as_str().to_string(),
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RememberArgs {
     /// decision | fact | symbol | episode (opaque to the store).
@@ -95,6 +160,50 @@ pub struct RememberArgs {
     pub valid_from: Option<i64>,
     /// Optional confidence override in `0.0..=1.0`. Omitted defaults to 1.0.
     pub confidence: Option<f64>,
+    /// Optional additional facts and the edges between them, written
+    /// atomically with the top-level fact above through
+    /// `Graph::ingest_episode`. Omitted, `remember` behaves exactly as
+    /// before this field existed.
+    pub episode: Option<EpisodeArgs>,
+}
+
+/// One nested fact inside `RememberArgs.episode.facts`. Same shape as
+/// `RememberArgs`'s own fact fields, minus `scope` (an episode's facts share
+/// the top-level fact's scope; there is no per-item override).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EpisodeFactArgs {
+    pub kind: String,
+    pub label: String,
+    pub content: String,
+    pub attributes: Option<serde_json::Value>,
+    pub valid_from: Option<i64>,
+    pub confidence: Option<f64>,
+    pub subject: Option<String>,
+}
+
+/// One edge inside `RememberArgs.episode.edges`, linking two items of the
+/// same episode, or an item to an already-existing node, by reference
+/// instead of a real id neither may have yet.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EpisodeEdgeArgs {
+    /// `"fact:N"` (0 is the top-level fact, 1..=N is `episode.facts`), or a
+    /// handle `recall`/`relate` would accept. `"entity:N"` arrives in WU-5.
+    pub from: String,
+    pub to: String,
+    /// Relation type, for example `mentions`. `supersedes` is reserved, same
+    /// as `relate`.
+    pub kind: String,
+}
+
+/// `RememberArgs.episode`: additional facts, and the edges between them and
+/// the top-level fact, written atomically. `entities` is added by WU-5, as a
+/// second field on this same struct; deliberately absent here, since
+/// referencing a type WU-5 declares would make this WU fail to compile as
+/// its own commit.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EpisodeArgs {
+    pub facts: Vec<EpisodeFactArgs>,
+    pub edges: Vec<EpisodeEdgeArgs>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -287,50 +396,213 @@ impl MemoryServer {
             .unwrap_or_else(|| DEFAULT_PRODUCER.to_string())
     }
 
+    /// Resolves one episode edge reference, already known syntactically
+    /// valid by the caller's validation pass: `"fact:N"` (parsing cannot
+    /// fail here) to `EpisodeRef::New`, or a handle to `EpisodeRef::Existing`
+    /// via the one real `resolve_handle` DB read this reference gets.
+    async fn episode_ref(&self, s: &str, fact_count: usize) -> liam_store::Result<EpisodeRef> {
+        if let Some(n) = parse_fact_ref(s, fact_count) {
+            return Ok(EpisodeRef::New(n));
+        }
+        self.store.resolve_handle(s).await.map(EpisodeRef::Existing)
+    }
+
     #[tool(description = "Record a durable decision or fact into long-term memory.")]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         // Cheap checks first, before the embed call pays for a rejected
         // request: the `relate` handler establishes this convention.
-        if let Some(c) = args.confidence {
-            if !(0.0..=1.0).contains(&c) {
-                return "remember failed: confidence must be between 0.0 and 1.0".to_string();
+        if let Some(problem) = confidence_problem(args.confidence) {
+            return format!("remember failed: {problem}");
+        }
+        if let Some(problem) = attributes_problem(&args.attributes) {
+            return format!("remember failed: {problem}");
+        }
+
+        let Some(episode) = args.episode else {
+            let embedding = match self.embedder.embed(&args.content).await {
+                Ok(v) => v,
+                Err(e) => return format!("embed failed: {e}"),
+            };
+            let mut node = NewNode::now(args.kind, args.label, args.content)
+                .with_embedding(embedding)
+                .with_producer(self.producer());
+            if let Some(scope) = args.scope {
+                node = node.with_scope(scope);
+            }
+            if let Some(attributes) = args.attributes {
+                node = node.with_attributes(attributes);
+            }
+            if let Some(valid_from) = args.valid_from {
+                node = node.with_valid_from(liam_store::Millis(valid_from));
+            }
+            if let Some(confidence) = args.confidence {
+                node = node.with_confidence(confidence);
+            }
+            let write = match args.subject {
+                Some(subject) => self.store.upsert_by(node.with_subject(subject)).await,
+                None => self.store.insert(node).await,
+            };
+            return match write {
+                Ok(id) => format!("remembered {}", id.as_str()),
+                Err(e) => format!("remember failed: {e}"),
+            };
+        };
+
+        // `args.episode` was `Some`: an episode of additional facts and
+        // edges, written atomically with the top-level fact through
+        // `Graph::ingest_episode`. Bounded first, before any per-item check
+        // or DB call, so a caller-sized episode can't hold
+        // `ingest_episode`'s transaction open indefinitely.
+        let total = 1 + episode.facts.len() + episode.edges.len();
+        if total > MAX_EPISODE_ITEMS {
+            return format!(
+                "remember failed: episode has {total} items, over the {MAX_EPISODE_ITEMS} max"
+            );
+        }
+
+        // Every fact's confidence/attributes, and every edge's kind and
+        // from/to syntax, validated up front, accumulating every problem
+        // rather than stopping at the first: no DB call happens until this
+        // whole pass is clean.
+        let fact_count = episode.facts.len();
+        let mut problems: Vec<String> = Vec::new();
+        for (i, fact) in episode.facts.iter().enumerate() {
+            if let Some(problem) = confidence_problem(fact.confidence) {
+                problems.push(format!("fact:{}: {problem}", i + 1));
+            }
+            if let Some(problem) = attributes_problem(&fact.attributes) {
+                problems.push(format!("fact:{}: {problem}", i + 1));
             }
         }
-        if let Some(v) = &args.attributes {
-            if !v.is_object() {
-                return "remember failed: attributes must be a JSON object".to_string();
+        for (j, edge) in episode.edges.iter().enumerate() {
+            let kind = edge.kind.trim().to_lowercase();
+            if kind.is_empty() {
+                problems.push(format!("edge {j}: type must not be empty"));
+            } else if kind == relation::SUPERSEDES {
+                problems.push(format!(
+                    "edge {j}: '{}' is reserved for version history",
+                    relation::SUPERSEDES
+                ));
             }
-            if v.to_string().chars().count() > MAX_ATTRIBUTES_CHARS {
-                return format!(
-                    "remember failed: attributes exceeds {MAX_ATTRIBUTES_CHARS} characters"
-                );
+            for (role, reference) in [("from", edge.from.as_str()), ("to", edge.to.as_str())] {
+                if parse_fact_ref(reference, fact_count).is_none() && !is_handle_shaped(reference) {
+                    problems.push(format!(
+                        "edge {j}: {role} '{reference}' is not a recognized reference"
+                    ));
+                }
             }
         }
+        if !problems.is_empty() {
+            return format!("remember failed: {}", problems.join("; "));
+        }
+
+        // Every from/to is now known syntactically valid: either "fact:N" in
+        // bounds, or handle-shaped. Resolve the handle-shaped ones now, the
+        // one real DB read per handle-form reference; a resolution failure
+        // is a validation failure too, accumulated the same way as the pass
+        // above, even though the DB check itself couldn't happen until now.
+        let mut refs: Vec<(EpisodeRef, EpisodeRef)> = Vec::with_capacity(episode.edges.len());
+        let mut resolve_problems: Vec<String> = Vec::new();
+        for (j, edge) in episode.edges.iter().enumerate() {
+            match (
+                self.episode_ref(&edge.from, fact_count).await,
+                self.episode_ref(&edge.to, fact_count).await,
+            ) {
+                (Ok(from), Ok(to)) => refs.push((from, to)),
+                (from, to) => {
+                    if let Err(e) = from {
+                        resolve_problems.push(format!("edge {j}: from: {e}"));
+                    }
+                    if let Err(e) = to {
+                        resolve_problems.push(format!("edge {j}: to: {e}"));
+                    }
+                }
+            }
+        }
+        if !resolve_problems.is_empty() {
+            return format!("remember failed: {}", resolve_problems.join("; "));
+        }
+
+        // Embed the top-level fact plus every episode.facts entry, then
+        // build the combined node list in order: index 0 is the top-level
+        // fact, 1..=fact_count is episode.facts.
         let embedding = match self.embedder.embed(&args.content).await {
             Ok(v) => v,
             Err(e) => return format!("embed failed: {e}"),
         };
-        let mut node = NewNode::now(args.kind, args.label, args.content)
+        let mut nodes = Vec::with_capacity(1 + fact_count);
+        let mut top = NewNode::now(args.kind, args.label, args.content)
             .with_embedding(embedding)
             .with_producer(self.producer());
         if let Some(scope) = args.scope {
-            node = node.with_scope(scope);
+            top = top.with_scope(scope);
         }
         if let Some(attributes) = args.attributes {
-            node = node.with_attributes(attributes);
+            top = top.with_attributes(attributes);
         }
         if let Some(valid_from) = args.valid_from {
-            node = node.with_valid_from(liam_store::Millis(valid_from));
+            top = top.with_valid_from(liam_store::Millis(valid_from));
         }
         if let Some(confidence) = args.confidence {
-            node = node.with_confidence(confidence);
+            top = top.with_confidence(confidence);
         }
-        let write = match args.subject {
-            Some(subject) => self.store.upsert_by(node.with_subject(subject)).await,
-            None => self.store.insert(node).await,
-        };
-        match write {
-            Ok(id) => format!("remembered {}", id.as_str()),
+        if let Some(subject) = args.subject {
+            top = top.with_subject(subject);
+        }
+        nodes.push(top);
+
+        for fact in episode.facts {
+            let embedding = match self.embedder.embed(&fact.content).await {
+                Ok(v) => v,
+                Err(e) => return format!("embed failed: {e}"),
+            };
+            let mut node = NewNode::now(fact.kind, fact.label, fact.content)
+                .with_embedding(embedding)
+                .with_producer(self.producer());
+            if let Some(attributes) = fact.attributes {
+                node = node.with_attributes(attributes);
+            }
+            if let Some(valid_from) = fact.valid_from {
+                node = node.with_valid_from(liam_store::Millis(valid_from));
+            }
+            if let Some(confidence) = fact.confidence {
+                node = node.with_confidence(confidence);
+            }
+            if let Some(subject) = fact.subject {
+                node = node.with_subject(subject);
+            }
+            nodes.push(node);
+        }
+
+        let edges: Vec<EpisodeEdge> = episode
+            .edges
+            .iter()
+            .zip(&refs)
+            .map(|(edge, (from, to))| EpisodeEdge {
+                from: from.clone(),
+                to: to.clone(),
+                kind: edge.kind.trim().to_lowercase(),
+                attributes: serde_json::json!({}),
+            })
+            .collect();
+
+        match self.store.ingest_episode(nodes, edges).await {
+            Ok(result) => {
+                let mut lines: Vec<String> = result
+                    .node_ids
+                    .iter()
+                    .map(|id| format!("remembered {}", id.as_str()))
+                    .collect();
+                for ((from, to), edge) in refs.iter().zip(&episode.edges) {
+                    lines.push(format!(
+                        "related {} -{}-> {}",
+                        resolved_id(from, &result.node_ids),
+                        edge.kind.trim().to_lowercase(),
+                        resolved_id(to, &result.node_ids)
+                    ));
+                }
+                lines.join("\n")
+            }
             Err(e) => format!("remember failed: {e}"),
         }
     }
@@ -861,6 +1133,7 @@ mod tests {
                 attributes: None,
                 valid_from: None,
                 confidence: None,
+                episode: None,
             }))
             .await;
         assert!(out.starts_with("remembered "), "seed failed: {out}");
@@ -915,6 +1188,7 @@ mod tests {
                 attributes: None,
                 valid_from: None,
                 confidence: None,
+                episode: None,
             }))
             .await;
         assert!(out.starts_with("remembered "), "seed failed: {out}");
@@ -972,6 +1246,7 @@ mod tests {
                 attributes: None,
                 valid_from: None,
                 confidence: None,
+                episode: None,
             }))
             .await;
         assert!(out.starts_with("remembered "), "remember failed: {out}");
@@ -1008,6 +1283,7 @@ mod tests {
             attributes: None,
             valid_from: None,
             confidence: None,
+            episode: None,
         }
     }
 
@@ -1271,6 +1547,383 @@ mod tests {
             "valid_from {:?} not within [{before:?}, {after:?}]",
             hits[0].valid_from
         );
+    }
+
+    /// Bare-bones episode fact args, mirroring `remember_args`: every field
+    /// but `content` is a fixed default, distinct content per call so a test
+    /// can find its own node with `Query::text`.
+    fn episode_fact(content: &str) -> EpisodeFactArgs {
+        EpisodeFactArgs {
+            kind: "fact".to_string(),
+            label: "label".to_string(),
+            content: content.to_string(),
+            attributes: None,
+            valid_from: None,
+            confidence: None,
+            subject: None,
+        }
+    }
+
+    fn episode_edge(from: &str, to: &str, kind: &str) -> EpisodeEdgeArgs {
+        EpisodeEdgeArgs {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: kind.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_without_episode_is_unchanged() {
+        // Given a server, and a remember call with `episode` explicitly
+        // absent, the shape every pre-WU4 caller sends
+        let server = plain_server().await;
+
+        // When remember is called
+        let out = server
+            .remember(Parameters(remember_args(
+                "episode absent regression content",
+            )))
+            .await;
+
+        // Then the response is the same "remembered {id}" shape as before,
+        // and exactly one node lands: no episode-shaped side effect at all
+        assert!(out.starts_with("remembered "), "{out}");
+        assert!(!out.contains('\n'), "unexpected extra line: {out}");
+        let hits = server
+            .store
+            .query_explained(&Query::text("episode absent regression content"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_facts_and_an_edge_between_them_writes_atomically() {
+        // Given a top-level fact, one episode.facts entry, and an edge
+        // between them by combined index
+        let server = plain_server().await;
+
+        // When remember is called with episode set
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("episodenestedfactmarker")],
+                    edges: vec![episode_edge("fact:0", "fact:1", "mentions")],
+                }),
+                ..remember_args("episodetoplevelfactmarker")
+            }))
+            .await;
+
+        // Then it succeeds, both facts exist, and the edge exists
+        assert!(!out.contains("failed"), "{out}");
+        let mut lines = out.lines();
+        let top_id = lines
+            .next()
+            .expect("top-level fact line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        let nested_id = lines
+            .next()
+            .expect("nested fact line")
+            .trim_start_matches("remembered ")
+            .to_string();
+
+        // Counted by content match, not by result length: the edge just
+        // created between them makes each reachable as a graph-expanded
+        // neighbour of the other's text hit too (`ExplainedHit::expanded`),
+        // so a bare length assertion would be pinning that expansion
+        // behaviour instead of "both facts exist".
+        let top = server
+            .store
+            .query_explained(&Query::text("episodetoplevelfactmarker"))
+            .await
+            .unwrap();
+        assert!(
+            top.iter()
+                .any(|h| h.hit.content == "episodetoplevelfactmarker"),
+            "{out}"
+        );
+        let nested = server
+            .store
+            .query_explained(&Query::text("episodenestedfactmarker"))
+            .await
+            .unwrap();
+        assert!(
+            nested
+                .iter()
+                .any(|h| h.hit.content == "episodenestedfactmarker"),
+            "{out}"
+        );
+
+        // The edge exists: relating the same ordered triple again reports
+        // "already relates", the existing idempotency signal `relate` uses.
+        let relate_again = server
+            .relate(Parameters(RelateArgs {
+                from: top_id,
+                to: nested_id,
+                kind: "mentions".to_string(),
+            }))
+            .await;
+        assert!(
+            relate_again.contains("already relates"),
+            "edge missing: {relate_again}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_rejects_supersedes_edge_kind() {
+        // Given an episode whose one edge asserts the reserved `supersedes`
+        // type
+        let server = plain_server().await;
+        let marker = "episode supersedes rejection content";
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("episode supersedes nested content")],
+                    edges: vec![episode_edge("fact:0", "fact:1", "supersedes")],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused, and nothing lands, not even the top-level fact
+        assert!(out.contains("reserved"), "{out}");
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_rejects_out_of_range_confidence_on_a_nested_fact() {
+        // Given an episode whose nested fact carries an out-of-range
+        // confidence
+        let server = plain_server().await;
+        let marker = "episode nested confidence rejection content";
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![EpisodeFactArgs {
+                        confidence: Some(5.0),
+                        ..episode_fact("episode nested confidence nested content")
+                    }],
+                    edges: vec![],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused, and nothing lands: per-item validation runs,
+        // not just the top-level field's
+        assert!(out.contains("confidence"), "{out}");
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_rejects_an_out_of_bounds_fact_index() {
+        // Given an episode with two facts total (the top-level one plus one
+        // episode.facts entry) and an edge naming "fact:5", well past the
+        // valid 0..=2 range
+        let server = plain_server().await;
+        let marker = "episode out of bounds index rejection content";
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("episode out of bounds nested content")],
+                    edges: vec![episode_edge("fact:0", "fact:5", "mentions")],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused, and nothing lands
+        assert!(out.contains("failed"), "{out}");
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_rejects_an_unrecognized_reference_form() {
+        // Given an episode whose edge references "bogus:0", deliberately not
+        // "entity:0" (which becomes valid from WU-5 on)
+        let server = plain_server().await;
+        let marker = "episode unrecognized reference rejection content";
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    edges: vec![episode_edge("fact:0", "bogus:0", "mentions")],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused, and nothing lands
+        assert!(out.contains("failed"), "{out}");
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_rejects_a_request_over_max_episode_items() {
+        // Given an episode one item over MAX_EPISODE_ITEMS once the
+        // always-present top-level fact is counted
+        let server = plain_server().await;
+        let marker = "episode over max rejection content";
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        let facts: Vec<EpisodeFactArgs> = (0..MAX_EPISODE_ITEMS)
+            .map(|i| episode_fact(&format!("episode over max nested content {i}")))
+            .collect();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts,
+                    edges: vec![],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused before any DB call, and nothing lands
+        assert!(out.contains("failed"), "{out}");
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "wrote a node despite rejection: {out}");
+
+        // Given the same shape, but exactly at the limit (one fewer fact)
+        let at_cap_marker = "episode at max cap content";
+        let facts: Vec<EpisodeFactArgs> = (0..MAX_EPISODE_ITEMS - 1)
+            .map(|i| episode_fact(&format!("episode at max cap nested content {i}")))
+            .collect();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts,
+                    edges: vec![],
+                }),
+                ..remember_args(at_cap_marker)
+            }))
+            .await;
+
+        // Then the limit itself is accepted, not an off-by-one
+        assert!(!out.contains("failed"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_reports_an_edge_to_a_since_superseded_fact_as_a_failure() {
+        // Given two episode facts sharing a subject, so the second
+        // supersedes the first per `Graph::ingest_episode`'s own dedup
+        // rules, plus an edge referencing the first by its original combined
+        // index
+        let server = plain_server().await;
+        let top_marker = "episode superseded edge top content";
+        let first_marker = "episode superseded edge first content";
+        let second_marker = "episode superseded edge second content";
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![
+                        EpisodeFactArgs {
+                            subject: Some("episode-supersede-subject".to_string()),
+                            ..episode_fact(first_marker)
+                        },
+                        EpisodeFactArgs {
+                            subject: Some("episode-supersede-subject".to_string()),
+                            ..episode_fact(second_marker)
+                        },
+                    ],
+                    edges: vec![episode_edge("fact:1", "fact:2", "mentions")],
+                }),
+                ..remember_args(top_marker)
+            }))
+            .await;
+
+        // Then the whole call fails, naming the failing reference (the dead
+        // node's id, embedded in `Graph::ingest_episode`'s own "is not live"
+        // message), not a generic "remember failed" with no detail
+        assert!(out.starts_with("remember failed:"), "{out}");
+        assert!(out.contains("is not live"), "{out}");
+
+        // And nothing landed: not the top-level fact, not either episode
+        // fact, proving the whole episode rolled back together
+        for marker in [top_marker, first_marker, second_marker] {
+            let hits = server
+                .store
+                .query_explained(&Query::text(marker))
+                .await
+                .unwrap();
+            assert_eq!(
+                hits.len(),
+                0,
+                "{marker} wrote a node despite rejection: {out}"
+            );
+        }
     }
 
     /// Count rendered evidence blocks in a captured `system\nprompt` pair,
@@ -2343,6 +2996,7 @@ mod tests {
                 attributes: Some(json!({"hue": "blue"})),
                 valid_from: None,
                 confidence: Some(0.4),
+                episode: None,
             }))
             .await;
         seed(&server, "fact", "Beta", "the zorbnax rollout costs money").await;
