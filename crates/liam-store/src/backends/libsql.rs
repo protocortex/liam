@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use libsql::{Builder, Connection, Database};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{Millis, NodeId};
 use crate::value::{Row, Value};
@@ -345,6 +345,63 @@ impl Backend for LibsqlBackend {
         .await
         .map_err(err)
     }
+
+    async fn begin(&self) -> Result<Box<dyn BackendTx + '_>> {
+        let guard = self.write.lock().await;
+        let transaction = guard.transaction().await.map_err(err)?;
+        Ok(Box::new(LibsqlTx { transaction, guard }))
+    }
+}
+
+/// An open transaction on `LibsqlBackend`'s write connection.
+///
+/// Field order matters for Drop safety and MUST stay `transaction` before
+/// `guard`: Rust drops struct fields in declaration order. An implicit drop
+/// (an early `?` return from a caller, or a bug that never calls
+/// `commit`/`rollback`) must run the transaction's own rollback-on-drop
+/// BEFORE the write lock releases, so no other writer can touch the
+/// connection while that rollback is still in flight. Declaring `guard`
+/// first would let the lock release while the transaction is still rolling
+/// back underneath it.
+struct LibsqlTx<'a> {
+    transaction: libsql::Transaction,
+    // Never read directly: held purely so the write lock stays taken for
+    // this transaction's whole lifetime and releases, via `Drop`, exactly
+    // when `transaction` (declared above, so it drops first) is gone.
+    #[allow(dead_code)]
+    guard: MutexGuard<'a, Connection>,
+}
+
+#[async_trait]
+impl<'a> BackendTx for LibsqlTx<'a> {
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
+        // `Transaction` derefs to `Connection`, so this is the same call
+        // `LibsqlBackend::execute` makes, just against the transaction's
+        // connection instead of the shared write connection directly.
+        self.transaction
+            .execute(sql, libsql::params_from_iter(bind(params)))
+            .await
+            .map_err(err)
+    }
+
+    async fn query(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        let rows = self
+            .transaction
+            .query(sql, libsql::params_from_iter(bind(params)))
+            .await
+            .map_err(err)?;
+        read_rows(rows).await
+    }
+
+    async fn commit(self: Box<Self>) -> Result<()> {
+        // `self` (and with it `self.guard`) drops when this returns,
+        // releasing the write lock exactly once, on completion.
+        self.transaction.commit().await.map_err(err)
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<()> {
+        self.transaction.rollback().await.map_err(err)
+    }
 }
 
 impl LibsqlBackend {
@@ -650,5 +707,145 @@ mod tests {
 
         // Then the pool actually has that many connections
         assert_eq!(backend.read_pool.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn begin_then_write_then_read_sees_own_write_then_commit_then_visible_outside() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("tx_commit.db", ARBITRARY_POOL_SIZE).await;
+        backend
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        // Act: write and, still inside the same open tx, read it back
+        // (proves read-your-own-write), then commit.
+        let mut tx = backend.begin().await.expect("begin transaction");
+        tx.execute("INSERT INTO t (id) VALUES (?1)", &[Value::Int(1)])
+            .await
+            .expect("insert inside tx");
+        let seen_inside = tx
+            .query("SELECT id FROM t", &[])
+            .await
+            .expect("query inside tx");
+        assert_eq!(
+            seen_inside.len(),
+            1,
+            "the write must be visible inside its own still-open tx"
+        );
+        tx.commit().await.expect("commit");
+
+        // Assert: visible through the ordinary Backend::query too, now that
+        // the tx has committed.
+        let seen_outside = backend
+            .query("SELECT id FROM t", &[])
+            .await
+            .expect("query outside tx");
+        assert_eq!(seen_outside.len(), 1);
+        assert_eq!(seen_outside[0].get_i64(0).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn rollback_leaves_no_trace() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("tx_rollback.db", ARBITRARY_POOL_SIZE).await;
+        backend
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        // Act
+        let mut tx = backend.begin().await.expect("begin transaction");
+        tx.execute("INSERT INTO t (id) VALUES (?1)", &[Value::Int(1)])
+            .await
+            .expect("insert inside tx");
+        tx.rollback().await.expect("rollback");
+
+        // Assert
+        let rows = backend.query("SELECT id FROM t", &[]).await.expect("query");
+        assert_eq!(rows.len(), 0);
+    }
+
+    /// Distinct from `rollback_leaves_no_trace`: that test calls `rollback`
+    /// explicitly and would pass even if `Drop` did nothing at all. This one
+    /// never calls `commit` or `rollback`, so it is the only test that
+    /// actually exercises the `Drop`-triggered rollback path.
+    #[tokio::test]
+    async fn dropping_without_commit_leaves_no_trace() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("tx_drop.db", ARBITRARY_POOL_SIZE).await;
+        backend
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        // Act: `tx` goes out of scope here with no call to `commit` or
+        // `rollback`.
+        {
+            let mut tx = backend.begin().await.expect("begin transaction");
+            tx.execute("INSERT INTO t (id) VALUES (?1)", &[Value::Int(1)])
+                .await
+                .expect("insert inside tx");
+        }
+
+        // Assert
+        let rows = backend.query("SELECT id FROM t", &[]).await.expect("query");
+        assert_eq!(rows.len(), 0);
+    }
+
+    /// Proves `BackendTx` holds the write lock for its whole open lifetime,
+    /// not just per statement (the coarser contract `begin`'s doc comment on
+    /// `Backend` describes). No sleeps or timing polls: a `Notify` orders
+    /// "the spawned task has started and is about to contend for the write
+    /// lock" strictly before "the main task checks whether it finished", so
+    /// the `is_finished` check right after can't race the spawn itself.
+    #[tokio::test]
+    async fn begin_serializes_with_other_writes() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("tx_serializes.db", ARBITRARY_POOL_SIZE).await;
+        backend
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+        let backend = std::sync::Arc::new(backend);
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        // Act: open a tx and write on it, without committing yet, so the
+        // write lock stays held.
+        let mut tx = backend.begin().await.expect("begin transaction");
+        tx.execute("INSERT INTO t (id) VALUES (?1)", &[Value::Int(1)])
+            .await
+            .expect("insert inside tx");
+
+        // Spawn a second task that announces (before anything else, in
+        // particular before any `.await`) that it is about to contend for
+        // the write lock, then immediately awaits an ordinary write through
+        // the same backend.
+        let spawned_backend = backend.clone();
+        let spawned_notify = notify.clone();
+        let handle = tokio::spawn(async move {
+            spawned_notify.notify_one();
+            spawned_backend
+                .execute("INSERT INTO t (id) VALUES (?1)", &[Value::Int(2)])
+                .await
+        });
+
+        // Assert: once the spawned task has started, it must still be
+        // blocked on the write lock, since the main task's open tx still
+        // holds it.
+        notify.notified().await;
+        assert!(
+            !handle.is_finished(),
+            "the spawned write must still be blocked while the tx is open"
+        );
+
+        // Act: release the write lock by committing.
+        tx.commit().await.expect("commit");
+
+        // Assert: the spawned write completes now that the lock is free.
+        handle
+            .await
+            .expect("spawned task did not panic")
+            .expect("spawned write succeeded");
     }
 }
