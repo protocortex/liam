@@ -35,6 +35,11 @@ pub enum Error {
     /// names which of its three guards refused.
     #[error("relate refused: {0}")]
     RelateRefused(String),
+
+    /// An `EpisodeRef::New(i)` passed to `Graph::ingest_episode` named an
+    /// index outside the bounds of that call's own `nodes` list.
+    #[error("invalid reference: {0}")]
+    InvalidReference(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -5,7 +5,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::ids::{Millis, NodeId};
+use crate::ids::{EdgeId, Millis, NodeId};
 
 fn empty_attributes() -> Value {
     Value::Object(Map::new())
@@ -149,6 +149,36 @@ impl NewNode {
         self.producer = producer.into();
         self
     }
+}
+
+/// How an `EpisodeEdge` names one of its endpoints inside one
+/// `Graph::ingest_episode` call: either a node freshly created by that same
+/// call, by its index into the `nodes` list passed alongside, or a node that
+/// already exists in the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EpisodeRef {
+    /// Index into the `nodes` list passed to `ingest_episode`.
+    New(usize),
+    /// A node id that already exists in the store.
+    Existing(NodeId),
+}
+
+/// One edge inside an `ingest_episode` call, referencing its endpoints by
+/// `EpisodeRef` so it can link nodes that do not have real ids yet.
+#[derive(Clone, Debug)]
+pub struct EpisodeEdge {
+    pub from: EpisodeRef,
+    pub to: EpisodeRef,
+    pub kind: String,
+    pub attributes: Value,
+}
+
+/// What `Graph::ingest_episode` wrote: the ids it assigned, in the same
+/// order and length as the `nodes`/`edges` lists the caller passed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpisodeResult {
+    pub node_ids: Vec<NodeId>,
+    pub edge_ids: Vec<EdgeId>,
 }
 
 /// A typed edge to insert.
