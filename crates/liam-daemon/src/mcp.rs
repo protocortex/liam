@@ -155,6 +155,39 @@ fn resolved_id(r: &EpisodeRef, node_ids: &[liam_store::NodeId]) -> String {
     }
 }
 
+/// Applies `remember`'s five optional per-node fields to an
+/// already-constructed `NewNode`, shared by every site that builds a node
+/// from `RememberArgs`/`EpisodeFactArgs`: the non-episode path, the
+/// episode's top-level fact, and each `episode.facts` entry. Each field is
+/// applied only when present, in the same order those call sites already
+/// applied it, so the resulting node shape is unchanged for every
+/// combination of present/absent fields.
+fn apply_optional_fields(
+    mut node: NewNode,
+    scope: Option<String>,
+    attributes: Option<serde_json::Value>,
+    valid_from: Option<i64>,
+    confidence: Option<f64>,
+    subject: Option<String>,
+) -> NewNode {
+    if let Some(scope) = scope {
+        node = node.with_scope(scope);
+    }
+    if let Some(attributes) = attributes {
+        node = node.with_attributes(attributes);
+    }
+    if let Some(valid_from) = valid_from {
+        node = node.with_valid_from(liam_store::Millis(valid_from));
+    }
+    if let Some(confidence) = confidence {
+        node = node.with_confidence(confidence);
+    }
+    if let Some(subject) = subject {
+        node = node.with_subject(subject);
+    }
+    node
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RememberArgs {
     /// decision | fact | symbol | episode (opaque to the store).
@@ -462,24 +495,22 @@ impl MemoryServer {
                 Ok(v) => v,
                 Err(e) => return format!("embed failed: {e}"),
             };
-            let mut node = NewNode::now(args.kind, args.label, args.content)
+            let node = NewNode::now(args.kind, args.label, args.content)
                 .with_embedding(embedding)
                 .with_producer(self.producer());
-            if let Some(scope) = args.scope {
-                node = node.with_scope(scope);
-            }
-            if let Some(attributes) = args.attributes {
-                node = node.with_attributes(attributes);
-            }
-            if let Some(valid_from) = args.valid_from {
-                node = node.with_valid_from(liam_store::Millis(valid_from));
-            }
-            if let Some(confidence) = args.confidence {
-                node = node.with_confidence(confidence);
-            }
-            let write = match args.subject {
-                Some(subject) => self.store.upsert_by(node.with_subject(subject)).await,
-                None => self.store.insert(node).await,
+            let has_subject = args.subject.is_some();
+            let node = apply_optional_fields(
+                node,
+                args.scope,
+                args.attributes,
+                args.valid_from,
+                args.confidence,
+                args.subject,
+            );
+            let write = if has_subject {
+                self.store.upsert_by(node).await
+            } else {
+                self.store.insert(node).await
             };
             return match write {
                 Ok(id) => format!("remembered {}", id.as_str()),
@@ -581,24 +612,17 @@ impl MemoryServer {
         // `scope`. Cheap to clone at this size: episodes are capped at
         // `MAX_EPISODE_ITEMS`.
         let scope = args.scope;
-        let mut top = NewNode::now(args.kind, args.label, args.content)
+        let top = NewNode::now(args.kind, args.label, args.content)
             .with_embedding(embedding)
             .with_producer(self.producer());
-        if let Some(scope) = scope.clone() {
-            top = top.with_scope(scope);
-        }
-        if let Some(attributes) = args.attributes {
-            top = top.with_attributes(attributes);
-        }
-        if let Some(valid_from) = args.valid_from {
-            top = top.with_valid_from(liam_store::Millis(valid_from));
-        }
-        if let Some(confidence) = args.confidence {
-            top = top.with_confidence(confidence);
-        }
-        if let Some(subject) = args.subject {
-            top = top.with_subject(subject);
-        }
+        let top = apply_optional_fields(
+            top,
+            scope.clone(),
+            args.attributes,
+            args.valid_from,
+            args.confidence,
+            args.subject,
+        );
         nodes.push(top);
 
         for fact in episode.facts {
@@ -606,24 +630,17 @@ impl MemoryServer {
                 Ok(v) => v,
                 Err(e) => return format!("embed failed: {e}"),
             };
-            let mut node = NewNode::now(fact.kind, fact.label, fact.content)
+            let node = NewNode::now(fact.kind, fact.label, fact.content)
                 .with_embedding(embedding)
                 .with_producer(self.producer());
-            if let Some(scope) = scope.clone() {
-                node = node.with_scope(scope);
-            }
-            if let Some(attributes) = fact.attributes {
-                node = node.with_attributes(attributes);
-            }
-            if let Some(valid_from) = fact.valid_from {
-                node = node.with_valid_from(liam_store::Millis(valid_from));
-            }
-            if let Some(confidence) = fact.confidence {
-                node = node.with_confidence(confidence);
-            }
-            if let Some(subject) = fact.subject {
-                node = node.with_subject(subject);
-            }
+            let node = apply_optional_fields(
+                node,
+                scope.clone(),
+                fact.attributes,
+                fact.valid_from,
+                fact.confidence,
+                fact.subject,
+            );
             nodes.push(node);
         }
 
