@@ -526,10 +526,31 @@ impl<B: Backend> Graph<B> {
         // and `supersede` already put them: `BackendTx` never grows a
         // `vector_upsert` method, so nothing about "having a transaction"
         // moves this call inside one.
+        //
+        // Unlike `insert`/`supersede`'s single-node `?` shape, a failure here
+        // does not abort the loop or fail the call. By this point the
+        // transaction has already committed, so the meaningful
+        // success/failure boundary for `ingest_episode` is behind us: the row
+        // data is correct and durable, the vector just won't surface in
+        // search until it's retried or backfilled. Aborting on the first
+        // failure would silently orphan every embedding after it; returning
+        // `Err` here would tell a caller the call failed when the durable
+        // write actually succeeded, inviting a retry that mints duplicate
+        // nodes for episodes with no `subject` to dedup against. A dims
+        // mismatch is handled the same way as a `vector_upsert` failure: it's
+        // a real config bug, not transient I/O, but nodes in one call
+        // typically share an embedder config, so continuing just logs the
+        // same problem a few more times rather than compounding any new
+        // risk.
         for (id, node) in ids.iter().zip(&nodes) {
             if let Some(embedding) = node.embedding.as_deref() {
-                self.check_dims(embedding)?;
-                self.backend.vector_upsert(id.as_str(), embedding).await?;
+                if let Err(e) = self.check_dims(embedding) {
+                    tracing::error!(?id, error = %e, "episode vector dims check failed, node row committed without a vector");
+                    continue;
+                }
+                if let Err(e) = self.backend.vector_upsert(id.as_str(), embedding).await {
+                    tracing::error!(?id, error = %e, "episode vector upsert failed, node row committed without a vector");
+                }
             }
         }
 
@@ -4096,6 +4117,93 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_vector_upsert_failure_does_not_fail_the_call_or_orphan_later_vectors() {
+        // Arrange: 3 new embedded facts; the double fails the FIRST
+        // `vector_upsert` call (node 1's) and lets the rest through, dims = 8
+        // per `graph_at`'s `GraphConfig::new(8)`.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g: Graph<FailingVectorBackend> =
+            Graph::open_with_clock(":memory:", GraphConfig::new(8), clock)
+                .await
+                .unwrap();
+        g.backend.set_fail_on_vector_upsert(0);
+        let e1 = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let e2 = vec![0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let e3 = vec![0.0f32, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let nodes = vec![
+            NewNode::now("fact", "One", "x").with_embedding(e1),
+            NewNode::now("fact", "Two", "y").with_embedding(e2.clone()),
+            NewNode::now("fact", "Three", "z").with_embedding(e3.clone()),
+        ];
+
+        // Act: node 1's vector_upsert fails, but the call as a whole must
+        // still report success, since the transaction already committed.
+        let result = g.ingest_episode(nodes, vec![]).await.unwrap();
+
+        // Assert: all 3 node ROWS exist, proving the commit was unaffected.
+        let node_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            node_rows[0].get_i64(0).unwrap(),
+            3,
+            "all 3 node rows must be committed regardless of the later vector failure"
+        );
+
+        // Nodes 2 and 3's vectors ARE present, proving the loop kept going
+        // past node 1's failure instead of aborting.
+        let hits2 = g
+            .backend
+            .vector_search(&e2, 5, None, None, Millis(1000))
+            .await
+            .unwrap();
+        assert!(
+            hits2.contains(&result.node_ids[1]),
+            "node 2's vector must be written even though node 1's vector_upsert failed first"
+        );
+        let hits3 = g
+            .backend
+            .vector_search(&e3, 5, None, None, Millis(1000))
+            .await
+            .unwrap();
+        assert!(
+            hits3.contains(&result.node_ids[2]),
+            "node 3's vector must be written even though node 1's vector_upsert failed first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_dims_failure_does_not_fail_the_call() {
+        // Arrange: dims = 8 per `graph_at`'s `GraphConfig::new(8)`; this
+        // embedding is the wrong length, so `check_dims` rejects it before
+        // `vector_upsert` is ever called.
+        let g = graph_at(Millis(1000)).await;
+        let wrong_length_embedding = vec![1.0f32, 0.0, 0.0, 0.0];
+        let nodes = vec![NewNode::now("fact", "One", "x").with_embedding(wrong_length_embedding)];
+
+        // Act: a dims mismatch must be handled the same way as a
+        // vector_upsert failure, logged and skipped, not propagated.
+        let result = g.ingest_episode(nodes, vec![]).await.unwrap();
+
+        // Assert: the row is committed despite the dims mismatch.
+        let node_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM nodes WHERE id = ?1",
+                &[result.node_ids[0].as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            node_rows[0].get_i64(0).unwrap(),
+            1,
+            "the node row must be committed despite the dims mismatch"
+        );
+    }
+
     /// Wraps a real `BackendTx`, failing exactly one targeted `execute` call
     /// while delegating every other call straight through.
     ///
@@ -4203,6 +4311,88 @@ mod tests {
                 execute_calls: 0,
                 fail_on_execute,
             }))
+        }
+    }
+
+    /// Wraps a real `Backend`, failing exactly one targeted `vector_upsert`
+    /// call while delegating every other call straight through.
+    ///
+    /// Simpler than `FailingTx`/`FailingBackend` above: `vector_upsert` is a
+    /// plain `Backend` method, not a `BackendTx` one, so this needs no fake
+    /// transaction, just one intercepted method. `fail_on_vector_upsert`
+    /// defaults to "never" (`usize::MAX`) so any other test using this type
+    /// would see ordinary behavior; the one test that needs a fault sets it
+    /// explicitly after `open`.
+    struct FailingVectorBackend {
+        inner: crate::backends::DefaultBackend,
+        /// 0-based count of `vector_upsert` calls seen so far.
+        vector_upsert_calls: std::sync::atomic::AtomicUsize,
+        /// The `vector_upsert_calls` value (before incrementing) that fails.
+        fail_on_vector_upsert: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FailingVectorBackend {
+        fn set_fail_on_vector_upsert(&self, n: usize) {
+            self.fail_on_vector_upsert
+                .store(n, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FailingVectorBackend {
+        async fn open(path: &str, read_pool_size: usize) -> Result<Self> {
+            Ok(Self {
+                inner: crate::backends::DefaultBackend::open(path, read_pool_size).await?,
+                vector_upsert_calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_on_vector_upsert: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            })
+        }
+        async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+            self.inner.query(sql, params).await
+        }
+        async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+            self.inner.execute(sql, params).await
+        }
+        async fn execute_batch(&self, sql: &str) -> Result<()> {
+            self.inner.execute_batch(sql).await
+        }
+        async fn execute_atomic(&self, statements: &[(String, Vec<Value>)]) -> Result<()> {
+            self.inner.execute_atomic(statements).await
+        }
+        fn vector_ddl(&self, dims: usize) -> String {
+            self.inner.vector_ddl(dims)
+        }
+        async fn vector_upsert(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
+            let call = self
+                .vector_upsert_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call
+                == self
+                    .fail_on_vector_upsert
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Backend("injected vector_upsert failure".to_string()));
+            }
+            self.inner.vector_upsert(node_id, embedding).await
+        }
+        async fn vector_delete(&self, node_id: &str) -> Result<()> {
+            self.inner.vector_delete(node_id).await
+        }
+        async fn vector_search(
+            &self,
+            query: &[f32],
+            k: usize,
+            kind: Option<&str>,
+            scope: Option<&str>,
+            as_of: Millis,
+        ) -> Result<Vec<NodeId>> {
+            self.inner.vector_search(query, k, kind, scope, as_of).await
+        }
+        async fn vector_sweep_orphans(&self) -> Result<u64> {
+            self.inner.vector_sweep_orphans().await
+        }
+        async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
+            self.inner.begin().await
         }
     }
 }
