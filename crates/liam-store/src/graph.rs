@@ -38,6 +38,23 @@ const EDGE_REFUSAL_DIAGNOSTIC_SQL: &str = "SELECT
    EXISTS(SELECT 1 FROM edges
           WHERE src = ?1 AND dst = ?2 AND type = ?4 AND tx_to = ?3)";
 
+/// The conditional edge INSERT `relate` and `Graph::ingest_episode`'s
+/// per-edge write both run: insert the row only if the source is live, the
+/// target is live, and no identical edge already exists for the ordered
+/// triple (src, dst, type). Shared as one literal, matching
+/// `EDGE_REFUSAL_DIAGNOSTIC_SQL` above, so the two call sites, one against
+/// `&Backend`, one against an open `BackendTx`, can never drift apart on the
+/// guard itself. `relate` binds its attributes as the literal text `"{}"`
+/// rather than a caller-supplied value, since a `relate` edge never carries
+/// attributes; `ingest_episode` binds the episode edge's real attributes
+/// JSON. Bind order: id, src, dst, type, attributes, tx_from, tx_to, FOREVER.
+const EDGE_INSERT_SQL: &str = "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+     WHERE EXISTS     (SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?8)
+       AND EXISTS     (SELECT 1 FROM nodes WHERE id = ?3 AND tx_to = ?8)
+       AND NOT EXISTS (SELECT 1 FROM edges
+                       WHERE src = ?2 AND dst = ?3 AND type = ?4 AND tx_to = ?8)";
+
 /// The specific refusal message for a failed edge write, given the three
 /// flags `EDGE_REFUSAL_DIAGNOSTIC_SQL` produces. A free function, not a
 /// `Graph` method, since `Graph::ingest_episode` needs it against a
@@ -330,17 +347,13 @@ impl<B: Backend> Graph<B> {
         let written = self
             .backend
             .execute(
-                "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
-                 SELECT ?1, ?2, ?3, ?4, '{}', ?5, ?6
-                 WHERE EXISTS     (SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?7)
-                   AND EXISTS     (SELECT 1 FROM nodes WHERE id = ?3 AND tx_to = ?7)
-                   AND NOT EXISTS (SELECT 1 FROM edges
-                                   WHERE src = ?2 AND dst = ?3 AND type = ?4 AND tx_to = ?7)",
+                EDGE_INSERT_SQL,
                 &[
                     id.as_str().into(),
                     src.as_str().into(),
                     dst.as_str().into(),
                     kind.into(),
+                    "{}".into(),
                     now.into(),
                     FOREVER.into(),
                     FOREVER.into(),
@@ -474,12 +487,7 @@ impl<B: Backend> Graph<B> {
             // followed by a batch write.
             let written = tx
                 .execute(
-                    "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-                     WHERE EXISTS     (SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?8)
-                       AND EXISTS     (SELECT 1 FROM nodes WHERE id = ?3 AND tx_to = ?8)
-                       AND NOT EXISTS (SELECT 1 FROM edges
-                                       WHERE src = ?2 AND dst = ?3 AND type = ?4 AND tx_to = ?8)",
+                    EDGE_INSERT_SQL,
                     &[
                         id.as_str().into(),
                         src.as_str().into(),
@@ -2560,6 +2568,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows[0].get_i64(0).unwrap(), 2, "both types must be stored");
+    }
+
+    #[tokio::test]
+    async fn relate_stores_an_empty_json_object_as_attributes() {
+        // Pins the claim behind sharing `EDGE_INSERT_SQL` with `ingest_episode`:
+        // binding `relate`'s attributes as a parameter instead of hardcoding
+        // the SQL literal `'{}'` must still store the same value.
+        let g = graph_at(Millis(1000)).await;
+        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+
+        let edge_id = g.relate(&a, &b, "mentions").await.unwrap();
+
+        let rows = g
+            .backend
+            .query(
+                "SELECT attributes FROM edges WHERE id = ?1",
+                &[edge_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_string(0).unwrap(), "{}");
     }
 
     #[tokio::test]
