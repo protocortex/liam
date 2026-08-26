@@ -111,6 +111,32 @@ fn live_at(alias: &str, t: usize) -> String {
     )
 }
 
+/// SQL + params for "the live node with this subject (and scope), if any."
+/// Shared by `find_live_by_subject` (run against `&Backend`, for `upsert_by`)
+/// and `Graph::ingest_episode`'s per-node supersede check (run against an
+/// open `BackendTx`, so it also sees writes from earlier in the same
+/// episode's own transaction). Sharing the SQL-building here, not the whole
+/// method, since the `&Backend` vs `&mut BackendTx` split makes sharing the
+/// execution itself awkward.
+fn live_by_subject_query(subject: &str, now: Millis, scope: Option<&str>) -> (String, Vec<Value>) {
+    let mut params: Vec<Value> = vec![subject.into(), now.into()];
+    let scope_filter = match scope {
+        Some(s) => {
+            params.push(s.into());
+            " AND scope = ?3"
+        }
+        None => " AND scope IS NULL",
+    };
+    // If two live nodes ever share a subject+scope, supersede the newest
+    // deterministically (tie-break by id) rather than an arbitrary row.
+    let sql = format!(
+        "SELECT id FROM nodes WHERE subject = ?1 AND {live}{scope_filter}
+         ORDER BY tx_from DESC, id DESC LIMIT 1",
+        live = live_at("nodes", 2),
+    );
+    (sql, params)
+}
+
 fn opt_text(v: Option<String>) -> Value {
     v.map(Value::Text).unwrap_or(Value::Null)
 }
@@ -358,8 +384,10 @@ impl<B: Backend> Graph<B> {
     /// index into `nodes` or an already-existing id, so a caller never needs
     /// to read back a freshly-inserted node's id before linking it.
     ///
-    /// No subject-based dedup in this WU: every node is a plain insert. (WU-3
-    /// adds superseding a same-subject competitor on top of this.)
+    /// A node carrying a `subject` supersedes a same-subject competitor,
+    /// whether it went live before this call or earlier in this same
+    /// episode: ordinary check-then-write per node, inside the same loop, in
+    /// order.
     pub async fn ingest_episode(
         &self,
         nodes: Vec<NewNode>,
@@ -388,11 +416,50 @@ impl<B: Backend> Graph<B> {
         let mut tx = self.backend.begin().await?;
 
         for (id, node) in ids.iter().zip(&nodes) {
-            // WU-3 extends this with a per-node `if let Some(old) = ...`
-            // supersede branch, run before the insert below. No dedup yet:
-            // every node here is a plain insert.
+            let mut superseded: Option<NodeId> = None;
+            if let Some(subject) = node.subject.as_deref() {
+                // Same SQL as `find_live_by_subject`, run against the open
+                // `tx` instead of `&self.backend` so it sees writes from
+                // earlier in this same episode (an earlier node that
+                // already superseded something).
+                let (sql, params) = live_by_subject_query(subject, now, node.scope.as_deref());
+                let rows = tx.query(&sql, &params).await?;
+                if let Some(old_id) = rows
+                    .first()
+                    .map(|r| NodeId::from_raw(r.get_string(0).unwrap_or_default()))
+                {
+                    // Close the old row now, targeting the exact id the
+                    // query just returned. The `supersedes` edge itself is
+                    // inserted after the new node's own row below, since
+                    // `edges.src` references `nodes(id)` and the new node
+                    // does not exist yet.
+                    tx.execute(
+                        "UPDATE nodes SET tx_to = ?1 WHERE id = ?2 AND tx_to = ?3",
+                        &[now.into(), old_id.as_str().into(), FOREVER.into()],
+                    )
+                    .await?;
+                    superseded = Some(old_id);
+                }
+            }
             let (sql, params) = self.node_insert(id, node, now)?;
             tx.execute(&sql, &params).await?;
+            if let Some(old_id) = superseded {
+                // Mirrors `supersede`'s own edge-insert shape: link new ->
+                // old with a reserved `supersedes` edge.
+                tx.execute(
+                    "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
+                     VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)",
+                    &[
+                        EdgeId::new().as_str().into(),
+                        id.as_str().into(),
+                        old_id.as_str().into(),
+                        crate::types::relation::SUPERSEDES.into(),
+                        now.into(),
+                        FOREVER.into(),
+                    ],
+                )
+                .await?;
+            }
         }
 
         let mut edge_ids = Vec::with_capacity(edges.len());
@@ -806,21 +873,7 @@ impl<B: Backend> Graph<B> {
         scope: Option<&str>,
     ) -> Result<Option<NodeId>> {
         let now = self.clock.now();
-        let mut params: Vec<Value> = vec![subject.into(), now.into()];
-        let scope_filter = match scope {
-            Some(s) => {
-                params.push(s.into());
-                " AND scope = ?3"
-            }
-            None => " AND scope IS NULL",
-        };
-        // If two live nodes ever share a subject+scope, supersede the newest
-        // deterministically (tie-break by id) rather than an arbitrary row.
-        let sql = format!(
-            "SELECT id FROM nodes WHERE subject = ?1 AND {live}{scope_filter}
-             ORDER BY tx_from DESC, id DESC LIMIT 1",
-            live = live_at("nodes", 2),
-        );
+        let (sql, params) = live_by_subject_query(subject, now, scope);
         let rows = self.backend.query(&sql, &params).await?;
         Ok(rows
             .first()
@@ -3781,6 +3834,266 @@ mod tests {
         // Assert
         assert!(result.node_ids.is_empty());
         assert!(result.edge_ids.is_empty());
+    }
+
+    // ---- WU-3: subject-based dedup inside ingest_episode ----
+
+    #[tokio::test]
+    async fn a_node_with_a_subject_already_live_outside_the_call_gets_superseded() {
+        // Arrange: a node with subject "alice" already live before this call.
+        let g = graph_at(Millis(1000)).await;
+        let old = g
+            .insert(NewNode::now("fact", "v1", "alice is 30").with_subject("alice"))
+            .await
+            .unwrap();
+        let nodes = vec![NewNode::now("fact", "v2", "alice is 31").with_subject("alice")];
+
+        // Act
+        let result = g.ingest_episode(nodes, vec![]).await.unwrap();
+        let new_id = &result.node_ids[0];
+
+        // Assert
+        let old_rows = g
+            .backend
+            .query(
+                "SELECT tx_to FROM nodes WHERE id = ?1",
+                &[old.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            old_rows[0].get_i64(0).unwrap(),
+            FOREVER.0,
+            "old must be closed"
+        );
+        let new_rows = g
+            .backend
+            .query(
+                "SELECT tx_to FROM nodes WHERE id = ?1",
+                &[new_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            new_rows[0].get_i64(0).unwrap(),
+            FOREVER.0,
+            "new must be live"
+        );
+        let edge_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE type = 'supersedes' AND src = ?1 AND dst = ?2",
+                &[new_id.as_str().into(), old.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            edge_rows[0].get_i64(0).unwrap(),
+            1,
+            "a supersedes edge must link new -> old"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_items_in_one_call_with_the_same_subject_supersede_in_order() {
+        // Arrange: two nodes in one call, both subject "alice", no prior state.
+        let g = graph_at(Millis(1000)).await;
+        let nodes = vec![
+            NewNode::now("fact", "v1", "alice is 30").with_subject("alice"),
+            NewNode::now("fact", "v2", "alice is 31").with_subject("alice"),
+        ];
+
+        // Act
+        let result = g.ingest_episode(nodes, vec![]).await.unwrap();
+        let (id0, id1) = (&result.node_ids[0], &result.node_ids[1]);
+
+        // Assert: index 0 becomes live first, then index 1 supersedes it
+        // within the same transaction.
+        let id0_rows = g
+            .backend
+            .query(
+                "SELECT tx_to FROM nodes WHERE id = ?1",
+                &[id0.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            id0_rows[0].get_i64(0).unwrap(),
+            FOREVER.0,
+            "index 0 must be superseded"
+        );
+        let id1_rows = g
+            .backend
+            .query(
+                "SELECT tx_to FROM nodes WHERE id = ?1",
+                &[id1.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            id1_rows[0].get_i64(0).unwrap(),
+            FOREVER.0,
+            "index 1 must be live"
+        );
+        let edge_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE type = 'supersedes' AND src = ?1 AND dst = ?2",
+                &[id1.as_str().into(), id0.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            edge_rows[0].get_i64(0).unwrap(),
+            1,
+            "index 1 must supersede index 0 within the same call"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edge_to_an_already_superseded_same_episode_reference_fails_the_whole_call() {
+        // Arrange: node 0 and node 1 share a subject, so node 1 supersedes
+        // node 0 during the node-writing phase; the edge references node 0
+        // by its original index, after it has already been closed.
+        let g = graph_at(Millis(1000)).await;
+        let nodes = vec![
+            NewNode::now("fact", "v1", "alice is 30").with_subject("alice"),
+            NewNode::now("fact", "v2", "alice is 31").with_subject("alice"),
+            NewNode::now("fact", "Unrelated", "z"),
+        ];
+        let edges = vec![EpisodeEdge {
+            from: EpisodeRef::New(0),
+            to: EpisodeRef::New(2),
+            kind: "mentions".to_string(),
+            attributes: serde_json::json!({}),
+        }];
+
+        // Act
+        let err = g.ingest_episode(nodes, edges).await.unwrap_err();
+
+        // Assert: the whole call fails, naming a specific (not generic) id,
+        // matching relate_refusal's wording. Node 0's real id is generated
+        // inside ingest_episode and never returned on failure since the
+        // whole episode rolls back, so this checks message shape (a real
+        // 26-character ULID, not a placeholder) rather than equality
+        // against an independently captured id.
+        let msg = match &err {
+            Error::RelateRefused(m) => m.clone(),
+            other => panic!("expected RelateRefused: {other:?}"),
+        };
+        assert!(msg.contains("is not live"), "{msg}");
+        let id_token = msg.split_whitespace().nth(2).expect("id token in message");
+        assert_eq!(id_token.len(), 26, "{msg}");
+        assert!(id_token.chars().all(|c| c.is_ascii_alphanumeric()), "{msg}");
+
+        // Nothing from the episode was written, including node 1 and the
+        // edge, both of which would have been individually valid alone.
+        let node_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            node_rows[0].get_i64(0).unwrap(),
+            0,
+            "nothing from the episode must exist"
+        );
+        let edge_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM edges", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            edge_rows[0].get_i64(0).unwrap(),
+            0,
+            "not even the supersedes edge from node 1 -> node 0 must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subject_less_node_is_a_plain_insert() {
+        // Arrange: a subject-less node alongside a subject-bearing node that
+        // does supersede something, so the assertion below distinguishes
+        // "no supersedes edges at all" from "the subject-less node is never
+        // one of their endpoints."
+        let g = graph_at(Millis(1000)).await;
+        let old = g
+            .insert(NewNode::now("fact", "v1", "alice is 30").with_subject("alice"))
+            .await
+            .unwrap();
+        let nodes = vec![
+            NewNode::now("fact", "NoSubject", "x"),
+            NewNode::now("fact", "v2", "alice is 31").with_subject("alice"),
+        ];
+
+        // Act
+        let result = g.ingest_episode(nodes, vec![]).await.unwrap();
+        let no_subject_id = &result.node_ids[0];
+        let with_subject_id = &result.node_ids[1];
+
+        // Assert
+        let supersede_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE type = 'supersedes' AND src = ?1 AND dst = ?2",
+                &[with_subject_id.as_str().into(), old.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            supersede_rows[0].get_i64(0).unwrap(),
+            1,
+            "the subject-bearing node must still supersede the prior live node"
+        );
+        let no_subject_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE type = 'supersedes' AND (src = ?1 OR dst = ?1)",
+                &[no_subject_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            no_subject_rows[0].get_i64(0).unwrap(),
+            0,
+            "the subject-less node must never be a supersedes edge endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn vectors_are_written_after_commit_for_every_embedded_node() {
+        // Arrange: two nodes with distinct embeddings, dims = 8 per
+        // `graph_at`'s `GraphConfig::new(8)`.
+        let g = graph_at(Millis(1000)).await;
+        let e1 = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let e2 = vec![0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let nodes = vec![
+            NewNode::now("fact", "One", "x").with_embedding(e1.clone()),
+            NewNode::now("fact", "Two", "y").with_embedding(e2.clone()),
+        ];
+
+        // Act
+        let result = g.ingest_episode(nodes, vec![]).await.unwrap();
+
+        // Assert
+        let hits1 = g
+            .backend
+            .vector_search(&e1, 5, None, None, Millis(1000))
+            .await
+            .unwrap();
+        assert!(
+            hits1.contains(&result.node_ids[0]),
+            "the first node's embedding must be searchable after commit"
+        );
+        let hits2 = g
+            .backend
+            .vector_search(&e2, 5, None, None, Millis(1000))
+            .await
+            .unwrap();
+        assert!(
+            hits2.contains(&result.node_ids[1]),
+            "the second node's embedding must be searchable after commit"
+        );
     }
 
     /// Wraps a real `BackendTx`, failing exactly one targeted `execute` call
