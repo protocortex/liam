@@ -141,6 +141,7 @@ fn parse_entity_ref(s: &str, entity_count: usize) -> Option<usize> {
 /// here to recognize a handle-shaped episode edge reference up front,
 /// without paying for the DB read until the reference is actually resolved.
 fn is_handle_shaped(s: &str) -> bool {
+    let s = s.trim();
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
@@ -1856,9 +1857,9 @@ mod tests {
 
     #[tokio::test]
     async fn remember_with_episode_rejects_an_out_of_bounds_fact_index() {
-        // Given an episode with two facts total (the top-level one plus one
-        // episode.facts entry) and an edge naming "fact:5", well past the
-        // valid 0..=2 range
+        // Given an episode with two valid combined fact indices (0 = the
+        // top-level fact, 1 = the one episode.facts entry) and an edge
+        // naming "fact:5", well past the valid 0..=1 range
         let server = plain_server().await;
         let marker = "episode out of bounds index rejection content";
         let before = server
@@ -1880,8 +1881,12 @@ mod tests {
             }))
             .await;
 
-        // Then it is refused, and nothing lands
-        assert!(out.contains("failed"), "{out}");
+        // Then it is refused specifically for that reference, and nothing
+        // lands
+        assert!(
+            out.contains("not a recognized reference") && out.contains("fact:5"),
+            "{out}"
+        );
         let after = server
             .store
             .query_explained(&Query::text(marker))
@@ -1889,6 +1894,37 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(after, before, "wrote a node despite rejection: {out}");
+
+        // And the true boundary, one past the last valid index, is rejected
+        // too: "fact:2" is not a valid combined index in this same
+        // 2-valid-index episode, so a one-off bug in parse_fact_ref's bound
+        // check (e.g. "<=" instead of "<") would wrongly accept it while
+        // still correctly rejecting the far-out-of-range "fact:5" above
+        let boundary_marker = "episode boundary index rejection content";
+        let boundary_out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("episode boundary nested content")],
+                    entities: vec![],
+                    edges: vec![episode_edge("fact:0", "fact:2", "mentions")],
+                }),
+                ..remember_args(boundary_marker)
+            }))
+            .await;
+        assert!(
+            boundary_out.contains("not a recognized reference") && boundary_out.contains("fact:2"),
+            "{boundary_out}"
+        );
+        let boundary_after = server
+            .store
+            .query_explained(&Query::text(boundary_marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            boundary_after, 0,
+            "wrote a node despite boundary rejection: {boundary_out}"
+        );
     }
 
     #[tokio::test]
@@ -1916,8 +1952,12 @@ mod tests {
             }))
             .await;
 
-        // Then it is refused, and nothing lands
-        assert!(out.contains("failed"), "{out}");
+        // Then it is refused specifically for that reference, and nothing
+        // lands
+        assert!(
+            out.contains("not a recognized reference") && out.contains("bogus:0"),
+            "{out}"
+        );
         let after = server
             .store
             .query_explained(&Query::text(marker))
@@ -1925,6 +1965,54 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_accepts_a_whitespace_padded_handle_reference() {
+        // Given a pre-existing handle target, and an episode edge that names
+        // it with incidental leading/trailing whitespace: is_handle_shaped
+        // must trim before its alphanumeric check, the same way
+        // Graph::resolve_handle trims before its own, or this reference is
+        // wrongly rejected before resolve_handle ever runs
+        let server = plain_server().await;
+        let existing_handle = seed(
+            &server,
+            "fact",
+            "Existing handle target",
+            "padded handle existing content",
+        )
+        .await;
+        let marker = "padded handle top content";
+
+        // When remember is called with the edge's "to" padded with whitespace
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![],
+                    edges: vec![episode_edge(
+                        "fact:0",
+                        &format!("  {existing_handle}  "),
+                        "mentions",
+                    )],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is accepted, not refused as "not a recognized reference",
+        // and the edge resolves to the existing handle's real id
+        assert!(!out.contains("failed"), "{out}");
+        let top_id = out
+            .lines()
+            .next()
+            .expect("remembered line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        assert!(
+            out.contains(&format!("related {top_id} -mentions-> {existing_handle}")),
+            "{out}"
+        );
     }
 
     #[tokio::test]
