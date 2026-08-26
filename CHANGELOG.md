@@ -6,6 +6,13 @@ All notable changes to LIAM are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `remember` accepts an optional `episode` field, so a client can write several related facts,
+  the entities they mention, and the edges between them in one call. Everything in the episode
+  lands together, or none of it does. Leaving `episode` out keeps `remember` working exactly as
+  it always has.
+
 ### Changed
 
 - License changed from AGPL-3.0-only to Apache-2.0. Applies going forward only; releases already
