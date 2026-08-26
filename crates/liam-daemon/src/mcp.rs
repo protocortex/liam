@@ -2335,6 +2335,218 @@ mod tests {
         assert_eq!(after.len(), 0, "wrote a node despite rejection: {out}");
     }
 
+    #[tokio::test]
+    async fn remember_with_a_full_mixed_episode_round_trips_through_mcp() {
+        // Given a prior, separate `remember` call establishing entity
+        // "Grace" as live, and a separate fact remembered before this
+        // episode, so this episode's third edge can reference it by its
+        // handle string rather than an episode-local index
+        let server = plain_server().await;
+
+        let prior_entity_out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Grace")],
+                    edges: vec![],
+                }),
+                ..remember_args("mixed episode prior entity top content")
+            }))
+            .await;
+        assert!(!prior_entity_out.contains("failed"), "{prior_entity_out}");
+        let prior_entity_id = prior_entity_out
+            .lines()
+            .nth(1)
+            .expect("prior entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+
+        let existing_handle = seed(
+            &server,
+            "fact",
+            "Existing handle target",
+            "mixed episode existing handle content",
+        )
+        .await;
+
+        // When remember is called with a full mixed episode: 2 nested facts
+        // (plus the top-level fact makes 3 fact-shaped nodes total), 2
+        // entities (one brand new, one superseding "Grace" above), and 3
+        // edges: fact-to-fact by index, fact-to-entity by index, and
+        // fact-to-existing-handle by handle string
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![
+                        episode_fact("mixed episode fact one content"),
+                        episode_fact("mixed episode fact two content"),
+                    ],
+                    entities: vec![
+                        episode_entity("person", "Henry"),
+                        episode_entity("person", "Grace"),
+                    ],
+                    edges: vec![
+                        episode_edge("fact:1", "fact:2", "supports"),
+                        episode_edge("fact:1", "entity:0", "mentions"),
+                        episode_edge("fact:2", &existing_handle, "relates_to"),
+                    ],
+                }),
+                ..remember_args("mixed episode top content")
+            }))
+            .await;
+
+        // Then the response has one "remembered {id}" line per written node
+        // (top fact, 2 nested facts, 2 entities, in order) followed by one
+        // "related ..." line per edge, in order; ids are read out of the
+        // response text itself, since they are runtime-generated ULIDs
+        assert!(!out.contains("failed"), "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 8, "expected 5 remembered + 3 related: {out}");
+        for line in &lines[..5] {
+            assert!(line.starts_with("remembered "), "{out}");
+        }
+        for line in &lines[5..] {
+            assert!(line.starts_with("related "), "{out}");
+        }
+        let top_id = lines[0].trim_start_matches("remembered ").to_string();
+        let fact1_id = lines[1].trim_start_matches("remembered ").to_string();
+        let fact2_id = lines[2].trim_start_matches("remembered ").to_string();
+        let henry_id = lines[3].trim_start_matches("remembered ").to_string();
+        let grace_id = lines[4].trim_start_matches("remembered ").to_string();
+
+        assert_eq!(
+            lines[5],
+            format!("related {fact1_id} -supports-> {fact2_id}")
+        );
+        assert_eq!(
+            lines[6],
+            format!("related {fact1_id} -mentions-> {henry_id}")
+        );
+        assert_eq!(
+            lines[7],
+            format!("related {fact2_id} -relates_to-> {existing_handle}")
+        );
+
+        // Every written item is independently recall-able afterward: the
+        // top fact and both nested facts by content, the pre-existing
+        // handle target too
+        for marker in [
+            "mixed episode top content",
+            "mixed episode fact one content",
+            "mixed episode fact two content",
+            "mixed episode existing handle content",
+        ] {
+            let hits = server
+                .store
+                .query_explained(&Query::text(marker))
+                .await
+                .unwrap();
+            assert!(
+                hits.iter().any(|h| h.hit.content == marker),
+                "{marker} missing: {out}"
+            );
+        }
+
+        // Both entities are independently reachable: the newly-created one,
+        // and the superseding one; the prior call's now-superseded entity is
+        // not live any more
+        assert!(
+            server.store.resolve_handle(&henry_id).await.is_ok(),
+            "new entity should be live"
+        );
+        assert!(
+            server.store.resolve_handle(&grace_id).await.is_ok(),
+            "superseding entity should be live"
+        );
+        assert!(
+            server.store.resolve_handle(&prior_entity_id).await.is_err(),
+            "prior entity should have been superseded, not left live"
+        );
+        assert_ne!(prior_entity_id, grace_id, "expected two distinct ids");
+
+        // All 3 edges exist with the right endpoints: relating each same
+        // ordered triple again reports "already relates", the existing
+        // idempotency signal `relate` uses
+        for (from, to, kind) in [
+            (fact1_id.clone(), fact2_id.clone(), "supports"),
+            (fact1_id.clone(), henry_id.clone(), "mentions"),
+            (fact2_id.clone(), existing_handle.clone(), "relates_to"),
+        ] {
+            let relate_again = server
+                .relate(Parameters(RelateArgs {
+                    from,
+                    to,
+                    kind: kind.to_string(),
+                }))
+                .await;
+            assert!(
+                relate_again.contains("already relates"),
+                "edge missing for {kind}: {relate_again}"
+            );
+        }
+        // top_id is written but not referenced by any edge in this episode;
+        // confirming it round-trips through recall proves it was still
+        // written even though nothing points at it.
+        assert!(
+            server.store.resolve_handle(&top_id).await.is_ok(),
+            "top-level fact should be live"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_reports_every_validation_problem_before_writing_anything() {
+        // Given an episode with two independent problems in the same call:
+        // an out-of-range confidence on episode.facts[1], and a reserved
+        // edge kind on episode.edges[0]
+        let server = plain_server().await;
+        let top_marker = "episode multi problem top content";
+        let fact0_marker = "episode multi problem fact zero content";
+        let fact1_marker = "episode multi problem fact one content";
+
+        // When remember is called with both problems present at once
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![
+                        episode_fact(fact0_marker),
+                        EpisodeFactArgs {
+                            confidence: Some(5.0),
+                            ..episode_fact(fact1_marker)
+                        },
+                    ],
+                    entities: vec![],
+                    edges: vec![episode_edge("fact:0", "fact:1", "supersedes")],
+                }),
+                ..remember_args(top_marker)
+            }))
+            .await;
+
+        // Then the response reports BOTH problems, not just the first one
+        // encountered, proving `problems.push(...)` accumulates across the
+        // whole validation pass rather than returning at the first failure
+        assert!(out.starts_with("remember failed:"), "{out}");
+        assert!(
+            out.contains("confidence"),
+            "confidence problem missing: {out}"
+        );
+        assert!(out.contains("reserved"), "edge kind problem missing: {out}");
+
+        // And nothing landed at all: not the top-level fact, not either
+        // nested fact
+        for marker in [top_marker, fact0_marker, fact1_marker] {
+            let hits = server
+                .store
+                .query_explained(&Query::text(marker))
+                .await
+                .unwrap();
+            assert_eq!(
+                hits.len(),
+                0,
+                "{marker} wrote a node despite rejection: {out}"
+            );
+        }
+    }
+
     /// Count rendered evidence blocks in a captured `system\nprompt` pair,
     /// skipping the system prompt's own explanation of the fence syntax
     /// (which quotes a literal `<<<EVIDENCE n>>>` as its example and would
