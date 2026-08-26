@@ -49,11 +49,12 @@ const DEFAULT_PRODUCER: &str = "unknown";
 /// Same value by consistency, not by coupling.
 const MAX_ATTRIBUTES_CHARS: usize = 2000;
 
-/// Cap on `1 + episode.facts.len() + episode.edges.len()` for `remember`'s
-/// `episode` field (the leading `1` is the always-present top-level fact).
-/// Bounds how long `Graph::ingest_episode`'s transaction holds the write
-/// lock; see the plan's Architecture section, "Cost of the transaction
-/// staying open for the whole call."
+/// Cap on `1 + episode.facts.len() + episode.entities.len() +
+/// episode.edges.len()` for `remember`'s `episode` field (the leading `1`
+/// is the always-present top-level fact). Bounds how long
+/// `Graph::ingest_episode`'s transaction holds the write lock; see the
+/// plan's Architecture section, "Cost of the transaction staying open for
+/// the whole call."
 const MAX_EPISODE_ITEMS: usize = 100;
 
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
@@ -115,11 +116,24 @@ fn attributes_problem(attributes: &Option<serde_json::Value>) -> Option<String> 
 /// Parses a `"fact:N"` episode edge reference into its combined node index
 /// (0 is the always-present top-level fact, 1..=`fact_count` is
 /// `episode.facts`), if `s` has that shape and `N` is in bounds. `None` for
-/// anything else, including a handle or an unrecognized form (from WU-5 on,
-/// `"entity:N"` too); the caller distinguishes those separately.
+/// anything else, including a handle, an `"entity:N"` reference (see
+/// `parse_entity_ref`), or an unrecognized form; the caller distinguishes
+/// those separately.
 fn parse_fact_ref(s: &str, fact_count: usize) -> Option<usize> {
     let n: usize = s.strip_prefix("fact:")?.parse().ok()?;
     (n < 1 + fact_count).then_some(n)
+}
+
+/// Parses an `"entity:N"` episode edge reference into its entity-LOCAL index
+/// (0-based into `episode.entities`), if `s` has that shape and `N` is in
+/// bounds. Unlike `parse_fact_ref` there is no "top-level" slot to offset
+/// by, so the bounds check is just `n < entity_count`. `None` for anything
+/// else. The caller translates a `Some` result to the combined node index
+/// (`1 + fact_count + n`) once `fact_count` is in scope; this function does
+/// not need it.
+fn parse_entity_ref(s: &str, entity_count: usize) -> Option<usize> {
+    let n: usize = s.strip_prefix("entity:")?.parse().ok()?;
+    (n < entity_count).then_some(n)
 }
 
 /// The same cheap syntactic pre-check `Graph::resolve_handle` runs before its
@@ -186,8 +200,9 @@ pub struct EpisodeFactArgs {
 /// instead of a real id neither may have yet.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EpisodeEdgeArgs {
-    /// `"fact:N"` (0 is the top-level fact, 1..=N is `episode.facts`), or a
-    /// handle `recall`/`relate` would accept. `"entity:N"` arrives in WU-5.
+    /// `"fact:N"` (0 is the top-level fact, 1..=N is `episode.facts`),
+    /// `"entity:N"` (0-based into `episode.entities`), or a handle
+    /// `recall`/`relate` would accept.
     pub from: String,
     pub to: String,
     /// Relation type, for example `mentions`. `supersedes` is reserved, same
@@ -195,14 +210,25 @@ pub struct EpisodeEdgeArgs {
     pub kind: String,
 }
 
-/// `RememberArgs.episode`: additional facts, and the edges between them and
-/// the top-level fact, written atomically. `entities` is added by WU-5, as a
-/// second field on this same struct; deliberately absent here, since
-/// referencing a type WU-5 declares would make this WU fail to compile as
-/// its own commit.
+/// One entity inside `RememberArgs.episode.entities`, an entity page node
+/// referenced by episode edges via `"entity:N"`. Written through
+/// `liam_store::NewNode::entity(entity_type, name)`: `entity_type` becomes
+/// its `kind` (for example "person", "company"), `name` becomes its label
+/// and, normalized, its subject, so the same entity named across two
+/// separate `remember` calls supersedes instead of duplicating. Gets no
+/// embedding, since its content is always empty by construction.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EpisodeEntityArgs {
+    pub entity_type: String,
+    pub name: String,
+}
+
+/// `RememberArgs.episode`: additional facts, entities, and the edges
+/// between them and the top-level fact, written atomically.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EpisodeArgs {
     pub facts: Vec<EpisodeFactArgs>,
+    pub entities: Vec<EpisodeEntityArgs>,
     pub edges: Vec<EpisodeEdgeArgs>,
 }
 
@@ -397,12 +423,24 @@ impl MemoryServer {
     }
 
     /// Resolves one episode edge reference, already known syntactically
-    /// valid by the caller's validation pass: `"fact:N"` (parsing cannot
-    /// fail here) to `EpisodeRef::New`, or a handle to `EpisodeRef::Existing`
-    /// via the one real `resolve_handle` DB read this reference gets.
-    async fn episode_ref(&self, s: &str, fact_count: usize) -> liam_store::Result<EpisodeRef> {
+    /// valid by the caller's validation pass: `"fact:N"` or `"entity:N"`
+    /// (parsing cannot fail here) to `EpisodeRef::New` at the combined
+    /// index (an entity-local index `n` becomes `1 + fact_count + n`), or a
+    /// handle to `EpisodeRef::Existing` via the one real `resolve_handle` DB
+    /// read this reference gets. One method, not a fact/entity pair,
+    /// because both branches produce the same `EpisodeRef::New` shape; the
+    /// only difference is which parser and which index offset apply.
+    async fn episode_ref(
+        &self,
+        s: &str,
+        fact_count: usize,
+        entity_count: usize,
+    ) -> liam_store::Result<EpisodeRef> {
         if let Some(n) = parse_fact_ref(s, fact_count) {
             return Ok(EpisodeRef::New(n));
+        }
+        if let Some(n) = parse_entity_ref(s, entity_count) {
+            return Ok(EpisodeRef::New(1 + fact_count + n));
         }
         self.store.resolve_handle(s).await.map(EpisodeRef::Existing)
     }
@@ -453,7 +491,7 @@ impl MemoryServer {
         // `Graph::ingest_episode`. Bounded first, before any per-item check
         // or DB call, so a caller-sized episode can't hold
         // `ingest_episode`'s transaction open indefinitely.
-        let total = 1 + episode.facts.len() + episode.edges.len();
+        let total = 1 + episode.facts.len() + episode.entities.len() + episode.edges.len();
         if total > MAX_EPISODE_ITEMS {
             return format!(
                 "remember failed: episode has {total} items, over the {MAX_EPISODE_ITEMS} max"
@@ -465,6 +503,7 @@ impl MemoryServer {
         // rather than stopping at the first: no DB call happens until this
         // whole pass is clean.
         let fact_count = episode.facts.len();
+        let entity_count = episode.entities.len();
         let mut problems: Vec<String> = Vec::new();
         for (i, fact) in episode.facts.iter().enumerate() {
             if let Some(problem) = confidence_problem(fact.confidence) {
@@ -485,7 +524,10 @@ impl MemoryServer {
                 ));
             }
             for (role, reference) in [("from", edge.from.as_str()), ("to", edge.to.as_str())] {
-                if parse_fact_ref(reference, fact_count).is_none() && !is_handle_shaped(reference) {
+                if parse_fact_ref(reference, fact_count).is_none()
+                    && parse_entity_ref(reference, entity_count).is_none()
+                    && !is_handle_shaped(reference)
+                {
                     problems.push(format!(
                         "edge {j}: {role} '{reference}' is not a recognized reference"
                     ));
@@ -505,8 +547,8 @@ impl MemoryServer {
         let mut resolve_problems: Vec<String> = Vec::new();
         for (j, edge) in episode.edges.iter().enumerate() {
             match (
-                self.episode_ref(&edge.from, fact_count).await,
-                self.episode_ref(&edge.to, fact_count).await,
+                self.episode_ref(&edge.from, fact_count, entity_count).await,
+                self.episode_ref(&edge.to, fact_count, entity_count).await,
             ) {
                 (Ok(from), Ok(to)) => refs.push((from, to)),
                 (from, to) => {
@@ -525,12 +567,13 @@ impl MemoryServer {
 
         // Embed the top-level fact plus every episode.facts entry, then
         // build the combined node list in order: index 0 is the top-level
-        // fact, 1..=fact_count is episode.facts.
+        // fact, 1..=fact_count is episode.facts, and
+        // 1+fact_count..1+fact_count+entity_count is episode.entities.
         let embedding = match self.embedder.embed(&args.content).await {
             Ok(v) => v,
             Err(e) => return format!("embed failed: {e}"),
         };
-        let mut nodes = Vec::with_capacity(1 + fact_count);
+        let mut nodes = Vec::with_capacity(1 + fact_count + entity_count);
         let mut top = NewNode::now(args.kind, args.label, args.content)
             .with_embedding(embedding)
             .with_producer(self.producer());
@@ -572,6 +615,16 @@ impl MemoryServer {
                 node = node.with_subject(subject);
             }
             nodes.push(node);
+        }
+
+        // Entities land after every fact, in episode.entities order,
+        // landing entity j at combined index 1 + fact_count + j. No embed
+        // call: an entity's content is always empty by construction
+        // (`NewNode::entity`), so there is nothing to embed.
+        for entity in episode.entities {
+            nodes.push(
+                NewNode::entity(entity.entity_type, entity.name).with_producer(self.producer()),
+            );
         }
 
         let edges: Vec<EpisodeEdge> = episode
@@ -896,6 +949,41 @@ mod tests {
     impl liam_model::Reranker for FailingReranker {
         async fn scores(&self, _q: &str, _d: &[String]) -> liam_model::Result<Vec<f32>> {
             Err(liam_model::ModelError::Rerank("boom".into()))
+        }
+    }
+
+    /// Wraps a real `Embedder`, counting every `embed` call, so a test can
+    /// assert exactly how many calls one `remember` invocation made.
+    /// `MockEmbedder` itself has no counter of its own; this follows the
+    /// same small-custom-double pattern as `FailingLlm`/`FailingReranker`
+    /// above, delegating the real work to the wrapped embedder instead of
+    /// faking a result.
+    struct CountingEmbedder {
+        inner: liam_model::MockEmbedder,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbedder {
+        fn new(dims: usize) -> Self {
+            Self {
+                inner: liam_model::MockEmbedder::new(dims),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for CountingEmbedder {
+        fn dims(&self) -> usize {
+            self.inner.dims()
+        }
+        async fn embed(&self, text: &str) -> liam_model::Result<Vec<f32>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.embed(text).await
         }
     }
 
@@ -1572,6 +1660,13 @@ mod tests {
         }
     }
 
+    fn episode_entity(entity_type: &str, name: &str) -> EpisodeEntityArgs {
+        EpisodeEntityArgs {
+            entity_type: entity_type.to_string(),
+            name: name.to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn remember_without_episode_is_unchanged() {
         // Given a server, and a remember call with `episode` explicitly
@@ -1608,6 +1703,7 @@ mod tests {
             .remember(Parameters(RememberArgs {
                 episode: Some(EpisodeArgs {
                     facts: vec![episode_fact("episodenestedfactmarker")],
+                    entities: vec![],
                     edges: vec![episode_edge("fact:0", "fact:1", "mentions")],
                 }),
                 ..remember_args("episodetoplevelfactmarker")
@@ -1688,6 +1784,7 @@ mod tests {
             .remember(Parameters(RememberArgs {
                 episode: Some(EpisodeArgs {
                     facts: vec![episode_fact("episode supersedes nested content")],
+                    entities: vec![],
                     edges: vec![episode_edge("fact:0", "fact:1", "supersedes")],
                 }),
                 ..remember_args(marker)
@@ -1726,6 +1823,7 @@ mod tests {
                         confidence: Some(5.0),
                         ..episode_fact("episode nested confidence nested content")
                     }],
+                    entities: vec![],
                     edges: vec![],
                 }),
                 ..remember_args(marker)
@@ -1763,6 +1861,7 @@ mod tests {
             .remember(Parameters(RememberArgs {
                 episode: Some(EpisodeArgs {
                     facts: vec![episode_fact("episode out of bounds nested content")],
+                    entities: vec![],
                     edges: vec![episode_edge("fact:0", "fact:5", "mentions")],
                 }),
                 ..remember_args(marker)
@@ -1798,6 +1897,7 @@ mod tests {
             .remember(Parameters(RememberArgs {
                 episode: Some(EpisodeArgs {
                     facts: vec![],
+                    entities: vec![],
                     edges: vec![episode_edge("fact:0", "bogus:0", "mentions")],
                 }),
                 ..remember_args(marker)
@@ -1836,6 +1936,7 @@ mod tests {
             .remember(Parameters(RememberArgs {
                 episode: Some(EpisodeArgs {
                     facts,
+                    entities: vec![],
                     edges: vec![],
                 }),
                 ..remember_args(marker)
@@ -1863,6 +1964,7 @@ mod tests {
             .remember(Parameters(RememberArgs {
                 episode: Some(EpisodeArgs {
                     facts,
+                    entities: vec![],
                     edges: vec![],
                 }),
                 ..remember_args(at_cap_marker)
@@ -1898,6 +2000,7 @@ mod tests {
                             ..episode_fact(second_marker)
                         },
                     ],
+                    entities: vec![],
                     edges: vec![episode_edge("fact:1", "fact:2", "mentions")],
                 }),
                 ..remember_args(top_marker)
@@ -1924,6 +2027,312 @@ mod tests {
                 "{marker} wrote a node despite rejection: {out}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_entities_upserts_by_name_across_calls() {
+        // Given two SEPARATE remember calls, each naming entity "Alice" in
+        // its own episode
+        let server = plain_server().await;
+
+        // When the first call remembers "Alice"
+        let first_out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Alice")],
+                    edges: vec![],
+                }),
+                ..remember_args("episode entity first call marker")
+            }))
+            .await;
+        assert!(!first_out.contains("failed"), "{first_out}");
+        let first_entity_id = first_out
+            .lines()
+            .nth(1)
+            .expect("entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+
+        // And the second call remembers "Alice" again, in a wholly separate
+        // episode
+        let second_out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Alice")],
+                    edges: vec![],
+                }),
+                ..remember_args("episode entity second call marker")
+            }))
+            .await;
+        assert!(!second_out.contains("failed"), "{second_out}");
+        let second_entity_id = second_out
+            .lines()
+            .nth(1)
+            .expect("entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+
+        // Then the second supersedes the first rather than duplicating: the
+        // first id is no longer live (resolve_handle only finds live rows),
+        // the second is
+        assert_ne!(
+            first_entity_id, second_entity_id,
+            "expected two distinct ids"
+        );
+        assert!(
+            server.store.resolve_handle(&first_entity_id).await.is_err(),
+            "first entity's id is still live; expected the second call to supersede it"
+        );
+        assert!(
+            server.store.resolve_handle(&second_entity_id).await.is_ok(),
+            "second entity's id should be live"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_entities_get_no_embedding() {
+        // Given a server wired with a call-counting embedder, and an
+        // episode with one nested fact and two entities
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        let embedder = Arc::new(CountingEmbedder::new(8));
+        let server = MemoryServer::new(
+            Arc::new(store),
+            embedder.clone(),
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            1,
+        );
+
+        // When remember is called with 1 nested fact and 2 entities
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("episode entity embedding nested content")],
+                    entities: vec![
+                        episode_entity("person", "Bob"),
+                        episode_entity("person", "Carol"),
+                    ],
+                    edges: vec![],
+                }),
+                ..remember_args("episode entity embedding top content")
+            }))
+            .await;
+
+        // Then it succeeds, and the embedder was called exactly once per
+        // fact (the top-level fact plus the one nested fact), never for
+        // either entity
+        assert!(!out.contains("failed"), "{out}");
+        assert_eq!(
+            embedder.call_count(),
+            2,
+            "expected 1 (top-level) + 1 (nested fact) = 2 embed calls, entities must not embed"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_edge_references_an_entity_by_index() {
+        // Given one entity and an edge "fact:0" -> "entity:0"
+        let server = plain_server().await;
+
+        // When remember is called
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Dave")],
+                    edges: vec![episode_edge("fact:0", "entity:0", "mentions")],
+                }),
+                ..remember_args("episode entity edge top content")
+            }))
+            .await;
+
+        // Then it succeeds, the entity exists, and the edge's reported type
+        // is exactly what was sent
+        assert!(!out.contains("failed"), "{out}");
+        let mut lines = out.lines();
+        let top_id = lines
+            .next()
+            .expect("top-level fact line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        let entity_id = lines
+            .next()
+            .expect("entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        assert!(
+            out.contains(&format!("related {top_id} -mentions-> {entity_id}")),
+            "{out}"
+        );
+
+        // And the edge exists: relating the same ordered triple again
+        // reports "already relates", the existing idempotency signal
+        // `relate` uses.
+        let relate_again = server
+            .relate(Parameters(RelateArgs {
+                from: top_id,
+                to: entity_id,
+                kind: "mentions".to_string(),
+            }))
+            .await;
+        assert!(
+            relate_again.contains("already relates"),
+            "edge missing: {relate_again}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_edge_references_the_correct_entity_among_several() {
+        // Given one nested fact and two entities, with an edge from
+        // "fact:1" to "entity:1". Combined indices: 0 = top-level fact, 1 =
+        // the nested fact, 2 = entity 0, 3 = entity 1, so this exercises the
+        // nontrivial `1 + fact_count + j` arithmetic.
+        let server = plain_server().await;
+
+        // When remember is called
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("episode entity among several nested content")],
+                    entities: vec![
+                        episode_entity("person", "Eve"),
+                        episode_entity("person", "Frank"),
+                    ],
+                    edges: vec![episode_edge("fact:1", "entity:1", "mentions")],
+                }),
+                ..remember_args("episode entity among several top content")
+            }))
+            .await;
+
+        // Then it succeeds, and the edge's destination is SPECIFICALLY the
+        // second entity's node, not the first's or either fact's
+        assert!(!out.contains("failed"), "{out}");
+        let mut lines = out.lines();
+        let top_id = lines
+            .next()
+            .expect("top-level fact line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        let fact_id = lines
+            .next()
+            .expect("nested fact line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        let entity0_id = lines
+            .next()
+            .expect("first entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        let entity1_id = lines
+            .next()
+            .expect("second entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        assert!(
+            out.contains(&format!("related {fact_id} -mentions-> {entity1_id}")),
+            "{out}"
+        );
+        for wrong in [&top_id, &fact_id, &entity0_id] {
+            assert!(
+                !out.contains(&format!("related {fact_id} -mentions-> {wrong}")),
+                "edge landed on the wrong node {wrong}: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_rejects_a_request_over_max_episode_items_counting_entities() {
+        // Given an episode where facts.len() + edges.len() alone is under
+        // MAX_EPISODE_ITEMS, but adding entities.len() pushes the total
+        // over
+        let server = plain_server().await;
+        let marker = "episode entities over max rejection content";
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        let facts: Vec<EpisodeFactArgs> = (0..MAX_EPISODE_ITEMS / 2)
+            .map(|i| episode_fact(&format!("episode entities over max nested content {i}")))
+            .collect();
+        let entities: Vec<EpisodeEntityArgs> = (0..(MAX_EPISODE_ITEMS - facts.len()))
+            .map(|i| episode_entity("person", &format!("Entity {i}")))
+            .collect();
+        assert!(
+            facts.len() < MAX_EPISODE_ITEMS,
+            "facts + edges alone must stay under the cap for this test to prove anything"
+        );
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts,
+                    entities,
+                    edges: vec![],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused, and nothing lands
+        assert!(out.contains("failed"), "{out}");
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_reports_an_edge_to_a_since_superseded_entity_as_a_failure() {
+        // Given two entities naming the same person, differing only in case
+        // and trailing whitespace (so `NewNode::entity`'s
+        // `name.trim().to_lowercase()` normalization, not an accidental
+        // exact-string match, is what makes them collide), plus an edge
+        // referencing the first by its original combined index
+        let server = plain_server().await;
+        let top_marker = "episode superseded entity edge top content";
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![
+                        episode_entity("person", "Alice"),
+                        episode_entity("person", "alice "),
+                    ],
+                    edges: vec![episode_edge("entity:0", "entity:1", "mentions")],
+                }),
+                ..remember_args(top_marker)
+            }))
+            .await;
+
+        // Then the whole call fails, naming the failing reference (the dead
+        // node's id, embedded in `Graph::ingest_episode`'s own "is not live"
+        // message)
+        assert!(out.starts_with("remember failed:"), "{out}");
+        assert!(out.contains("is not live"), "{out}");
+
+        // And nothing landed, not even the top-level fact, proving the
+        // whole episode rolled back together
+        let after = server
+            .store
+            .query_explained(&Query::text(top_marker))
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 0, "wrote a node despite rejection: {out}");
     }
 
     /// Count rendered evidence blocks in a captured `system\nprompt` pair,
