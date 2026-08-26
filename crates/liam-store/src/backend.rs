@@ -27,6 +27,17 @@ use crate::value::{Row, Value};
 /// connection would make "concurrent clients" true at the transport layer
 /// and false at the store, which is the whole reason this store gained a
 /// separate read pool. Any second backend must honour the same contract.
+///
+/// `begin` is a write too, but a coarser one than any other method here.
+/// Every other write method holds the write lock for exactly one statement
+/// (or, for `execute_atomic`, one fixed, small, library-built list); a
+/// `BackendTx` returned by `begin` holds it for its entire open lifetime,
+/// however long the caller takes between `begin()` and its
+/// `commit()`/`rollback()`. A caller that keeps a `BackendTx` open across an
+/// unbounded amount of work blocks every other write for that whole span,
+/// so this capability is deliberately narrow: it exists for callers that
+/// can bound how long they hold it open, not as a general substitute for
+/// `execute`/`execute_atomic`.
 #[async_trait]
 pub trait Backend: Send + Sync + Sized {
     /// Open (and if needed create) a local database at `path`.
@@ -81,4 +92,26 @@ pub trait Backend: Send + Sync + Sized {
     /// cleanup). Serializes with every other write; see the trait's
     /// concurrency contract above.
     async fn vector_sweep_orphans(&self) -> Result<u64>;
+
+    /// Open a transaction. Write. Serializes with every other write, but
+    /// for as long as the returned `BackendTx` stays open, not for one
+    /// statement; see the trait's concurrency contract above.
+    async fn begin(&self) -> Result<Box<dyn BackendTx + '_>>;
+}
+
+/// An open transaction on a `Backend`. Holds whatever lock or connection
+/// state its backend needs for the duration between `begin()` and this
+/// being consumed by `commit()`/`rollback()` (or dropped without either,
+/// which each implementor must define a safe fallback for).
+#[async_trait]
+pub trait BackendTx: Send {
+    /// Write, inside this transaction. Not yet durable until `commit()`.
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64>;
+    /// Read, inside this transaction: sees this transaction's own writes so
+    /// far, not yet visible to any other connection.
+    async fn query(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>>;
+    /// Consume this transaction, making its writes durable.
+    async fn commit(self: Box<Self>) -> Result<()>;
+    /// Consume this transaction, discarding its writes.
+    async fn rollback(self: Box<Self>) -> Result<()>;
 }

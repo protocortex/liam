@@ -3061,6 +3061,9 @@ mod tests {
         async fn vector_sweep_orphans(&self) -> Result<u64> {
             self.0.vector_sweep_orphans().await
         }
+        async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
+            self.0.begin().await
+        }
     }
 
     #[tokio::test]
