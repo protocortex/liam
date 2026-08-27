@@ -194,7 +194,10 @@ pub struct RememberArgs {
     pub kind: String,
     pub label: String,
     pub content: String,
-    /// Optional partition (project, agent).
+    /// Optional partition (project, agent). Trimmed; rejected if empty
+    /// after trimming, over 200 characters, contains a character outside
+    /// ASCII letters, digits, `-`, `_`, `/`, or has a leading/trailing `/`
+    /// or an empty segment (`//`).
     pub scope: Option<String>,
     /// Optional identity; a new value with the same subject supersedes the old.
     pub subject: Option<String>,
@@ -270,6 +273,11 @@ pub struct EpisodeArgs {
 pub struct RecallArgs {
     pub query: String,
     pub kind: Option<String>,
+    /// Optional partition filter; only memories written with the same
+    /// scope match. Trimmed; rejected if empty after trimming, over 200
+    /// characters, contains a character outside ASCII letters, digits,
+    /// `-`, `_`, `/`, or has a leading/trailing `/` or an empty segment
+    /// (`//`).
     pub scope: Option<String>,
     pub k: Option<usize>,
     /// Optional point-in-time recall, epoch milliseconds. Omitted means
@@ -293,6 +301,11 @@ pub struct RelateArgs {
 pub struct AskArgs {
     pub question: String,
     pub kind: Option<String>,
+    /// Optional partition filter; only memories written with the same
+    /// scope match. Trimmed; rejected if empty after trimming, over 200
+    /// characters, contains a character outside ASCII letters, digits,
+    /// `-`, `_`, `/`, or has a leading/trailing `/` or an empty segment
+    /// (`//`).
     pub scope: Option<String>,
     pub k: Option<usize>,
     /// Optional point-in-time recall, epoch milliseconds. Omitted means
