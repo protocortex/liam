@@ -460,7 +460,7 @@ impl<B: Backend> Graph<B> {
     /// order.
     pub async fn ingest_episode(
         &self,
-        nodes: Vec<NewNode>,
+        mut nodes: Vec<NewNode>,
         edges: Vec<EpisodeEdge>,
     ) -> Result<EpisodeResult> {
         // A bad `EpisodeRef::New` index must fail before any transaction
@@ -476,6 +476,10 @@ impl<B: Backend> Graph<B> {
                     }
                 }
             }
+        }
+
+        for node in &mut nodes {
+            node.scope = validate_scope(&node.scope)?;
         }
 
         // Pre-generate every node's id (a ULID, no DB round-trip) so edges
@@ -4406,6 +4410,120 @@ mod tests {
             edge_rows[0].get_i64(0).unwrap(),
             0,
             "not even the supersedes edge from node 1 -> node 0 must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_rejects_a_malformed_scope_before_any_transaction_opens() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let nodes = vec![NewNode::now("fact", "v1", "alice is 30").with_scope("proj//a")];
+
+        // Act
+        let err = g.ingest_episode(nodes, vec![]).await.unwrap_err();
+
+        // Assert
+        assert!(matches!(err, Error::InvalidScope(_)), "{err}");
+        let node_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            node_rows[0].get_i64(0).unwrap(),
+            0,
+            "nothing must be written when scope validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_rejects_the_whole_call_when_a_later_node_has_a_malformed_scope() {
+        // Arrange: node 0 carries a valid scope, node 1's scope is
+        // malformed. The pre-flight loop mutates nodes[0].scope in place
+        // (trimming it) before it reaches nodes[1] and fails, so this pins
+        // that the in-memory mutation never reaches the database: no
+        // transaction opened, nothing to roll back.
+        let g = graph_at(Millis(1000)).await;
+        let nodes = vec![
+            NewNode::now("fact", "v1", "alice is 30").with_scope("proj-a"),
+            NewNode::now("fact", "v2", "bob is 40").with_scope("proj//a"),
+        ];
+
+        // Act
+        let err = g.ingest_episode(nodes, vec![]).await.unwrap_err();
+
+        // Assert
+        assert!(matches!(err, Error::InvalidScope(_)), "{err}");
+        let node_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            node_rows[0].get_i64(0).unwrap(),
+            0,
+            "nothing from the episode must exist, not even node 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_normalizes_scope_before_finding_live_competitor() {
+        // Arrange: a live node under a trimmed scope, then an episode whose
+        // node names the same scope with trailing whitespace, mirroring
+        // `upsert_by_normalizes_scope_before_finding_live_competitor` but
+        // through `ingest_episode`'s own `live_by_subject_query` path.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g
+            .upsert_by(
+                NewNode::now("fact", "v1", "widget price is 10")
+                    .with_subject("s1")
+                    .with_scope("proj-a"),
+            )
+            .await
+            .unwrap();
+
+        // Act
+        clock.set(Millis(2000));
+        let nodes = vec![NewNode::now("fact", "v2", "widget price is 20")
+            .with_subject("s1")
+            .with_scope("proj-a ")];
+        let result = g.ingest_episode(nodes, vec![]).await.unwrap();
+        let new_id = &result.node_ids[0];
+
+        // Assert: the old node is superseded, not duplicated
+        let old_rows = g
+            .backend
+            .query(
+                "SELECT tx_to FROM nodes WHERE id = ?1",
+                &[old.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            old_rows[0].get_i64(0).unwrap(),
+            FOREVER.0,
+            "trailing-space scope must match the live node, not duplicate it"
+        );
+        let new_rows = g
+            .backend
+            .query(
+                "SELECT tx_to, scope FROM nodes WHERE id = ?1",
+                &[new_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            new_rows[0].get_i64(0).unwrap(),
+            FOREVER.0,
+            "new must be live"
+        );
+        assert_eq!(
+            new_rows[0].get_string(1).unwrap(),
+            "proj-a",
+            "the stored scope must be trimmed"
         );
     }
 
