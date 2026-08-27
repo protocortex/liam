@@ -740,7 +740,8 @@ impl<B: Backend> Graph<B> {
     async fn query_core(&self, q: &Query) -> Result<Vec<ExplainedHit>> {
         let now = q.as_of.unwrap_or_else(|| self.clock.now());
         let pool = q.k.max(1) * 3;
-        let scope = q.scope.as_deref();
+        let scope = validate_scope(&q.scope)?;
+        let scope = scope.as_deref();
         let kind = q.kind.as_deref();
 
         let lexical = match q.text.as_deref() {
@@ -2288,6 +2289,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids_from(&rows).unwrap(), vec![fact]);
+    }
+
+    #[tokio::test]
+    async fn query_rejects_invalid_scope() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let result = g
+            .query(&Query::text("zenith rollout").with_scope("bad scope!"))
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[tokio::test]
+    async fn query_explained_rejects_invalid_scope() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let result = g
+            .query_explained(&Query::text("zenith rollout").with_scope("bad scope!"))
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[tokio::test]
+    async fn query_trims_scope_before_filtering() {
+        // Arrange: a node stored under an already-normalized scope, matching
+        // the write side's trimming (`insert` runs `validate_scope` too).
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now("decision", "Rollout", "zenith rollout notes").with_scope("proj-a"))
+            .await
+            .unwrap();
+
+        // Act: query with an untrimmed scope.
+        let hits = g
+            .query(&Query::text("zenith rollout").with_scope(" proj-a "))
+            .await
+            .unwrap();
+
+        // Assert: the read side trims before filtering, so it still matches.
+        assert!(hits.iter().any(|h| h.label == "Rollout"));
     }
 
     #[tokio::test]
