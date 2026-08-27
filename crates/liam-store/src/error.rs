@@ -40,6 +40,12 @@ pub enum Error {
     /// index outside the bounds of that call's own `nodes` list.
     #[error("invalid reference: {0}")]
     InvalidReference(String),
+
+    /// `validate_scope` rejected a `scope` value: empty after trimming, over
+    /// the length cap, an invalid character, or a malformed `/`-segment shape.
+    /// Carries the specific reason.
+    #[error("invalid scope: {0}")]
+    InvalidScope(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
