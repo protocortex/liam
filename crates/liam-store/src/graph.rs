@@ -196,8 +196,7 @@ pub(crate) fn validate_scope(scope: &Option<String>) -> Result<Option<String>> {
     }
     if trimmed.starts_with('/') || trimmed.ends_with('/') || trimmed.contains("//") {
         return Err(Error::InvalidScope(
-            "scope must not start or end with '/', or contain an empty segment ('//')"
-                .to_string(),
+            "scope must not start or end with '/', or contain an empty segment ('//')".to_string(),
         ));
     }
     Ok(Some(trimmed.to_string()))

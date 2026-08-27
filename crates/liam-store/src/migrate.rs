@@ -273,8 +273,8 @@ async fn column_exists<B: Backend>(backend: &B, table: &str, column: &str) -> Re
 #[cfg(all(test, feature = "backend-libsql"))]
 mod tests {
     use super::*;
-    use crate::DefaultBackend;
     use crate::value::Value;
+    use crate::DefaultBackend;
     use std::sync::Arc;
     use tempfile::TempDir;
 
