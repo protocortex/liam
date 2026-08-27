@@ -265,6 +265,11 @@ impl<B: Backend> Graph<B> {
         // only grants a fresh one, by rebuilding the referencing tables
         // (ADR-0003). Detects and no-ops on a database that already has it.
         crate::migrate::ensure_cascade(&backend).await?;
+        // Trims whitespace from any scope value stored before `validate_scope`
+        // existed, so it still matches a scope-filtered query under the new
+        // trim-then-compare rules. Logs (does not rewrite) anything still
+        // invalid after the trim.
+        crate::migrate::normalize_scope_column(&backend).await?;
         Ok(Self {
             backend,
             clock,
