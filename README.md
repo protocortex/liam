@@ -131,7 +131,7 @@ Point a client at `liamd` and it exposes two tools.
 | `kind` | yes | Opaque label: `decision`, `fact`, `symbol`, `episode`. |
 | `label` | yes | Short title. |
 | `content` | yes | The text to embed and store. |
-| `scope` | no | Partition by project or agent. |
+| `scope` | no | Partition by project or agent. Trimmed; ASCII letters, digits, `-`, `_`, `/`; up to 200 characters; no leading/trailing `/` or empty segment (`//`). |
 | `subject` | no | Identity. A new value with the same subject supersedes the old. |
 
 `recall` retrieves and reranks.
@@ -140,7 +140,7 @@ Point a client at `liamd` and it exposes two tools.
 |---|---|---|
 | `query` | yes | Text; embedded for the vector channel too. |
 | `kind` | no | Restrict to one kind. |
-| `scope` | no | Restrict to one partition. |
+| `scope` | no | Restrict to one partition. Same format as `remember`'s `scope`. |
 | `k` | no | How many hits to return (default 8). |
 
 By default the embedder is a mock, so retrieval leans on full-text and graph

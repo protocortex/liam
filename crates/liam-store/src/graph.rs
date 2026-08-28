@@ -154,6 +154,54 @@ fn live_by_subject_query(subject: &str, now: Millis, scope: Option<&str>) -> (St
     (sql, params)
 }
 
+/// Stated default from the scope-field-validation design (2026-08-27), not
+/// measured from any production data (there is none yet): a starting
+/// point, matching how `MAX_EPISODE_ITEMS`/`MAX_ATTRIBUTES_CHARS` are
+/// treated in `liam-daemon`.
+const MAX_SCOPE_CHARS: usize = 200;
+
+/// Normalize and validate an optional `scope` (the retrieval-partition
+/// string on `NewNode` and `Query`) before it reaches storage or a filter.
+/// `None` passes through unchanged. Otherwise: trims whitespace, rejects
+/// an empty-after-trim value, a value over `MAX_SCOPE_CHARS`, any
+/// character outside ASCII alphanumeric/`-`/`_`/`/`, and a leading or
+/// trailing `/` or an empty segment (`//`). `/` is accepted syntax
+/// reserved for a future hierarchy parser (M3.5); nothing here treats it
+/// as meaningful yet, scope matching stays exact-string. Called at every
+/// write entry point that accepts a `scope` (`insert`, `upsert_by`,
+/// `supersede`, `ingest_episode`), from the read path (`query_core`), and
+/// from `migrate::normalize_scope_column` to flag data written before this
+/// existed, so a malformed value can never mean "matches nothing" on one
+/// side and "a real partition" on the other.
+pub(crate) fn validate_scope(scope: &Option<String>) -> Result<Option<String>> {
+    let Some(raw) = scope else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidScope("scope must not be empty".to_string()));
+    }
+    if trimmed.chars().count() > MAX_SCOPE_CHARS {
+        return Err(Error::InvalidScope(format!(
+            "scope exceeds {MAX_SCOPE_CHARS} characters"
+        )));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/'))
+    {
+        return Err(Error::InvalidScope(
+            "scope must contain only ASCII letters, digits, '-', '_', '/'".to_string(),
+        ));
+    }
+    if trimmed.starts_with('/') || trimmed.ends_with('/') || trimmed.contains("//") {
+        return Err(Error::InvalidScope(
+            "scope must not start or end with '/', or contain an empty segment ('//')".to_string(),
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 fn opt_text(v: Option<String>) -> Value {
     v.map(Value::Text).unwrap_or(Value::Null)
 }
@@ -216,6 +264,11 @@ impl<B: Backend> Graph<B> {
         // only grants a fresh one, by rebuilding the referencing tables
         // (ADR-0003). Detects and no-ops on a database that already has it.
         crate::migrate::ensure_cascade(&backend).await?;
+        // Trims whitespace from any scope value stored before `validate_scope`
+        // existed, so it still matches a scope-filtered query under the new
+        // trim-then-compare rules. Logs (does not rewrite) anything still
+        // invalid after the trim.
+        crate::migrate::normalize_scope_column(&backend).await?;
         Ok(Self {
             backend,
             clock,
@@ -227,7 +280,8 @@ impl<B: Backend> Graph<B> {
 
     // ---- write ----
 
-    pub async fn insert(&self, node: NewNode) -> Result<NodeId> {
+    pub async fn insert(&self, mut node: NewNode) -> Result<NodeId> {
+        node.scope = validate_scope(&node.scope)?;
         let id = NodeId::new();
         let now = self.clock.now();
         self.write_node(&id, &node, now).await?;
@@ -241,7 +295,8 @@ impl<B: Backend> Graph<B> {
     /// Insert, or supersede a competing live node with the same subject and
     /// scope. This makes contradiction handling automatic: the caller sets a
     /// subject, the library closes the prior version and links to it.
-    pub async fn upsert_by(&self, node: NewNode) -> Result<NodeId> {
+    pub async fn upsert_by(&self, mut node: NewNode) -> Result<NodeId> {
+        node.scope = validate_scope(&node.scope)?;
         let subject = match node.subject.clone() {
             Some(s) => s,
             None => return self.insert(node).await,
@@ -257,7 +312,8 @@ impl<B: Backend> Graph<B> {
 
     /// Close the old node in transaction time, insert the new one, link them
     /// with a reserved `supersedes` edge.
-    pub async fn supersede(&self, old: &NodeId, node: NewNode) -> Result<NodeId> {
+    pub async fn supersede(&self, old: &NodeId, mut node: NewNode) -> Result<NodeId> {
+        node.scope = validate_scope(&node.scope)?;
         let now = self.clock.now();
         if !self.exists_as_of(old, now).await? {
             return Err(Error::NodeNotFound(old.as_str().to_string()));
@@ -403,7 +459,7 @@ impl<B: Backend> Graph<B> {
     /// order.
     pub async fn ingest_episode(
         &self,
-        nodes: Vec<NewNode>,
+        mut nodes: Vec<NewNode>,
         edges: Vec<EpisodeEdge>,
     ) -> Result<EpisodeResult> {
         // A bad `EpisodeRef::New` index must fail before any transaction
@@ -419,6 +475,10 @@ impl<B: Backend> Graph<B> {
                     }
                 }
             }
+        }
+
+        for node in &mut nodes {
+            node.scope = validate_scope(&node.scope)?;
         }
 
         // Pre-generate every node's id (a ULID, no DB round-trip) so edges
@@ -679,7 +739,8 @@ impl<B: Backend> Graph<B> {
     async fn query_core(&self, q: &Query) -> Result<Vec<ExplainedHit>> {
         let now = q.as_of.unwrap_or_else(|| self.clock.now());
         let pool = q.k.max(1) * 3;
-        let scope = q.scope.as_deref();
+        let scope = validate_scope(&q.scope)?;
+        let scope = scope.as_deref();
         let kind = q.kind.as_deref();
 
         let lexical = match q.text.as_deref() {
@@ -1855,6 +1916,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_trims_scope_before_storing() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        g.insert(
+            NewNode::now("decision", "Rollout", "zenith rollout notes").with_scope(" proj-a "),
+        )
+        .await
+        .unwrap();
+
+        // Assert: found under the trimmed scope, not the raw untrimmed value
+        let hits = g
+            .query(&Query::text("zenith rollout").with_scope("proj-a"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].label, "Rollout");
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_whitespace_only_scope() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let result = g
+            .insert(NewNode::now("decision", "Bad", "whitespace scope body").with_scope("   "))
+            .await;
+
+        // Assert: rejected, and no row written
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+        let hits = g
+            .query(&Query::text("whitespace scope body"))
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "invalid scope must not reach storage");
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_scope_with_embedded_space() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let result = g
+            .insert(NewNode::now("decision", "Bad", "body").with_scope("proj a"))
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_malformed_leading_slash_scope() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let result = g
+            .insert(NewNode::now("decision", "Bad", "body").with_scope("/bad"))
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[tokio::test]
+    async fn upsert_by_normalizes_scope_before_finding_live_competitor() {
+        // Arrange: the design doc's motivating bug, a live node under a
+        // trimmed scope, then an update that names the same scope with
+        // trailing whitespace.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        g.upsert_by(
+            NewNode::now("fact", "v1", "widget price is 10")
+                .with_subject("s1")
+                .with_scope("proj-a"),
+        )
+        .await
+        .unwrap();
+
+        // Act
+        clock.set(Millis(2000));
+        g.upsert_by(
+            NewNode::now("fact", "v2", "widget price is 20")
+                .with_subject("s1")
+                .with_scope("proj-a "),
+        )
+        .await
+        .unwrap();
+
+        // Assert: exactly one live node with subject s1, the old one superseded
+        let hits = g
+            .query(&Query::text("widget price").with_k(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "trailing-space scope must match the trimmed live node, not duplicate it"
+        );
+        assert_eq!(hits[0].label, "v2");
+
+        // Assert: the stored scope is trimmed
+        let scoped = g
+            .query(&Query::text("widget price").with_scope("proj-a"))
+            .await
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].label, "v2");
+    }
+
+    #[tokio::test]
+    async fn supersede_rejects_invalid_scope_and_normalizes_valid_scope() {
+        // Arrange: a live node to supersede directly, matching the
+        // direct-call usage shape at `as_of_recovers_superseded_history`.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g
+            .insert(NewNode::now("decision", "Deno", "runtime"))
+            .await
+            .unwrap();
+
+        // Act: an invalid scope on the direct supersede call
+        clock.set(Millis(2000));
+        let invalid = g
+            .supersede(
+                &old,
+                NewNode::now("decision", "Rust", "runtime").with_scope("bad@scope"),
+            )
+            .await;
+
+        // Assert: rejected, pinning that `validate_scope` runs inside
+        // `supersede` itself, independent of `upsert_by`'s own normalization
+        assert!(matches!(invalid, Err(Error::InvalidScope(_))));
+
+        // Act: a valid but untrimmed scope on the direct supersede call
+        let new_id = g
+            .supersede(
+                &old,
+                NewNode::now("decision", "Rust", "runtime").with_scope(" proj-a "),
+            )
+            .await
+            .unwrap();
+
+        // Assert: the stored scope is trimmed
+        let hits = g
+            .query(&Query::text("runtime").with_scope("proj-a"))
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|h| h.id == new_id));
+    }
+
+    #[tokio::test]
     async fn query_returns_all_matching_candidates() {
         // Guards the batched candidate fetch: several live nodes match one
         // query and all must come back.
@@ -1897,6 +2117,138 @@ mod tests {
         assert_eq!(n.subject.as_deref(), Some("ada lovelace"));
     }
 
+    #[test]
+    fn validate_scope_passes_none_through_unchanged() {
+        // Arrange
+        let scope: Option<String> = None;
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn validate_scope_rejects_whitespace_only_scope() {
+        // Arrange
+        let scope = Some("  ".to_string());
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[test]
+    fn validate_scope_trims_surrounding_whitespace() {
+        // Arrange
+        let scope = Some("  proj-a  ".to_string());
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert_eq!(result.unwrap(), Some("proj-a".to_string()));
+    }
+
+    #[test]
+    fn validate_scope_accepts_exactly_max_chars() {
+        // Arrange
+        let scope = Some("a".repeat(MAX_SCOPE_CHARS));
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_scope_rejects_scope_over_max_chars() {
+        // Arrange
+        let scope = Some("a".repeat(MAX_SCOPE_CHARS + 1));
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[test]
+    fn validate_scope_rejects_embedded_space() {
+        // Arrange
+        let scope = Some("proj a".to_string());
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[test]
+    fn validate_scope_rejects_non_ascii_alphanumeric_character() {
+        // Arrange
+        let scope = Some("proj@a".to_string());
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[test]
+    fn validate_scope_rejects_leading_slash() {
+        // Arrange
+        let scope = Some("/proj-a".to_string());
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[test]
+    fn validate_scope_rejects_trailing_slash() {
+        // Arrange
+        let scope = Some("proj-a/".to_string());
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[test]
+    fn validate_scope_rejects_empty_segment() {
+        // Arrange
+        let scope = Some("proj//a".to_string());
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[test]
+    fn validate_scope_accepts_valid_multi_segment_scope() {
+        // Arrange
+        let scope = Some("project-x/backend".to_string());
+
+        // Act
+        let result = validate_scope(&scope);
+
+        // Assert
+        assert_eq!(result.unwrap(), Some("project-x/backend".to_string()));
+    }
+
     #[tokio::test]
     async fn entity_mentions_edge_round_trips() {
         let clock = Arc::new(FixedClock::new(Millis(1000)));
@@ -1936,6 +2288,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids_from(&rows).unwrap(), vec![fact]);
+    }
+
+    #[tokio::test]
+    async fn query_rejects_invalid_scope() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let result = g
+            .query(&Query::text("zenith rollout").with_scope("bad scope!"))
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[tokio::test]
+    async fn query_explained_rejects_invalid_scope() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let result = g
+            .query_explained(&Query::text("zenith rollout").with_scope("bad scope!"))
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(Error::InvalidScope(_))));
+    }
+
+    #[tokio::test]
+    async fn query_trims_scope_before_filtering() {
+        // Arrange: a node stored under an already-normalized scope, matching
+        // the write side's trimming (`insert` runs `validate_scope` too).
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now("decision", "Rollout", "zenith rollout notes").with_scope("proj-a"))
+            .await
+            .unwrap();
+
+        // Act: query with an untrimmed scope.
+        let hits = g
+            .query(&Query::text("zenith rollout").with_scope(" proj-a "))
+            .await
+            .unwrap();
+
+        // Assert: the read side trims before filtering, so it still matches.
+        assert!(hits.iter().any(|h| h.label == "Rollout"));
     }
 
     #[tokio::test]
@@ -4058,6 +4457,120 @@ mod tests {
             edge_rows[0].get_i64(0).unwrap(),
             0,
             "not even the supersedes edge from node 1 -> node 0 must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_rejects_a_malformed_scope_before_any_transaction_opens() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let nodes = vec![NewNode::now("fact", "v1", "alice is 30").with_scope("proj//a")];
+
+        // Act
+        let err = g.ingest_episode(nodes, vec![]).await.unwrap_err();
+
+        // Assert
+        assert!(matches!(err, Error::InvalidScope(_)), "{err}");
+        let node_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            node_rows[0].get_i64(0).unwrap(),
+            0,
+            "nothing must be written when scope validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_rejects_the_whole_call_when_a_later_node_has_a_malformed_scope() {
+        // Arrange: node 0 carries a valid scope, node 1's scope is
+        // malformed. The pre-flight loop mutates nodes[0].scope in place
+        // (trimming it) before it reaches nodes[1] and fails, so this pins
+        // that the in-memory mutation never reaches the database: no
+        // transaction opened, nothing to roll back.
+        let g = graph_at(Millis(1000)).await;
+        let nodes = vec![
+            NewNode::now("fact", "v1", "alice is 30").with_scope("proj-a"),
+            NewNode::now("fact", "v2", "bob is 40").with_scope("proj//a"),
+        ];
+
+        // Act
+        let err = g.ingest_episode(nodes, vec![]).await.unwrap_err();
+
+        // Assert
+        assert!(matches!(err, Error::InvalidScope(_)), "{err}");
+        let node_rows = g
+            .backend
+            .query("SELECT COUNT(*) FROM nodes", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            node_rows[0].get_i64(0).unwrap(),
+            0,
+            "nothing from the episode must exist, not even node 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_normalizes_scope_before_finding_live_competitor() {
+        // Arrange: a live node under a trimmed scope, then an episode whose
+        // node names the same scope with trailing whitespace, mirroring
+        // `upsert_by_normalizes_scope_before_finding_live_competitor` but
+        // through `ingest_episode`'s own `live_by_subject_query` path.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g
+            .upsert_by(
+                NewNode::now("fact", "v1", "widget price is 10")
+                    .with_subject("s1")
+                    .with_scope("proj-a"),
+            )
+            .await
+            .unwrap();
+
+        // Act
+        clock.set(Millis(2000));
+        let nodes = vec![NewNode::now("fact", "v2", "widget price is 20")
+            .with_subject("s1")
+            .with_scope("proj-a ")];
+        let result = g.ingest_episode(nodes, vec![]).await.unwrap();
+        let new_id = &result.node_ids[0];
+
+        // Assert: the old node is superseded, not duplicated
+        let old_rows = g
+            .backend
+            .query(
+                "SELECT tx_to FROM nodes WHERE id = ?1",
+                &[old.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            old_rows[0].get_i64(0).unwrap(),
+            FOREVER.0,
+            "trailing-space scope must match the live node, not duplicate it"
+        );
+        let new_rows = g
+            .backend
+            .query(
+                "SELECT tx_to, scope FROM nodes WHERE id = ?1",
+                &[new_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            new_rows[0].get_i64(0).unwrap(),
+            FOREVER.0,
+            "new must be live"
+        );
+        assert_eq!(
+            new_rows[0].get_string(1).unwrap(),
+            "proj-a",
+            "the stored scope must be trimmed"
         );
     }
 

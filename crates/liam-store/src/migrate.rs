@@ -202,6 +202,56 @@ async fn all_strings<B: Backend>(backend: &B, sql: &str) -> Result<Vec<String>> 
     rows.iter().map(|row| row.get_string(0)).collect()
 }
 
+/// Trim whitespace from every already-stored `nodes.scope` value, so a row
+/// written before `validate_scope` (`graph.rs`) existed matches the same
+/// trimmed value a scope-filtered query now searches for. Safe to call on
+/// every open: a database with no untrimmed scope is left untouched.
+///
+/// Each row is read into Rust and trimmed with the same `str::trim()`
+/// `validate_scope` uses internally, then only rows that actually changed
+/// get their own `UPDATE`, one row at a time. SQLite's single-argument SQL
+/// `TRIM()` strips only ASCII spaces, not the full Unicode whitespace set
+/// (tabs, newlines, carriage returns) that `str::trim()` strips, so a bulk
+/// SQL `TRIM()` would silently leave those values both untouched and
+/// unlogged; reading and trimming in Rust is what makes this exactly what
+/// `validate_scope` itself does on write.
+///
+/// Only whitespace is fixed here, mechanically. A scope that is still
+/// invalid after trimming (empty, over the length cap, a disallowed
+/// character, a malformed `/` shape) is NOT rewritten or dropped: guessing
+/// a replacement would be a worse kind of data loss than the
+/// stops-matching-a-scope-filter state this otherwise leaves it in. Each
+/// such row is logged instead, so whoever operates this store can see and
+/// correct it by hand.
+pub async fn normalize_scope_column<B: Backend>(backend: &B) -> Result<()> {
+    let rows = backend
+        .query("SELECT id, scope FROM nodes WHERE scope IS NOT NULL", &[])
+        .await?;
+    for row in &rows {
+        let id = row.get_string(0)?;
+        let scope = row.get_string(1)?;
+        let trimmed = scope.trim();
+        if trimmed != scope {
+            backend
+                .execute(
+                    "UPDATE nodes SET scope = ?1 WHERE id = ?2",
+                    &[trimmed.into(), id.as_str().into()],
+                )
+                .await?;
+        }
+        if crate::graph::validate_scope(&Some(trimmed.to_string())).is_err() {
+            tracing::warn!(
+                node = %id,
+                scope = %scope,
+                "stored scope does not conform to the new validation rules \
+                 (after whitespace trim); it will not match any future \
+                 scope-filtered query until corrected"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Whether `table` already has `column`, read from `PRAGMA table_info`.
 ///
 /// Errors if `table` does not exist. `PRAGMA table_info` on a nonexistent
@@ -233,6 +283,7 @@ async fn column_exists<B: Backend>(backend: &B, table: &str, column: &str) -> Re
 #[cfg(all(test, feature = "backend-libsql"))]
 mod tests {
     use super::*;
+    use crate::value::Value;
     use crate::DefaultBackend;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -650,5 +701,202 @@ mod tests {
         let (_dir, backend) = file_backend_at("no_tables.db").await;
 
         ensure_cascade(&backend).await.expect("no tables is fine");
+    }
+
+    // ---- normalize_scope_column ----
+
+    /// A backend carrying the real `nodes` table (via `crate::schema::schema`),
+    /// so a raw `INSERT` below bypasses `validate_scope` (`graph.rs`) exactly
+    /// the way a row written before that validation existed would have.
+    async fn nodes_schema_backend_at(name: &str) -> (TempDir, DefaultBackend) {
+        let (dir, backend) = file_backend_at(name).await;
+        let config = crate::types::GraphConfig::new(3);
+        backend
+            .execute_batch(&crate::schema::schema(&config))
+            .await
+            .expect("create nodes schema");
+        (dir, backend)
+    }
+
+    /// Inserts a `nodes` row directly with the given raw `scope`, skipping
+    /// `validate_scope` entirely, to simulate a row written before this
+    /// migration shipped. Every other column either has a schema default or
+    /// is filled with an arbitrary valid placeholder.
+    async fn insert_raw_node(backend: &DefaultBackend, id: &str, scope: Value) {
+        backend
+            .execute(
+                "INSERT INTO nodes (id, kind, label, content, scope, valid_from, tx_from)
+                 VALUES (?1, 'fact', 'label', 'content', ?2, 0, 0)",
+                &[id.into(), scope],
+            )
+            .await
+            .expect("insert raw node");
+    }
+
+    /// Reads `scope` back for `id`, as `None` for `NULL` and `Some` for text.
+    /// Not `Row::get_string`, which errors on `NULL`, exactly the case this
+    /// helper needs to distinguish.
+    async fn scope_of(backend: &DefaultBackend, id: &str) -> Option<String> {
+        let rows = backend
+            .query("SELECT scope FROM nodes WHERE id = ?1", &[id.into()])
+            .await
+            .expect("query scope");
+        match &rows[0].0[0] {
+            Value::Null => None,
+            Value::Text(s) => Some(s.clone()),
+            other => panic!("scope is neither NULL nor text: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trims_whitespace_from_a_stored_scope() {
+        // Arrange
+        let (_dir, backend) = nodes_schema_backend_at("trim.db").await;
+        insert_raw_node(&backend, "n1", Value::Text(" proj-a ".to_string())).await;
+
+        // Act
+        normalize_scope_column(&backend).await.expect("normalize");
+
+        // Assert
+        assert_eq!(scope_of(&backend, "n1").await, Some("proj-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn trims_a_trailing_tab_that_sql_trim_would_leave_untouched() {
+        // Arrange: a trailing tab, not a space. SQLite's single-argument
+        // TRIM() only strips ASCII spaces, so a bulk SQL TRIM() leaves this
+        // exact value untouched; only Rust's str::trim() catches it.
+        let (_dir, backend) = nodes_schema_backend_at("tab.db").await;
+        insert_raw_node(&backend, "n1", Value::Text("proj-a\t".to_string())).await;
+
+        // Act
+        normalize_scope_column(&backend).await.expect("normalize");
+
+        // Assert
+        assert_eq!(scope_of(&backend, "n1").await, Some("proj-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn trims_leading_and_trailing_newlines_and_carriage_returns() {
+        // Arrange
+        let (_dir, backend) = nodes_schema_backend_at("newline.db").await;
+        insert_raw_node(&backend, "n1", Value::Text("\nproj-a\r\n".to_string())).await;
+
+        // Act
+        normalize_scope_column(&backend).await.expect("normalize");
+
+        // Assert
+        assert_eq!(scope_of(&backend, "n1").await, Some("proj-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_already_clean_scope_is_left_unchanged() {
+        // Arrange
+        let (_dir, backend) = nodes_schema_backend_at("clean.db").await;
+        insert_raw_node(&backend, "n1", Value::Text("proj-a".to_string())).await;
+
+        // Act
+        normalize_scope_column(&backend).await.expect("normalize");
+
+        // Assert
+        assert_eq!(scope_of(&backend, "n1").await, Some("proj-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_scope_still_invalid_after_trim_is_left_exactly_as_stored() {
+        // Arrange
+        let (_dir, backend) = nodes_schema_backend_at("invalid.db").await;
+        insert_raw_node(&backend, "n1", Value::Text("bad scope!".to_string())).await;
+
+        // Act
+        normalize_scope_column(&backend).await.expect("normalize");
+
+        // Assert: not rewritten, not nulled.
+        assert_eq!(
+            scope_of(&backend, "n1").await,
+            Some("bad scope!".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_only_scope_becomes_an_empty_string_and_stays_there() {
+        // Arrange
+        let (_dir, backend) = nodes_schema_backend_at("whitespace.db").await;
+        insert_raw_node(&backend, "n1", Value::Text("   ".to_string())).await;
+
+        // Act
+        normalize_scope_column(&backend).await.expect("normalize");
+
+        // Assert
+        assert_eq!(scope_of(&backend, "n1").await, Some(String::new()));
+    }
+
+    #[tokio::test]
+    async fn trim_and_the_post_trim_validity_check_both_apply_together() {
+        // Arrange
+        let (_dir, backend) = nodes_schema_backend_at("trim_and_invalid.db").await;
+        insert_raw_node(&backend, "n1", Value::Text(" bad@scope ".to_string())).await;
+
+        // Act
+        normalize_scope_column(&backend).await.expect("normalize");
+
+        // Assert: trimmed, but still left as-is (not conforming).
+        assert_eq!(
+            scope_of(&backend, "n1").await,
+            Some("bad@scope".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_scope_is_left_untouched() {
+        // Arrange
+        let (_dir, backend) = nodes_schema_backend_at("null.db").await;
+        insert_raw_node(&backend, "n1", Value::Null).await;
+
+        // Act
+        let result = normalize_scope_column(&backend).await;
+
+        // Assert
+        result.expect("no error on a NULL scope");
+        assert_eq!(scope_of(&backend, "n1").await, None);
+    }
+
+    #[tokio::test]
+    async fn running_normalize_scope_column_again_is_a_no_op() {
+        // Arrange
+        let (_dir, backend) = nodes_schema_backend_at("normalize_idempotent.db").await;
+        insert_raw_node(&backend, "n1", Value::Text(" proj-a ".to_string())).await;
+        insert_raw_node(&backend, "n2", Value::Text("bad scope!".to_string())).await;
+        normalize_scope_column(&backend).await.expect("first run");
+
+        // Act
+        normalize_scope_column(&backend)
+            .await
+            .expect("second run is a no-op");
+
+        // Assert
+        assert_eq!(scope_of(&backend, "n1").await, Some("proj-a".to_string()));
+        assert_eq!(
+            scope_of(&backend, "n2").await,
+            Some("bad scope!".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn running_normalize_scope_column_again_on_a_tab_padded_scope_is_a_no_op() {
+        // Arrange: the first run must trim the tab a bulk SQL TRIM() would
+        // have missed; the second run must then change nothing further.
+        let (_dir, backend) = nodes_schema_backend_at("normalize_idempotent_tab.db").await;
+        insert_raw_node(&backend, "n1", Value::Text("proj-a\t".to_string())).await;
+        normalize_scope_column(&backend).await.expect("first run");
+        assert_eq!(scope_of(&backend, "n1").await, Some("proj-a".to_string()));
+
+        // Act
+        normalize_scope_column(&backend)
+            .await
+            .expect("second run is a no-op");
+
+        // Assert
+        assert_eq!(scope_of(&backend, "n1").await, Some("proj-a".to_string()));
     }
 }
