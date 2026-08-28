@@ -90,6 +90,28 @@ fn mrl_truncate(full: &[f32], dims: usize) -> Vec<f32> {
     out
 }
 
+/// Reject a requested Matryoshka output width the model cannot honor: zero
+/// (silently produces empty vectors, since `mrl_truncate` has nothing to
+/// truncate to and nothing to renormalize) or larger than the model's native
+/// width (Matryoshka only shrinks). Pure and gated the same as `mrl_truncate`,
+/// so both bounds are unit tested without a real model.
+#[cfg(any(test, feature = "local"))]
+fn validate_dims(model_id: &str, dims: usize, native_dims: usize) -> Result<()> {
+    if dims == 0 {
+        return Err(crate::error::ModelError::Embed(format!(
+            "embedding_dims must be greater than 0, got 0 for {model_id}"
+        )));
+    }
+    if dims > native_dims {
+        return Err(crate::error::ModelError::Embed(format!(
+            "embedding_dims ({dims}) exceeds {model_id}'s native output width \
+             ({native_dims}); Matryoshka truncation can only shrink an embedding, \
+             not extend it"
+        )));
+    }
+    Ok(())
+}
+
 /// In-process embedder over fastembed-rs (feature `local`). Runs a Qwen3
 /// embedding model with candle; no server, offline once the model is cached.
 /// The sync fastembed call runs on a blocking thread so the async runtime stays
@@ -120,14 +142,7 @@ impl FastEmbedEmbedder {
             EMBED_MAX_INPUT_TOKENS,
         )
         .map_err(|e| crate::error::ModelError::Embed(e.to_string()))?;
-        let native_dims = model.config().hidden_size;
-        if dims > native_dims {
-            return Err(crate::error::ModelError::Embed(format!(
-                "embedding_dims ({dims}) exceeds {model_id}'s native output width \
-                 ({native_dims}); Matryoshka truncation can only shrink an embedding, \
-                 not extend it"
-            )));
-        }
+        validate_dims(model_id, dims, model.config().hidden_size)?;
         Ok(Self {
             model: std::sync::Arc::new(std::sync::Mutex::new(model)),
             dims,
@@ -166,7 +181,7 @@ impl Embedder for FastEmbedEmbedder {
 
 #[cfg(test)]
 mod tests {
-    use super::mrl_truncate;
+    use super::{mrl_truncate, validate_dims};
 
     #[test]
     fn mrl_truncate_shrinks_and_renormalizes() {
@@ -222,5 +237,35 @@ mod tests {
 
         // Assert: zero prefix stays zero rather than NaN from a 0/0 divide.
         assert_eq!(truncated, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn validate_dims_accepts_a_width_within_the_native_size() {
+        assert!(validate_dims("test-model", 768, 1024).is_ok());
+    }
+
+    #[test]
+    fn validate_dims_accepts_the_native_size_exactly() {
+        // Boundary: no truncation needed at all, still a valid request.
+        assert!(validate_dims("test-model", 1024, 1024).is_ok());
+    }
+
+    #[test]
+    fn validate_dims_rejects_zero() {
+        // A zero width would make mrl_truncate return an empty vector for
+        // every embed call, so this must fail at load instead of silently
+        // shipping unusable embeddings.
+        let err = validate_dims("test-model", 0, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("greater than 0"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn validate_dims_rejects_a_width_larger_than_native() {
+        let err = validate_dims("test-model", 2048, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds"), "unexpected message: {err}");
     }
 }
