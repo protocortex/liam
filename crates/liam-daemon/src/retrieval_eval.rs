@@ -16,11 +16,19 @@
 //!   `#[tokio::test]`, so it runs under plain `cargo test -p liam-daemon` and
 //!   the existing CI `test` job, with no model download. Added in WU-3.
 //! - **Real-embedder, gated + `#[ignore]`d:** loads the actual local embedder
-//!   behind `#[cfg(feature = "local")]` and scores `VectorSemantic` too. Added
-//!   in WU-4, which documents the exact run command in that module's doc
-//!   comment; TODO(WU-4): the full command belongs here once that module
-//!   exists (see `eval.rs`'s `# llama.cpp baseline` style for the convention
-//!   to follow).
+//!   behind `#[cfg(feature = "local")]` and scores `VectorSemantic` too.
+//!   Downloads model weights on first run and is slow, like `eval.rs`'s own
+//!   gated tier, so it is `#[ignore]`d rather than part of plain
+//!   `cargo test -p liam-daemon`:
+//!
+//!   ```text
+//!   cargo test -p liam-daemon --features local -- --ignored --nocapture retrieval
+//!   ```
+//!
+//!   Env override: `LIAM_RETRIEVAL_EVAL_MODEL`, mirroring `eval.rs`'s
+//!   `LIAM_EVAL_MODEL` for local A/B runs against a different embedding
+//!   model. Added in WU-4; see `mod real_embedder_run` below for the harness
+//!   itself.
 //!
 //! # Metrics
 //!
@@ -40,6 +48,31 @@
 //! maintainer to read and, when they change meaningfully, hand-transcribe
 //! into a dated table here, the same convention `eval.rs` uses for its own
 //! baselines.
+//!
+//! # Real-embedder baseline (2026-08-30, Apple M1 Pro, macOS 15.7.5,
+//! # Qwen/Qwen3-Embedding-0.6B, 768 dims, `cargo test --release ... --ignored
+//! # --nocapture retrieval`)
+//!
+//! | category       | n | precision@4 | precision@8 | recall@4 | recall@8 | MRR   |
+//! |----------------|---|-------------|-------------|----------|----------|-------|
+//! | Lexical        | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
+//! | VectorSemantic | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
+//! | GraphExpansion | 5 | 0.450       | 0.225       | 0.900    | 0.900    | 1.000 |
+//! | KindFilter     | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
+//! | ScopeFilter    | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
+//! | Decay          | 5 | 0.100       | 0.125       | 0.400    | 1.000    | 0.302 |
+//! | Confidence     | 5 | 0.050       | 0.050       | 0.200    | 0.400    | 0.150 |
+//! | AsOf           | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
+//!
+//! `VectorSemantic` (the category this tier adds over the text-only one)
+//! lands at a perfect 1.000 recall/MRR on this small, single-narrative
+//! corpus: every paraphrase question's expected fact is the sole real
+//! semantic match in the corpus for that paraphrase, so once the real
+//! embedder is in the loop there is no other candidate for it to lose rank
+//! to. `Confidence` is the harness's weakest category here, which is a
+//! property of the small fixed corpus and `HARNESS_K` (every fact is
+//! observable, so a competing lower-confidence version of the same subject
+//! can outrank the expected one), not a regression to chase.
 
 use std::collections::HashSet;
 
@@ -1093,8 +1126,16 @@ const QUESTIONS: &[Question] = &[
 /// `mod tests`'s: both the text-only tier below and WU-4's real-embedder
 /// tier build queries the same way, and duplicating this per tier would let
 /// the two drift apart silently.
-fn build_query(question: &Question, base: Millis, k: usize) -> Query {
-    let query = Query::text(question.query_text).with_k(k);
+///
+/// `embedding` is `None` for the text-only tier (no vector arm to feed) and
+/// `Some(...)` for `Category::VectorSemantic` questions in the real-embedder
+/// tier, which embeds `question.query_text` itself before calling this and
+/// passes the result through rather than this function owning any embedder.
+fn build_query(question: &Question, base: Millis, k: usize, embedding: Option<Vec<f32>>) -> Query {
+    let mut query = Query::text(question.query_text).with_k(k);
+    if let Some(embedding) = embedding {
+        query = query.with_embedding(embedding);
+    }
     match question.knob {
         Knob::None => query,
         Knob::Kind(kind) => query.with_kind(kind),
@@ -1669,7 +1710,7 @@ mod tests {
             .iter()
             .filter(|q| q.category != Category::VectorSemantic)
         {
-            let query = build_query(question, base, HARNESS_K);
+            let query = build_query(question, base, HARNESS_K, None);
             // An empty result is a valid 0.0-scoring outcome, not a harness
             // bug; only a genuine store error panics here.
             let hits = store
@@ -1763,5 +1804,205 @@ mod tests {
             vector_semantic_line.contains("not run this tier"),
             "VectorSemantic row must read as not-run, not scored: {vector_semantic_line}"
         );
+    }
+}
+
+/// Real-embedder tier: gated behind `feature = "local"` and `#[ignore]`d,
+/// since it downloads model weights on first run and takes real time (see
+/// the module doc's "Two tiers" section for the exact run command). A
+/// sibling of `mod tests`, not nested inside it, specifically so it can
+/// `use super::*;` and reuse `build_query`/`score_question`/
+/// `average_category_metrics` the same way `mod tests` does, rather than
+/// duplicating WU-3's seed/score loop.
+#[cfg(feature = "local")]
+mod real_embedder_run {
+    use super::*;
+
+    /// Retrieval width: same value and same reasoning as the text-only
+    /// tier's own `HARNESS_K` (`mod tests`, above) — widened past the
+    /// pipeline's usual `k=8` default so `fts5_query`'s stopword-OR lexical
+    /// matches on this small corpus cannot crowd a real hit (lexical or, in
+    /// this tier, vector) out of the scored window before it can be
+    /// observed. Redefined here rather than shared because `mod tests`'s
+    /// copy is `#[cfg(test)]`-only and private to that module.
+    const HARNESS_K: usize = CORPUS.len();
+
+    /// Read an env override, falling back to `default` when unset. Same
+    /// small shape as `eval.rs`'s own `env_or`; redefined locally rather
+    /// than shared across modules since it is a two-line function with no
+    /// state to keep in sync.
+    fn env_or(key: &str, default: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| default.to_string())
+    }
+
+    /// Given the seeded `CORPUS`/`QUESTIONS` fixtures and a real local
+    /// embedder, when every question runs (including `VectorSemantic`, which
+    /// the text-only tier above skips) against a real in-memory store, then
+    /// the harness completes without panicking, every scored metric lands in
+    /// `[0.0, 1.0]`, and the printed report names all 8 categories.
+    #[tokio::test]
+    #[ignore = "downloads embedder weights; see module doc for the run command"]
+    async fn real_embedder_tier_scores_every_category_including_vector_semantic() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use liam_model::Embedder;
+        use liam_store::{DefaultGraph, FixedClock, GraphConfig, NewEdge, NewNode, NodeId};
+
+        // Arrange: load the real embedder first, since its output width
+        // sizes the store's vector table below. `model_id`/`dims` read the
+        // daemon's own shipped defaults (`Config::default()`), not a
+        // hardcoded copy, so this harness keeps measuring whatever the
+        // daemon actually ships; `LIAM_RETRIEVAL_EVAL_MODEL` overrides the
+        // model for a local A/B run, mirroring `eval.rs`'s `LIAM_EVAL_MODEL`.
+        let model_id = env_or(
+            "LIAM_RETRIEVAL_EVAL_MODEL",
+            &crate::config::Config::default().embedder.model,
+        );
+        let dims = crate::config::Config::default().embedding_dims;
+        let embedder =
+            liam_model::FastEmbedEmbedder::load(&model_id, dims).expect("load real embedder");
+
+        // Same bitemporal-clock pattern as the text-only tier's test above
+        // (see its comment for why `DefaultGraph::open`'s real clock would
+        // break `Knob::AsOf`), but this tier's own store instance,
+        // independent of that test's.
+        let base = Millis::now();
+        let clock = Arc::new(FixedClock::new(base));
+        let store =
+            DefaultGraph::open_with_clock(":memory:", GraphConfig::new(dims), clock.clone())
+                .await
+                .expect("open in-memory store");
+
+        // Seed every fact with a real embedding this time, in addition to
+        // everything the text-only tier already seeds.
+        let mut ids: HashMap<&str, NodeId> = HashMap::new();
+        for fact in CORPUS {
+            let valid_from = fact
+                .valid_from_offset_ms
+                .map(|offset| Millis(base.0 + offset));
+            clock.set(valid_from.unwrap_or(base));
+
+            let embedding = embedder
+                .embed(fact.content)
+                .await
+                .expect("embed corpus fact");
+            let mut node =
+                NewNode::now(fact.kind, fact.label, fact.content).with_embedding(embedding);
+            if let Some(scope) = fact.scope {
+                node = node.with_scope(scope);
+            }
+            if let Some(confidence) = fact.confidence {
+                node = node.with_confidence(confidence);
+            }
+            if let Some(valid_from) = valid_from {
+                node = node.with_valid_from(valid_from);
+            }
+            let id = store.insert(node).await.expect("seed corpus fact");
+            ids.insert(fact.label, id);
+        }
+
+        // Back to "today" for edges and every query below, same reason as
+        // the text-only tier's test.
+        clock.set(base);
+
+        // Seed GraphExpansion edges, same direction convention as the
+        // text-only tier's test.
+        for linked in CORPUS.iter().filter(|f| f.edge_target.is_some()) {
+            let seed_label = linked.edge_target.expect("filtered to Some above");
+            let seed_id = ids
+                .get(seed_label)
+                .unwrap_or_else(|| panic!("edge_target {seed_label:?} not seeded"));
+            let linked_id = ids
+                .get(linked.label)
+                .unwrap_or_else(|| panic!("fact {:?} not seeded", linked.label));
+            store
+                .link(NewEdge::new(seed_id, linked_id, "mentions"))
+                .await
+                .expect("link GraphExpansion pair");
+        }
+
+        // Act: run every question, no category filter this time, scoring
+        // each against WU-1's metrics. VectorSemantic questions get their
+        // query text embedded too, then passed through `build_query`.
+        let mut per_category: HashMap<Category, Vec<CategoryMetrics>> = HashMap::new();
+
+        for question in QUESTIONS {
+            let embedding = if question.category == Category::VectorSemantic {
+                Some(
+                    embedder
+                        .embed(question.query_text)
+                        .await
+                        .expect("embed VectorSemantic query"),
+                )
+            } else {
+                None
+            };
+            let query = build_query(question, base, HARNESS_K, embedding);
+            // An empty result is a valid 0.0-scoring outcome, not a harness
+            // bug; only a genuine store error panics here.
+            let hits = store
+                .query_explained(&query)
+                .await
+                .expect("query_explained should succeed");
+
+            let retrieved: Vec<String> =
+                hits.iter().map(|h| h.hit.id.as_str().to_string()).collect();
+            let relevant: HashSet<&str> = question
+                .expected_relevant
+                .iter()
+                .map(|label| {
+                    ids.get(label)
+                        .unwrap_or_else(|| panic!("expected_relevant label {label:?} not seeded"))
+                        .as_str()
+                })
+                .collect();
+
+            per_category
+                .entry(question.category)
+                .or_default()
+                .push(score_question(&retrieved, &relevant));
+        }
+
+        // Assert: every scored metric is a valid, finite fraction.
+        for metrics in per_category.values().flatten() {
+            for value in [
+                metrics.precision_at_4,
+                metrics.precision_at_8,
+                metrics.recall_at_4,
+                metrics.recall_at_8,
+                metrics.mrr,
+            ] {
+                assert!(
+                    value.is_finite() && (0.0..=1.0).contains(&value),
+                    "metric value {value} outside [0.0, 1.0]"
+                );
+            }
+        }
+
+        // Aggregate per-category into the report; every category is scored
+        // this tier, including VectorSemantic (no not-run special case).
+        let scores: Vec<CategoryScore> = Category::ALL
+            .iter()
+            .map(|&category| {
+                let empty = Vec::new();
+                let results = per_category.get(&category).unwrap_or(&empty);
+                CategoryScore {
+                    category,
+                    scored: results.len(),
+                    metrics: average_category_metrics(results),
+                }
+            })
+            .collect();
+
+        let report = format_report(&scores);
+        println!("{report}");
+
+        for category in Category::ALL {
+            assert!(
+                report.contains(category.name()),
+                "report missing category {category:?}: {report}"
+            );
+        }
     }
 }
