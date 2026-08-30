@@ -755,12 +755,456 @@ const CORPUS: &[Fact] = &[
     },
 ];
 
+/// The category-specific extra a `Question` layers on top of its text query,
+/// per the module doc's text-plus-knob rule. `Lexical`/`GraphExpansion`/
+/// `Confidence` need nothing beyond `query_text` itself, since their "knob"
+/// is structural (an edge, or a `competes_with` pair) rather than a `Query`
+/// field, so they carry `Knob::None`.
+///
+/// The check below only matches each variant's discriminant (`Kind(_)`, not
+/// the carried value); WU-3/WU-4 read the value itself to build a `Query`.
+/// `allow(dead_code)` here is temporary and removed once WU-3 reads it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum Knob {
+    None,
+    Kind(&'static str),
+    Scope(&'static str),
+    /// A duration in milliseconds (see `DAY_MS`), always positive.
+    HalfLife(i64),
+    /// An offset in milliseconds from harness run time, same convention as
+    /// `Fact::valid_from_offset_ms` (negative = in the past).
+    AsOf(i64),
+}
+
+/// One retrieval question: a text query plus its category's knob, and the
+/// `CORPUS` labels a correct run must surface.
+#[derive(Debug, Clone, Copy)]
+struct Question {
+    name: &'static str,
+    category: Category,
+    query_text: &'static str,
+    knob: Knob,
+    expected_relevant: &'static [&'static str],
+}
+
+const QUESTIONS: &[Question] = &[
+    // Lexical
+    Question {
+        name: "lexical_hq_location",
+        category: Category::Lexical,
+        query_text: "Where is Kestrel Robotics headquarters located?",
+        knob: Knob::None,
+        expected_relevant: &["Kestrel HQ"],
+    },
+    Question {
+        name: "lexical_founders",
+        category: Category::Lexical,
+        query_text: "Who founded Kestrel Robotics?",
+        knob: Knob::None,
+        expected_relevant: &["Kestrel Founding"],
+    },
+    Question {
+        name: "lexical_titanium_frame",
+        category: Category::Lexical,
+        query_text: "What frame material did the engineering team choose for the Falconer \
+                      drone?",
+        knob: Knob::None,
+        expected_relevant: &["Titanium Frame Decision"],
+    },
+    Question {
+        name: "lexical_falconer_battery",
+        category: Category::Lexical,
+        query_text: "What battery does the Falconer drone use?",
+        knob: Knob::None,
+        expected_relevant: &["Falconer Battery"],
+    },
+    Question {
+        name: "lexical_demo_day_flight",
+        category: Category::Lexical,
+        query_text: "How long did the Falconer drone fly autonomously on demo day?",
+        knob: Knob::None,
+        expected_relevant: &["Falconer Demo Day"],
+    },
+    // VectorSemantic (real-embedder tier only, WU-4): each query_text is a
+    // paraphrase with weak lexical overlap against its expected fact.
+    Question {
+        name: "vector_solar_charging",
+        category: Category::VectorSemantic,
+        query_text: "Is the company experimenting with any renewable energy for recharging \
+                      its fleet?",
+        knob: Knob::None,
+        expected_relevant: &["Solar Charging Pilot"],
+    },
+    Question {
+        name: "vector_remote_work",
+        category: Category::VectorSemantic,
+        query_text: "Can staff do their jobs from a home office part of the week?",
+        knob: Knob::None,
+        expected_relevant: &["Remote Work Policy"],
+    },
+    Question {
+        name: "vector_drone_swarm",
+        category: Category::VectorSemantic,
+        query_text: "What is being studied about groups of small flying robots avoiding \
+                      obstacles together?",
+        knob: Knob::None,
+        expected_relevant: &["Drone Swarm Research"],
+    },
+    Question {
+        name: "vector_onboarding_speed",
+        category: Category::VectorSemantic,
+        query_text: "Did the company make it quicker for new clients to get started?",
+        knob: Knob::None,
+        expected_relevant: &["Customer Onboarding Redesign"],
+    },
+    Question {
+        name: "vector_quieter_rotors",
+        category: Category::VectorSemantic,
+        query_text: "Are the blades on the newest aircraft quieter than before?",
+        knob: Knob::None,
+        expected_relevant: &["Noise Reduction Rotor"],
+    },
+    // GraphExpansion: query_text surfaces the seed via lexical match;
+    // expected_relevant names both the seed and its linked fact.
+    Question {
+        name: "graph_motor_recall_reason",
+        category: Category::GraphExpansion,
+        query_text: "Why did Kestrel Robotics recall the Falconer's motor?",
+        knob: Knob::None,
+        expected_relevant: &["Falconer Motor Recall", "Motor Vendor Notice"],
+    },
+    Question {
+        name: "graph_weatherproof_casing",
+        category: Category::GraphExpansion,
+        query_text: "How did the engineering team weatherproof the Falconer casing?",
+        knob: Knob::None,
+        expected_relevant: &["Weatherproof Casing", "Field Test Storm Report"],
+    },
+    Question {
+        name: "graph_logistics_partnership",
+        category: Category::GraphExpansion,
+        query_text: "What logistics partnership did Kestrel Robotics sign?",
+        knob: Knob::None,
+        expected_relevant: &["Logistics Partnership Signed", "SwiftHaul Pilot Results"],
+    },
+    Question {
+        name: "graph_firmware_rollback",
+        category: Category::GraphExpansion,
+        query_text: "Why was the v3.2 firmware update rolled back?",
+        knob: Knob::None,
+        expected_relevant: &["Software Update Rollback", "Firmware Bug Report"],
+    },
+    Question {
+        name: "graph_motor_bearing_defect",
+        category: Category::GraphExpansion,
+        query_text: "What bearing defect caused the Falconer motor recall?",
+        knob: Knob::None,
+        expected_relevant: &["Falconer Motor Recall", "Motor Vendor Notice"],
+    },
+    // KindFilter
+    Question {
+        name: "kind_warehouse_decision",
+        category: Category::KindFilter,
+        query_text: "warehouse automation",
+        knob: Knob::Kind("decision"),
+        expected_relevant: &["Warehouse Automation Decision"],
+    },
+    Question {
+        name: "kind_data_retention_policy",
+        category: Category::KindFilter,
+        query_text: "flight log data retention",
+        knob: Knob::Kind("policy"),
+        expected_relevant: &["Data Retention Policy"],
+    },
+    Question {
+        name: "kind_battery_supplier_fact",
+        category: Category::KindFilter,
+        query_text: "lithium battery cell supplier Nevada",
+        knob: Knob::Kind("fact"),
+        expected_relevant: &["Battery Supplier Fact"],
+    },
+    Question {
+        name: "kind_certification_flight_episode",
+        category: Category::KindFilter,
+        query_text: "certification flight Falconer drone",
+        knob: Knob::Kind("episode"),
+        expected_relevant: &["Certification Flight Episode"],
+    },
+    Question {
+        name: "kind_insurance_provider_decision",
+        category: Category::KindFilter,
+        query_text: "insurance provider commercial drone fleet",
+        knob: Knob::Kind("decision"),
+        expected_relevant: &["Insurance Provider Decision"],
+    },
+    // ScopeFilter
+    Question {
+        name: "scope_engineering_sprint",
+        category: Category::ScopeFilter,
+        query_text: "two week sprint cycles",
+        knob: Knob::Scope("engineering"),
+        expected_relevant: &["Engineering Sprint Cadence"],
+    },
+    Question {
+        name: "scope_legal_compliance",
+        category: Category::ScopeFilter,
+        query_text: "compliance review",
+        knob: Knob::Scope("legal"),
+        expected_relevant: &["Legal Compliance Review"],
+    },
+    Question {
+        name: "scope_finance_budget",
+        category: Category::ScopeFilter,
+        query_text: "Falconer production line budget",
+        knob: Knob::Scope("finance"),
+        expected_relevant: &["Finance Budget Approval"],
+    },
+    Question {
+        name: "scope_operations_maintenance",
+        category: Category::ScopeFilter,
+        query_text: "Falconer maintenance",
+        knob: Knob::Scope("operations"),
+        expected_relevant: &["Operations Fleet Maintenance"],
+    },
+    Question {
+        name: "scope_marketing_launch",
+        category: Category::ScopeFilter,
+        query_text: "Falconer drone launch campaign",
+        knob: Knob::Scope("marketing"),
+        expected_relevant: &["Marketing Launch Campaign"],
+    },
+    // Decay
+    Question {
+        name: "decay_camera_sensor",
+        category: Category::Decay,
+        query_text: "Falconer drone camera sensor megapixel stills frames per second",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["Camera Sensor Spec (2026)"],
+    },
+    Question {
+        name: "decay_flight_range",
+        category: Category::Decay,
+        query_text: "Falconer drone maximum flight range single charge",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["Range Spec (Current)"],
+    },
+    Question {
+        name: "decay_support_hours",
+        category: Category::Decay,
+        query_text: "Kestrel Robotics customer support operating hours Mountain Time",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["Support Hours (New)"],
+    },
+    Question {
+        name: "decay_pricing_tier",
+        category: Category::Decay,
+        query_text: "Falconer drone starter package price",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["Pricing Tier (New)"],
+    },
+    Question {
+        name: "decay_team_size",
+        category: Category::Decay,
+        query_text: "Kestrel Robotics engineering team employees",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["Team Size (New)"],
+    },
+    // AsOf
+    Question {
+        name: "asof_product_name",
+        category: Category::AsOf,
+        query_text: "What was the Falconer drone originally called before its public \
+                      release?",
+        knob: Knob::AsOf(-495 * DAY_MS),
+        expected_relevant: &["Product Name (Original)"],
+    },
+    Question {
+        name: "asof_headquarters",
+        category: Category::AsOf,
+        query_text: "Where was Kestrel Robotics' original headquarters before the move to \
+                      Boulder?",
+        knob: Knob::AsOf(-750 * DAY_MS),
+        expected_relevant: &["Headquarters (Original)"],
+    },
+    Question {
+        name: "asof_ceo",
+        category: Category::AsOf,
+        query_text: "Who was Kestrel Robotics' first CEO?",
+        knob: Knob::AsOf(-500 * DAY_MS),
+        expected_relevant: &["CEO (Original)"],
+    },
+    Question {
+        name: "asof_product_line",
+        category: Category::AsOf,
+        query_text: "What kind of drones did Kestrel Robotics originally build?",
+        knob: Knob::AsOf(-600 * DAY_MS),
+        expected_relevant: &["Product Line (Original)"],
+    },
+    Question {
+        name: "asof_motor_vendor",
+        category: Category::AsOf,
+        query_text: "Which vendor originally supplied the Falconer's motor?",
+        knob: Knob::AsOf(-250 * DAY_MS),
+        expected_relevant: &["Falconer Motor Vendor (Original)"],
+    },
+    // Confidence: query_text matches both halves of a pair; expected_relevant
+    // names the higher-confidence half, whose competes_with names the loser
+    // (checked below).
+    Question {
+        name: "confidence_top_speed_terms",
+        category: Category::Confidence,
+        query_text: "Falconer drone top speed kilometers per hour",
+        knob: Knob::None,
+        expected_relevant: &["Falconer Top Speed (Verified)"],
+    },
+    Question {
+        name: "confidence_top_speed_phrase",
+        category: Category::Confidence,
+        query_text: "How fast can the Falconer drone fly?",
+        knob: Knob::None,
+        expected_relevant: &["Falconer Top Speed (Verified)"],
+    },
+    Question {
+        name: "confidence_payload_terms",
+        category: Category::Confidence,
+        query_text: "Falconer drone payload capacity kilograms",
+        knob: Knob::None,
+        expected_relevant: &["Payload Capacity (Verified)"],
+    },
+    Question {
+        name: "confidence_payload_phrase",
+        category: Category::Confidence,
+        query_text: "How much weight can the Falconer drone carry?",
+        knob: Knob::None,
+        expected_relevant: &["Payload Capacity (Verified)"],
+    },
+    Question {
+        name: "confidence_battery_life",
+        category: Category::Confidence,
+        query_text: "Falconer drone battery life minutes of flight",
+        knob: Knob::None,
+        expected_relevant: &["Battery Life (Verified)"],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn fact_by_label(label: &str) -> Option<&'static Fact> {
         CORPUS.iter().find(|f| f.label == label)
+    }
+
+    #[test]
+    fn every_question_expected_relevant_label_exists_in_corpus() {
+        // Given the full QUESTIONS table, when every question's
+        // expected_relevant labels are checked against CORPUS, then every
+        // one exists as a real corpus label.
+        for q in QUESTIONS {
+            for label in q.expected_relevant {
+                assert!(
+                    fact_by_label(label).is_some(),
+                    "question {} references unknown corpus label {label:?}",
+                    q.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_category_has_at_least_one_question() {
+        // Given QUESTIONS grouped by category, when checked, then every one
+        // of the 8 Category::ALL variants has at least one question.
+        for category in Category::ALL {
+            assert!(
+                QUESTIONS.iter().any(|q| q.category == category),
+                "category {category:?} has no question"
+            );
+        }
+    }
+
+    #[test]
+    fn question_names_are_unique() {
+        // Given QUESTIONS, when checked for uniqueness by name, then no two
+        // questions share a name.
+        let mut names: Vec<&str> = QUESTIONS.iter().map(|q| q.name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "duplicate question names");
+    }
+
+    #[test]
+    fn every_non_vector_semantic_question_carries_its_declared_knob() {
+        // Given every Question other than VectorSemantic, when its
+        // knob/shape is inspected, then it always carries non-empty
+        // query_text, and for KindFilter/ScopeFilter/Decay/AsOf specifically,
+        // the matching category-specific knob field is actually set.
+        for q in QUESTIONS {
+            if q.category == Category::VectorSemantic {
+                continue;
+            }
+            assert!(
+                !q.query_text.is_empty(),
+                "question {} has empty query_text",
+                q.name
+            );
+            let knob_matches_category = match q.category {
+                Category::KindFilter => matches!(q.knob, Knob::Kind(_)),
+                Category::ScopeFilter => matches!(q.knob, Knob::Scope(_)),
+                Category::Decay => matches!(q.knob, Knob::HalfLife(_)),
+                Category::AsOf => matches!(q.knob, Knob::AsOf(_)),
+                // Lexical/GraphExpansion/Confidence have no Query-level knob;
+                // their "knob" is structural (an edge or a competes_with
+                // pair), checked by the two tests below instead.
+                _ => true,
+            };
+            assert!(
+                knob_matches_category,
+                "question {} (category {:?}) does not carry its declared knob: {:?}",
+                q.name, q.category, q.knob
+            );
+        }
+    }
+
+    #[test]
+    fn confidence_questions_name_a_real_competitor_with_a_different_confidence() {
+        // Given every Confidence question's expected-relevant fact, when its
+        // competes_with field is read from CORPUS, then the named fact
+        // exists in CORPUS AND its confidence value actually differs from
+        // the expected-relevant fact's confidence.
+        for q in QUESTIONS
+            .iter()
+            .filter(|q| q.category == Category::Confidence)
+        {
+            for label in q.expected_relevant {
+                let fact = fact_by_label(label).unwrap_or_else(|| {
+                    panic!(
+                        "question {} references unknown corpus label {label:?}",
+                        q.name
+                    )
+                });
+                let competitor_label = fact.competes_with.unwrap_or_else(|| {
+                    panic!(
+                        "confidence fact {label:?} (question {}) has no competes_with",
+                        q.name
+                    )
+                });
+                let competitor = fact_by_label(competitor_label).unwrap_or_else(|| {
+                    panic!(
+                        "fact {label:?}'s competes_with names unknown label {competitor_label:?}"
+                    )
+                });
+                let fact_confidence = fact.confidence.unwrap_or(1.0);
+                let competitor_confidence = competitor.confidence.unwrap_or(1.0);
+                assert_ne!(
+                    fact_confidence, competitor_confidence,
+                    "fact {label:?} and its named competitor {competitor_label:?} must differ \
+                     in confidence"
+                );
+            }
+        }
     }
 
     #[test]
