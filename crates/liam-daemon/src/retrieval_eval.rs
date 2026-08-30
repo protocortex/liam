@@ -1157,8 +1157,12 @@ mod tests {
                 Category::AsOf => matches!(q.knob, Knob::AsOf(_)),
                 // Lexical/GraphExpansion/Confidence have no Query-level knob;
                 // their "knob" is structural (an edge or a competes_with
-                // pair), checked by the two tests below instead.
-                _ => true,
+                // pair), checked by the two tests below instead. Require
+                // Knob::None explicitly here rather than accepting any
+                // value, so a copy-paste error that leaves a stray
+                // non-None knob on one of these three categories is
+                // caught instead of silently passing.
+                _ => matches!(q.knob, Knob::None),
             };
             assert!(
                 knob_matches_category,
@@ -1218,6 +1222,42 @@ mod tests {
                 fact_by_label(target).is_some(),
                 "fact {:?} has edge_target {target:?}, which is not a corpus label",
                 fact.label
+            );
+        }
+    }
+
+    #[test]
+    fn graph_expansion_questions_expected_relevant_matches_seeded_edge() {
+        // Given each GraphExpansion question's expected_relevant pair
+        // (authored as [seed, linked fact]), when the linked fact's
+        // edge_target is read back from CORPUS, then it names the seed
+        // label, tying the question's ground truth to the specific edge
+        // the harness seeds via Graph::link, not just to some valid corpus
+        // label.
+        for q in QUESTIONS
+            .iter()
+            .filter(|q| q.category == Category::GraphExpansion)
+        {
+            assert_eq!(
+                q.expected_relevant.len(),
+                2,
+                "GraphExpansion question {} must name exactly a seed and its linked fact",
+                q.name
+            );
+            let seed_label = q.expected_relevant[0];
+            let linked_label = q.expected_relevant[1];
+            let linked_fact = fact_by_label(linked_label).unwrap_or_else(|| {
+                panic!(
+                    "question {} references unknown corpus label {linked_label:?}",
+                    q.name
+                )
+            });
+            assert_eq!(
+                linked_fact.edge_target,
+                Some(seed_label),
+                "question {}'s linked fact {linked_label:?} must have edge_target pointing at \
+                 seed {seed_label:?}",
+                q.name
             );
         }
     }
@@ -1310,6 +1350,22 @@ mod tests {
 
         // Assert
         assert_eq!(precision, 0.5);
+    }
+
+    #[test]
+    fn precision_at_k_denominator_is_k_not_retrieved_len() {
+        // Arrange: a short retrieved list, well under k=4, with its one
+        // entry relevant.
+        let retrieved = vec!["a".to_string()];
+        let relevant = set(&["a"]);
+
+        // Act
+        let precision = precision_at_k(&retrieved, &relevant, 4);
+
+        // Assert: divided by k=4 (0.25), not by retrieved.len()=1, which
+        // would wrongly give 1.0 and reward a short list for having fewer
+        // slots to be wrong in.
+        assert_eq!(precision, 0.25);
     }
 
     #[test]
