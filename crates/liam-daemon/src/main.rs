@@ -13,6 +13,10 @@ mod clusters;
 #[cfg(test)]
 mod eval;
 mod mcp;
+/// Retrieval-quality benchmark for `Graph::query`; test-only, see the module
+/// docs to run each tier.
+#[cfg(test)]
+mod retrieval_eval;
 mod storelock;
 mod telemetry;
 mod transport;
