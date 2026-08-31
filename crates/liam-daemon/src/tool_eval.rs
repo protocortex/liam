@@ -13,13 +13,32 @@
 //! - **Mock tier, always-on:** `MockEmbedder`/`IdentityReranker`/`MockLlm`, no
 //!   model download. A plain `#[tokio::test]`, runs under
 //!   `cargo test -p liam-daemon --bin liamd tool_eval`.
-//! - **Real-embedder, gated + `#[ignore]`d (added in a later WU):** the actual
-//!   local embedder behind `#[cfg(feature = "local")]`, downloads weights on
-//!   first run:
+//! - **Real-tier, gated + `#[ignore]`d:** the actual local embedder
+//!   (`FastEmbedEmbedder`, Qwen3) AND the actual local reranker
+//!   (`FastEmbedReranker`, a BGE cross-encoder) behind `#[cfg(feature =
+//!   "local")]`, downloading weights on first run:
 //!
 //!   ```text
-//!   cargo test --release -p liam-daemon --features local -- --ignored --nocapture tool_eval
+//!   cargo test --release -p liam-daemon --bin liamd --features local -- --ignored --nocapture reranking
 //!   ```
+//!
+//!   Env override: `LIAM_TOOL_EVAL_MODEL`, mirroring `eval.rs`'s
+//!   `LIAM_EVAL_MODEL` and `retrieval_eval.rs`'s `LIAM_RETRIEVAL_EVAL_MODEL`
+//!   for a local A/B run against a different embedding model.
+//!
+//! # Real-tier baseline (2026-08-31, Apple M1 Pro, macOS 15.7.5,
+//! # Qwen/Qwen3-Embedding-0.6B, 768 dims, default BGE reranker via fastembed,
+//! # `cargo test --release -p liam-daemon --bin liamd --features local --
+//! # --ignored --nocapture reranking`)
+//!
+//! `reranking_promotes_the_correct_target_over_a_surface_decoy`: under
+//! `IdentityReranker` (real embedding + lexical RRF, no rerank), recall
+//! ordered `["Gizmo ship date", "Nightjar ship date"]` for the query "When
+//! does the zorbnax gizmo's successor ship?" (decoy reciprocal rank 1.0,
+//! target reciprocal rank 0.5). Under `FastEmbedReranker`, the same query
+//! against the same fixture reordered to `["Nightjar ship date", "Gizmo ship
+//! date"]` (target reciprocal rank 1.0). See `mod real_tier` below for why
+//! this fixture reproduces the flaw.
 
 use std::sync::Arc;
 
@@ -115,6 +134,157 @@ fn labels_in_order(recall_text: &str) -> Vec<String> {
             Some(label.to_string())
         })
         .collect()
+}
+
+/// Real-tier: gated behind `feature = "local"` and `#[ignore]`d, since it
+/// downloads model weights on first run and takes real time (see the module
+/// doc's "Two tiers" section for the exact run command). A sibling of `mod
+/// tests`, not nested inside it, specifically so it can `use super::*;` and
+/// reuse `build_server`/`seed`/`labels_in_order` the same way `mod tests`
+/// does, mirroring `retrieval_eval.rs`'s own `mod real_embedder_run`.
+#[cfg(feature = "local")]
+mod real_tier {
+    use std::collections::HashSet;
+
+    use super::*;
+    use crate::mcp::RecallArgs;
+
+    /// Read an env override, falling back to `default` when unset. Same
+    /// small shape as `eval.rs`'s and `retrieval_eval.rs`'s own `env_or`;
+    /// redefined locally rather than shared across modules, per those
+    /// modules' own doc comments, since it is a two-line function with no
+    /// state to keep in sync.
+    fn env_or(key: &str, default: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| default.to_string())
+    }
+
+    /// Label of the fixture's correct answer to `QUERY`.
+    const TARGET_LABEL: &str = "Nightjar ship date";
+    /// Label of the fixture's surface-similar wrong answer to `QUERY`.
+    const DECOY_LABEL: &str = "Gizmo ship date";
+
+    /// Query asking specifically about the zorbnax gizmo's SUCCESSOR, not
+    /// the gizmo itself.
+    const QUERY: &str = "When does the zorbnax gizmo's successor ship?";
+
+    /// The two-fact fixture that reproduces the ranking flaw. WHY the decoy
+    /// beats the target under `IdentityReranker` (real embedding + lexical
+    /// RRF, no rerank) despite answering the wrong question: `DECOY`'s
+    /// wording ("The zorbnax gizmo ships in June 2026") repeats `QUERY`'s
+    /// most literal phrase, "zorbnax gizmo ... ship", verbatim, but never
+    /// mentions a successor at all: it's the ORIGINAL product's ship date,
+    /// not the one `QUERY` actually asks for. `TARGET` answers the actual
+    /// question (the successor's ship date, under its own name "Nightjar")
+    /// and shares the word "successor" with `QUERY`, but paraphrases the
+    /// verb ("launches" instead of "ship") and never repeats `QUERY`'s
+    /// "zorbnax gizmo ships" phrase, so it has less raw surface/n-gram
+    /// overlap with `QUERY` than `DECOY` does, despite being the fact
+    /// `QUERY` is actually about. A cross-encoder reranker scores `QUERY`
+    /// and each document JOINTLY (not via separately-computed vectors), so
+    /// it can tell "this document is about the ORIGINAL gizmo, not its
+    /// successor" in a way that surface-overlap-driven ranking cannot; see
+    /// this module's top-of-file doc comment for the real ranks this fixture
+    /// produced.
+    const FIXTURE: [Fact; 2] = [
+        ("fact", DECOY_LABEL, "The zorbnax gizmo ships in June 2026."),
+        (
+            "fact",
+            TARGET_LABEL,
+            "Nightjar, the zorbnax gizmo's successor, launches in November 2026.",
+        ),
+    ];
+
+    /// Given a target fact and a surface-similar decoy fact seeded
+    /// identically into two real-embedding stores, when the same query is
+    /// recalled under `IdentityReranker`, then the decoy ranks first and the
+    /// target is outranked; when the same query is recalled under
+    /// `FastEmbedReranker`, then the target is promoted to rank first.
+    #[tokio::test]
+    #[ignore = "downloads reranker weights; see module doc for the run command"]
+    async fn reranking_promotes_the_correct_target_over_a_surface_decoy() {
+        // Arrange: one real embedder, loaded once, shared by both servers,
+        // since both need to embed the SAME facts/query identically for the
+        // comparison to isolate the reranker as the only variable that
+        // differs between them.
+        let model_id = env_or(
+            "LIAM_TOOL_EVAL_MODEL",
+            &crate::config::Config::default().embedder.model,
+        );
+        let dims = crate::config::Config::default().embedding_dims;
+        let embedder = Arc::new(liam_model::FastEmbedEmbedder::load(&model_id, dims).expect(
+            "load real embedder (Qwen3); requires network access for first-time model \
+                 download",
+        ));
+
+        let baseline_server = build_server(
+            embedder.clone(),
+            Arc::new(liam_model::IdentityReranker),
+            dims,
+        )
+        .await;
+        seed(&baseline_server, &FIXTURE).await;
+
+        let real_reranker = liam_model::FastEmbedReranker::load().expect(
+            "load reranker (BGE cross-encoder); requires network access for first-time model \
+             download",
+        );
+        let real_server = build_server(embedder, Arc::new(real_reranker), dims).await;
+        seed(&real_server, &FIXTURE).await;
+
+        // Act
+        let baseline_recall_text = baseline_server
+            .recall(Parameters(RecallArgs {
+                query: QUERY.to_string(),
+                kind: None,
+                scope: None,
+                k: Some(FIXTURE.len()),
+                as_of: None,
+            }))
+            .await;
+        let real_recall_text = real_server
+            .recall(Parameters(RecallArgs {
+                query: QUERY.to_string(),
+                kind: None,
+                scope: None,
+                k: Some(FIXTURE.len()),
+                as_of: None,
+            }))
+            .await;
+        println!("baseline (IdentityReranker) order: {baseline_recall_text}");
+        println!("real (FastEmbedReranker) order: {real_recall_text}");
+
+        let baseline_labels = labels_in_order(&baseline_recall_text);
+        let real_labels = labels_in_order(&real_recall_text);
+        println!("baseline labels: {baseline_labels:?}");
+        println!("real labels: {real_labels:?}");
+
+        // Assert
+        let decoy = HashSet::from([DECOY_LABEL]);
+        let target = HashSet::from([TARGET_LABEL]);
+        let baseline_decoy_rr = crate::retrieval_eval::reciprocal_rank(&baseline_labels, &decoy);
+        let baseline_target_rr = crate::retrieval_eval::reciprocal_rank(&baseline_labels, &target);
+        let real_target_rr = crate::retrieval_eval::reciprocal_rank(&real_labels, &target);
+        println!(
+            "reciprocal rank: baseline decoy={baseline_decoy_rr}, baseline \
+             target={baseline_target_rr}, real target={real_target_rr}"
+        );
+
+        assert_eq!(
+            baseline_decoy_rr, 1.0,
+            "expected the decoy to rank first under IdentityReranker, proving it is a real, \
+             retrieved competitor rather than the target simply being missing: {baseline_labels:?}"
+        );
+        assert!(
+            baseline_target_rr < 1.0,
+            "expected the target to be outranked (not missing) under IdentityReranker: \
+             {baseline_labels:?}"
+        );
+        assert_eq!(
+            real_target_rr, 1.0,
+            "expected the target to be promoted to rank first under FastEmbedReranker: \
+             {real_labels:?}"
+        );
+    }
 }
 
 #[cfg(test)]
