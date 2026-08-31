@@ -39,6 +39,18 @@
 //! against the same fixture reordered to `["Nightjar ship date", "Gizmo ship
 //! date"]` (target reciprocal rank 1.0). See `mod real_tier` below for why
 //! this fixture reproduces the flaw.
+//!
+//! `semantic_paraphrase_recovers_the_remembered_fact` (2026-08-31, same
+//! machine/model as above,
+//! `cargo test --release -p liam-daemon --bin liamd --features local --
+//! --ignored --nocapture semantic_paraphrase`): recalling under
+//! `IdentityReranker` with the paraphrase query "Will they fix it for free
+//! if liquid gets inside accidentally?" against the sole seeded fact
+//! "Nightjar's warranty only covers manufacturing defects, never water
+//! damage." (zero shared non-stopword tokens between query and fact
+//! content) returned that fact, label "Nightjar warranty terms", as the
+//! only and top hit (reciprocal rank 1.0), confirming the real embedder
+//! alone, with no lexical overlap to lean on, recovers the fact.
 
 use std::sync::Arc;
 
@@ -283,6 +295,82 @@ mod real_tier {
             real_target_rr, 1.0,
             "expected the target to be promoted to rank first under FastEmbedReranker: \
              {real_labels:?}"
+        );
+    }
+
+    /// Label of the sole fact seeded for
+    /// `semantic_paraphrase_recovers_the_remembered_fact`.
+    const PARAPHRASE_FACT_LABEL: &str = "Nightjar warranty terms";
+
+    /// The fact, phrased around coverage/defects/water damage.
+    const PARAPHRASE_FACT_CONTENT: &str =
+        "Nightjar's warranty only covers manufacturing defects, never water damage.";
+
+    /// A paraphrase of the question `PARAPHRASE_FACT_CONTENT` answers,
+    /// sharing MINIMAL lexical overlap with it. Verified by eye before
+    /// writing this test: `PARAPHRASE_FACT_CONTENT`'s non-stopword/content
+    /// words are {nightjar, warranty, covers, manufacturing, defects,
+    /// water, damage}; `PARAPHRASE_QUERY`'s are {fix, free, liquid, gets,
+    /// inside, accidentally}. Zero words in common, so plain lexical/FTS
+    /// matching has nothing to latch onto here and only a real semantic
+    /// embedding (mapping "water damage" near "liquid ... inside" and
+    /// "covers" near "fix ... for free") can recover the fact for this
+    /// query.
+    const PARAPHRASE_QUERY: &str = "Will they fix it for free if liquid gets inside accidentally?";
+
+    /// The single-fact fixture for
+    /// `semantic_paraphrase_recovers_the_remembered_fact`.
+    const PARAPHRASE_FACT: Fact = ("fact", PARAPHRASE_FACT_LABEL, PARAPHRASE_FACT_CONTENT);
+
+    /// Given a fact remembered with wording A, when recalled with a
+    /// paraphrase B sharing minimal lexical overlap with A, then the
+    /// fact's reciprocal rank in the recall output is exactly 1.0. Uses
+    /// `IdentityReranker`, not `FastEmbedReranker`: the sibling test above
+    /// already covers reranking quality, so this test isolates the
+    /// embedder as the only variable being measured, per this module's
+    /// doc comment. Loads its OWN `Arc<FastEmbedEmbedder>` rather than
+    /// reusing the sibling test's instance: each `#[tokio::test]` function
+    /// gets a fresh instance, no cross-test-function shared state.
+    #[tokio::test]
+    #[ignore = "downloads embedder weights; see module doc for the run command"]
+    async fn semantic_paraphrase_recovers_the_remembered_fact() {
+        // Arrange
+        let model_id = env_or(
+            "LIAM_TOOL_EVAL_MODEL",
+            &crate::config::Config::default().embedder.model,
+        );
+        let dims = crate::config::Config::default().embedding_dims;
+        let embedder = Arc::new(liam_model::FastEmbedEmbedder::load(&model_id, dims).expect(
+            "load real embedder (Qwen3); requires network access for first-time model \
+             download",
+        ));
+        let server = build_server(embedder, Arc::new(liam_model::IdentityReranker), dims).await;
+        seed(&server, &[PARAPHRASE_FACT]).await;
+
+        // Act
+        let recall_text = server
+            .recall(Parameters(RecallArgs {
+                query: PARAPHRASE_QUERY.to_string(),
+                kind: None,
+                scope: None,
+                k: Some(1),
+                as_of: None,
+            }))
+            .await;
+        println!("recall order: {recall_text}");
+        let labels = labels_in_order(&recall_text);
+        println!("labels: {labels:?}");
+
+        // Assert
+        let rr = crate::retrieval_eval::reciprocal_rank(
+            &labels,
+            &HashSet::from([PARAPHRASE_FACT_LABEL]),
+        );
+        println!("reciprocal rank: {rr}");
+        assert_eq!(
+            rr, 1.0,
+            "expected the real embedder to recover the fact for a lexically-disjoint paraphrase \
+             query: {labels:?}"
         );
     }
 }
