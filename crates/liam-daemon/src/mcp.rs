@@ -49,6 +49,16 @@ const DEFAULT_PRODUCER: &str = "unknown";
 /// Same value by consistency, not by coupling.
 const MAX_ATTRIBUTES_CHARS: usize = 2000;
 
+/// Cap on `content`'s length for `remember` (top-level and every
+/// `episode.facts[i]`). A starting point, not measured from production
+/// data, matching how `MAX_SCOPE_CHARS` is framed in `liam-store`. The
+/// value is kept comfortably under `liam-model`'s `EMBED_MAX_INPUT_TOKENS`
+/// (8192 tokens): that cap is the tokenizer's own `max_length`, which
+/// silently truncates input rather than erroring, so content passing this
+/// check does not silently lose embedding fidelity to an unnoticed
+/// truncation downstream.
+const MAX_CONTENT_CHARS: usize = 16_000;
+
 /// Cap on `1 + episode.facts.len() + episode.entities.len() +
 /// episode.edges.len()` for `remember`'s `episode` field (the leading `1`
 /// is the always-present top-level fact). Bounds how long
@@ -111,6 +121,20 @@ fn attributes_problem(attributes: &Option<serde_json::Value>) -> Option<String> 
         ));
     }
     None
+}
+
+/// Content size check for `remember`'s top-level `content` field: `None`
+/// within `MAX_CONTENT_CHARS`, otherwise the problem. Unlike
+/// `attributes_problem`, `content` is a plain `&str`, always present
+/// rather than `Option`, since it is a required top-level field. Counts
+/// `chars()`, not bytes, so a multi-byte-but-single-scalar character
+/// (e.g. `'é'`) is not double-counted against the cap.
+fn content_problem(content: &str) -> Option<String> {
+    if content.chars().count() > MAX_CONTENT_CHARS {
+        Some(format!("content exceeds {MAX_CONTENT_CHARS} characters"))
+    } else {
+        None
+    }
 }
 
 /// Parses a `"fact:N"` episode edge reference into its combined node index
@@ -502,6 +526,9 @@ impl MemoryServer {
             return format!("remember failed: {problem}");
         }
         if let Some(problem) = attributes_problem(&args.attributes) {
+            return format!("remember failed: {problem}");
+        }
+        if let Some(problem) = content_problem(&args.content) {
             return format!("remember failed: {problem}");
         }
 
@@ -1651,6 +1678,86 @@ mod tests {
         assert_eq!(
             after, before,
             "over-cap attributes wrote a node despite rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_content_boundary_at_the_max_char_cap() {
+        // Given content built to exactly MAX_CONTENT_CHARS
+        let server = plain_server().await;
+        let at_cap = "x".repeat(MAX_CONTENT_CHARS);
+        assert_eq!(at_cap.chars().count(), MAX_CONTENT_CHARS);
+
+        // When remember is called with it
+        let out = server.remember(Parameters(remember_args(&at_cap))).await;
+
+        // Then it is accepted
+        assert!(out.starts_with("remembered "), "{out}");
+
+        // Given content one character past the cap, built around a unique
+        // marker so the before/after query below can detect a written node
+        let marker = "content over cap marker";
+        let over_cap = format!(
+            "{marker} {}",
+            "x".repeat(MAX_CONTENT_CHARS - marker.chars().count())
+        );
+        assert_eq!(over_cap.chars().count(), MAX_CONTENT_CHARS + 1);
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+
+        // When remember is called with it
+        let out = server.remember(Parameters(remember_args(&over_cap))).await;
+
+        // Then it is refused with the exact error text, and no node lands
+        assert_eq!(
+            out,
+            format!("remember failed: content exceeds {MAX_CONTENT_CHARS} characters")
+        );
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            after, before,
+            "over-cap content wrote a node despite rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_content_boundary_counts_unicode_scalars_not_bytes() {
+        // Given content built from the precomposed 'é' scalar (U+00E9, 2
+        // UTF-8 bytes) repeated to exactly MAX_CONTENT_CHARS characters: a
+        // regression that swapped `.chars().count()` for `.len()` (byte
+        // count) in `content_problem` would double-count this and reject it
+        // at the cap, something ASCII-only fixtures can't catch since ASCII
+        // chars and bytes are 1:1.
+        let server = plain_server().await;
+        let at_cap: String = "é".repeat(MAX_CONTENT_CHARS);
+        assert_eq!(at_cap.chars().count(), MAX_CONTENT_CHARS);
+
+        // When remember is called with it
+        let out = server.remember(Parameters(remember_args(&at_cap))).await;
+
+        // Then it is accepted
+        assert!(out.starts_with("remembered "), "{out}");
+
+        // Given content one character past the cap, built the same way
+        let over_cap: String = "é".repeat(MAX_CONTENT_CHARS + 1);
+        assert_eq!(over_cap.chars().count(), MAX_CONTENT_CHARS + 1);
+
+        // When remember is called with it
+        let out = server.remember(Parameters(remember_args(&over_cap))).await;
+
+        // Then it is refused with the exact error text
+        assert_eq!(
+            out,
+            format!("remember failed: content exceeds {MAX_CONTENT_CHARS} characters")
         );
     }
 
