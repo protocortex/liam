@@ -580,6 +580,9 @@ impl MemoryServer {
         let entity_count = episode.entities.len();
         let mut problems: Vec<String> = Vec::new();
         for (i, fact) in episode.facts.iter().enumerate() {
+            if let Some(problem) = content_problem(&fact.content) {
+                problems.push(format!("fact:{}: {problem}", i + 1));
+            }
             if let Some(problem) = confidence_problem(fact.confidence) {
                 problems.push(format!("fact:{}: {problem}", i + 1));
             }
@@ -1994,6 +1997,75 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_rejects_oversized_content_on_a_nested_fact() {
+        // Given an episode whose nested fact's content is one character over
+        // MAX_CONTENT_CHARS, among otherwise-valid facts
+        let server = plain_server().await;
+        let marker = "episode nested content ceiling rejection content";
+        let over_cap = "x".repeat(MAX_CONTENT_CHARS + 1);
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact(&over_cap)],
+                    entities: vec![],
+                    edges: vec![],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused with the fact-prefixed content problem, and
+        // nothing lands: per-item content validation runs, not just the
+        // top-level field's
+        assert!(out.contains("fact:1: content exceeds"), "{out}");
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_reports_both_content_and_confidence_problems_on_the_same_fact() {
+        // Given a single episode fact with BOTH oversized content AND an
+        // out-of-range confidence
+        let server = plain_server().await;
+        let marker = "episode nested content and confidence content";
+        let over_cap = "x".repeat(MAX_CONTENT_CHARS + 1);
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![EpisodeFactArgs {
+                        confidence: Some(5.0),
+                        ..episode_fact(&over_cap)
+                    }],
+                    entities: vec![],
+                    edges: vec![],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then the response reports BOTH problems under the same "fact:1"
+        // prefix, proving accumulation on a single item rather than
+        // short-circuiting at the first problem found
+        assert!(out.contains("fact:1: content exceeds"), "{out}");
+        assert!(out.contains("fact:1: confidence must be"), "{out}");
     }
 
     #[tokio::test]
