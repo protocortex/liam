@@ -492,8 +492,10 @@ impl MemoryServer {
         self.store.resolve_handle(s).await.map(EpisodeRef::Existing)
     }
 
+    // `pub(crate)` so the tool-eval grounding harness (see `tool_eval.rs`) drives
+    // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Record a durable decision or fact into long-term memory.")]
-    async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
+    pub(crate) async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         // Cheap checks first, before the embed call pays for a rejected
         // request: the `relate` handler establishes this convention.
         if let Some(problem) = confidence_problem(args.confidence) {
@@ -703,8 +705,10 @@ impl MemoryServer {
         }
     }
 
+    // `pub(crate)` so the tool-eval grounding harness (see `tool_eval.rs`) drives
+    // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Retrieve relevant long-term memory, reranked for precision.")]
-    async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
+    pub(crate) async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let embedding = self.embedder.embed(&args.query).await.ok();
         let q = build_query(
             &args.query,
