@@ -147,6 +147,22 @@ By default the embedder is a mock, so retrieval leans on full-text and graph
 signals. Set `provider = "local"` and build with `--features local` for real
 embeddings.
 
+### Try it with a real embedder
+
+From your clone of this repo, build with the `local` feature, switch the
+config to the `local` provider, then start the daemon as documented above:
+
+```sh
+cargo build -p liam-daemon --features local
+```
+
+Set `embedder.provider = "local"` in `liam.toml` (see the Configuration table
+below for the rest of the keys). Run `liamd` as shown above, then call
+`recall` from your MCP client. The vector channel now carries real semantic
+similarity instead of the mock embedder's hash-derived placeholder, so
+results ranked mainly by meaning (not just shared words) start showing up
+alongside the full-text and graph signals `recall` always blends in.
+
 ## Configuration
 
 The daemon reads `liam.toml` from the working directory. Override the path with
