@@ -74,10 +74,11 @@ const ASK_TIMEOUT_SECS: u64 = 300;
 /// its server once, inline, inside a single `#[ignore]`d test behind a fixed
 /// real LLM and reranker, because it only ever measures answer synthesis.
 /// This module's tests each need a fresh store per test (`seed` mutates it)
-/// and vary the embedder/reranker across tiers (mock now, a real embedder in
-/// a later WU), so the construction has to be a reusable function rather than
-/// one inline block; there being no third caller yet, that function stays
-/// here instead of becoming a shared helper across the eval modules.
+/// and vary the embedder/reranker across tiers, mock now (`mod tests` below)
+/// and a real embedder (`mod real_tier` below), both in this file, so the
+/// construction has to be a reusable function rather than one inline block;
+/// there being no third caller yet, that function stays here instead of
+/// becoming a shared helper across the eval modules.
 async fn build_server(
     embedder: Arc<dyn liam_model::Embedder>,
     reranker: Arc<dyn liam_model::Reranker>,
@@ -302,8 +303,8 @@ mod real_tier {
             "expected the decoy to rank first under IdentityReranker, proving it is a real, \
              retrieved competitor rather than the target simply being missing: {baseline_labels:?}"
         );
-        assert!(
-            baseline_target_rr < 1.0,
+        assert_eq!(
+            baseline_target_rr, 0.5,
             "expected the target to be outranked (not missing) under IdentityReranker: \
              {baseline_labels:?}"
         );
@@ -385,8 +386,6 @@ mod real_tier {
 
 #[cfg(test)]
 mod tests {
-    use rmcp::handler::server::wrapper::Parameters;
-
     use super::*;
     use crate::mcp::RecallArgs;
 
@@ -397,12 +396,19 @@ mod tests {
         let embedder = Arc::new(liam_model::MockEmbedder::new(DIMS));
         let reranker = Arc::new(liam_model::IdentityReranker);
         let server = build_server(embedder, reranker, DIMS).await;
-        let fact: Fact = (
-            "fact",
-            "Storage engine",
-            "LIAM stores all memory in libSQL, a single-file SQLite fork.",
-        );
-        seed(&server, &[fact]).await;
+        let facts: [Fact; 2] = [
+            (
+                "fact",
+                "Storage engine",
+                "LIAM stores all memory in libSQL, a single-file SQLite fork.",
+            ),
+            (
+                "fact",
+                "Mascot",
+                "The zorbnax team mascot is a wombat named Pixel.",
+            ),
+        ];
+        seed(&server, &facts).await;
 
         // Act
         let recall_text = server
@@ -410,13 +416,16 @@ mod tests {
                 query: "libSQL SQLite storage".to_string(),
                 kind: None,
                 scope: None,
-                k: None,
+                k: Some(1),
                 as_of: None,
             }))
             .await;
 
         // Assert
-        assert!(labels_in_order(&recall_text).contains(&"Storage engine".to_string()));
+        assert_eq!(
+            labels_in_order(&recall_text),
+            vec!["Storage engine".to_string()]
+        );
     }
 
     #[test]
@@ -441,6 +450,18 @@ mod tests {
 
         // Assert
         assert_eq!(labels, vec!["Storage engine".to_string()]);
+    }
+
+    #[test]
+    fn labels_in_order_block_without_delimiter_is_skipped() {
+        // Arrange
+        let recall_text = "garbage with no delimiter";
+
+        // Act
+        let labels = labels_in_order(recall_text);
+
+        // Assert
+        assert!(labels.is_empty());
     }
 
     #[test]
