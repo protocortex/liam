@@ -158,9 +158,10 @@ cargo build -p liam-daemon --features local
 
 Set `embedder.provider = "local"` in `liam.toml` (see the Configuration table
 below for the rest of the keys). Run `liamd` as shown above, then call
-`recall` from your MCP client. The vector channel now uses real embeddings, so
-results are semantically ranked instead of falling back to the mock's
-lexical-only matching.
+`recall` from your MCP client. The vector channel now carries real semantic
+similarity instead of the mock embedder's hash-derived placeholder, so
+results ranked mainly by meaning (not just shared words) start showing up
+alongside the full-text and graph signals `recall` always blends in.
 
 ## Configuration
 
