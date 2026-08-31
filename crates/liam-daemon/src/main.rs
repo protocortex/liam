@@ -19,6 +19,9 @@ mod mcp;
 mod retrieval_eval;
 mod storelock;
 mod telemetry;
+/// Grounding eval for remember/recall/relate; test-only, see the module docs to run each tier.
+#[cfg(test)]
+mod tool_eval;
 mod transport;
 
 use std::sync::Arc;
