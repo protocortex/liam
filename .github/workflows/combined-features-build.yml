@@ -1,0 +1,31 @@
+name: Combined features build (local,llama)
+
+# Deliberately no `pull_request` or `push` trigger. This workflow exists to
+# catch a break in the exact combination `release.yml` ships
+# (`--features local,llama`), which is compiled NOWHERE in ci.yml (see that
+# workflow's `deny` job comment and release.yml's own comment block). It must
+# never join the default PR-triggered matrix, so `schedule` plus
+# `workflow_dispatch` are the only ways in.
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Monday 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  # macos-latest, matching release.yml's runner, NOT because `llama` needs
+  # macOS to compile (Metal is target-gated inside llama-cpp-sys-2's build
+  # script, not behind a cargo feature). The reason is release.yml itself: v1
+  # ships macOS only, and the point of this job is to catch a break in that
+  # exact target before a tag goes out.
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Build only, no `--release`, no test run, per the issue's cost
+      # guidance. This is cheaper than release.yml's `--release` build; the
+      # goal is just "does it compile".
+      - name: Build (local,llama features)
+        run: cargo build -p liam-daemon --features local,llama
