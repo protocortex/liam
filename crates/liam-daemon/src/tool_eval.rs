@@ -170,6 +170,30 @@ mod real_tier {
         std::env::var(key).unwrap_or_else(|_| default.to_string())
     }
 
+    /// Loads a real `FastEmbedEmbedder` (Qwen3), returning it alongside the
+    /// configured embedding dims that `build_server` also needs.
+    ///
+    /// WHY this returns a freshly LOADED embedder rather than a
+    /// shared/cached one: this only dedupes the loading CODE across the two
+    /// `#[tokio::test]` functions in this module, not the loaded INSTANCE.
+    /// Each test still calls this helper independently and gets its own
+    /// `FastEmbedEmbedder`, per this module's doc comment on no
+    /// cross-test-function shared state; do not "simplify" this into a
+    /// `once_cell`/`lazy_static` shared across tests.
+    fn load_real_embedder() -> (Arc<dyn liam_model::Embedder>, usize) {
+        let model_id = env_or(
+            "LIAM_TOOL_EVAL_MODEL",
+            &crate::config::Config::default().embedder.model,
+        );
+        let dims = crate::config::Config::default().embedding_dims;
+        let embedder: Arc<dyn liam_model::Embedder> =
+            Arc::new(liam_model::FastEmbedEmbedder::load(&model_id, dims).expect(
+                "load real embedder (Qwen3); requires network access for first-time model \
+                 download",
+            ));
+        (embedder, dims)
+    }
+
     /// Label of the fixture's correct answer to `QUERY`.
     const TARGET_LABEL: &str = "Nightjar ship date";
     /// Label of the fixture's surface-similar wrong answer to `QUERY`.
@@ -218,15 +242,7 @@ mod real_tier {
         // since both need to embed the SAME facts/query identically for the
         // comparison to isolate the reranker as the only variable that
         // differs between them.
-        let model_id = env_or(
-            "LIAM_TOOL_EVAL_MODEL",
-            &crate::config::Config::default().embedder.model,
-        );
-        let dims = crate::config::Config::default().embedding_dims;
-        let embedder = Arc::new(liam_model::FastEmbedEmbedder::load(&model_id, dims).expect(
-            "load real embedder (Qwen3); requires network access for first-time model \
-                 download",
-        ));
+        let (embedder, dims) = load_real_embedder();
 
         let baseline_server = build_server(
             embedder.clone(),
@@ -335,15 +351,7 @@ mod real_tier {
     #[ignore = "downloads embedder weights; see module doc for the run command"]
     async fn semantic_paraphrase_recovers_the_remembered_fact() {
         // Arrange
-        let model_id = env_or(
-            "LIAM_TOOL_EVAL_MODEL",
-            &crate::config::Config::default().embedder.model,
-        );
-        let dims = crate::config::Config::default().embedding_dims;
-        let embedder = Arc::new(liam_model::FastEmbedEmbedder::load(&model_id, dims).expect(
-            "load real embedder (Qwen3); requires network access for first-time model \
-             download",
-        ));
+        let (embedder, dims) = load_real_embedder();
         let server = build_server(embedder, Arc::new(liam_model::IdentityReranker), dims).await;
         seed(&server, &[PARAPHRASE_FACT]).await;
 
