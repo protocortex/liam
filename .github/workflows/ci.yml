@@ -144,6 +144,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # cargo-llvm-cov needs this component to invoke llvm-cov/llvm-profdata;
+          # taiki-e/install-action only installs the cargo-llvm-cov binary itself.
+          # Found missing during Step 9 adversarial review: without it this job
+          # would fail every run, silently swallowed by continue-on-error.
+          components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
