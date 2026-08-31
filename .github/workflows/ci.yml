@@ -134,6 +134,28 @@ jobs:
       # flag, so it must precede `check` on the command line.
       - run: cargo deny --features local,llama check
 
+  # Informational only: no threshold is enforced, and continue-on-error at the
+  # job level means a coverage regression (or even a broken install/run step)
+  # never blocks a PR. The report lands on the checks tab via
+  # GITHUB_STEP_SUMMARY so it's visible without digging into logs.
+  coverage:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage
+        run: |
+          {
+            echo '## Coverage'
+            echo '```'
+            cargo llvm-cov --workspace --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ONE macOS job doing what `test (macos-latest)`, `build-local
   # (macos-latest)` and `build-llama` used to do as three.
   #
