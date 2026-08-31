@@ -768,12 +768,10 @@ impl MemoryServer {
             .join("\n\n")
     }
 
-    // `pub(crate)` so the tool-eval grounding harness (see `tool_eval.rs`) drives
-    // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(
         description = "Record a relationship between two memories, using the handles recall returns."
     )]
-    pub(crate) async fn relate(&self, Parameters(args): Parameters<RelateArgs>) -> String {
+    async fn relate(&self, Parameters(args): Parameters<RelateArgs>) -> String {
         // Lower-cased here, at the client boundary, so `Mentions` and
         // `mentions` are one relation instead of two. The clustering dedup keys
         // on the type string, so leaving both would let a pair reach weight 2.0
