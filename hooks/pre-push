@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Blocks pushes with unformatted Rust code. Issue #82's fmt drift got past a
+# local commit and would have failed CI on push; this catches it earlier.
+cargo fmt --all --check
+exit $?

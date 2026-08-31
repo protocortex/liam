@@ -17,3 +17,16 @@ No project-specific code style rules beyond the baseline. See [.github/CONTRIBUT
 ## Project-Specific Tests
 
 See the [README](README.md) for test commands and coverage expectations.
+
+## Git hooks
+
+This repo ships a local `pre-push` hook that runs `cargo fmt --all --check` and blocks the push if it
+reports drift. Install it once after cloning:
+
+```
+git config core.hooksPath hooks
+```
+
+**Warning:** `core.hooksPath` replaces git's hook-lookup directory entirely, it does not add to
+`.git/hooks`. If you already have a personal local hook, move it into `hooks/` first instead of running
+the command blind, or it will silently stop firing.
