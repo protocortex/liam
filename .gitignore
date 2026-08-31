@@ -12,6 +12,9 @@
 # the store's advisory lock, created next to the database by any local run
 *.db.lock
 /.liam/
+# fastembed's own reranker cache lands here (crate-relative), not under
+# ~/.cache/huggingface, when a crate's working directory is the crate root
+**/.fastembed_cache/
 .claude/designs/
 .claude/plans/
 .claude/implement/
