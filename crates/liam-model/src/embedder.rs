@@ -112,6 +112,30 @@ fn validate_dims(model_id: &str, dims: usize, native_dims: usize) -> Result<()> 
     Ok(())
 }
 
+/// Parse `config.json` bytes as a Qwen3 embedding config. Sharded and
+/// Qwen3-VL checkpoints nest their fields under `text_config` instead of at
+/// the top level, so they fail this parse rather than being silently
+/// mis-loaded; see `load`'s scope note on why they are not ported.
+#[cfg(feature = "local")]
+fn parse_qwen3_config(model_id: &str, bytes: &[u8]) -> Result<fastembed::Qwen3Config> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        crate::error::ModelError::Embed(format!(
+            "{model_id}'s config.json does not parse as a Qwen3 embedding config ({e}); \
+             sharded and Qwen3-VL checkpoints are not supported by this loader"
+        ))
+    })
+}
+
+/// The weight-fetch failure message: named so its wording is pinned by a
+/// test, unlike this file's usual inline `ModelError::Embed` formatting.
+#[cfg(feature = "local")]
+fn weight_fetch_error(model_id: &str, cause: &str) -> crate::error::ModelError {
+    crate::error::ModelError::Embed(format!(
+        "failed to fetch model.safetensors for {model_id}: {cause}; sharded checkpoints \
+         are not supported by this loader"
+    ))
+}
+
 /// In-process embedder over fastembed-rs (feature `local`). Runs a Qwen3
 /// embedding model with candle; no server, offline once the model is cached.
 /// The sync fastembed call runs on a blocking thread so the async runtime stays
@@ -125,23 +149,73 @@ pub struct FastEmbedEmbedder {
 
 #[cfg(feature = "local")]
 impl FastEmbedEmbedder {
-    /// Load a model by Hugging Face id (e.g. "Qwen/Qwen3-Embedding-0.6B"),
-    /// truncating its output to `dims` via Matryoshka (see `mrl_truncate`).
+    /// Load a model by Hugging Face id (e.g. "Qwen/Qwen3-Embedding-0.6B") into
+    /// `cache_dir`, truncating its output to `dims` via Matryoshka (see
+    /// `mrl_truncate`).
     ///
-    /// Confirmed against fastembed v5.17.3's `qwen3` feature:
-    /// `Qwen3TextEmbedding::from_hf(model_id, &device, DType, max_length)`,
-    /// where `max_length` bounds tokenizer input, not output width, and
-    /// `embed(&[&str]) -> Result<Vec<Vec<f32>>>`, which always returns the
-    /// model's native hidden size.
-    pub fn load(model_id: &str, dims: usize) -> Result<Self> {
+    /// Ported from fastembed v5.17.3's `Qwen3TextEmbedding::from_hf`
+    /// (`qwen3.rs:1010-1087`), which builds its `hf_hub` API with no cache
+    /// directory, so its weights always land under the OS default
+    /// `~/.cache/huggingface/hub` regardless of this project's configured
+    /// `embedder.cache_dir`. This body is the same steps with an explicit
+    /// `with_cache_dir`, only a single unsharded `model.safetensors` and a
+    /// plain (non-VL) `Qwen3Config` supported; see `parse_qwen3_config` and
+    /// `weight_fetch_error` for the two rejected shapes.
+    pub fn load(model_id: &str, dims: usize, cache_dir: &str) -> Result<Self> {
         let device = candle_core::Device::Cpu;
-        let model = fastembed::Qwen3TextEmbedding::from_hf(
-            model_id,
-            &device,
-            candle_core::DType::F32,
-            EMBED_MAX_INPUT_TOKENS,
-        )
-        .map_err(|e| crate::error::ModelError::Embed(e.to_string()))?;
+        let api = hf_hub::api::sync::ApiBuilder::new()
+            .with_cache_dir(std::path::PathBuf::from(cache_dir))
+            .build()
+            .map_err(|e| {
+                crate::error::ModelError::Embed(format!("hf-hub api for {model_id}: {e}"))
+            })?;
+        let repo = api.model(model_id.to_string());
+
+        let config_path = repo.get("config.json").map_err(|e| {
+            crate::error::ModelError::Embed(format!("fetch config.json for {model_id}: {e}"))
+        })?;
+        let config_bytes = std::fs::read(&config_path).map_err(|e| {
+            crate::error::ModelError::Embed(format!("read config.json for {model_id}: {e}"))
+        })?;
+        let cfg = parse_qwen3_config(model_id, &config_bytes)?;
+
+        let weight_path = repo
+            .get("model.safetensors")
+            .map_err(|e| weight_fetch_error(model_id, &e.to_string()))?;
+
+        // SAFETY: weight_path was just fetched from a file hf-hub confirms
+        // exists, and the mmap stays read-only for this process's lifetime.
+        let vb = unsafe {
+            candle_nn::VarBuilder::from_mmaped_safetensors(
+                &[weight_path],
+                candle_core::DType::F32,
+                &device,
+            )
+        }
+        .map_err(|e| {
+            crate::error::ModelError::Embed(format!("load weights for {model_id}: {e}"))
+        })?;
+        let qwen3_model = fastembed::Qwen3Model::new(cfg, vb).map_err(|e| {
+            crate::error::ModelError::Embed(format!("build model for {model_id}: {e}"))
+        })?;
+
+        let tokenizer_path = repo.get("tokenizer.json").map_err(|e| {
+            crate::error::ModelError::Embed(format!("fetch tokenizer.json for {model_id}: {e}"))
+        })?;
+        let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            crate::error::ModelError::Embed(format!("load tokenizer for {model_id}: {e}"))
+        })?;
+        let _ = tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            direction: tokenizers::PaddingDirection::Left,
+            ..Default::default()
+        }));
+        let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+            max_length: EMBED_MAX_INPUT_TOKENS,
+            ..Default::default()
+        }));
+
+        let model = fastembed::Qwen3TextEmbedding::new(qwen3_model, tokenizer);
         validate_dims(model_id, dims, model.config().hidden_size)?;
         Ok(Self {
             model: std::sync::Arc::new(std::sync::Mutex::new(model)),
@@ -182,6 +256,8 @@ impl Embedder for FastEmbedEmbedder {
 #[cfg(test)]
 mod tests {
     use super::{mrl_truncate, validate_dims};
+    #[cfg(feature = "local")]
+    use super::{parse_qwen3_config, weight_fetch_error};
 
     #[test]
     fn mrl_truncate_shrinks_and_renormalizes() {
@@ -267,5 +343,142 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds"), "unexpected message: {err}");
+    }
+
+    /// A minimal, well-formed Qwen3 embedding config: every field
+    /// `fastembed::Qwen3Config` requires without a `#[serde(default)]` or
+    /// `Option` type, so this parses on its own and also nests under
+    /// `text_config` to build a VL-shaped fixture below.
+    #[cfg(feature = "local")]
+    const VALID_QWEN3_CONFIG_JSON: &str = r#"{
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "hidden_act": "silu",
+        "hidden_size": 1024,
+        "intermediate_size": 3072,
+        "max_position_embeddings": 32768,
+        "num_attention_heads": 16,
+        "num_hidden_layers": 28,
+        "num_key_value_heads": 8,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1000000.0,
+        "tie_word_embeddings": true,
+        "vocab_size": 151936
+    }"#;
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn parse_qwen3_config_parses_a_well_formed_config() {
+        // Arrange / Act
+        let cfg = parse_qwen3_config("test-model", VALID_QWEN3_CONFIG_JSON.as_bytes())
+            .expect("a well-formed Qwen3 config must parse");
+
+        // Assert
+        assert_eq!(cfg.hidden_size, 1024);
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn parse_qwen3_config_rejects_unsupported_shapes_naming_the_model() {
+        // Arrange: malformed JSON, and a VL-shaped config nesting every field
+        // under text_config instead of at the top level, the real shape of a
+        // Qwen3-VL checkpoint's config.json.
+        let malformed = b"not json";
+        let vl_shaped = format!(r#"{{"text_config": {VALID_QWEN3_CONFIG_JSON}}}"#);
+
+        // Act
+        let malformed_err = parse_qwen3_config("test-model", malformed)
+            .unwrap_err()
+            .to_string();
+        let vl_err = parse_qwen3_config("Qwen/Qwen3-VL-Embedding-2B", vl_shaped.as_bytes())
+            .unwrap_err()
+            .to_string();
+
+        // Assert: both name the model id and state the same limitation.
+        assert!(
+            malformed_err.contains("test-model"),
+            "message: {malformed_err}"
+        );
+        assert!(
+            malformed_err.contains("sharded"),
+            "message: {malformed_err}"
+        );
+        assert!(
+            vl_err.contains("Qwen/Qwen3-VL-Embedding-2B"),
+            "message: {vl_err}"
+        );
+        assert!(vl_err.contains("VL"), "message: {vl_err}");
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn weight_fetch_error_names_the_model_the_cause_and_the_limitation() {
+        // Arrange / Act
+        let err = weight_fetch_error("test-model", "404 not found").to_string();
+
+        // Assert
+        assert!(err.contains("test-model"), "message: {err}");
+        assert!(err.contains("404 not found"), "message: {err}");
+        assert!(err.contains("sharded"), "message: {err}");
+    }
+
+    /// Real-tier regression pin for issue #112: a fresh temp dir per run
+    /// means this can only pass if `with_cache_dir` genuinely took effect,
+    /// since the old bare `from_hf` call would leave it empty. Gated and
+    /// ignored the same way as `tool_eval.rs`'s and `retrieval_eval.rs`'s own
+    /// real-tier tests: `cargo test -p liam-model --features local -- --ignored`.
+    #[cfg(feature = "local")]
+    #[tokio::test]
+    #[ignore = "downloads embedder weights; see module doc for the run command"]
+    async fn load_downloads_weights_into_the_configured_cache_dir() {
+        use crate::Embedder;
+
+        // Arrange
+        let cache_dir = std::env::temp_dir().join(format!(
+            "liam-embedder-cache-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let model_id = "Qwen/Qwen3-Embedding-0.6B";
+        let native_dims = 1024;
+
+        // Act
+        let embedder =
+            super::FastEmbedEmbedder::load(model_id, native_dims, cache_dir.to_str().unwrap())
+                .expect("load real embedder into a fresh cache dir");
+
+        // Assert: the fetched files landed somewhere under the fresh cache dir.
+        for file in ["config.json", "model.safetensors", "tokenizer.json"] {
+            assert!(
+                file_exists_under(&cache_dir, file),
+                "{file} should exist under {cache_dir:?} after load"
+            );
+        }
+        let vector = embedder
+            .embed("hello world")
+            .await
+            .expect("embed after load");
+        assert_eq!(vector.len(), native_dims);
+    }
+
+    #[cfg(feature = "local")]
+    fn file_exists_under(dir: &std::path::Path, name: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if file_exists_under(&path, name) {
+                    return true;
+                }
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                return true;
+            }
+        }
+        false
     }
 }

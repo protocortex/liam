@@ -74,9 +74,13 @@ pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<d
 #[cfg(feature = "local")]
 fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
     use liam_model::{FastEmbedEmbedder, FastEmbedReranker};
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cache_dir =
+        resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
     let embedder = Arc::new(FastEmbedEmbedder::load(
         &config.embedder.model,
         config.embedding_dims,
+        &cache_dir,
     )?);
     let reranker = Arc::new(FastEmbedReranker::load()?);
     Ok((embedder, reranker))

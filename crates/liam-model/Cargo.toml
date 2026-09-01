@@ -15,6 +15,15 @@ fastembed = { version = "5", features = ["qwen3"], optional = true }
 # Tracks the candle-core 0.11 line; fastembed 5.17.3+ itself moved onto
 # candle-core 0.11, so this stays in lockstep with what fastembed resolves.
 candle-core = { version = "0.11", optional = true }
+# Builds the VarBuilder that loads the Qwen3 embedder's weights from
+# safetensors, mirroring the candle-core line above.
+candle-nn = { version = "0.11", optional = true }
+# Tokenizes embedder input. "onig" matches fastembed's own default tokenizer
+# backend, so this stays in lockstep with what fastembed already resolves.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
+# Parses config.json into fastembed::Qwen3Config. fastembed already depends on
+# it to parse the same file internally; this makes it directly callable here.
+serde_json = { version = "1", optional = true }
 # "rt" for spawn_blocking: the embedder, reranker, and llama.cpp provider all
 # run blocking model calls on it instead of the async runtime.
 tokio = { version = "1", features = ["rt", "sync"], optional = true }
@@ -47,7 +56,7 @@ default = []
 # opt-in because it needs the CUDA toolkit and nvcc at BUILD time, which no
 # default build may assume.
 cuda = ["candle-core/cuda"]
-local = ["dep:fastembed", "dep:candle-core", "dep:tokio"]
+local = ["dep:fastembed", "dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:serde_json", "dep:hf-hub", "dep:tokio"]
 llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:anyhow", "dep:tokio", "dep:hf-hub"]
 
 [dev-dependencies]

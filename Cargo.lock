@@ -2270,11 +2270,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "candle-core",
+ "candle-nn",
  "encoding_rs",
  "fastembed",
  "hf-hub",
  "llama-cpp-2",
+ "serde_json",
  "thiserror 2.0.18",
+ "tokenizers",
  "tokio",
 ]
 

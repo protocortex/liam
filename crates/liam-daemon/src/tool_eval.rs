@@ -187,11 +187,18 @@ mod real_tier {
             &crate::config::Config::default().embedder.model,
         );
         let dims = crate::config::Config::default().embedding_dims;
-        let embedder: Arc<dyn liam_model::Embedder> =
-            Arc::new(liam_model::FastEmbedEmbedder::load(&model_id, dims).expect(
+        let cache_dir = liam_daemon::models::resolve_path_with_home(
+            "embedder.cache_dir",
+            &crate::config::Config::default().embedder.cache_dir,
+            &std::env::var("HOME").unwrap_or_default(),
+        )
+        .expect("resolve embedder.cache_dir");
+        let embedder: Arc<dyn liam_model::Embedder> = Arc::new(
+            liam_model::FastEmbedEmbedder::load(&model_id, dims, &cache_dir).expect(
                 "load real embedder (Qwen3); requires network access for first-time model \
                  download",
-            ));
+            ),
+        );
         (embedder, dims)
     }
 
