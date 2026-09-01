@@ -34,6 +34,9 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Fixed
 
+- `embedder.cache_dir` now relocates the embedder's weights too, not just the reranker's.
+  Each model lands under its own `models--Org--Name` subdirectory of the configured path.
+
 - Garbage collection no longer fails on any store that holds a relationship.
   It deleted memories before the links pointing at them, which the database
   rejects, so the whole sweep aborted. The daemon logged the failure and carried
