@@ -131,8 +131,8 @@ fn parse_qwen3_config(model_id: &str, bytes: &[u8]) -> Result<fastembed::Qwen3Co
 #[cfg(feature = "local")]
 fn weight_fetch_error(model_id: &str, cause: &str) -> crate::error::ModelError {
     crate::error::ModelError::Embed(format!(
-        "failed to fetch model.safetensors for {model_id}: {cause}; sharded checkpoints \
-         are not supported by this loader"
+        "failed to fetch model.safetensors for {model_id}: {cause}; if {model_id} is a \
+         sharded or Qwen3-VL checkpoint, this loader does not support that shape"
     ))
 }
 
@@ -178,13 +178,14 @@ impl FastEmbedEmbedder {
             crate::error::ModelError::Embed(format!("read config.json for {model_id}: {e}"))
         })?;
         let cfg = parse_qwen3_config(model_id, &config_bytes)?;
+        validate_dims(model_id, dims, cfg.hidden_size)?;
 
         let weight_path = repo
             .get("model.safetensors")
             .map_err(|e| weight_fetch_error(model_id, &e.to_string()))?;
 
-        // SAFETY: weight_path was just fetched from a file hf-hub confirms
-        // exists, and the mmap stays read-only for this process's lifetime.
+        // SAFETY: hf-hub stores each blob at a content-addressed path never
+        // mutated in place, so no concurrent write can invalidate this mmap.
         let vb = unsafe {
             candle_nn::VarBuilder::from_mmaped_safetensors(
                 &[weight_path],
@@ -216,7 +217,6 @@ impl FastEmbedEmbedder {
         }));
 
         let model = fastembed::Qwen3TextEmbedding::new(qwen3_model, tokenizer);
-        validate_dims(model_id, dims, model.config().hidden_size)?;
         Ok(Self {
             model: std::sync::Arc::new(std::sync::Mutex::new(model)),
             dims,
@@ -408,6 +408,14 @@ mod tests {
             "message: {vl_err}"
         );
         assert!(vl_err.contains("VL"), "message: {vl_err}");
+
+        // ...for different reasons: malformed bytes never parse as JSON at
+        // all, the VL fixture is valid JSON missing required fields.
+        assert!(
+            !malformed_err.contains("missing field"),
+            "message: {malformed_err}"
+        );
+        assert!(vl_err.contains("missing field"), "message: {vl_err}");
     }
 
     #[cfg(feature = "local")]
