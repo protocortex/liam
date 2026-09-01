@@ -57,10 +57,7 @@ pub fn resolve_path_with_home(key: &str, value: &str, home: &str) -> anyhow::Res
 /// fastembed in-process.
 ///
 /// Callers must set `FASTEMBED_CACHE_DIR` before this runs, while the process
-/// is still single-threaded. `liamd` does it in `main`, `liam` does it in
-/// `fetch_models`. That variable steers the reranker only; the embedder
-/// weights are pinned to the hf-hub default by fastembed, as measured and
-/// explained on `EmbedderConfig::cache_dir`.
+/// is still single-threaded (see `EmbedderConfig::cache_dir`).
 pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
     if config.embedder.provider == "local" {
         return build_local(config);
@@ -74,9 +71,13 @@ pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<d
 #[cfg(feature = "local")]
 fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
     use liam_model::{FastEmbedEmbedder, FastEmbedReranker};
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cache_dir =
+        resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
     let embedder = Arc::new(FastEmbedEmbedder::load(
         &config.embedder.model,
         config.embedding_dims,
+        &cache_dir,
     )?);
     let reranker = Arc::new(FastEmbedReranker::load()?);
     Ok((embedder, reranker))

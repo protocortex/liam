@@ -107,14 +107,7 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
             &home,
         )?;
         println!("embedder: {}", config.embedder.model);
-        // Two destinations, and only one of them is ours to pick. Printing
-        // the configured path alone would be a plain lie: the embedder
-        // weights ignore embedder.cache_dir and always land in the hf-hub
-        // default. An operator who pointed cache_dir at an external volume
-        // deserves to learn that here, not from a full home directory. See
-        // `EmbedderConfig::cache_dir` for the upstream cause.
-        println!("  reranker -> {cache_dir}");
-        println!("  weights  -> ~/.cache/huggingface/hub (embedder.cache_dir cannot move these)");
+        println!("  cache_dir -> {cache_dir}");
         // The same single-threaded requirement `liamd` documents in `main`:
         // fastembed reads this out of the environment, and mutating the
         // environment once other threads exist is a data race on POSIX.

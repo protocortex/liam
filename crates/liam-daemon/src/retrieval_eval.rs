@@ -1949,8 +1949,14 @@ mod real_embedder_run {
             &crate::config::Config::default().embedder.model,
         );
         let dims = crate::config::Config::default().embedding_dims;
-        let embedder =
-            liam_model::FastEmbedEmbedder::load(&model_id, dims).expect("load real embedder");
+        let cache_dir = liam_daemon::models::resolve_path_with_home(
+            "embedder.cache_dir",
+            &crate::config::Config::default().embedder.cache_dir,
+            &std::env::var("HOME").unwrap_or_default(),
+        )
+        .expect("resolve embedder.cache_dir");
+        let embedder = liam_model::FastEmbedEmbedder::load(&model_id, dims, &cache_dir)
+            .expect("load real embedder");
 
         // Same bitemporal-clock pattern as the text-only tier's test above
         // (see its comment for why `DefaultGraph::open`'s real clock would

@@ -63,27 +63,8 @@ pub struct EmbedderConfig {
     pub provider: String,
     /// Hugging Face model id for the local provider.
     pub model: String,
-    /// Where the RERANKER's files live. Sets FASTEMBED_CACHE_DIR.
-    ///
-    /// It does NOT place the embedder weights, despite the name, and no
-    /// setting available to us can. fastembed's `Qwen3TextEmbedding::from_hf`
-    /// builds a bare `ApiBuilder::new()` with no cache directory (fastembed
-    /// 5.17.3, `src/models/qwen3.rs:1018`), bypassing fastembed's own
-    /// `pull_from_hf` helper, and hf-hub's `Cache::default` is a hardcoded
-    /// `~/.cache/huggingface/hub` that reads no environment variable at all
-    /// (hf-hub 0.5.0, `src/lib.rs:202`). So neither FASTEMBED_CACHE_DIR nor
-    /// HF_HOME moves the embedder. Verified by running `liam fetch-models`
-    /// and watching the file land in `~/.cache/huggingface/hub`.
-    ///
-    /// The reranker honours this because `TextRerank::try_new` goes through
-    /// `InitOptions::default`, which does read FASTEMBED_CACHE_DIR.
-    ///
-    /// Consequences worth knowing before relying on this field: an operator
-    /// cannot relocate the embedder onto another volume, and a "bundle"
-    /// release artifact cannot pre-place those weights anywhere but the
-    /// hf-hub default. Fixing it needs `Qwen3TextEmbedding::new` plus a
-    /// hand-rolled download, because the config parser it depends on is
-    /// private upstream.
+    /// Where both models' files live, each under its own `models--Org--Name`
+    /// subdirectory (reranker via `FASTEMBED_CACHE_DIR`, embedder via `with_cache_dir`).
     pub cache_dir: String,
 }
 

@@ -64,9 +64,8 @@ fn main() -> anyhow::Result<()> {
         // two model cache dirs were missed, and the shipped mock defaults hid
         // it because a mock embedder never reads the cache dir at all.
         //
-        // Note this places the RERANKER only. The embedder weights ignore
-        // this variable entirely and always go to the hf-hub default; see
-        // `EmbedderConfig::cache_dir` for the measurement and the cause.
+        // This sets the reranker's cache dir via the env var; the embedder
+        // lands under the same directory too, via its own explicit parameter.
         let home = std::env::var("HOME").unwrap_or_default();
         let cache_dir =
             resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;

@@ -180,7 +180,7 @@ unknown key fails loudly.
 | `gc.run_on_start` | `false` | Sweep once at boot. |
 | `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. |
 | `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`. |
-| `embedder.cache_dir` | `~/.liam/models` | Reranker files; sets `FASTEMBED_CACHE_DIR`. Does **not** move the embedder weights, which fastembed pins to `~/.cache/huggingface/hub`. |
+| `embedder.cache_dir` | `~/.liam/models` | Files for both the reranker and the embedder, each under its own `models--Org--Name` subdirectory. |
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
 | `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
 | `read_pool_size` | `4` | Read connections. Ignored for an in-memory database. |
@@ -244,12 +244,10 @@ that. Running it again is safe.
 truncated file downloads happily and only fails when something tries to use it,
 which would otherwise be a user's first `recall`, long after the install.
 
-The models land in two places, and only one is configurable. The reranker goes
-to `embedder.cache_dir`; the embedder weights go to `~/.cache/huggingface/hub`
-regardless of config, because fastembed's Qwen3 loader constructs its hub client
-without a cache directory. That also blocks the bundle-in-release option (ship
-the weights in the tarball), since there is no supported way to point the
-embedder at them.
+Both models land under `embedder.cache_dir`, each in its own `models--Org--Name`
+subdirectory. That makes a bundle-in-release option possible (ship the weights
+in the tarball, pointed at by that same directory), though fetch-on-install is
+still the route the current release workflow takes.
 
 ## Status
 
