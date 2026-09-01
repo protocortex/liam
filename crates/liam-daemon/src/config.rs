@@ -64,7 +64,7 @@ pub struct EmbedderConfig {
     /// Hugging Face model id for the local provider.
     pub model: String,
     /// Where both models' files live, each under its own `models--Org--Name`
-    /// subdirectory. Sets FASTEMBED_CACHE_DIR for the reranker; the embedder honours it via its own `with_cache_dir` call.
+    /// subdirectory (reranker via `FASTEMBED_CACHE_DIR`, embedder via `with_cache_dir`).
     pub cache_dir: String,
 }
 

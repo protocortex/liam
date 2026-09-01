@@ -433,28 +433,35 @@ mod tests {
     async fn load_downloads_weights_into_the_configured_cache_dir() {
         use crate::Embedder;
 
-        // Arrange
-        let cache_dir = std::env::temp_dir().join(format!(
+        // Arrange: removed on drop, even on an early panic below.
+        struct CleanupOnDrop(std::path::PathBuf);
+        impl Drop for CleanupOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let cache_dir = CleanupOnDrop(std::env::temp_dir().join(format!(
             "liam-embedder-cache-dir-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
                 .as_nanos()
-        ));
+        )));
         let model_id = "Qwen/Qwen3-Embedding-0.6B";
         let native_dims = 1024;
 
         // Act
         let embedder =
-            super::FastEmbedEmbedder::load(model_id, native_dims, cache_dir.to_str().unwrap())
+            super::FastEmbedEmbedder::load(model_id, native_dims, cache_dir.0.to_str().unwrap())
                 .expect("load real embedder into a fresh cache dir");
 
         // Assert: the fetched files landed somewhere under the fresh cache dir.
         for file in ["config.json", "model.safetensors", "tokenizer.json"] {
             assert!(
-                file_exists_under(&cache_dir, file),
-                "{file} should exist under {cache_dir:?} after load"
+                file_exists_under(&cache_dir.0, file),
+                "{file} should exist under {:?} after load",
+                cache_dir.0
             );
         }
         let vector = embedder
