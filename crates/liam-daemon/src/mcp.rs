@@ -728,9 +728,7 @@ impl MemoryServer {
                 // resynthesis; a handle-referenced existing entity does not.
                 let entity_start = 1 + fact_count;
                 let entity_end = entity_start + entity_count;
-                let is_fresh_entity = |r: &EpisodeRef| {
-                    matches!(r, EpisodeRef::New(i) if (entity_start..entity_end).contains(i))
-                };
+                let is_fresh_entity = |r: &EpisodeRef| matches!(r, EpisodeRef::New(i) if (entity_start..entity_end).contains(i));
                 let resolved_node_id = |r: &EpisodeRef| -> liam_store::NodeId {
                     match r {
                         EpisodeRef::New(i) => result.node_ids[*i].clone(),
@@ -2847,7 +2845,11 @@ mod tests {
 
         // Then synthesis ran exactly once for that entity, not twice
         assert!(!out.contains("synthesis failed"), "{out}");
-        assert_eq!(llm.call_count(), 1, "expected exactly one synthesis call: {out}");
+        assert_eq!(
+            llm.call_count(),
+            1,
+            "expected exactly one synthesis call: {out}"
+        );
     }
 
     #[tokio::test]
@@ -2903,8 +2905,9 @@ mod tests {
             .unwrap();
         for label in ["Both One", "Both Two"] {
             assert!(
-                hits.iter()
-                    .any(|h| h.hit.label == label && h.hit.content == "a synthesized entity profile"),
+                hits.iter().any(
+                    |h| h.hit.label == label && h.hit.content == "a synthesized entity profile"
+                ),
                 "{label}'s resynthesized content should already be queryable: {out}"
             );
         }
@@ -2917,7 +2920,9 @@ mod tests {
         let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
         let entity_id = server
             .store
-            .upsert_by(NewNode::entity("person", "Kim").with_attributes(json!({"role": "engineer"})))
+            .upsert_by(
+                NewNode::entity("person", "Kim").with_attributes(json!({"role": "engineer"})),
+            )
             .await
             .expect("seed entity with attributes");
 
@@ -2930,7 +2935,11 @@ mod tests {
 
         // Then the new node's attributes match the old one's, not wiped
         assert!(
-            server.store.resolve_handle(entity_id.as_str()).await.is_err(),
+            server
+                .store
+                .resolve_handle(entity_id.as_str())
+                .await
+                .is_err(),
             "the old version should have been superseded"
         );
         let hits = server
@@ -2972,7 +2981,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            top.iter().any(|h| h.hit.content == "synthesis failure top content"),
+            top.iter()
+                .any(|h| h.hit.content == "synthesis failure top content"),
             "{out}"
         );
         let entity_id = out
