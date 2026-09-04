@@ -1,15 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Cold-start concurrency tuning: benchmarked empirically, cached per model and backend.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::Duration;
 
 use liam_model::Llm;
 use serde::{Deserialize, Serialize};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 use crate::ask::estimate_tokens;
+
+/// Entries a `RollingWindow` keeps before the oldest is evicted.
+const ROLLING_WINDOW_CAPACITY: usize = 50;
+
+/// Fixed-capacity ring buffer of AIMD latency samples, shared process-wide
+/// behind an `Arc<Mutex<_>>` so every connection's calls merge into one window.
+pub(crate) struct RollingWindow {
+    entries: VecDeque<(Duration, Duration)>,
+}
+
+impl RollingWindow {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(ROLLING_WINDOW_CAPACITY),
+        }
+    }
+
+    /// Records one call's queue wait and generation time, evicting the
+    /// oldest entry first once the window is already full.
+    pub(crate) fn record(&mut self, queue_wait: Duration, generation_time: Duration) {
+        if self.entries.len() == ROLLING_WINDOW_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((queue_wait, generation_time));
+    }
+
+    /// Average end-to-end latency (`queue_wait + generation_time`) over
+    /// whatever is currently in the window; zero when empty.
+    #[allow(dead_code)] // consumed by a later WU in this segment; exercised directly by this module's own tests meanwhile
+    pub(crate) fn average_latency(&self) -> Duration {
+        if self.entries.is_empty() {
+            return Duration::ZERO;
+        }
+        let total: Duration = self.entries.iter().map(|&(wait, gen)| wait + gen).sum();
+        total / self.entries.len() as u32
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// Measured KV-cache cost of one concurrent context, the same figure
 /// `LlmConfig::max_concurrent_generations` documents.
@@ -315,5 +359,60 @@ pub(crate) mod tests {
 
         // Assert
         assert_eq!(ceiling, 3);
+    }
+
+    #[test]
+    fn rolling_window_average_matches_hand_computed_expectation() {
+        // Arrange: each of the 3 calls totals 100ms end-to-end.
+        let mut window = RollingWindow::new();
+        window.record(Duration::from_millis(10), Duration::from_millis(90));
+        window.record(Duration::from_millis(20), Duration::from_millis(80));
+        window.record(Duration::from_millis(30), Duration::from_millis(70));
+
+        // Act
+        let average = window.average_latency();
+
+        // Assert
+        assert_eq!(average, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn rolling_window_evicts_the_oldest_entries_once_full() {
+        // Arrange: 10 slow calls, then 50 fast ones, past the 50 capacity.
+        let mut window = RollingWindow::new();
+        for _ in 0..10 {
+            window.record(Duration::from_millis(500), Duration::from_millis(500));
+        }
+        for _ in 0..50 {
+            window.record(Duration::from_millis(5), Duration::from_millis(5));
+        }
+
+        // Act
+        let average = window.average_latency();
+
+        // Assert: if any slow call still counted, the average could not be
+        // this low; only the most recent 50 (the fast ones) contribute.
+        assert_eq!(window.len(), 50);
+        assert_eq!(average, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn rolling_window_record_stays_fast_under_a_thousand_calls() {
+        // Arrange
+        let mut window = RollingWindow::new();
+
+        // Act
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            window.record(Duration::from_millis(1), Duration::from_millis(1));
+        }
+        let elapsed = start.elapsed();
+
+        // Assert: a generous, CI-safe bound; widen it if it ever flakes on a
+        // loaded runner, never delete the guard outright.
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "record took {elapsed:?} for 1000 calls"
+        );
     }
 }

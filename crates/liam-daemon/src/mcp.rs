@@ -9,7 +9,7 @@
 
 pub mod producer;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use liam_model::{Embedder, Llm, Reranker};
@@ -28,6 +28,7 @@ use crate::ask::{
 };
 use crate::clusters::{narrow_groups, render_clusters};
 use crate::synthesis;
+use crate::tuning::RollingWindow;
 
 /// Token budget for the sufficiency pre-pass. Only "YES"/"NO" is wanted, with a
 /// little slack for models that add punctuation or a stray word; anything longer
@@ -391,6 +392,9 @@ pub struct MemoryServer {
     /// lock, so an operator with memory headroom can raise the limit above 1
     /// instead of every request serializing permanently.
     generation_permits: Arc<Semaphore>,
+    /// AIMD latency samples from every `ask` and entity-synthesis call,
+    /// shared process-wide: `Arc`-wrapped since `MemoryServer` clones per connection.
+    rolling_window: Arc<Mutex<RollingWindow>>,
     /// Producer id stamped on every node this connection's `remember` calls
     /// write. Per-CONNECTION, unlike every field above it, which is set once
     /// for the process's whole lifetime: that mismatch is why this is not a
@@ -426,6 +430,33 @@ pub struct MemoryServer {
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
+/// RAII guard: records `ask`'s permit-held duration on drop, covering every
+/// one of its early-return branches without a record call at each site.
+struct PermitTimer {
+    window: Arc<Mutex<RollingWindow>>,
+    queue_wait: Duration,
+    start: tokio::time::Instant,
+}
+
+impl PermitTimer {
+    fn new(window: Arc<Mutex<RollingWindow>>, queue_wait: Duration) -> Self {
+        Self {
+            window,
+            queue_wait,
+            start: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for PermitTimer {
+    fn drop(&mut self) {
+        self.window
+            .lock()
+            .expect("rolling window mutex poisoned")
+            .record(self.queue_wait, self.start.elapsed());
+    }
+}
+
 #[tool_router]
 impl MemoryServer {
     // Each argument is a distinct config field threaded straight through, the
@@ -456,6 +487,7 @@ impl MemoryServer {
             ask_sufficiency_check,
             ask_context_tokens,
             generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
+            rolling_window: Arc::new(Mutex::new(RollingWindow::new())),
             producer: OnceLock::new(),
             tool_router: Self::tool_router(),
         }
@@ -495,6 +527,13 @@ impl MemoryServer {
     /// once the auto-tune benchmark learns the real ceiling.
     pub(crate) fn generation_permits_handle(&self) -> Arc<Semaphore> {
         self.generation_permits.clone()
+    }
+
+    /// Test-only: exposes the shared window so a test can confirm `ask` and
+    /// entity synthesis land in the same one, not two independent copies.
+    #[cfg(test)]
+    pub(crate) fn rolling_window_handle(&self) -> Arc<Mutex<RollingWindow>> {
+        self.rolling_window.clone()
     }
 
     /// The producer id to stamp on this connection's writes right now:
@@ -830,6 +869,7 @@ impl MemoryServer {
         let new_content = match synthesis::synthesize_entity(
             &*self.llm,
             &self.generation_permits,
+            &self.rolling_window,
             deadline,
             &candidate.kind,
             &candidate.label,
@@ -1105,6 +1145,7 @@ impl MemoryServer {
         // clone of the `Arc` keeps the permit's lifetime independent of any
         // borrow of `self` across the awaits below; it drops, releasing the
         // slot, when `ask` returns.
+        let acquire_start = tokio::time::Instant::now();
         let _generation_permit = match tokio::time::timeout_at(
             deadline,
             self.generation_permits.clone().acquire_owned(),
@@ -1122,6 +1163,8 @@ impl MemoryServer {
             // back.
             Err(_) => return fallback_answer("timed out waiting for a generation slot", evidence),
         };
+        // Covers every return path below, not just one model call.
+        let _permit_timer = PermitTimer::new(self.rolling_window.clone(), acquire_start.elapsed());
 
         // Sufficiency pre-pass: ask whether the evidence answers the question at
         // all, and refuse outright if it does not. See
@@ -4193,6 +4236,57 @@ mod tests {
         // Then the semaphore is sized to exactly that value, unchanged from
         // today's behavior
         assert_eq!(server.generation_permits.available_permits(), 5);
+    }
+
+    #[tokio::test]
+    async fn ask_and_entity_synthesis_record_into_the_same_shared_rolling_window() {
+        // Arrange: seed evidence so `ask` reaches its model call, then clone
+        // the server the way the accept loop clones one per connection.
+        let llm = Arc::new(liam_model::MockLlm);
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        seed(
+            &server,
+            "fact",
+            "Topic",
+            "the wibbleflux service runs nightly.",
+        )
+        .await;
+        let other_connection = server.clone();
+
+        // Act: one call through `ask` on the original connection, one call
+        // through `synthesize_entity` on the OTHER connection's clone.
+        let _ = server
+            .ask(Parameters(AskArgs {
+                question: "What does the wibbleflux service do?".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+        let permits = other_connection.generation_permits_handle();
+        let window = other_connection.rolling_window_handle();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        synthesis::synthesize_entity(
+            &*llm,
+            &permits,
+            &window,
+            deadline,
+            "person",
+            "Someone",
+            &[],
+            8192,
+            64,
+        )
+        .await
+        .expect("synthesis should succeed");
+
+        // Assert: both calls landed in the SAME window, not two independent
+        // ones, which is what an accidentally per-connection window would show.
+        assert_eq!(
+            server.rolling_window_handle().lock().expect("window lock").len(),
+            2
+        );
     }
 
     #[tokio::test]
