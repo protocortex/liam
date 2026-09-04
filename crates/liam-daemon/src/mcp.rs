@@ -490,6 +490,12 @@ impl MemoryServer {
         }
     }
 
+    /// Shares this server's generation semaphore so startup can grow it
+    /// once the auto-tune benchmark learns the real ceiling.
+    pub(crate) fn generation_permits_handle(&self) -> Arc<Semaphore> {
+        self.generation_permits.clone()
+    }
+
     /// The producer id to stamp on this connection's writes right now:
     /// whatever `set_producer` set, or `DEFAULT_PRODUCER` if it has not run
     /// yet. See `producer`'s field doc for the two windows where that
@@ -4186,6 +4192,30 @@ mod tests {
         // Then the semaphore is sized to exactly that value, unchanged from
         // today's behavior
         assert_eq!(server.generation_permits.available_permits(), 5);
+    }
+
+    #[tokio::test]
+    async fn generation_permits_handle_shares_the_same_semaphore_across_clones() {
+        // Given two independently obtained handles to the same server
+        let server = server_with_generation_limit(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            1,
+        )
+        .await;
+        let first = server.generation_permits_handle();
+        let second = server.generation_permits_handle();
+
+        // When both clones add permits
+        first.add_permits(2);
+        second.add_permits(3);
+
+        // Then the underlying semaphore reflects both additions, proving the
+        // handles are clones of the same Arc, not independent copies
+        assert_eq!(server.generation_permits.available_permits(), 6);
     }
 
     #[tokio::test]

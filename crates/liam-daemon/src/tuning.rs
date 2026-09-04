@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Cold-start concurrency tuning: benchmarked empirically, cached per model and backend.
-// no caller yet; the startup wiring that calls this module lands separately
-#![allow(dead_code)]
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -31,7 +29,7 @@ const BENCHMARK_MAX_TOKENS: usize = 64;
 const CACHE_FILE_NAME: &str = "concurrency_tuning.json";
 
 /// Read available system RAM and turn it into a concurrency ceiling.
-fn memory_ceiling() -> usize {
+pub(crate) fn memory_ceiling() -> usize {
     let system = System::new_with_specifics(
         RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
     );
@@ -48,7 +46,7 @@ fn compute_ceiling(available_bytes: u64) -> usize {
 
 /// Probes concurrency 1..=`ceiling`, stopping once the marginal gain drops
 /// below `IMPROVEMENT_THRESHOLD`; returns the last level that cleared it.
-async fn cold_start_benchmark(llm: &dyn Llm, ceiling: usize) -> usize {
+pub(crate) async fn cold_start_benchmark(llm: &dyn Llm, ceiling: usize) -> usize {
     let ceiling = ceiling.max(1);
     let mut best_level = 1;
     let mut best_throughput = throughput_at(llm, 1).await;
@@ -117,14 +115,14 @@ fn cache_path(cache_dir: &str) -> PathBuf {
 }
 
 /// `None` on a missing file, a parse error, or a fingerprint mismatch: all three mean "benchmark again".
-fn load_cached(cache_dir: &str, model: &str, backend: &str) -> Option<usize> {
+pub(crate) fn load_cached(cache_dir: &str, model: &str, backend: &str) -> Option<usize> {
     let contents = std::fs::read_to_string(cache_path(cache_dir)).ok()?;
     let entry: CacheEntry = serde_json::from_str(&contents).ok()?;
     (entry.model == model && entry.backend == backend).then_some(entry.value)
 }
 
 /// Best-effort write: a failed write just costs a repeat benchmark next start.
-fn save_cache(cache_dir: &str, model: &str, backend: &str, value: usize) {
+pub(crate) fn save_cache(cache_dir: &str, model: &str, backend: &str, value: usize) {
     let entry = CacheEntry {
         model: model.to_string(),
         backend: backend.to_string(),
