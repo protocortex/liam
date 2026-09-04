@@ -239,17 +239,29 @@ fn build_autotuned_server(
 
     if cached.is_none() {
         let handle = server.generation_permits_handle();
+        let granted_capacity = server.granted_capacity_handle();
         let ceiling = tuning::memory_ceiling();
         tokio::spawn(async move {
             let result = tuning::cold_start_benchmark(&*llm, ceiling).await;
             tuning::save_cache(&cache_dir, &model_fingerprint, &backend, result);
-            if result > 1 {
-                handle.add_permits(result - 1);
-            }
+            grow_from_benchmark(&handle, &granted_capacity, result);
         });
     }
 
     server
+}
+
+/// Grows the semaphore and the AIMD capacity counter together, or neither
+/// at the safe floor of 1: leaving the counter behind would drift it.
+fn grow_from_benchmark(
+    handle: &Arc<tokio::sync::Semaphore>,
+    granted_capacity: &Arc<std::sync::atomic::AtomicUsize>,
+    result: usize,
+) {
+    if result > 1 {
+        handle.add_permits(result - 1);
+        granted_capacity.fetch_add(result - 1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The socket daemon: resolve the listener (activated by launchd, or bound
@@ -528,6 +540,41 @@ mod tests {
             llm_double.calls(),
             0,
             "a cache hit must spawn no benchmark at all"
+        );
+    }
+
+    #[test]
+    fn grow_from_benchmark_keeps_granted_capacity_in_step_with_the_semaphore() {
+        // Given a floor of 1 in both, as `build_autotuned_server` starts them
+        let handle = Arc::new(tokio::sync::Semaphore::new(1));
+        let granted_capacity = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+
+        // When a benchmark result of 4 is applied
+        grow_from_benchmark(&handle, &granted_capacity, 4);
+
+        // Then both reflect the grow, not just the semaphore
+        assert_eq!(handle.available_permits(), 4);
+        assert_eq!(
+            granted_capacity.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "granted_capacity must track a cold-start benchmark's grow"
+        );
+    }
+
+    #[test]
+    fn grow_from_benchmark_leaves_both_unchanged_at_the_safe_floor() {
+        // Given the safe floor of 1 in both
+        let handle = Arc::new(tokio::sync::Semaphore::new(1));
+        let granted_capacity = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+
+        // When the benchmark result is also 1 (no concurrency beat the floor)
+        grow_from_benchmark(&handle, &granted_capacity, 1);
+
+        // Then neither moves
+        assert_eq!(handle.available_permits(), 1);
+        assert_eq!(
+            granted_capacity.load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
     }
 }
