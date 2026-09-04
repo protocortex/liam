@@ -24,6 +24,11 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- `llm.max_concurrent_generations` now defaults to `0`, meaning auto-tune, instead of `1`. A `0`
+  used to be treated as a misconfiguration, silently clamped to `1` with a warning; it is now the
+  intentional default, so that warning is gone. Setting it explicitly still works exactly as
+  before.
+
 - License changed from AGPL-3.0-only to Apache-2.0. Applies going forward only; releases already
   published under AGPL-3.0-only keep those terms for anyone who already has them.
 

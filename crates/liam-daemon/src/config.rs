@@ -95,9 +95,8 @@ pub struct LlmConfig {
     /// disagreed a full-size prompt would overflow the context and decode
     /// would fail.
     pub context_tokens: usize,
-    /// Generation is serialized by default: each concurrent context costs about
-    /// 110MB of KV cache, while measured parallel throughput on a saturated GPU
-    /// gains only 1.13x. Operators with headroom can raise this.
+    /// Each concurrent context costs about 110MB of KV cache. `0`, the
+    /// default, means auto-tune; set explicitly to use a fixed limit instead.
     pub max_concurrent_generations: usize,
 }
 
@@ -181,7 +180,7 @@ impl Default for LlmConfig {
             device: "auto".into(),
             warmup: true,
             context_tokens: 8192,
-            max_concurrent_generations: 1,
+            max_concurrent_generations: 0,
         }
     }
 }
@@ -370,7 +369,7 @@ mod tests {
         let path = write_temp_toml("[llm]\nprovider = \"mock\"\n");
         let c = Config::load(&path).expect("config without the new llm keys must still parse");
         assert_eq!(c.llm.context_tokens, 8192);
-        assert_eq!(c.llm.max_concurrent_generations, 1);
+        assert_eq!(c.llm.max_concurrent_generations, 0);
         let _ = std::fs::remove_file(&path);
     }
 
