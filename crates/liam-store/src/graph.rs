@@ -748,6 +748,35 @@ impl<B: Backend> Graph<B> {
             .next())
     }
 
+    /// Nodes `entity_id` mentions, live at `as_of`, most-recently mentioned
+    /// first (`fetch_candidates`'s own order is not meaningful, restored after).
+    pub async fn mentions(
+        &self,
+        entity_id: &NodeId,
+        as_of: Millis,
+        limit: usize,
+    ) -> Result<Vec<Candidate>> {
+        let rows = self
+            .backend
+            .query(
+                "SELECT dst FROM edges WHERE src = ?1 AND type = ?2
+                 AND tx_from <= ?3 AND tx_to > ?3
+                 ORDER BY tx_from DESC LIMIT ?4",
+                &[
+                    entity_id.as_str().into(),
+                    crate::types::relation::MENTIONS.into(),
+                    as_of.into(),
+                    (limit as i64).into(),
+                ],
+            )
+            .await?;
+        let ordered_ids = ids_from(&rows)?;
+        let candidates = self
+            .fetch_candidates(&ordered_ids, as_of, None, None)
+            .await?;
+        Ok(reorder_by_recency(candidates, &ordered_ids))
+    }
+
     async fn query_core(&self, q: &Query) -> Result<Vec<ExplainedHit>> {
         let now = q.as_of.unwrap_or_else(|| self.clock.now());
         let pool = q.k.max(1) * 3;
@@ -1458,6 +1487,17 @@ fn ids_from(rows: &[Row]) -> Result<Vec<NodeId>> {
         .collect()
 }
 
+/// Restores `candidates` to the order `ordered_ids` names, dropping any id
+/// with no matching candidate.
+fn reorder_by_recency(candidates: Vec<Candidate>, ordered_ids: &[NodeId]) -> Vec<Candidate> {
+    let mut by_id: HashMap<NodeId, Candidate> =
+        candidates.into_iter().map(|c| (c.id.clone(), c)).collect();
+    ordered_ids
+        .iter()
+        .filter_map(|id| by_id.remove(id))
+        .collect()
+}
+
 /// Groups members by community id, largest group first, tied groups broken by
 /// the first member's id. A free function (not inline in `community_groups`)
 /// so the tie-break is testable against fixed input, independent of what
@@ -1630,6 +1670,7 @@ fn intern(index: &mut HashMap<String, usize>, labels: &mut Vec<String>, id: Stri
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
+    use crate::types::relation;
     use crate::DefaultGraph;
     use tempfile::TempDir;
 
@@ -1872,6 +1913,193 @@ mod tests {
 
         // Assert
         assert!(found.is_none());
+    }
+
+    // ---- Graph::mentions ----
+
+    #[tokio::test]
+    async fn mentions_returns_all_live_mentions_most_recent_first() {
+        // Arrange: three mentions-linked facts, each written at a later tick.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let first = g
+            .insert(NewNode::now("fact", "first", "note one"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &first, relation::MENTIONS))
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        let second = g
+            .insert(NewNode::now("fact", "second", "note two"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &second, relation::MENTIONS))
+            .await
+            .unwrap();
+        clock.set(Millis(3000));
+        let third = g
+            .insert(NewNode::now("fact", "third", "note three"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &third, relation::MENTIONS))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.mentions(&entity, Millis(3000), 10).await.unwrap();
+
+        // Assert: most-recently-mentioned first.
+        let ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![third, second, first]);
+    }
+
+    #[tokio::test]
+    async fn mentions_excludes_edges_of_a_different_type() {
+        // Arrange: a mentions edge and an unrelated edge to the same entity.
+        let g = graph_at(Millis(1000)).await;
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let mentioned = g
+            .insert(NewNode::now("fact", "mentioned", "note"))
+            .await
+            .unwrap();
+        let other = g
+            .insert(NewNode::now("fact", "other", "unrelated"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &mentioned, relation::MENTIONS))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &other, "supersedes"))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.mentions(&entity, Millis(1000), 10).await.unwrap();
+
+        // Assert: only the mentions-typed edge's target comes back.
+        let ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![mentioned]);
+    }
+
+    #[tokio::test]
+    async fn mentions_respects_limit_keeping_the_most_recent() {
+        // Arrange: more live mentions than the limit, each at a later tick.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            clock.set(Millis(1000 + i * 1000));
+            let fact = g
+                .insert(NewNode::now("fact", "note", "note"))
+                .await
+                .unwrap();
+            g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
+                .await
+                .unwrap();
+            ids.push(fact);
+        }
+
+        // Act
+        let found = g.mentions(&entity, Millis(5000), 2).await.unwrap();
+
+        // Assert: exactly `limit` results, the two most recent.
+        let found_ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
+        assert_eq!(found_ids, vec![ids[4].clone(), ids[3].clone()]);
+    }
+
+    #[tokio::test]
+    async fn mentions_excludes_an_edge_expired_before_as_of() {
+        // Arrange: a mentions edge closed (superseded) before the as-of instant.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g
+            .insert(NewNode::now("fact", "note", "note"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
+            .await
+            .unwrap();
+        g.backend
+            .execute("UPDATE edges SET tx_to = ?1", &[Millis(2000).into()])
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.mentions(&entity, Millis(2500), 10).await.unwrap();
+
+        // Assert
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn reorder_by_recency_restores_recency_order_from_scrambled_input() {
+        // Arrange: candidates hydrated scrambled, true order given separately.
+        let a = NodeId::from_raw("a");
+        let b = NodeId::from_raw("b");
+        let c = NodeId::from_raw("c");
+        let candidate = |id: &NodeId| Candidate {
+            id: id.clone(),
+            kind: "fact".to_string(),
+            label: String::new(),
+            content: String::new(),
+            attributes: serde_json::Value::Null,
+            confidence: 1.0,
+            valid_from: Millis(0),
+        };
+        let scrambled = vec![candidate(&c), candidate(&a), candidate(&b)];
+        let ordered_ids = vec![a.clone(), b.clone(), c.clone()];
+
+        // Act
+        let result = reorder_by_recency(scrambled, &ordered_ids);
+
+        // Assert
+        let ids: Vec<NodeId> = result.into_iter().map(|cand| cand.id).collect();
+        assert_eq!(ids, vec![a, b, c]);
+    }
+
+    #[tokio::test]
+    async fn mentions_matches_recency_order_despite_interleaved_insert_order() {
+        // Arrange: facts inserted in ascending order, then mentioned in a
+        // scrambled order, decoupling physical id order from recency order.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let mut facts = Vec::new();
+        for _ in 0..5 {
+            facts.push(
+                g.insert(NewNode::now("fact", "note", "note"))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let link_order = [2, 0, 4, 1, 3];
+        let mut expected_recency_order = Vec::new();
+        for (step, &idx) in link_order.iter().enumerate() {
+            clock.set(Millis(5000 - step as i64 * 1000));
+            g.link(NewEdge::new(&entity, &facts[idx], relation::MENTIONS))
+                .await
+                .unwrap();
+            expected_recency_order.push(facts[idx].clone());
+        }
+
+        // Act
+        let found = g.mentions(&entity, Millis(5000), 10).await.unwrap();
+
+        // Assert
+        let ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, expected_recency_order);
     }
 
     #[tokio::test]
