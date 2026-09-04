@@ -832,7 +832,11 @@ pub(crate) mod tests {
             "shrink does not touch granted_capacity"
         );
         assert!(
-            handles.held_permit.lock().expect("held permit lock").is_some(),
+            handles
+                .held_permit
+                .lock()
+                .expect("held permit lock")
+                .is_some(),
             "a regression must shrink"
         );
         assert_eq!(permits.available_permits(), 1);
@@ -858,7 +862,11 @@ pub(crate) mod tests {
         drive_window(&llm, &permits, &window, ROLLING_WINDOW_CAPACITY).await;
         let (qw2, total2) = window_averages(&window);
         evaluate(handles.clone(), qw2, total2, ceiling).await;
-        assert!(handles.held_permit.lock().expect("held permit lock").is_some());
+        assert!(handles
+            .held_permit
+            .lock()
+            .expect("held permit lock")
+            .is_some());
 
         // Act: window 3 is back to one effective permit, flat generation
         // again, so queue-wait dominates with no regression versus window 2
@@ -868,7 +876,11 @@ pub(crate) mod tests {
 
         // Assert: the held permit is released, not a new one added on top
         assert!(ran);
-        assert!(handles.held_permit.lock().expect("held permit lock").is_none());
+        assert!(handles
+            .held_permit
+            .lock()
+            .expect("held permit lock")
+            .is_none());
         assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
         assert_eq!(permits.available_permits(), 2);
     }
@@ -895,7 +907,11 @@ pub(crate) mod tests {
             handles.granted_capacity.load(Ordering::Relaxed),
             ROLLING_WINDOW_CAPACITY
         );
-        assert!(handles.held_permit.lock().expect("held permit lock").is_none());
+        assert!(handles
+            .held_permit
+            .lock()
+            .expect("held permit lock")
+            .is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -918,7 +934,11 @@ pub(crate) mod tests {
 
         // Assert
         assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
-        assert!(handles.held_permit.lock().expect("held permit lock").is_none());
+        assert!(handles
+            .held_permit
+            .lock()
+            .expect("held permit lock")
+            .is_none());
         assert_eq!(permits.available_permits(), 2);
     }
 
@@ -946,7 +966,11 @@ pub(crate) mod tests {
         // `0`-sentinel mistaken for a prior average would read as a regression.
         assert!(ran);
         assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
-        assert!(handles.held_permit.lock().expect("held permit lock").is_none());
+        assert!(handles
+            .held_permit
+            .lock()
+            .expect("held permit lock")
+            .is_none());
     }
 
     #[tokio::test(start_paused = true)]

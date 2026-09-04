@@ -4451,7 +4451,11 @@ mod tests {
         // Assert: both calls landed in the SAME window, not two independent
         // ones, which is what an accidentally per-connection window would show.
         assert_eq!(
-            server.rolling_window_handle().lock().expect("window lock").len(),
+            server
+                .rolling_window_handle()
+                .lock()
+                .expect("window lock")
+                .len(),
             2
         );
     }
