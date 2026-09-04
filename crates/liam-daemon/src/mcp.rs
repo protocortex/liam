@@ -27,6 +27,7 @@ use crate::ask::{
     format_answer,
 };
 use crate::clusters::{narrow_groups, render_clusters};
+use crate::synthesis;
 
 /// Token budget for the sufficiency pre-pass. Only "YES"/"NO" is wanted, with a
 /// little slack for models that add punctuation or a stray word; anything longer
@@ -66,6 +67,14 @@ const MAX_CONTENT_CHARS: usize = 16_000;
 /// plan's Architecture section, "Cost of the transaction staying open for
 /// the whole call."
 const MAX_EPISODE_ITEMS: usize = 100;
+
+/// Safety cap on `Graph::mentions` reads per triggered entity: generous
+/// relative to `MAX_EPISODE_ITEMS`, not a tuning knob.
+const MENTIONS_FETCH_LIMIT: usize = 200;
+
+/// Cap on entity-page synthesis output: a short compiled profile, not a
+/// full answer. Measured real output was ~55 tokens / ~270 chars.
+const ENTITY_SYNTHESIS_MAX_NEW_TOKENS: usize = 256;
 
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope/as_of shape to a `Query`;
@@ -266,8 +275,8 @@ pub struct EpisodeEdgeArgs {
     /// `recall`/`relate` would accept.
     pub from: String,
     pub to: String,
-    /// Relation type, for example `mentions`. `supersedes` is reserved, same
-    /// as `relate`.
+    /// Relation type, for example `mentions`: `from` must be the entity,
+    /// `to` the fact. `supersedes` is reserved, same as `relate`.
     pub kind: String,
 }
 
@@ -715,6 +724,34 @@ impl MemoryServer {
 
         match self.store.ingest_episode(nodes, edges).await {
             Ok(result) => {
+                // Only a fresh `entity:N` from THIS episode triggers
+                // resynthesis; a handle-referenced existing entity does not.
+                let entity_start = 1 + fact_count;
+                let entity_end = entity_start + entity_count;
+                let is_fresh_entity = |r: &EpisodeRef| {
+                    matches!(r, EpisodeRef::New(i) if (entity_start..entity_end).contains(i))
+                };
+                let resolved_node_id = |r: &EpisodeRef| -> liam_store::NodeId {
+                    match r {
+                        EpisodeRef::New(i) => result.node_ids[*i].clone(),
+                        EpisodeRef::Existing(id) => id.clone(),
+                    }
+                };
+                let mut triggered: Vec<liam_store::NodeId> = Vec::new();
+                for ((from, to), edge) in refs.iter().zip(&episode.edges) {
+                    if edge.kind.trim().to_lowercase() != relation::MENTIONS {
+                        continue;
+                    }
+                    for r in [from, to] {
+                        if is_fresh_entity(r) {
+                            let id = resolved_node_id(r);
+                            if !triggered.contains(&id) {
+                                triggered.push(id);
+                            }
+                        }
+                    }
+                }
+
                 let mut lines: Vec<String> = result
                     .node_ids
                     .iter()
@@ -728,9 +765,90 @@ impl MemoryServer {
                         resolved_id(to, &result.node_ids)
                     ));
                 }
+
+                if !triggered.is_empty() {
+                    // Spawned to run concurrently; collection stays
+                    // sequential so no outcome is ever dropped.
+                    let mut handles = Vec::with_capacity(triggered.len());
+                    for entity_id in triggered {
+                        let server = self.clone();
+                        handles.push(tokio::spawn(async move {
+                            server.resynthesize_entity(entity_id).await
+                        }));
+                    }
+                    for handle in handles {
+                        match handle.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(failure)) => {
+                                lines.push(format!("synthesis failed for {failure}"))
+                            }
+                            Err(join_err) => {
+                                lines.push(format!("synthesis failed for a task: {join_err}"))
+                            }
+                        }
+                    }
+                }
+
                 lines.join("\n")
             }
             Err(e) => format!("remember failed: {e}"),
+        }
+    }
+
+    /// Recompiles one entity's page from its mentions after `remember`'s
+    /// episode already committed; a failure is reported, never panicked.
+    async fn resynthesize_entity(&self, entity_id: liam_store::NodeId) -> Result<(), String> {
+        let now = liam_store::Millis::now();
+        let candidate = match self.store.get(&entity_id, now).await {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Err(format!(
+                    "{}: entity vanished before synthesis could run",
+                    entity_id.as_str()
+                ))
+            }
+            Err(e) => return Err(format!("{}: {e}", entity_id.as_str())),
+        };
+        let label = candidate.label.clone();
+        let mentions: Vec<ask::Evidence> = match self
+            .store
+            .mentions(&entity_id, now, MENTIONS_FETCH_LIMIT)
+            .await
+        {
+            Ok(rows) => rows.iter().map(ask::Evidence::from_candidate).collect(),
+            Err(e) => return Err(format!("{label}: {e}")),
+        };
+        // A fresh deadline per entity: each entity's synthesis is
+        // independent of every other entity's.
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.ask_timeout_secs.max(1));
+        let new_content = match synthesis::synthesize_entity(
+            &*self.llm,
+            &self.generation_permits,
+            deadline,
+            &candidate.kind,
+            &candidate.label,
+            &mentions,
+            self.ask_context_tokens,
+            ENTITY_SYNTHESIS_MAX_NEW_TOKENS,
+        )
+        .await
+        {
+            Ok(content) => content,
+            Err(e) => return Err(format!("{label}: {e}")),
+        };
+        let embedding = match self.embedder.embed(&new_content).await {
+            Ok(v) => v,
+            Err(e) => return Err(format!("{label}: {e}")),
+        };
+        let mut node = NewNode::entity(candidate.kind, candidate.label)
+            .with_attributes(candidate.attributes)
+            .with_embedding(embedding)
+            .with_producer(self.producer());
+        node.content = new_content;
+        match self.store.upsert_by(node).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("{label}: {e}")),
         }
     }
 
@@ -1221,6 +1339,58 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("condition never became true; the two tasks likely deadlocked");
+    }
+
+    /// Counts calls and always succeeds with a fixed reply, for entity
+    /// synthesis tests that assert on call count.
+    struct CountingLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingLlm {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl liam_model::Llm for CountingLlm {
+        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("a synthesized entity profile".to_string())
+        }
+    }
+
+    /// Errors on its first call only, succeeds after: pins that one
+    /// entity's failure must not drop another entity's success.
+    struct FirstCallErrorsLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FirstCallErrorsLlm {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl liam_model::Llm for FirstCallErrorsLlm {
+        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(liam_model::ModelError::Llm("boom".into()))
+            } else {
+                Ok("the surviving entity profile".to_string())
+            }
+        }
     }
 
     /// Fresh in-memory server wired with the given reranker/llm, a 30s ask
@@ -2454,7 +2624,8 @@ mod tests {
 
     #[tokio::test]
     async fn remember_with_episode_edge_references_an_entity_by_index() {
-        // Given one entity and an edge "fact:0" -> "entity:0"
+        // Given one entity and an edge "fact:0" -> "entity:0". Kind
+        // "relates_to", not "mentions", so the entity stays live below.
         let server = plain_server().await;
 
         // When remember is called
@@ -2463,7 +2634,7 @@ mod tests {
                 episode: Some(EpisodeArgs {
                     facts: vec![],
                     entities: vec![episode_entity("person", "Dave")],
-                    edges: vec![episode_edge("fact:0", "entity:0", "mentions")],
+                    edges: vec![episode_edge("fact:0", "entity:0", "relates_to")],
                 }),
                 ..remember_args("episode entity edge top content")
             }))
@@ -2484,18 +2655,16 @@ mod tests {
             .trim_start_matches("remembered ")
             .to_string();
         assert!(
-            out.contains(&format!("related {top_id} -mentions-> {entity_id}")),
+            out.contains(&format!("related {top_id} -relates_to-> {entity_id}")),
             "{out}"
         );
 
-        // And the edge exists: relating the same ordered triple again
-        // reports "already relates", the existing idempotency signal
-        // `relate` uses.
+        // And the edge exists: relating it again reports "already relates".
         let relate_again = server
             .relate(Parameters(RelateArgs {
                 from: top_id,
                 to: entity_id,
-                kind: "mentions".to_string(),
+                kind: "relates_to".to_string(),
             }))
             .await;
         assert!(
@@ -2652,6 +2821,358 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remember_synthesizes_a_mentioned_entity_exactly_once_despite_two_mentions_edges() {
+        // Given an episode where 2 separate facts each carry a mentions
+        // edge to the SAME fresh entity
+        let llm = Arc::new(CountingLlm::new());
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+
+        // When remember runs
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![
+                        episode_fact("dedup trigger fact one content"),
+                        episode_fact("dedup trigger fact two content"),
+                    ],
+                    entities: vec![episode_entity("person", "Dedup Entity")],
+                    edges: vec![
+                        episode_edge("entity:0", "fact:1", "mentions"),
+                        episode_edge("entity:0", "fact:2", "mentions"),
+                    ],
+                }),
+                ..remember_args("dedup trigger top content")
+            }))
+            .await;
+
+        // Then synthesis ran exactly once for that entity, not twice
+        assert!(!out.contains("synthesis failed"), "{out}");
+        assert_eq!(llm.call_count(), 1, "expected exactly one synthesis call: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_synthesizes_every_freshly_mentioned_entity_before_returning() {
+        // Given an episode mentioning 2 distinct fresh entities
+        let llm = Arc::new(CountingLlm::new());
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+
+        // When remember runs
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![
+                        episode_entity("person", "Both One"),
+                        episode_entity("person", "Both Two"),
+                    ],
+                    edges: vec![
+                        episode_edge("entity:0", "fact:0", "mentions"),
+                        episode_edge("entity:1", "fact:0", "mentions"),
+                    ],
+                }),
+                ..remember_args("both entities top content")
+            }))
+            .await;
+
+        // Then both synthesized, and both completed before returning: the
+        // ORIGINAL entity ids are already superseded by their own writes
+        assert!(!out.contains("synthesis failed"), "{out}");
+        assert_eq!(llm.call_count(), 2, "{out}");
+        let entity0_id = out
+            .lines()
+            .nth(1)
+            .expect("first entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        let entity1_id = out
+            .lines()
+            .nth(2)
+            .expect("second entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        for id in [&entity0_id, &entity1_id] {
+            assert!(
+                server.store.resolve_handle(id).await.is_err(),
+                "original entity id should have been superseded by its own resynthesis: {out}"
+            );
+        }
+        let hits = server
+            .store
+            .query_explained(&Query::text("a synthesized entity profile"))
+            .await
+            .unwrap();
+        for label in ["Both One", "Both Two"] {
+            assert!(
+                hits.iter()
+                    .any(|h| h.hit.label == label && h.hit.content == "a synthesized entity profile"),
+                "{label}'s resynthesized content should already be queryable: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resynthesize_entity_preserves_existing_attributes_on_the_new_node() {
+        // Given a live entity that already carries attributes
+        let llm = Arc::new(CountingLlm::new());
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let entity_id = server
+            .store
+            .upsert_by(NewNode::entity("person", "Kim").with_attributes(json!({"role": "engineer"})))
+            .await
+            .expect("seed entity with attributes");
+
+        // When its resynthesis runs, the same per-entity flow `remember`
+        // triggers for a freshly mentioned entity
+        server
+            .resynthesize_entity(entity_id.clone())
+            .await
+            .expect("resynthesis should succeed");
+
+        // Then the new node's attributes match the old one's, not wiped
+        assert!(
+            server.store.resolve_handle(entity_id.as_str()).await.is_err(),
+            "the old version should have been superseded"
+        );
+        let hits = server
+            .store
+            .query_explained(&Query::text("a synthesized entity profile"))
+            .await
+            .unwrap();
+        let new_entity = hits
+            .iter()
+            .find(|h| h.hit.label == "Kim")
+            .expect("resynthesized entity missing");
+        assert_eq!(new_entity.hit.attributes, json!({"role": "engineer"}));
+    }
+
+    #[tokio::test]
+    async fn remember_still_commits_the_episode_when_entity_synthesis_fails() {
+        // Given a mock llm that always errors
+        let llm = Arc::new(FailingLlm);
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm).await;
+
+        // When remember runs an episode mentioning a fresh entity
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Failing Entity")],
+                    edges: vec![episode_edge("entity:0", "fact:0", "mentions")],
+                }),
+                ..remember_args("synthesis failure top content")
+            }))
+            .await;
+
+        // Then the episode's facts/entities/edges are still fully
+        // committed
+        assert!(!out.starts_with("remember failed:"), "{out}");
+        let top = server
+            .store
+            .query_explained(&Query::text("synthesis failure top content"))
+            .await
+            .unwrap();
+        assert!(
+            top.iter().any(|h| h.hit.content == "synthesis failure top content"),
+            "{out}"
+        );
+        let entity_id = out
+            .lines()
+            .nth(1)
+            .expect("entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        assert!(
+            server.store.resolve_handle(&entity_id).await.is_ok(),
+            "entity should still be live: {out}"
+        );
+
+        // And the response names the entity synthesis failed for
+        assert!(out.contains("synthesis failed for Failing Entity"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn remember_runs_entity_synthesis_concurrently_not_sequentially() {
+        // 2 permits, not the shipped default of 1: only then can peak
+        // reach 2, proving true concurrency, not just bounded queuing.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm = Arc::new(GatedLlm::new(release.clone()));
+        let server = Arc::new(
+            server_with_generation_limit(
+                Arc::new(liam_model::IdentityReranker),
+                llm.clone(),
+                30,
+                false,
+                8192,
+                2,
+            )
+            .await,
+        );
+
+        // When remember runs an episode mentioning 2 distinct fresh
+        // entities, spawned since the gated llm blocks until released
+        let remember_server = server.clone();
+        let handle = tokio::spawn(async move {
+            remember_server
+                .remember(Parameters(RememberArgs {
+                    episode: Some(EpisodeArgs {
+                        facts: vec![],
+                        entities: vec![
+                            episode_entity("person", "Concurrent One"),
+                            episode_entity("person", "Concurrent Two"),
+                        ],
+                        edges: vec![
+                            episode_edge("entity:0", "fact:0", "mentions"),
+                            episode_edge("entity:1", "fact:0", "mentions"),
+                        ],
+                    }),
+                    ..remember_args("concurrent entity synthesis top content")
+                }))
+                .await
+        });
+        wait_until(|| llm.in_flight() == 2).await;
+        release.notify_one();
+        release.notify_one();
+        let out = handle.await.expect("remember task panicked");
+
+        // Then the PEAK proves both syntheses were in flight together,
+        // not one after the other
+        assert!(!out.contains("failed"), "{out}");
+        assert_eq!(
+            llm.peak(),
+            2,
+            "expected both entity syntheses concurrently in flight: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_records_both_outcomes_when_one_of_two_entity_syntheses_fails() {
+        // Given a llm that errors on its first call and succeeds after,
+        // and an episode mentioning 2 distinct fresh entities
+        let llm = Arc::new(FirstCallErrorsLlm::new());
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm).await;
+
+        // When remember runs
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![
+                        episode_entity("person", "Mixed One"),
+                        episode_entity("person", "Mixed Two"),
+                    ],
+                    edges: vec![
+                        episode_edge("entity:0", "fact:0", "mentions"),
+                        episode_edge("entity:1", "fact:0", "mentions"),
+                    ],
+                }),
+                ..remember_args("mixed outcome top content")
+            }))
+            .await;
+
+        // Then both outcomes are recorded: one entity's content was
+        // compiled, the other is named in the failure list
+        let succeeded = server
+            .store
+            .query_explained(&Query::text("the surviving entity profile"))
+            .await
+            .unwrap();
+        assert_eq!(
+            succeeded.len(),
+            1,
+            "expected exactly one entity to succeed: {out}"
+        );
+        let survivor_label = succeeded[0].hit.label.clone();
+        let failed_label = if survivor_label == "Mixed One" {
+            "Mixed Two"
+        } else {
+            "Mixed One"
+        };
+        assert!(
+            out.contains(&format!("synthesis failed for {failed_label}")),
+            "expected the OTHER entity named as failed: {out}"
+        );
+        assert!(
+            !out.contains(&format!("synthesis failed for {survivor_label}")),
+            "the successful entity must not also be reported as failed: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_does_not_resynthesize_an_existing_entity_referenced_only_by_handle() {
+        // Given a live entity from a prior call
+        let llm = Arc::new(CountingLlm::new());
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let prior_out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Handle Only Entity")],
+                    edges: vec![],
+                }),
+                ..remember_args("handle only entity top content")
+            }))
+            .await;
+        assert!(!prior_out.contains("failed"), "{prior_out}");
+        let entity_handle = prior_out
+            .lines()
+            .nth(1)
+            .expect("entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+
+        // When a second episode mentions the SAME entity only by handle,
+        // never as an entity:N reference
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("handle only mention fact content")],
+                    entities: vec![],
+                    edges: vec![episode_edge(&entity_handle, "fact:1", "mentions")],
+                }),
+                ..remember_args("handle only second top content")
+            }))
+            .await;
+
+        // Then synthesis does not run for it
+        assert!(!out.contains("failed"), "{out}");
+        assert_eq!(
+            llm.call_count(),
+            0,
+            "existing entities referenced only by handle must not trigger resynthesis: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_synthesizes_a_mentioned_entity_from_its_real_mention_content() {
+        // Given a fresh entity linked to a fact via a correctly-directed
+        // mentions edge (`from`: entity, `to`: fact)
+        let llm = Arc::new(RecordingLlm::new("a synthesized entity profile"));
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+
+        // When remember runs
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("the xyzzy-marker-42 distinctive fact content")],
+                    entities: vec![episode_entity("person", "Xyzzy Entity")],
+                    edges: vec![episode_edge("entity:0", "fact:1", "mentions")],
+                }),
+                ..remember_args("xyzzy marker top content")
+            }))
+            .await;
+
+        // Then the fact's real content reached the synthesis prompt, not an
+        // empty mentions list
+        assert!(!out.contains("synthesis failed"), "{out}");
+        assert!(
+            llm.last_prompt()
+                .contains("the xyzzy-marker-42 distinctive fact content"),
+            "expected the mentioned fact's real content in the synthesis prompt: {}",
+            llm.last_prompt()
+        );
+    }
+
+    #[tokio::test]
     async fn remember_with_a_full_mixed_episode_round_trips_through_mcp() {
         // Given a prior, separate `remember` call establishing entity
         // "Grace" as live, and a separate fact remembered before this
@@ -2763,12 +3284,20 @@ mod tests {
             );
         }
 
-        // Both entities are independently reachable: the newly-created one,
-        // and the superseding one; the prior call's now-superseded entity is
-        // not live any more
+        // Henry's own id was superseded by its own resynthesis (mentioned
+        // via a "mentions" edge); a live, resynthesized Henry still exists
         assert!(
-            server.store.resolve_handle(&henry_id).await.is_ok(),
-            "new entity should be live"
+            server.store.resolve_handle(&henry_id).await.is_err(),
+            "Henry's original id should have been superseded by its own resynthesis"
+        );
+        let resynthesized_henry = server
+            .store
+            .query_explained(&Query::text("Henry"))
+            .await
+            .unwrap();
+        assert!(
+            resynthesized_henry.iter().any(|h| h.hit.label == "Henry"),
+            "expected a resynthesized, still-live Henry entity: {out}"
         );
         assert!(
             server.store.resolve_handle(&grace_id).await.is_ok(),
@@ -2780,12 +3309,10 @@ mod tests {
         );
         assert_ne!(prior_entity_id, grace_id, "expected two distinct ids");
 
-        // All 3 edges exist with the right endpoints: relating each same
-        // ordered triple again reports "already relates", the existing
-        // idempotency signal `relate` uses
+        // The other 2 edges still exist, each reporting "already relates";
+        // Henry's own edge is checked above instead, since its target is superseded.
         for (from, to, kind) in [
             (fact1_id.clone(), fact2_id.clone(), "supports"),
-            (fact1_id.clone(), henry_id.clone(), "mentions"),
             (fact2_id.clone(), existing_handle.clone(), "relates_to"),
         ] {
             let relate_again = server

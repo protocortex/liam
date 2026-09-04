@@ -63,7 +63,6 @@ pub fn build_synthesis_prompt(
 
 /// Acquire a permit from the same semaphore `ask` uses, trim `mentions` to
 /// `context_tokens`, then synthesize a profile capped at `max_new_tokens`.
-#[allow(dead_code)] // caller lands separately, wiring synthesis into remember
 #[allow(clippy::too_many_arguments)] // each argument is a distinct value, no natural grouping
 pub async fn synthesize_entity(
     llm: &dyn Llm,
