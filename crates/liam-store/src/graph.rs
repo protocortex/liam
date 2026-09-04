@@ -216,14 +216,16 @@ fn decay_factor(valid_from: Millis, now: Millis, half_life: Option<Millis>) -> f
     }
 }
 
-struct Candidate {
-    id: NodeId,
-    kind: String,
-    label: String,
-    content: String,
-    attributes: serde_json::Value,
-    confidence: f64,
-    valid_from: Millis,
+/// A raw node row as stored: unlike `Hit`/`ExplainedHit`, carries no
+/// retrieval score, so it fits a direct by-id lookup as well as scoring.
+pub struct Candidate {
+    pub id: NodeId,
+    pub kind: String,
+    pub label: String,
+    pub content: String,
+    pub attributes: serde_json::Value,
+    pub confidence: f64,
+    pub valid_from: Millis,
 }
 
 pub struct Graph<B: Backend> {
@@ -734,6 +736,16 @@ impl<B: Backend> Graph<B> {
     /// it: lexical rank, vector rank, fused RRF, confidence, decay, expansion.
     pub async fn query_explained(&self, q: &Query) -> Result<Vec<ExplainedHit>> {
         self.query_core(q).await
+    }
+
+    /// Fetch one node by id, live at `as_of`. `None` if it doesn't exist or
+    /// isn't live at that instant.
+    pub async fn get(&self, id: &NodeId, as_of: Millis) -> Result<Option<Candidate>> {
+        Ok(self
+            .fetch_candidates(std::slice::from_ref(id), as_of, None, None)
+            .await?
+            .into_iter()
+            .next())
     }
 
     async fn query_core(&self, q: &Query) -> Result<Vec<ExplainedHit>> {
@@ -1800,6 +1812,66 @@ mod tests {
             .unwrap();
         assert!(past.iter().any(|h| h.label == "Deno"));
         assert!(past.iter().all(|h| h.label != "Rust"));
+    }
+
+    #[tokio::test]
+    async fn get_returns_live_node_at_as_of() {
+        // Arrange: a node live at the query instant.
+        let g = graph_at(Millis(1000)).await;
+        let id = g
+            .insert(NewNode::now("decision", "Use libSQL", "single file"))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.get(&id, Millis(1000)).await.unwrap();
+
+        // Assert
+        let candidate = found.expect("live node must be found");
+        assert_eq!(candidate.id, id);
+        assert_eq!(candidate.kind, "decision");
+        assert_eq!(candidate.label, "Use libSQL");
+        assert_eq!(candidate.content, "single file");
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_node_superseded_before_as_of() {
+        // Arrange: advance the clock so supersede closes tx_to, not just
+        // valid_from, since only tx_from/tx_to gate the live window here.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g
+            .insert(NewNode::now("decision", "Deno", "runtime").with_valid_from(Millis(1000)))
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        g.supersede(
+            &old,
+            NewNode::now("decision", "Rust", "runtime").with_valid_from(Millis(2000)),
+        )
+        .await
+        .unwrap();
+
+        // Act
+        let found = g.get(&old, Millis(2500)).await.unwrap();
+
+        // Assert
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_unknown_id() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let unknown = NodeId::from_raw("nonexistent");
+
+        // Act
+        let found = g.get(&unknown, Millis(1000)).await.unwrap();
+
+        // Assert
+        assert!(found.is_none());
     }
 
     #[tokio::test]
