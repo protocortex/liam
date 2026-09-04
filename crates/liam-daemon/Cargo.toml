@@ -56,6 +56,12 @@ clap = { version = "4", features = ["derive"] }
 # running when the deadline passes.
 tokio-util = { version = "0.7", default-features = false }
 
+# Cold-start concurrency tuning (WU-8) reads available system RAM to bound how
+# many concurrent generations it is even worth benchmarking. MIT/Apache-2.0,
+# actively maintained, ~84M downloads; used for its memory-reading API only,
+# not its process/CPU/disk features.
+sysinfo = "0.37"
+
 # launchd socket activation (WU-6b). macOS-only BY TARGET, not by cargo feature:
 # `launch_activate_socket` is a libSystem call that exists nowhere else, so a
 # Linux build must never see this crate. Same pattern liam-model uses for Metal.
@@ -65,6 +71,9 @@ raunch = "1.0.1"
 [dev-dependencies]
 # storelock tests need an isolated, disposable directory per test.
 tempfile = "3"
+# tuning's benchmark tests drive latency via tokio::time::pause/advance rather
+# than a real sleep; `test-util` is not part of `full`, so it needs its own line.
+tokio = { version = "1", features = ["test-util"] }
 # WU-8's two-client acceptance test needs a real MCP client to drive the
 # socket from the outside. `client` is the only feature this actually adds:
 # production plays the server role only, and `transport-async-rw` is already
