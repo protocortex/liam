@@ -24,6 +24,7 @@ mod telemetry;
 #[cfg(test)]
 mod tool_eval;
 mod transport;
+mod tuning;
 
 use std::sync::Arc;
 
