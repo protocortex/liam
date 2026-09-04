@@ -5058,7 +5058,9 @@ mod tests {
         // recently linked mention first
         assert!(out.contains("compiled bio of ada"), "{out}");
         let fact1_pos = out.find("first mention content").expect("fact one missing");
-        let fact2_pos = out.find("second mention content").expect("fact two missing");
+        let fact2_pos = out
+            .find("second mention content")
+            .expect("fact two missing");
         assert!(
             fact2_pos < fact1_pos,
             "most recently linked mention should come first: {out}"
@@ -5140,7 +5142,10 @@ mod tests {
             .find(|t| t.name == "timeline")
             .expect("timeline must be listed");
         let schema = serde_json::to_string(&tool.input_schema).unwrap();
-        assert!(schema.contains("\"entity\""), "entity missing from {schema}");
+        assert!(
+            schema.contains("\"entity\""),
+            "entity missing from {schema}"
+        );
     }
 
     #[tokio::test]
