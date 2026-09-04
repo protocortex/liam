@@ -443,19 +443,9 @@ impl MemoryServer {
         ask_context_tokens: usize,
         max_concurrent_generations: usize,
     ) -> Self {
-        // `Semaphore::new(0)` would deadlock every `ask` call forever, since no
-        // permit could ever be issued: clamp a misconfigured 0 up to the
-        // smallest usable value (fully serialized) instead of taking it
-        // literally.
-        let max_concurrent_generations = if max_concurrent_generations == 0 {
-            tracing::warn!(
-                "llm.max_concurrent_generations was 0; clamping to 1, or every ask call would \
-                 deadlock waiting for a permit that could never be issued"
-            );
-            1
-        } else {
-            max_concurrent_generations
-        };
+        // `Semaphore::new(0)` would deadlock every `ask` call forever. `0` now
+        // means auto-tune, still unimplemented here; floor it to 1 meanwhile.
+        let max_concurrent_generations = max_concurrent_generations.max(1);
         Self {
             store,
             embedder,
@@ -4123,6 +4113,79 @@ mod tests {
             1,
             "peak concurrent generation calls exceeded the configured limit of 1"
         );
+    }
+
+    /// Captures everything written to it, so a test can assert on log text
+    /// without a real terminal.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured logs lock").extend(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_max_concurrent_generations_clamps_without_logging_a_warning() {
+        // Given the new default of 0, with logs captured instead of dropped
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .finish();
+
+        // When the server constructs
+        let server = tracing::subscriber::with_default(subscriber, || {
+            MemoryServer::new(
+                Arc::new(store),
+                Arc::new(liam_model::MockEmbedder::new(8)),
+                Arc::new(liam_model::IdentityReranker),
+                Arc::new(liam_model::MockLlm),
+                30,
+                false,
+                8192,
+                0,
+            )
+        });
+
+        // Then it floors to the smallest usable permit count, and the retired
+        // "clamping to 1" warning is never logged for what is now the default
+        assert_eq!(server.generation_permits.available_permits(), 1);
+        let log = String::from_utf8(captured.0.lock().expect("captured logs lock").clone())
+            .expect("log output is utf8");
+        assert!(!log.contains("clamping"), "unexpected clamp warning: {log}");
+    }
+
+    #[tokio::test]
+    async fn explicit_max_concurrent_generations_is_used_as_is() {
+        // Given an explicit positive value, unrelated to the 0 sentinel
+        let server = server_with_generation_limit(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            5,
+        )
+        .await;
+
+        // Then the semaphore is sized to exactly that value, unchanged from
+        // today's behavior
+        assert_eq!(server.generation_permits.available_permits(), 5);
     }
 
     #[tokio::test]
