@@ -143,6 +143,13 @@ Point a client at `liamd` and it exposes two tools.
 | `scope` | no | Restrict to one partition. Same format as `remember`'s `scope`. |
 | `k` | no | How many hits to return (default 8). |
 
+`timeline` shows an entity's compiled page and the mentions behind it, most
+recent first.
+
+| Field | Required | Notes |
+|---|---|---|
+| `entity` | yes | Handle or unambiguous prefix, as shown by `recall`. |
+
 By default the embedder is a mock, so retrieval leans on full-text and graph
 signals. Set `provider = "local"` and build with `--features local` for real
 embeddings.
