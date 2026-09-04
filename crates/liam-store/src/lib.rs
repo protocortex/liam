@@ -23,7 +23,7 @@ pub use backend::Backend;
 pub use backends::DefaultBackend;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::{Error, Result};
-pub use graph::Graph;
+pub use graph::{Candidate, Graph};
 pub use ids::{EdgeId, Millis, NodeId, FOREVER, HANDLE_LEN};
 pub use types::{
     relation, Change, ClusterMember, ClusterState, ExplainedHit, Fingerprint, GcReport,
