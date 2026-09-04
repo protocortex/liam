@@ -354,9 +354,8 @@ pub struct MemoryServer {
     embedder: Arc<dyn Embedder>,
     reranker: Arc<dyn Reranker>,
     llm: Arc<dyn Llm>,
-    /// Wall-clock deadline for the WHOLE `ask` request, the generation-permit
-    /// acquire, the sufficiency pre-pass, and synthesis together, before
-    /// falling back to ranked evidence; see `config::Config::ask_timeout_secs`.
+    /// Wall-clock deadline for the WHOLE `ask` request (permit acquire,
+    /// sufficiency pre-pass, `ask`'s own synthesis); `synthesize_entity` shares it too.
     ask_timeout_secs: u64,
     /// Whether `ask` runs the yes/no sufficiency pre-pass before synthesizing;
     /// see `config::Config::ask_sufficiency_check`.
