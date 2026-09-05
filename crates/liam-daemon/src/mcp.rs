@@ -843,6 +843,9 @@ impl MemoryServer {
             .with_attributes(candidate.attributes)
             .with_embedding(embedding)
             .with_producer(self.producer());
+        if let Some(scope) = candidate.scope.clone() {
+            node = node.with_scope(scope);
+        }
         node.content = new_content;
         match self.store.upsert_by(node).await {
             Ok(_) => Ok(()),
@@ -2955,6 +2958,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resynthesize_entity_preserves_the_original_entitys_scope() {
+        // Given a live entity scoped to "proj-x"
+        let llm = Arc::new(CountingLlm::new());
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let entity_id = server
+            .store
+            .upsert_by(NewNode::entity("person", "Priya").with_scope("proj-x"))
+            .await
+            .expect("seed scoped entity");
+
+        // When its resynthesis runs, the same per-entity flow `remember`
+        // triggers for a freshly mentioned entity
+        server
+            .resynthesize_entity(entity_id.clone())
+            .await
+            .expect("resynthesis should succeed");
+
+        // Then the original id is genuinely superseded, not left live
+        // alongside a second, unscoped duplicate: a scope-dropping
+        // rebuild fails to match the live "proj-x" competitor by subject
+        // AND scope, so `upsert_by` falls through to `insert` and the
+        // old id survives
+        assert!(
+            server
+                .store
+                .resolve_handle(entity_id.as_str())
+                .await
+                .is_err(),
+            "the old scoped version should have been superseded, not forked"
+        );
+
+        // And the resynthesized node kept the same scope: it is visible
+        // to a proj-x-scoped query...
+        let scoped = server
+            .store
+            .query_explained(&Query::text("a synthesized entity profile").with_scope("proj-x"))
+            .await
+            .unwrap();
+        assert!(
+            scoped.iter().any(|h| h.hit.label == "Priya"),
+            "resynthesized entity missing from its own proj-x scope"
+        );
+
+        // ...but not to a different scope's query, the isolation
+        // guarantee a scope-dropping rebuild would silently break
+        let other_scope = server
+            .store
+            .query_explained(&Query::text("a synthesized entity profile").with_scope("proj-y"))
+            .await
+            .unwrap();
+        assert!(
+            !other_scope.iter().any(|h| h.hit.label == "Priya"),
+            "resynthesized entity leaked into the proj-y scope"
+        );
+    }
+
+    #[tokio::test]
     async fn remember_still_commits_the_episode_when_entity_synthesis_fails() {
         // Given a mock llm that always errors
         let llm = Arc::new(FailingLlm);
@@ -3234,7 +3294,7 @@ mod tests {
                     ],
                     edges: vec![
                         episode_edge("fact:1", "fact:2", "supports"),
-                        episode_edge("fact:1", "entity:0", "mentions"),
+                        episode_edge("entity:0", "fact:1", "mentions"),
                         episode_edge("fact:2", &existing_handle, "relates_to"),
                     ],
                 }),
@@ -3267,7 +3327,7 @@ mod tests {
         );
         assert_eq!(
             lines[6],
-            format!("related {fact1_id} -mentions-> {henry_id}")
+            format!("related {henry_id} -mentions-> {fact1_id}")
         );
         assert_eq!(
             lines[7],
