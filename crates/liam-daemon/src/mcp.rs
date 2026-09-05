@@ -443,8 +443,9 @@ impl MemoryServer {
         ask_context_tokens: usize,
         max_concurrent_generations: usize,
     ) -> Self {
-        // `Semaphore::new(0)` would deadlock every `ask` call forever. `0` now
-        // means auto-tune, still unimplemented here; floor it to 1 meanwhile.
+        // `Semaphore::new(0)` would deadlock every `ask` call forever. `0` means
+        // auto-tune (see `main.rs::build_autotuned_server`); this floor only
+        // matters for a direct explicit-`0` construction that bypasses it.
         let max_concurrent_generations = max_concurrent_generations.max(1);
         Self {
             store,
