@@ -244,23 +244,30 @@ fn build_autotuned_server(
         tokio::spawn(async move {
             let result = tuning::cold_start_benchmark(&*llm, ceiling).await;
             tuning::save_cache(&cache_dir, &model_fingerprint, &backend, result);
-            grow_from_benchmark(&handle, &granted_capacity, result);
+            grow_from_benchmark(&handle, &granted_capacity, ceiling, result);
         });
     }
 
     server
 }
 
-/// Grows the semaphore and the AIMD capacity counter together, or neither
-/// at the safe floor of 1: leaving the counter behind would drift it.
+/// Grows the semaphore and the AIMD capacity counter together, or neither,
+/// capped at `ceiling` the same way `tuning::grow` caps its own step. The
+/// AIMD engine can grow `granted_capacity` on its own while the benchmark is
+/// still running, so this must re-check the current value rather than adding
+/// `result - 1` on top of it unconditionally.
 fn grow_from_benchmark(
     handle: &Arc<tokio::sync::Semaphore>,
     granted_capacity: &Arc<std::sync::atomic::AtomicUsize>,
+    ceiling: usize,
     result: usize,
 ) {
-    if result > 1 {
-        handle.add_permits(result - 1);
-        granted_capacity.fetch_add(result - 1, std::sync::atomic::Ordering::Relaxed);
+    let current = granted_capacity.load(std::sync::atomic::Ordering::Relaxed);
+    let target = result.min(ceiling);
+    if target > current {
+        let add = target - current;
+        handle.add_permits(add);
+        granted_capacity.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -545,12 +552,13 @@ mod tests {
 
     #[test]
     fn grow_from_benchmark_keeps_granted_capacity_in_step_with_the_semaphore() {
-        // Given a floor of 1 in both, as `build_autotuned_server` starts them
+        // Given a floor of 1 in both, as `build_autotuned_server` starts them,
+        // and a ceiling well above the benchmark result below the ceiling case
         let handle = Arc::new(tokio::sync::Semaphore::new(1));
         let granted_capacity = Arc::new(std::sync::atomic::AtomicUsize::new(1));
 
         // When a benchmark result of 4 is applied
-        grow_from_benchmark(&handle, &granted_capacity, 4);
+        grow_from_benchmark(&handle, &granted_capacity, 8, 4);
 
         // Then both reflect the grow, not just the semaphore
         assert_eq!(handle.available_permits(), 4);
@@ -568,13 +576,50 @@ mod tests {
         let granted_capacity = Arc::new(std::sync::atomic::AtomicUsize::new(1));
 
         // When the benchmark result is also 1 (no concurrency beat the floor)
-        grow_from_benchmark(&handle, &granted_capacity, 1);
+        grow_from_benchmark(&handle, &granted_capacity, 8, 1);
 
         // Then neither moves
         assert_eq!(handle.available_permits(), 1);
         assert_eq!(
             granted_capacity.load(std::sync::atomic::Ordering::Relaxed),
             1
+        );
+    }
+
+    #[test]
+    fn grow_from_benchmark_does_not_exceed_the_ceiling_when_already_there() {
+        // Given granted_capacity already at the ceiling, as the AIMD engine
+        // could have raised it independently while the benchmark still ran
+        let ceiling = 4;
+        let handle = Arc::new(tokio::sync::Semaphore::new(ceiling));
+        let granted_capacity = Arc::new(std::sync::atomic::AtomicUsize::new(ceiling));
+
+        // When the benchmark concludes with a result above the ceiling
+        grow_from_benchmark(&handle, &granted_capacity, ceiling, 6);
+
+        // Then neither the semaphore nor the counter exceeds the ceiling
+        assert_eq!(handle.available_permits(), ceiling);
+        assert_eq!(
+            granted_capacity.load(std::sync::atomic::Ordering::Relaxed),
+            ceiling
+        );
+    }
+
+    #[test]
+    fn grow_from_benchmark_grows_only_up_to_the_ceiling_not_past_it() {
+        // Given granted_capacity below the ceiling
+        let ceiling = 4;
+        let handle = Arc::new(tokio::sync::Semaphore::new(2));
+        let granted_capacity = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+
+        // When the benchmark result would push it past the ceiling if applied raw
+        grow_from_benchmark(&handle, &granted_capacity, ceiling, 6);
+
+        // Then it grows only up to the ceiling, not past it
+        assert_eq!(handle.available_permits(), ceiling);
+        assert_eq!(
+            granted_capacity.load(std::sync::atomic::Ordering::Relaxed),
+            ceiling
         );
     }
 }
