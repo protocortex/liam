@@ -223,6 +223,7 @@ pub struct Candidate {
     pub kind: String,
     pub label: String,
     pub content: String,
+    pub scope: Option<String>,
     pub attributes: serde_json::Value,
     pub confidence: f64,
     pub valid_from: Millis,
@@ -978,7 +979,7 @@ impl<B: Backend> Graph<B> {
                 }
             }
             let sql = format!(
-                "SELECT id, kind, label, content, attributes, confidence, valid_from
+                "SELECT id, kind, label, content, scope, attributes, confidence, valid_from
                  FROM nodes WHERE id IN ({placeholders}) AND {live}{filters}",
                 live = live_at("nodes", 1),
             );
@@ -989,9 +990,10 @@ impl<B: Backend> Graph<B> {
                     kind: row.get_string(1)?,
                     label: row.get_string(2)?,
                     content: row.get_string(3)?,
-                    attributes: serde_json::from_str(&row.get_string(4)?)?,
-                    confidence: row_f64(row, 5),
-                    valid_from: Millis(row.get_i64(6)?),
+                    scope: opt_string(row, 4)?,
+                    attributes: serde_json::from_str(&row.get_string(5)?)?,
+                    confidence: row_f64(row, 6),
+                    valid_from: Millis(row.get_i64(7)?),
                 });
             }
         }
@@ -1526,6 +1528,18 @@ fn row_f64(row: &Row, i: usize) -> f64 {
     }
 }
 
+/// Read a nullable TEXT column as `Option<String>`. `Row::get_string` errors
+/// on NULL, exactly the case a nullable column like `scope` needs to allow.
+fn opt_string(row: &Row, i: usize) -> Result<Option<String>> {
+    match row.0.get(i) {
+        Some(Value::Text(v)) => Ok(Some(v.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(other) => Err(Error::Backend(format!(
+            "column {i} is neither text nor null: {other:?}"
+        ))),
+    }
+}
+
 /// Turn arbitrary user text into a safe FTS5 MATCH string. FTS5 parses the
 /// *value* of a MATCH parameter as its own query language, so a natural-language
 /// question (`?`, `'`, `:`, leading `-`, bare `AND`/`OR`/`NOT`, parentheses)
@@ -1876,6 +1890,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_returns_candidate_scope_matching_stored_scope() {
+        // Arrange: a live node stored under a scope.
+        let g = graph_at(Millis(1000)).await;
+        let id = g
+            .insert(NewNode::now("decision", "Use libSQL", "single file").with_scope("proj-a"))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.get(&id, Millis(1000)).await.unwrap();
+
+        // Assert
+        let candidate = found.expect("live node must be found");
+        assert_eq!(candidate.scope, Some("proj-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_scope_for_unscoped_node() {
+        // Arrange: a live node stored with no scope, the common case.
+        let g = graph_at(Millis(1000)).await;
+        let id = g
+            .insert(NewNode::now("decision", "Use libSQL", "single file"))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.get(&id, Millis(1000)).await.unwrap();
+
+        // Assert
+        let candidate = found.expect("live node must be found");
+        assert_eq!(candidate.scope, None);
+    }
+
+    #[tokio::test]
     async fn get_returns_none_for_node_superseded_before_as_of() {
         // Arrange: advance the clock so supersede closes tx_to, not just
         // valid_from, since only tx_from/tx_to gate the live window here.
@@ -2052,6 +2100,7 @@ mod tests {
             kind: "fact".to_string(),
             label: String::new(),
             content: String::new(),
+            scope: None,
             attributes: serde_json::Value::Null,
             confidence: 1.0,
             valid_from: Millis(0),
@@ -2329,6 +2378,52 @@ mod tests {
             .unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].label, "v2");
+    }
+
+    #[tokio::test]
+    async fn upsert_by_supersedes_scoped_entity_rebuilt_from_candidate_scope() {
+        // Arrange: a scoped entity, matching what `resynthesize_entity`
+        // (crates/liam-daemon/src/mcp.rs, a separate later fix) will read via
+        // `Graph::get` and rebuild.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let original = g
+            .upsert_by(
+                NewNode::now("person", "kim", "profile v1")
+                    .with_subject("kim")
+                    .with_scope("project-a"),
+            )
+            .await
+            .unwrap();
+
+        // Act: read it back and rebuild a `NewNode` from the `Candidate`,
+        // carrying its scope forward, then upsert again.
+        clock.set(Millis(2000));
+        let candidate = g
+            .get(&original, Millis(2000))
+            .await
+            .unwrap()
+            .expect("live node");
+        let mut rebuilt = NewNode::now(candidate.kind, "kim", "profile v2").with_subject("kim");
+        if let Some(scope) = candidate.scope.clone() {
+            rebuilt = rebuilt.with_scope(scope);
+        }
+        g.upsert_by(rebuilt).await.unwrap();
+
+        // Assert: the rebuild superseded the original scoped entity instead of
+        // forking an unscoped duplicate.
+        let live = g
+            .query(&Query::text("kim").with_scope("project-a").with_k(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            live.len(),
+            1,
+            "resynthesis must supersede the scoped entity, not fork a duplicate"
+        );
+        assert_eq!(live[0].content, "profile v2");
     }
 
     #[tokio::test]
