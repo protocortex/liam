@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(c.ask_timeout_secs, 30);
         assert!(c.ask_sufficiency_check);
         assert_eq!(c.llm.context_tokens, 8192);
-        assert_eq!(c.llm.max_concurrent_generations, 1);
+        assert_eq!(c.llm.max_concurrent_generations, 0);
         assert_eq!(c.socket_path, "~/.liam/liamd.sock");
         // The SHIPPED liam.toml is the dev config and keeps a relative
         // database next to the checkout, which is what `cargo run` wants.
