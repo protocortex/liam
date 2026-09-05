@@ -51,6 +51,9 @@ pub(crate) async fn cold_start_benchmark(llm: &dyn Llm, ceiling: usize) -> usize
     let mut best_level = 1;
     let mut best_throughput = throughput_at(llm, 1).await;
     for level in 2..=ceiling {
+        if best_throughput <= 0.0 {
+            break;
+        }
         let throughput = throughput_at(llm, level).await;
         let gain = (throughput - best_throughput) / best_throughput;
         if gain < IMPROVEMENT_THRESHOLD {
@@ -152,22 +155,18 @@ pub(crate) mod tests {
 
     const PLATEAU_OUTPUT: &str = "the weather is mild today";
 
-    /// `Llm` double with two independent, `tokio::time::pause`-driven latency
-    /// knobs: one keyed by in-flight call count, one by call ordinal.
+    /// `Llm` double with a `tokio::time::pause`-driven latency knob keyed by
+    /// in-flight call count.
     pub(crate) struct SequencedLatencyLlm {
         concurrency_latency: Box<dyn Fn(usize) -> Duration + Send + Sync>,
-        call_index_latency: Box<dyn Fn(usize) -> Duration + Send + Sync>,
         in_flight: AtomicUsize,
-        call_index: AtomicUsize,
     }
 
     impl SequencedLatencyLlm {
         pub(crate) fn new() -> Self {
             Self {
                 concurrency_latency: Box::new(|_| Duration::ZERO),
-                call_index_latency: Box::new(|_| Duration::ZERO),
                 in_flight: AtomicUsize::new(0),
-                call_index: AtomicUsize::new(0),
             }
         }
 
@@ -177,16 +176,6 @@ pub(crate) mod tests {
             f: impl Fn(usize) -> Duration + Send + Sync + 'static,
         ) -> Self {
             self.concurrency_latency = Box::new(f);
-            self
-        }
-
-        /// Delay keyed by the cumulative call ordinal (1-based) since construction.
-        #[allow(dead_code)] // not exercised by this module's own tests yet
-        pub(crate) fn with_call_index_latency(
-            mut self,
-            f: impl Fn(usize) -> Duration + Send + Sync + 'static,
-        ) -> Self {
-            self.call_index_latency = Box::new(f);
             self
         }
     }
@@ -204,9 +193,7 @@ pub(crate) mod tests {
             _max_new_tokens: usize,
         ) -> Result<String> {
             let concurrency = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            let call_index = self.call_index.fetch_add(1, Ordering::SeqCst) + 1;
-            let delay =
-                (self.concurrency_latency)(concurrency) + (self.call_index_latency)(call_index);
+            let delay = (self.concurrency_latency)(concurrency);
             tokio::time::sleep(delay).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(PLATEAU_OUTPUT.to_string())
@@ -278,6 +265,31 @@ pub(crate) mod tests {
         assert_eq!(
             cached, None,
             "a backend mismatch must not return a stale value"
+        );
+    }
+
+    struct AlwaysFailingLlm;
+
+    #[async_trait]
+    impl Llm for AlwaysFailingLlm {
+        async fn complete(&self, _system: &str, _prompt: &str) -> Result<String> {
+            Err(liam_model::ModelError::Llm("boom".into()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_start_benchmark_stays_at_the_safe_floor_when_every_call_errors() {
+        // Arrange: every probed level's calls all error, so throughput is
+        // 0.0 at every level, including the level-1 baseline.
+        let llm = AlwaysFailingLlm;
+
+        // Act
+        let result = cold_start_benchmark(&llm, 4).await;
+
+        // Assert
+        assert_eq!(
+            result, 1,
+            "a total outage during the benchmark must not climb past the safe floor"
         );
     }
 
