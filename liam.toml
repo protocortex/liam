@@ -39,7 +39,7 @@ cache_dir       = "~/.liam/models"
 device          = "auto"   # auto | metal | cuda | cpu; auto = fastest compiled in, else cpu
 warmup          = true     # pay Metal's ~10s first-call kernel compile at startup
 context_tokens  = 8192     # sizes both the llama.cpp context and ask's evidence trimming
-max_concurrent_generations = 1   # generation is serialized by default; raise if you have KV cache headroom
+max_concurrent_generations = 0   # 0 = auto-tune from a one-time benchmark; set a fixed number to disable
 
 [producers]
 unknown_id = "unknown"     # producer id recorded for a client not named in [producers.clients]

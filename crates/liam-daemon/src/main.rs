@@ -24,6 +24,7 @@ mod telemetry;
 #[cfg(test)]
 mod tool_eval;
 mod transport;
+mod tuning;
 
 use std::sync::Arc;
 
@@ -38,6 +39,7 @@ pub use liam_daemon::config;
 
 use config::Config;
 use liam_daemon::models::{build_llm, build_models, resolve_config_path, resolve_path_with_home};
+use liam_model::{Embedder, Llm, Reranker};
 use mcp::MemoryServer;
 
 fn main() -> anyhow::Result<()> {
@@ -155,16 +157,36 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
 
     spawn_gc(&config, Arc::clone(&store));
 
-    let server = MemoryServer::new(
-        store,
-        embedder,
-        reranker,
-        llm,
-        config.ask_timeout_secs,
-        config.ask_sufficiency_check,
-        config.llm.context_tokens,
-        config.llm.max_concurrent_generations,
-    );
+    let server = if config.llm.max_concurrent_generations == 0 {
+        let cache_dir = resolve_config_path("llm.cache_dir", &config.llm.cache_dir)?
+            .to_string_lossy()
+            .into_owned();
+        let model_fingerprint = format!("{}/{}", config.llm.model, config.llm.gguf_file);
+        let backend = llm.backend().to_string();
+        build_autotuned_server(
+            store,
+            embedder,
+            reranker,
+            llm,
+            config.ask_timeout_secs,
+            config.ask_sufficiency_check,
+            config.llm.context_tokens,
+            cache_dir,
+            model_fingerprint,
+            backend,
+        )
+    } else {
+        MemoryServer::new(
+            store,
+            embedder,
+            reranker,
+            llm,
+            config.ask_timeout_secs,
+            config.ask_sufficiency_check,
+            config.llm.context_tokens,
+            config.llm.max_concurrent_generations,
+        )
+    };
 
     match mode {
         cli::Mode::Serve => serve_socket(&config, server).await,
@@ -186,6 +208,48 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
             Ok(())
         }
     }
+}
+
+/// Builds the server for the `max_concurrent_generations == 0` sentinel: a
+/// cache hit constructs at that value; a miss floors to 1, then grows it later.
+#[allow(clippy::too_many_arguments)]
+fn build_autotuned_server(
+    store: Arc<DefaultGraph>,
+    embedder: Arc<dyn Embedder>,
+    reranker: Arc<dyn Reranker>,
+    llm: Arc<dyn Llm>,
+    ask_timeout_secs: u64,
+    ask_sufficiency_check: bool,
+    ask_context_tokens: usize,
+    cache_dir: String,
+    model_fingerprint: String,
+    backend: String,
+) -> MemoryServer {
+    let cached = tuning::load_cached(&cache_dir, &model_fingerprint, &backend);
+    let server = MemoryServer::new(
+        store,
+        embedder,
+        reranker,
+        llm.clone(),
+        ask_timeout_secs,
+        ask_sufficiency_check,
+        ask_context_tokens,
+        cached.unwrap_or(1),
+    );
+
+    if cached.is_none() {
+        let handle = server.generation_permits_handle();
+        let ceiling = tuning::memory_ceiling();
+        tokio::spawn(async move {
+            let result = tuning::cold_start_benchmark(&*llm, ceiling).await;
+            tuning::save_cache(&cache_dir, &model_fingerprint, &backend, result);
+            if result > 1 {
+                handle.add_permits(result - 1);
+            }
+        });
+    }
+
+    server
 }
 
 /// The socket daemon: resolve the listener (activated by launchd, or bound
@@ -344,5 +408,126 @@ mod tests {
         let did_work = refresh_clusters(&store).await;
 
         assert!(!did_work, "an unchanged store must report no work");
+    }
+
+    /// `Llm` double counting `complete_capped` calls, blocked on a `Notify`
+    /// the test never fires, so a benchmark using it starts but never finishes.
+    struct GatedCountingLlm {
+        release: Arc<tokio::sync::Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GatedCountingLlm {
+        fn new(release: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                release,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Llm for GatedCountingLlm {
+        async fn complete(&self, system: &str, prompt: &str) -> liam_model::Result<String> {
+            self.complete_capped(system, prompt, usize::MAX).await
+        }
+
+        async fn complete_capped(
+            &self,
+            _system: &str,
+            _prompt: &str,
+            _max_new_tokens: usize,
+        ) -> liam_model::Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release.notified().await;
+            Ok("gated".to_string())
+        }
+    }
+
+    async fn autotune_store() -> Arc<DefaultGraph> {
+        Arc::new(
+            DefaultGraph::open(":memory:", GraphConfig::new(8))
+                .await
+                .expect("open in-memory store"),
+        )
+    }
+
+    #[tokio::test]
+    async fn autotuned_server_accepts_requests_before_the_benchmark_completes() {
+        // Given no cache file, so a benchmark runs, gated so it never
+        // resolves in this test
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().to_str().expect("utf8 path").to_string();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm_double = Arc::new(GatedCountingLlm::new(release));
+        let llm: Arc<dyn Llm> = llm_double.clone();
+
+        // When the server is built
+        let server = build_autotuned_server(
+            autotune_store().await,
+            Arc::new(liam_model::MockEmbedder::new(8)),
+            Arc::new(liam_model::IdentityReranker),
+            llm,
+            30,
+            false,
+            8192,
+            cache_dir,
+            "model/quant".to_string(),
+            "cpu".to_string(),
+        );
+
+        // Then it is already usable at the safe floor before the benchmark
+        // resolves, and the benchmark has genuinely started in the background
+        assert_eq!(server.generation_permits_handle().available_permits(), 1);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            llm_double.calls(),
+            1,
+            "the background benchmark must have started"
+        );
+        assert_eq!(
+            server.generation_permits_handle().available_permits(),
+            1,
+            "permits must not grow until the gated benchmark resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn autotuned_server_skips_the_benchmark_on_a_cache_hit() {
+        // Given a cache entry matching the fingerprint used below
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().to_str().expect("utf8 path").to_string();
+        tuning::save_cache(&cache_dir, "model/quant", "cpu", 4);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm_double = Arc::new(GatedCountingLlm::new(release));
+        let llm: Arc<dyn Llm> = llm_double.clone();
+
+        // When the server is built with the same cache dir/model/backend
+        let server = build_autotuned_server(
+            autotune_store().await,
+            Arc::new(liam_model::MockEmbedder::new(8)),
+            Arc::new(liam_model::IdentityReranker),
+            llm,
+            30,
+            false,
+            8192,
+            cache_dir,
+            "model/quant".to_string(),
+            "cpu".to_string(),
+        );
+
+        // Then the semaphore is sized from the cache immediately, and no
+        // benchmark ever runs
+        assert_eq!(server.generation_permits_handle().available_permits(), 4);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            llm_double.calls(),
+            0,
+            "a cache hit must spawn no benchmark at all"
+        );
     }
 }
