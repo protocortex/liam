@@ -216,14 +216,17 @@ fn decay_factor(valid_from: Millis, now: Millis, half_life: Option<Millis>) -> f
     }
 }
 
-struct Candidate {
-    id: NodeId,
-    kind: String,
-    label: String,
-    content: String,
-    attributes: serde_json::Value,
-    confidence: f64,
-    valid_from: Millis,
+/// A raw node row as stored: unlike `Hit`/`ExplainedHit`, carries no
+/// retrieval score, so it fits a direct by-id lookup as well as scoring.
+pub struct Candidate {
+    pub id: NodeId,
+    pub kind: String,
+    pub label: String,
+    pub content: String,
+    pub scope: Option<String>,
+    pub attributes: serde_json::Value,
+    pub confidence: f64,
+    pub valid_from: Millis,
 }
 
 pub struct Graph<B: Backend> {
@@ -736,6 +739,45 @@ impl<B: Backend> Graph<B> {
         self.query_core(q).await
     }
 
+    /// Fetch one node by id, live at `as_of`. `None` if it doesn't exist or
+    /// isn't live at that instant.
+    pub async fn get(&self, id: &NodeId, as_of: Millis) -> Result<Option<Candidate>> {
+        Ok(self
+            .fetch_candidates(std::slice::from_ref(id), as_of, None, None)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Nodes `entity_id` mentions, live at `as_of`, most-recently mentioned
+    /// first (`fetch_candidates`'s own order is not meaningful, restored after).
+    pub async fn mentions(
+        &self,
+        entity_id: &NodeId,
+        as_of: Millis,
+        limit: usize,
+    ) -> Result<Vec<Candidate>> {
+        let rows = self
+            .backend
+            .query(
+                "SELECT dst FROM edges WHERE src = ?1 AND type = ?2
+                 AND tx_from <= ?3 AND tx_to > ?3
+                 ORDER BY tx_from DESC LIMIT ?4",
+                &[
+                    entity_id.as_str().into(),
+                    crate::types::relation::MENTIONS.into(),
+                    as_of.into(),
+                    (limit as i64).into(),
+                ],
+            )
+            .await?;
+        let ordered_ids = ids_from(&rows)?;
+        let candidates = self
+            .fetch_candidates(&ordered_ids, as_of, None, None)
+            .await?;
+        Ok(reorder_by_recency(candidates, &ordered_ids))
+    }
+
     async fn query_core(&self, q: &Query) -> Result<Vec<ExplainedHit>> {
         let now = q.as_of.unwrap_or_else(|| self.clock.now());
         let pool = q.k.max(1) * 3;
@@ -937,7 +979,7 @@ impl<B: Backend> Graph<B> {
                 }
             }
             let sql = format!(
-                "SELECT id, kind, label, content, attributes, confidence, valid_from
+                "SELECT id, kind, label, content, scope, attributes, confidence, valid_from
                  FROM nodes WHERE id IN ({placeholders}) AND {live}{filters}",
                 live = live_at("nodes", 1),
             );
@@ -948,9 +990,10 @@ impl<B: Backend> Graph<B> {
                     kind: row.get_string(1)?,
                     label: row.get_string(2)?,
                     content: row.get_string(3)?,
-                    attributes: serde_json::from_str(&row.get_string(4)?)?,
-                    confidence: row_f64(row, 5),
-                    valid_from: Millis(row.get_i64(6)?),
+                    scope: opt_string(row, 4)?,
+                    attributes: serde_json::from_str(&row.get_string(5)?)?,
+                    confidence: row_f64(row, 6),
+                    valid_from: Millis(row.get_i64(7)?),
                 });
             }
         }
@@ -1446,6 +1489,17 @@ fn ids_from(rows: &[Row]) -> Result<Vec<NodeId>> {
         .collect()
 }
 
+/// Restores `candidates` to the order `ordered_ids` names, dropping any id
+/// with no matching candidate.
+fn reorder_by_recency(candidates: Vec<Candidate>, ordered_ids: &[NodeId]) -> Vec<Candidate> {
+    let mut by_id: HashMap<NodeId, Candidate> =
+        candidates.into_iter().map(|c| (c.id.clone(), c)).collect();
+    ordered_ids
+        .iter()
+        .filter_map(|id| by_id.remove(id))
+        .collect()
+}
+
 /// Groups members by community id, largest group first, tied groups broken by
 /// the first member's id. A free function (not inline in `community_groups`)
 /// so the tie-break is testable against fixed input, independent of what
@@ -1471,6 +1525,18 @@ fn row_f64(row: &Row, i: usize) -> f64 {
         Some(Value::Real(v)) => *v,
         Some(Value::Int(v)) => *v as f64,
         _ => 1.0,
+    }
+}
+
+/// Read a nullable TEXT column as `Option<String>`. `Row::get_string` errors
+/// on NULL, exactly the case a nullable column like `scope` needs to allow.
+fn opt_string(row: &Row, i: usize) -> Result<Option<String>> {
+    match row.0.get(i) {
+        Some(Value::Text(v)) => Ok(Some(v.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(other) => Err(Error::Backend(format!(
+            "column {i} is neither text nor null: {other:?}"
+        ))),
     }
 }
 
@@ -1618,6 +1684,7 @@ fn intern(index: &mut HashMap<String, usize>, labels: &mut Vec<String>, id: Stri
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
+    use crate::types::relation;
     use crate::DefaultGraph;
     use tempfile::TempDir;
 
@@ -1800,6 +1867,288 @@ mod tests {
             .unwrap();
         assert!(past.iter().any(|h| h.label == "Deno"));
         assert!(past.iter().all(|h| h.label != "Rust"));
+    }
+
+    #[tokio::test]
+    async fn get_returns_live_node_at_as_of() {
+        // Arrange: a node live at the query instant.
+        let g = graph_at(Millis(1000)).await;
+        let id = g
+            .insert(NewNode::now("decision", "Use libSQL", "single file"))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.get(&id, Millis(1000)).await.unwrap();
+
+        // Assert
+        let candidate = found.expect("live node must be found");
+        assert_eq!(candidate.id, id);
+        assert_eq!(candidate.kind, "decision");
+        assert_eq!(candidate.label, "Use libSQL");
+        assert_eq!(candidate.content, "single file");
+    }
+
+    #[tokio::test]
+    async fn get_returns_candidate_scope_matching_stored_scope() {
+        // Arrange: a live node stored under a scope.
+        let g = graph_at(Millis(1000)).await;
+        let id = g
+            .insert(NewNode::now("decision", "Use libSQL", "single file").with_scope("proj-a"))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.get(&id, Millis(1000)).await.unwrap();
+
+        // Assert
+        let candidate = found.expect("live node must be found");
+        assert_eq!(candidate.scope, Some("proj-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_scope_for_unscoped_node() {
+        // Arrange: a live node stored with no scope, the common case.
+        let g = graph_at(Millis(1000)).await;
+        let id = g
+            .insert(NewNode::now("decision", "Use libSQL", "single file"))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.get(&id, Millis(1000)).await.unwrap();
+
+        // Assert
+        let candidate = found.expect("live node must be found");
+        assert_eq!(candidate.scope, None);
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_node_superseded_before_as_of() {
+        // Arrange: advance the clock so supersede closes tx_to, not just
+        // valid_from, since only tx_from/tx_to gate the live window here.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g
+            .insert(NewNode::now("decision", "Deno", "runtime").with_valid_from(Millis(1000)))
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        g.supersede(
+            &old,
+            NewNode::now("decision", "Rust", "runtime").with_valid_from(Millis(2000)),
+        )
+        .await
+        .unwrap();
+
+        // Act
+        let found = g.get(&old, Millis(2500)).await.unwrap();
+
+        // Assert
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_unknown_id() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let unknown = NodeId::from_raw("nonexistent");
+
+        // Act
+        let found = g.get(&unknown, Millis(1000)).await.unwrap();
+
+        // Assert
+        assert!(found.is_none());
+    }
+
+    // ---- Graph::mentions ----
+
+    #[tokio::test]
+    async fn mentions_returns_all_live_mentions_most_recent_first() {
+        // Arrange: three mentions-linked facts, each written at a later tick.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let first = g
+            .insert(NewNode::now("fact", "first", "note one"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &first, relation::MENTIONS))
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        let second = g
+            .insert(NewNode::now("fact", "second", "note two"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &second, relation::MENTIONS))
+            .await
+            .unwrap();
+        clock.set(Millis(3000));
+        let third = g
+            .insert(NewNode::now("fact", "third", "note three"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &third, relation::MENTIONS))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.mentions(&entity, Millis(3000), 10).await.unwrap();
+
+        // Assert: most-recently-mentioned first.
+        let ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![third, second, first]);
+    }
+
+    #[tokio::test]
+    async fn mentions_excludes_edges_of_a_different_type() {
+        // Arrange: a mentions edge and an unrelated edge to the same entity.
+        let g = graph_at(Millis(1000)).await;
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let mentioned = g
+            .insert(NewNode::now("fact", "mentioned", "note"))
+            .await
+            .unwrap();
+        let other = g
+            .insert(NewNode::now("fact", "other", "unrelated"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &mentioned, relation::MENTIONS))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &other, "supersedes"))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.mentions(&entity, Millis(1000), 10).await.unwrap();
+
+        // Assert: only the mentions-typed edge's target comes back.
+        let ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![mentioned]);
+    }
+
+    #[tokio::test]
+    async fn mentions_respects_limit_keeping_the_most_recent() {
+        // Arrange: more live mentions than the limit, each at a later tick.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            clock.set(Millis(1000 + i * 1000));
+            let fact = g
+                .insert(NewNode::now("fact", "note", "note"))
+                .await
+                .unwrap();
+            g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
+                .await
+                .unwrap();
+            ids.push(fact);
+        }
+
+        // Act
+        let found = g.mentions(&entity, Millis(5000), 2).await.unwrap();
+
+        // Assert: exactly `limit` results, the two most recent.
+        let found_ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
+        assert_eq!(found_ids, vec![ids[4].clone(), ids[3].clone()]);
+    }
+
+    #[tokio::test]
+    async fn mentions_excludes_an_edge_expired_before_as_of() {
+        // Arrange: a mentions edge closed (superseded) before the as-of instant.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g
+            .insert(NewNode::now("fact", "note", "note"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
+            .await
+            .unwrap();
+        g.backend
+            .execute("UPDATE edges SET tx_to = ?1", &[Millis(2000).into()])
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.mentions(&entity, Millis(2500), 10).await.unwrap();
+
+        // Assert
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn reorder_by_recency_restores_recency_order_from_scrambled_input() {
+        // Arrange: candidates hydrated scrambled, true order given separately.
+        let a = NodeId::from_raw("a");
+        let b = NodeId::from_raw("b");
+        let c = NodeId::from_raw("c");
+        let candidate = |id: &NodeId| Candidate {
+            id: id.clone(),
+            kind: "fact".to_string(),
+            label: String::new(),
+            content: String::new(),
+            scope: None,
+            attributes: serde_json::Value::Null,
+            confidence: 1.0,
+            valid_from: Millis(0),
+        };
+        let scrambled = vec![candidate(&c), candidate(&a), candidate(&b)];
+        let ordered_ids = vec![a.clone(), b.clone(), c.clone()];
+
+        // Act
+        let result = reorder_by_recency(scrambled, &ordered_ids);
+
+        // Assert
+        let ids: Vec<NodeId> = result.into_iter().map(|cand| cand.id).collect();
+        assert_eq!(ids, vec![a, b, c]);
+    }
+
+    #[tokio::test]
+    async fn mentions_matches_recency_order_despite_interleaved_insert_order() {
+        // Arrange: facts inserted in ascending order, then mentioned in a
+        // scrambled order, decoupling physical id order from recency order.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let mut facts = Vec::new();
+        for _ in 0..5 {
+            facts.push(
+                g.insert(NewNode::now("fact", "note", "note"))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let link_order = [2, 0, 4, 1, 3];
+        let mut expected_recency_order = Vec::new();
+        for (step, &idx) in link_order.iter().enumerate() {
+            clock.set(Millis(5000 - step as i64 * 1000));
+            g.link(NewEdge::new(&entity, &facts[idx], relation::MENTIONS))
+                .await
+                .unwrap();
+            expected_recency_order.push(facts[idx].clone());
+        }
+
+        // Act
+        let found = g.mentions(&entity, Millis(5000), 10).await.unwrap();
+
+        // Assert
+        let ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, expected_recency_order);
     }
 
     #[tokio::test]
@@ -2029,6 +2378,52 @@ mod tests {
             .unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].label, "v2");
+    }
+
+    #[tokio::test]
+    async fn upsert_by_supersedes_scoped_entity_rebuilt_from_candidate_scope() {
+        // Arrange: a scoped entity, matching what `resynthesize_entity`
+        // (crates/liam-daemon/src/mcp.rs, a separate later fix) will read via
+        // `Graph::get` and rebuild.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let original = g
+            .upsert_by(
+                NewNode::now("person", "kim", "profile v1")
+                    .with_subject("kim")
+                    .with_scope("project-a"),
+            )
+            .await
+            .unwrap();
+
+        // Act: read it back and rebuild a `NewNode` from the `Candidate`,
+        // carrying its scope forward, then upsert again.
+        clock.set(Millis(2000));
+        let candidate = g
+            .get(&original, Millis(2000))
+            .await
+            .unwrap()
+            .expect("live node");
+        let mut rebuilt = NewNode::now(candidate.kind, "kim", "profile v2").with_subject("kim");
+        if let Some(scope) = candidate.scope.clone() {
+            rebuilt = rebuilt.with_scope(scope);
+        }
+        g.upsert_by(rebuilt).await.unwrap();
+
+        // Assert: the rebuild superseded the original scoped entity instead of
+        // forking an unscoped duplicate.
+        let live = g
+            .query(&Query::text("kim").with_scope("project-a").with_k(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            live.len(),
+            1,
+            "resynthesis must supersede the scoped entity, not fork a duplicate"
+        );
+        assert_eq!(live[0].content, "profile v2");
     }
 
     #[tokio::test]
