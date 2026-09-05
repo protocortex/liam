@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MCP tool surface: `remember`, `recall`, `relate`, `ask`, and `clusters`,
-//! wiring the store and the model.
+//! MCP tool surface: `remember`, `recall`, `relate`, `ask`, `clusters`, and
+//! `timeline`, wiring the store and the model.
 //!
 //! VERSION CHECK: the rmcp macro surface (`#[tool_router]`, `#[tool]`,
 //! `#[tool_handler]`, `Parameters`) moves across releases. Confirmed unchanged
@@ -75,6 +75,10 @@ const MENTIONS_FETCH_LIMIT: usize = 200;
 /// Cap on entity-page synthesis output: a short compiled profile, not a
 /// full answer. Measured real output was ~55 tokens / ~270 chars.
 const ENTITY_SYNTHESIS_MAX_NEW_TOKENS: usize = 256;
+
+/// Fixed default for `timeline`'s `Graph::mentions` read; the tool takes no
+/// caller-supplied limit.
+const TIMELINE_MENTIONS_LIMIT: usize = 50;
 
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope/as_of shape to a `Query`;
@@ -355,6 +359,12 @@ pub struct ClustersArgs {
     /// Number of memories to show per cluster. Narrows within the token
     /// budget; cannot widen past it.
     pub members: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TimelineArgs {
+    /// Handle of the entity, as shown by `recall`. A full id works too.
+    pub entity: String,
 }
 
 #[derive(Clone)]
@@ -986,6 +996,52 @@ impl MemoryServer {
                 .count_tokens(s)
                 .unwrap_or_else(|| estimate_tokens(s))
         })
+    }
+
+    #[tool(
+        description = "Show an entity's compiled page and the mentions behind it, most recent first."
+    )]
+    async fn timeline(&self, Parameters(args): Parameters<TimelineArgs>) -> String {
+        let id = match self.store.resolve_handle(&args.entity).await {
+            Ok(id) => id,
+            Err(e) => return format!("timeline failed: {e}"),
+        };
+        let now = liam_store::Millis::now();
+        let entity = match self.store.get(&id, now).await {
+            Ok(Some(c)) => c,
+            Ok(None) => return format!("timeline failed: {} is not currently live", id.handle()),
+            Err(e) => return format!("timeline failed: {e}"),
+        };
+        let mentions = match self.store.mentions(&id, now, TIMELINE_MENTIONS_LIMIT).await {
+            Ok(m) => m,
+            Err(e) => return format!("timeline failed: {e}"),
+        };
+        let header = format!(
+            "[{} {}] {}\n{}",
+            entity.kind,
+            id.handle(),
+            entity.label,
+            entity.content
+        );
+        let mentions_section = if mentions.is_empty() {
+            "no mentions yet".to_string()
+        } else {
+            mentions
+                .iter()
+                .map(|m| {
+                    format!(
+                        "[{} {}] {} — known since {}\n{}",
+                        m.kind,
+                        m.id.handle(),
+                        m.label,
+                        ask::fmt_millis(m.valid_from.0),
+                        m.content
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        format!("{header}\n\n{mentions_section}")
     }
 
     // `pub(crate)` so the grounding eval (see `eval.rs`) drives the same code
@@ -4957,6 +5013,139 @@ mod tests {
         for field in ["\"k\"", "\"members\""] {
             assert!(schema.contains(field), "{field} missing from {schema}");
         }
+    }
+
+    #[tokio::test]
+    async fn timeline_returns_compiled_content_and_mentions_most_recent_first() {
+        // Given an entity with a compiled page and 2 live mentions, linked
+        // at two different instants
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let server = server_with_clock(clock.clone()).await;
+        let mut entity_node = NewNode::entity("person", "Ada Lovelace");
+        entity_node.content = "compiled bio of ada".to_string();
+        let entity_id = server.store.insert(entity_node).await.expect("seed entity");
+        let fact1 = server
+            .store
+            .insert(NewNode::now("fact", "Fact One", "first mention content"))
+            .await
+            .expect("seed fact one");
+        let fact2 = server
+            .store
+            .insert(NewNode::now("fact", "Fact Two", "second mention content"))
+            .await
+            .expect("seed fact two");
+        clock.set(Millis(2000));
+        server
+            .store
+            .relate(&entity_id, &fact1, relation::MENTIONS)
+            .await
+            .expect("link fact one");
+        clock.set(Millis(3000));
+        server
+            .store
+            .relate(&entity_id, &fact2, relation::MENTIONS)
+            .await
+            .expect("link fact two");
+
+        // When timeline runs
+        let out = server
+            .timeline(Parameters(TimelineArgs {
+                entity: entity_id.as_str().to_string(),
+            }))
+            .await;
+
+        // Then the compiled content and both mentions appear, most
+        // recently linked mention first
+        assert!(out.contains("compiled bio of ada"), "{out}");
+        let fact1_pos = out.find("first mention content").expect("fact one missing");
+        let fact2_pos = out
+            .find("second mention content")
+            .expect("fact two missing");
+        assert!(
+            fact2_pos < fact1_pos,
+            "most recently linked mention should come first: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_reports_an_unresolvable_handle_as_not_found() {
+        // Given a handle that resolves to no node
+        let server = plain_server().await;
+
+        // When timeline runs
+        let out = server
+            .timeline(Parameters(TimelineArgs {
+                entity: "0000000000000".to_string(),
+            }))
+            .await;
+
+        // Then it fails clearly instead of panicking or succeeding empty
+        assert!(out.starts_with("timeline failed:"), "{out}");
+        assert!(out.contains("no live node"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn timeline_on_an_entity_with_no_mentions_says_so() {
+        // Given an entity created directly, with no mentions edges at all
+        let server = plain_server().await;
+        let entity_id = server
+            .store
+            .insert(NewNode::entity("person", "Lonely Entity"))
+            .await
+            .expect("seed entity");
+
+        // When timeline runs
+        let out = server
+            .timeline(Parameters(TimelineArgs {
+                entity: entity_id.as_str().to_string(),
+            }))
+            .await;
+
+        // Then it returns the entity's own data with an explicit
+        // "no mentions yet" section, not an error
+        assert!(out.contains("Lonely Entity"), "{out}");
+        assert!(out.contains("no mentions yet"), "{out}");
+        assert!(!out.starts_with("timeline failed:"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn timeline_on_a_non_entity_node_returns_its_own_data_without_crashing() {
+        // Given a handle that resolves to a live node that was never an
+        // entity (an ordinary remembered fact)
+        let server = plain_server().await;
+        let handle = seed(&server, "fact", "Ordinary Fact", "ordinary content").await;
+
+        // When timeline runs
+        let out = server
+            .timeline(Parameters(TimelineArgs { entity: handle }))
+            .await;
+
+        // Then it still returns that node's own data and an empty
+        // mentions list, without crashing
+        assert!(out.contains("Ordinary Fact"), "{out}");
+        assert!(out.contains("ordinary content"), "{out}");
+        assert!(out.contains("no mentions yet"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn timeline_is_registered_with_the_argument_names_clients_send() {
+        let server = plain_server().await;
+
+        assert!(
+            server.tool_router.has_route("timeline"),
+            "timeline not routed"
+        );
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "timeline")
+            .expect("timeline must be listed");
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        assert!(
+            schema.contains("\"entity\""),
+            "entity missing from {schema}"
+        );
     }
 
     #[tokio::test]
