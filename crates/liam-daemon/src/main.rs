@@ -644,4 +644,41 @@ mod tests {
             "a shrink that cannot reclaim its permits right now must not corrupt the counter"
         );
     }
+
+    #[test]
+    fn reconcile_capacity_after_benchmark_does_not_exceed_the_ceiling_when_already_there() {
+        // Given granted_capacity already at the ceiling, as the AIMD engine
+        // could have raised it independently while the benchmark still ran
+        let ceiling = 4;
+        let handle = Arc::new(tokio::sync::Semaphore::new(ceiling));
+        let granted_capacity = Arc::new(std::sync::atomic::AtomicUsize::new(ceiling));
+
+        // When the benchmark concludes with a result above the ceiling
+        reconcile_capacity_after_benchmark(&handle, &granted_capacity, ceiling, 6);
+
+        // Then neither the semaphore nor the counter exceeds the ceiling
+        assert_eq!(handle.available_permits(), ceiling);
+        assert_eq!(
+            granted_capacity.load(std::sync::atomic::Ordering::Relaxed),
+            ceiling
+        );
+    }
+
+    #[test]
+    fn reconcile_capacity_after_benchmark_grows_only_up_to_the_ceiling_not_past_it() {
+        // Given granted_capacity below the ceiling
+        let ceiling = 4;
+        let handle = Arc::new(tokio::sync::Semaphore::new(2));
+        let granted_capacity = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+
+        // When the benchmark result would push it past the ceiling if applied raw
+        reconcile_capacity_after_benchmark(&handle, &granted_capacity, ceiling, 6);
+
+        // Then it grows only up to the ceiling, not past it
+        assert_eq!(handle.available_permits(), ceiling);
+        assert_eq!(
+            granted_capacity.load(std::sync::atomic::Ordering::Relaxed),
+            ceiling
+        );
+    }
 }
