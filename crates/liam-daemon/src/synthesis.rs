@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Entity-page synthesis: a grounded profile for one entity from its mentions.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use liam_model::{Llm, ModelError, Result};
 use tokio::sync::Semaphore;
@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 use crate::ask::{
     estimate_tokens, fit_evidence_to_budget, fmt_millis, neutralize_fence, truncate, Evidence,
 };
+use crate::tuning::RollingWindow;
 
 /// Cap on the entity kind/label rendered into the prompt: both are
 /// caller-supplied, same untrusted-length concern as evidence content.
@@ -67,6 +68,7 @@ pub fn build_synthesis_prompt(
 pub async fn synthesize_entity(
     llm: &dyn Llm,
     permit_semaphore: &Arc<Semaphore>,
+    rolling_window: &Arc<Mutex<RollingWindow>>,
     deadline: tokio::time::Instant,
     entity_kind: &str,
     entity_label: &str,
@@ -74,6 +76,7 @@ pub async fn synthesize_entity(
     context_tokens: usize,
     max_new_tokens: usize,
 ) -> Result<String> {
+    let acquire_start = tokio::time::Instant::now();
     let _permit =
         match tokio::time::timeout_at(deadline, permit_semaphore.clone().acquire_owned()).await {
             Ok(Ok(permit)) => permit,
@@ -90,6 +93,8 @@ pub async fn synthesize_entity(
                 ))
             }
         };
+    let queue_wait = acquire_start.elapsed();
+    let generation_start = tokio::time::Instant::now();
 
     let mentions = fit_evidence_to_budget(
         |slice| build_synthesis_prompt(entity_kind, entity_label, slice),
@@ -99,7 +104,7 @@ pub async fn synthesize_entity(
     );
     let (system, user) = build_synthesis_prompt(entity_kind, entity_label, mentions);
 
-    match tokio::time::timeout_at(
+    let result = match tokio::time::timeout_at(
         deadline,
         llm.complete_capped(&system, &user, max_new_tokens),
     )
@@ -109,7 +114,12 @@ pub async fn synthesize_entity(
         Err(_) => Err(ModelError::Llm(
             "timed out generating the entity synthesis".to_string(),
         )),
-    }
+    };
+    rolling_window
+        .lock()
+        .expect("rolling window mutex poisoned")
+        .record(queue_wait, generation_start.elapsed());
+    result
 }
 
 #[cfg(test)]
@@ -203,12 +213,14 @@ mod tests {
         ];
         let llm = RecordingLlm::new();
         let permits = Arc::new(Semaphore::new(1));
+        let window = Arc::new(Mutex::new(RollingWindow::new()));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         // Act
         synthesize_entity(
             &llm,
             &permits,
+            &window,
             deadline,
             "person",
             "Ada Lovelace",
@@ -231,12 +243,14 @@ mod tests {
         let mentions = vec![mention("fact", "Role", "Works as an engineer.", 0)];
         let llm = FailingLlm;
         let permits = Arc::new(Semaphore::new(1));
+        let window = Arc::new(Mutex::new(RollingWindow::new()));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         // Act
         let result = synthesize_entity(
             &llm,
             &permits,
+            &window,
             deadline,
             "person",
             "Ada Lovelace",
