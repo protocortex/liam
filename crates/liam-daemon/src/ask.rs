@@ -71,7 +71,6 @@ impl Evidence {
 
     /// Build from a raw stored node: same truncation/fence-neutralization as
     /// `from_hit`, reading `Candidate`'s flat fields directly.
-    #[allow(dead_code)] // caller lands separately, in remember's episode wiring
     pub fn from_candidate(c: &liam_store::Candidate) -> Self {
         let attributes = match &c.attributes {
             serde_json::Value::Object(map) if !map.is_empty() => {
