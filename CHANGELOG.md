@@ -13,6 +13,15 @@ All notable changes to LIAM are recorded here. The format follows
   lands together, or none of it does. Leaving `episode` out keeps `remember` working exactly as
   it always has.
 
+- `remember` now synthesizes an entity's compiled page from its mentions whenever an episode
+  newly links a fresh entity, after the episode itself has already committed. A synthesis
+  failure never fails the `remember` call; it's named in the response text instead. Re-mentioning
+  an entity that already existed before the call, by handle rather than creating it fresh in the
+  same episode, does not yet trigger resynthesis.
+
+- `timeline` MCP tool: given an entity handle, returns its compiled page plus its live mentions,
+  most recent first.
+
 ### Changed
 
 - License changed from AGPL-3.0-only to Apache-2.0. Applies going forward only; releases already
