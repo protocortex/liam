@@ -632,7 +632,10 @@ mod tests {
         // Given the ceiling's permits are all currently held by real traffic
         let handle = Arc::new(tokio::sync::Semaphore::new(4));
         let granted_capacity = Arc::new(std::sync::atomic::AtomicUsize::new(4));
-        let _held = handle.clone().try_acquire_many_owned(4).expect("hold all permits");
+        let _held = handle
+            .clone()
+            .try_acquire_many_owned(4)
+            .expect("hold all permits");
 
         // When the benchmark would otherwise shrink capacity to 1
         reconcile_capacity_after_benchmark(&handle, &granted_capacity, 4, 1);
