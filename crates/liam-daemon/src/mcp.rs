@@ -4434,8 +4434,12 @@ mod tests {
         let permits = other_connection.generation_permits_handle();
         let window = other_connection.rolling_window_handle();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // A separate grounded double, not `llm`: `MockLlm`'s echo reply is fine
+        // for `ask` (grounded by the question's own wording) but dilutes far
+        // below the grounded-word threshold with no mentions to draw from.
+        let synthesis_llm = CountingLlm::new();
         synthesis::synthesize_entity(
-            &*llm,
+            &synthesis_llm,
             &permits,
             &window,
             deadline,
