@@ -225,7 +225,8 @@ fn build_autotuned_server(
     model_fingerprint: String,
     backend: String,
 ) -> MemoryServer {
-    let cached = tuning::load_cached(&cache_dir, &model_fingerprint, &backend);
+    let ceiling = tuning::memory_ceiling(ask_context_tokens);
+    let cached = tuning::load_cached(&cache_dir, &model_fingerprint, &backend, ask_context_tokens);
     let server = MemoryServer::new(
         store,
         embedder,
@@ -234,17 +235,28 @@ fn build_autotuned_server(
         ask_timeout_secs,
         ask_sufficiency_check,
         ask_context_tokens,
-        cached.unwrap_or(1),
+        cached.unwrap_or(ceiling),
     );
 
     if cached.is_none() {
         let handle = server.generation_permits_handle();
-        let ceiling = tuning::memory_ceiling();
         tokio::spawn(async move {
-            let result = tuning::cold_start_benchmark(&*llm, ceiling).await;
-            tuning::save_cache(&cache_dir, &model_fingerprint, &backend, result);
-            if result > 1 {
-                handle.add_permits(result - 1);
+            let result = tuning::cold_start_benchmark(&*llm, ceiling, &handle).await;
+            tuning::save_cache(
+                &cache_dir,
+                &model_fingerprint,
+                &backend,
+                result,
+                ask_context_tokens,
+            );
+            // Best-effort trim back to the throughput-optimal level: if real
+            // traffic is concurrently holding some of the ceiling's headroom
+            // right now, this just leaves that headroom in place rather than
+            // blocking startup on reclaiming it.
+            if result < ceiling {
+                if let Ok(permit) = handle.try_acquire_many((ceiling - result) as u32) {
+                    permit.forget();
+                }
             }
         });
     }
@@ -457,7 +469,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn autotuned_server_accepts_requests_before_the_benchmark_completes() {
+    async fn autotuned_server_accepts_requests_up_to_the_memory_ceiling_before_the_benchmark_completes(
+    ) {
         // Given no cache file, so a benchmark runs, gated so it never
         // resolves in this test
         let dir = tempfile::tempdir().expect("tempdir");
@@ -465,6 +478,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let llm_double = Arc::new(GatedCountingLlm::new(release));
         let llm: Arc<dyn Llm> = llm_double.clone();
+        let ceiling = tuning::memory_ceiling(8192);
 
         // When the server is built
         let server = build_autotuned_server(
@@ -480,9 +494,13 @@ mod tests {
             "cpu".to_string(),
         );
 
-        // Then it is already usable at the safe floor before the benchmark
-        // resolves, and the benchmark has genuinely started in the background
-        assert_eq!(server.generation_permits_handle().available_permits(), 1);
+        // Then it is already usable up to the memory-safe ceiling before the
+        // benchmark resolves, and the benchmark has genuinely started in the
+        // background, holding one of those same permits for its own probe
+        assert_eq!(
+            server.generation_permits_handle().available_permits(),
+            ceiling
+        );
         tokio::task::yield_now().await;
         assert_eq!(
             llm_double.calls(),
@@ -491,8 +509,8 @@ mod tests {
         );
         assert_eq!(
             server.generation_permits_handle().available_permits(),
-            1,
-            "permits must not grow until the gated benchmark resolves"
+            ceiling - 1,
+            "the benchmark's own probe must hold a real permit from the shared semaphore"
         );
     }
 
@@ -501,7 +519,7 @@ mod tests {
         // Given a cache entry matching the fingerprint used below
         let dir = tempfile::tempdir().expect("tempdir");
         let cache_dir = dir.path().to_str().expect("utf8 path").to_string();
-        tuning::save_cache(&cache_dir, "model/quant", "cpu", 4);
+        tuning::save_cache(&cache_dir, "model/quant", "cpu", 4, 8192);
         let release = Arc::new(tokio::sync::Notify::new());
         let llm_double = Arc::new(GatedCountingLlm::new(release));
         let llm: Arc<dyn Llm> = llm_double.clone();
