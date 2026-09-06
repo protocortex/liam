@@ -204,9 +204,9 @@ pub fn build_ask_prompt(question: &str, evidence: &[Evidence]) -> (String, Strin
 /// generation actually uses.
 const ANSWER_TOKEN_RESERVE: usize = 512;
 
-/// Trim `evidence` from the tail until the rendered `ask` prompt (system AND
-/// user, both returned by `build_ask_prompt`, so the long fixed system prompt
-/// is counted too, not just the part that varies) plus `ANSWER_TOKEN_RESERVE`
+/// Trim `evidence` from the tail until the rendered prompt (system AND user,
+/// both returned by the caller's `render` closure, so a long fixed system
+/// prompt is counted too, not just the part that varies) plus `ANSWER_TOKEN_RESERVE`
 /// fits inside `budget`, as measured by `count`. Retrieval ranks best-first,
 /// so the tail holds the lowest-ranked items and dropping it first keeps the
 /// strongest evidence.
