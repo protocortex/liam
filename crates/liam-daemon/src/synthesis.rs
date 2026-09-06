@@ -4,13 +4,12 @@
 use std::sync::{Arc, Mutex};
 
 use liam_model::{Llm, ModelError, Result};
-use tokio::sync::Semaphore;
 
 use crate::ask::{
     estimate_tokens, fit_evidence_to_budget, fmt_millis, is_grounded, neutralize_fence, truncate,
     Evidence,
 };
-use crate::tuning::RollingWindow;
+use crate::tuning::{self, AimdHandles, RollingWindow};
 
 /// Cap on the entity kind/label rendered into the prompt: both are
 /// caller-supplied, same untrusted-length concern as evidence content.
@@ -75,7 +74,7 @@ pub fn build_synthesis_prompt(
 #[allow(clippy::too_many_arguments)] // each argument is a distinct value, no natural grouping
 pub async fn synthesize_entity(
     llm: &dyn Llm,
-    permit_semaphore: &Arc<Semaphore>,
+    aimd: &AimdHandles,
     rolling_window: &Arc<Mutex<RollingWindow>>,
     deadline: tokio::time::Instant,
     entity_kind: &str,
@@ -86,7 +85,9 @@ pub async fn synthesize_entity(
 ) -> Result<String> {
     let acquire_start = tokio::time::Instant::now();
     let _permit =
-        match tokio::time::timeout_at(deadline, permit_semaphore.clone().acquire_owned()).await {
+        match tokio::time::timeout_at(deadline, aimd.generation_permits.clone().acquire_owned())
+            .await
+        {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
                 return Err(ModelError::Llm(
@@ -123,10 +124,13 @@ pub async fn synthesize_entity(
             "timed out generating the entity synthesis".to_string(),
         )),
     };
-    rolling_window
-        .lock()
-        .expect("rolling window mutex poisoned")
-        .record(queue_wait, generation_start.elapsed());
+    tuning::record_and_maybe_evaluate(
+        rolling_window,
+        aimd.clone(),
+        queue_wait,
+        generation_start.elapsed(),
+        context_tokens,
+    );
     let profile = result?;
 
     // Last line of defence against prompt injection and free-running
@@ -145,12 +149,25 @@ pub async fn synthesize_entity(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
 
     use tokio::sync::Semaphore;
 
     use super::*;
     use crate::ask::Evidence;
+
+    /// Fresh AIMD state with no prior evaluation and no held-back permit,
+    /// mirroring `tuning.rs`'s own private `test_handles`.
+    fn test_handles(generation_permits: Arc<Semaphore>, granted_capacity: usize) -> AimdHandles {
+        AimdHandles {
+            generation_permits,
+            granted_capacity: Arc::new(AtomicUsize::new(granted_capacity)),
+            held_permit: Arc::new(Mutex::new(None)),
+            evaluating: Arc::new(AtomicBool::new(false)),
+            previous_window_average: Arc::new(Mutex::new(None)),
+        }
+    }
 
     fn mention(kind: &str, label: &str, content: &str, valid_from_ms: i64) -> Evidence {
         Evidence {
@@ -264,14 +281,14 @@ mod tests {
             mention("fact", "Location", "Lives in Lisbon.", 0),
         ];
         let llm = RecordingLlm::new();
-        let permits = Arc::new(Semaphore::new(1));
+        let aimd = test_handles(Arc::new(Semaphore::new(1)), 1);
         let window = Arc::new(Mutex::new(RollingWindow::new()));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         // Act
         synthesize_entity(
             &llm,
-            &permits,
+            &aimd,
             &window,
             deadline,
             "person",
@@ -309,14 +326,14 @@ mod tests {
         // Arrange
         let mentions = vec![mention("fact", "Role", "Works as an engineer.", 0)];
         let llm = UngroundedLlm;
-        let permits = Arc::new(Semaphore::new(1));
+        let aimd = test_handles(Arc::new(Semaphore::new(1)), 1);
         let window = Arc::new(Mutex::new(RollingWindow::new()));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         // Act
         let result = synthesize_entity(
             &llm,
-            &permits,
+            &aimd,
             &window,
             deadline,
             "person",
@@ -339,14 +356,14 @@ mod tests {
         // Arrange
         let mentions = vec![mention("fact", "Role", "Works as an engineer.", 0)];
         let llm = FailingLlm;
-        let permits = Arc::new(Semaphore::new(1));
+        let aimd = test_handles(Arc::new(Semaphore::new(1)), 1);
         let window = Arc::new(Mutex::new(RollingWindow::new()));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         // Act
         let result = synthesize_entity(
             &llm,
-            &permits,
+            &aimd,
             &window,
             deadline,
             "person",
@@ -369,13 +386,14 @@ mod tests {
         let llm = RecordingLlm::new();
         let permits = Arc::new(Semaphore::new(1));
         permits.close();
+        let aimd = test_handles(permits, 1);
         let window = Arc::new(Mutex::new(RollingWindow::new()));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         // Act
         let result = synthesize_entity(
             &llm,
-            &permits,
+            &aimd,
             &window,
             deadline,
             "person",
@@ -409,6 +427,7 @@ mod tests {
             .acquire_owned()
             .await
             .expect("hold the sole permit");
+        let aimd = test_handles(permits, 1);
         let window = Arc::new(Mutex::new(RollingWindow::new()));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
 
@@ -417,7 +436,7 @@ mod tests {
         let (result, ()) = tokio::join!(
             synthesize_entity(
                 &llm,
-                &permits,
+                &aimd,
                 &window,
                 deadline,
                 "person",
@@ -435,6 +454,62 @@ mod tests {
             err.to_string()
                 .contains("timed out waiting for a generation slot"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesize_entity_closing_a_window_boundary_triggers_an_aimd_evaluation() {
+        // Arrange: 49 direct records, so the 50th call, made through
+        // synthesize_entity itself, closes the window boundary.
+        let mentions = vec![mention("fact", "Role", "Works as an engineer.", 0)];
+        let llm = RecordingLlm::new();
+        let window = Arc::new(Mutex::new(RollingWindow::new()));
+        {
+            let mut w = window.lock().expect("window lock");
+            for _ in 0..49 {
+                w.record(
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(1),
+                );
+            }
+        }
+        let aimd = test_handles(Arc::new(Semaphore::new(1)), 1);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // Act: the 50th recorded call, driven by synthesize_entity.
+        let _ = synthesize_entity(
+            &llm,
+            &aimd,
+            &window,
+            deadline,
+            "person",
+            "Ada Lovelace",
+            &mentions,
+            100,
+            64,
+        )
+        .await;
+
+        // `evaluate` runs on a spawned task; yield until `decide`'s one
+        // unconditional side effect lands (set before any grow/shrink check).
+        let mut evaluated = false;
+        for _ in 0..10_000 {
+            if aimd
+                .previous_window_average
+                .lock()
+                .expect("previous window average mutex poisoned")
+                .is_some()
+            {
+                evaluated = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Assert
+        assert!(
+            evaluated,
+            "a window boundary closed by an entity-synthesis call must trigger evaluate()"
         );
     }
 }

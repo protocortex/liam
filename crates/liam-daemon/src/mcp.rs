@@ -917,7 +917,7 @@ impl MemoryServer {
         };
         let new_content = match synthesis::synthesize_entity(
             &*self.llm,
-            &self.generation_permits,
+            &self.aimd_handles(),
             &self.rolling_window,
             deadline,
             &candidate.kind,
@@ -4431,8 +4431,8 @@ mod tests {
                 as_of: None,
             }))
             .await;
-        let permits = other_connection.generation_permits_handle();
         let window = other_connection.rolling_window_handle();
+        let aimd = other_connection.aimd_handles();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         // A separate grounded double, not `llm`: `MockLlm`'s echo reply is fine
         // for `ask` (grounded by the question's own wording) but dilutes far
@@ -4440,7 +4440,7 @@ mod tests {
         let synthesis_llm = CountingLlm::new();
         synthesis::synthesize_entity(
             &synthesis_llm,
-            &permits,
+            &aimd,
             &window,
             deadline,
             "person",
