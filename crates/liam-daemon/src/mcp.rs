@@ -5203,6 +5203,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeline_reports_not_live_for_a_node_with_a_future_valid_from() {
+        // Given a resolvable handle whose node isn't valid-time-live yet
+        let server = plain_server().await;
+        let one_day_ms = 24 * 60 * 60 * 1000;
+        let future_entity = NewNode::entity("person", "Future Person")
+            .with_valid_from(Millis(Millis::now().0 + one_day_ms));
+        let entity_id = server
+            .store
+            .insert(future_entity)
+            .await
+            .expect("seed future entity");
+
+        // When timeline runs
+        let out = server
+            .timeline(Parameters(TimelineArgs {
+                entity: entity_id.as_str().to_string(),
+            }))
+            .await;
+
+        // Then it reports the node as not currently live, not a crash
+        // or an unresolvable-handle error
+        assert_eq!(
+            out,
+            format!(
+                "timeline failed: {} is not currently live",
+                entity_id.handle()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn timeline_on_an_entity_with_no_mentions_says_so() {
         // Given an entity created directly, with no mentions edges at all
         let server = plain_server().await;
