@@ -757,6 +757,11 @@ impl<B: Backend> Graph<B> {
         as_of: Millis,
         limit: usize,
     ) -> Result<Vec<Candidate>> {
+        // Over-fetch, matching `query_core`'s pool: the edge predicate alone
+        // doesn't know a `dst` node was later superseded, so hydration below
+        // can drop candidates and must not do so out of a bare `limit`-sized
+        // pool.
+        let pool = limit.max(1) * 3;
         let rows = self
             .backend
             .query(
@@ -767,7 +772,7 @@ impl<B: Backend> Graph<B> {
                     entity_id.as_str().into(),
                     crate::types::relation::MENTIONS.into(),
                     as_of.into(),
-                    (limit as i64).into(),
+                    (pool as i64).into(),
                 ],
             )
             .await?;
@@ -775,7 +780,9 @@ impl<B: Backend> Graph<B> {
         let candidates = self
             .fetch_candidates(&ordered_ids, as_of, None, None)
             .await?;
-        Ok(reorder_by_recency(candidates, &ordered_ids))
+        let mut reordered = reorder_by_recency(candidates, &ordered_ids);
+        reordered.truncate(limit);
+        Ok(reordered)
     }
 
     async fn query_core(&self, q: &Query) -> Result<Vec<ExplainedHit>> {
@@ -2149,6 +2156,54 @@ mod tests {
         // Assert
         let ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
         assert_eq!(ids, expected_recency_order);
+    }
+
+    #[tokio::test]
+    async fn mentions_does_not_undercount_when_the_most_recent_edge_targets_a_superseded_node() {
+        // Arrange: two live mentions, then a third, most-recent-by-tx_from
+        // mentions edge to a node that is later superseded. The edge itself
+        // stays live forever (`supersede` never touches edges), so it would
+        // previously have consumed the `LIMIT` slot ahead of a still-live
+        // mention.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let first = g
+            .insert(NewNode::now("fact", "first", "note one"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &first, relation::MENTIONS))
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        let second = g
+            .insert(NewNode::now("fact", "second", "note two"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &second, relation::MENTIONS))
+            .await
+            .unwrap();
+        clock.set(Millis(3000));
+        let stale = g
+            .insert(NewNode::now("fact", "stale", "note three"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &stale, relation::MENTIONS))
+            .await
+            .unwrap();
+        clock.set(Millis(4000));
+        g.supersede(&stale, NewNode::now("fact", "stale", "replacement"))
+            .await
+            .unwrap();
+
+        // Act
+        let found = g.mentions(&entity, Millis(4000), 2).await.unwrap();
+
+        // Assert: both still-live mentions come back, not just one.
+        let ids: Vec<NodeId> = found.into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![second, first]);
     }
 
     #[tokio::test]
