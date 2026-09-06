@@ -906,12 +906,16 @@ impl MemoryServer {
         // answer prompt, would let the pre-pass vouch for evidence the answer
         // never sees. The closure prefers the model's real count and only
         // falls back to the estimate when the provider cannot count.
-        let evidence =
-            fit_evidence_to_budget(&args.question, &evidence, self.ask_context_tokens, |s| {
+        let evidence = fit_evidence_to_budget(
+            |slice| build_ask_prompt(&args.question, slice),
+            &evidence,
+            self.ask_context_tokens,
+            |s| {
                 self.llm
                     .count_tokens(s)
                     .unwrap_or_else(|| estimate_tokens(s))
-            });
+            },
+        );
 
         // One deadline for the whole request: the permit acquire, the
         // sufficiency pre-pass, and synthesis below all race against this

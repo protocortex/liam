@@ -204,9 +204,9 @@ pub fn build_ask_prompt(question: &str, evidence: &[Evidence]) -> (String, Strin
 /// generation actually uses.
 const ANSWER_TOKEN_RESERVE: usize = 512;
 
-/// Trim `evidence` from the tail until the rendered `ask` prompt (system AND
-/// user, both returned by `build_ask_prompt`, so the long fixed system prompt
-/// is counted too, not just the part that varies) plus `ANSWER_TOKEN_RESERVE`
+/// Trim `evidence` from the tail until the rendered prompt (system AND user,
+/// both returned by the caller's `render` closure, so a long fixed system
+/// prompt is counted too, not just the part that varies) plus `ANSWER_TOKEN_RESERVE`
 /// fits inside `budget`, as measured by `count`. Retrieval ranks best-first,
 /// so the tail holds the lowest-ranked items and dropping it first keeps the
 /// strongest evidence.
@@ -223,16 +223,16 @@ const ANSWER_TOKEN_RESERVE: usize = 512;
 /// `count` is injected so this stays testable without a model: the real
 /// caller passes `Llm::count_tokens`/`estimate_tokens`, tests pass a plain
 /// closure such as counting characters.
-pub fn fit_evidence_to_budget<'a>(
-    question: &str,
-    evidence: &'a [Evidence],
+pub fn fit_evidence_to_budget(
+    render: impl Fn(&[Evidence]) -> (String, String),
+    evidence: &[Evidence],
     budget: usize,
     count: impl Fn(&str) -> usize,
-) -> &'a [Evidence] {
+) -> &[Evidence] {
     let allowance = budget.saturating_sub(ANSWER_TOKEN_RESERVE);
     let mut kept = evidence.len();
     while kept > 1 {
-        let (system, user) = build_ask_prompt(question, &evidence[..kept]);
+        let (system, user) = render(&evidence[..kept]);
         if count(&system) + count(&user) <= allowance {
             break;
         }
@@ -981,7 +981,12 @@ mod tests {
         ];
 
         // Act
-        let kept = fit_evidence_to_budget("Q?", &items, 100_000, |s| s.chars().count());
+        let kept = fit_evidence_to_budget(
+            |slice| build_ask_prompt("Q?", slice),
+            &items,
+            100_000,
+            |s| s.chars().count(),
+        );
 
         // Assert: nothing dropped, and original best-first order is preserved.
         assert_eq!(kept.len(), 3);
@@ -1015,7 +1020,8 @@ mod tests {
         let budget = tokens_for_2 + ANSWER_TOKEN_RESERVE;
 
         // Act
-        let kept = fit_evidence_to_budget("Q?", &items, budget, count);
+        let kept =
+            fit_evidence_to_budget(|slice| build_ask_prompt("Q?", slice), &items, budget, count);
 
         // Assert: exactly the 2 strongest items survive, in their original
         // order, not merely 2 items of any identity.
@@ -1041,7 +1047,8 @@ mod tests {
         let budget = exact_tokens + ANSWER_TOKEN_RESERVE;
 
         // Act
-        let kept = fit_evidence_to_budget("Q?", &items, budget, count);
+        let kept =
+            fit_evidence_to_budget(|slice| build_ask_prompt("Q?", slice), &items, budget, count);
 
         // Assert
         assert_eq!(kept.len(), 3);
@@ -1057,7 +1064,12 @@ mod tests {
         let items = vec![evidence("fact", "Solo", &"x".repeat(2000), 0)];
 
         // Act
-        let kept = fit_evidence_to_budget("Q?", &items, 1, |s| s.chars().count());
+        let kept = fit_evidence_to_budget(
+            |slice| build_ask_prompt("Q?", slice),
+            &items,
+            1,
+            |s| s.chars().count(),
+        );
 
         // Assert: the single item is returned, not zero, and nothing panicked.
         assert_eq!(kept.len(), 1);
@@ -1074,7 +1086,12 @@ mod tests {
         ];
 
         // Act
-        let kept = fit_evidence_to_budget("Q?", &items, 10, |s| s.chars().count());
+        let kept = fit_evidence_to_budget(
+            |slice| build_ask_prompt("Q?", slice),
+            &items,
+            10,
+            |s| s.chars().count(),
+        );
 
         // Assert: never zero, never a panic, and it is the best-ranked item.
         assert_eq!(kept.len(), 1);
