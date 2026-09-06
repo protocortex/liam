@@ -1291,6 +1291,7 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
         in_flight: std::sync::atomic::AtomicUsize,
         peak: std::sync::atomic::AtomicUsize,
+        grounded: bool,
     }
 
     impl GatedLlm {
@@ -1299,6 +1300,19 @@ mod tests {
                 release,
                 in_flight: std::sync::atomic::AtomicUsize::new(0),
                 peak: std::sync::atomic::AtomicUsize::new(0),
+                grounded: false,
+            }
+        }
+
+        /// As `new`, but replies with `grounded_entity_reply(prompt)` instead
+        /// of the fixed literal, for the one call site that gates entity
+        /// synthesis rather than `ask`.
+        fn new_grounded(release: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                release,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                grounded: true,
             }
         }
 
@@ -1313,7 +1327,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl liam_model::Llm for GatedLlm {
-        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+        async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
             let now = self
                 .in_flight
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -1323,7 +1337,11 @@ mod tests {
             self.release.notified().await;
             self.in_flight
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("the wibbleflux service runs nightly [1].".to_string())
+            if self.grounded {
+                Ok(grounded_entity_reply(prompt))
+            } else {
+                Ok("the wibbleflux service runs nightly [1].".to_string())
+            }
         }
     }
 
@@ -1342,8 +1360,24 @@ mod tests {
         panic!("condition never became true; the two tasks likely deadlocked");
     }
 
-    /// Counts calls and always succeeds with a fixed reply, for entity
-    /// synthesis tests that assert on call count.
+    /// Extracts "(kind) label" from a synthesis prompt's "Entity: (kind) label" line and
+    /// echoes it back verbatim, which `is_grounded` always accepts (the reply is a subset
+    /// of its own vocabulary seed) regardless of which entity or how short its label is.
+    fn grounded_entity_reply(prompt: &str) -> String {
+        let line = prompt
+            .lines()
+            .find(|l| l.starts_with("Entity: ("))
+            .expect("synthesis prompt must have an Entity line");
+        let rest = line.trim_start_matches("Entity: (");
+        let close = rest
+            .find(')')
+            .expect("Entity line must have a closing paren");
+        format!("{} {}", &rest[..close], rest[close + 1..].trim())
+    }
+
+    /// Counts calls and always succeeds with a reply grounded in the
+    /// entity's own kind/label, for entity synthesis tests that assert on
+    /// call count.
     struct CountingLlm {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -1362,14 +1396,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl liam_model::Llm for CountingLlm {
-        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+        async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("a synthesized entity profile".to_string())
+            Ok(grounded_entity_reply(prompt))
         }
     }
 
-    /// Errors on its first call only, succeeds after: pins that one
-    /// entity's failure must not drop another entity's success.
+    /// Errors on its first call only, succeeds after with a reply grounded
+    /// in the entity's own kind/label: pins that one entity's failure must
+    /// not drop another entity's success.
     struct FirstCallErrorsLlm {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -1384,12 +1419,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl liam_model::Llm for FirstCallErrorsLlm {
-        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+        async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
                 Err(liam_model::ModelError::Llm("boom".into()))
             } else {
-                Ok("the surviving entity profile".to_string())
+                Ok(grounded_entity_reply(prompt))
             }
         }
     }
@@ -2679,8 +2714,15 @@ mod tests {
         // Given one nested fact and two entities, with an edge from
         // "fact:1" to "entity:1". Combined indices: 0 = top-level fact, 1 =
         // the nested fact, 2 = entity 0, 3 = entity 1, so this exercises the
-        // nontrivial `1 + fact_count + j` arithmetic.
-        let server = plain_server().await;
+        // nontrivial `1 + fact_count + j` arithmetic. Uses `CountingLlm`
+        // instead of `plain_server`'s `MockLlm` because this episode
+        // triggers entity synthesis, which `MockLlm`'s echo cannot pass
+        // `is_grounded`.
+        let server = server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(CountingLlm::new()),
+        )
+        .await;
 
         // When remember is called
         let out = server
@@ -2901,16 +2943,16 @@ mod tests {
                 "original entity id should have been superseded by its own resynthesis: {out}"
             );
         }
-        let hits = server
-            .store
-            .query_explained(&Query::text("a synthesized entity profile"))
-            .await
-            .unwrap();
         for label in ["Both One", "Both Two"] {
+            let expected_content = format!("person {label}");
+            let hits = server
+                .store
+                .query_explained(&Query::text(expected_content.as_str()))
+                .await
+                .unwrap();
             assert!(
-                hits.iter().any(
-                    |h| h.hit.label == label && h.hit.content == "a synthesized entity profile"
-                ),
+                hits.iter()
+                    .any(|h| h.hit.label == label && h.hit.content == expected_content),
                 "{label}'s resynthesized content should already be queryable: {out}"
             );
         }
@@ -2947,13 +2989,14 @@ mod tests {
         );
         let hits = server
             .store
-            .query_explained(&Query::text("a synthesized entity profile"))
+            .query_explained(&Query::text("person Kim"))
             .await
             .unwrap();
         let new_entity = hits
             .iter()
             .find(|h| h.hit.label == "Kim")
             .expect("resynthesized entity missing");
+        assert_eq!(new_entity.hit.content, "person Kim");
         assert_eq!(new_entity.hit.attributes, json!({"role": "engineer"}));
     }
 
@@ -2993,7 +3036,7 @@ mod tests {
         // to a proj-x-scoped query...
         let scoped = server
             .store
-            .query_explained(&Query::text("a synthesized entity profile").with_scope("proj-x"))
+            .query_explained(&Query::text("person Priya").with_scope("proj-x"))
             .await
             .unwrap();
         assert!(
@@ -3005,7 +3048,7 @@ mod tests {
         // guarantee a scope-dropping rebuild would silently break
         let other_scope = server
             .store
-            .query_explained(&Query::text("a synthesized entity profile").with_scope("proj-y"))
+            .query_explained(&Query::text("person Priya").with_scope("proj-y"))
             .await
             .unwrap();
         assert!(
@@ -3065,7 +3108,7 @@ mod tests {
         // 2 permits, not the shipped default of 1: only then can peak
         // reach 2, proving true concurrency, not just bounded queuing.
         let release = Arc::new(tokio::sync::Notify::new());
-        let llm = Arc::new(GatedLlm::new(release.clone()));
+        let llm = Arc::new(GatedLlm::new_grounded(release.clone()));
         let server = Arc::new(
             server_with_generation_limit(
                 Arc::new(liam_model::IdentityReranker),
@@ -3140,12 +3183,28 @@ mod tests {
             .await;
 
         // Then both outcomes are recorded: one entity's content was
-        // compiled, the other is named in the failure list
-        let succeeded = server
+        // compiled, the other is named in the failure list. Filtered to an
+        // exact content match, not just a lexical hit: the FTS search for
+        // "person Mixed One" also surfaces "person Mixed Two" (they share
+        // both words), so raw hit count alone would not tell the two apart.
+        let mut succeeded: Vec<_> = server
             .store
-            .query_explained(&Query::text("the surviving entity profile"))
+            .query_explained(&Query::text("person Mixed One"))
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|h| h.hit.content == "person Mixed One")
+            .collect();
+        if succeeded.is_empty() {
+            succeeded = server
+                .store
+                .query_explained(&Query::text("person Mixed Two"))
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|h| h.hit.content == "person Mixed Two")
+                .collect();
+        }
         assert_eq!(
             succeeded.len(),
             1,
@@ -3216,7 +3275,7 @@ mod tests {
     async fn remember_synthesizes_a_mentioned_entity_from_its_real_mention_content() {
         // Given a fresh entity linked to a fact via a correctly-directed
         // mentions edge (`from`: entity, `to`: fact)
-        let llm = Arc::new(RecordingLlm::new("a synthesized entity profile"));
+        let llm = Arc::new(RecordingLlm::new("person Xyzzy Entity"));
         let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
 
         // When remember runs
@@ -3247,8 +3306,15 @@ mod tests {
         // Given a prior, separate `remember` call establishing entity
         // "Grace" as live, and a separate fact remembered before this
         // episode, so this episode's third edge can reference it by its
-        // handle string rather than an episode-local index
-        let server = plain_server().await;
+        // handle string rather than an episode-local index. Uses
+        // `CountingLlm` instead of `plain_server`'s `MockLlm` because this
+        // episode triggers entity synthesis, which `MockLlm`'s echo cannot
+        // pass `is_grounded`.
+        let server = server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(CountingLlm::new()),
+        )
+        .await;
 
         let prior_entity_out = server
             .remember(Parameters(RememberArgs {
