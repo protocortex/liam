@@ -765,13 +765,18 @@ impl MemoryServer {
                 }
 
                 if !triggered.is_empty() {
+                    // One shared deadline for the whole triggered batch,
+                    // mirroring `ask`'s "one deadline for the whole request" pattern.
+                    let entity_synthesis_deadline = tokio::time::Instant::now()
+                        + Duration::from_secs(self.ask_timeout_secs.max(1));
                     // Spawned to run concurrently; collection stays
                     // sequential so no outcome is ever dropped.
                     let mut handles = Vec::with_capacity(triggered.len());
                     for entity_id in triggered {
                         let server = self.clone();
+                        let deadline = entity_synthesis_deadline;
                         handles.push(tokio::spawn(async move {
-                            server.resynthesize_entity(entity_id).await
+                            server.resynthesize_entity(entity_id, deadline).await
                         }));
                     }
                     for handle in handles {
@@ -793,9 +798,13 @@ impl MemoryServer {
         }
     }
 
-    /// Recompiles one entity's page from its mentions after `remember`'s
-    /// episode already committed; a failure is reported, never panicked.
-    async fn resynthesize_entity(&self, entity_id: liam_store::NodeId) -> Result<(), String> {
+    /// Recompiles one entity's page from its mentions using `remember`'s
+    /// shared batch deadline; a failure is reported, never panicked.
+    async fn resynthesize_entity(
+        &self,
+        entity_id: liam_store::NodeId,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
         let now = liam_store::Millis::now();
         let candidate = match self.store.get(&entity_id, now).await {
             Ok(Some(c)) => c,
@@ -816,10 +825,6 @@ impl MemoryServer {
             Ok(rows) => rows.iter().map(ask::Evidence::from_candidate).collect(),
             Err(e) => return Err(format!("{label}: {e}")),
         };
-        // A fresh deadline per entity: each entity's synthesis is
-        // independent of every other entity's.
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(self.ask_timeout_secs.max(1));
         let new_content = match synthesis::synthesize_entity(
             &*self.llm,
             &self.generation_permits,
@@ -2973,8 +2978,9 @@ mod tests {
 
         // When its resynthesis runs, the same per-entity flow `remember`
         // triggers for a freshly mentioned entity
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         server
-            .resynthesize_entity(entity_id.clone())
+            .resynthesize_entity(entity_id.clone(), deadline)
             .await
             .expect("resynthesis should succeed");
 
@@ -3013,8 +3019,9 @@ mod tests {
 
         // When its resynthesis runs, the same per-entity flow `remember`
         // triggers for a freshly mentioned entity
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         server
-            .resynthesize_entity(entity_id.clone())
+            .resynthesize_entity(entity_id.clone(), deadline)
             .await
             .expect("resynthesis should succeed");
 
@@ -3054,6 +3061,51 @@ mod tests {
         assert!(
             !other_scope.iter().any(|h| h.hit.label == "Priya"),
             "resynthesized entity leaked into the proj-y scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn resynthesize_entity_honors_the_deadline_it_is_given_not_a_fresh_one() {
+        // Given an already-elapsed deadline, a sole permit held all test long,
+        // and an hour-long `ask_timeout_secs` a fresh deadline would never miss.
+        let llm = Arc::new(CountingLlm::new());
+        let server = server_with_generation_limit(
+            Arc::new(liam_model::IdentityReranker),
+            llm,
+            3600,
+            false,
+            8192,
+            1,
+        )
+        .await;
+        let _held = server
+            .generation_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold the sole permit");
+        let entity_id = server
+            .store
+            .upsert_by(NewNode::entity("person", "Deadline Carrier"))
+            .await
+            .expect("seed entity");
+        let already_elapsed = tokio::time::Instant::now() - Duration::from_millis(1);
+
+        // When resynthesis runs with that deadline, guarded by a short real
+        // timeout so a regression that recomputes its own fails, not hangs
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            server.resynthesize_entity(entity_id, already_elapsed),
+        )
+        .await
+        .expect("must fail fast on the passed deadline, not hang on a freshly computed one");
+
+        // Then it fails immediately for having missed THAT deadline, proving
+        // the passed-in value governed the wait rather than a fresh one
+        let err = outcome.expect_err("an already-elapsed deadline must not grant a permit");
+        assert!(
+            err.contains("timed out waiting for a generation slot"),
+            "{err}"
         );
     }
 
