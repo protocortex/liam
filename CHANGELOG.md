@@ -20,7 +20,8 @@ All notable changes to LIAM are recorded here. The format follows
   same episode, does not yet trigger resynthesis.
 
 - `timeline` MCP tool: given an entity handle, returns its compiled page plus its live mentions,
-  most recent first.
+  most recent first. Accepts an optional `limit` (default 50, max 200); a capped result ends with
+  a "(more mentions exist)" trailer instead of claiming an exact total it cannot prove.
 
 ### Changed
 
