@@ -198,8 +198,10 @@ impl EvaluationHooks {
 /// to a shrink/grow decision about the corrected capacity. If the correction
 /// cannot fully reclaim the excess (real traffic holds it), or if capacity
 /// was already within ceiling, falls through to the ordinary decision: a
-/// regression against the prior window shrinks; otherwise a queue-wait-
-/// dominant window grows. `None` (first evaluation) always takes the grow check.
+/// regression exceeding `SHRINK_REGRESSION_THRESHOLD` shrinks; otherwise any
+/// held-back permit releases first, and only when there was none does a
+/// queue-wait-dominant window grow. `None` (first evaluation) always takes
+/// the non-regressing arm.
 async fn decide(
     handles: &AimdHandles,
     window_queue_wait: Duration,
@@ -225,29 +227,41 @@ async fn decide(
     }
 
     match previous {
-        Some(prev) if window_total > prev => shrink(handles).await,
+        Some(prev) if window_total > shrink_bar(prev) => shrink(handles).await,
         _ => {
-            let generation_time = window_total
-                .checked_sub(window_queue_wait)
-                .unwrap_or(Duration::ZERO);
-            if window_queue_wait > generation_time {
-                grow(handles, ceiling);
+            if !release_held_permit(handles) {
+                let generation_time = window_total
+                    .checked_sub(window_queue_wait)
+                    .unwrap_or(Duration::ZERO);
+                if window_queue_wait > generation_time {
+                    grow_new_capacity(handles, ceiling);
+                }
             }
         }
     }
 }
 
-/// Releases a held-back permit if there is one; otherwise adds a new one
-/// while under `ceiling`. Never both in the same call.
-fn grow(handles: &AimdHandles, ceiling: usize) {
+/// The latency bar `window_total` must exceed for a regression to be worth
+/// shrinking capacity for, `SHRINK_REGRESSION_THRESHOLD` above `prev`. Both
+/// `decide`'s comparison and its boundary test call this so the two never
+/// drift from independently re-derived floating-point arithmetic.
+fn shrink_bar(prev: Duration) -> Duration {
+    prev.mul_f64(1.0 + SHRINK_REGRESSION_THRESHOLD)
+}
+
+/// Releases a held-back permit if there is one, returning whether it did.
+/// Never touches `granted_capacity`: a held permit was already counted in it.
+fn release_held_permit(handles: &AimdHandles) -> bool {
     let mut held = handles
         .held_permit
         .lock()
         .expect("held permit mutex poisoned");
-    if held.take().is_some() {
-        return;
-    }
-    drop(held);
+    held.take().is_some()
+}
+
+/// Adds one new permit while under `ceiling`. Call only when there was no
+/// held-back permit to release instead (see `release_held_permit`).
+fn grow_new_capacity(handles: &AimdHandles, ceiling: usize) {
     if handles.granted_capacity.load(Ordering::Relaxed) < ceiling {
         handles.generation_permits.add_permits(1);
         handles.granted_capacity.fetch_add(1, Ordering::Relaxed);
@@ -280,6 +294,16 @@ const MAX_CONCURRENCY_CEILING: usize = 8;
 
 /// Minimum throughput gain the next level must clear to be worth the memory.
 const IMPROVEMENT_THRESHOLD: f64 = 0.10;
+
+/// Minimum latency regression, as a fraction of the prior window, worth
+/// shrinking AIMD capacity for. Gates a different question from
+/// `IMPROVEMENT_THRESHOLD` (whether a higher benchmark concurrency level is
+/// worth the memory, inside `cold_start_benchmark`'s plateau detection): this
+/// one gates whether a regression against the prior window is big enough to
+/// shrink for. Kept as its own constant, even though it shares
+/// `IMPROVEMENT_THRESHOLD`'s current value, so retuning one can never
+/// silently retune the other.
+const SHRINK_REGRESSION_THRESHOLD: f64 = 0.10;
 
 const BENCHMARK_SYSTEM: &str = "You are a helpful assistant.";
 const BENCHMARK_PROMPT: &str = "Say one short sentence about the weather.";
@@ -932,6 +956,80 @@ pub(crate) mod tests {
             .is_none());
         assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
         assert_eq!(permits.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn aimd_decide_shrinks_only_when_the_regression_exceeds_the_shrink_bar() {
+        // Arrange: a fixed prior average, capacity at the ceiling so the
+        // ceiling-correction branch above the match is a no-op for all
+        // three cases.
+        let prev = Duration::from_millis(1000);
+        let bar = shrink_bar(prev);
+        let ceiling = 2;
+
+        for (window_total, should_shrink) in [
+            (bar - Duration::from_millis(1), false),
+            (bar, false),
+            (bar + Duration::from_millis(1), true),
+        ] {
+            let permits = Arc::new(Semaphore::new(ceiling));
+            let handles = test_handles(permits.clone(), ceiling);
+            *handles
+                .previous_window_average
+                .lock()
+                .expect("previous window lock") = Some(prev);
+
+            // Act
+            decide(&handles, Duration::ZERO, window_total, ceiling).await;
+
+            // Assert: strictly over the bar shrinks, at or under it does not
+            assert_eq!(
+                handles
+                    .held_permit
+                    .lock()
+                    .expect("held permit lock")
+                    .is_some(),
+                should_shrink,
+                "window_total {window_total:?} against shrink_bar {bar:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aimd_decide_releases_a_held_permit_on_any_non_regressing_window() {
+        // Arrange: a held-back permit already exists, and the window is
+        // non-regressing (equal to prev) but NOT queue-wait-dominant.
+        let permits = Arc::new(Semaphore::new(2));
+        let handles = test_handles(permits.clone(), 2);
+        let held = permits
+            .clone()
+            .try_acquire_owned()
+            .expect("permit available");
+        *handles.held_permit.lock().expect("held permit lock") = Some(held);
+        let ceiling = 2;
+        let prev = Duration::from_millis(1000);
+        *handles
+            .previous_window_average
+            .lock()
+            .expect("previous window lock") = Some(prev);
+
+        // Act
+        decide(
+            &handles,
+            Duration::from_millis(10),
+            Duration::from_millis(1000),
+            ceiling,
+        )
+        .await;
+
+        // Assert: the held permit released, not a new grow on top of it
+        assert!(handles
+            .held_permit
+            .lock()
+            .expect("held permit lock")
+            .is_none());
+        assert_eq!(permits.available_permits(), 2);
+        assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test(start_paused = true)]
