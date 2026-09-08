@@ -1188,6 +1188,9 @@ pub(crate) mod tests {
         assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
     }
 
+    // Must stay current-thread flavor (the default): POISON_NEXT_DECIDE
+    // relies on the spawned evaluate() task staying on this test's own OS
+    // thread.
     #[tokio::test(start_paused = true)]
     async fn aimd_evaluate_resets_the_guard_and_recovers_after_decide_panics() {
         // Arrange: a queue-wait-dominant window, so a later, real decide()
@@ -1350,6 +1353,39 @@ pub(crate) mod tests {
         // produced; a correction that should not have run touched nothing
         assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 3);
         assert_eq!(permits.available_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn aimd_decide_runs_the_ordinary_decision_when_granted_capacity_equals_the_ceiling() {
+        // Arrange: granted_capacity (4) sits exactly at ceiling (4), the
+        // boundary between the correction branch's `>` and a mutant `>=`.
+        // Seed a previous average low enough that the ordinary shrink logic
+        // would fire if the correction check let it run.
+        let permits = Arc::new(Semaphore::new(4));
+        let handles = test_handles(permits.clone(), 4);
+        let ceiling = 4;
+        *handles
+            .previous_window_average
+            .lock()
+            .expect("previous window lock") = Some(Duration::from_millis(10));
+        let window_total = Duration::from_millis(100);
+
+        // Act
+        decide(&handles, Duration::from_millis(5), window_total, ceiling).await;
+
+        // Assert: shrink actually ran (a permit is held back), proving `>`,
+        // not `>=`, gates the correction; a mutant `>=` would have entered
+        // the correction branch, seen `granted_capacity <= ceiling` already
+        // true, and returned before the shrink decision ever ran.
+        assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), ceiling);
+        assert!(
+            handles
+                .held_permit
+                .lock()
+                .expect("held permit lock")
+                .is_some(),
+            "the ordinary shrink decision must run when capacity is exactly at the ceiling"
+        );
     }
 
     #[test]
