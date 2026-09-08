@@ -368,6 +368,36 @@ async fn join_all<T>(mut futures: Vec<Pin<Box<dyn Future<Output = T> + Send + '_
     .await
 }
 
+/// Moves the semaphore and the AIMD capacity counter from wherever they
+/// actually are right now to the benchmark's throughput-optimal `result`,
+/// capped at `ceiling`. The server starts both at `ceiling` (the memory-safe
+/// maximum) before the benchmark's result is known, so this can shrink as
+/// often as it grows; either way it re-reads `granted_capacity`'s current
+/// value first, since the AIMD engine can grow or shrink it independently
+/// while the benchmark is still running. A shrink is best-effort: if real
+/// traffic is holding the permits this would reclaim, it leaves capacity
+/// where it is rather than blocking startup on reclaiming it.
+pub(crate) fn reconcile_capacity(
+    handle: &Arc<Semaphore>,
+    granted_capacity: &Arc<AtomicUsize>,
+    ceiling: usize,
+    result: usize,
+) {
+    let target = result.clamp(1, ceiling);
+    let current = granted_capacity.load(Ordering::Relaxed);
+    if target > current {
+        let add = target - current;
+        handle.add_permits(add);
+        granted_capacity.fetch_add(add, Ordering::Relaxed);
+    } else if target < current {
+        let shrink = current - target;
+        if let Ok(permit) = handle.try_acquire_many(shrink as u32) {
+            permit.forget();
+            granted_capacity.fetch_sub(shrink, Ordering::Relaxed);
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
     model: String,
@@ -1005,5 +1035,109 @@ pub(crate) mod tests {
         assert!(task1_ran);
         assert_eq!(hooks.decisions.load(Ordering::Relaxed), 1);
         assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn reconcile_capacity_keeps_granted_capacity_in_step_with_the_semaphore() {
+        // Given a floor of 1 in both
+        let handle = Arc::new(Semaphore::new(1));
+        let granted_capacity = Arc::new(AtomicUsize::new(1));
+
+        // When a benchmark result of 4 is applied, well under the ceiling
+        reconcile_capacity(&handle, &granted_capacity, 8, 4);
+
+        // Then both reflect the grow, not just the semaphore
+        assert_eq!(handle.available_permits(), 4);
+        assert_eq!(
+            granted_capacity.load(Ordering::Relaxed),
+            4,
+            "granted_capacity must track a cold-start benchmark's grow"
+        );
+    }
+
+    #[test]
+    fn reconcile_capacity_leaves_both_unchanged_at_the_same_result() {
+        // Given both already at the benchmark's eventual result
+        let handle = Arc::new(Semaphore::new(1));
+        let granted_capacity = Arc::new(AtomicUsize::new(1));
+
+        // When the benchmark result matches current capacity exactly
+        reconcile_capacity(&handle, &granted_capacity, 8, 1);
+
+        // Then neither moves
+        assert_eq!(handle.available_permits(), 1);
+        assert_eq!(granted_capacity.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reconcile_capacity_shrinks_from_the_ceiling_to_a_lower_result() {
+        // Given both starting at the memory-safe ceiling, as
+        // `build_autotuned_server` now starts them before the benchmark
+        // resolves
+        let handle = Arc::new(Semaphore::new(8));
+        let granted_capacity = Arc::new(AtomicUsize::new(8));
+
+        // When the benchmark finds only 3 concurrent calls throughput-optimal
+        reconcile_capacity(&handle, &granted_capacity, 8, 3);
+
+        // Then both shrink to the throughput-optimal result, not stay at the ceiling
+        assert_eq!(handle.available_permits(), 3);
+        assert_eq!(
+            granted_capacity.load(Ordering::Relaxed),
+            3,
+            "granted_capacity must track a cold-start benchmark's shrink"
+        );
+    }
+
+    #[test]
+    fn reconcile_capacity_skips_a_shrink_it_cannot_reclaim() {
+        // Given the ceiling's permits are all currently held by real traffic
+        let handle = Arc::new(Semaphore::new(4));
+        let granted_capacity = Arc::new(AtomicUsize::new(4));
+        let _held = handle
+            .clone()
+            .try_acquire_many_owned(4)
+            .expect("hold all permits");
+
+        // When the benchmark would otherwise shrink capacity to 1
+        reconcile_capacity(&handle, &granted_capacity, 4, 1);
+
+        // Then the shrink is skipped rather than blocking on unavailable permits
+        assert_eq!(
+            granted_capacity.load(Ordering::Relaxed),
+            4,
+            "a shrink that cannot reclaim its permits right now must not corrupt the counter"
+        );
+    }
+
+    #[test]
+    fn reconcile_capacity_does_not_exceed_the_ceiling_when_already_there() {
+        // Given granted_capacity already at the ceiling, as the AIMD engine
+        // could have raised it independently while the benchmark still ran
+        let ceiling = 4;
+        let handle = Arc::new(Semaphore::new(ceiling));
+        let granted_capacity = Arc::new(AtomicUsize::new(ceiling));
+
+        // When the benchmark concludes with a result above the ceiling
+        reconcile_capacity(&handle, &granted_capacity, ceiling, 6);
+
+        // Then neither the semaphore nor the counter exceeds the ceiling
+        assert_eq!(handle.available_permits(), ceiling);
+        assert_eq!(granted_capacity.load(Ordering::Relaxed), ceiling);
+    }
+
+    #[test]
+    fn reconcile_capacity_grows_only_up_to_the_ceiling_not_past_it() {
+        // Given granted_capacity below the ceiling
+        let ceiling = 4;
+        let handle = Arc::new(Semaphore::new(2));
+        let granted_capacity = Arc::new(AtomicUsize::new(2));
+
+        // When the benchmark result would push it past the ceiling if applied raw
+        reconcile_capacity(&handle, &granted_capacity, ceiling, 6);
+
+        // Then it grows only up to the ceiling, not past it
+        assert_eq!(handle.available_permits(), ceiling);
+        assert_eq!(granted_capacity.load(Ordering::Relaxed), ceiling);
     }
 }
