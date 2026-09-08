@@ -697,6 +697,19 @@ impl MemoryServer {
                     "edge {j}: '{}' is reserved for version history",
                     relation::SUPERSEDES
                 ));
+            } else if kind == relation::MENTIONS {
+                if parse_entity_ref(&edge.to, entity_count).is_some() {
+                    problems.push(format!(
+                        "edge {j}: mentions edge must have an entity as 'from' and a fact as \
+                         'to' (to is backwards)"
+                    ));
+                }
+                if parse_fact_ref(&edge.from, fact_count).is_some() {
+                    problems.push(format!(
+                        "edge {j}: mentions edge must have an entity as 'from' and a fact as \
+                         'to' (from is backwards)"
+                    ));
+                }
             }
             for (role, reference) in [("from", edge.from.as_str()), ("to", edge.to.as_str())] {
                 if parse_fact_ref(reference, fact_count).is_none()
@@ -2220,7 +2233,7 @@ mod tests {
                 episode: Some(EpisodeArgs {
                     facts: vec![episode_fact("episodenestedfactmarker")],
                     entities: vec![],
-                    edges: vec![episode_edge("fact:0", "fact:1", "mentions")],
+                    edges: vec![episode_edge("fact:0", "fact:1", "relates_to")],
                 }),
                 ..remember_args("episodetoplevelfactmarker")
             }))
@@ -2273,7 +2286,7 @@ mod tests {
             .relate(Parameters(RelateArgs {
                 from: top_id,
                 to: nested_id,
-                kind: "mentions".to_string(),
+                kind: "relates_to".to_string(),
             }))
             .await;
         assert!(
@@ -2316,6 +2329,154 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_rejects_a_mentions_edge_with_a_fresh_entity_as_to() {
+        // Given an episode whose one edge is a `mentions` edge with a fresh
+        // entity as `to` (backwards: `to` should be a fact) and a
+        // handle-shaped `from`, so only the `to`-is-entity check fires,
+        // independent of the `from`-is-fact check
+        let server = plain_server().await;
+        let existing_handle = seed(
+            &server,
+            "fact",
+            "Existing handle target",
+            "backwards mentions to-entity handle content",
+        )
+        .await;
+        let marker = "backwards mentions to entity content";
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Backwards To Entity")],
+                    edges: vec![episode_edge(&existing_handle, "entity:0", "mentions")],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused, naming the edge index and the backwards
+        // direction, and nothing lands, not even the top-level fact
+        assert!(out.contains("edge 0"), "{out}");
+        assert!(out.contains("backwards"), "{out}");
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_with_episode_rejects_a_mentions_edge_with_a_fresh_fact_as_from() {
+        // Given an episode whose one edge is a `mentions` edge with a fresh
+        // fact as `from` (backwards: `from` should be an entity) and a
+        // handle-shaped `to`, so only the `from`-is-fact check fires,
+        // independent of the `to`-is-entity check
+        let server = plain_server().await;
+        let existing_handle = seed(
+            &server,
+            "fact",
+            "Existing handle target",
+            "backwards mentions from-fact handle content",
+        )
+        .await;
+        let marker = "backwards mentions from fact content";
+        let before = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+
+        // When remember is called with it
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("backwards mentions nested fact content")],
+                    entities: vec![],
+                    edges: vec![episode_edge("fact:1", &existing_handle, "mentions")],
+                }),
+                ..remember_args(marker)
+            }))
+            .await;
+
+        // Then it is refused, naming the edge index and the backwards
+        // direction, and nothing lands, not even the top-level fact
+        assert!(out.contains("edge 0"), "{out}");
+        assert!(out.contains("backwards"), "{out}");
+        let after = server
+            .store
+            .query_explained(&Query::text(marker))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "wrote a node despite rejection: {out}");
+    }
+
+    #[tokio::test]
+    async fn remember_writes_a_mentions_edge_whose_from_is_a_handle_reference_to_an_existing_entity(
+    ) {
+        // Given a live entity from a prior call, referenced afterward by its
+        // handle rather than an episode-local `entity:N` index
+        let server = plain_server().await;
+        let prior_out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Handle Mentions Entity")],
+                    edges: vec![],
+                }),
+                ..remember_args("handle mentions entity top content")
+            }))
+            .await;
+        assert!(!prior_out.contains("failed"), "{prior_out}");
+        let entity_handle = prior_out
+            .lines()
+            .nth(1)
+            .expect("entity line")
+            .trim_start_matches("remembered ")
+            .to_string();
+
+        // When a mentions edge uses that handle as `from` and a fresh fact
+        // as `to`: the correct direction, just with `from` not "entity:N"
+        // syntax
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("handle mentions fact content")],
+                    entities: vec![],
+                    edges: vec![episode_edge(&entity_handle, "fact:1", "mentions")],
+                }),
+                ..remember_args("handle mentions second top content")
+            }))
+            .await;
+
+        // Then it succeeds, and the edge is positively confirmed written: a
+        // "related" line names the exact from/to pair, not just the absence
+        // of a rejection string
+        assert!(!out.contains("failed"), "{out}");
+        let fact_id = out
+            .lines()
+            .nth(1)
+            .expect("fact line")
+            .trim_start_matches("remembered ")
+            .to_string();
+        assert!(
+            out.contains(&format!("related {entity_handle} -mentions-> {fact_id}")),
+            "expected the mentions edge confirmed in the response: {out}"
+        );
     }
 
     #[tokio::test]
@@ -2565,7 +2726,7 @@ mod tests {
                     edges: vec![episode_edge(
                         "fact:0",
                         &format!("  {existing_handle}  "),
-                        "mentions",
+                        "relates_to",
                     )],
                 }),
                 ..remember_args(marker)
@@ -2582,7 +2743,7 @@ mod tests {
             .trim_start_matches("remembered ")
             .to_string();
         assert!(
-            out.contains(&format!("related {top_id} -mentions-> {existing_handle}")),
+            out.contains(&format!("related {top_id} -relates_to-> {existing_handle}")),
             "{out}"
         );
     }
@@ -2673,7 +2834,7 @@ mod tests {
                         },
                     ],
                     entities: vec![],
-                    edges: vec![episode_edge("fact:1", "fact:2", "mentions")],
+                    edges: vec![episode_edge("fact:1", "fact:2", "relates_to")],
                 }),
                 ..remember_args(top_marker)
             }))
@@ -2861,13 +3022,13 @@ mod tests {
 
     #[tokio::test]
     async fn remember_with_episode_edge_references_the_correct_entity_among_several() {
-        // Given one nested fact and two entities, with an edge from
-        // "fact:1" to "entity:1". Combined indices: 0 = top-level fact, 1 =
-        // the nested fact, 2 = entity 0, 3 = entity 1, so this exercises the
-        // nontrivial `1 + fact_count + j` arithmetic. Uses `CountingLlm`
-        // instead of `plain_server`'s `MockLlm` because this episode
-        // triggers entity synthesis, which `MockLlm`'s echo cannot pass
-        // `is_grounded`.
+        // Given one nested fact and two entities, with a correctly-directed
+        // mentions edge from "entity:1" to "fact:1". Combined indices: 0 =
+        // top-level fact, 1 = the nested fact, 2 = entity 0, 3 = entity 1, so
+        // this exercises the nontrivial `1 + fact_count + j` arithmetic on
+        // the entity side. Uses `CountingLlm` instead of `plain_server`'s
+        // `MockLlm` because this episode triggers entity synthesis, which
+        // `MockLlm`'s echo cannot pass `is_grounded`.
         let server = server_with(
             Arc::new(liam_model::IdentityReranker),
             Arc::new(CountingLlm::new()),
@@ -2883,14 +3044,14 @@ mod tests {
                         episode_entity("person", "Eve"),
                         episode_entity("person", "Frank"),
                     ],
-                    edges: vec![episode_edge("fact:1", "entity:1", "mentions")],
+                    edges: vec![episode_edge("entity:1", "fact:1", "mentions")],
                 }),
                 ..remember_args("episode entity among several top content")
             }))
             .await;
 
-        // Then it succeeds, and the edge's destination is SPECIFICALLY the
-        // second entity's node, not the first's or either fact's
+        // Then it succeeds, and the edge's source is SPECIFICALLY the
+        // second entity's node, not the first's
         assert!(!out.contains("failed"), "{out}");
         let mut lines = out.lines();
         let top_id = lines
@@ -2914,13 +3075,13 @@ mod tests {
             .trim_start_matches("remembered ")
             .to_string();
         assert!(
-            out.contains(&format!("related {fact_id} -mentions-> {entity1_id}")),
+            out.contains(&format!("related {entity1_id} -mentions-> {fact_id}")),
             "{out}"
         );
-        for wrong in [&top_id, &fact_id, &entity0_id] {
+        for wrong in [&top_id, &entity0_id] {
             assert!(
-                !out.contains(&format!("related {fact_id} -mentions-> {wrong}")),
-                "edge landed on the wrong node {wrong}: {out}"
+                !out.contains(&format!("related {wrong} -mentions-> {fact_id}")),
+                "edge sourced from the wrong node {wrong}: {out}"
             );
         }
     }
@@ -2991,7 +3152,7 @@ mod tests {
                         episode_entity("person", "Alice"),
                         episode_entity("person", "alice "),
                     ],
-                    edges: vec![episode_edge("entity:0", "entity:1", "mentions")],
+                    edges: vec![episode_edge("entity:0", "entity:1", "relates_to")],
                 }),
                 ..remember_args(top_marker)
             }))
