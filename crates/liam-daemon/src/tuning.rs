@@ -127,6 +127,20 @@ pub(crate) fn record_and_maybe_evaluate(
     });
 }
 
+/// RAII guard: resets `evaluating` to `false` on drop, covering every path
+/// out of the guarded section including a panic, unlike a plain `.store()`
+/// call placed after the guarded work (see `PermitTimer` for the precedent
+/// this follows, `mcp.rs:465-502`).
+struct EvaluatingGuard {
+    evaluating: Arc<AtomicBool>,
+}
+
+impl Drop for EvaluatingGuard {
+    fn drop(&mut self) {
+        self.evaluating.store(false, Ordering::Release);
+    }
+}
+
 /// Single-flight-guarded grow/shrink/no-op decision for one closed window.
 /// Returns whether this call actually ran the decision, `false` if another evaluation was already in flight.
 pub(crate) async fn evaluate(
@@ -142,8 +156,10 @@ pub(crate) async fn evaluate(
     {
         return false;
     }
+    let _guard = EvaluatingGuard {
+        evaluating: handles.evaluating.clone(),
+    };
     decide(&handles, window_queue_wait, window_total, ceiling).await;
-    handles.evaluating.store(false, Ordering::Release);
     true
 }
 
@@ -163,11 +179,13 @@ pub(crate) async fn evaluate_with_hooks(
     {
         return false;
     }
+    let _guard = EvaluatingGuard {
+        evaluating: handles.evaluating.clone(),
+    };
     hooks.reached_pause.notify_one();
     hooks.release.notified().await;
     hooks.decisions.fetch_add(1, Ordering::Relaxed);
     decide(&handles, window_queue_wait, window_total, ceiling).await;
-    handles.evaluating.store(false, Ordering::Release);
     true
 }
 
@@ -191,6 +209,17 @@ impl EvaluationHooks {
     }
 }
 
+thread_local! {
+    /// Test-only seam: when set, the next `decide()` call on this thread
+    /// panics immediately, so a test can drive a real panic through
+    /// `evaluate()`'s normal call path instead of bypassing `decide()`'s own
+    /// logic. Thread-local, not a shared `static`, because the test harness
+    /// runs each test on its own OS thread and `#[tokio::test]`'s
+    /// current-thread runtime keeps every task of one test on that thread.
+    #[cfg(test)]
+    static POISON_NEXT_DECIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// First corrects `granted_capacity` down to `ceiling` when it has been
 /// exceeded (e.g. by a dropped memory ceiling), skipping the rest of this
 /// call only when that correction fully succeeds; its `window_total` was
@@ -208,6 +237,11 @@ async fn decide(
     window_total: Duration,
     ceiling: usize,
 ) {
+    #[cfg(test)]
+    if POISON_NEXT_DECIDE.with(std::cell::Cell::get) {
+        panic!("decide poisoned for test");
+    }
+
     let previous = handles
         .previous_window_average
         .lock()
@@ -1152,6 +1186,66 @@ pub(crate) mod tests {
         assert!(task1_ran);
         assert_eq!(hooks.decisions.load(Ordering::Relaxed), 1);
         assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aimd_evaluate_resets_the_guard_and_recovers_after_decide_panics() {
+        // Arrange: a queue-wait-dominant window, so a later, real decide()
+        // call has an observable effect (a capacity grow) once it runs.
+        let permits = Arc::new(Semaphore::new(1));
+        let handles = test_handles(permits, 1);
+        let ceiling = 4;
+        let queue_wait = Duration::from_millis(80);
+        let total = Duration::from_millis(100);
+        POISON_NEXT_DECIDE.with(|p| p.set(true));
+
+        // Act: drive the panic through evaluate()'s real call path, spawned
+        // the same way the single-flight test above drives its tasks.
+        let joined = tokio::spawn({
+            let handles = handles.clone();
+            async move { evaluate(handles, queue_wait, total, ceiling).await }
+        })
+        .await;
+
+        // Assert: the panic propagates as a task join error, and the guard
+        // still reset despite decide() never returning normally.
+        assert!(
+            joined.is_err(),
+            "decide()'s panic must reach the join handle"
+        );
+        assert!(
+            !handles.evaluating.load(Ordering::Acquire),
+            "the guard must reset even though decide() panicked"
+        );
+
+        // A genuine future panic would not repeat itself, so clear the seam
+        // before proving the AIMD loop is not permanently wedged.
+        POISON_NEXT_DECIDE.with(|p| p.set(false));
+        let ran = evaluate(handles.clone(), queue_wait, total, ceiling).await;
+
+        // Assert: a subsequent evaluate() call still runs, and its decide()
+        // call has the expected, observable effect.
+        assert!(ran, "evaluate() must not be wedged by the earlier panic");
+        assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn evaluating_guard_resets_the_flag_when_dropped_during_a_panic() {
+        // Arrange
+        let evaluating = Arc::new(AtomicBool::new(true));
+        let guard_evaluating = evaluating.clone();
+
+        // Act: unwind out of the guard's scope without ever completing it normally
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = EvaluatingGuard {
+                evaluating: guard_evaluating,
+            };
+            panic!("simulated panic while the guard is held");
+        }));
+
+        // Assert
+        assert!(result.is_err());
+        assert!(!evaluating.load(Ordering::Acquire));
     }
 
     #[tokio::test]
