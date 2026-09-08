@@ -191,7 +191,14 @@ impl EvaluationHooks {
     }
 }
 
-/// A regression against the prior window shrinks; otherwise a queue-wait-
+/// First corrects `granted_capacity` down to `ceiling` when it has been
+/// exceeded (e.g. by a dropped memory ceiling), skipping the rest of this
+/// call only when that correction fully succeeds; its `window_total` was
+/// measured against stale, over-ceiling capacity, so it is not a fair input
+/// to a shrink/grow decision about the corrected capacity. If the correction
+/// cannot fully reclaim the excess (real traffic holds it), or if capacity
+/// was already within ceiling, falls through to the ordinary decision: a
+/// regression against the prior window shrinks; otherwise a queue-wait-
 /// dominant window grows. `None` (first evaluation) always takes the grow check.
 async fn decide(
     handles: &AimdHandles,
@@ -204,6 +211,18 @@ async fn decide(
         .lock()
         .expect("previous window average mutex poisoned")
         .replace(window_total);
+
+    if handles.granted_capacity.load(Ordering::Relaxed) > ceiling {
+        reconcile_capacity(
+            &handles.generation_permits,
+            &handles.granted_capacity,
+            ceiling,
+            ceiling,
+        );
+        if handles.granted_capacity.load(Ordering::Relaxed) <= ceiling {
+            return;
+        }
+    }
 
     match previous {
         Some(prev) if window_total > prev => shrink(handles).await,
@@ -1035,6 +1054,110 @@ pub(crate) mod tests {
         assert!(task1_ran);
         assert_eq!(hooks.decisions.load(Ordering::Relaxed), 1);
         assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn aimd_decide_corrects_granted_capacity_to_ceiling_and_skips_the_latency_decision() {
+        // Arrange: granted_capacity (6) is over ceiling (4) with all 6
+        // permits free, so the correction can fully reclaim the excess. Seed
+        // a previous average low enough that the ordinary shrink logic would
+        // fire if it ran this window.
+        let permits = Arc::new(Semaphore::new(6));
+        let handles = test_handles(permits.clone(), 6);
+        let ceiling = 4;
+        let window_total = Duration::from_millis(100);
+        *handles
+            .previous_window_average
+            .lock()
+            .expect("previous window lock") = Some(Duration::from_millis(10));
+
+        // Act
+        decide(&handles, Duration::from_millis(5), window_total, ceiling).await;
+
+        // Assert: corrected to the ceiling, average recorded regardless, and
+        // the ordinary shrink/grow logic did not also run this window
+        assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), ceiling);
+        assert_eq!(permits.available_permits(), ceiling);
+        assert_eq!(
+            *handles
+                .previous_window_average
+                .lock()
+                .expect("previous window lock"),
+            Some(window_total)
+        );
+        assert!(
+            handles
+                .held_permit
+                .lock()
+                .expect("held permit lock")
+                .is_none(),
+            "shrink must not also fire once the correction already succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn aimd_decide_falls_through_to_the_latency_decision_when_the_ceiling_correction_fails() {
+        // Arrange: granted_capacity (6) is over ceiling (4), excess = 2, but
+        // 5 of the 6 permits are held by real traffic, leaving only 1 free,
+        // so reconcile_capacity's try_acquire_many(2) cannot succeed.
+        let permits = Arc::new(Semaphore::new(6));
+        let mut _held: Vec<_> = Vec::new();
+        for _ in 0..5 {
+            _held.push(
+                permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("permit available"),
+            );
+        }
+        let handles = test_handles(permits.clone(), 6);
+        let ceiling = 4;
+        *handles
+            .previous_window_average
+            .lock()
+            .expect("previous window lock") = Some(Duration::from_millis(10));
+        let window_total = Duration::from_millis(100);
+
+        // Act
+        decide(&handles, Duration::from_millis(5), window_total, ceiling).await;
+
+        // Assert: the correction failed (still over ceiling), but the
+        // fallthrough still ran shrink() against the previously-captured
+        // average rather than silently doing nothing
+        assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 6);
+        assert!(
+            handles
+                .held_permit
+                .lock()
+                .expect("held permit lock")
+                .is_some(),
+            "shrink must actually run on the fallthrough, not silently no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn aimd_decide_leaves_capacity_under_the_ceiling_untouched_by_the_correction_check() {
+        // Arrange: granted_capacity (2) is already at or under ceiling (4),
+        // so the correction check must be a no-op.
+        let permits = Arc::new(Semaphore::new(2));
+        let handles = test_handles(permits.clone(), 2);
+        let ceiling = 4;
+
+        // Act: a queue-wait-dominant window with no prior average, so the
+        // ordinary logic alone takes the grow branch
+        decide(
+            &handles,
+            Duration::from_millis(80),
+            Duration::from_millis(100),
+            ceiling,
+        )
+        .await;
+
+        // Assert: capacity moved only by the grow the ordinary logic
+        // produced; a correction that should not have run touched nothing
+        assert_eq!(handles.granted_capacity.load(Ordering::Relaxed), 3);
+        assert_eq!(permits.available_permits(), 3);
     }
 
     #[test]
