@@ -149,6 +149,7 @@ recent first.
 | Field | Required | Notes |
 |---|---|---|
 | `entity` | yes | Handle or unambiguous prefix, as shown by `recall`. |
+| `limit` | no | How many mentions to show (default 50, max 200). A capped result ends with an "(more mentions exist)" trailer instead of claiming an exact total. |
 
 By default the embedder is a mock, so retrieval leans on full-text and graph
 signals. Set `provider = "local"` and build with `--features local` for real

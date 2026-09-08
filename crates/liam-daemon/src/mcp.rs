@@ -78,9 +78,26 @@ const MENTIONS_FETCH_LIMIT: usize = 200;
 /// full answer. Measured real output was ~55 tokens / ~270 chars.
 const ENTITY_SYNTHESIS_MAX_NEW_TOKENS: usize = 256;
 
-/// Fixed default for `timeline`'s `Graph::mentions` read; the tool takes no
-/// caller-supplied limit.
-const TIMELINE_MENTIONS_LIMIT: usize = 50;
+/// Default and upper bound on the number of mentions `timeline` shows.
+/// WHY: caller-supplied `limit` is otherwise unbounded, and each mention's
+/// full content lands in the response, so a large `limit` on a well-mentioned
+/// entity would blow the response size. Mirrors `ask`'s `clamp_ask_k`
+/// (see `ask.rs`): default keeps `timeline`'s existing behavior when `limit`
+/// is omitted, and the cap bounds a single response regardless of how many
+/// mentions the entity has.
+const DEFAULT_TIMELINE_LIMIT: usize = 50;
+const MAX_TIMELINE_LIMIT: usize = 200;
+
+/// Resolve the caller's `limit` into the usable range: absent means
+/// `DEFAULT_TIMELINE_LIMIT`, and anything else is clamped to
+/// `1..=MAX_TIMELINE_LIMIT`. WHY clamp the bottom too: mirrors `clamp_ask_k`'s
+/// reasoning, a `limit = 0` would render no mentions, which reads as a claim
+/// that the entity has none rather than a claim about the argument.
+fn clamp_timeline_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_TIMELINE_LIMIT)
+        .clamp(1, MAX_TIMELINE_LIMIT)
+}
 
 /// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
 /// handlers apply the same k/embedding/kind/scope/as_of shape to a `Query`;
@@ -367,6 +384,10 @@ pub struct ClustersArgs {
 pub struct TimelineArgs {
     /// Handle of the entity, as shown by `recall`. A full id works too.
     pub entity: String,
+    /// How many mentions to show, most recent first. Absent defaults to
+    /// `DEFAULT_TIMELINE_LIMIT` (50); anything above `MAX_TIMELINE_LIMIT`
+    /// (200) is capped, not rejected.
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -1111,10 +1132,20 @@ impl MemoryServer {
             Ok(None) => return format!("timeline failed: {} is not currently live", id.handle()),
             Err(e) => return format!("timeline failed: {e}"),
         };
-        let mentions = match self.store.mentions(&id, now, TIMELINE_MENTIONS_LIMIT).await {
+        let limit = clamp_timeline_limit(args.limit);
+        // Over-fetch by one: a row past `limit` proves "there is at least
+        // one more" without a specific, unprovable total count. It says
+        // nothing about `Graph::mentions`'s own internal over-fetch pool
+        // (`limit.max(1) * 3`), which exists to survive hydration drops and
+        // is unrelated to this trailer.
+        let mut mentions = match self.store.mentions(&id, now, limit + 1).await {
             Ok(m) => m,
             Err(e) => return format!("timeline failed: {e}"),
         };
+        let truncated = mentions.len() > limit;
+        if truncated {
+            mentions.truncate(limit);
+        }
         let header = format!(
             "[{} {}] {}\n{}",
             entity.kind,
@@ -1140,7 +1171,12 @@ impl MemoryServer {
                 .collect::<Vec<_>>()
                 .join("\n\n")
         };
-        format!("{header}\n\n{mentions_section}")
+        let trailer = if truncated {
+            "\n\n(more mentions exist)"
+        } else {
+            ""
+        };
+        format!("{header}\n\n{mentions_section}{trailer}")
     }
 
     // `pub(crate)` so the grounding eval (see `eval.rs`) drives the same code
@@ -5571,15 +5607,16 @@ mod tests {
             .await
             .expect("link fact two");
 
-        // When timeline runs
+        // When timeline runs with no caller-supplied limit
         let out = server
             .timeline(Parameters(TimelineArgs {
                 entity: entity_id.as_str().to_string(),
+                limit: None,
             }))
             .await;
 
         // Then the compiled content and both mentions appear, most
-        // recently linked mention first
+        // recently linked mention first, with no "more" trailer
         assert!(out.contains("compiled bio of ada"), "{out}");
         let fact1_pos = out.find("first mention content").expect("fact one missing");
         let fact2_pos = out
@@ -5589,6 +5626,7 @@ mod tests {
             fact2_pos < fact1_pos,
             "most recently linked mention should come first: {out}"
         );
+        assert!(!out.contains("more mentions exist"), "{out}");
     }
 
     #[tokio::test]
@@ -5600,6 +5638,7 @@ mod tests {
         let out = server
             .timeline(Parameters(TimelineArgs {
                 entity: "0000000000000".to_string(),
+                limit: None,
             }))
             .await;
 
@@ -5625,6 +5664,7 @@ mod tests {
         let out = server
             .timeline(Parameters(TimelineArgs {
                 entity: entity_id.as_str().to_string(),
+                limit: None,
             }))
             .await;
 
@@ -5653,6 +5693,7 @@ mod tests {
         let out = server
             .timeline(Parameters(TimelineArgs {
                 entity: entity_id.as_str().to_string(),
+                limit: None,
             }))
             .await;
 
@@ -5672,7 +5713,10 @@ mod tests {
 
         // When timeline runs
         let out = server
-            .timeline(Parameters(TimelineArgs { entity: handle }))
+            .timeline(Parameters(TimelineArgs {
+                entity: handle,
+                limit: None,
+            }))
             .await;
 
         // Then it still returns that node's own data and an empty
@@ -5680,6 +5724,158 @@ mod tests {
         assert!(out.contains("Ordinary Fact"), "{out}");
         assert!(out.contains("ordinary content"), "{out}");
         assert!(out.contains("no mentions yet"), "{out}");
+    }
+
+    #[test]
+    fn clamp_timeline_limit_defaults_and_bounds_the_mention_count() {
+        // Arrange / Act / Assert
+        assert_eq!(
+            clamp_timeline_limit(None),
+            DEFAULT_TIMELINE_LIMIT,
+            "absent limit defaults"
+        );
+        assert_eq!(
+            clamp_timeline_limit(Some(10)),
+            10,
+            "in-range limit passes through"
+        );
+        assert_eq!(
+            clamp_timeline_limit(Some(MAX_TIMELINE_LIMIT)),
+            MAX_TIMELINE_LIMIT,
+            "the cap itself is allowed"
+        );
+        assert_eq!(
+            clamp_timeline_limit(Some(10_000)),
+            MAX_TIMELINE_LIMIT,
+            "oversized limit is capped, not passed to the store"
+        );
+        assert_eq!(
+            clamp_timeline_limit(Some(0)),
+            1,
+            "limit=0 shows one mention, not none"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_truncates_to_the_caller_supplied_limit_and_appends_a_trailer() {
+        // Given an entity with 3 live mentions, linked at three different
+        // instants, and a caller-supplied limit of 2
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let server = server_with_clock(clock.clone()).await;
+        let entity_id = server
+            .store
+            .insert(NewNode::entity("person", "Ada Lovelace"))
+            .await
+            .expect("seed entity");
+        let oldest = server
+            .store
+            .insert(NewNode::now(
+                "fact",
+                "Fact Oldest",
+                "oldest mention content",
+            ))
+            .await
+            .expect("seed oldest fact");
+        let middle = server
+            .store
+            .insert(NewNode::now(
+                "fact",
+                "Fact Middle",
+                "middle mention content",
+            ))
+            .await
+            .expect("seed middle fact");
+        let newest = server
+            .store
+            .insert(NewNode::now(
+                "fact",
+                "Fact Newest",
+                "newest mention content",
+            ))
+            .await
+            .expect("seed newest fact");
+        clock.set(Millis(2000));
+        server
+            .store
+            .relate(&entity_id, &oldest, relation::MENTIONS)
+            .await
+            .expect("link oldest fact");
+        clock.set(Millis(3000));
+        server
+            .store
+            .relate(&entity_id, &middle, relation::MENTIONS)
+            .await
+            .expect("link middle fact");
+        clock.set(Millis(4000));
+        server
+            .store
+            .relate(&entity_id, &newest, relation::MENTIONS)
+            .await
+            .expect("link newest fact");
+
+        // When timeline runs with limit: Some(2)
+        let out = server
+            .timeline(Parameters(TimelineArgs {
+                entity: entity_id.as_str().to_string(),
+                limit: Some(2),
+            }))
+            .await;
+
+        // Then exactly the 2 most recently linked mentions show, followed
+        // by the trailer, and the excluded oldest mention is absent
+        assert!(out.contains("newest mention content"), "{out}");
+        assert!(out.contains("middle mention content"), "{out}");
+        assert!(!out.contains("oldest mention content"), "{out}");
+        assert!(out.contains("more mentions exist"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn timeline_shows_all_mentions_with_no_trailer_when_count_equals_the_limit() {
+        // Given an entity with exactly 2 live mentions, linked at two
+        // different instants, and a caller-supplied limit of 2
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let server = server_with_clock(clock.clone()).await;
+        let entity_id = server
+            .store
+            .insert(NewNode::entity("person", "Ada Lovelace"))
+            .await
+            .expect("seed entity");
+        let fact1 = server
+            .store
+            .insert(NewNode::now("fact", "Fact One", "first mention content"))
+            .await
+            .expect("seed fact one");
+        let fact2 = server
+            .store
+            .insert(NewNode::now("fact", "Fact Two", "second mention content"))
+            .await
+            .expect("seed fact two");
+        clock.set(Millis(2000));
+        server
+            .store
+            .relate(&entity_id, &fact1, relation::MENTIONS)
+            .await
+            .expect("link fact one");
+        clock.set(Millis(3000));
+        server
+            .store
+            .relate(&entity_id, &fact2, relation::MENTIONS)
+            .await
+            .expect("link fact two");
+
+        // When timeline runs with limit: Some(2)
+        let out = server
+            .timeline(Parameters(TimelineArgs {
+                entity: entity_id.as_str().to_string(),
+                limit: Some(2),
+            }))
+            .await;
+
+        // Then both mentions show and no trailer appears (the "+1"
+        // over-fetch comparison is strictly greater-than, not >=)
+        assert!(out.contains("first mention content"), "{out}");
+        assert!(out.contains("second mention content"), "{out}");
+        assert!(!out.contains("more mentions exist"), "{out}");
     }
 
     #[tokio::test]
