@@ -1215,6 +1215,88 @@ impl MemoryServer {
         format!("{header}\n\n{mentions_section}{trailer}")
     }
 
+    /// Acquires one slot from `generation_permits`, racing the shared request
+    /// `deadline` rather than a fresh timeout of its own: see the `deadline`
+    /// comment in `ask` for why every stage has to share one instant. Returns
+    /// the exact reason text `ask` hands to `fallback_answer` on either
+    /// failure path.
+    async fn acquire_generation_permit(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<OwnedSemaphorePermit, &'static str> {
+        match tokio::time::timeout_at(deadline, self.generation_permits.clone().acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err("no generation slot is available"),
+            // Without this timeout, the k-th queued caller would wait up to
+            // k * ask_timeout_secs before its own generation budget even
+            // started, so a queue would turn one slow request into a pile of
+            // requests that each look like a hang. The shared deadline is
+            // what keeps that wait from silently eating into budget the
+            // later stages never get back.
+            Err(_) => Err("timed out waiting for a generation slot"),
+        }
+    }
+
+    /// Runs the sufficiency pre-pass against the shared `deadline`: does the
+    /// evidence actually contain the answer? `true` means proceed to
+    /// synthesis; only an explicit parsed "no" returns `false`, so a
+    /// timeout, an LLM error, or an unparseable reply fails open rather than
+    /// denying memory the store really holds.
+    async fn passes_sufficiency_check(
+        &self,
+        question: &str,
+        evidence: &[ask::Evidence],
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let (system, user) = ask::build_sufficiency_prompt(question, evidence);
+        let verdict = tokio::time::timeout_at(
+            deadline,
+            // Capped hard: the verdict is one word, and an uncapped pre-pass
+            // let a rambling model spend 50s per question (see eval.rs).
+            self.llm
+                .complete_capped(&system, &user, SUFFICIENCY_MAX_TOKENS),
+        )
+        .await;
+        if let Ok(Ok(reply)) = verdict {
+            ask::parse_sufficiency(&reply) != Some(false)
+        } else {
+            true
+        }
+    }
+
+    /// Builds the answer prompt, synthesizes against the shared `deadline`,
+    /// and dispatches to the grounded answer or one of the fallback
+    /// variants: the natural end of `ask`'s orchestration.
+    async fn synthesize_answer(
+        &self,
+        question: &str,
+        evidence: &[ask::Evidence],
+        deadline: tokio::time::Instant,
+    ) -> String {
+        let (system, user) = build_ask_prompt(question, evidence);
+        let synth = tokio::time::timeout_at(deadline, self.llm.complete(&system, &user)).await;
+        match synth {
+            Ok(Ok(a)) if !a.trim().is_empty() => {
+                let answer = a.trim();
+                // Last line of defence against prompt injection and free-running
+                // fabrication: an answer that shares almost no vocabulary with the
+                // evidence is not a synthesis of it, whatever the model intended.
+                // Unlike the prompt rules, this does not depend on the model
+                // cooperating. See `ask::is_grounded`.
+                if ask::is_grounded(answer, question, evidence) {
+                    format_answer(answer, evidence)
+                } else {
+                    fallback_answer("the answer was not grounded in the evidence", evidence)
+                }
+            }
+            Ok(Ok(_)) => fallback_answer("the model returned an empty answer", evidence),
+            Ok(Err(_)) => fallback_answer("the model failed", evidence),
+            Err(_) => fallback_answer("synthesis timed out", evidence),
+        }
+    }
+
     // `pub(crate)` so the grounding eval (see `eval.rs`) drives the same code
     // path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
@@ -1280,22 +1362,9 @@ impl MemoryServer {
         // borrow of `self` across the awaits below; it drops, releasing the
         // slot, when `ask` returns.
         let acquire_start = tokio::time::Instant::now();
-        let _generation_permit = match tokio::time::timeout_at(
-            deadline,
-            self.generation_permits.clone().acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return fallback_answer("no generation slot is available", evidence),
-            // Without this timeout, the k-th queued caller would wait up to
-            // k * ask_timeout_secs before its own generation budget even
-            // started, so a queue would turn one slow request into a pile of
-            // requests that each look like a hang. The whole request now
-            // shares one deadline, so this bound is what keeps that wait
-            // from silently eating into budget the later stages never get
-            // back.
-            Err(_) => return fallback_answer("timed out waiting for a generation slot", evidence),
+        let _generation_permit = match self.acquire_generation_permit(deadline).await {
+            Ok(permit) => permit,
+            Err(reason) => return fallback_answer(reason, evidence),
         };
         // Covers every return path below, not just one model call.
         let _permit_timer = PermitTimer::new(
@@ -1308,47 +1377,16 @@ impl MemoryServer {
         // Sufficiency pre-pass: ask whether the evidence answers the question at
         // all, and refuse outright if it does not. See
         // `ask::build_sufficiency_prompt` for why this is a separate call.
-        if self.ask_sufficiency_check {
-            let (system, user) = ask::build_sufficiency_prompt(&args.question, evidence);
-            let verdict = tokio::time::timeout_at(
-                deadline,
-                // Capped hard: the verdict is one word, and an uncapped pre-pass
-                // let a rambling model spend 50s per question (see eval.rs).
-                self.llm
-                    .complete_capped(&system, &user, SUFFICIENCY_MAX_TOKENS),
-            )
-            .await;
-            // Only an explicit NO refuses. A timeout, an error, or an
-            // unparseable reply falls through to synthesis: failing closed here
-            // would turn any model hiccup into "I don't know" about memory the
-            // store really holds.
-            if let Ok(Ok(reply)) = verdict {
-                if ask::parse_sufficiency(&reply) == Some(false) {
-                    return ask::insufficient_answer(evidence);
-                }
-            }
+        if self.ask_sufficiency_check
+            && !self
+                .passes_sufficiency_check(&args.question, evidence, deadline)
+                .await
+        {
+            return ask::insufficient_answer(evidence);
         }
 
-        let (system, user) = build_ask_prompt(&args.question, evidence);
-        let synth = tokio::time::timeout_at(deadline, self.llm.complete(&system, &user)).await;
-        match synth {
-            Ok(Ok(a)) if !a.trim().is_empty() => {
-                let answer = a.trim();
-                // Last line of defence against prompt injection and free-running
-                // fabrication: an answer that shares almost no vocabulary with the
-                // evidence is not a synthesis of it, whatever the model intended.
-                // Unlike the prompt rules, this does not depend on the model
-                // cooperating. See `ask::is_grounded`.
-                if ask::is_grounded(answer, &args.question, evidence) {
-                    format_answer(answer, evidence)
-                } else {
-                    fallback_answer("the answer was not grounded in the evidence", evidence)
-                }
-            }
-            Ok(Ok(_)) => fallback_answer("the model returned an empty answer", evidence),
-            Ok(Err(_)) => fallback_answer("the model failed", evidence),
-            Err(_) => fallback_answer("synthesis timed out", evidence),
-        }
+        self.synthesize_answer(&args.question, evidence, deadline)
+            .await
     }
 }
 
@@ -4939,6 +4977,190 @@ mod tests {
             answer.contains("the wibbleflux service runs nightly."),
             "answer missing evidence content: {answer}"
         );
+    }
+
+    #[tokio::test]
+    async fn acquire_generation_permit_returns_ok_when_a_permit_is_available() {
+        // Arrange: the default single-slot semaphore, untouched.
+        let server = server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        let result = server.acquire_generation_permit(deadline).await;
+
+        // Assert
+        assert!(result.is_ok(), "expected a permit to be granted");
+    }
+
+    #[tokio::test]
+    async fn acquire_generation_permit_returns_err_when_the_semaphore_is_closed() {
+        // Arrange: close the semaphore instead of exhausting it, mirroring a
+        // shutdown path rather than ordinary contention.
+        let server = server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+        )
+        .await;
+        server.generation_permits_handle().close();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        let result = server.acquire_generation_permit(deadline).await;
+
+        // Assert
+        assert_eq!(result.err(), Some("no generation slot is available"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_generation_permit_returns_err_when_the_deadline_is_already_past() {
+        // Arrange: hold the sole permit directly so the callee's own acquire
+        // attempt can never complete, then advance the paused clock past the
+        // deadline instead of waiting on a real timer.
+        let server = server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+        )
+        .await;
+        let _held = server
+            .generation_permits_handle()
+            .try_acquire_owned()
+            .expect("sole permit should be free at test start");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        tokio::time::advance(Duration::from_millis(100)).await;
+
+        // Act
+        let result = server.acquire_generation_permit(deadline).await;
+
+        // Assert
+        assert_eq!(
+            result.err(),
+            Some("timed out waiting for a generation slot")
+        );
+    }
+
+    #[tokio::test]
+    async fn passes_sufficiency_check_returns_true_on_an_explicit_yes() {
+        // Arrange
+        let server = server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(SufficiencyLlm {
+                verdict: "YES",
+                answer: "unused",
+            }),
+        )
+        .await;
+        let evidence = vec![sufficiency_evidence()];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        let sufficient = server
+            .passes_sufficiency_check("Who is the mascot?", &evidence, deadline)
+            .await;
+
+        // Assert
+        assert!(
+            sufficient,
+            "an explicit YES verdict must proceed to synthesis"
+        );
+    }
+
+    #[tokio::test]
+    async fn passes_sufficiency_check_returns_false_on_an_explicit_no() {
+        // Arrange
+        let server = server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(SufficiencyLlm {
+                verdict: "NO",
+                answer: "unused",
+            }),
+        )
+        .await;
+        let evidence = vec![sufficiency_evidence()];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        let sufficient = server
+            .passes_sufficiency_check("Who is the mascot?", &evidence, deadline)
+            .await;
+
+        // Assert
+        assert!(!sufficient, "an explicit NO verdict must refuse");
+    }
+
+    #[tokio::test]
+    async fn passes_sufficiency_check_fails_open_on_a_timeout() {
+        // Arrange: a deadline that has already elapsed by the time the
+        // never-returning `SlowLlm::complete` is polled.
+        let server = server_with(Arc::new(liam_model::IdentityReranker), Arc::new(SlowLlm)).await;
+        let evidence = vec![sufficiency_evidence()];
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        // Act
+        let sufficient = server
+            .passes_sufficiency_check("Who is the mascot?", &evidence, deadline)
+            .await;
+
+        // Assert: a timeout is not an explicit refusal, so synthesis proceeds.
+        assert!(sufficient, "a timeout must fail open");
+    }
+
+    #[tokio::test]
+    async fn passes_sufficiency_check_fails_open_on_an_llm_error() {
+        // Arrange
+        let server =
+            server_with(Arc::new(liam_model::IdentityReranker), Arc::new(FailingLlm)).await;
+        let evidence = vec![sufficiency_evidence()];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        let sufficient = server
+            .passes_sufficiency_check("Who is the mascot?", &evidence, deadline)
+            .await;
+
+        // Assert: an LLM error is not an explicit refusal, so synthesis proceeds.
+        assert!(sufficient, "an LLM error must fail open");
+    }
+
+    #[tokio::test]
+    async fn passes_sufficiency_check_fails_open_on_an_unparseable_reply() {
+        // Arrange: a model that ignores "reply YES or NO" must not be read
+        // as a refusal, or a chatty model would deny memory the store holds.
+        let server = server_with(
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(SufficiencyLlm {
+                verdict: "Well, it depends on what you mean.",
+                answer: "unused",
+            }),
+        )
+        .await;
+        let evidence = vec![sufficiency_evidence()];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        let sufficient = server
+            .passes_sufficiency_check("Who is the mascot?", &evidence, deadline)
+            .await;
+
+        // Assert
+        assert!(sufficient, "an unparseable verdict must fail open");
+    }
+
+    /// One evidence item shared by the `passes_sufficiency_check` tests
+    /// above: its content is unused by `SufficiencyLlm`/`FailingLlm`/
+    /// `SlowLlm`, only its presence in the prompt matters.
+    fn sufficiency_evidence() -> ask::Evidence {
+        ask::Evidence {
+            kind: "fact".to_string(),
+            label: "Mascot".to_string(),
+            content: "The team mascot is a wombat named Pixel.".to_string(),
+            valid_from_ms: 0,
+            confidence: 1.0,
+            attributes: None,
+        }
     }
 
     #[tokio::test]
