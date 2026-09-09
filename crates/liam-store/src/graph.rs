@@ -229,6 +229,75 @@ pub struct Candidate {
     pub valid_from: Millis,
 }
 
+/// Turns lexical and vector search rank lists into one fused RRF score per
+/// candidate id, using `1 / (rrf_k + rank + 1)` summed across every list a
+/// candidate appears in.
+fn rrf_fuse(lexical: &[NodeId], vector: &[NodeId], rrf_k: f64) -> HashMap<String, f64> {
+    let mut rrf: HashMap<String, f64> = HashMap::new();
+    for (i, id) in lexical.iter().chain(vector.iter()).enumerate() {
+        let rank = if i < lexical.len() {
+            i
+        } else {
+            i - lexical.len()
+        };
+        *rrf.entry(id.as_str().to_string()).or_insert(0.0) += 1.0 / (rrf_k + rank as f64 + 1.0);
+    }
+    rrf
+}
+
+/// Scores hydrated candidate rows by RRF base score, confidence, time decay,
+/// and expansion weighting, then returns the top `k` by score descending.
+/// Pure and DB-free: every input is already-fetched data, so callers can
+/// exercise it directly with hand-built rows, no `Graph` or backend needed.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct value, no natural grouping
+fn score_and_rank(
+    rows: Vec<Candidate>,
+    candidates: &HashMap<String, (f64, bool)>,
+    lex_rank: &HashMap<String, usize>,
+    vec_rank: &HashMap<String, usize>,
+    now: Millis,
+    half_life: Option<Millis>,
+    expansion_weight: f64,
+    floor: f64,
+    k: usize,
+) -> Vec<ExplainedHit> {
+    let mut out = Vec::with_capacity(rows.len());
+    for c in rows {
+        let (base, is_expanded) = candidates
+            .get(c.id.as_str())
+            .copied()
+            .unwrap_or((floor, true));
+        let decay = decay_factor(c.valid_from, now, half_life);
+        let weight = if is_expanded { expansion_weight } else { 1.0 };
+        let score = base * c.confidence * decay * weight;
+        out.push(ExplainedHit {
+            hit: Hit {
+                id: c.id.clone(),
+                kind: c.kind,
+                label: c.label,
+                content: c.content,
+                attributes: c.attributes,
+                score,
+            },
+            lexical_rank: lex_rank.get(c.id.as_str()).copied(),
+            vector_rank: vec_rank.get(c.id.as_str()).copied(),
+            rrf: base,
+            confidence: c.confidence,
+            decay,
+            valid_from: c.valid_from,
+            expanded: is_expanded,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.hit
+            .score
+            .partial_cmp(&a.hit.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(k);
+    out
+}
+
 pub struct Graph<B: Backend> {
     backend: B,
     clock: Arc<dyn Clock>,
@@ -816,16 +885,7 @@ impl<B: Backend> Graph<B> {
             .map(|(i, id)| (id.as_str().to_string(), i))
             .collect();
 
-        let mut rrf: HashMap<String, f64> = HashMap::new();
-        for (i, id) in lexical.iter().chain(vector.iter()).enumerate() {
-            let rank = if i < lexical.len() {
-                i
-            } else {
-                i - lexical.len()
-            };
-            *rrf.entry(id.as_str().to_string()).or_insert(0.0) +=
-                1.0 / (self.rrf_k + rank as f64 + 1.0);
-        }
+        let rrf = rrf_fuse(&lexical, &vector, self.rrf_k);
 
         // Seeds: top of the fused list. Expand their neighbours, down-weighted.
         let mut seeds: Vec<(String, f64)> = rrf.iter().map(|(k, v)| (k.clone(), *v)).collect();
@@ -853,44 +913,17 @@ impl<B: Backend> Graph<B> {
             .collect();
         let rows = self.fetch_candidates(&ids, now, scope, kind).await?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for c in rows {
-            let (base, is_expanded) = candidates
-                .get(c.id.as_str())
-                .copied()
-                .unwrap_or((floor, true));
-            let decay = decay_factor(c.valid_from, now, q.half_life);
-            let weight = if is_expanded {
-                self.expansion_weight
-            } else {
-                1.0
-            };
-            let score = base * c.confidence * decay * weight;
-            out.push(ExplainedHit {
-                hit: Hit {
-                    id: c.id.clone(),
-                    kind: c.kind,
-                    label: c.label,
-                    content: c.content,
-                    attributes: c.attributes,
-                    score,
-                },
-                lexical_rank: lex_rank.get(c.id.as_str()).copied(),
-                vector_rank: vec_rank.get(c.id.as_str()).copied(),
-                rrf: base,
-                confidence: c.confidence,
-                decay,
-                valid_from: c.valid_from,
-                expanded: is_expanded,
-            });
-        }
-        out.sort_by(|a, b| {
-            b.hit
-                .score
-                .partial_cmp(&a.hit.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        out.truncate(q.k);
+        let out = score_and_rank(
+            rows,
+            &candidates,
+            &lex_rank,
+            &vec_rank,
+            now,
+            q.half_life,
+            self.expansion_weight,
+            floor,
+            q.k,
+        );
         Ok(out)
     }
 
@@ -2121,6 +2154,195 @@ mod tests {
         // Assert
         let ids: Vec<NodeId> = result.into_iter().map(|cand| cand.id).collect();
         assert_eq!(ids, vec![a, b, c]);
+    }
+
+    fn scoring_candidate(id: &str, confidence: f64, valid_from: Millis) -> Candidate {
+        Candidate {
+            id: NodeId::from_raw(id),
+            kind: "fact".to_string(),
+            label: String::new(),
+            content: String::new(),
+            scope: None,
+            attributes: serde_json::Value::Null,
+            confidence,
+            valid_from,
+        }
+    }
+
+    #[test]
+    fn score_and_rank_applies_weight_one_when_not_expanded() {
+        // Arrange: a hydrated row whose candidate entry marks it non-expanded.
+        let now = Millis(1000);
+        let row = scoring_candidate("a", 0.5, now);
+        let mut candidates = HashMap::new();
+        candidates.insert("a".to_string(), (2.0, false));
+
+        // Act
+        let out = score_and_rank(
+            vec![row],
+            &candidates,
+            &HashMap::new(),
+            &HashMap::new(),
+            now,
+            None,
+            3.0,
+            0.1,
+            10,
+        );
+
+        // Assert: score uses weight 1.0, not the expansion weight.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].hit.score, 2.0 * 0.5 * 1.0 * 1.0);
+        assert!(!out[0].expanded);
+    }
+
+    #[test]
+    fn score_and_rank_applies_expansion_weight_when_expanded() {
+        // Arrange: a hydrated row whose candidate entry marks it expansion-only.
+        let now = Millis(1000);
+        let row = scoring_candidate("a", 0.5, now);
+        let mut candidates = HashMap::new();
+        candidates.insert("a".to_string(), (2.0, true));
+
+        // Act
+        let out = score_and_rank(
+            vec![row],
+            &candidates,
+            &HashMap::new(),
+            &HashMap::new(),
+            now,
+            None,
+            3.0,
+            0.1,
+            10,
+        );
+
+        // Assert: score uses the expansion weight, not 1.0.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].hit.score, 2.0 * 0.5 * 1.0 * 3.0);
+        assert!(out[0].expanded);
+    }
+
+    #[test]
+    fn score_and_rank_falls_back_to_floor_and_expanded_when_missing() {
+        // Arrange: a hydrated row with no entry in the candidate map at all.
+        let now = Millis(1000);
+        let row = scoring_candidate("a", 1.0, now);
+        let candidates = HashMap::new();
+        let floor = 0.25;
+
+        // Act
+        let out = score_and_rank(
+            vec![row],
+            &candidates,
+            &HashMap::new(),
+            &HashMap::new(),
+            now,
+            None,
+            4.0,
+            floor,
+            10,
+        );
+
+        // Assert: falls back to the floor score and counts as expanded.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rrf, floor);
+        assert!(out[0].expanded);
+        assert_eq!(out[0].hit.score, floor * 1.0 * 1.0 * 4.0);
+    }
+
+    #[test]
+    fn score_and_rank_reports_rank_map_presence_per_row() {
+        // Arrange: one row present in both rank maps, one absent from both.
+        let now = Millis(1000);
+        let present = scoring_candidate("present", 1.0, now);
+        let absent = scoring_candidate("absent", 1.0, now);
+        let mut candidates = HashMap::new();
+        candidates.insert("present".to_string(), (1.0, false));
+        candidates.insert("absent".to_string(), (1.0, false));
+        let mut lex_rank = HashMap::new();
+        lex_rank.insert("present".to_string(), 2usize);
+        let mut vec_rank = HashMap::new();
+        vec_rank.insert("present".to_string(), 5usize);
+
+        // Act
+        let out = score_and_rank(
+            vec![present, absent],
+            &candidates,
+            &lex_rank,
+            &vec_rank,
+            now,
+            None,
+            1.0,
+            0.1,
+            10,
+        );
+
+        // Assert
+        let by_id: HashMap<&str, &ExplainedHit> =
+            out.iter().map(|h| (h.hit.id.as_str(), h)).collect();
+        assert_eq!(by_id["present"].lexical_rank, Some(2));
+        assert_eq!(by_id["present"].vector_rank, Some(5));
+        assert_eq!(by_id["absent"].lexical_rank, None);
+        assert_eq!(by_id["absent"].vector_rank, None);
+    }
+
+    #[test]
+    fn score_and_rank_sorts_descending_and_truncates_to_k() {
+        // Arrange: three rows with distinct scores, k smaller than the count.
+        let now = Millis(1000);
+        let rows = vec![
+            scoring_candidate("low", 0.1, now),
+            scoring_candidate("high", 0.9, now),
+            scoring_candidate("mid", 0.5, now),
+        ];
+        let mut candidates = HashMap::new();
+        candidates.insert("low".to_string(), (1.0, false));
+        candidates.insert("high".to_string(), (1.0, false));
+        candidates.insert("mid".to_string(), (1.0, false));
+
+        // Act
+        let out = score_and_rank(
+            rows,
+            &candidates,
+            &HashMap::new(),
+            &HashMap::new(),
+            now,
+            None,
+            1.0,
+            0.1,
+            2,
+        );
+
+        // Assert
+        let ids: Vec<&str> = out.iter().map(|h| h.hit.id.as_str()).collect();
+        assert_eq!(ids, vec!["high", "mid"]);
+    }
+
+    #[test]
+    fn score_and_rank_decay_is_one_when_half_life_is_none() {
+        // Arrange: a row valid long before `now`; with no half-life the real
+        // `decay_factor` helper should still report no decay.
+        let now = Millis(10_000);
+        let row = scoring_candidate("a", 1.0, Millis(0));
+        let mut candidates = HashMap::new();
+        candidates.insert("a".to_string(), (1.0, false));
+
+        // Act
+        let out = score_and_rank(
+            vec![row],
+            &candidates,
+            &HashMap::new(),
+            &HashMap::new(),
+            now,
+            None,
+            1.0,
+            0.1,
+            10,
+        );
+
+        // Assert
+        assert_eq!(out[0].decay, 1.0);
     }
 
     #[tokio::test]
