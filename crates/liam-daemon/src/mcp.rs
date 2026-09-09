@@ -325,6 +325,65 @@ pub struct EpisodeArgs {
     pub edges: Vec<EpisodeEdgeArgs>,
 }
 
+/// `remember`'s syntactic validation pass for an `episode`: every fact's
+/// content/confidence/attributes, then every edge's kind and from/to syntax,
+/// accumulating every problem instead of stopping at the first. Pure and
+/// `&self`-free, since none of these checks touches the store; a handle
+/// reference's existence is checked later, once this pass is clean. Problems
+/// come back facts-then-edges, each group in index order, and within one
+/// edge in a fixed order (empty-kind, then supersedes, then mentions
+/// direction, then the from/to reference check), matching the order
+/// `remember` has always reported them in.
+fn validate_episode(episode: &EpisodeArgs, fact_count: usize, entity_count: usize) -> Vec<String> {
+    let mut problems: Vec<String> = Vec::new();
+    for (i, fact) in episode.facts.iter().enumerate() {
+        if let Some(problem) = content_problem(&fact.content) {
+            problems.push(format!("fact:{}: {problem}", i + 1));
+        }
+        if let Some(problem) = confidence_problem(fact.confidence) {
+            problems.push(format!("fact:{}: {problem}", i + 1));
+        }
+        if let Some(problem) = attributes_problem(&fact.attributes) {
+            problems.push(format!("fact:{}: {problem}", i + 1));
+        }
+    }
+    for (j, edge) in episode.edges.iter().enumerate() {
+        let kind = edge.kind.trim().to_lowercase();
+        if kind.is_empty() {
+            problems.push(format!("edge {j}: type must not be empty"));
+        } else if kind == relation::SUPERSEDES {
+            problems.push(format!(
+                "edge {j}: '{}' is reserved for version history",
+                relation::SUPERSEDES
+            ));
+        } else if kind == relation::MENTIONS {
+            if parse_entity_ref(&edge.to, entity_count).is_some() {
+                problems.push(format!(
+                    "edge {j}: mentions edge must have an entity as 'from' and a fact as \
+                     'to' (to is backwards)"
+                ));
+            }
+            if parse_fact_ref(&edge.from, fact_count).is_some() {
+                problems.push(format!(
+                    "edge {j}: mentions edge must have an entity as 'from' and a fact as \
+                     'to' (from is backwards)"
+                ));
+            }
+        }
+        for (role, reference) in [("from", edge.from.as_str()), ("to", edge.to.as_str())] {
+            if parse_fact_ref(reference, fact_count).is_none()
+                && parse_entity_ref(reference, entity_count).is_none()
+                && !is_handle_shaped(reference)
+            {
+                problems.push(format!(
+                    "edge {j}: {role} '{reference}' is not a recognized reference"
+                ));
+            }
+        }
+    }
+    problems
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RecallArgs {
     pub query: String,
@@ -635,6 +694,44 @@ impl MemoryServer {
         self.store.resolve_handle(s).await.map(EpisodeRef::Existing)
     }
 
+    /// Resolves every episode edge's `from`/`to` into a real `EpisodeRef`,
+    /// once `validate_episode` has confirmed both sides are syntactically
+    /// valid: the one real DB read per handle-form reference. A resolution
+    /// failure is a validation failure too, accumulated the same way
+    /// `validate_episode` accumulates its own problems, even though the DB
+    /// check itself couldn't happen until now. `Err` carries every problem
+    /// found rather than the first, so a caller reports them all at once.
+    async fn resolve_episode_refs(
+        &self,
+        episode: &EpisodeArgs,
+        fact_count: usize,
+        entity_count: usize,
+    ) -> Result<Vec<(EpisodeRef, EpisodeRef)>, Vec<String>> {
+        let mut refs: Vec<(EpisodeRef, EpisodeRef)> = Vec::with_capacity(episode.edges.len());
+        let mut resolve_problems: Vec<String> = Vec::new();
+        for (j, edge) in episode.edges.iter().enumerate() {
+            match (
+                self.episode_ref(&edge.from, fact_count, entity_count).await,
+                self.episode_ref(&edge.to, fact_count, entity_count).await,
+            ) {
+                (Ok(from), Ok(to)) => refs.push((from, to)),
+                (from, to) => {
+                    if let Err(e) = from {
+                        resolve_problems.push(format!("edge {j}: from: {e}"));
+                    }
+                    if let Err(e) = to {
+                        resolve_problems.push(format!("edge {j}: to: {e}"));
+                    }
+                }
+            }
+        }
+        if resolve_problems.is_empty() {
+            Ok(refs)
+        } else {
+            Err(resolve_problems)
+        }
+    }
+
     // `pub(crate)` so the tool-eval grounding harness (see `tool_eval.rs`) drives
     // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Record a durable decision or fact into long-term memory.")]
@@ -692,87 +789,26 @@ impl MemoryServer {
         }
 
         // Every fact's confidence/attributes, and every edge's kind and
-        // from/to syntax, validated up front, accumulating every problem
-        // rather than stopping at the first: no DB call happens until this
-        // whole pass is clean.
+        // from/to syntax, validated up front by `validate_episode`: no DB
+        // call happens until that whole pass is clean.
         let fact_count = episode.facts.len();
         let entity_count = episode.entities.len();
-        let mut problems: Vec<String> = Vec::new();
-        for (i, fact) in episode.facts.iter().enumerate() {
-            if let Some(problem) = content_problem(&fact.content) {
-                problems.push(format!("fact:{}: {problem}", i + 1));
-            }
-            if let Some(problem) = confidence_problem(fact.confidence) {
-                problems.push(format!("fact:{}: {problem}", i + 1));
-            }
-            if let Some(problem) = attributes_problem(&fact.attributes) {
-                problems.push(format!("fact:{}: {problem}", i + 1));
-            }
-        }
-        for (j, edge) in episode.edges.iter().enumerate() {
-            let kind = edge.kind.trim().to_lowercase();
-            if kind.is_empty() {
-                problems.push(format!("edge {j}: type must not be empty"));
-            } else if kind == relation::SUPERSEDES {
-                problems.push(format!(
-                    "edge {j}: '{}' is reserved for version history",
-                    relation::SUPERSEDES
-                ));
-            } else if kind == relation::MENTIONS {
-                if parse_entity_ref(&edge.to, entity_count).is_some() {
-                    problems.push(format!(
-                        "edge {j}: mentions edge must have an entity as 'from' and a fact as \
-                         'to' (to is backwards)"
-                    ));
-                }
-                if parse_fact_ref(&edge.from, fact_count).is_some() {
-                    problems.push(format!(
-                        "edge {j}: mentions edge must have an entity as 'from' and a fact as \
-                         'to' (from is backwards)"
-                    ));
-                }
-            }
-            for (role, reference) in [("from", edge.from.as_str()), ("to", edge.to.as_str())] {
-                if parse_fact_ref(reference, fact_count).is_none()
-                    && parse_entity_ref(reference, entity_count).is_none()
-                    && !is_handle_shaped(reference)
-                {
-                    problems.push(format!(
-                        "edge {j}: {role} '{reference}' is not a recognized reference"
-                    ));
-                }
-            }
-        }
+        let problems = validate_episode(&episode, fact_count, entity_count);
         if !problems.is_empty() {
             return format!("remember failed: {}", problems.join("; "));
         }
 
         // Every from/to is now known syntactically valid: either "fact:N" in
-        // bounds, or handle-shaped. Resolve the handle-shaped ones now, the
-        // one real DB read per handle-form reference; a resolution failure
-        // is a validation failure too, accumulated the same way as the pass
-        // above, even though the DB check itself couldn't happen until now.
-        let mut refs: Vec<(EpisodeRef, EpisodeRef)> = Vec::with_capacity(episode.edges.len());
-        let mut resolve_problems: Vec<String> = Vec::new();
-        for (j, edge) in episode.edges.iter().enumerate() {
-            match (
-                self.episode_ref(&edge.from, fact_count, entity_count).await,
-                self.episode_ref(&edge.to, fact_count, entity_count).await,
-            ) {
-                (Ok(from), Ok(to)) => refs.push((from, to)),
-                (from, to) => {
-                    if let Err(e) = from {
-                        resolve_problems.push(format!("edge {j}: from: {e}"));
-                    }
-                    if let Err(e) = to {
-                        resolve_problems.push(format!("edge {j}: to: {e}"));
-                    }
-                }
+        // bounds, or handle-shaped. Resolve the handle-shaped ones now.
+        let refs = match self
+            .resolve_episode_refs(&episode, fact_count, entity_count)
+            .await
+        {
+            Ok(refs) => refs,
+            Err(resolve_problems) => {
+                return format!("remember failed: {}", resolve_problems.join("; "));
             }
-        }
-        if !resolve_problems.is_empty() {
-            return format!("remember failed: {}", resolve_problems.join("; "));
-        }
+        };
 
         // Embed the top-level fact plus every episode.facts entry, then
         // build the combined node list in order: index 0 is the top-level
@@ -2230,6 +2266,173 @@ mod tests {
             entity_type: entity_type.to_string(),
             name: name.to_string(),
         }
+    }
+
+    #[test]
+    fn validate_episode_returns_empty_for_a_clean_episode() {
+        // Given an episode with one valid fact and no edges
+        let episode = EpisodeArgs {
+            facts: vec![episode_fact("clean content")],
+            entities: vec![],
+            edges: vec![],
+        };
+
+        // When validated
+        let problems = validate_episode(&episode, episode.facts.len(), episode.entities.len());
+
+        // Then no problems are reported
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn validate_episode_reports_a_facts_content_problem() {
+        // Given one fact whose content exceeds MAX_CONTENT_CHARS
+        let over_cap = "x".repeat(MAX_CONTENT_CHARS + 1);
+        let episode = EpisodeArgs {
+            facts: vec![episode_fact(&over_cap)],
+            entities: vec![],
+            edges: vec![],
+        };
+
+        // When validated
+        let problems = validate_episode(&episode, episode.facts.len(), episode.entities.len());
+
+        // Then the content problem is reported against fact:1
+        assert_eq!(
+            problems,
+            vec![format!(
+                "fact:1: content exceeds {MAX_CONTENT_CHARS} characters"
+            )]
+        );
+    }
+
+    #[test]
+    fn validate_episode_reports_a_facts_confidence_problem() {
+        // Given one fact with an out-of-range confidence
+        let episode = EpisodeArgs {
+            facts: vec![EpisodeFactArgs {
+                confidence: Some(5.0),
+                ..episode_fact("fine content")
+            }],
+            entities: vec![],
+            edges: vec![],
+        };
+
+        // When validated
+        let problems = validate_episode(&episode, episode.facts.len(), episode.entities.len());
+
+        // Then the confidence problem is reported against fact:1
+        assert_eq!(
+            problems,
+            vec!["fact:1: confidence must be between 0.0 and 1.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_episode_reports_an_edge_with_an_empty_kind() {
+        // Given an edge whose kind is empty
+        let episode = EpisodeArgs {
+            facts: vec![],
+            entities: vec![],
+            edges: vec![episode_edge("fact:0", "fact:0", "")],
+        };
+
+        // When validated
+        let problems = validate_episode(&episode, episode.facts.len(), episode.entities.len());
+
+        // Then the empty-kind problem is reported against edge 0
+        assert_eq!(problems, vec!["edge 0: type must not be empty".to_string()]);
+    }
+
+    #[test]
+    fn validate_episode_reports_an_edge_asserting_supersedes() {
+        // Given an edge asserting the reserved `supersedes` kind
+        let episode = EpisodeArgs {
+            facts: vec![],
+            entities: vec![],
+            edges: vec![episode_edge("fact:0", "fact:0", "supersedes")],
+        };
+
+        // When validated
+        let problems = validate_episode(&episode, episode.facts.len(), episode.entities.len());
+
+        // Then the reserved-kind problem is reported against edge 0
+        assert_eq!(
+            problems,
+            vec!["edge 0: 'supersedes' is reserved for version history".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_episode_reports_a_backwards_mentions_edge_with_a_fresh_entity_as_to() {
+        // Given a mentions edge whose `to` is a fresh entity reference
+        // (backwards: `to` should be a fact) and whose `from` is
+        // handle-shaped, so only the to-is-entity check fires, independent
+        // of the from-is-fact check
+        let episode = EpisodeArgs {
+            facts: vec![],
+            entities: vec![episode_entity("person", "Someone")],
+            edges: vec![episode_edge("abc123", "entity:0", "mentions")],
+        };
+
+        // When validated
+        let problems = validate_episode(&episode, episode.facts.len(), episode.entities.len());
+
+        // Then only the to-is-backwards problem is reported
+        assert_eq!(
+            problems,
+            vec![
+                "edge 0: mentions edge must have an entity as 'from' and a fact as 'to' \
+                 (to is backwards)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_episode_reports_a_backwards_mentions_edge_with_a_fresh_fact_as_from() {
+        // Given a mentions edge whose `from` is a fresh fact reference
+        // (backwards: `from` should be an entity) and whose `to` is
+        // handle-shaped, so only the from-is-fact check fires, independent
+        // of the to-is-entity check
+        let episode = EpisodeArgs {
+            facts: vec![episode_fact("nested content")],
+            entities: vec![],
+            edges: vec![episode_edge("fact:1", "abc123", "mentions")],
+        };
+
+        // When validated
+        let problems = validate_episode(&episode, episode.facts.len(), episode.entities.len());
+
+        // Then only the from-is-backwards problem is reported
+        assert_eq!(
+            problems,
+            vec![
+                "edge 0: mentions edge must have an entity as 'from' and a fact as 'to' \
+                 (from is backwards)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_episode_reports_an_edge_with_an_unrecognized_reference() {
+        // Given an edge whose `to` is neither a fact/entity reference nor
+        // handle-shaped
+        let episode = EpisodeArgs {
+            facts: vec![],
+            entities: vec![],
+            edges: vec![episode_edge("fact:0", "bogus:0", "relates_to")],
+        };
+
+        // When validated
+        let problems = validate_episode(&episode, episode.facts.len(), episode.entities.len());
+
+        // Then the unrecognized-reference problem is reported against edge 0's to
+        assert_eq!(
+            problems,
+            vec!["edge 0: to 'bogus:0' is not a recognized reference".to_string()]
+        );
     }
 
     #[tokio::test]
