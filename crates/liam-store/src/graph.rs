@@ -1214,6 +1214,55 @@ impl<B: Backend> Graph<B> {
         })
     }
 
+    /// The mentions fingerprint of one entity, keyed by `(subject, scope)`
+    /// rather than `NodeId`, so a check made before a supersession still finds
+    /// the entity after one.
+    ///
+    /// Resolves the live node for `(subject, scope)` as of `as_of` first, then
+    /// aggregates `COUNT(*)`/`MAX(tx_from)` over that node's own live
+    /// `mentions` edges, mirroring `edge_fingerprint`'s query shape at entity
+    /// scope instead of store scope. A subject with no live node under that
+    /// scope (wrong scope, or never observed) fingerprints as empty rather
+    /// than an error: "nothing to be stale yet" is a valid state here.
+    pub async fn entity_mentions_fingerprint(
+        &self,
+        subject: &str,
+        scope: Option<&str>,
+        as_of: Millis,
+    ) -> Result<Fingerprint> {
+        let (sql, params) = live_by_subject_query(subject, as_of, scope);
+        let rows = self.backend.query(&sql, &params).await?;
+        let Some(node_row) = rows.first() else {
+            return Ok(Fingerprint {
+                edge_count: 0,
+                max_tx_from: Millis(0),
+            });
+        };
+        let node_id = NodeId::from_raw(node_row.get_string(0)?);
+
+        let rows = self
+            .backend
+            .query(
+                "SELECT COUNT(*), MAX(tx_from) FROM edges
+                 WHERE src = ?1 AND type = ?2 AND tx_from <= ?3 AND tx_to > ?3",
+                &[
+                    node_id.as_str().into(),
+                    crate::types::relation::MENTIONS.into(),
+                    as_of.into(),
+                ],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            // An aggregate without GROUP BY always returns one row, so this is
+            // unreachable rather than an empty-edge-set case.
+            return Err(Error::Backend("fingerprint query returned no row".into()));
+        };
+        Ok(Fingerprint {
+            edge_count: row.get_i64(0)?,
+            max_tx_from: max_tx_from_of(row, 1)?,
+        })
+    }
+
     /// The stored run state, or `None` when this store has never clustered.
     ///
     /// `None` is NOT the same as a zero fingerprint and must never be defaulted
@@ -3985,7 +4034,223 @@ mod tests {
         assert!(g.read_cluster_state().await.unwrap().is_none());
     }
 
-    // ---- WU-8: warm-start detection and seed construction ----
+    // ---- entity mentions fingerprint ----
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_counts_live_mentions_edges() {
+        // Arrange: an entity with two live `mentions` edges written at different instants.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let person = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact_a = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        let fact_b = g.insert(NewNode::now("fact", "second", "x")).await.unwrap();
+        clock.set(Millis(2000));
+        g.link(NewEdge::new(
+            &person,
+            &fact_a,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(
+            &person,
+            &fact_b,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(4000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(fp.edge_count, 2);
+        assert_eq!(fp.max_tx_from, Millis(3000));
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_is_zero_for_a_subject_with_no_live_entity() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("nobody", None, Millis(1000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(fp.edge_count, 0);
+        assert_eq!(fp.max_tx_from, Millis(0));
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_keeps_scopes_distinct_for_the_same_subject() {
+        // Arrange: two entities sharing a subject, differing only by scope, each
+        // with its own mention count, so resolving by subject alone would
+        // conflate them.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let global = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let scoped = g
+            .insert(NewNode::entity("person", "Ada").with_scope("proj-x"))
+            .await
+            .unwrap();
+        let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        clock.set(Millis(2000));
+        g.link(NewEdge::new(
+            &global,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(
+            &scoped,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+        clock.set(Millis(4000));
+        g.link(NewEdge::new(
+            &scoped,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let global_fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(5000))
+            .await
+            .unwrap();
+        let scoped_fp = g
+            .entity_mentions_fingerprint("ada", Some("proj-x"), Millis(5000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(global_fp.edge_count, 1);
+        assert_eq!(global_fp.max_tx_from, Millis(2000));
+        assert_eq!(scoped_fp.edge_count, 2);
+        assert_eq!(scoped_fp.max_tx_from, Millis(4000));
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_ignores_an_edge_closed_in_transaction_time() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let person = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        g.link(NewEdge::new(
+            &person,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+        g.backend
+            .execute("UPDATE edges SET tx_to = ?1", &[Millis(1500).into()])
+            .await
+            .unwrap();
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(2000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(fp.edge_count, 0);
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_ignores_an_edge_not_yet_live_at_as_of() {
+        // Arrange: the mentions edge is written after the instant being fingerprinted.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let person = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(
+            &person,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(2000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(
+            fp.edge_count, 0,
+            "an edge written after as_of must not count"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_follows_a_superseded_entity_to_its_new_node() {
+        // Arrange: the entity is superseded once; only the new node's mention counts.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let old_fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        g.link(NewEdge::new(
+            &old,
+            &old_fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        clock.set(Millis(2000));
+        let new = g
+            .supersede(&old, NewNode::entity("person", "Ada"))
+            .await
+            .unwrap();
+        let new_fact = g.insert(NewNode::now("fact", "second", "x")).await.unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(
+            &new,
+            &new_fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(4000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(
+            fp.edge_count, 1,
+            "must follow the new live node, not the superseded one"
+        );
+        assert_eq!(fp.max_tx_from, Millis(3000));
+    }
 
     #[tokio::test]
     async fn a_cold_start_is_due_only_strictly_after_twenty_four_hours() {
