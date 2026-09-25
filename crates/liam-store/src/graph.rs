@@ -1214,6 +1214,190 @@ impl<B: Backend> Graph<B> {
         })
     }
 
+    /// The mentions fingerprint of one entity, keyed by `(subject, scope)`
+    /// rather than `NodeId`, so a check made before a supersession still finds
+    /// the entity after one.
+    ///
+    /// Resolves the live node for `(subject, scope)` as of `as_of` first, then
+    /// aggregates `COUNT(*)`/`MAX(tx_from)` over that node's own live
+    /// `mentions` edges, mirroring `edge_fingerprint`'s query shape at entity
+    /// scope instead of store scope. A subject with no live node under that
+    /// scope (wrong scope, or never observed) fingerprints as empty rather
+    /// than an error: "nothing to be stale yet" is a valid state here.
+    pub async fn entity_mentions_fingerprint(
+        &self,
+        subject: &str,
+        scope: Option<&str>,
+        as_of: Millis,
+    ) -> Result<Fingerprint> {
+        let (sql, params) = live_by_subject_query(subject, as_of, scope);
+        let rows = self.backend.query(&sql, &params).await?;
+        let Some(node_row) = rows.first() else {
+            return Ok(Fingerprint {
+                edge_count: 0,
+                max_tx_from: Millis(0),
+            });
+        };
+        let node_id = NodeId::from_raw(node_row.get_string(0)?);
+
+        let rows = self
+            .backend
+            .query(
+                "SELECT COUNT(*), MAX(tx_from) FROM edges
+                 WHERE src = ?1 AND type = ?2 AND tx_from <= ?3 AND tx_to > ?3",
+                &[
+                    node_id.as_str().into(),
+                    crate::types::relation::MENTIONS.into(),
+                    as_of.into(),
+                ],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            // An aggregate without GROUP BY always returns one row, so this is
+            // unreachable rather than an empty-edge-set case.
+            return Err(Error::Backend("fingerprint query returned no row".into()));
+        };
+        Ok(Fingerprint {
+            edge_count: row.get_i64(0)?,
+            max_tx_from: max_tx_from_of(row, 1)?,
+        })
+    }
+
+    /// Record the mentions fingerprint an entity was just synthesized from,
+    /// keyed by `(subject, scope)` so a later `stale_entities` check survives
+    /// the entity's `NodeId` changing under a supersede.
+    ///
+    /// Delete-then-insert, like `cluster_state_writes`: `entity_mention_state`
+    /// has a real `(subject, scope)` primary key, but the pair of statements
+    /// keeps both tables' write paths in one idiom rather than introducing a
+    /// second one for this table alone.
+    pub async fn mark_entity_synthesized(
+        &self,
+        subject: &str,
+        scope: Option<&str>,
+        fingerprint: Fingerprint,
+        as_of: Millis,
+    ) -> Result<()> {
+        let scope = scope.unwrap_or("");
+        let statements = vec![
+            (
+                "DELETE FROM entity_mention_state WHERE subject = ?1 AND scope = ?2".to_string(),
+                vec![subject.into(), scope.into()],
+            ),
+            (
+                "INSERT INTO entity_mention_state
+                   (subject, scope, mentions_count, mentions_max_tx_from, last_synthesized_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)"
+                    .to_string(),
+                vec![
+                    subject.into(),
+                    scope.into(),
+                    fingerprint.edge_count.into(),
+                    fingerprint.max_tx_from.into(),
+                    as_of.into(),
+                ],
+            ),
+        ];
+        self.backend.execute_atomic(&statements).await?;
+        Ok(())
+    }
+
+    /// Live `(NodeId, subject, scope)` triples due for resynthesis, oldest
+    /// `last_synthesized_at` first, up to `limit`.
+    ///
+    /// Two candidate sources feed the same list: a stored
+    /// `entity_mention_state` row whose live fingerprint has drifted from what
+    /// it recorded, and a live entity with no stored row at all (never
+    /// synthesized, sorted first via `Millis(0)`). A stored row whose subject
+    /// no longer resolves to a live node is skipped rather than reported:
+    /// there is nothing left to resynthesize.
+    pub async fn stale_entities(
+        &self,
+        limit: usize,
+        as_of: Millis,
+    ) -> Result<Vec<(NodeId, String, Option<String>)>> {
+        struct Candidate {
+            id: NodeId,
+            subject: String,
+            scope: Option<String>,
+            last_synthesized_at: Millis,
+        }
+
+        let mut candidates = Vec::new();
+
+        let state_rows = self
+            .backend
+            .query(
+                "SELECT subject, scope, mentions_count, mentions_max_tx_from, last_synthesized_at
+                 FROM entity_mention_state",
+                &[],
+            )
+            .await?;
+        for row in &state_rows {
+            let subject = row.get_string(0)?;
+            let raw_scope = row.get_string(1)?;
+            let scope = if raw_scope.is_empty() {
+                None
+            } else {
+                Some(raw_scope)
+            };
+            let stored_count = row.get_i64(2)?;
+            let stored_max_tx_from = Millis(row.get_i64(3)?);
+            let last_synthesized_at = Millis(row.get_i64(4)?);
+
+            let (live_sql, live_params) = live_by_subject_query(&subject, as_of, scope.as_deref());
+            let live_rows = self.backend.query(&live_sql, &live_params).await?;
+            let Some(live_row) = live_rows.first() else {
+                continue;
+            };
+            let id = NodeId::from_raw(live_row.get_string(0)?);
+
+            let live_fingerprint = self
+                .entity_mentions_fingerprint(&subject, scope.as_deref(), as_of)
+                .await?;
+            if live_fingerprint.edge_count != stored_count
+                || live_fingerprint.max_tx_from != stored_max_tx_from
+            {
+                candidates.push(Candidate {
+                    id,
+                    subject,
+                    scope,
+                    last_synthesized_at,
+                });
+            }
+        }
+
+        let live = live_at("n", 1);
+        let never_synthesized_rows = self
+            .backend
+            .query(
+                &format!(
+                    "SELECT n.id, n.subject, n.scope
+                     FROM nodes n
+                     LEFT JOIN entity_mention_state s
+                       ON s.subject = n.subject AND s.scope = COALESCE(n.scope, '')
+                     WHERE n.subject IS NOT NULL AND n.content = '' AND {live} AND s.subject IS NULL"
+                ),
+                &[as_of.into()],
+            )
+            .await?;
+        for row in &never_synthesized_rows {
+            candidates.push(Candidate {
+                id: NodeId::from_raw(row.get_string(0)?),
+                subject: row.get_string(1)?,
+                scope: opt_string(row, 2)?,
+                last_synthesized_at: Millis(0),
+            });
+        }
+
+        candidates.sort_by_key(|c| c.last_synthesized_at);
+        Ok(candidates
+            .into_iter()
+            .take(limit)
+            .map(|c| (c.id, c.subject, c.scope))
+            .collect())
+    }
+
     /// The stored run state, or `None` when this store has never clustered.
     ///
     /// `None` is NOT the same as a zero fingerprint and must never be defaulted
@@ -3985,7 +4169,431 @@ mod tests {
         assert!(g.read_cluster_state().await.unwrap().is_none());
     }
 
-    // ---- WU-8: warm-start detection and seed construction ----
+    // ---- entity mentions fingerprint ----
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_counts_live_mentions_edges() {
+        // Arrange: an entity with two live `mentions` edges written at different instants.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let person = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact_a = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        let fact_b = g.insert(NewNode::now("fact", "second", "x")).await.unwrap();
+        clock.set(Millis(2000));
+        g.link(NewEdge::new(
+            &person,
+            &fact_a,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(
+            &person,
+            &fact_b,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(4000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(fp.edge_count, 2);
+        assert_eq!(fp.max_tx_from, Millis(3000));
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_is_zero_for_a_subject_with_no_live_entity() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("nobody", None, Millis(1000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(fp.edge_count, 0);
+        assert_eq!(fp.max_tx_from, Millis(0));
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_keeps_scopes_distinct_for_the_same_subject() {
+        // Arrange: two entities sharing a subject, differing only by scope, each
+        // with its own mention count, so resolving by subject alone would
+        // conflate them.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let global = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let scoped = g
+            .insert(NewNode::entity("person", "Ada").with_scope("proj-x"))
+            .await
+            .unwrap();
+        let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        clock.set(Millis(2000));
+        g.link(NewEdge::new(
+            &global,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(
+            &scoped,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+        clock.set(Millis(4000));
+        g.link(NewEdge::new(
+            &scoped,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let global_fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(5000))
+            .await
+            .unwrap();
+        let scoped_fp = g
+            .entity_mentions_fingerprint("ada", Some("proj-x"), Millis(5000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(global_fp.edge_count, 1);
+        assert_eq!(global_fp.max_tx_from, Millis(2000));
+        assert_eq!(scoped_fp.edge_count, 2);
+        assert_eq!(scoped_fp.max_tx_from, Millis(4000));
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_ignores_an_edge_closed_in_transaction_time() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let person = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        g.link(NewEdge::new(
+            &person,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+        g.backend
+            .execute("UPDATE edges SET tx_to = ?1", &[Millis(1500).into()])
+            .await
+            .unwrap();
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(2000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(fp.edge_count, 0);
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_ignores_an_edge_not_yet_live_at_as_of() {
+        // Arrange: the mentions edge is written after the instant being fingerprinted.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let person = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(
+            &person,
+            &fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(2000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(
+            fp.edge_count, 0,
+            "an edge written after as_of must not count"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_entity_mentions_fingerprint_follows_a_superseded_entity_to_its_new_node() {
+        // Arrange: the entity is superseded once; only the new node's mention counts.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let old_fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        g.link(NewEdge::new(
+            &old,
+            &old_fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        clock.set(Millis(2000));
+        let new = g
+            .supersede(&old, NewNode::entity("person", "Ada"))
+            .await
+            .unwrap();
+        let new_fact = g.insert(NewNode::now("fact", "second", "x")).await.unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(
+            &new,
+            &new_fact,
+            crate::types::relation::MENTIONS,
+        ))
+        .await
+        .unwrap();
+
+        // Act
+        let fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(4000))
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(
+            fp.edge_count, 1,
+            "must follow the new live node, not the superseded one"
+        );
+        assert_eq!(fp.max_tx_from, Millis(3000));
+    }
+
+    // ---- stale entities ----
+
+    #[tokio::test]
+    async fn stale_entities_reports_the_current_live_id_when_the_fingerprint_has_moved() {
+        // Arrange: mark synthesized against the original node, then supersede
+        // it and add a new mention, so the live id has changed since the mark.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fp0 = g
+            .entity_mentions_fingerprint("ada", None, Millis(1000))
+            .await
+            .unwrap();
+        g.mark_entity_synthesized("ada", None, fp0, Millis(1000))
+            .await
+            .unwrap();
+
+        clock.set(Millis(2000));
+        let new = g
+            .supersede(&old, NewNode::entity("person", "Ada"))
+            .await
+            .unwrap();
+        let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(&new, &fact, relation::MENTIONS))
+            .await
+            .unwrap();
+
+        // Act
+        let stale = g.stale_entities(10, Millis(4000)).await.unwrap();
+
+        // Assert
+        assert_eq!(
+            stale,
+            vec![(new, "ada".to_string(), None)],
+            "must report the current live id, not the superseded one"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_entities_omits_a_subject_whose_fingerprint_matches_its_stored_state() {
+        // Arrange: mark synthesized with the fingerprint the entity already has.
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fp = g
+            .entity_mentions_fingerprint("ada", None, Millis(1000))
+            .await
+            .unwrap();
+        g.mark_entity_synthesized("ada", None, fp, Millis(1000))
+            .await
+            .unwrap();
+
+        // Act
+        let stale = g.stale_entities(10, Millis(2000)).await.unwrap();
+
+        // Assert
+        assert!(
+            stale.is_empty(),
+            "an up-to-date fingerprint must not be reported as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_entities_includes_a_live_subject_with_no_stored_state() {
+        // Arrange: a live entity that has never been synthesized.
+        let g = graph_at(Millis(1000)).await;
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+
+        // Act
+        let stale = g.stale_entities(10, Millis(2000)).await.unwrap();
+
+        // Assert
+        assert_eq!(stale, vec![(entity, "ada".to_string(), None)]);
+    }
+
+    #[tokio::test]
+    async fn stale_entities_omits_a_live_fact_with_a_subject_and_no_stored_state() {
+        // Arrange: an ordinary fact, not an entity page, carrying a subject
+        // (RememberArgs.subject applies to any kind) and never synthesized.
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now("fact", "price note", "the price is $5").with_subject("price"))
+            .await
+            .unwrap();
+
+        // Act
+        let stale = g.stale_entities(10, Millis(2000)).await.unwrap();
+
+        // Assert
+        assert!(
+            stale.is_empty(),
+            "a fact with non-empty content must never be treated as an unsynthesized entity"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_entities_honors_limit_and_orders_oldest_last_synthesized_first() {
+        // Arrange: a never-synthesized entity (treated as oldest), a
+        // long-ago-synthesized entity that has since drifted, a
+        // recently-synthesized entity that has also since drifted, and an
+        // up-to-date entity that must never appear.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+
+        let alice = g.insert(NewNode::entity("person", "Alice")).await.unwrap();
+
+        let bob = g.insert(NewNode::entity("person", "Bob")).await.unwrap();
+        let bob_fp = g
+            .entity_mentions_fingerprint("bob", None, Millis(1000))
+            .await
+            .unwrap();
+        g.mark_entity_synthesized("bob", None, bob_fp, Millis(1000))
+            .await
+            .unwrap();
+
+        let carol = g.insert(NewNode::entity("person", "Carol")).await.unwrap();
+        let carol_fp = g
+            .entity_mentions_fingerprint("carol", None, Millis(5000))
+            .await
+            .unwrap();
+        g.mark_entity_synthesized("carol", None, carol_fp, Millis(5000))
+            .await
+            .unwrap();
+
+        let dave = g.insert(NewNode::entity("person", "Dave")).await.unwrap();
+        let dave_fp = g
+            .entity_mentions_fingerprint("dave", None, Millis(6000))
+            .await
+            .unwrap();
+        g.mark_entity_synthesized("dave", None, dave_fp, Millis(6000))
+            .await
+            .unwrap();
+
+        let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        clock.set(Millis(7000));
+        for entity in [&alice, &bob, &carol] {
+            g.link(NewEdge::new(entity, &fact, relation::MENTIONS))
+                .await
+                .unwrap();
+        }
+
+        // Act
+        let stale = g.stale_entities(2, Millis(8000)).await.unwrap();
+
+        // Assert
+        assert_eq!(
+            stale,
+            vec![
+                (alice, "alice".to_string(), None),
+                (bob, "bob".to_string(), None),
+            ],
+            "never-synthesized sorts before long-ago, and the limit caps the rest"
+        );
+        assert!(
+            !stale.iter().any(|(id, _, _)| id == &dave),
+            "an up-to-date entity must never be reported as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_entities_omits_a_subject_marked_synthesized_after_its_id_changed() {
+        // Arrange: mark synthesized, supersede, add a mention, then mark
+        // synthesized again with the NEW node's fingerprint.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fp0 = g
+            .entity_mentions_fingerprint("ada", None, Millis(1000))
+            .await
+            .unwrap();
+        g.mark_entity_synthesized("ada", None, fp0, Millis(1000))
+            .await
+            .unwrap();
+
+        clock.set(Millis(2000));
+        let new = g
+            .supersede(&old, NewNode::entity("person", "Ada"))
+            .await
+            .unwrap();
+        let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(&new, &fact, relation::MENTIONS))
+            .await
+            .unwrap();
+
+        let fp1 = g
+            .entity_mentions_fingerprint("ada", None, Millis(4000))
+            .await
+            .unwrap();
+        g.mark_entity_synthesized("ada", None, fp1, Millis(4000))
+            .await
+            .unwrap();
+
+        // Act
+        let stale = g.stale_entities(10, Millis(4000)).await.unwrap();
+
+        // Assert
+        assert!(
+            stale.is_empty(),
+            "resynthesizing against the new id must clear the staleness, id churn notwithstanding"
+        );
+    }
 
     #[tokio::test]
     async fn a_cold_start_is_due_only_strictly_after_twenty_four_hours() {

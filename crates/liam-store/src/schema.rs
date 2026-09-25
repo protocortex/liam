@@ -111,8 +111,147 @@ CREATE TABLE IF NOT EXISTS cluster_state (
   computed_at        INTEGER NOT NULL,
   last_cold_start_at INTEGER NOT NULL
 );
+
+-- scope DEFAULT '' (never NULL) so (subject, scope) behaves as a normal
+-- uniqueness constraint: SQLite treats NULLs as distinct in a PRIMARY KEY,
+-- which would let multiple \"no scope\" rows coexist for the same subject.
+CREATE TABLE IF NOT EXISTS entity_mention_state (
+  subject              TEXT    NOT NULL,
+  scope                TEXT    NOT NULL DEFAULT '',
+  mentions_count       INTEGER NOT NULL,
+  mentions_max_tx_from INTEGER NOT NULL,
+  last_synthesized_at  INTEGER NOT NULL,
+  PRIMARY KEY (subject, scope)
+);
+
+CREATE TABLE IF NOT EXISTS provenance_repair_state (
+  id               INTEGER PRIMARY KEY CHECK (id = 1),
+  last_repaired_at INTEGER NOT NULL
+);
 ",
     );
 
     sql
+}
+
+#[cfg(all(test, feature = "backend-libsql"))]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::DefaultBackend;
+    use tempfile::TempDir;
+
+    async fn file_backend_at(name: &str) -> (TempDir, DefaultBackend) {
+        // This test exercises schema shape, not read pooling.
+        const ARBITRARY_POOL_SIZE: usize = 1;
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join(name);
+        let backend = DefaultBackend::open(path.to_str().expect("utf8 path"), ARBITRARY_POOL_SIZE)
+            .await
+            .expect("open file-backed backend");
+        (dir, backend)
+    }
+
+    async fn table_columns_with_pk(backend: &DefaultBackend, table: &str) -> Vec<(String, i64)> {
+        backend
+            .query(&format!("PRAGMA table_info({table})"), &[])
+            .await
+            .expect("query table_info")
+            .iter()
+            .map(|row| {
+                (
+                    row.get_string(1).expect("column name at index 1"),
+                    row.get_i64(5).expect("pk ordinal at index 5"),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fresh_database_gets_entity_mention_state_and_provenance_repair_state() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("fresh.db").await;
+
+        // Act
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("apply schema to a fresh database");
+
+        // Assert: entity_mention_state is keyed on (subject, scope), subject first.
+        let mention_columns = table_columns_with_pk(&backend, "entity_mention_state").await;
+        assert_eq!(
+            mention_columns
+                .iter()
+                .find(|(name, _)| name == "subject")
+                .map(|(_, pk)| *pk),
+            Some(1),
+            "subject must be the first primary key column"
+        );
+        assert_eq!(
+            mention_columns
+                .iter()
+                .find(|(name, _)| name == "scope")
+                .map(|(_, pk)| *pk),
+            Some(2),
+            "scope must be the second primary key column"
+        );
+        for column in [
+            "mentions_count",
+            "mentions_max_tx_from",
+            "last_synthesized_at",
+        ] {
+            assert!(
+                mention_columns.iter().any(|(name, _)| name == column),
+                "entity_mention_state is missing column {column}"
+            );
+        }
+
+        // Assert: provenance_repair_state carries the single-row watermark shape.
+        let repair_columns = table_columns_with_pk(&backend, "provenance_repair_state").await;
+        assert!(repair_columns.iter().any(|(name, _)| name == "id"));
+        assert!(repair_columns
+            .iter()
+            .any(|(name, _)| name == "last_repaired_at"));
+    }
+
+    /// Applying `schema()` a second time is exactly what `Graph::open_with_clock`
+    /// does on every open (see the comment above the unconditional block near
+    /// the end of `schema()`), so the first application here stands in for a
+    /// database created before these two tables existed, and the second for
+    /// reopening it afterward.
+    #[tokio::test]
+    async fn reopening_a_database_that_predates_the_new_tables_creates_them_with_no_error() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("reopen.db").await;
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("apply schema the first time");
+
+        // Act
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("reapplying schema must not error");
+
+        // Assert
+        let mention_exists = backend
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entity_mention_state'",
+                &[],
+            )
+            .await
+            .expect("query sqlite_master");
+        assert_eq!(mention_exists[0].get_i64(0).unwrap(), 1);
+
+        let repair_exists = backend
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='provenance_repair_state'",
+                &[],
+            )
+            .await
+            .expect("query sqlite_master");
+        assert_eq!(repair_exists[0].get_i64(0).unwrap(), 1);
+    }
 }
