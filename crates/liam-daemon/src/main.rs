@@ -327,7 +327,19 @@ fn spawn_gc(config: &Config, server: MemoryServer) {
 async fn maintenance_tick(server: &MemoryServer, policy: &liam_store::RetentionPolicy) {
     let store = server.store_handle();
     sweep(&store, policy).await;
+    repair_mentions(&store).await;
     refresh_clusters(&store).await;
+}
+
+/// Repairs `mentions` edges left dangling by a supersession, so citing
+/// entities keep pointing at the current fact. A failure here must not block
+/// the rest of the tick, matching `sweep`'s and `refresh_clusters`'s own
+/// error-doesn't-abort-the-tick pattern.
+async fn repair_mentions(store: &DefaultGraph) {
+    match store.repair_superseded_mentions().await {
+        Ok(repaired) => tracing::info!(repaired, "provenance repair completed"),
+        Err(e) => tracing::warn!(error = %e, "provenance repair failed"),
+    }
 }
 
 async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
@@ -359,7 +371,9 @@ async fn refresh_clusters(store: &DefaultGraph) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use liam_store::{FixedClock, GraphConfig, Millis, NewEdge, NewNode, RetentionPolicy};
+    use liam_store::{
+        relation, FixedClock, GraphConfig, Millis, NewEdge, NewNode, RetentionPolicy,
+    };
 
     async fn seeded_pair(t0: Millis) -> (DefaultGraph, std::sync::Arc<FixedClock>) {
         let clock = std::sync::Arc::new(FixedClock::new(t0));
@@ -563,6 +577,117 @@ mod tests {
             llm_double.calls(),
             0,
             "a cache hit must spawn no benchmark at all"
+        );
+    }
+
+    /// Captures everything written to it, so a test can assert on log text
+    /// without a real terminal.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured logs lock").extend(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Installs `captured` as the default subscriber for the calling thread
+    /// and returns the guard that must stay in scope for the duration of the
+    /// awaited call being observed. A plain `with_default` closure cannot
+    /// wrap an `.await`, so this uses the guard form instead; `#[tokio::test]`
+    /// defaults to a current-thread runtime, so the test body never migrates
+    /// to another OS thread mid-await and the thread-local guard stays valid
+    /// across the awaits it wraps.
+    fn install_captured_logs(captured: CapturedLogs) -> tracing::subscriber::DefaultGuard {
+        // Without `with_ansi(false)` the formatter wraps field separators in
+        // color codes (e.g. `repaired\x1b[2m=\x1b[0m1`), which breaks a plain
+        // substring match like `repaired=1` even though the field is there.
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn the_tick_repairs_a_superseded_facts_mentions_edge() {
+        // Given a fact superseded since the watermark, cited by an entity
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let store = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = store
+            .insert(NewNode::entity("person", "Ada"))
+            .await
+            .unwrap();
+        let fact = store
+            .insert(NewNode::now("fact", "first", "x"))
+            .await
+            .unwrap();
+        store
+            .relate(&entity, &fact, relation::MENTIONS)
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        let fact2 = store
+            .supersede(&fact, NewNode::now("fact", "second", "x"))
+            .await
+            .unwrap();
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let server = test_server(Arc::clone(&store));
+        let captured = CapturedLogs::default();
+        let _guard = install_captured_logs(captured.clone());
+
+        // When the tick fires
+        maintenance_tick(&server, &policy).await;
+
+        // Then the citing entity gains a mentions edge to the new fact
+        let neighbors = store.neighbors(&entity, Millis(2000)).await.unwrap();
+        assert!(
+            neighbors.contains(&fact2),
+            "the entity must gain a mentions edge to the fact that superseded the original"
+        );
+
+        // And the repaired count is logged
+        let log = String::from_utf8(captured.0.lock().expect("captured logs lock").clone())
+            .expect("log output is utf8");
+        assert!(
+            log.contains("repaired=1"),
+            "expected the repaired count to be logged: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tick_logs_zero_repairs_when_nothing_was_superseded() {
+        // Given nothing superseded since the watermark
+        let (store, _clock) = seeded_pair(Millis(1000)).await;
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let server = test_server(Arc::clone(&store));
+        let captured = CapturedLogs::default();
+        let _guard = install_captured_logs(captured.clone());
+
+        // When the tick fires
+        maintenance_tick(&server, &policy).await;
+
+        // Then repair is a no-op and logs zero repairs
+        let log = String::from_utf8(captured.0.lock().expect("captured logs lock").clone())
+            .expect("log output is utf8");
+        assert!(
+            log.contains("repaired=0"),
+            "expected a zero repaired count to be logged: {log}"
         );
     }
 }
