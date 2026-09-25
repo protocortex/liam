@@ -1376,7 +1376,7 @@ impl<B: Backend> Graph<B> {
                      FROM nodes n
                      LEFT JOIN entity_mention_state s
                        ON s.subject = n.subject AND s.scope = COALESCE(n.scope, '')
-                     WHERE n.subject IS NOT NULL AND {live} AND s.subject IS NULL"
+                     WHERE n.subject IS NOT NULL AND n.content = '' AND {live} AND s.subject IS NULL"
                 ),
                 &[as_of.into()],
             )
@@ -4462,6 +4462,25 @@ mod tests {
 
         // Assert
         assert_eq!(stale, vec![(entity, "ada".to_string(), None)]);
+    }
+
+    #[tokio::test]
+    async fn stale_entities_omits_a_live_fact_with_a_subject_and_no_stored_state() {
+        // Arrange: an ordinary fact, not an entity page, carrying a subject
+        // (RememberArgs.subject applies to any kind) and never synthesized.
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now("fact", "price note", "the price is $5").with_subject("price"))
+            .await
+            .unwrap();
+
+        // Act
+        let stale = g.stale_entities(10, Millis(2000)).await.unwrap();
+
+        // Assert
+        assert!(
+            stale.is_empty(),
+            "a fact with non-empty content must never be treated as an unsynthesized entity"
+        );
     }
 
     #[tokio::test]
