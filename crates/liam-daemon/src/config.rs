@@ -54,6 +54,8 @@ pub struct GcConfig {
     pub interval_hours: u64,
     pub reclaim: bool,
     pub run_on_start: bool,
+    /// Ceiling on entities re-synthesized per maintenance tick.
+    pub max_resynth_per_tick: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,6 +154,7 @@ impl Default for GcConfig {
             interval_hours: 6,
             reclaim: true,
             run_on_start: false,
+            max_resynth_per_tick: 5,
         }
     }
 }
@@ -370,6 +373,25 @@ mod tests {
         let c = Config::load(&path).expect("config without the new llm keys must still parse");
         assert_eq!(c.llm.context_tokens, 8192);
         assert_eq!(c.llm.max_concurrent_generations, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn max_resynth_per_tick_defaults_to_five() {
+        let c = Config::default();
+        assert_eq!(c.gc.max_resynth_per_tick, 5);
+    }
+
+    #[test]
+    fn max_resynth_per_tick_override_is_used() {
+        // Given an explicit override in the [gc] table
+        let path = write_temp_toml("[gc]\nmax_resynth_per_tick = 12\n");
+
+        // When loaded
+        let c = Config::load(&path).expect("config with gc.max_resynth_per_tick must parse");
+
+        // Then the configured value is used
+        assert_eq!(c.gc.max_resynth_per_tick, 12);
         let _ = std::fs::remove_file(&path);
     }
 
