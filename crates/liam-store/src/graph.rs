@@ -141,22 +141,48 @@ pub fn classify_relate_outcome(result: &Result<EdgeId>) -> EdgeOutcome {
     }
 }
 
+/// Folds one `relate` outcome into a per-`SUPERSEDES`-edge repair tally, so
+/// two independent repair branches (mentions pointing at the superseded node,
+/// and the superseded node's own outgoing mentions) can share one combined
+/// outcome for the watermark.
+fn fold_repair_outcome(
+    outcome: EdgeOutcome,
+    inserted: &mut usize,
+    saw_insert: &mut bool,
+    saw_failure: &mut bool,
+) {
+    match outcome {
+        EdgeOutcome::Inserted => {
+            *inserted += 1;
+            *saw_insert = true;
+        }
+        EdgeOutcome::RealFailure => *saw_failure = true,
+        EdgeOutcome::AlreadyPresent | EdgeOutcome::NotLive => {}
+    }
+}
+
 /// The newest `tx_from` a batch replay can safely resume from, given the
-/// outcomes it has processed so far in order. Once a `RealFailure` appears,
-/// nothing at or after it counts: a later scan has to revisit the failed
-/// edge and everything after, which it can only do if the watermark stayed
-/// behind it. Returns `None` when there is no safe entry to resume from,
-/// either because `processed` is empty or because the first entry already
-/// failed.
+/// outcomes it has processed so far. Bounded on the VALUE of the first
+/// failure's `tx_from`, not its position in `processed`: an `ingest_episode`
+/// call can stamp several supersessions with one shared `tx_from`, so two
+/// entries can tie, and whichever of them is a `RealFailure` has to exclude
+/// every entry at or after that same timestamp, regardless of which one
+/// happened to be processed first. Returns `None` when there is no safe
+/// entry to resume from, either because `processed` is empty or because the
+/// earliest failure's `tx_from` is also the smallest timestamp present.
 pub fn next_watermark(processed: &[(Millis, EdgeOutcome)]) -> Option<Millis> {
-    let safe_prefix_len = processed
+    let failure_bound = processed
         .iter()
-        .position(|(_, outcome)| *outcome == EdgeOutcome::RealFailure)
-        .unwrap_or(processed.len());
-    processed[..safe_prefix_len]
-        .iter()
-        .map(|(tx_from, _)| *tx_from)
-        .max()
+        .find(|(_, outcome)| *outcome == EdgeOutcome::RealFailure)
+        .map(|(tx_from, _)| *tx_from);
+    match failure_bound {
+        Some(bound) => processed
+            .iter()
+            .filter(|(tx_from, _)| *tx_from < bound)
+            .map(|(tx_from, _)| *tx_from)
+            .max(),
+        None => processed.iter().map(|(tx_from, _)| *tx_from).max(),
+    }
 }
 
 /// Resolve an `EpisodeRef` to the node id it names inside one
@@ -1449,11 +1475,12 @@ impl<B: Backend> Graph<B> {
             .collect())
     }
 
-    /// Reattach mentions still pointing at a superseded node onto the node
-    /// that now stands in for it, walking a multi-hop chain to the terminal
-    /// live node when more than one supersession landed before this ran, then
-    /// advance a persisted watermark so a later run only scans supersessions
-    /// this pass has not already seen. Returns the count of `mentions` edges
+    /// Reattach mentions still pointing at a superseded node, and the
+    /// superseded node's own outgoing mentions, onto the node that now
+    /// stands in for it, walking a multi-hop chain to the terminal live node
+    /// when more than one supersession landed before this ran, then advance
+    /// a persisted watermark so a later run only scans supersessions this
+    /// pass has not already seen. Returns the count of `mentions` edges
     /// actually inserted.
     ///
     /// The repair insert goes through `relate`, never `link`: both the
@@ -1503,14 +1530,43 @@ impl<B: Backend> Graph<B> {
                 let result = self
                     .relate(&mentioning, &terminal, crate::types::relation::MENTIONS)
                     .await;
-                match classify_relate_outcome(&result) {
-                    EdgeOutcome::Inserted => {
-                        inserted += 1;
-                        saw_insert = true;
-                    }
-                    EdgeOutcome::RealFailure => saw_failure = true,
-                    EdgeOutcome::AlreadyPresent | EdgeOutcome::NotLive => {}
-                }
+                fold_repair_outcome(
+                    classify_relate_outcome(&result),
+                    &mut inserted,
+                    &mut saw_insert,
+                    &mut saw_failure,
+                );
+            }
+
+            // The original node's own outgoing mentions, not just mentions
+            // pointing at it: `supersede` never moves a node's own edges, so
+            // an entity superseded by resynthesis keeps these on the dead id
+            // forever unless repair moves them to the terminal node too. A
+            // no-op whenever `original` is a plain fact, since a `mentions`
+            // edge's `src` is always the entity end, never the fact end, so
+            // a fact has no live outgoing `mentions` edges to find here.
+            let own_mention_rows = self
+                .backend
+                .query(
+                    "SELECT dst FROM edges WHERE src = ?1 AND type = ?2 AND tx_to = ?3",
+                    &[
+                        original.as_str().into(),
+                        crate::types::relation::MENTIONS.into(),
+                        FOREVER.into(),
+                    ],
+                )
+                .await?;
+            for mention_row in &own_mention_rows {
+                let mentioned = NodeId::from_raw(mention_row.get_string(0)?);
+                let result = self
+                    .relate(&terminal, &mentioned, crate::types::relation::MENTIONS)
+                    .await;
+                fold_repair_outcome(
+                    classify_relate_outcome(&result),
+                    &mut inserted,
+                    &mut saw_insert,
+                    &mut saw_failure,
+                );
             }
 
             // A `SUPERSEDES` edge with nothing to repair, or nothing but safe
@@ -6540,6 +6596,35 @@ mod tests {
         assert_eq!(watermark, None);
     }
 
+    #[test]
+    fn next_watermark_excludes_a_tied_timestamp_when_the_success_is_processed_first() {
+        // Both entries share tx_from=100: the success is processed before
+        // the failure, but nothing is safely before the failure's own
+        // timestamp, so the watermark must not advance to it.
+        let processed = vec![
+            (Millis(100), EdgeOutcome::Inserted),
+            (Millis(100), EdgeOutcome::RealFailure),
+        ];
+
+        let watermark = next_watermark(&processed);
+
+        assert_eq!(watermark, None);
+    }
+
+    #[test]
+    fn next_watermark_excludes_a_tied_timestamp_regardless_of_processing_order() {
+        // Same tie as above with the failure processed first, confirming the
+        // bound comes from the timestamp, not from list position.
+        let processed = vec![
+            (Millis(100), EdgeOutcome::RealFailure),
+            (Millis(100), EdgeOutcome::Inserted),
+        ];
+
+        let watermark = next_watermark(&processed);
+
+        assert_eq!(watermark, None);
+    }
+
     // ---- repair_superseded_mentions ----
 
     #[tokio::test]
@@ -6869,6 +6954,59 @@ mod tests {
             rows[0].get_i64(0).unwrap(),
             1,
             "no new mentions edge should have been added"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_moves_a_superseded_entitys_own_mention_to_the_terminal_entity() {
+        // Arrange: an entity mentions a fact, then the entity itself is
+        // superseded directly, standing in for what resynthesis does. Unlike
+        // `supersede`, this leaves the entity's own `mentions` edge attached
+        // to the now-dead original id.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        g.relate(&entity, &fact, relation::MENTIONS).await.unwrap();
+        clock.set(Millis(2000));
+        let terminal_entity = g
+            .supersede(&entity, NewNode::entity("person", "Ada"))
+            .await
+            .unwrap();
+
+        // Act
+        let repaired = g.repair_superseded_mentions().await.unwrap();
+
+        // Assert: the mention now originates from the terminal entity id,
+        // not the dead original.
+        assert_eq!(repaired, 1);
+        let fingerprint = g
+            .entity_mentions_fingerprint("ada", None, Millis(3000))
+            .await
+            .unwrap();
+        assert_eq!(
+            fingerprint.edge_count, 1,
+            "the live entity node must have exactly one mentions edge"
+        );
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4",
+                &[
+                    terminal_entity.as_str().into(),
+                    fact.as_str().into(),
+                    relation::MENTIONS.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get_i64(0).unwrap(),
+            1,
+            "a live mentions edge from the terminal entity to the fact must exist"
         );
     }
 }
