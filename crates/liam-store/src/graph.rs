@@ -108,6 +108,83 @@ fn edge_refusal_from_rows(rows: Vec<Row>, src: &NodeId, dst: &NodeId, kind: &str
     ))
 }
 
+/// What a single `relate` attempt resolved to, once a caller replaying a
+/// batch of edges needs to tell a safe no-op from a real problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeOutcome {
+    /// The edge row was written.
+    Inserted,
+    /// `relate` refused because the identical triple already exists: the
+    /// edge is already there, so replaying this attempt again is a no-op.
+    AlreadyPresent,
+    /// `relate` refused because the source or target node is not live: not
+    /// this call's fault, and retrying it will not change that.
+    NotLive,
+    /// Anything else, including a non-`RelateRefused` error: worth surfacing
+    /// rather than silently treated as a safe no-op.
+    RealFailure,
+}
+
+/// Classifies a `relate` result into the four outcomes a batch replay cares
+/// about, reading `RelateRefused`'s message the same way `edge_refusal`
+/// built it.
+pub fn classify_relate_outcome(result: &Result<EdgeId>) -> EdgeOutcome {
+    match result {
+        Ok(_) => EdgeOutcome::Inserted,
+        Err(Error::RelateRefused(message)) if message.contains("already relates to") => {
+            EdgeOutcome::AlreadyPresent
+        }
+        Err(Error::RelateRefused(message)) if message.contains("is not live") => {
+            EdgeOutcome::NotLive
+        }
+        Err(_) => EdgeOutcome::RealFailure,
+    }
+}
+
+/// Folds one `relate` outcome into a per-`SUPERSEDES`-edge repair tally, so
+/// two independent repair branches (mentions pointing at the superseded node,
+/// and the superseded node's own outgoing mentions) can share one combined
+/// outcome for the watermark.
+fn fold_repair_outcome(
+    outcome: EdgeOutcome,
+    inserted: &mut usize,
+    saw_insert: &mut bool,
+    saw_failure: &mut bool,
+) {
+    match outcome {
+        EdgeOutcome::Inserted => {
+            *inserted += 1;
+            *saw_insert = true;
+        }
+        EdgeOutcome::RealFailure => *saw_failure = true,
+        EdgeOutcome::AlreadyPresent | EdgeOutcome::NotLive => {}
+    }
+}
+
+/// The newest `tx_from` a batch replay can safely resume from, given the
+/// outcomes it has processed so far. Bounded on the VALUE of the first
+/// failure's `tx_from`, not its position in `processed`: an `ingest_episode`
+/// call can stamp several supersessions with one shared `tx_from`, so two
+/// entries can tie, and whichever of them is a `RealFailure` has to exclude
+/// every entry at or after that same timestamp, regardless of which one
+/// happened to be processed first. Returns `None` when there is no safe
+/// entry to resume from, either because `processed` is empty or because the
+/// earliest failure's `tx_from` is also the smallest timestamp present.
+pub fn next_watermark(processed: &[(Millis, EdgeOutcome)]) -> Option<Millis> {
+    let failure_bound = processed
+        .iter()
+        .find(|(_, outcome)| *outcome == EdgeOutcome::RealFailure)
+        .map(|(tx_from, _)| *tx_from);
+    match failure_bound {
+        Some(bound) => processed
+            .iter()
+            .filter(|(tx_from, _)| *tx_from < bound)
+            .map(|(tx_from, _)| *tx_from)
+            .max(),
+        None => processed.iter().map(|(tx_from, _)| *tx_from).max(),
+    }
+}
+
 /// Resolve an `EpisodeRef` to the node id it names inside one
 /// `ingest_episode` call: the pre-generated id at its index, for `New`, or
 /// the given id, for `Existing`. Every `New` index is validated in bounds
@@ -1396,6 +1473,184 @@ impl<B: Backend> Graph<B> {
             .take(limit)
             .map(|c| (c.id, c.subject, c.scope))
             .collect())
+    }
+
+    /// Reattach mentions still pointing at a superseded node, and the
+    /// superseded node's own outgoing mentions, onto the node that now
+    /// stands in for it, walking a multi-hop chain to the terminal live node
+    /// when more than one supersession landed before this ran, then advance
+    /// a persisted watermark so a later run only scans supersessions this
+    /// pass has not already seen. Returns the count of `mentions` edges
+    /// actually inserted.
+    ///
+    /// The repair insert goes through `relate`, never `link`: both the
+    /// liveness guard and the duplicate-triple guard on `(src, dst, type)`
+    /// have to hold, since two `mentions` edges seeded outside `relate` can
+    /// otherwise race each other onto the same repaired triple within one
+    /// pass. Each `relate` result is classified via `classify_relate_outcome`
+    /// and folded per `SUPERSEDES` edge: a real failure on any one repair
+    /// keeps that edge's `tx_from` from advancing the watermark, even when a
+    /// sibling repair on the same edge succeeded, so a later run revisits
+    /// exactly what this one could not finish.
+    pub async fn repair_superseded_mentions(&self) -> Result<usize> {
+        let watermark = self.repair_watermark().await?;
+        let supersede_rows = self
+            .backend
+            .query(
+                "SELECT dst, tx_from FROM edges WHERE type = ?1 AND tx_from > ?2
+                 ORDER BY tx_from ASC",
+                &[crate::types::relation::SUPERSEDES.into(), watermark.into()],
+            )
+            .await?;
+
+        let mut inserted = 0usize;
+        let mut processed: Vec<(Millis, EdgeOutcome)> = Vec::with_capacity(supersede_rows.len());
+
+        for row in &supersede_rows {
+            let original = NodeId::from_raw(row.get_string(0)?);
+            let tx_from = Millis(row.get_i64(1)?);
+            let terminal = self.terminal_supersession(&original).await?;
+
+            let mention_rows = self
+                .backend
+                .query(
+                    "SELECT src FROM edges WHERE dst = ?1 AND type = ?2 AND tx_to = ?3",
+                    &[
+                        original.as_str().into(),
+                        crate::types::relation::MENTIONS.into(),
+                        FOREVER.into(),
+                    ],
+                )
+                .await?;
+
+            let mut saw_failure = false;
+            let mut saw_insert = false;
+            for mention_row in &mention_rows {
+                let mentioning = NodeId::from_raw(mention_row.get_string(0)?);
+                let result = self
+                    .relate(&mentioning, &terminal, crate::types::relation::MENTIONS)
+                    .await;
+                fold_repair_outcome(
+                    classify_relate_outcome(&result),
+                    &mut inserted,
+                    &mut saw_insert,
+                    &mut saw_failure,
+                );
+            }
+
+            // The original node's own outgoing mentions, not just mentions
+            // pointing at it: `supersede` never moves a node's own edges, so
+            // an entity superseded by resynthesis keeps these on the dead id
+            // forever unless repair moves them to the terminal node too. A
+            // no-op whenever `original` is a plain fact, since a `mentions`
+            // edge's `src` is always the entity end, never the fact end, so
+            // a fact has no live outgoing `mentions` edges to find here.
+            let own_mention_rows = self
+                .backend
+                .query(
+                    "SELECT dst FROM edges WHERE src = ?1 AND type = ?2 AND tx_to = ?3",
+                    &[
+                        original.as_str().into(),
+                        crate::types::relation::MENTIONS.into(),
+                        FOREVER.into(),
+                    ],
+                )
+                .await?;
+            for mention_row in &own_mention_rows {
+                let mentioned = NodeId::from_raw(mention_row.get_string(0)?);
+                let result = self
+                    .relate(&terminal, &mentioned, crate::types::relation::MENTIONS)
+                    .await;
+                fold_repair_outcome(
+                    classify_relate_outcome(&result),
+                    &mut inserted,
+                    &mut saw_insert,
+                    &mut saw_failure,
+                );
+            }
+
+            // A `SUPERSEDES` edge with nothing to repair, or nothing but safe
+            // no-ops, is fully handled: only an actual failure blocks the
+            // watermark from moving past it.
+            let outcome = if saw_failure {
+                EdgeOutcome::RealFailure
+            } else if saw_insert {
+                EdgeOutcome::Inserted
+            } else {
+                EdgeOutcome::AlreadyPresent
+            };
+            processed.push((tx_from, outcome));
+        }
+
+        if let Some(new_watermark) = next_watermark(&processed) {
+            if new_watermark > watermark {
+                self.persist_repair_watermark(new_watermark).await?;
+            }
+        }
+
+        Ok(inserted)
+    }
+
+    /// The persisted repair watermark, or `Millis(0)` when repair has never
+    /// run, so the first pass scans every `SUPERSEDES` edge in the store.
+    async fn repair_watermark(&self) -> Result<Millis> {
+        let rows = self
+            .backend
+            .query(
+                "SELECT last_repaired_at FROM provenance_repair_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        match rows.first() {
+            Some(row) => Ok(Millis(row.get_i64(0)?)),
+            None => Ok(Millis(0)),
+        }
+    }
+
+    /// Delete-then-insert into the single-row `provenance_repair_state`
+    /// table, matching `mark_entity_synthesized`'s idiom for a table with no
+    /// natural key to `UPDATE` against across backends.
+    async fn persist_repair_watermark(&self, watermark: Millis) -> Result<()> {
+        let statements = vec![
+            (
+                "DELETE FROM provenance_repair_state WHERE id = 1".to_string(),
+                Vec::new(),
+            ),
+            (
+                "INSERT INTO provenance_repair_state (id, last_repaired_at) VALUES (1, ?1)"
+                    .to_string(),
+                vec![watermark.into()],
+            ),
+        ];
+        self.backend.execute_atomic(&statements).await?;
+        Ok(())
+    }
+
+    /// The terminal live node reached by following `SUPERSEDES` edges forward
+    /// from `original`: each step asks "who superseded the current node" (an
+    /// edge with `dst` equal to it, since `supersede` inserts `new -> old`),
+    /// moving to that edge's `src`, until no further supersession is found.
+    /// A node superseded only once returns after a single step; a node never
+    /// superseded again returns `original` itself unchanged.
+    async fn terminal_supersession(&self, original: &NodeId) -> Result<NodeId> {
+        let mut current = original.clone();
+        loop {
+            let rows = self
+                .backend
+                .query(
+                    "SELECT src FROM edges WHERE dst = ?1 AND type = ?2 AND tx_to = ?3",
+                    &[
+                        current.as_str().into(),
+                        crate::types::relation::SUPERSEDES.into(),
+                        FOREVER.into(),
+                    ],
+                )
+                .await?;
+            match rows.first() {
+                Some(row) => current = NodeId::from_raw(row.get_string(0)?),
+                None => return Ok(current),
+            }
+        }
     }
 
     /// The stored run state, or `None` when this store has never clustered.
@@ -6217,5 +6472,541 @@ mod tests {
         async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
             self.inner.begin().await
         }
+    }
+
+    #[test]
+    fn classify_relate_outcome_maps_an_insert_to_inserted() {
+        // Arrange
+        let result: Result<EdgeId> = Ok(EdgeId::new());
+
+        // Act
+        let outcome = classify_relate_outcome(&result);
+
+        // Assert
+        assert_eq!(outcome, EdgeOutcome::Inserted);
+    }
+
+    #[test]
+    fn classify_relate_outcome_maps_source_not_live_to_not_live() {
+        let result: Result<EdgeId> = Err(Error::RelateRefused(
+            "source node 01ARZ3NDEKTSV4RRFFQ69G5FAV is not live".to_string(),
+        ));
+
+        let outcome = classify_relate_outcome(&result);
+
+        assert_eq!(outcome, EdgeOutcome::NotLive);
+    }
+
+    #[test]
+    fn classify_relate_outcome_maps_target_not_live_to_not_live() {
+        let result: Result<EdgeId> = Err(Error::RelateRefused(
+            "target node 01ARZ3NDEKTSV4RRFFQ69G5FAV is not live".to_string(),
+        ));
+
+        let outcome = classify_relate_outcome(&result);
+
+        assert_eq!(outcome, EdgeOutcome::NotLive);
+    }
+
+    #[test]
+    fn classify_relate_outcome_maps_a_duplicate_triple_to_already_present() {
+        let result: Result<EdgeId> = Err(Error::RelateRefused(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV already relates to 01BX5ZZKBKACTAV9WEVGEMMVRZ as 'mentions'"
+                .to_string(),
+        ));
+
+        let outcome = classify_relate_outcome(&result);
+
+        assert_eq!(outcome, EdgeOutcome::AlreadyPresent);
+    }
+
+    #[test]
+    fn classify_relate_outcome_maps_a_concurrent_write_retry_to_real_failure() {
+        // Every guard passed on the diagnostic re-read, so something else
+        // flipped between the insert and the diagnostic: not a safe no-op.
+        let result: Result<EdgeId> = Err(Error::RelateRefused(
+            "a concurrent write took the row, retry".to_string(),
+        ));
+
+        let outcome = classify_relate_outcome(&result);
+
+        assert_eq!(outcome, EdgeOutcome::RealFailure);
+    }
+
+    #[test]
+    fn classify_relate_outcome_maps_a_non_relate_refused_error_to_real_failure() {
+        let result: Result<EdgeId> = Err(Error::Backend("connection reset".to_string()));
+
+        let outcome = classify_relate_outcome(&result);
+
+        assert_eq!(outcome, EdgeOutcome::RealFailure);
+    }
+
+    #[test]
+    fn next_watermark_is_none_for_an_empty_list() {
+        // Arrange
+        let processed: Vec<(Millis, EdgeOutcome)> = Vec::new();
+
+        // Act
+        let watermark = next_watermark(&processed);
+
+        // Assert
+        assert_eq!(watermark, None);
+    }
+
+    #[test]
+    fn next_watermark_advances_to_the_newest_tx_from_when_everything_succeeds() {
+        let processed = vec![
+            (Millis(100), EdgeOutcome::Inserted),
+            (Millis(300), EdgeOutcome::AlreadyPresent),
+            (Millis(200), EdgeOutcome::NotLive),
+        ];
+
+        let watermark = next_watermark(&processed);
+
+        assert_eq!(watermark, Some(Millis(300)));
+    }
+
+    #[test]
+    fn next_watermark_never_advances_past_a_real_failure_despite_later_successes() {
+        // The entry at 300 succeeds but comes after the failure at 200, so it
+        // must not pull the watermark forward: a later scan has to revisit
+        // the failed edge, which it can only do if the watermark stayed
+        // behind it.
+        let processed = vec![
+            (Millis(100), EdgeOutcome::Inserted),
+            (Millis(200), EdgeOutcome::RealFailure),
+            (Millis(300), EdgeOutcome::Inserted),
+        ];
+
+        let watermark = next_watermark(&processed);
+
+        assert_eq!(watermark, Some(Millis(100)));
+    }
+
+    #[test]
+    fn next_watermark_is_none_when_the_first_entry_is_a_real_failure() {
+        let processed = vec![
+            (Millis(100), EdgeOutcome::RealFailure),
+            (Millis(200), EdgeOutcome::Inserted),
+        ];
+
+        let watermark = next_watermark(&processed);
+
+        assert_eq!(watermark, None);
+    }
+
+    #[test]
+    fn next_watermark_excludes_a_tied_timestamp_when_the_success_is_processed_first() {
+        // Both entries share tx_from=100: the success is processed before
+        // the failure, but nothing is safely before the failure's own
+        // timestamp, so the watermark must not advance to it.
+        let processed = vec![
+            (Millis(100), EdgeOutcome::Inserted),
+            (Millis(100), EdgeOutcome::RealFailure),
+        ];
+
+        let watermark = next_watermark(&processed);
+
+        assert_eq!(watermark, None);
+    }
+
+    #[test]
+    fn next_watermark_excludes_a_tied_timestamp_regardless_of_processing_order() {
+        // Same tie as above with the failure processed first, confirming the
+        // bound comes from the timestamp, not from list position.
+        let processed = vec![
+            (Millis(100), EdgeOutcome::RealFailure),
+            (Millis(100), EdgeOutcome::Inserted),
+        ];
+
+        let watermark = next_watermark(&processed);
+
+        assert_eq!(watermark, None);
+    }
+
+    // ---- repair_superseded_mentions ----
+
+    #[tokio::test]
+    async fn repair_inserts_a_mentions_edge_to_the_node_that_superseded_the_original() {
+        // Arrange: an entity mentions a fact, which is then superseded once.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        g.relate(&entity, &fact, relation::MENTIONS).await.unwrap();
+        clock.set(Millis(2000));
+        let fact2 = g
+            .supersede(&fact, NewNode::now("fact", "second", "x"))
+            .await
+            .unwrap();
+
+        // Act
+        let repaired = g.repair_superseded_mentions().await.unwrap();
+
+        // Assert
+        assert_eq!(repaired, 1);
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4",
+                &[
+                    entity.as_str().into(),
+                    fact2.as_str().into(),
+                    relation::MENTIONS.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get_i64(0).unwrap(),
+            1,
+            "a live mentions edge to the new node must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_follows_a_two_hop_supersession_chain_to_the_terminal_node() {
+        // Arrange: fact A is superseded by B, and B is superseded by C, both
+        // landing inside one repair window, so the entity's mention must jump
+        // straight to C rather than stopping at the intermediate B.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact_a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+        g.relate(&entity, &fact_a, relation::MENTIONS)
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        let fact_b = g
+            .supersede(&fact_a, NewNode::now("fact", "b", "x"))
+            .await
+            .unwrap();
+        clock.set(Millis(3000));
+        let fact_c = g
+            .supersede(&fact_b, NewNode::now("fact", "c", "x"))
+            .await
+            .unwrap();
+
+        // Act
+        let repaired = g.repair_superseded_mentions().await.unwrap();
+
+        // Assert
+        assert_eq!(repaired, 1);
+        let to_terminal = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4",
+                &[
+                    entity.as_str().into(),
+                    fact_c.as_str().into(),
+                    relation::MENTIONS.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_terminal[0].get_i64(0).unwrap(),
+            1,
+            "must land on the terminal node C"
+        );
+        let to_intermediate = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4",
+                &[
+                    entity.as_str().into(),
+                    fact_b.as_str().into(),
+                    relation::MENTIONS.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_intermediate[0].get_i64(0).unwrap(),
+            0,
+            "must not stop at the intermediate node B"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_excludes_an_already_processed_supersession_on_a_second_run() {
+        // Arrange: repair once, so the watermark moves past this supersession.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        g.relate(&entity, &fact, relation::MENTIONS).await.unwrap();
+        clock.set(Millis(2000));
+        let fact2 = g
+            .supersede(&fact, NewNode::now("fact", "second", "x"))
+            .await
+            .unwrap();
+        let first_pass = g.repair_superseded_mentions().await.unwrap();
+        assert_eq!(first_pass, 1, "sanity: the first pass must repair it");
+
+        // Act: run again with nothing new since the watermark advanced past it.
+        let second_pass = g.repair_superseded_mentions().await.unwrap();
+
+        // Assert: the watermark excludes the edge from the scan entirely,
+        // rather than `relate` refusing a second attempt that never fires.
+        assert_eq!(second_pass, 0);
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4",
+                &[
+                    entity.as_str().into(),
+                    fact2.as_str().into(),
+                    relation::MENTIONS.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get_i64(0).unwrap(),
+            1,
+            "exactly one mentions edge to the terminal, not a second insert attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_lets_relates_own_duplicate_guard_absorb_a_second_attempt_within_one_pass() {
+        // Arrange: two live mentions edges from the same entity to the same
+        // original node, seeded via `link` directly since `link` carries no
+        // duplicate guard, unlike `relate`. Both fall inside one repair pass.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        let fact2 = g
+            .supersede(&fact, NewNode::now("fact", "second", "x"))
+            .await
+            .unwrap();
+
+        // Act
+        let repaired = g.repair_superseded_mentions().await.unwrap();
+
+        // Assert: `relate`'s own duplicate-triple guard absorbs the second
+        // attempt within this single pass, distinct from the watermark
+        // exclusion across separate passes.
+        assert_eq!(repaired, 1);
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4",
+                &[
+                    entity.as_str().into(),
+                    fact2.as_str().into(),
+                    relation::MENTIONS.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_i64(0).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn repair_ignores_a_supersession_edge_older_than_the_watermark() {
+        // Arrange: a supersession, with the watermark manually advanced past
+        // it (standing in for an earlier repair pass), then a fresh mention
+        // added to the now-dead original node afterward.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        clock.set(Millis(2000));
+        let fact2 = g
+            .supersede(&fact, NewNode::now("fact", "second", "x"))
+            .await
+            .unwrap();
+        g.backend
+            .execute(
+                "INSERT INTO provenance_repair_state (id, last_repaired_at) VALUES (1, ?1)",
+                &[Millis(2000).into()],
+            )
+            .await
+            .unwrap();
+        clock.set(Millis(3000));
+        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
+            .await
+            .unwrap();
+
+        // Act
+        let repaired = g.repair_superseded_mentions().await.unwrap();
+
+        // Assert: bounded scan, not full-graph, so the old supersession never
+        // resurfaces regardless of when a mention lands on its dead node.
+        assert_eq!(repaired, 0);
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4",
+                &[
+                    entity.as_str().into(),
+                    fact2.as_str().into(),
+                    relation::MENTIONS.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_i64(0).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn repair_picks_up_a_pre_restart_supersession_after_reopening_the_graph() {
+        // Arrange: a supersession happens, then the `Graph` handle is dropped
+        // and a fresh one reopened over the same backing file, simulating a
+        // daemon restart with the watermark never advanced manually.
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("repair.db");
+        let path_str = path.to_str().expect("temp path is valid utf-8");
+
+        let (entity, fact2) = {
+            let clock = Arc::new(FixedClock::new(Millis(1000)));
+            let g = DefaultGraph::open_with_clock(path_str, GraphConfig::new(8), clock.clone())
+                .await
+                .unwrap();
+            let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+            let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+            g.relate(&entity, &fact, relation::MENTIONS).await.unwrap();
+            clock.set(Millis(2000));
+            let fact2 = g
+                .supersede(&fact, NewNode::now("fact", "second", "x"))
+                .await
+                .unwrap();
+            (entity, fact2)
+        }; // g drops here, releasing the file before reopening.
+
+        // Act
+        let clock = Arc::new(FixedClock::new(Millis(3000)));
+        let g = DefaultGraph::open_with_clock(path_str, GraphConfig::new(8), clock)
+            .await
+            .expect("reopen graph over the same backing file");
+        let repaired = g.repair_superseded_mentions().await.unwrap();
+
+        // Assert
+        assert_eq!(
+            repaired, 1,
+            "repair after a restart must still find the pre-restart supersession"
+        );
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4",
+                &[
+                    entity.as_str().into(),
+                    fact2.as_str().into(),
+                    relation::MENTIONS.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_i64(0).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn repair_does_nothing_for_a_mention_of_a_fact_that_was_never_superseded() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        g.relate(&entity, &fact, relation::MENTIONS).await.unwrap();
+
+        // Act
+        let repaired = g.repair_superseded_mentions().await.unwrap();
+
+        // Assert
+        assert_eq!(repaired, 0);
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE type = ?1",
+                &[relation::MENTIONS.into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get_i64(0).unwrap(),
+            1,
+            "no new mentions edge should have been added"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_moves_a_superseded_entitys_own_mention_to_the_terminal_entity() {
+        // Arrange: an entity mentions a fact, then the entity itself is
+        // superseded directly, standing in for what resynthesis does. Unlike
+        // `supersede`, this leaves the entity's own `mentions` edge attached
+        // to the now-dead original id.
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
+        let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
+        g.relate(&entity, &fact, relation::MENTIONS).await.unwrap();
+        clock.set(Millis(2000));
+        let terminal_entity = g
+            .supersede(&entity, NewNode::entity("person", "Ada"))
+            .await
+            .unwrap();
+
+        // Act
+        let repaired = g.repair_superseded_mentions().await.unwrap();
+
+        // Assert: the mention now originates from the terminal entity id,
+        // not the dead original.
+        assert_eq!(repaired, 1);
+        let fingerprint = g
+            .entity_mentions_fingerprint("ada", None, Millis(3000))
+            .await
+            .unwrap();
+        assert_eq!(
+            fingerprint.edge_count, 1,
+            "the live entity node must have exactly one mentions edge"
+        );
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4",
+                &[
+                    terminal_entity.as_str().into(),
+                    fact.as_str().into(),
+                    relation::MENTIONS.into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get_i64(0).unwrap(),
+            1,
+            "a live mentions edge from the terminal entity to the fact must exist"
+        );
     }
 }
