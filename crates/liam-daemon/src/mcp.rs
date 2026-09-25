@@ -967,7 +967,7 @@ impl MemoryServer {
 
     /// Recompiles one entity's page from its mentions using `remember`'s
     /// shared batch deadline; a failure is reported, never panicked.
-    async fn resynthesize_entity(
+    pub(crate) async fn resynthesize_entity(
         &self,
         entity_id: liam_store::NodeId,
         deadline: tokio::time::Instant,

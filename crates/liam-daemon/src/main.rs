@@ -306,29 +306,110 @@ fn spawn_gc(config: &Config, server: MemoryServer) {
     let policy = config.gc_policy();
     let interval = config.gc_interval();
     let run_on_start = config.gc.run_on_start;
+    let max_resynth_per_tick = config.gc.max_resynth_per_tick;
+    let ask_timeout_secs = config.ask_timeout_secs;
+    // An autotuned server (`max_concurrent_generations == 0`) is still
+    // calibrating its generation-permit capacity when the run-on-start tick
+    // fires, so that one tick alone skips resynthesis to avoid competing with
+    // the calibration benchmark for the same permits. Every later tick,
+    // periodic or otherwise, resynthesizes normally.
+    let skip_first_resynth = run_on_start && config.llm.max_concurrent_generations == 0;
     tokio::spawn(async move {
         if run_on_start {
-            maintenance_tick(&server, &policy).await;
+            maintenance_tick(
+                &server,
+                &policy,
+                max_resynth_per_tick,
+                ask_timeout_secs,
+                skip_first_resynth,
+            )
+            .await;
         }
         let mut tick = tokio::time::interval(interval);
         tick.tick().await; // drop the immediate first tick
         loop {
             tick.tick().await;
-            maintenance_tick(&server, &policy).await;
+            maintenance_tick(
+                &server,
+                &policy,
+                max_resynth_per_tick,
+                ask_timeout_secs,
+                false,
+            )
+            .await;
         }
     });
 }
 
-/// Sweep, then refresh clusters if anything moved the edge fingerprint. Runs
-/// the refresh even after a partial sweep, since `gc` is independent
-/// statements rather than one transaction. `server` is otherwise unused for
-/// now: it is threaded through so a later resynthesis step can call into the
-/// same connection without another signature change.
-async fn maintenance_tick(server: &MemoryServer, policy: &liam_store::RetentionPolicy) {
+/// Sweep, repair, refresh clusters, then resynthesize stale entities unless
+/// `skip_resynthesis` is set (the run-on-start tick of an autotuning server,
+/// which cannot yet spare generation permits for it).
+async fn maintenance_tick(
+    server: &MemoryServer,
+    policy: &liam_store::RetentionPolicy,
+    max_resynth_per_tick: usize,
+    ask_timeout_secs: u64,
+    skip_resynthesis: bool,
+) {
     let store = server.store_handle();
     sweep(&store, policy).await;
     repair_mentions(&store).await;
     refresh_clusters(&store).await;
+    if !skip_resynthesis {
+        resynthesize_stale(server, &store, max_resynth_per_tick, ask_timeout_secs).await;
+    }
+}
+
+/// Resynthesizes up to `max_resynth_per_tick` stale entities, oldest first.
+/// Entities are processed one at a time, never concurrently: `resynthesize_entity`
+/// draws from the same shared generation-permit pool `ask` uses, so firing them
+/// all at once would starve concurrent user requests instead of yielding to them
+/// between entities.
+async fn resynthesize_stale(
+    server: &MemoryServer,
+    store: &DefaultGraph,
+    max_resynth_per_tick: usize,
+    ask_timeout_secs: u64,
+) {
+    let now = liam_store::Millis::now();
+    let stale = match store.stale_entities(max_resynth_per_tick, now).await {
+        Ok(stale) => stale,
+        Err(e) => {
+            tracing::warn!(error = %e, "stale entity lookup failed");
+            return;
+        }
+    };
+
+    for (node_id, subject, scope) in stale {
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(ask_timeout_secs.max(1));
+        match server.resynthesize_entity(node_id, deadline).await {
+            Ok(()) => {
+                match store
+                    .entity_mentions_fingerprint(&subject, scope.as_deref(), now)
+                    .await
+                {
+                    Ok(fingerprint) => {
+                        match store
+                            .mark_entity_synthesized(&subject, scope.as_deref(), fingerprint, now)
+                            .await
+                        {
+                            Ok(()) => tracing::info!(subject, "entity resynthesized"),
+                            Err(e) => {
+                                tracing::warn!(subject, error = %e, "failed to mark entity synthesized")
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(subject, error = %e, "failed to recompute entity mentions fingerprint after resynthesis")
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(subject, error = %e, "entity resynthesis failed");
+            }
+        }
+    }
 }
 
 /// Repairs `mentions` edges left dangling by a supersession, so citing
@@ -411,7 +492,7 @@ mod tests {
         let store = Arc::new(store);
         let server = test_server(Arc::clone(&store));
 
-        maintenance_tick(&server, &policy).await;
+        maintenance_tick(&server, &policy, 0, 30, true).await;
 
         assert!(
             !store.refresh_communities().await.unwrap(),
@@ -435,7 +516,7 @@ mod tests {
         let store = Arc::new(store);
         let server = test_server(Arc::clone(&store));
 
-        maintenance_tick(&server, &policy).await;
+        maintenance_tick(&server, &policy, 0, 30, true).await;
 
         assert!(
             !store.refresh_communities().await.unwrap(),
@@ -651,7 +732,7 @@ mod tests {
         let _guard = install_captured_logs(captured.clone());
 
         // When the tick fires
-        maintenance_tick(&server, &policy).await;
+        maintenance_tick(&server, &policy, 0, 30, true).await;
 
         // Then the citing entity gains a mentions edge to the new fact
         let neighbors = store.neighbors(&entity, Millis(2000)).await.unwrap();
@@ -680,7 +761,7 @@ mod tests {
         let _guard = install_captured_logs(captured.clone());
 
         // When the tick fires
-        maintenance_tick(&server, &policy).await;
+        maintenance_tick(&server, &policy, 0, 30, true).await;
 
         // Then repair is a no-op and logs zero repairs
         let log = String::from_utf8(captured.0.lock().expect("captured logs lock").clone())
@@ -688,6 +769,364 @@ mod tests {
         assert!(
             log.contains("repaired=0"),
             "expected a zero repaired count to be logged: {log}"
+        );
+    }
+
+    /// As `test_server`, but with a caller-supplied `Llm` instead of the fixed
+    /// `MockLlm`, for the resynthesis tests below that need a double which
+    /// either succeeds with a grounded reply or fails outright.
+    fn test_server_with_llm(store: Arc<DefaultGraph>, llm: Arc<dyn Llm>) -> MemoryServer {
+        MemoryServer::new(
+            store,
+            Arc::new(liam_model::MockEmbedder::new(8)),
+            Arc::new(liam_model::IdentityReranker),
+            llm,
+            30,
+            false,
+            8192,
+            1,
+        )
+    }
+
+    /// Always errors, so a resynthesis attempt driven by it must leave the
+    /// entity stale rather than succeed (mirror mcp.rs's `FailingLlm`).
+    struct FailingLlm;
+    #[async_trait::async_trait]
+    impl Llm for FailingLlm {
+        async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+            Err(liam_model::ModelError::Llm("boom".into()))
+        }
+    }
+
+    /// Extracts "(kind) label" from a synthesis prompt's "Entity: (kind) label"
+    /// line and echoes it back, which entity synthesis's grounding check always
+    /// accepts since the reply is drawn entirely from its own vocabulary seed
+    /// (mirror mcp.rs's `grounded_entity_reply`).
+    fn grounded_entity_reply(prompt: &str) -> String {
+        let line = prompt
+            .lines()
+            .find(|l| l.starts_with("Entity: ("))
+            .expect("synthesis prompt must have an Entity line");
+        let rest = line.trim_start_matches("Entity: (");
+        let close = rest
+            .find(')')
+            .expect("Entity line must have a closing paren");
+        format!("{} {}", &rest[..close], rest[close + 1..].trim())
+    }
+
+    /// Always succeeds with a reply grounded in the entity's own kind/label,
+    /// for resynthesis tests that need a working generation path.
+    struct GroundedLlm;
+    #[async_trait::async_trait]
+    impl Llm for GroundedLlm {
+        async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
+            Ok(grounded_entity_reply(prompt))
+        }
+    }
+
+    /// Blocks inside `complete()` on a `Notify` the test controls, tracking the
+    /// PEAK number of concurrent `complete()` calls it has ever seen: a final
+    /// count of 0 proves nothing, since every call reaches 0 eventually
+    /// whether or not two of them were ever in flight together (mirror
+    /// mcp.rs's `GatedLlm`).
+    struct GatedLlm {
+        release: Arc<tokio::sync::Notify>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GatedLlm {
+        fn new(release: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                release,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn in_flight(&self) -> usize {
+            self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Llm for GatedLlm {
+        async fn complete(&self, _s: &str, _prompt: &str) -> liam_model::Result<String> {
+            let now = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.peak
+                .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            self.release.notified().await;
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("gated reply".to_string())
+        }
+    }
+
+    /// Cooperatively yields until `condition()` is true, bounded so a real bug
+    /// panics the test instead of hanging the suite (mirror mcp.rs's
+    /// `wait_until`).
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never became true; the two tasks likely deadlocked");
+    }
+
+    #[tokio::test]
+    async fn the_tick_resynthesizes_at_most_the_configured_cap_oldest_stale_first() {
+        // Given 2 stale (never-synthesized) entities and a cap of 1
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        let capped = store
+            .insert(NewNode::entity("person", "First Stale"))
+            .await
+            .unwrap();
+        let leftover = store
+            .insert(NewNode::entity("person", "Second Stale"))
+            .await
+            .unwrap();
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let llm: Arc<dyn Llm> = Arc::new(GroundedLlm);
+        let server = test_server_with_llm(Arc::clone(&store), llm);
+
+        // When the tick fires with max_resynth_per_tick = 1
+        maintenance_tick(&server, &policy, 1, 30, false).await;
+
+        // Then exactly the cap's worth were resynthesized: the capped
+        // entity's old id no longer resolves, superseded by a fresh one
+        assert!(
+            store.resolve_handle(capped.as_str()).await.is_err(),
+            "the entity within the cap must have been superseded"
+        );
+        // And the entity beyond the cap is untouched and still reported stale
+        assert!(
+            store.resolve_handle(leftover.as_str()).await.is_ok(),
+            "the entity beyond the cap must remain live under its old id"
+        );
+        let stale = store.stale_entities(10, Millis::now()).await.unwrap();
+        assert!(
+            stale.iter().any(|(id, _, _)| id == &leftover),
+            "the entity beyond the cap must still be reported stale for the next tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_resynthesis_clears_the_entitys_stale_state() {
+        // Given a single stale (never-synthesized) entity
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        let old_id = store
+            .insert(NewNode::entity("person", "Solo Stale"))
+            .await
+            .unwrap();
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let llm: Arc<dyn Llm> = Arc::new(GroundedLlm);
+        let server = test_server_with_llm(Arc::clone(&store), llm);
+
+        // When the tick fires
+        maintenance_tick(&server, &policy, 5, 30, false).await;
+
+        // Then the entity's id changed, proving a real resynthesis ran
+        assert!(
+            store.resolve_handle(old_id.as_str()).await.is_err(),
+            "a successful resynthesis must supersede the old id"
+        );
+        // And a follow-up check at the same as_of no longer reports it stale,
+        // proving the (subject, scope) staleness state was updated even
+        // though the NodeId it is keyed against changed underneath it
+        let stale = store.stale_entities(10, Millis::now()).await.unwrap();
+        assert!(
+            stale.is_empty(),
+            "a freshly resynthesized entity must not still be reported stale: {stale:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_resynthesis_leaves_the_entity_stale_and_logs_it_without_a_panic() {
+        // Given a stale entity whose resynthesis will fail
+        let failing_store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        let failing_entity = failing_store
+            .insert(NewNode::entity("person", "Fails Guy"))
+            .await
+            .unwrap();
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let failing_store = Arc::new(failing_store);
+        let failing_llm: Arc<dyn Llm> = Arc::new(FailingLlm);
+        let failing_server = test_server_with_llm(Arc::clone(&failing_store), failing_llm);
+        let captured = CapturedLogs::default();
+        let _guard = install_captured_logs(captured.clone());
+
+        // When its tick fires
+        maintenance_tick(&failing_server, &policy, 5, 30, false).await;
+
+        // Then the tick completed without panicking (reaching here proves
+        // that), the entity remains live under its old id and still stale
+        assert!(
+            failing_store
+                .resolve_handle(failing_entity.as_str())
+                .await
+                .is_ok(),
+            "a failed resynthesis must leave the entity's old id live"
+        );
+        let stale = failing_store
+            .stale_entities(10, Millis::now())
+            .await
+            .unwrap();
+        assert!(
+            stale.iter().any(|(id, _, _)| id == &failing_entity),
+            "a failed resynthesis must leave the entity reported stale"
+        );
+        // And the failure was logged
+        let log = String::from_utf8(captured.0.lock().expect("captured logs lock").clone())
+            .expect("log output is utf8");
+        assert!(
+            log.contains("entity resynthesis failed"),
+            "expected the failure to be logged: {log}"
+        );
+
+        // And a separate entity's own tick, with a working llm, still
+        // succeeds independently: the failure path above never touched
+        // shared state a second entity's resynthesis would also need
+        let working_store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        let working_entity = working_store
+            .insert(NewNode::entity("person", "Works Guy"))
+            .await
+            .unwrap();
+        let working_store = Arc::new(working_store);
+        let working_llm: Arc<dyn Llm> = Arc::new(GroundedLlm);
+        let working_server = test_server_with_llm(Arc::clone(&working_store), working_llm);
+
+        maintenance_tick(&working_server, &policy, 5, 30, false).await;
+
+        assert!(
+            working_store
+                .resolve_handle(working_entity.as_str())
+                .await
+                .is_err(),
+            "the other entity's own resynthesis must still succeed independently"
+        );
+    }
+
+    #[tokio::test]
+    async fn resynthesize_stale_processes_entities_one_at_a_time_not_concurrently() {
+        // Given 2 stale entities, a cap covering both, and an llm gated so a
+        // call blocks until this test decides to release it
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        store
+            .insert(NewNode::entity("person", "Gated One"))
+            .await
+            .unwrap();
+        store
+            .insert(NewNode::entity("person", "Gated Two"))
+            .await
+            .unwrap();
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm = Arc::new(GatedLlm::new(release.clone()));
+        let server = test_server_with_llm(Arc::clone(&store), llm.clone());
+
+        // When the tick runs, spawned since the gated llm blocks until released
+        let handle = tokio::spawn(async move {
+            maintenance_tick(&server, &policy, 2, 30, false).await;
+        });
+
+        // Then only one entity's generation is ever in flight: release the
+        // first, wait for the second to start, release it too
+        wait_until(|| llm.in_flight() == 1).await;
+        release.notify_one();
+        wait_until(|| llm.in_flight() == 1).await;
+        release.notify_one();
+        handle.await.expect("maintenance tick task panicked");
+
+        // The PEAK proves the two generations were never in flight together,
+        // not merely that the count returned to normal afterward
+        assert_eq!(
+            llm.peak(),
+            1,
+            "resynthesize_stale must process entities sequentially, \
+             never two generations in flight together"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_resynthesis_skips_only_resynthesis_not_the_rest_of_the_tick() {
+        // Given a stale entity, and a superseded fact so repair has work to log
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let store = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let stale_entity = store
+            .insert(NewNode::entity("person", "Autotune Guy"))
+            .await
+            .unwrap();
+        let citing_entity = store
+            .insert(NewNode::entity("person", "Cited By"))
+            .await
+            .unwrap();
+        let fact = store
+            .insert(NewNode::now("fact", "first", "x"))
+            .await
+            .unwrap();
+        store
+            .relate(&citing_entity, &fact, relation::MENTIONS)
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        store
+            .supersede(&fact, NewNode::now("fact", "second", "x"))
+            .await
+            .unwrap();
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let llm: Arc<dyn Llm> = Arc::new(GroundedLlm);
+        let server = test_server_with_llm(Arc::clone(&store), llm);
+        let captured = CapturedLogs::default();
+        let _guard = install_captured_logs(captured.clone());
+
+        // When the autotuning run-on-start tick fires with resynthesis skipped
+        maintenance_tick(&server, &policy, 5, 30, true).await;
+
+        // Then repair still ran (its own log line is still present) ...
+        let log = String::from_utf8(captured.0.lock().expect("captured logs lock").clone())
+            .expect("log output is utf8");
+        assert!(
+            log.contains("repaired=1"),
+            "repair must still run when resynthesis is skipped: {log}"
+        );
+        // ... but resynthesis never touched the stale entity
+        assert!(
+            store.resolve_handle(stale_entity.as_str()).await.is_ok(),
+            "a skipped resynthesis pass must leave the stale entity untouched"
+        );
+
+        // When a later tick fires with resynthesis no longer skipped
+        maintenance_tick(&server, &policy, 5, 30, false).await;
+
+        // Then that later tick resynthesizes the entity normally
+        assert!(
+            store.resolve_handle(stale_entity.as_str()).await.is_err(),
+            "a later, non-skipped tick must resynthesize the entity"
         );
     }
 }
