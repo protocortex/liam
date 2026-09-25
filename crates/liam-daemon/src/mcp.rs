@@ -642,6 +642,13 @@ impl MemoryServer {
         self.granted_capacity.clone()
     }
 
+    /// Shares this server's store handle: the same `Graph` every request
+    /// handler uses, so the maintenance tick reads and writes through the
+    /// one connection rather than opening a second.
+    pub(crate) fn store_handle(&self) -> Arc<DefaultGraph> {
+        self.store.clone()
+    }
+
     /// Bundles this connection's AIMD state for one evaluation to use.
     fn aimd_handles(&self) -> AimdHandles {
         AimdHandles {
@@ -960,7 +967,7 @@ impl MemoryServer {
 
     /// Recompiles one entity's page from its mentions using `remember`'s
     /// shared batch deadline; a failure is reported, never panicked.
-    async fn resynthesize_entity(
+    pub(crate) async fn resynthesize_entity(
         &self,
         entity_id: liam_store::NodeId,
         deadline: tokio::time::Instant,
