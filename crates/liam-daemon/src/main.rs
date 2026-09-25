@@ -385,13 +385,26 @@ async fn resynthesize_stale(
             tokio::time::Instant::now() + std::time::Duration::from_secs(ask_timeout_secs.max(1));
         match server.resynthesize_entity(node_id, deadline).await {
             Ok(()) => {
+                // `resynthesize_entity` supersedes using the real wall clock, so the
+                // node it just closed and the one it just opened straddle an instant
+                // strictly later than the loop-level `now` captured above (which is
+                // for the initial stale-entities query, not this fingerprint). Reusing
+                // that stale `now` here would still resolve the just-superseded old
+                // node, recording its mention count against the new node's key and
+                // making the entity look stale again on every following tick.
+                let post_resynthesis_now = liam_store::Millis::now();
                 match store
-                    .entity_mentions_fingerprint(&subject, scope.as_deref(), now)
+                    .entity_mentions_fingerprint(&subject, scope.as_deref(), post_resynthesis_now)
                     .await
                 {
                     Ok(fingerprint) => {
                         match store
-                            .mark_entity_synthesized(&subject, scope.as_deref(), fingerprint, now)
+                            .mark_entity_synthesized(
+                                &subject,
+                                scope.as_deref(),
+                                fingerprint,
+                                post_resynthesis_now,
+                            )
                             .await
                         {
                             Ok(()) => tracing::info!(subject, "entity resynthesized"),
@@ -824,6 +837,20 @@ mod tests {
         }
     }
 
+    /// As `GroundedLlm`, but sleeps on the real clock first, so the wall-clock
+    /// instant `resynthesize_entity`'s supersede runs at is measurably later
+    /// than the one `resynthesize_stale` captured before its loop began: the
+    /// gap a fresh-fingerprint regression test needs to be reproducible
+    /// rather than a coin flip on how fast the test happens to run.
+    struct DelayedGroundedLlm;
+    #[async_trait::async_trait]
+    impl Llm for DelayedGroundedLlm {
+        async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(grounded_entity_reply(prompt))
+        }
+    }
+
     /// Blocks inside `complete()` on a `Notify` the test controls, tracking the
     /// PEAK number of concurrent `complete()` calls it has ever seen: a final
     /// count of 0 proves nothing, since every call reaches 0 eventually
@@ -952,6 +979,56 @@ mod tests {
         assert!(
             stale.is_empty(),
             "a freshly resynthesized entity must not still be reported stale: {stale:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resynthesized_entity_with_a_live_mention_is_not_reported_stale_again_next_tick() {
+        // Given an entity with one live mentions edge of its own, so the old
+        // and new node fingerprint differently (1 mention vs. 0, since a
+        // supersede never carries a node's own edges over on its own), and a
+        // slow-but-successful llm so the real wall clock has visibly moved
+        // by the time the resynthesis it drives actually supersedes the
+        // entity, past the `now` `resynthesize_stale` captured before its
+        // loop began
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        let entity = store
+            .insert(NewNode::entity("person", "Mentioned Stale"))
+            .await
+            .unwrap();
+        let fact = store
+            .insert(NewNode::now("fact", "some fact", "x"))
+            .await
+            .unwrap();
+        store
+            .relate(&entity, &fact, relation::MENTIONS)
+            .await
+            .unwrap();
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let llm: Arc<dyn Llm> = Arc::new(DelayedGroundedLlm);
+        let server = test_server_with_llm(Arc::clone(&store), llm);
+
+        // When the tick fires and resynthesizes it
+        maintenance_tick(&server, &policy, 5, 30, false).await;
+        assert!(
+            store.resolve_handle(entity.as_str()).await.is_err(),
+            "a successful resynthesis must supersede the old id"
+        );
+
+        // Then a later check, at a genuinely fresh wall-clock instant, must
+        // not find it stale again. A fingerprint recorded against the
+        // just-superseded old node's mention count (this entity's 1, rather
+        // than the new node's real 0) would mismatch the new node's actual
+        // fingerprint forever after, reporting the entity stale on every
+        // following tick regardless of whether anything had changed
+        let stale = store.stale_entities(10, Millis::now()).await.unwrap();
+        assert!(
+            stale.is_empty(),
+            "the recorded fingerprint must reflect the new node, not the just-superseded \
+             old one: {stale:?}"
         );
     }
 
