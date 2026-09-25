@@ -642,6 +642,13 @@ impl MemoryServer {
         self.granted_capacity.clone()
     }
 
+    /// Shares this server's store handle: the same `Graph` every request
+    /// handler uses, so the maintenance tick reads and writes through the
+    /// one connection rather than opening a second.
+    pub(crate) fn store_handle(&self) -> Arc<DefaultGraph> {
+        self.store.clone()
+    }
+
     /// Bundles this connection's AIMD state for one evaluation to use.
     fn aimd_handles(&self) -> AimdHandles {
         AimdHandles {

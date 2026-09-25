@@ -155,8 +155,6 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
         }
     }
 
-    spawn_gc(&config, Arc::clone(&store));
-
     let server = if config.llm.max_concurrent_generations == 0 {
         let cache_dir = resolve_config_path("llm.cache_dir", &config.llm.cache_dir)?
             .to_string_lossy()
@@ -187,6 +185,8 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
             config.llm.max_concurrent_generations,
         )
     };
+
+    spawn_gc(&config, server.clone());
 
     match mode {
         cli::Mode::Serve => serve_socket(&config, server).await,
@@ -300,30 +300,34 @@ async fn serve_socket(config: &Config, server: MemoryServer) -> anyhow::Result<(
 /// GC and the cluster refresh, on the SAME `Graph` every request handler
 /// uses, not a second connection: a second connection only traded an
 /// in-process wait for an opaque SQLite lock timeout. See ADR-0002
-/// Amendment 4.
-fn spawn_gc(config: &Config, store: Arc<DefaultGraph>) {
+/// Amendment 4. Takes a `MemoryServer` clone, not just its store, so the tick
+/// can also reach the LLM and entity-resynthesis path a later change adds.
+fn spawn_gc(config: &Config, server: MemoryServer) {
     let policy = config.gc_policy();
     let interval = config.gc_interval();
     let run_on_start = config.gc.run_on_start;
     tokio::spawn(async move {
         if run_on_start {
-            maintenance_tick(&store, &policy).await;
+            maintenance_tick(&server, &policy).await;
         }
         let mut tick = tokio::time::interval(interval);
         tick.tick().await; // drop the immediate first tick
         loop {
             tick.tick().await;
-            maintenance_tick(&store, &policy).await;
+            maintenance_tick(&server, &policy).await;
         }
     });
 }
 
 /// Sweep, then refresh clusters if anything moved the edge fingerprint. Runs
 /// the refresh even after a partial sweep, since `gc` is independent
-/// statements rather than one transaction.
-async fn maintenance_tick(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
-    sweep(store, policy).await;
-    refresh_clusters(store).await;
+/// statements rather than one transaction. `server` is otherwise unused for
+/// now: it is threaded through so a later resynthesis step can call into the
+/// same connection without another signature change.
+async fn maintenance_tick(server: &MemoryServer, policy: &liam_store::RetentionPolicy) {
+    let store = server.store_handle();
+    sweep(&store, policy).await;
+    refresh_clusters(&store).await;
 }
 
 async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
@@ -368,14 +372,32 @@ mod tests {
         (store, clock)
     }
 
+    /// A `MemoryServer` wrapping `store`, backed by mock model doubles that
+    /// never touch a real embedder, reranker, or LLM: enough for
+    /// `maintenance_tick` to reach the store it holds, nothing else.
+    fn test_server(store: Arc<DefaultGraph>) -> MemoryServer {
+        MemoryServer::new(
+            store,
+            Arc::new(liam_model::MockEmbedder::new(8)),
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            1,
+        )
+    }
+
     #[tokio::test]
     async fn the_tick_refreshes_clusters_after_the_sweep() {
         let (store, _clock) = seeded_pair(Millis(1000)).await;
         // Nothing is old enough to sweep under this policy, which isolates the
         // refresh half of `maintenance_tick` from the sweep half.
         let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let server = test_server(Arc::clone(&store));
 
-        maintenance_tick(&store, &policy).await;
+        maintenance_tick(&server, &policy).await;
 
         assert!(
             !store.refresh_communities().await.unwrap(),
@@ -396,8 +418,10 @@ mod tests {
         let (store, clock) = seeded_pair(t0).await;
         clock.set(Millis(t0.0 + 10_000));
         let policy = RetentionPolicy::keep("fact", Millis(1));
+        let store = Arc::new(store);
+        let server = test_server(Arc::clone(&store));
 
-        maintenance_tick(&store, &policy).await;
+        maintenance_tick(&server, &policy).await;
 
         assert!(
             !store.refresh_communities().await.unwrap(),
