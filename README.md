@@ -187,6 +187,8 @@ unknown key fails loudly.
 | `gc.reclaim` | `true` | Run incremental vacuum after a sweep. |
 | `gc.run_on_start` | `false` | Sweep once at boot. |
 | `gc.max_resynth_per_tick` | `5` | Ceiling on entities re-synthesized per maintenance tick. |
+| `gc.full_synthesis_mention_threshold` | `8` | Live-mention count at or above which the next resynthesis uses the full-tier token budget. |
+| `gc.full_synthesis_max_new_tokens` | `512` | Output token budget for a full-tier resynthesis. |
 | `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. |
 | `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`. |
 | `embedder.cache_dir` | `~/.liam/models` | Files for both the reranker and the embedder, each under its own `models--Org--Name` subdirectory. |

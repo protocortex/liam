@@ -56,6 +56,11 @@ pub struct GcConfig {
     pub run_on_start: bool,
     /// Ceiling on entities re-synthesized per maintenance tick.
     pub max_resynth_per_tick: usize,
+    /// Live-mention threshold at or above which the next resynthesis uses
+    /// the full-tier token budget instead of the baseline.
+    pub full_synthesis_mention_threshold: usize,
+    /// Output token budget for a full-tier resynthesis.
+    pub full_synthesis_max_new_tokens: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +160,8 @@ impl Default for GcConfig {
             reclaim: true,
             run_on_start: false,
             max_resynth_per_tick: 5,
+            full_synthesis_mention_threshold: 8,
+            full_synthesis_max_new_tokens: 512,
         }
     }
 }
@@ -392,6 +399,48 @@ mod tests {
 
         // Then the configured value is used
         assert_eq!(c.gc.max_resynth_per_tick, 12);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn full_synthesis_mention_threshold_defaults_to_eight() {
+        // Given no explicit override in the [gc] table
+        let path = write_temp_toml("[gc]\n");
+
+        // When loaded
+        let c = Config::load(&path).expect("config with gc defaults must parse");
+
+        // Then the default value is used
+        assert_eq!(c.gc.full_synthesis_mention_threshold, 8);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn full_synthesis_max_new_tokens_defaults_to_512() {
+        // Given no explicit override in the [gc] table
+        let path = write_temp_toml("[gc]\n");
+
+        // When loaded
+        let c = Config::load(&path).expect("config with gc defaults must parse");
+
+        // Then the default value is used
+        assert_eq!(c.gc.full_synthesis_max_new_tokens, 512);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn full_synthesis_overrides_are_used() {
+        // Given explicit overrides in the [gc] table
+        let path = write_temp_toml(
+            "[gc]\nfull_synthesis_mention_threshold = 16\nfull_synthesis_max_new_tokens = 1024\n",
+        );
+
+        // When loaded
+        let c = Config::load(&path).expect("config with gc overrides must parse");
+
+        // Then the configured values are used
+        assert_eq!(c.gc.full_synthesis_mention_threshold, 16);
+        assert_eq!(c.gc.full_synthesis_max_new_tokens, 1024);
         let _ = std::fs::remove_file(&path);
     }
 
