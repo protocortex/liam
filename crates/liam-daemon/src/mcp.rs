@@ -76,7 +76,7 @@ const MENTIONS_FETCH_LIMIT: usize = 200;
 
 /// Cap on entity-page synthesis output: a short compiled profile, not a
 /// full answer. Measured real output was ~55 tokens / ~270 chars.
-const ENTITY_SYNTHESIS_MAX_NEW_TOKENS: usize = 256;
+pub(crate) const ENTITY_SYNTHESIS_MAX_NEW_TOKENS: usize = 256;
 
 /// Default and upper bound on the number of mentions `timeline` shows.
 /// WHY: caller-supplied `limit` is otherwise unbounded, and each mention's
@@ -943,7 +943,13 @@ impl MemoryServer {
                         let server = self.clone();
                         let deadline = entity_synthesis_deadline;
                         handles.push(tokio::spawn(async move {
-                            server.resynthesize_entity(entity_id, deadline).await
+                            server
+                                .resynthesize_entity(
+                                    entity_id,
+                                    deadline,
+                                    ENTITY_SYNTHESIS_MAX_NEW_TOKENS,
+                                )
+                                .await
                         }));
                     }
                     for handle in handles {
@@ -971,6 +977,7 @@ impl MemoryServer {
         &self,
         entity_id: liam_store::NodeId,
         deadline: tokio::time::Instant,
+        max_new_tokens: usize,
     ) -> Result<(), String> {
         let now = liam_store::Millis::now();
         let candidate = match self.store.get(&entity_id, now).await {
@@ -1001,7 +1008,7 @@ impl MemoryServer {
             &candidate.label,
             &mentions,
             self.ask_context_tokens,
-            ENTITY_SYNTHESIS_MAX_NEW_TOKENS,
+            max_new_tokens,
         )
         .await
         {
@@ -3570,7 +3577,7 @@ mod tests {
         // triggers for a freshly mentioned entity
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         server
-            .resynthesize_entity(entity_id.clone(), deadline)
+            .resynthesize_entity(entity_id.clone(), deadline, ENTITY_SYNTHESIS_MAX_NEW_TOKENS)
             .await
             .expect("resynthesis should succeed");
 
@@ -3611,7 +3618,7 @@ mod tests {
         // triggers for a freshly mentioned entity
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         server
-            .resynthesize_entity(entity_id.clone(), deadline)
+            .resynthesize_entity(entity_id.clone(), deadline, ENTITY_SYNTHESIS_MAX_NEW_TOKENS)
             .await
             .expect("resynthesis should succeed");
 
@@ -3685,7 +3692,7 @@ mod tests {
         // timeout so a regression that recomputes its own fails, not hangs
         let outcome = tokio::time::timeout(
             Duration::from_millis(200),
-            server.resynthesize_entity(entity_id, already_elapsed),
+            server.resynthesize_entity(entity_id, already_elapsed, ENTITY_SYNTHESIS_MAX_NEW_TOKENS),
         )
         .await
         .expect("must fail fast on the passed deadline, not hang on a freshly computed one");

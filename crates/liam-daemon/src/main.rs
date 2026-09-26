@@ -383,7 +383,10 @@ async fn resynthesize_stale(
     for (node_id, subject, scope) in stale {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(ask_timeout_secs.max(1));
-        match server.resynthesize_entity(node_id, deadline).await {
+        match server
+            .resynthesize_entity(node_id, deadline, mcp::ENTITY_SYNTHESIS_MAX_NEW_TOKENS)
+            .await
+        {
             Ok(()) => {
                 // `resynthesize_entity` supersedes using the real wall clock, so the
                 // node it just closed and the one it just opened straddle an instant
