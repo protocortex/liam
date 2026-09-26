@@ -307,6 +307,8 @@ fn spawn_gc(config: &Config, server: MemoryServer) {
     let interval = config.gc_interval();
     let run_on_start = config.gc.run_on_start;
     let max_resynth_per_tick = config.gc.max_resynth_per_tick;
+    let full_synthesis_mention_threshold = config.gc.full_synthesis_mention_threshold;
+    let full_synthesis_max_new_tokens = config.gc.full_synthesis_max_new_tokens;
     let ask_timeout_secs = config.ask_timeout_secs;
     // An autotuned server (`max_concurrent_generations == 0`) is still
     // calibrating its generation-permit capacity when the run-on-start tick
@@ -322,6 +324,8 @@ fn spawn_gc(config: &Config, server: MemoryServer) {
                 max_resynth_per_tick,
                 ask_timeout_secs,
                 skip_first_resynth,
+                full_synthesis_mention_threshold,
+                full_synthesis_max_new_tokens,
             )
             .await;
         }
@@ -335,6 +339,8 @@ fn spawn_gc(config: &Config, server: MemoryServer) {
                 max_resynth_per_tick,
                 ask_timeout_secs,
                 false,
+                full_synthesis_mention_threshold,
+                full_synthesis_max_new_tokens,
             )
             .await;
         }
@@ -350,13 +356,23 @@ async fn maintenance_tick(
     max_resynth_per_tick: usize,
     ask_timeout_secs: u64,
     skip_resynthesis: bool,
+    full_synthesis_mention_threshold: usize,
+    full_synthesis_max_new_tokens: usize,
 ) {
     let store = server.store_handle();
     sweep(&store, policy).await;
     repair_mentions(&store).await;
     refresh_clusters(&store).await;
     if !skip_resynthesis {
-        resynthesize_stale(server, &store, max_resynth_per_tick, ask_timeout_secs).await;
+        resynthesize_stale(
+            server,
+            &store,
+            max_resynth_per_tick,
+            ask_timeout_secs,
+            full_synthesis_mention_threshold,
+            full_synthesis_max_new_tokens,
+        )
+        .await;
     }
 }
 
@@ -370,6 +386,8 @@ async fn resynthesize_stale(
     store: &DefaultGraph,
     max_resynth_per_tick: usize,
     ask_timeout_secs: u64,
+    full_synthesis_mention_threshold: usize,
+    full_synthesis_max_new_tokens: usize,
 ) {
     let now = liam_store::Millis::now();
     let stale = match store.stale_entities(max_resynth_per_tick, now).await {
@@ -381,10 +399,25 @@ async fn resynthesize_stale(
     };
 
     for (node_id, subject, scope) in stale {
+        // Deliberate duplicate query: stale_entities already computed a fingerprint
+        // internally and discarded it; widening its return type would touch ~10 more
+        // test call sites elsewhere, out of scope here.
+        let tier_fingerprint = store
+            .entity_mentions_fingerprint(&subject, scope.as_deref(), now)
+            .await;
+        if let Err(e) = &tier_fingerprint {
+            tracing::warn!(subject, error = %e, "tier fingerprint lookup failed, falling back to light tier");
+        }
+        let max_new_tokens = resynthesis_budget(
+            tier_fingerprint.as_ref().map(|f| *f),
+            full_synthesis_mention_threshold,
+            full_synthesis_max_new_tokens,
+            mcp::ENTITY_SYNTHESIS_MAX_NEW_TOKENS,
+        );
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(ask_timeout_secs.max(1));
         match server
-            .resynthesize_entity(node_id, deadline, mcp::ENTITY_SYNTHESIS_MAX_NEW_TOKENS)
+            .resynthesize_entity(node_id, deadline, max_new_tokens)
             .await
         {
             Ok(()) => {
@@ -425,6 +458,20 @@ async fn resynthesize_stale(
                 tracing::warn!(subject, error = %e, "entity resynthesis failed");
             }
         }
+    }
+}
+
+/// Picks the resynthesis token budget for a fingerprint: full tier at or above the
+/// mention threshold, light tier below it or when the fingerprint lookup failed.
+fn resynthesis_budget(
+    fingerprint: Result<liam_store::Fingerprint, &liam_store::Error>,
+    threshold: usize,
+    full_budget: usize,
+    light_budget: usize,
+) -> usize {
+    match fingerprint {
+        Ok(f) if f.edge_count as usize >= threshold => full_budget,
+        _ => light_budget,
     }
 }
 
@@ -469,7 +516,7 @@ async fn refresh_clusters(store: &DefaultGraph) -> bool {
 mod tests {
     use super::*;
     use liam_store::{
-        relation, FixedClock, GraphConfig, Millis, NewEdge, NewNode, RetentionPolicy,
+        relation, Fingerprint, FixedClock, GraphConfig, Millis, NewEdge, NewNode, RetentionPolicy,
     };
 
     async fn seeded_pair(t0: Millis) -> (DefaultGraph, std::sync::Arc<FixedClock>) {
@@ -508,7 +555,7 @@ mod tests {
         let store = Arc::new(store);
         let server = test_server(Arc::clone(&store));
 
-        maintenance_tick(&server, &policy, 0, 30, true).await;
+        maintenance_tick(&server, &policy, 0, 30, true, 8, 512).await;
 
         assert!(
             !store.refresh_communities().await.unwrap(),
@@ -532,7 +579,7 @@ mod tests {
         let store = Arc::new(store);
         let server = test_server(Arc::clone(&store));
 
-        maintenance_tick(&server, &policy, 0, 30, true).await;
+        maintenance_tick(&server, &policy, 0, 30, true, 8, 512).await;
 
         assert!(
             !store.refresh_communities().await.unwrap(),
@@ -748,7 +795,7 @@ mod tests {
         let _guard = install_captured_logs(captured.clone());
 
         // When the tick fires
-        maintenance_tick(&server, &policy, 0, 30, true).await;
+        maintenance_tick(&server, &policy, 0, 30, true, 8, 512).await;
 
         // Then the citing entity gains a mentions edge to the new fact
         let neighbors = store.neighbors(&entity, Millis(2000)).await.unwrap();
@@ -777,7 +824,7 @@ mod tests {
         let _guard = install_captured_logs(captured.clone());
 
         // When the tick fires
-        maintenance_tick(&server, &policy, 0, 30, true).await;
+        maintenance_tick(&server, &policy, 0, 30, true, 8, 512).await;
 
         // Then repair is a no-op and logs zero repairs
         let log = String::from_utf8(captured.0.lock().expect("captured logs lock").clone())
@@ -932,7 +979,7 @@ mod tests {
         let server = test_server_with_llm(Arc::clone(&store), llm);
 
         // When the tick fires with max_resynth_per_tick = 1
-        maintenance_tick(&server, &policy, 1, 30, false).await;
+        maintenance_tick(&server, &policy, 1, 30, false, 8, 512).await;
 
         // Then exactly the cap's worth were resynthesized: the capped
         // entity's old id no longer resolves, superseded by a fresh one
@@ -968,7 +1015,7 @@ mod tests {
         let server = test_server_with_llm(Arc::clone(&store), llm);
 
         // When the tick fires
-        maintenance_tick(&server, &policy, 5, 30, false).await;
+        maintenance_tick(&server, &policy, 5, 30, false, 8, 512).await;
 
         // Then the entity's id changed, proving a real resynthesis ran
         assert!(
@@ -1015,7 +1062,7 @@ mod tests {
         let server = test_server_with_llm(Arc::clone(&store), llm);
 
         // When the tick fires and resynthesizes it
-        maintenance_tick(&server, &policy, 5, 30, false).await;
+        maintenance_tick(&server, &policy, 5, 30, false, 8, 512).await;
         assert!(
             store.resolve_handle(entity.as_str()).await.is_err(),
             "a successful resynthesis must supersede the old id"
@@ -1053,7 +1100,7 @@ mod tests {
         let _guard = install_captured_logs(captured.clone());
 
         // When its tick fires
-        maintenance_tick(&failing_server, &policy, 5, 30, false).await;
+        maintenance_tick(&failing_server, &policy, 5, 30, false, 8, 512).await;
 
         // Then the tick completed without panicking (reaching here proves
         // that), the entity remains live under its old id and still stale
@@ -1094,7 +1141,7 @@ mod tests {
         let working_llm: Arc<dyn Llm> = Arc::new(GroundedLlm);
         let working_server = test_server_with_llm(Arc::clone(&working_store), working_llm);
 
-        maintenance_tick(&working_server, &policy, 5, 30, false).await;
+        maintenance_tick(&working_server, &policy, 5, 30, false, 8, 512).await;
 
         assert!(
             working_store
@@ -1128,7 +1175,7 @@ mod tests {
 
         // When the tick runs, spawned since the gated llm blocks until released
         let handle = tokio::spawn(async move {
-            maintenance_tick(&server, &policy, 2, 30, false).await;
+            maintenance_tick(&server, &policy, 2, 30, false, 8, 512).await;
         });
 
         // Then only one entity's generation is ever in flight: release the
@@ -1185,7 +1232,7 @@ mod tests {
         let _guard = install_captured_logs(captured.clone());
 
         // When the autotuning run-on-start tick fires with resynthesis skipped
-        maintenance_tick(&server, &policy, 5, 30, true).await;
+        maintenance_tick(&server, &policy, 5, 30, true, 8, 512).await;
 
         // Then repair still ran (its own log line is still present) ...
         let log = String::from_utf8(captured.0.lock().expect("captured logs lock").clone())
@@ -1201,12 +1248,174 @@ mod tests {
         );
 
         // When a later tick fires with resynthesis no longer skipped
-        maintenance_tick(&server, &policy, 5, 30, false).await;
+        maintenance_tick(&server, &policy, 5, 30, false, 8, 512).await;
 
         // Then that later tick resynthesizes the entity normally
         assert!(
             store.resolve_handle(stale_entity.as_str()).await.is_err(),
             "a later, non-skipped tick must resynthesize the entity"
+        );
+    }
+
+    #[test]
+    fn resynthesis_budget_returns_full_budget_at_exact_threshold() {
+        // Given a fingerprint whose edge_count sits exactly at the threshold
+        let fingerprint = Ok(Fingerprint {
+            edge_count: 8,
+            max_tx_from: Millis(0),
+        });
+
+        // When the resynthesis budget is computed
+        let budget = resynthesis_budget(fingerprint, 8, 512, 256);
+
+        // Then the full budget applies: the boundary is inclusive, not exclusive
+        assert_eq!(budget, 512);
+    }
+
+    #[test]
+    fn resynthesis_budget_returns_light_budget_below_threshold() {
+        // Given a fingerprint one edge short of the threshold
+        let fingerprint = Ok(Fingerprint {
+            edge_count: 7,
+            max_tx_from: Millis(0),
+        });
+
+        // When the resynthesis budget is computed
+        let budget = resynthesis_budget(fingerprint, 8, 512, 256);
+
+        // Then the light budget applies
+        assert_eq!(budget, 256);
+    }
+
+    #[test]
+    fn resynthesis_budget_returns_full_budget_comfortably_above_threshold() {
+        // Given a fingerprint comfortably above the threshold
+        let fingerprint = Ok(Fingerprint {
+            edge_count: 20,
+            max_tx_from: Millis(0),
+        });
+
+        // When the resynthesis budget is computed
+        let budget = resynthesis_budget(fingerprint, 8, 512, 256);
+
+        // Then the full budget applies
+        assert_eq!(budget, 512);
+    }
+
+    #[test]
+    fn resynthesis_budget_returns_light_budget_on_fingerprint_error() {
+        // Given a failed fingerprint lookup
+        let err = liam_store::Error::Backend("test".into());
+        let fingerprint = Err(&err);
+
+        // When the resynthesis budget is computed
+        let budget = resynthesis_budget(fingerprint, 8, 512, 256);
+
+        // Then it falls back to the light budget rather than aborting
+        assert_eq!(budget, 256);
+    }
+
+    /// Captures the actual `max_new_tokens` value the resynthesis path passed
+    /// to `complete_capped`, so a test can assert on what really reached the
+    /// LLM call rather than inferring it from an isolated threshold check.
+    struct RecordingMaxTokensLlm {
+        recorded_max_new_tokens: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl RecordingMaxTokensLlm {
+        fn new() -> Self {
+            Self {
+                recorded_max_new_tokens: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn recorded(&self) -> Option<usize> {
+            *self.recorded_max_new_tokens.lock().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Llm for RecordingMaxTokensLlm {
+        async fn complete(&self, system: &str, prompt: &str) -> liam_model::Result<String> {
+            self.complete_capped(system, prompt, usize::MAX).await
+        }
+
+        async fn complete_capped(
+            &self,
+            _system: &str,
+            _prompt: &str,
+            max_new_tokens: usize,
+        ) -> liam_model::Result<String> {
+            *self.recorded_max_new_tokens.lock().unwrap() = Some(max_new_tokens);
+            Ok("recorded".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tick_gives_a_frequently_mentioned_entity_the_full_tier_budget() {
+        // Given a stale entity with 20 live mentions, comfortably at or above
+        // a full-synthesis mention threshold of 8
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        let entity = store
+            .insert(NewNode::entity("person", "Frequently Mentioned"))
+            .await
+            .unwrap();
+        for i in 0..20 {
+            let fact = store
+                .insert(NewNode::now("fact", format!("fact {i}"), "x"))
+                .await
+                .unwrap();
+            store
+                .relate(&entity, &fact, relation::MENTIONS)
+                .await
+                .unwrap();
+        }
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let llm = Arc::new(RecordingMaxTokensLlm::new());
+        let server = test_server_with_llm(Arc::clone(&store), llm.clone());
+
+        // When the tick fires with a full-synthesis threshold of 8 and a
+        // full-tier budget of 512
+        maintenance_tick(&server, &policy, 5, 30, false, 8, 512).await;
+
+        // Then the actual max_new_tokens value reaching the LLM call is the
+        // full-tier budget, not the light-tier default
+        assert_eq!(
+            llm.recorded(),
+            Some(512),
+            "an entity at or above the mention threshold must get the full-tier budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tick_gives_a_rarely_mentioned_entity_the_baseline_budget() {
+        // Given a stale entity with no live mentions, below a
+        // full-synthesis mention threshold of 8
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        store
+            .insert(NewNode::entity("person", "Rarely Mentioned"))
+            .await
+            .unwrap();
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let llm = Arc::new(RecordingMaxTokensLlm::new());
+        let server = test_server_with_llm(Arc::clone(&store), llm.clone());
+
+        // When the tick fires with the same full-synthesis threshold of 8
+        // and full-tier budget of 512
+        maintenance_tick(&server, &policy, 5, 30, false, 8, 512).await;
+
+        // Then the actual max_new_tokens value reaching the LLM call is the
+        // baseline light-tier budget
+        assert_eq!(
+            llm.recorded(),
+            Some(mcp::ENTITY_SYNTHESIS_MAX_NEW_TOKENS),
+            "an entity below the mention threshold must get the baseline budget"
         );
     }
 }
