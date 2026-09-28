@@ -205,30 +205,56 @@ fn live_at(alias: &str, t: usize) -> String {
     )
 }
 
-/// SQL + params for "the live node with this subject (and scope), if any."
-/// Shared by `find_live_by_subject` (run against `&Backend`, for `upsert_by`)
-/// and `Graph::ingest_episode`'s per-node supersede check (run against an
-/// open `BackendTx`, so it also sees writes from earlier in the same
-/// episode's own transaction). Sharing the SQL-building here, not the whole
-/// method, since the `&Backend` vs `&mut BackendTx` split makes sharing the
-/// execution itself awkward.
-fn live_by_subject_query(subject: &str, now: Millis, scope: Option<&str>) -> (String, Vec<Value>) {
+/// SQL + params for "the live node with this subject (and scope, and
+/// producer if given), if any." Shared by `find_live_by_subject` (run
+/// against `&Backend`, for `upsert_by`) and `Graph::ingest_episode`'s
+/// per-node supersede check (run against an open `BackendTx`, so it also
+/// sees writes from earlier in the same episode's own transaction). Sharing
+/// the SQL-building here, not the whole method, since the `&Backend` vs
+/// `&mut BackendTx` split makes sharing the execution itself awkward.
+fn live_by_subject_query(
+    subject: &str,
+    now: Millis,
+    scope: Option<&str>,
+    producer: Option<&str>,
+) -> (String, Vec<Value>) {
     let mut params: Vec<Value> = vec![subject.into(), now.into()];
-    let scope_filter = match scope {
-        Some(s) => {
-            params.push(s.into());
-            " AND scope = ?3"
-        }
-        None => " AND scope IS NULL",
-    };
+    let mut filters = String::new();
+    let mut next = 3;
+    if let Some(s) = scope {
+        params.push(s.into());
+        filters.push_str(&format!(" AND scope = ?{next}"));
+        next += 1;
+    } else {
+        filters.push_str(" AND scope IS NULL");
+    }
+    if let Some(p) = producer {
+        params.push(p.into());
+        filters.push_str(&format!(" AND producer = ?{next}"));
+    } else {
+        // Producer-blind collision: only an entity page (content is always
+        // empty, per `NewNode::entity`) may collide here, never a fact that
+        // happens to share the same subject and scope.
+        filters.push_str(" AND content = ''");
+    }
     // If two live nodes ever share a subject+scope, supersede the newest
     // deterministically (tie-break by id) rather than an arbitrary row.
     let sql = format!(
-        "SELECT id FROM nodes WHERE subject = ?1 AND {live}{scope_filter}
+        "SELECT id FROM nodes WHERE subject = ?1 AND {live}{filters}
          ORDER BY tx_from DESC, id DESC LIMIT 1",
         live = live_at("nodes", 2),
     );
     (sql, params)
+}
+
+/// A node's own collision key for `find_live_by_subject`/`live_by_subject_query`: entity pages
+/// collide on `(subject, scope)` alone, everything else also keys on `producer`.
+fn collision_producer(node: &NewNode) -> Option<&str> {
+    if node.entity_page {
+        None
+    } else {
+        Some(node.producer.as_str())
+    }
 }
 
 /// Stated default from the scope-field-validation design (2026-08-27), not
@@ -441,9 +467,11 @@ impl<B: Backend> Graph<B> {
         Ok(id)
     }
 
-    /// Insert, or supersede a competing live node with the same subject and
-    /// scope. This makes contradiction handling automatic: the caller sets a
-    /// subject, the library closes the prior version and links to it.
+    /// Insert, or supersede a competing live node with the same collision
+    /// key: `(subject, scope, producer)` for a fact, `(subject, scope)` alone
+    /// for an entity page. This makes contradiction handling automatic: the
+    /// caller sets a subject, the library closes the prior version and links
+    /// to it.
     pub async fn upsert_by(&self, mut node: NewNode) -> Result<NodeId> {
         node.scope = validate_scope(&node.scope)?;
         let subject = match node.subject.clone() {
@@ -451,7 +479,7 @@ impl<B: Backend> Graph<B> {
             None => return self.insert(node).await,
         };
         match self
-            .find_live_by_subject(&subject, node.scope.as_deref())
+            .find_live_by_subject(&subject, node.scope.as_deref(), collision_producer(&node))
             .await?
         {
             Some(existing) => self.supersede(&existing, node).await,
@@ -644,7 +672,12 @@ impl<B: Backend> Graph<B> {
                 // `tx` instead of `&self.backend` so it sees writes from
                 // earlier in this same episode (an earlier node that
                 // already superseded something).
-                let (sql, params) = live_by_subject_query(subject, now, node.scope.as_deref());
+                let (sql, params) = live_by_subject_query(
+                    subject,
+                    now,
+                    node.scope.as_deref(),
+                    collision_producer(node),
+                );
                 let rows = tx.query(&sql, &params).await?;
                 if let Some(old_id) = rows
                     .first()
@@ -1121,9 +1154,10 @@ impl<B: Backend> Graph<B> {
         &self,
         subject: &str,
         scope: Option<&str>,
+        producer: Option<&str>,
     ) -> Result<Option<NodeId>> {
         let now = self.clock.now();
-        let (sql, params) = live_by_subject_query(subject, now, scope);
+        let (sql, params) = live_by_subject_query(subject, now, scope, producer);
         let rows = self.backend.query(&sql, &params).await?;
         Ok(rows
             .first()
@@ -1307,7 +1341,7 @@ impl<B: Backend> Graph<B> {
         scope: Option<&str>,
         as_of: Millis,
     ) -> Result<Fingerprint> {
-        let (sql, params) = live_by_subject_query(subject, as_of, scope);
+        let (sql, params) = live_by_subject_query(subject, as_of, scope, None);
         let rows = self.backend.query(&sql, &params).await?;
         let Some(node_row) = rows.first() else {
             return Ok(Fingerprint {
@@ -1422,7 +1456,8 @@ impl<B: Backend> Graph<B> {
             let stored_max_tx_from = Millis(row.get_i64(3)?);
             let last_synthesized_at = Millis(row.get_i64(4)?);
 
-            let (live_sql, live_params) = live_by_subject_query(&subject, as_of, scope.as_deref());
+            let (live_sql, live_params) =
+                live_by_subject_query(&subject, as_of, scope.as_deref(), None);
             let live_rows = self.backend.query(&live_sql, &live_params).await?;
             let Some(live_row) = live_rows.first() else {
                 continue;
@@ -3633,7 +3668,7 @@ mod tests {
             .await
             .unwrap();
 
-        // When producer B supersedes it by subject via upsert_by
+        // When producer B writes the same subject and scope via upsert_by
         clock.set(Millis(2000));
         let new_id = g
             .upsert_by(
@@ -3644,25 +3679,187 @@ mod tests {
             .await
             .unwrap();
 
-        // Then the new version records B and the superseded version still
-        // records A: history attributes each version to whoever wrote it.
+        // Then both versions stay live, each still recording its own writer:
+        // a fact collides on (subject, scope, producer), so different
+        // producers never compete for the same subject.
         let rows = g
             .backend
             .query(
-                "SELECT id, producer FROM nodes WHERE id IN (?1, ?2)",
+                "SELECT id, producer, tx_to FROM nodes WHERE id IN (?1, ?2)",
                 &[old_id.as_str().into(), new_id.as_str().into()],
             )
             .await
             .unwrap();
-        let producer_of = |id: &str| -> String {
+        let row_of = |id: &str| -> (String, i64) {
+            let r = rows
+                .iter()
+                .find(|r| r.get_string(0).unwrap() == id)
+                .unwrap();
+            (r.get_string(1).unwrap(), r.get_i64(2).unwrap())
+        };
+        let (old_producer, old_tx_to) = row_of(old_id.as_str());
+        let (new_producer, new_tx_to) = row_of(new_id.as_str());
+        assert_eq!(old_producer, "agent-a");
+        assert_eq!(new_producer, "agent-b");
+        assert_eq!(old_tx_to, FOREVER.0, "producer agent-a's node stays live");
+        assert_eq!(new_tx_to, FOREVER.0, "producer agent-b's node stays live");
+    }
+
+    #[tokio::test]
+    async fn upsert_by_keeps_both_producers_live_for_same_subject_and_scope() {
+        // Arrange: a live node with subject "price", producer "agent-a"
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let a_id = g
+            .upsert_by(
+                NewNode::now("fact", "v1", "price is 10")
+                    .with_subject("price")
+                    .with_producer("agent-a"),
+            )
+            .await
+            .unwrap();
+
+        // Act: producer "agent-b" writes subject "price" in the same scope
+        clock.set(Millis(2000));
+        let b_id = g
+            .upsert_by(
+                NewNode::now("fact", "v2", "price is 20")
+                    .with_subject("price")
+                    .with_producer("agent-b"),
+            )
+            .await
+            .unwrap();
+
+        // Assert: both nodes remain live (neither superseded)
+        let rows = g
+            .backend
+            .query(
+                "SELECT id, tx_to FROM nodes WHERE id IN (?1, ?2)",
+                &[a_id.as_str().into(), b_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        let tx_to_of = |id: &str| -> i64 {
             rows.iter()
                 .find(|r| r.get_string(0).unwrap() == id)
                 .unwrap()
-                .get_string(1)
+                .get_i64(1)
                 .unwrap()
         };
-        assert_eq!(producer_of(old_id.as_str()), "agent-a");
-        assert_eq!(producer_of(new_id.as_str()), "agent-b");
+        assert_eq!(
+            tx_to_of(a_id.as_str()),
+            FOREVER.0,
+            "producer agent-a's node stays live"
+        );
+        assert_eq!(
+            tx_to_of(b_id.as_str()),
+            FOREVER.0,
+            "producer agent-b's node stays live"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_by_supersedes_entity_pages_across_producers() {
+        // Arrange: a live entity page for "Alice" from producer "agent-a"
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let a_id = g
+            .upsert_by(NewNode::entity("person", "Alice").with_producer("agent-a"))
+            .await
+            .unwrap();
+
+        // Act: producer "agent-b" writes the same entity page in the same scope
+        clock.set(Millis(2000));
+        let b_id = g
+            .upsert_by(NewNode::entity("person", "Alice").with_producer("agent-b"))
+            .await
+            .unwrap();
+
+        // Assert: the second write supersedes the first, regardless of producer
+        let rows = g
+            .backend
+            .query(
+                "SELECT id, tx_to FROM nodes WHERE id IN (?1, ?2)",
+                &[a_id.as_str().into(), b_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        let tx_to_of = |id: &str| -> i64 {
+            rows.iter()
+                .find(|r| r.get_string(0).unwrap() == id)
+                .unwrap()
+                .get_i64(1)
+                .unwrap()
+        };
+        assert_ne!(
+            tx_to_of(a_id.as_str()),
+            FOREVER.0,
+            "producer agent-a's page is superseded"
+        );
+        assert_eq!(
+            tx_to_of(b_id.as_str()),
+            FOREVER.0,
+            "producer agent-b's page stays live"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_by_supersedes_when_same_producer_writes_twice() {
+        // Arrange: a live node with subject "price", producer "agent-a"
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let old_id = g
+            .upsert_by(
+                NewNode::now("fact", "v1", "price is 10")
+                    .with_subject("price")
+                    .with_producer("agent-a"),
+            )
+            .await
+            .unwrap();
+
+        // Act: the same producer "agent-a" writes subject "price" again
+        clock.set(Millis(2000));
+        let new_id = g
+            .upsert_by(
+                NewNode::now("fact", "v2", "price is 20")
+                    .with_subject("price")
+                    .with_producer("agent-a"),
+            )
+            .await
+            .unwrap();
+
+        // Assert: the second write supersedes the first
+        let rows = g
+            .backend
+            .query(
+                "SELECT id, tx_to FROM nodes WHERE id IN (?1, ?2)",
+                &[old_id.as_str().into(), new_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        let tx_to_of = |id: &str| -> i64 {
+            rows.iter()
+                .find(|r| r.get_string(0).unwrap() == id)
+                .unwrap()
+                .get_i64(1)
+                .unwrap()
+        };
+        assert_ne!(
+            tx_to_of(old_id.as_str()),
+            FOREVER.0,
+            "the first agent-a write is superseded"
+        );
+        assert_eq!(
+            tx_to_of(new_id.as_str()),
+            FOREVER.0,
+            "the second agent-a write stays live"
+        );
     }
 
     #[tokio::test]
@@ -6106,6 +6303,301 @@ mod tests {
             new_rows[0].get_string(1).unwrap(),
             "proj-a",
             "the stored scope must be trimmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_keeps_facts_live_across_producers() {
+        // Arrange: a live fact from producer "agent-a" in one episode call
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let first = g
+            .ingest_episode(
+                vec![NewNode::now("fact", "v1", "price is 10")
+                    .with_subject("price")
+                    .with_producer("agent-a")],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let a_id = &first.node_ids[0];
+
+        // Act: a second episode call from producer "agent-b" carries a fact
+        // with the same subject and scope
+        clock.set(Millis(2000));
+        let second = g
+            .ingest_episode(
+                vec![NewNode::now("fact", "v2", "price is 20")
+                    .with_subject("price")
+                    .with_producer("agent-b")],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let b_id = &second.node_ids[0];
+
+        // Assert: both facts stay live
+        let rows = g
+            .backend
+            .query(
+                "SELECT id, tx_to FROM nodes WHERE id IN (?1, ?2)",
+                &[a_id.as_str().into(), b_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        let tx_to_of = |id: &str| -> i64 {
+            rows.iter()
+                .find(|r| r.get_string(0).unwrap() == id)
+                .unwrap()
+                .get_i64(1)
+                .unwrap()
+        };
+        assert_eq!(
+            tx_to_of(a_id.as_str()),
+            FOREVER.0,
+            "producer agent-a's fact stays live"
+        );
+        assert_eq!(
+            tx_to_of(b_id.as_str()),
+            FOREVER.0,
+            "producer agent-b's fact stays live"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_collapses_entity_pages_across_producers_to_one_live() {
+        // Arrange: a live "Alice" entity page from producer "agent-a"'s episode
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        g.ingest_episode(
+            vec![NewNode::entity("person", "Alice")
+                .with_scope("s")
+                .with_producer("agent-a")],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Act: producer "agent-b"'s episode carries the same entity page in the same scope
+        clock.set(Millis(2000));
+        g.ingest_episode(
+            vec![NewNode::entity("person", "Alice")
+                .with_scope("s")
+                .with_producer("agent-b")],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Assert: exactly one live "Alice" page remains, the "agent-a" page superseded
+        let rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM nodes WHERE subject = ?1 AND scope = ?2 AND tx_to = ?3",
+                &["alice".into(), "s".into(), FOREVER.into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get_i64(0).unwrap(),
+            1,
+            "exactly one live Alice page must remain, ignoring producer"
+        );
+
+        // Assert: the live page belongs to "agent-b", proving the correct
+        // page won rather than some other count happening to equal one
+        let live_producer = g
+            .backend
+            .query(
+                "SELECT producer FROM nodes WHERE subject = ?1 AND scope = ?2 AND tx_to = ?3",
+                &["alice".into(), "s".into(), FOREVER.into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            live_producer[0].get_string(0).unwrap(),
+            "agent-b",
+            "the live Alice page must belong to agent-b"
+        );
+
+        // Assert: agent-a's superseded page is still present in history
+        let total_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM nodes WHERE subject = ?1 AND scope = ?2",
+                &["alice".into(), "s".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            total_rows[0].get_i64(0).unwrap(),
+            2,
+            "agent-a's superseded Alice page must remain in history alongside agent-b's"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_picks_collision_key_per_node_not_per_call() {
+        // Arrange: producer "agent-a" already has a live "price" fact and a
+        // live "Alice" entity page in scope "s"
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        g.ingest_episode(
+            vec![
+                NewNode::now("fact", "v1", "price is 10")
+                    .with_subject("price")
+                    .with_scope("s")
+                    .with_producer("agent-a"),
+                NewNode::entity("person", "Alice")
+                    .with_scope("s")
+                    .with_producer("agent-a"),
+            ],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Act: one episode call from producer "agent-b" carries both a fact
+        // with subject "price" and an "Alice" entity page in the same scope
+        clock.set(Millis(2000));
+        g.ingest_episode(
+            vec![
+                NewNode::now("fact", "v2", "price is 20")
+                    .with_subject("price")
+                    .with_scope("s")
+                    .with_producer("agent-b"),
+                NewNode::entity("person", "Alice")
+                    .with_scope("s")
+                    .with_producer("agent-b"),
+            ],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Assert: both "price" facts stay live
+        let fact_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM nodes WHERE subject = ?1 AND scope = ?2 AND tx_to = ?3",
+                &["price".into(), "s".into(), FOREVER.into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fact_rows[0].get_i64(0).unwrap(),
+            2,
+            "both price facts must stay live, one per producer"
+        );
+
+        // Assert: exactly one "Alice" entity page stays live
+        let entity_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM nodes WHERE subject = ?1 AND scope = ?2 AND tx_to = ?3",
+                &["alice".into(), "s".into(), FOREVER.into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            entity_rows[0].get_i64(0).unwrap(),
+            1,
+            "exactly one Alice page must stay live, ignoring producer"
+        );
+
+        // Assert: the live Alice page belongs to "agent-b", proving the
+        // correct page won rather than some other count happening to equal one
+        let live_entity_producer = g
+            .backend
+            .query(
+                "SELECT producer FROM nodes WHERE subject = ?1 AND scope = ?2 AND tx_to = ?3",
+                &["alice".into(), "s".into(), FOREVER.into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            live_entity_producer[0].get_string(0).unwrap(),
+            "agent-b",
+            "the live Alice page must belong to agent-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_episode_entity_write_does_not_supersede_a_coincidentally_same_subject_fact() {
+        // Arrange: producer "agent-a" writes an entity page for "Alice" in scope "s"
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        g.ingest_episode(
+            vec![NewNode::entity("person", "Alice")
+                .with_scope("s")
+                .with_producer("agent-a")],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Act: producer "agent-b" writes, in a separate episode, an unrelated
+        // fact whose subject coincidentally collides with the entity's subject
+        clock.set(Millis(2000));
+        let fact_result = g
+            .ingest_episode(
+                vec![NewNode::now("fact", "some label", "some content")
+                    .with_subject("alice")
+                    .with_scope("s")
+                    .with_producer("agent-b")],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let fact_id = fact_result.node_ids[0].clone();
+
+        // Act: producer "agent-c" re-observes the same entity in a third episode
+        clock.set(Millis(3000));
+        g.ingest_episode(
+            vec![NewNode::entity("person", "Alice")
+                .with_scope("s")
+                .with_producer("agent-c")],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Assert: exactly one live entity page remains for subject "alice"/scope "s"
+        let entity_rows = g
+            .backend
+            .query(
+                "SELECT COUNT(*) FROM nodes WHERE subject = ?1 AND scope = ?2 AND tx_to = ?3 AND content = ''",
+                &["alice".into(), "s".into(), FOREVER.into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            entity_rows[0].get_i64(0).unwrap(),
+            1,
+            "exactly one live Alice entity page must remain"
+        );
+
+        // Assert: agent-b's fact is still live, untouched by the entity collision
+        let fact_rows = g
+            .backend
+            .query(
+                "SELECT tx_to FROM nodes WHERE id = ?1",
+                &[fact_id.as_str().into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fact_rows[0].get_i64(0).unwrap(),
+            FOREVER.0,
+            "agent-b's fact must stay live, not superseded by an unrelated entity write"
         );
     }
 

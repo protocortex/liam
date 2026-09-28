@@ -77,19 +77,21 @@ pub struct NewNode {
     pub valid_from: Option<Millis>,
     /// Optional retrieval partition (project, agent, namespace).
     pub scope: Option<String>,
-    /// Optional identity for contradiction handling; two live nodes with the
-    /// same subject in the same scope are treated as competing versions.
+    /// Optional identity for contradiction handling: a fact collides on
+    /// `(subject, scope, producer)`; an entity page collides on `(subject, scope)` alone.
     pub subject: Option<String>,
     pub confidence: f64,
     /// Who wrote this node: an MCP client identity, a job name, or
     /// `"unknown"`. Written and stored only; it is deliberately absent from
     /// `Hit`, `Query`, and every daemon tool surface, since exposing
     /// provenance on read is M2.6 (tool surface) and M3.5 (scope/identity
-    /// semantics), not this change. It also plays no part in the
-    /// `upsert_by`/`supersede` competitor key: two live nodes for one
-    /// subject differing only by producer is the conflict M3.5 owns, so
-    /// last writer still wins here regardless of who wrote it.
+    /// semantics), not this change. It is part of a fact's collision key
+    /// (`subject`, `scope`, `producer`); an entity page ignores it, colliding
+    /// on `(subject, scope)` alone.
     pub producer: String,
+    /// Set only by `NewNode::entity`; any path rebuilding a `NewNode` from a stored row must go
+    /// through `NewNode::entity`, never a struct literal, or the marker silently resets to false.
+    pub(crate) entity_page: bool,
 }
 
 impl NewNode {
@@ -109,6 +111,7 @@ impl NewNode {
             subject: None,
             confidence: 1.0,
             producer: "unknown".to_string(),
+            entity_page: false,
         }
     }
     /// An entity page node. `entity_type` becomes the `kind` (e.g. "person",
@@ -119,7 +122,9 @@ impl NewNode {
     pub fn entity(entity_type: impl Into<String>, name: impl Into<String>) -> Self {
         let name = name.into();
         let subject = name.trim().to_lowercase();
-        Self::now(entity_type, name, String::new()).with_subject(subject)
+        let mut node = Self::now(entity_type, name, String::new()).with_subject(subject);
+        node.entity_page = true;
+        node
     }
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
         self.embedding = Some(embedding);
@@ -380,4 +385,18 @@ pub struct ClusterMember {
     pub id: NodeId,
     pub kind: String,
     pub label: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_page_flag_set_only_by_entity_constructor() {
+        let fact = NewNode::now("fact", "l", "c").with_subject("x");
+        assert!(!fact.entity_page);
+
+        let page = NewNode::entity("person", "X");
+        assert!(page.entity_page);
+    }
 }

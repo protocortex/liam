@@ -1931,6 +1931,108 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
     }
 
+    #[tokio::test]
+    async fn remember_collapses_entity_pages_across_producers_via_episode() {
+        use liam_store::{Backend, DefaultBackend};
+
+        // Given two MemoryServer clones over one store, each stamped with a
+        // different producer before either calls remember
+        let db_path = temp_db_path();
+        let db_path_str = db_path.to_str().expect("temp path is valid utf-8");
+        let store = DefaultGraph::open(db_path_str, GraphConfig::new(8))
+            .await
+            .expect("open file-backed store");
+        let template = MemoryServer::new(
+            Arc::new(store),
+            Arc::new(liam_model::MockEmbedder::new(8)),
+            Arc::new(liam_model::IdentityReranker),
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            1,
+        );
+        let server_a = template.clone();
+        server_a.set_producer("agent-a");
+        let server_b = template.clone();
+        server_b.set_producer("agent-b");
+
+        // When each calls remember with an episode whose entities list
+        // names "Alice" (same type, same scope)
+        let out_a = server_a
+            .remember(Parameters(RememberArgs {
+                scope: Some("s".to_string()),
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Alice")],
+                    edges: vec![],
+                }),
+                ..remember_args("two producer episode entity content a")
+            }))
+            .await;
+        assert!(!out_a.contains("failed"), "{out_a}");
+
+        let out_b = server_b
+            .remember(Parameters(RememberArgs {
+                scope: Some("s".to_string()),
+                episode: Some(EpisodeArgs {
+                    facts: vec![],
+                    entities: vec![episode_entity("person", "Alice")],
+                    edges: vec![],
+                }),
+                ..remember_args("two producer episode entity content b")
+            }))
+            .await;
+        assert!(!out_b.contains("failed"), "{out_b}");
+
+        // Then exactly one live "Alice" entity page exists for that subject
+        // and scope, read back through a fresh connection to the same file
+        let raw = DefaultBackend::open(db_path_str, 1)
+            .await
+            .expect("open a second connection to the same file");
+        let rows = raw
+            .query(
+                "SELECT COUNT(*) FROM nodes WHERE subject = ?1 AND scope = ?2 AND tx_to = ?3",
+                &["alice".into(), "s".into(), liam_store::FOREVER.into()],
+            )
+            .await
+            .expect("query nodes");
+        assert_eq!(
+            rows[0].get_i64(0).unwrap(),
+            1,
+            "exactly one live Alice page must remain, ignoring producer"
+        );
+
+        // And both producers' writes landed as separate rows, with agent-b's
+        // the live one, proving the entity loop stamped each write with its
+        // own producer rather than collapsing both under one
+        let producer_rows = raw
+            .query(
+                "SELECT producer, tx_to FROM nodes WHERE subject = ?1 AND scope = ?2",
+                &["alice".into(), "s".into()],
+            )
+            .await
+            .expect("query nodes by producer");
+        assert_eq!(
+            producer_rows.len(),
+            2,
+            "both agent-a's and agent-b's Alice pages must exist as separate rows"
+        );
+        let live_row = producer_rows
+            .iter()
+            .find(|r| r.get_i64(1).unwrap() == liam_store::FOREVER.0)
+            .expect("one row must be live");
+        assert_eq!(
+            live_row.get_string(0).unwrap(),
+            "agent-b",
+            "the live Alice page must belong to agent-b"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
     /// Bare-bones args for tests that only exercise one of `attributes`,
     /// `valid_from`, or `confidence`; every other field is a fixed, unique
     /// content string so a test can find its own node with `Query::text`.
