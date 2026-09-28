@@ -205,6 +205,15 @@ fn live_at(alias: &str, t: usize) -> String {
     )
 }
 
+/// Scope-hierarchy read predicate: `col` matches the scope bound at `?{n}`
+/// exactly, or is a descendant separated by `/` (e.g. `work` also matches
+/// `work/liam`, but not `work-archive`). SQLite lets a numbered placeholder
+/// repeat, so this needs only the one bound param at `?{n}`. Shared by
+/// `lexical`, `fetch_candidates`, and `backends::libsql::vector_search`.
+pub(crate) fn scope_within(col: &str, n: usize) -> String {
+    format!("({col} = ?{n} OR substr({col}, 1, length(?{n})+1) = ?{n} || '/')")
+}
+
 /// SQL + params for "the live node with this subject (and scope, and
 /// producer if given), if any." Shared by `find_live_by_subject` (run
 /// against `&Backend`, for `upsert_by`) and `Graph::ingest_episode`'s
@@ -268,9 +277,10 @@ const MAX_SCOPE_CHARS: usize = 200;
 /// `None` passes through unchanged. Otherwise: trims whitespace, rejects
 /// an empty-after-trim value, a value over `MAX_SCOPE_CHARS`, any
 /// character outside ASCII alphanumeric/`-`/`_`/`/`, and a leading or
-/// trailing `/` or an empty segment (`//`). `/` is accepted syntax
-/// reserved for a future hierarchy parser (M3.5); nothing here treats it
-/// as meaningful yet, scope matching stays exact-string. Called at every
+/// trailing `/` or an empty segment (`//`). `/` separates hierarchy
+/// segments: reads (`lexical`/`fetch_candidates`/`vector_search`) match a
+/// scope plus every descendant, while write-side collision detection
+/// (`live_by_subject_query`) stays exact-match. Called at every
 /// write entry point that accepts a `scope` (`insert`, `upsert_by`,
 /// `supersede`, `ingest_episode`), from the read path (`query_core`), and
 /// from `migrate::normalize_scope_column` to flag data written before this
@@ -1075,7 +1085,7 @@ impl<B: Backend> Graph<B> {
             next += 1;
         }
         if let Some(scope) = scope {
-            filters.push_str(&format!(" AND n.scope = ?{next}"));
+            filters.push_str(&format!(" AND {}", scope_within("n.scope", next)));
             params.push(scope.into());
         }
         let sql = format!(
@@ -1121,12 +1131,13 @@ impl<B: Backend> Graph<B> {
             // kind or scope would otherwise ride along and break the filter the
             // caller asked for.
             let mut filters = String::new();
-            for (column, value) in [("scope", scope), ("kind", kind)] {
-                if let Some(v) = value {
-                    params.push(v.into());
-                    // Just-pushed value sits at the 1-based position `len()`.
-                    filters.push_str(&format!(" AND {column} = ?{}", params.len()));
-                }
+            if let Some(v) = scope {
+                params.push(v.into());
+                filters.push_str(&format!(" AND {}", scope_within("scope", params.len())));
+            }
+            if let Some(v) = kind {
+                params.push(v.into());
+                filters.push_str(&format!(" AND kind = ?{}", params.len()));
             }
             let sql = format!(
                 "SELECT id, kind, label, content, scope, attributes, confidence, valid_from
@@ -2354,6 +2365,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_candidates_scope_filter_includes_descendant_scopes() {
+        // Arrange: same shape as `scope_filter_holds_for_graph_expanded_neighbours`,
+        // but the neighbour sits in a scope that is a descendant of the
+        // query scope rather than an unrelated one, and is reachable only
+        // through graph expansion off the lexically-matched seed.
+        let g = graph_at(Millis(1000)).await;
+        let seed = g
+            .insert(
+                NewNode::now("decision", "Rollout", "zorbnax rollout approved").with_scope("work"),
+            )
+            .await
+            .unwrap();
+        let neighbour = g
+            .insert(NewNode::now("decision", "Detail", "unrelated notes").with_scope("work/liam"))
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&seed, &neighbour, "mentions"))
+            .await
+            .unwrap();
+        // A second expanded neighbour whose scope is a false string prefix
+        // of "work" (no "/" boundary), not a true descendant.
+        let false_prefix_neighbour = g
+            .insert(
+                NewNode::now("decision", "Archived", "unrelated notes").with_scope("work-archive"),
+            )
+            .await
+            .unwrap();
+        g.link(NewEdge::new(&seed, &false_prefix_neighbour, "mentions"))
+            .await
+            .unwrap();
+
+        // Act
+        let hits = g
+            .query(&Query::text("zorbnax rollout").with_scope("work"))
+            .await
+            .unwrap();
+
+        // Assert: the descendant-scoped neighbour, hydrated only through
+        // `fetch_candidates`, survives its scope filter, while the
+        // false-prefix-scoped neighbour is excluded by that same filter.
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Detail"),
+            "expected descendant-scoped expanded neighbour in hits: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Archived"),
+            "false-prefix-scoped expanded neighbour must not leak into hits: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn as_of_recovers_superseded_history() {
         let clock = Arc::new(FixedClock::new(Millis(1000)));
         let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
@@ -3178,6 +3241,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_by_scope_collision_stays_exact_match_after_hierarchy_change() {
+        // Arrange: a live node at the ancestor scope "work".
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let root = g
+            .upsert_by(
+                NewNode::now("fact", "v1", "widget price is 10")
+                    .with_subject("s1")
+                    .with_scope("work"),
+            )
+            .await
+            .unwrap();
+
+        // Act: a write with the same subject to the descendant scope
+        // "work/liam".
+        clock.set(Millis(2000));
+        let child = g
+            .upsert_by(
+                NewNode::now("fact", "v2", "widget price is 20")
+                    .with_subject("s1")
+                    .with_scope("work/liam"),
+            )
+            .await
+            .unwrap();
+
+        // Assert: the descendant-scope write did not supersede the
+        // ancestor-scope node. Write-side collision detection stays
+        // exact-match, unaffected by the read-side scope hierarchy.
+        assert!(
+            g.exists_as_of(&root, Millis(2000)).await.unwrap(),
+            "the ancestor-scoped node must still be live"
+        );
+
+        // Act: a write with the same subject to the ancestor scope "work"
+        // must equally not supersede the descendant-scoped node.
+        clock.set(Millis(3000));
+        let _grandchild = g
+            .upsert_by(
+                NewNode::now("fact", "v3", "widget price is 30")
+                    .with_subject("s1")
+                    .with_scope("work"),
+            )
+            .await
+            .unwrap();
+
+        // Assert: the descendant-scoped node is still live. A hierarchical
+        // write predicate would wrongly let this ancestor-scoped write
+        // supersede it.
+        assert!(
+            g.exists_as_of(&child, Millis(3000)).await.unwrap(),
+            "the descendant-scoped node must still be live after an ancestor-scope write"
+        );
+    }
+
+    #[tokio::test]
     async fn supersede_rejects_invalid_scope_and_normalizes_valid_scope() {
         // Arrange: a live node to supersede directly, matching the
         // direct-call usage shape at `as_of_recovers_superseded_history`.
@@ -3605,6 +3725,220 @@ mod tests {
 
         // Assert
         assert_eq!(hits[0].label, "Rare");
+    }
+
+    #[tokio::test]
+    async fn lexical_scope_filter_includes_descendant_scopes() {
+        // Given nodes scoped "work" and "work/liam" that share the same
+        // searchable terms, so a lexical hit is the only thing that can
+        // distinguish an ancestor-scope query from a scope miss.
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now("decision", "Root", "zorbnax rollout approved").with_scope("work"))
+            .await
+            .unwrap();
+        g.insert(
+            NewNode::now("decision", "Child", "zorbnax rollout approved").with_scope("work/liam"),
+        )
+        .await
+        .unwrap();
+
+        // When querying with scope "work"
+        let hits = g
+            .query(&Query::text("zorbnax rollout").with_scope("work"))
+            .await
+            .unwrap();
+
+        // Then both the "work"-scoped and "work/liam"-scoped nodes match.
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Root"),
+            "expected Root in hits: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"Child"),
+            "expected Child in hits: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_scope_filter_excludes_ancestor_scope() {
+        // Given the same "work" / "work/liam" nodes as the descendant-
+        // inclusion case, but querying the more specific child scope.
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now("decision", "Root", "zorbnax rollout approved").with_scope("work"))
+            .await
+            .unwrap();
+        g.insert(
+            NewNode::now("decision", "Child", "zorbnax rollout approved").with_scope("work/liam"),
+        )
+        .await
+        .unwrap();
+
+        // When querying with scope "work/liam"
+        let hits = g
+            .query(&Query::text("zorbnax rollout").with_scope("work/liam"))
+            .await
+            .unwrap();
+
+        // Then only the "work/liam"-scoped node matches; the ancestor does
+        // not.
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert_eq!(labels, vec!["Child"]);
+    }
+
+    #[tokio::test]
+    async fn lexical_scope_filter_matches_true_descendants_not_string_prefixes() {
+        // Given nodes at "work" (exact match), "work-archive" (shares the
+        // string prefix but has no "/" boundary), "work/a_b" (a true child
+        // whose segment contains a literal underscore), and "wo" (shorter
+        // than the query scope, so no "/" boundary is even possible), all
+        // sharing the same searchable content.
+        let g = graph_at(Millis(1000)).await;
+        let exact_id = g
+            .insert(
+                NewNode::now("decision", "Exact", "zorbnax rollout approved").with_scope("work"),
+            )
+            .await
+            .unwrap();
+        g.insert(
+            NewNode::now("decision", "FalsePrefix", "zorbnax rollout approved")
+                .with_scope("work-archive"),
+        )
+        .await
+        .unwrap();
+        let underscore_id = g
+            .insert(
+                NewNode::now("decision", "Underscore", "zorbnax rollout approved")
+                    .with_scope("work/a_b"),
+            )
+            .await
+            .unwrap();
+        g.insert(NewNode::now("decision", "Short", "zorbnax rollout approved").with_scope("wo"))
+            .await
+            .unwrap();
+
+        // When calling `lexical` directly, bypassing `fetch_candidates`'s
+        // own scope re-check, so a broken `lexical` predicate cannot hide
+        // behind it.
+        let lexical_ids = g
+            .lexical("zorbnax rollout", None, Some("work"), Millis(1000), 10)
+            .await
+            .unwrap();
+        let lexical_id_set: HashSet<NodeId> = lexical_ids.into_iter().collect();
+        let expected_id_set: HashSet<NodeId> = [exact_id, underscore_id].into_iter().collect();
+        assert_eq!(lexical_id_set, expected_id_set);
+
+        // When querying with scope "work" through the full pipeline
+        let hits = g
+            .query(&Query::text("zorbnax rollout").with_scope("work"))
+            .await
+            .unwrap();
+
+        // Then only the exact match and the true descendant match.
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Exact"),
+            "expected Exact in hits: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"Underscore"),
+            "expected Underscore in hits: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"FalsePrefix"),
+            "work-archive must not match scope work: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Short"),
+            "wo must not match scope work: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_scope_filter_underscore_in_query_scope_is_literal() {
+        // Given nodes at "a_b/c" (a true descendant of query scope "a_b")
+        // and "axb/c" (a different scope a LIKE pattern would conflate,
+        // since '_' is a wildcard only in the LIKE pattern, not the value;
+        // the earlier underscore test only put the underscore in the
+        // stored scope, which a naive LIKE implementation gets right by
+        // accident).
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now("decision", "Real", "zorbnax rollout approved").with_scope("a_b/c"))
+            .await
+            .unwrap();
+        g.insert(NewNode::now("decision", "Fake", "zorbnax rollout approved").with_scope("axb/c"))
+            .await
+            .unwrap();
+
+        // When querying with scope "a_b"
+        let hits = g
+            .query(&Query::text("zorbnax rollout").with_scope("a_b"))
+            .await
+            .unwrap();
+
+        // Then only the true descendant matches.
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Real"),
+            "expected Real in hits: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Fake"),
+            "axb/c must not match query scope a_b: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_kind_and_scope_filters_combine() {
+        // Given a decision and a fact, both scoped "work/liam", sharing the
+        // same searchable content, exercising the placeholder-index path
+        // where kind and scope filters are both active together.
+        let g = graph_at(Millis(1000)).await;
+        g.insert(
+            NewNode::now("decision", "Decided", "zorbnax rollout approved").with_scope("work/liam"),
+        )
+        .await
+        .unwrap();
+        g.insert(
+            NewNode::now("fact", "Stated", "zorbnax rollout approved").with_scope("work/liam"),
+        )
+        .await
+        .unwrap();
+
+        // When querying with kind "decision" and scope "work"
+        let hits = g
+            .query(
+                &Query::text("zorbnax rollout")
+                    .with_kind("decision")
+                    .with_scope("work"),
+            )
+            .await
+            .unwrap();
+
+        // Then only the decision comes back.
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert_eq!(labels, vec!["Decided"]);
+    }
+
+    #[tokio::test]
+    async fn lexical_no_scope_filter_matches_every_scope() {
+        // Given nodes across unrelated scopes
+        let g = graph_at(Millis(1000)).await;
+        g.insert(NewNode::now("decision", "A", "zorbnax rollout approved").with_scope("work"))
+            .await
+            .unwrap();
+        g.insert(NewNode::now("decision", "B", "zorbnax rollout approved").with_scope("personal"))
+            .await
+            .unwrap();
+
+        // When querying with no scope filter
+        let hits = g.query(&Query::text("zorbnax rollout")).await.unwrap();
+
+        // Then both nodes match regardless of scope, unchanged from
+        // today's behaviour.
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert!(labels.contains(&"A"), "expected A in hits: {labels:?}");
+        assert!(labels.contains(&"B"), "expected B in hits: {labels:?}");
     }
 
     #[tokio::test]
@@ -6772,6 +7106,60 @@ mod tests {
             1,
             "the node row must be committed despite the dims mismatch"
         );
+    }
+
+    #[tokio::test]
+    async fn vector_search_scope_filter_includes_descendant_scopes() {
+        // Arrange: the same embedding at an exact match ("work"), a true
+        // descendant ("work/liam"), a false string prefix with no "/"
+        // boundary ("work-archive"), and a query scope that is too short to
+        // be an ancestor of any of them ("wo"). Dims = 8 per `graph_at`'s
+        // `GraphConfig::new(8)`.
+        let g = graph_at(Millis(1000)).await;
+        let e = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let work_id = g
+            .insert(
+                NewNode::now("fact", "Exact", "x")
+                    .with_scope("work")
+                    .with_embedding(e.clone()),
+            )
+            .await
+            .unwrap();
+        let work_liam_id = g
+            .insert(
+                NewNode::now("fact", "Child", "x")
+                    .with_scope("work/liam")
+                    .with_embedding(e.clone()),
+            )
+            .await
+            .unwrap();
+        g.insert(
+            NewNode::now("fact", "Archived", "x")
+                .with_scope("work-archive")
+                .with_embedding(e.clone()),
+        )
+        .await
+        .unwrap();
+        g.insert(
+            NewNode::now("fact", "TooShort", "x")
+                .with_scope("wo")
+                .with_embedding(e.clone()),
+        )
+        .await
+        .unwrap();
+
+        // Act: search with the ancestor scope.
+        let hits = g
+            .backend
+            .vector_search(&e, 10, None, Some("work"), Millis(1000))
+            .await
+            .unwrap();
+
+        // Assert: exactly the exact-match and descendant-scoped nodes come
+        // back, proving both inclusion and exclusion in one assertion.
+        let hit_set: HashSet<NodeId> = hits.into_iter().collect();
+        let expected: HashSet<NodeId> = [work_id, work_liam_id].into_iter().collect();
+        assert_eq!(hit_set, expected);
     }
 
     /// Wraps a real `BackendTx`, failing exactly one targeted `execute` call

@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
+use crate::graph::scope_within;
 use crate::ids::{Millis, NodeId};
 use crate::value::{Row, Value};
 
@@ -311,7 +312,7 @@ impl Backend for LibsqlBackend {
             next += 1;
         }
         if let Some(scope) = scope {
-            filters.push_str(&format!(" AND n.scope = ?{next}"));
+            filters.push_str(&format!(" AND {}", scope_within("n.scope", next)));
             params.push(libsql::Value::Text(scope.to_string()));
         }
         // Same four-bound "live at T" predicate the lexical path enforces

@@ -388,11 +388,12 @@ fn validate_episode(episode: &EpisodeArgs, fact_count: usize, entity_count: usiz
 pub struct RecallArgs {
     pub query: String,
     pub kind: Option<String>,
-    /// Optional partition filter; only memories written with the same
-    /// scope match. Trimmed; rejected if empty after trimming, over 200
-    /// characters, contains a character outside ASCII letters, digits,
-    /// `-`, `_`, `/`, or has a leading/trailing `/` or an empty segment
-    /// (`//`).
+    /// Optional partition filter; matches memories written with this scope
+    /// or any descendant scope (for example `work` also matches
+    /// `work/liam`, but not `work-archive`). Trimmed; rejected if empty
+    /// after trimming, over 200 characters, contains a character outside
+    /// ASCII letters, digits, `-`, `_`, `/`, or has a leading/trailing `/`
+    /// or an empty segment (`//`).
     pub scope: Option<String>,
     pub k: Option<usize>,
     /// Optional point-in-time recall, epoch milliseconds. Omitted means
@@ -416,11 +417,12 @@ pub struct RelateArgs {
 pub struct AskArgs {
     pub question: String,
     pub kind: Option<String>,
-    /// Optional partition filter; only memories written with the same
-    /// scope match. Trimmed; rejected if empty after trimming, over 200
-    /// characters, contains a character outside ASCII letters, digits,
-    /// `-`, `_`, `/`, or has a leading/trailing `/` or an empty segment
-    /// (`//`).
+    /// Optional partition filter; matches memories written with this scope
+    /// or any descendant scope (for example `work` also matches
+    /// `work/liam`, but not `work-archive`). Trimmed; rejected if empty
+    /// after trimming, over 200 characters, contains a character outside
+    /// ASCII letters, digits, `-`, `_`, `/`, or has a leading/trailing `/`
+    /// or an empty segment (`//`).
     pub scope: Option<String>,
     pub k: Option<usize>,
     /// Optional point-in-time recall, epoch milliseconds. Omitted means
