@@ -18,6 +18,8 @@ pub mod relation {
     pub const SUPERSEDES: &str = "supersedes";
     /// Provenance: an entity node references a source fact/episode that mentions it.
     pub const MENTIONS: &str = "mentions";
+    /// Links two nodes representing the same real-world entity.
+    pub const SAME_AS: &str = "same_as";
 }
 
 /// Construction parameters. `embedding_dims` sets the dimension the backend's
