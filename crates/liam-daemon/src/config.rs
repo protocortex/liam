@@ -343,7 +343,10 @@ mod tests {
         assert_eq!(c.read_pool_size, 4);
         assert_eq!(c.max_connections, 16);
         assert_eq!(c.producers.unknown_id, "unknown");
-        assert!(c.producers.clients.is_empty());
+        assert_eq!(
+            c.producers.clients.get("ai-notetaker"),
+            Some(&"notetaker".to_string())
+        );
     }
 
     #[test]
@@ -470,6 +473,21 @@ mod tests {
             Some("notetaker")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shipped_liam_toml_has_ai_notetaker_producer_entry() {
+        // Given the real shipped liam.toml
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../liam.toml"));
+
+        // When loaded
+        let c = Config::load(path).expect("shipped liam.toml must parse");
+
+        // Then it maps the ai-notetaker client to the notetaker producer
+        assert_eq!(
+            c.producers.clients.get("ai-notetaker"),
+            Some(&"notetaker".to_string())
+        );
     }
 
     #[test]

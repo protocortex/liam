@@ -45,6 +45,5 @@ max_concurrent_generations = 0   # 0 = auto-tune from a one-time benchmark; set 
 unknown_id = "unknown"     # producer id recorded for a client not named in [producers.clients]
 
 [producers.clients]
-# MCP client name = canonical producer id, e.g.:
-# claude-code  = "claude"
-# ai-notetaker = "notetaker"
+# MCP client name = canonical producer id
+ai-notetaker = "notetaker"
