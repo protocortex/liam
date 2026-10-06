@@ -2104,6 +2104,7 @@ mod tests {
     use tempfile::TempDir;
 
     mod log_write;
+    mod log_write_faults;
 
     async fn graph_at(t: Millis) -> DefaultGraph {
         let clock = Arc::new(FixedClock::new(t));
@@ -7592,6 +7593,7 @@ mod tests {
         async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
             let call = self.execute_calls;
             self.execute_calls += 1;
+            self.probe.executed.lock().unwrap().push(sql.to_string());
             if call == self.fail_on_execute {
                 return Err(Error::Backend(
                     "injected mid-transaction failure".to_string(),
@@ -7604,6 +7606,15 @@ mod tests {
         }
         async fn commit(self: Box<Self>) -> Result<()> {
             self.probe.before_commit().await;
+            if self
+                .probe
+                .fail_commit
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // The failed commit still has to give back the write lock.
+                self.inner.rollback().await?;
+                return Err(Error::Backend("injected commit failure".to_string()));
+            }
             self.inner.commit().await
         }
         async fn rollback(self: Box<Self>) -> Result<()> {
@@ -7617,17 +7628,27 @@ mod tests {
     struct TxProbe {
         begins: std::sync::atomic::AtomicUsize,
         delay_odd_begins: std::sync::atomic::AtomicBool,
+        /// Delays the first `begin` of each pair, counting from `begins` = 0.
+        delay_even_begins: std::sync::atomic::AtomicBool,
         hang_commit: std::sync::atomic::AtomicBool,
+        fail_commit: std::sync::atomic::AtomicBool,
         /// A lock whose held-or-free state is recorded at every commit.
         watched: std::sync::Mutex<Option<SharedLog>>,
         commit_lock_held: std::sync::Mutex<Vec<bool>>,
+        /// Every statement a transaction was asked to execute, the one that
+        /// was made to fail included.
+        executed: std::sync::Mutex<Vec<String>>,
     }
 
     impl TxProbe {
         async fn before_begin(&self) {
             use std::sync::atomic::Ordering::SeqCst;
             let nth = self.begins.fetch_add(1, SeqCst);
-            if nth % 2 == 1 && self.delay_odd_begins.load(SeqCst) {
+            let slow = match nth % 2 {
+                0 => &self.delay_even_begins,
+                _ => &self.delay_odd_begins,
+            };
+            if slow.load(SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
@@ -7658,6 +7679,12 @@ mod tests {
         fn set_fail_on_execute(&self, n: usize) {
             self.fail_on_execute
                 .store(n, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_fail_commit(&self, fail: bool) {
+            self.probe
+                .fail_commit
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
         }
     }
 

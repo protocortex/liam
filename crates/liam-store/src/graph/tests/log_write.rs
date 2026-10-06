@@ -3,6 +3,7 @@
 //! transaction. Tests name the log through `RecordingLog`, a double that keeps
 //! what it accepted so a test can compare the log against the projection.
 
+use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -20,18 +21,18 @@ use super::*;
 use crate::graph::projection::{apply_steps, steps_for};
 use crate::DefaultBackend;
 
-type Appended = Arc<StdMutex<Vec<(LogOffset, LogEvent)>>>;
+pub(super) type Appended = Arc<StdMutex<Vec<(LogOffset, LogEvent)>>>;
 
 /// A log that records every event it accepted, over a writer that can be told
 /// to fail, so a test can compare the log against the projection.
-struct RecordingLog {
+pub(super) struct RecordingLog {
     inner: FailingLogWriter,
     appended: Appended,
     fail_after_recording: bool,
 }
 
 impl RecordingLog {
-    fn new() -> (Self, Appended) {
+    pub(super) fn new() -> (Self, Appended) {
         Self::over(FailingLogWriter::fail_after(u64::MAX))
     }
 
@@ -67,7 +68,7 @@ impl LogWriter for RecordingLog {
     }
 }
 
-fn share(writer: impl LogWriter + 'static) -> SharedLog {
+pub(super) fn share(writer: impl LogWriter + 'static) -> SharedLog {
     let bloom = HashBloom::new(BloomConfig::default());
     Arc::new(tokio::sync::Mutex::new(EventLog::new(
         Box::new(writer),
@@ -86,7 +87,7 @@ async fn open_clocked<B: Backend>(
     graph.with_log(log).await.expect("attach log")
 }
 
-async fn open_with<B: Backend>(path: &str, t: Millis, log: SharedLog) -> Graph<B> {
+pub(super) async fn open_with<B: Backend>(path: &str, t: Millis, log: SharedLog) -> Graph<B> {
     open_clocked(path, Arc::new(FixedClock::new(t)), log).await
 }
 
@@ -101,7 +102,7 @@ async fn clocked_graph<B: Backend>(t: Millis) -> (Graph<B>, Appended, String, Ar
 }
 
 /// A logged in-memory graph, the log's recorder, and the log's id.
-async fn logged_graph<B: Backend>(t: Millis) -> (Graph<B>, Appended, String) {
+pub(super) async fn logged_graph<B: Backend>(t: Millis) -> (Graph<B>, Appended, String) {
     let (graph, appended, log_id, _) = clocked_graph(t).await;
     (graph, appended, log_id)
 }
@@ -115,6 +116,49 @@ impl Clock for TickingClock {
     }
 }
 
+/// Bounds a test body so a write that deadlocks fails the test instead of
+/// hanging the run.
+pub(super) async fn within_deadline<T>(body: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), body)
+        .await
+        .expect("the test body did not finish, a write is likely deadlocked")
+}
+
+/// Runs `count` tasks at once, each released together behind a barrier, and
+/// returns what each produced in order.
+pub(super) async fn race<T, F>(count: usize, task: impl Fn(usize) -> F) -> Vec<T>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    let barrier = Arc::new(tokio::sync::Barrier::new(count));
+    let tasks: Vec<_> = (0..count)
+        .map(|index| {
+            let (barrier, work) = (Arc::clone(&barrier), task(index));
+            tokio::spawn(async move {
+                barrier.wait().await;
+                work.await
+            })
+        })
+        .collect();
+    let mut done = Vec::new();
+    for task in tasks {
+        done.push(task.await.unwrap());
+    }
+    done
+}
+
+/// Waits until `begins` transactions have been requested of the backend, so a
+/// test knows a write has reached `begin` without sleeping for a guessed time.
+async fn wait_for_begins(g: &Graph<FailingBackend>, begins: usize) {
+    within_deadline(async {
+        while g.backend.probe.begins.load(Ordering::SeqCst) < begins {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
 fn fact(content: &str) -> NewNode {
     NewNode::now("fact", "label", content)
         .with_producer("agent-a")
@@ -123,7 +167,7 @@ fn fact(content: &str) -> NewNode {
 
 /// `fact` with a supplied valid time, so source, trust, valid time, and ingest
 /// time are four different values on the log record.
-fn fact_at(content: &str) -> NewNode {
+pub(super) fn fact_at(content: &str) -> NewNode {
     fact(content).with_valid_from(Millis(500))
 }
 
@@ -141,7 +185,7 @@ fn assert_envelope_at(event: &LogEvent, ingested_at: i64) {
     assert_eq!(envelope, ("agent-a", 0.75, 500, ingested_at), "{event:?}");
 }
 
-fn events(appended: &Appended) -> Vec<LogEvent> {
+pub(super) fn events(appended: &Appended) -> Vec<LogEvent> {
     appended
         .lock()
         .unwrap()
@@ -160,7 +204,7 @@ fn node_writes(appended: &Appended) -> Vec<NodeRow> {
         .collect()
 }
 
-async fn count<B: Backend>(g: &Graph<B>, table: &str) -> i64 {
+pub(super) async fn count<B: Backend>(g: &Graph<B>, table: &str) -> i64 {
     let rows = g
         .backend
         .query(&format!("SELECT COUNT(*) FROM {table}"), &[])
@@ -171,7 +215,7 @@ async fn count<B: Backend>(g: &Graph<B>, table: &str) -> i64 {
 
 /// `None` when the cursor row does not exist yet; otherwise its log id and
 /// last applied offset (`None` while the offsets are still NULL).
-async fn cursor<B: Backend>(g: &Graph<B>) -> Option<(String, Option<(i64, i64)>)> {
+pub(super) async fn cursor<B: Backend>(g: &Graph<B>) -> Option<(String, Option<(i64, i64)>)> {
     let rows = g
         .backend
         .query(
@@ -188,7 +232,7 @@ async fn cursor<B: Backend>(g: &Graph<B>) -> Option<(String, Option<(i64, i64)>)
     Some((row.get_string(0).unwrap(), offset))
 }
 
-fn offset_pair(offset: LogOffset) -> (i64, i64) {
+pub(super) fn offset_pair(offset: LogOffset) -> (i64, i64) {
     (offset.segment as i64, offset.index as i64)
 }
 
@@ -510,116 +554,6 @@ async fn log_write_a_failed_duplicate_append_leaves_the_cursor_where_it_was() {
 }
 
 #[tokio::test]
-async fn log_write_projection_failure_voids_the_write_and_leaves_nothing_behind() {
-    // The transaction's executes are the node insert, the hash index, and the
-    // cursor: a failure at any of them must leave one atomic unit undone.
-    for failing_execute in 0..=2 {
-        // Arrange
-        let (log, appended) = RecordingLog::new();
-        let log_id = log.log_id().to_string();
-        let shared = share(log);
-        let g = open_with::<FailingBackend>(":memory:", Millis(1000), Arc::clone(&shared)).await;
-        g.backend.set_fail_on_execute(failing_execute);
-
-        // Act
-        let failed = g.insert(fact_at("same")).await;
-
-        // Assert
-        let context = format!("failing execute {failing_execute}");
-        assert!(
-            matches!(failed, Err(Error::Backend(_))),
-            "{context}: {failed:?}"
-        );
-        assert_eq!(count(&g, "nodes").await, 0, "{context}");
-        assert_eq!(count(&g, "log_hash_index").await, 0, "{context}");
-        let logged = events(&appended);
-        assert_eq!(logged.len(), 2, "{context}: the write, then its void");
-        assert!(matches!(logged[0].payload, LogPayload::NodeWrite(_)));
-        assert_eq!(
-            logged[1].payload,
-            LogPayload::Voided {
-                target_event_id: logged[0].event_id.clone()
-            }
-        );
-        assert_envelope(&logged[1]);
-        assert_eq!(
-            cursor(&g).await,
-            Some((log_id, Some(offset_pair(last_offset(&appended))))),
-            "{context}: the cursor sits on the void"
-        );
-        assert!(!shared
-            .lock()
-            .await
-            .bloom_might_contain(&logged[0].content_hash));
-
-        // Act: a retry after the fault clears is a first write, not a duplicate.
-        g.backend.set_fail_on_execute(usize::MAX);
-        let retried = g.insert(fact_at("same")).await;
-
-        // Assert
-        assert!(retried.is_ok(), "{context}: {retried:?}");
-        assert_eq!(count(&g, "nodes").await, 1, "{context}");
-        assert!(matches!(
-            events(&appended).last().unwrap().payload,
-            LogPayload::NodeWrite(_)
-        ));
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn log_write_concurrent_inserts_keep_wal_order_equal_to_commit_order() {
-    // Arrange: every second `begin` is slow, so a write that let go of the log
-    // lock before its commit would be overtaken by the next one.
-    const PAIRS: usize = 20;
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("graph.db");
-    let (log, appended) = RecordingLog::new();
-    let shared = share(log);
-    let g = Arc::new(
-        open_with::<FailingBackend>(path.to_str().unwrap(), Millis(1000), Arc::clone(&shared))
-            .await,
-    );
-    g.backend
-        .probe
-        .delay_odd_begins
-        .store(true, Ordering::SeqCst);
-    *g.backend.probe.watched.lock().unwrap() = Some(shared);
-
-    // Act
-    for pair in 0..PAIRS {
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let tasks: Vec<_> = (0..2)
-            .map(|side| {
-                let (g, barrier) = (Arc::clone(&g), Arc::clone(&barrier));
-                tokio::spawn(async move {
-                    barrier.wait().await;
-                    g.insert(fact(&format!("pair-{pair}-side-{side}"))).await
-                })
-            })
-            .collect();
-        for task in tasks {
-            task.await.unwrap().unwrap();
-        }
-    }
-
-    // Assert: node rowids are assigned in commit order, and the log lock was
-    // held at every commit.
-    let wal_order: Vec<String> = node_writes(&appended).into_iter().map(|r| r.id).collect();
-    let commit_order: Vec<String> = g
-        .backend
-        .query("SELECT id FROM nodes ORDER BY rowid", &[])
-        .await
-        .unwrap()
-        .iter()
-        .map(|row| row.get_string(0).unwrap())
-        .collect();
-    assert_eq!(wal_order.len(), PAIRS * 2);
-    assert_eq!(wal_order, commit_order);
-    let lock_held = g.backend.probe.commit_lock_held.lock().unwrap().clone();
-    assert_eq!(lock_held, vec![true; PAIRS * 2]);
-}
-
-#[tokio::test]
 async fn log_write_a_cancelled_write_poisons_the_log_until_reopen() {
     // Arrange: the write is appended, then its commit never resolves.
     let dir = TempDir::new().unwrap();
@@ -836,6 +770,10 @@ async fn stored_edge<B: Backend>(g: &Graph<B>, id: &str) -> EdgeRow {
     }
 }
 
+async fn node_effect<B: Backend>(g: &Graph<B>, id: &NodeId) -> RowEffect {
+    RowEffect::Node(stored_row(g, id, true).await)
+}
+
 async fn edge_between<B: Backend>(g: &Graph<B>, src: &str, dst: &str, kind: &str) -> EdgeRow {
     let rows = g
         .backend
@@ -876,14 +814,18 @@ async fn assert_indexed_with<B: Backend>(g: &Graph<B>, event: &LogEvent) {
     }
 }
 
-async fn assert_cursor_at_last_event<B: Backend>(g: &Graph<B>, appended: &Appended, log_id: &str) {
+pub(super) async fn assert_cursor_at_last_event<B: Backend>(
+    g: &Graph<B>,
+    appended: &Appended,
+    log_id: &str,
+) {
     assert_eq!(
         cursor(g).await,
         Some((log_id.to_string(), Some(offset_pair(last_offset(appended)))))
     );
 }
 
-fn events_since(appended: &Appended, since: usize) -> Vec<LogEvent> {
+pub(super) fn events_since(appended: &Appended, since: usize) -> Vec<LogEvent> {
     events(appended).split_off(since)
 }
 
@@ -900,6 +842,13 @@ fn batch_effects(event: &LogEvent) -> Vec<RowEffect> {
     }
 }
 
+fn batch_node(event: &LogEvent) -> NodeRow {
+    match batch_effects(event).into_iter().next() {
+        Some(RowEffect::Node(row)) => row,
+        other => panic!("expected the batch to start with a node row, found {other:?}"),
+    }
+}
+
 async fn live_ids_with_subject<B: Backend>(g: &Graph<B>, subject: &str) -> Vec<String> {
     g.backend
         .query(
@@ -913,7 +862,13 @@ async fn live_ids_with_subject<B: Backend>(g: &Graph<B>, subject: &str) -> Vec<S
         .collect()
 }
 
-fn mentions(from: usize, to: usize) -> EpisodeEdge {
+async fn assert_log_tables_untouched<B: Backend>(g: &Graph<B>) {
+    assert_eq!(count(g, "log_cursor").await, 0);
+    assert_eq!(count(g, "log_hash_index").await, 0);
+    assert_eq!(count(g, "log_quarantine").await, 0);
+}
+
+pub(super) fn mentions(from: usize, to: usize) -> EpisodeEdge {
     EpisodeEdge {
         from: EpisodeRef::New(from),
         to: EpisodeRef::New(to),
@@ -1047,6 +1002,109 @@ async fn log_write_relate_appends_one_edge_write_equal_to_the_stored_row() {
 }
 
 #[tokio::test]
+async fn log_write_ingest_episode_appends_one_batch_equal_to_every_stored_row() {
+    // Arrange: n0 supersedes the live row x, and n2 supersedes n0 inside the
+    // same episode, so the episode's edge starts at n2, the node left live.
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let x = g.insert(fact_at("v1").with_subject("s")).await.unwrap();
+    let peer = g.insert(fact_at("peer")).await.unwrap();
+    let since = events(&appended).len();
+    let cites = EpisodeEdge {
+        from: EpisodeRef::New(1),
+        to: EpisodeRef::Existing(peer.clone()),
+        kind: "cites".to_string(),
+        attributes: serde_json::json!({}),
+    };
+
+    // Act
+    let result = g
+        .ingest_episode(
+            vec![
+                fact_at("v2").with_subject("s"),
+                fact_at("ep-peer"),
+                fact_at("v3").with_subject("s"),
+            ],
+            vec![mentions(2, 1), cites],
+        )
+        .await
+        .unwrap();
+
+    // Assert: one event, rows in write order.
+    let logged = events_since(&appended, since);
+    assert_eq!(logged.len(), 1, "one event per episode: {logged:?}");
+    let [n0, n1, n2] = [0, 1, 2].map(|i| result.node_ids[i].clone());
+    // The log carries n0 as written, still open: the supersedes edge after it
+    // is what closes it, on replay as on the live write.
+    let n0_as_written = NodeRow {
+        tx_to: FOREVER.0,
+        ..stored_row(&g, &n0, true).await
+    };
+    let expected = vec![
+        RowEffect::Node(n0_as_written),
+        RowEffect::Edge(edge_between(&g, n0.as_str(), x.as_str(), relation::SUPERSEDES).await),
+        node_effect(&g, &n1).await,
+        node_effect(&g, &n2).await,
+        RowEffect::Edge(edge_between(&g, n2.as_str(), n0.as_str(), relation::SUPERSEDES).await),
+        RowEffect::Edge(stored_edge(&g, result.edge_ids[0].as_str()).await),
+        RowEffect::Edge(stored_edge(&g, result.edge_ids[1].as_str()).await),
+    ];
+    assert_eq!(logged[0].payload, LogPayload::EpisodeBatch(expected));
+    assert_eq!(logged[0].ingested_at, 1000);
+    assert_eq!(stored_row(&g, &x, true).await.tx_to, 1000);
+    assert_eq!(stored_row(&g, &n0, true).await.tx_to, 1000);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+}
+
+#[tokio::test]
+async fn log_write_every_episode_row_registers_in_the_hash_index_under_the_batch_event() {
+    // Arrange
+    let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+
+    // Act
+    g.ingest_episode(vec![fact_at("a"), fact_at("b")], vec![mentions(0, 1)])
+        .await
+        .unwrap();
+
+    // Assert
+    let logged = events(&appended);
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(batch_effects(&logged[0]).len(), 3);
+    assert_indexed_with(&g, &logged[0]).await;
+    assert_eq!(count(&g, "log_hash_index").await, 3);
+}
+
+#[tokio::test]
+async fn log_write_a_duplicate_inside_one_episode_keeps_the_first_carrier_without_a_duplicate_of() {
+    // Arrange
+    let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+
+    // Act: the same content twice in one batch.
+    let result = g
+        .ingest_episode(vec![fact_at("twin"), fact_at("twin")], vec![])
+        .await
+        .unwrap();
+
+    // Assert: the batch is all or nothing, so both rows are stored and nothing
+    // is logged as a duplicate. The index keeps the first carrier first.
+    let logged = events(&appended);
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(count(&g, "nodes").await, 2);
+    let first = &result.node_ids[0];
+    let hash = node_row_hash(&stored_row(&g, first, true).await);
+    let entry = index_entry(&g, &hash).await;
+    assert!(entry.is_some(), "the twin hash is indexed");
+    let (first_event_id, row_ids) = entry.unwrap();
+    assert_eq!(first_event_id, logged[0].event_id);
+    assert_eq!(row_ids.first().map(String::as_str), Some(first.as_str()));
+
+    // Act: later identical content resolves to the first carrier.
+    let later = g.insert(fact_at("twin")).await.unwrap();
+
+    // Assert
+    assert_eq!(&later, first);
+}
+
+#[tokio::test]
 async fn log_write_each_episode_is_one_batch_event_of_the_stored_rows() {
     // Arrange
     let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
@@ -1134,6 +1192,42 @@ async fn log_write_upsert_by_with_the_content_of_a_live_row_returns_it_and_logs_
     assert_cursor_at_last_event(&g, &appended, &log_id).await;
 }
 
+/// `new` was written as the last of `expected_events` events: stored live,
+/// logged as a write, and the index points at it.
+async fn assert_stored_as_a_new_write<B: Backend>(
+    g: &Graph<B>,
+    appended: &Appended,
+    new: &NodeId,
+    expected_events: usize,
+) {
+    let logged = events(appended);
+    assert_eq!(logged.len(), expected_events, "{logged:?}");
+    assert!(!has_duplicate_of(&logged), "{logged:?}");
+    let last = logged.last().unwrap();
+    let row = batch_node(last);
+    assert_eq!(row.id, new.as_str());
+    assert_eq!(
+        index_entry(g, &node_row_hash(&row)).await,
+        Some((last.event_id.clone(), vec![new.as_str().to_string()]))
+    );
+    assert_eq!(live_ids_with_subject(g, "s").await, vec![new.as_str()]);
+}
+
+#[tokio::test]
+async fn log_write_upsert_by_with_content_whose_carrier_was_superseded_is_a_new_write() {
+    // Arrange: X, then Y over it, so X's carrier is closed.
+    let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let x = g.upsert_by(fact_at("X").with_subject("s")).await.unwrap();
+    g.upsert_by(fact_at("Y").with_subject("s")).await.unwrap();
+
+    // Act
+    let third = g.upsert_by(fact_at("X").with_subject("s")).await.unwrap();
+
+    // Assert
+    assert_ne!(third, x);
+    assert_stored_as_a_new_write(&g, &appended, &third, 3).await;
+}
+
 #[tokio::test]
 async fn log_write_supersede_with_content_already_live_still_closes_old_and_repoints_the_index() {
     // Arrange
@@ -1166,6 +1260,51 @@ async fn log_write_supersede_with_content_already_live_still_closes_old_and_repo
         index_entry(&g, &hash).await,
         Some((logged[2].event_id.clone(), vec![z.as_str().to_string()]))
     );
+}
+
+#[tokio::test]
+async fn log_write_supersede_with_content_whose_carrier_was_superseded_is_a_new_write() {
+    // Arrange: X, then Y over it, so X's carrier is closed.
+    let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let x = g.insert(fact_at("X").with_subject("s")).await.unwrap();
+    let y = g
+        .supersede(&x, fact_at("Y").with_subject("s"))
+        .await
+        .unwrap();
+
+    // Act
+    let third = g
+        .supersede(&y, fact_at("X").with_subject("s"))
+        .await
+        .unwrap();
+
+    // Assert
+    assert_ne!(third, x);
+    assert_stored_as_a_new_write(&g, &appended, &third, 3).await;
+}
+
+#[tokio::test]
+async fn log_write_supersede_of_a_row_that_is_not_live_fails_without_appending() {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let old = g.insert(fact_at("old").with_subject("s")).await.unwrap();
+    g.supersede(&old, fact_at("new").with_subject("s"))
+        .await
+        .unwrap();
+    let logged_before = events(&appended);
+
+    // Act
+    let refused = g.supersede(&old, fact_at("again").with_subject("s")).await;
+
+    // Assert: the insert and the first supersede are logged, the refusal is not.
+    assert_eq!(logged_before.len(), 2, "{logged_before:?}");
+    assert!(
+        matches!(refused, Err(Error::NodeNotFound(_))),
+        "{refused:?}"
+    );
+    assert_eq!(events(&appended), logged_before);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+    assert!(g.insert(fact_at("after")).await.is_ok(), "log not poisoned");
 }
 
 // ---- relate dedup ----
@@ -1203,27 +1342,32 @@ async fn log_write_a_second_identical_relate_returns_the_first_edge_and_logs_dup
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn log_write_the_write_time_is_read_after_the_log_lock_and_the_transaction() {
-    // Arrange: the write lock is held, so the insert holds the log lock and
-    // waits in `begin`.
-    let (log, appended) = RecordingLog::new();
-    let clock = Arc::new(FixedClock::new(Millis(1000)));
-    let shared = share(log);
-    let g = Arc::new(open_clocked::<DefaultBackend>(":memory:", Arc::clone(&clock), shared).await);
-    let held = g.backend.begin().await.unwrap();
-    let insert = tokio::spawn({
-        let g = Arc::clone(&g);
-        async move { g.insert(fact("late")).await }
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    within_deadline(async {
+        // Arrange: the write lock is held, so the insert holds the log lock and
+        // waits in `begin`.
+        let (log, appended) = RecordingLog::new();
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let shared = share(log);
+        let g =
+            Arc::new(open_clocked::<FailingBackend>(":memory:", Arc::clone(&clock), shared).await);
+        let held = g.backend.begin().await.unwrap();
+        g.backend.probe.begins.store(0, Ordering::SeqCst);
+        let insert = tokio::spawn({
+            let g = Arc::clone(&g);
+            async move { g.insert(fact("late")).await }
+        });
+        wait_for_begins(&g, 1).await;
 
-    // Act: the clock moves while the write waits, then the write goes ahead.
-    clock.set(Millis(5000));
-    held.rollback().await.unwrap();
-    let id = insert.await.unwrap().unwrap();
+        // Act: the clock moves while the write waits, then the write goes ahead.
+        clock.set(Millis(5000));
+        held.rollback().await.unwrap();
+        let id = insert.await.unwrap().unwrap();
 
-    // Assert
-    assert_eq!(stored_row(&g, &id, false).await.tx_from, 5000);
-    assert_eq!(events(&appended)[0].ingested_at, 5000);
+        // Assert
+        assert_eq!(stored_row(&g, &id, false).await.tx_from, 5000);
+        assert_eq!(events(&appended)[0].ingested_at, 5000);
+    })
+    .await;
 }
 
 /// `old` was superseded by `current` at 3000, and the clock has since stepped
@@ -1284,43 +1428,42 @@ async fn log_write_a_supersede_of_a_row_closed_since_is_voided_not_a_silent_no_o
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_write_concurrent_upserts_of_one_subject_never_leave_two_live_rows() {
-    // Arrange: every second `begin` is slow, and every clock read is later than
-    // the one before, so a write stamped before it holds the log lock would be
-    // blind to a row the other committed first.
-    const SUBJECTS: usize = 20;
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("graph.db");
-    let (log, _) = RecordingLog::new();
-    let clock = Arc::new(TickingClock(AtomicI64::new(1000)));
-    let g =
-        Arc::new(open_clocked::<FailingBackend>(path.to_str().unwrap(), clock, share(log)).await);
-    g.backend
-        .probe
-        .delay_odd_begins
-        .store(true, Ordering::SeqCst);
+    within_deadline(async {
+        // Arrange: every second `begin` is slow, and every clock read is later than
+        // the one before, so a write stamped before it holds the log lock would be
+        // blind to a row the other committed first.
+        const SUBJECTS: usize = 20;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.db");
+        let (log, _) = RecordingLog::new();
+        let clock = Arc::new(TickingClock(AtomicI64::new(1000)));
+        let g = Arc::new(
+            open_clocked::<FailingBackend>(path.to_str().unwrap(), clock, share(log)).await,
+        );
+        g.backend
+            .probe
+            .delay_odd_begins
+            .store(true, Ordering::SeqCst);
 
-    for subject in 0..SUBJECTS {
-        // Act
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let tasks: Vec<_> = (0..2)
-            .map(|side| {
-                let (g, barrier) = (Arc::clone(&g), Arc::clone(&barrier));
-                tokio::spawn(async move {
-                    barrier.wait().await;
+        for subject in 0..SUBJECTS {
+            // Act
+            let written = race(2, |side| {
+                let g = Arc::clone(&g);
+                async move {
                     let node = fact(&format!("side-{side}")).with_subject(format!("s-{subject}"));
                     g.upsert_by(node).await
-                })
+                }
             })
-            .collect();
-        for task in tasks {
-            task.await.unwrap().unwrap();
-        }
+            .await;
+            assert!(written.iter().all(Result::is_ok), "{written:?}");
 
-        // Assert
-        let live = live_ids_with_subject(&g, &format!("s-{subject}")).await;
-        assert_eq!(live.len(), 1, "subject {subject}: {live:?}");
-    }
-    assert_eq!(count(&g, "nodes").await, (SUBJECTS * 2) as i64);
+            // Assert
+            let live = live_ids_with_subject(&g, &format!("s-{subject}")).await;
+            assert_eq!(live.len(), 1, "subject {subject}: {live:?}");
+        }
+        assert_eq!(count(&g, "nodes").await, (SUBJECTS * 2) as i64);
+    })
+    .await;
 }
 
 fn assert_reserved_refused(refused: &Result<impl std::fmt::Debug>) {
@@ -1472,4 +1615,188 @@ async fn log_write_replaying_the_logged_payloads_reproduces_the_live_rows() {
     // Assert
     assert_eq!(count(&replica, "edges").await, 5);
     assert_eq!(dump_rows(&replica).await, dump_rows(&g).await);
+}
+
+#[tokio::test]
+async fn log_write_relate_refuses_a_live_twin_the_log_never_recorded() {
+    // Arrange: the edge was written before a log was attached, so it is live
+    // but not in the hash index.
+    let unlogged = graph_at(Millis(1000)).await;
+    let src = unlogged.insert(fact_at("src")).await.unwrap();
+    let dst = unlogged.insert(fact_at("dst")).await.unwrap();
+    unlogged.relate(&src, &dst, "mentions").await.unwrap();
+    let (log, appended) = RecordingLog::new();
+    let g = unlogged.with_log(share(log)).await.unwrap();
+
+    // Act
+    let refused = g.relate(&src, &dst, "mentions").await;
+
+    // Assert: only an indexed twin can be answered as a duplicate.
+    assert!(
+        matches!(refused, Err(Error::RelateRefused(_))),
+        "{refused:?}"
+    );
+    assert!(events(&appended).is_empty());
+    assert_eq!(count(&g, "edges").await, 1);
+}
+
+#[tokio::test]
+async fn log_write_relate_after_the_first_edge_was_closed_or_deleted_is_a_new_write() {
+    for how in ["closed", "deleted"] {
+        // Arrange
+        let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+        let src = g.insert(fact_at("src")).await.unwrap();
+        let dst = g.insert(fact_at("dst")).await.unwrap();
+        let since = events(&appended).len();
+        let first = g.relate(&src, &dst, "mentions").await.unwrap();
+        if how == "closed" {
+            g.backend
+                .execute(
+                    "UPDATE edges SET tx_to = ?1 WHERE id = ?2",
+                    &[Millis(1000).into(), first.as_str().into()],
+                )
+                .await
+                .unwrap();
+        } else {
+            g.backend
+                .execute("DELETE FROM edges WHERE id = ?1", &[first.as_str().into()])
+                .await
+                .unwrap();
+        }
+
+        // Act
+        let second = g.relate(&src, &dst, "mentions").await;
+
+        // Assert: stored and logged as a write, and the index follows it.
+        assert!(second.is_ok(), "{how}: {second:?}");
+        let second = second.unwrap();
+        assert_ne!(second, first, "{how}");
+        let live = g
+            .backend
+            .query("SELECT id FROM edges WHERE tx_to = ?1", &[FOREVER.into()])
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1, "{how}");
+        assert_eq!(live[0].get_string(0).unwrap(), second.as_str(), "{how}");
+        let logged = events_since(&appended, since);
+        assert_eq!(logged.len(), 2, "{how}: {logged:?}");
+        assert!(!has_duplicate_of(&logged), "{how}: {logged:?}");
+        let stored = stored_edge(&g, second.as_str()).await;
+        assert_eq!(logged[1].payload, LogPayload::EdgeWrite(stored.clone()));
+        assert_eq!(
+            index_entry(&g, &edge_row_hash(&stored)).await,
+            Some((
+                logged[1].event_id.clone(),
+                vec![second.as_str().to_string()]
+            )),
+            "{how}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn log_write_a_refused_relate_appends_nothing_and_leaves_the_log_usable() {
+    // Arrange: an edge exists, then its source is superseded.
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let src = g.insert(fact_at("src").with_subject("s")).await.unwrap();
+    let dst = g.insert(fact_at("dst")).await.unwrap();
+    g.relate(&src, &dst, "mentions").await.unwrap();
+    g.supersede(&src, fact_at("src2").with_subject("s"))
+        .await
+        .unwrap();
+    let logged_before = events(&appended);
+    let cursor_before = cursor(&g).await;
+
+    // Act: the source is no longer live, though the edge's hash is indexed.
+    let refused = g.relate(&src, &dst, "mentions").await;
+
+    // Assert: a refusal is not a duplicate and is not logged.
+    assert_eq!(logged_before.len(), 4, "{logged_before:?}");
+    assert!(
+        matches!(&refused, Err(Error::RelateRefused(m)) if m.contains("not live")),
+        "{refused:?}"
+    );
+    assert_eq!(events(&appended), logged_before);
+    assert_eq!(cursor(&g).await, cursor_before);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+    assert!(g.insert(fact_at("after")).await.is_ok(), "log not poisoned");
+}
+
+// ---- no log injected ----
+
+#[tokio::test]
+async fn log_write_upsert_by_without_a_log_behaves_as_before() {
+    // Arrange
+    let g = graph_at(Millis(1000)).await;
+    let first = g.upsert_by(fact("same").with_subject("s")).await.unwrap();
+
+    // Act
+    let second = g.upsert_by(fact("same").with_subject("s")).await.unwrap();
+
+    // Assert: no dedup, the older version is closed and linked.
+    assert_ne!(second, first);
+    assert_eq!(count(&g, "nodes").await, 2);
+    assert_eq!(live_ids_with_subject(&g, "s").await, vec![second.as_str()]);
+    edge_between(&g, second.as_str(), first.as_str(), relation::SUPERSEDES).await;
+    assert_log_tables_untouched(&g).await;
+}
+
+#[tokio::test]
+async fn log_write_supersede_without_a_log_behaves_as_before() {
+    // Arrange
+    let g = graph_at(Millis(1000)).await;
+    let old = g.insert(fact("old")).await.unwrap();
+
+    // Act
+    let new = g.supersede(&old, fact("new")).await.unwrap();
+    let refused = g.supersede(&old, fact("again")).await;
+
+    // Assert
+    assert_eq!(count(&g, "nodes").await, 2);
+    assert_eq!(stored_row(&g, &old, false).await.tx_to, 1000);
+    edge_between(&g, new.as_str(), old.as_str(), relation::SUPERSEDES).await;
+    assert!(
+        matches!(refused, Err(Error::NodeNotFound(_))),
+        "{refused:?}"
+    );
+    assert_log_tables_untouched(&g).await;
+}
+
+#[tokio::test]
+async fn log_write_relate_without_a_log_behaves_as_before() {
+    // Arrange
+    let g = graph_at(Millis(1000)).await;
+    let src = g.insert(fact("src")).await.unwrap();
+    let dst = g.insert(fact("dst")).await.unwrap();
+
+    // Act
+    let first = g.relate(&src, &dst, "mentions").await;
+    let second = g.relate(&src, &dst, "mentions").await;
+
+    // Assert: the repeat is refused, not deduplicated.
+    assert!(first.is_ok(), "{first:?}");
+    assert!(
+        matches!(&second, Err(Error::RelateRefused(m)) if m.contains("already relates")),
+        "{second:?}"
+    );
+    assert_eq!(count(&g, "edges").await, 1);
+    assert_log_tables_untouched(&g).await;
+}
+
+#[tokio::test]
+async fn log_write_ingest_episode_without_a_log_behaves_as_before() {
+    // Arrange
+    let g = graph_at(Millis(1000)).await;
+
+    // Act
+    let result = g
+        .ingest_episode(vec![fact("twin"), fact("twin")], vec![mentions(0, 1)])
+        .await
+        .unwrap();
+
+    // Assert: both rows are stored and nothing is deduplicated or logged.
+    assert_eq!(result.node_ids.len(), 2);
+    assert_eq!(count(&g, "nodes").await, 2);
+    assert_eq!(count(&g, "edges").await, 1);
+    assert_log_tables_untouched(&g).await;
 }
