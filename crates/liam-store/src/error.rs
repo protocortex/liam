@@ -112,31 +112,85 @@ pub enum Error {
 
     /// A rebuild asked to start from an empty projection found rows in it.
     #[error(
-        "the store already holds projected rows; a rebuild resets them first, \
-         so ask for the reset explicitly if that is what you want"
+        "the store already holds projected rows; a rebuild that clears them \
+         has to be asked for, with a mode that does"
     )]
     ProjectionNotEmpty,
 
-    /// The rows a rebuild produced are not the rows that were expected: the
-    /// hash multiset of the live nodes and edges differs, even when the counts
-    /// agree. The store stays as the replay left it.
+    /// The live nodes and edges are not the multiset of row hashes the log
+    /// says they should be, even when the counts agree.
     #[error(
-        "the rebuilt projection does not match: expected {expected} live rows, \
-         found {found}, with {missing} missing and {unexpected} unexpected; \
-         the log and the store disagree, so restore the missing log segments \
-         or the database from a backup before trusting this store"
+        "{subject} does not match the log: expected {expected} live rows, \
+         found {found}, with {missing} missing and {unexpected} unexpected; {advice}",
+        subject = .against.subject(),
+        advice = .against.advice()
     )]
     RebuildMismatch {
+        against: MismatchSource,
         expected: usize,
         found: usize,
         missing: usize,
         unexpected: usize,
     },
 
+    /// A replacing rebuild would delete rows from a log that has no record at
+    /// all, which is a log that was lost or pointed at the wrong place.
+    #[error(
+        "the log is empty but the store holds {rows_unknown_to_log} live rows \
+         the log does not know; a rebuild would delete them all, so check the \
+         log directory first"
+    )]
+    EmptyLogWouldWipe { rows_unknown_to_log: usize },
+
+    /// A replacing rebuild would delete rows to take on a log other than the
+    /// one the store was built from, which is only allowed onto an empty store.
+    #[error(
+        "the store belongs to log {store} and holds {rows_unknown_to_log} live \
+         rows log {log} does not know; a rebuild would delete them, so open the \
+         store with the log directory of log {store}, or start from an empty store"
+    )]
+    ForeignLogWouldWipe {
+        store: uuid::Uuid,
+        log: uuid::Uuid,
+        rows_unknown_to_log: usize,
+    },
+
     /// A log table holds a value no write of this store produces, so the
     /// store was edited or damaged outside it.
     #[error("the log state in the store is corrupt: {0}")]
     CorruptLogState(String),
+}
+
+/// What the log's live rows were compared with when they did not match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MismatchSource {
+    /// The rows the replay produced. The store is as the replay left it.
+    Log,
+    /// The rows the store held before the rebuild, which had not touched it.
+    PriorProjection,
+}
+
+impl MismatchSource {
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Log => "the rebuilt projection",
+            Self::PriorProjection => "the projection",
+        }
+    }
+
+    fn advice(self) -> &'static str {
+        match self {
+            Self::Log => {
+                "the log and the store disagree, so restore the missing log segments \
+                 or the database from a backup before trusting this store"
+            }
+            Self::PriorProjection => {
+                "nothing was changed; unexpected rows are what rows_unknown_to_log counts \
+                 and the Replace mode drops them, and a store that is only behind the \
+                 log is brought up to date with catch_up"
+            }
+        }
+    }
 }
 
 fn log_end(head: &Option<liam_log::LogOffset>) -> String {
@@ -198,6 +252,37 @@ mod tests {
         assert!(
             message.contains("segment 2, record 0, beyond the log head at segment 1, record 9;"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn a_mismatch_gives_the_advice_that_fits_what_was_compared() {
+        // Arrange
+        let mismatch = |against| Error::RebuildMismatch {
+            against,
+            expected: 5,
+            found: 3,
+            missing: 3,
+            unexpected: 1,
+        };
+
+        // Act
+        let prior = mismatch(MismatchSource::PriorProjection).to_string();
+        let rebuilt = mismatch(MismatchSource::Log).to_string();
+
+        // Assert
+        assert_eq!(
+            prior,
+            "the projection does not match the log: expected 5 live rows, found 3, with 3 \
+             missing and 1 unexpected; nothing was changed; unexpected rows are what \
+             rows_unknown_to_log counts and the Replace mode drops them, and a store that \
+             is only behind the log is brought up to date with catch_up"
+        );
+        assert_eq!(
+            rebuilt,
+            "the rebuilt projection does not match the log: expected 5 live rows, found 3, \
+             with 3 missing and 1 unexpected; the log and the store disagree, so restore \
+             the missing log segments or the database from a backup before trusting this store"
         );
     }
 

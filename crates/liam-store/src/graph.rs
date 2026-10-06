@@ -6348,6 +6348,9 @@ mod tests {
         fn vector_delete_sql(&self) -> Option<&'static str> {
             self.0.vector_delete_sql()
         }
+        fn vector_clear_sql(&self) -> Option<&'static str> {
+            self.0.vector_clear_sql()
+        }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.0.vector_delete(node_id).await
         }
@@ -7901,6 +7904,9 @@ mod tests {
         fn vector_delete_sql(&self) -> Option<&'static str> {
             self.inner.vector_delete_sql()
         }
+        fn vector_clear_sql(&self) -> Option<&'static str> {
+            self.inner.vector_clear_sql()
+        }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
         }
@@ -8002,6 +8008,9 @@ mod tests {
         }
         fn vector_delete_sql(&self) -> Option<&'static str> {
             self.inner.vector_delete_sql()
+        }
+        fn vector_clear_sql(&self) -> Option<&'static str> {
+            self.inner.vector_clear_sql()
         }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await

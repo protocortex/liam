@@ -83,6 +83,10 @@ pub trait Backend: Send + Sync + Sized {
     /// for a caller that must do it inside a transaction of its own. `None` for
     /// a backend whose vectors go with their node.
     fn vector_delete_sql(&self) -> Option<&'static str>;
+    /// The statement that deletes every stored vector, for a caller that must
+    /// do it inside a transaction of its own. `None` for a backend whose vectors
+    /// go with their nodes.
+    fn vector_clear_sql(&self) -> Option<&'static str>;
 
     /// Read. Nearest node ids to `query`, restricted to the live set at
     /// `as_of` and, when given, to `kind` and `scope`. Each backend applies

@@ -13,21 +13,16 @@ use liam_log::event::{
 };
 use liam_log::hash::{edge_row_hash, node_row_hash};
 use liam_log::reader::{LogRecord, SequentialScanReader};
-use liam_log::wal::{WalConfig, WalError, WalWriter};
+use liam_log::wal::{WalError, WalWriter};
 use liam_log::{LogOffset, LogWriter};
 
 use super::support::{
-    count, cursor, event, fact, fact_at, has_node, offset_pair, record_counts, shared, Env,
-    ReembedProbe, StubEmbedder, ONE_SEGMENT,
+    count, cursor, edge, edge_write, event, fact, fact_at, has_node, node, node_write, offset_pair,
+    quarantined, record_counts, shared, tombstone, Env, ReembedProbe, StubEmbedder, ONE_SEGMENT,
+    SEGMENT_PER_EVENT,
 };
 use super::*;
 use crate::DefaultBackend;
-
-/// Rotates after every append, so each event sits in a segment of its own.
-const SEGMENT_PER_EVENT: WalConfig = WalConfig {
-    segment_max_bytes: 1,
-    rotate_interval_secs: 3600,
-};
 
 /// A writer that reports the log's head but fails every append, as a full disk
 /// would leave it.
@@ -52,55 +47,6 @@ fn clock_at(t: i64) -> Arc<FixedClock> {
 }
 
 // ---- events, built the way the write path logs them ----
-
-fn node(id: &str, content: &str) -> NodeRow {
-    NodeRow {
-        id: id.into(),
-        kind: "fact".into(),
-        label: "label".into(),
-        content: content.into(),
-        producer: "agent-a".into(),
-        attributes: "{}".into(),
-        scope: Some("proj/a".into()),
-        subject: None,
-        confidence: 0.75,
-        valid_from: 500,
-        valid_from_supplied: true,
-        valid_until: FOREVER.0,
-        tx_from: 1000,
-        tx_to: FOREVER.0,
-    }
-}
-
-fn edge(id: &str, src: &str, dst: &str) -> EdgeRow {
-    EdgeRow {
-        id: id.into(),
-        src: src.into(),
-        dst: dst.into(),
-        edge_type: "mentions".into(),
-        attributes: "{}".into(),
-        tx_from: 1000,
-        tx_to: FOREVER.0,
-    }
-}
-
-fn node_write(id: &str, content: &str) -> LogEvent {
-    let row = node(id, content);
-    event(
-        &format!("event-{id}"),
-        node_row_hash(&row),
-        LogPayload::NodeWrite(row),
-    )
-}
-
-fn edge_write(id: &str, src: &str, dst: &str) -> LogEvent {
-    let row = edge(id, src, dst);
-    event(
-        &format!("event-{id}"),
-        edge_row_hash(&row),
-        LogPayload::EdgeWrite(row),
-    )
-}
 
 /// A `supersedes` edge written on its own: it closes `dst`, then inserts the
 /// edge with no guard on `src`.
@@ -133,17 +79,6 @@ fn follow_up(event_id: &str, like: &LogEvent, payload: LogPayload) -> LogEvent {
     event(event_id, like.content_hash, payload)
 }
 
-fn tombstone(event_id: &str, targets: &[(TombstoneTable, &str)]) -> LogEvent {
-    let targets = targets
-        .iter()
-        .map(|(table, id)| TombstoneTarget {
-            table: *table,
-            id: (*id).into(),
-        })
-        .collect();
-    event(event_id, [0; 32], LogPayload::Tombstone(targets))
-}
-
 // ---- reading the store back ----
 
 async fn dump<B: Backend>(g: &Graph<B>, table: &str) -> String {
@@ -166,26 +101,6 @@ async fn tx_to<B: Backend>(g: &Graph<B>, id: &str) -> i64 {
 
 async fn cursor_offset<B: Backend>(g: &Graph<B>) -> Option<(i64, i64)> {
     cursor(g).await.and_then(|(_, offset)| offset)
-}
-
-async fn quarantined<B: Backend>(g: &Graph<B>) -> Vec<(String, i64, i64, String)> {
-    g.backend
-        .query(
-            "SELECT event_id, segment, seg_index, reason FROM log_quarantine ORDER BY event_id",
-            &[],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|row| {
-            (
-                row.get_string(0).unwrap(),
-                row.get_i64(1).unwrap(),
-                row.get_i64(2).unwrap(),
-                row.get_string(3).unwrap(),
-            )
-        })
-        .collect()
 }
 
 async fn lose_cursor<B: Backend>(g: &Graph<B>) {

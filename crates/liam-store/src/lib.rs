@@ -22,7 +22,7 @@ pub mod value;
 pub use backend::Backend;
 pub use backends::DefaultBackend;
 pub use clock::{Clock, FixedClock, SystemClock};
-pub use error::{Error, Result};
+pub use error::{Error, MismatchSource, Result};
 pub use graph::{
     Candidate, CatchUpReport, ContentEmbedder, EmbedError, EventLog, Graph, RebuildMode,
     RebuildReport, ReembedReport, SharedLog,

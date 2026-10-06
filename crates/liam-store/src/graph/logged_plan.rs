@@ -61,6 +61,9 @@ impl Table {
 
     /// What removing a row deletes, dependents first so the foreign keys hold.
     /// A node's vector is the backend's to delete, before these run.
+    ///
+    /// `LoggedRows` in rebuild.rs repeats the node cascade on purpose, to check
+    /// a replay independently of it, so the two must change together.
     pub(super) fn removal_sql(self) -> &'static [&'static str] {
         match self {
             // Cascades on a backend that enforces foreign keys; the explicit

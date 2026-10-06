@@ -34,6 +34,8 @@ const MIN_READ_POOL_SIZE: usize = 1;
 /// on its own, also by a removal that runs inside a caller's transaction.
 const VECTOR_DELETE_SQL: &str = "DELETE FROM node_vectors WHERE node_id = ?1";
 
+const VECTOR_CLEAR_SQL: &str = "DELETE FROM node_vectors";
+
 /// Whether `path` can safely back a multi-connection read pool: true only
 /// for a plain filesystem path, one that does not start with `file:` and
 /// is not the bare `:memory:` spelling. `database_path` comes from user
@@ -316,6 +318,10 @@ impl Backend for LibsqlBackend {
 
     fn vector_delete_sql(&self) -> Option<&'static str> {
         Some(VECTOR_DELETE_SQL)
+    }
+
+    fn vector_clear_sql(&self) -> Option<&'static str> {
+        Some(VECTOR_CLEAR_SQL)
     }
 
     async fn vector_delete(&self, node_id: &str) -> Result<()> {

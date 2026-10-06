@@ -262,9 +262,15 @@ async fn replay_projection(
 /// What a replay range holds besides the events to apply.
 pub(super) struct Ahead {
     /// The ids of the events a `Voided` record cancels.
-    pub(super) voided: HashSet<String>,
+    voided: HashSet<String>,
     /// The rows named by the tombstones that ran, so a voided one is left out.
     removed: Removed,
+}
+
+impl Ahead {
+    pub(super) fn into_voided(self) -> HashSet<String> {
+        self.voided
+    }
 }
 
 /// Rows named by a tombstone. Ids are never reused, so once the tombstone has

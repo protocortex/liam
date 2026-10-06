@@ -1,32 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Rebuilding the projection from the event log alone, and checking the result
-//! row by row against what the store held and what the log says should be live.
+//! row by row against what the log says should be live.
 
 use std::collections::HashMap;
 
 use futures_util::StreamExt;
 use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTable};
 use liam_log::hash::{edge_row_hash, node_row_hash};
+use uuid::Uuid;
 
+use super::log_cursor;
 use super::logged_write::{commit_or_abandon, HeldLog, SharedLog};
 use super::replay::{scan_ahead, CatchUpReport};
 use super::{opt_string, row_f64, Graph};
 use crate::backend::Backend;
-use crate::error::{Error, Result};
+use crate::error::{Error, MismatchSource, Result};
 use crate::ids::FOREVER;
+use crate::schema::{Clear, DERIVED_TABLES};
 use crate::types::relation;
 use crate::value::Row;
 
-/// What a rebuild does with rows the projection already holds.
+/// What a rebuild does with rows the projection already holds. A mode that
+/// clears the projection refuses first, under the log lock, whatever it would
+/// destroy that the log cannot give back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebuildMode {
-    /// Refuse a projection that is not empty.
+    /// Refuses a projection that holds any row.
     RequireEmpty,
-    /// Clear the projection first, and check the rebuilt rows against the ones
-    /// it held.
-    Reset,
-    /// Clear the projection first and trust the log over it: rows the store
-    /// held that the log does not record are dropped without a mismatch.
+    /// Clears the projection only when its live rows are exactly what the log
+    /// says should be live, and otherwise refuses with it untouched. A store
+    /// that is merely behind the log differs, so it is refused too.
+    ResetChecked,
+    /// Clears the projection and trusts the log over it: rows the log does not
+    /// record are dropped. It still refuses to wipe rows for an empty log, or to
+    /// take on a different log than the one the store was built from.
     Replace,
 }
 
@@ -39,30 +46,14 @@ pub struct RebuildReport {
     pub live_nodes: usize,
     /// Live edges after the rebuild.
     pub live_edges: usize,
-    /// Always true in a report: the multiset of live row hashes was verified.
-    pub hash_multiset_ok: bool,
 }
 
-/// Empties what the log derives, referencing rows first because the vector
-/// table has no cascade. `cluster_state` goes with the assignments, otherwise
-/// its fingerprint would vouch for communities that are no longer there.
-const RESET_SQL: [&str; 7] = [
-    "DELETE FROM node_vectors",
-    "DELETE FROM node_community",
-    "DELETE FROM cluster_state",
-    "DELETE FROM edges",
-    "DELETE FROM nodes",
-    "DELETE FROM log_hash_index",
-    "DELETE FROM log_quarantine",
-];
-
-/// Puts the cursor at the start of the log it is given, creating it when the
-/// store has none. The store takes on that log's id, which is what lets a store
-/// that belonged to another log, or ran ahead of this one, be rebuilt from it.
-const RESTART_CURSOR_SQL: &str = "INSERT INTO log_cursor (id, log_id, last_segment, last_index)
-     VALUES (1, ?1, NULL, NULL)
-     ON CONFLICT(id) DO UPDATE SET
-       log_id = excluded.log_id, last_segment = NULL, last_index = NULL";
+/// The sorted hashes of the live rows, with how many are nodes and edges.
+struct LiveRows {
+    hashes: Vec<[u8; 32]>,
+    nodes: usize,
+    edges: usize,
+}
 
 const LIVE_NODES_SQL: &str = "SELECT id, kind, label, content, producer, attributes, scope, \
      subject, confidence, valid_from, valid_until, tx_from, tx_to FROM nodes WHERE tx_to = ?1";
@@ -70,90 +61,111 @@ const LIVE_EDGES_SQL: &str =
     "SELECT id, src, dst, type, attributes, tx_from, tx_to FROM edges WHERE tx_to = ?1";
 
 impl<B: Backend> Graph<B> {
-    /// Attaches `log` without checking that the store belongs to it or has not
-    /// run past it, so a store those checks refuse can still be rebuilt. The
-    /// rebuild adopts the log. Anything else the store does before then is
-    /// unchecked.
-    pub fn with_log_for_rebuild(mut self, log: SharedLog) -> Self {
-        self.log = Some(log);
-        self
-    }
-
-    /// Empties every table the log derives and moves the log cursor back to the
-    /// start of the attached log, then empties the dedup filter.
-    pub async fn reset_projection(&self) -> Result<()> {
-        let mut held = HeldLog::acquire(self.attached_log()?).await?;
-        self.reset(&mut held).await
-    }
-
     /// The sorted multiset of canonical row hashes of every live node and edge.
     pub async fn projection_hash_multiset(&self) -> Result<Vec<[u8; 32]>> {
-        let mut hashes = Vec::new();
-        for row in self
-            .backend
-            .query(LIVE_NODES_SQL, &[FOREVER.into()])
-            .await?
-        {
-            hashes.push(node_row_hash(&stored_node(&row)?));
-        }
-        for row in self
-            .backend
-            .query(LIVE_EDGES_SQL, &[FOREVER.into()])
-            .await?
-        {
-            hashes.push(edge_row_hash(&stored_edge(&row)?));
-        }
-        hashes.sort_unstable();
-        Ok(hashes)
+        Ok(self.live_rows().await?.hashes)
     }
 
     /// How many live rows the store holds that the log does not account for,
-    /// such as rows written before the log existed. A reset drops them.
+    /// such as rows written before the log existed. `Replace` drops them.
     pub async fn rows_unknown_to_log(&self) -> Result<usize> {
-        let held = HeldLog::acquire(self.attached_log()?).await?;
-        let known = log_expected_multiset(&held).await?;
-        let stored = self.projection_hash_multiset().await?;
-        Ok(multiset_difference(&stored, &known).0)
+        let log = self.log.as_ref().ok_or(Error::NoEventLog)?;
+        let held = HeldLog::acquire(log).await?;
+        self.unknown_rows(&held).await
     }
 
-    /// Rebuilds the projection from the start of the log and verifies it. The
-    /// log lock is held from the reset to the end of the replay, so no write
-    /// lands on a half rebuilt store. A failure after the reset leaves the
-    /// store as the replay left it, and running the rebuild again starts over.
-    pub async fn rebuild_from_log(&self, mode: RebuildMode) -> Result<RebuildReport> {
-        let mut held = HeldLog::acquire(self.attached_log()?).await?;
-        let before = match mode {
-            RebuildMode::RequireEmpty if self.holds_rows().await? => {
-                return Err(Error::ProjectionNotEmpty)
-            }
-            RebuildMode::RequireEmpty => None,
-            RebuildMode::Reset => Some(self.projection_hash_multiset().await?),
-            RebuildMode::Replace => None,
-        };
-        self.reset(&mut held).await?;
+    /// Rebuilds the projection from the start of `log`, verifies it against the
+    /// log, and returns the store attached to `log`. A store the mode refuses
+    /// is untouched, and one whose replay fails is dropped with the error, so a
+    /// store that was not checked never escapes.
+    ///
+    /// The caller must hold the exclusive store lock and run no `gc` or other
+    /// writer for the whole call, as the CLI does: the log lock only orders
+    /// logged writes. An interrupted rebuild leaves the store on its log with
+    /// the cursor on the last record applied, so `catch_up` resumes it, and
+    /// `Replace` starts over. `ResetChecked` refuses such a partial store and
+    /// leaves it as it is.
+    pub async fn rebuild_from_log(
+        mut self,
+        log: SharedLog,
+        mode: RebuildMode,
+    ) -> Result<(Self, RebuildReport)> {
+        let report = self.rebuild(&log, mode).await?;
+        self.log = Some(log);
+        Ok((self, report))
+    }
+
+    async fn rebuild(&self, log: &SharedLog, mode: RebuildMode) -> Result<RebuildReport> {
+        let mut held = HeldLog::acquire(log).await?;
+        let previous_log = log_cursor::read(&self.backend)
+            .await?
+            .map(|cursor| cursor.log_id)
+            .filter(|id| *id != held.log_id);
+        self.check_before_reset(&held, mode, previous_log).await?;
+        tracing::info!(?mode, "rebuild: checks passed, resetting the projection");
+        self.reset(&mut held, previous_log.is_some()).await?;
         let replayed = self.replay(&mut held).await?;
         tracing::info!(?replayed, "rebuild: log replayed");
 
-        let rebuilt = self.projection_hash_multiset().await?;
-        verify(&log_expected_multiset(&held).await?, &rebuilt)?;
-        if let Some(before) = before {
-            verify(&before, &rebuilt)?;
-        }
-        tracing::info!(rows = rebuilt.len(), "rebuild: rebuilt rows verified");
+        let rebuilt = self.live_rows().await?;
+        let expected = log_expected_multiset(&held).await?;
+        verify(MismatchSource::Log, &expected, &rebuilt.hashes)?;
+        tracing::info!(
+            rows = rebuilt.hashes.len(),
+            "rebuild: rebuilt rows verified"
+        );
         drop(held);
 
         Ok(RebuildReport {
             replayed: self.reembedded(replayed).await,
-            live_nodes: self.live_count("nodes").await?,
-            live_edges: self.live_count("edges").await?,
-            hash_multiset_ok: true,
+            live_nodes: rebuilt.nodes,
+            live_edges: rebuilt.edges,
         })
     }
 
-    fn attached_log(&self) -> Result<&SharedLog> {
-        self.log.as_ref().ok_or(Error::NoEventLog)
+    /// Refuses, before anything is deleted, a rebuild that would destroy rows
+    /// the log cannot give back. `previous_log` is the log the store belonged
+    /// to when that is another one.
+    async fn check_before_reset(
+        &self,
+        held: &HeldLog,
+        mode: RebuildMode,
+        previous_log: Option<Uuid>,
+    ) -> Result<()> {
+        match mode {
+            RebuildMode::RequireEmpty if self.holds_rows().await? => Err(Error::ProjectionNotEmpty),
+            RebuildMode::RequireEmpty => Ok(()),
+            RebuildMode::ResetChecked => {
+                let expected = log_expected_multiset(held).await?;
+                let stored = self.live_rows().await?;
+                verify(MismatchSource::PriorProjection, &expected, &stored.hashes)
+            }
+            RebuildMode::Replace if !self.holds_rows().await? => Ok(()),
+            RebuildMode::Replace => {
+                if let Some(store) = previous_log {
+                    return Err(Error::ForeignLogWouldWipe {
+                        store,
+                        log: held.log_id,
+                        rows_unknown_to_log: self.unknown_rows(held).await?,
+                    });
+                }
+                if held.head()?.is_none() {
+                    return Err(Error::EmptyLogWouldWipe {
+                        rows_unknown_to_log: self.unknown_rows(held).await?,
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 
+    async fn unknown_rows(&self, held: &HeldLog) -> Result<usize> {
+        let known = log_expected_multiset(held).await?;
+        let stored = self.live_rows().await?;
+        Ok(multiset_difference(&stored.hashes, &known).0)
+    }
+
+    /// Any row at all, superseded ones included.
     async fn holds_rows(&self) -> Result<bool> {
         let rows = self
             .backend
@@ -165,29 +177,48 @@ impl<B: Backend> Graph<B> {
         Ok(rows.first().map(|row| row.get_i64(0)).transpose()? == Some(1))
     }
 
-    async fn live_count(&self, table: &str) -> Result<usize> {
-        let rows = self
-            .backend
-            .query(
-                &format!("SELECT COUNT(*) FROM {table} WHERE tx_to = ?1"),
-                &[FOREVER.into()],
-            )
-            .await?;
-        let count = rows.first().map(|row| row.get_i64(0)).transpose()?;
-        Ok(usize::try_from(count.unwrap_or(0)).unwrap_or(0))
+    async fn live_rows(&self) -> Result<LiveRows> {
+        let live = [FOREVER.into()];
+        let mut hashes = Vec::new();
+        for row in self.backend.query(LIVE_NODES_SQL, &live).await? {
+            hashes.push(node_row_hash(&stored_node(&row)?));
+        }
+        let nodes = hashes.len();
+        for row in self.backend.query(LIVE_EDGES_SQL, &live).await? {
+            hashes.push(edge_row_hash(&stored_edge(&row)?));
+        }
+        let edges = hashes.len() - nodes;
+        hashes.sort_unstable();
+        Ok(LiveRows {
+            hashes,
+            nodes,
+            edges,
+        })
     }
 
     /// One transaction, so a failure leaves the old projection whole. The dedup
-    /// filter is emptied only once the index it mirrors is gone.
-    async fn reset(&self, held: &mut HeldLog) -> Result<()> {
+    /// filter is emptied only once the index it mirrors is gone. `adopting`
+    /// says the store takes on another log, which also drops what the old one
+    /// left behind.
+    pub(super) async fn reset(&self, held: &mut HeldLog, adopting: bool) -> Result<()> {
+        // The vector table has no cascade, so it goes first.
+        let statements = self
+            .backend
+            .vector_clear_sql()
+            .map(str::to_owned)
+            .into_iter()
+            .chain(
+                DERIVED_TABLES
+                    .iter()
+                    .filter(|(_, clear)| adopting || *clear == Clear::Always)
+                    .map(|(table, _)| format!("DELETE FROM {table}")),
+            );
         let mut tx = self.backend.begin().await?;
         let cleared = async {
-            for sql in RESET_SQL {
-                tx.execute(sql, &[]).await?;
+            for sql in statements {
+                tx.execute(&sql, &[]).await?;
             }
-            tx.execute(RESTART_CURSOR_SQL, &[held.log_id.to_string().into()])
-                .await?;
-            Ok(())
+            log_cursor::restart_in_tx(&mut *tx, held.log_id).await
         }
         .await;
         commit_or_abandon(tx, cleared).await?;
@@ -233,12 +264,13 @@ fn stored_edge(row: &Row) -> Result<EdgeRow> {
 
 /// Fails when `found` is not the multiset `expected`, naming how far apart they
 /// are even when the counts agree.
-fn verify(expected: &[[u8; 32]], found: &[[u8; 32]]) -> Result<()> {
+fn verify(against: MismatchSource, expected: &[[u8; 32]], found: &[[u8; 32]]) -> Result<()> {
     let (missing, unexpected) = multiset_difference(expected, found);
     if missing + unexpected == 0 {
         return Ok(());
     }
     Err(Error::RebuildMismatch {
+        against,
         expected: expected.len(),
         found: found.len(),
         missing,
@@ -246,28 +278,28 @@ fn verify(expected: &[[u8; 32]], found: &[[u8; 32]]) -> Result<()> {
     })
 }
 
-/// How many entries of the sorted multiset `held` are absent from `wanted`, and
-/// how many of `wanted` are absent from `held`. A hash held twice counts twice.
-fn multiset_difference(held: &[[u8; 32]], wanted: &[[u8; 32]]) -> (usize, usize) {
-    let (mut held_only, mut wanted_only) = (0, 0);
-    let (mut held, mut wanted) = (held.iter().peekable(), wanted.iter().peekable());
-    while let (Some(h), Some(w)) = (held.peek(), wanted.peek()) {
-        match h.cmp(w) {
+/// How many entries of the sorted multiset `left` are absent from `right`, and
+/// how many of `right` are absent from `left`. A hash held twice counts twice.
+fn multiset_difference(left: &[[u8; 32]], right: &[[u8; 32]]) -> (usize, usize) {
+    let (mut only_left, mut only_right) = (0, 0);
+    let (mut left, mut right) = (left.iter().peekable(), right.iter().peekable());
+    while let (Some(l), Some(r)) = (left.peek(), right.peek()) {
+        match l.cmp(r) {
             std::cmp::Ordering::Less => {
-                held_only += 1;
-                held.next();
+                only_left += 1;
+                left.next();
             }
             std::cmp::Ordering::Greater => {
-                wanted_only += 1;
-                wanted.next();
+                only_right += 1;
+                right.next();
             }
             std::cmp::Ordering::Equal => {
-                held.next();
-                wanted.next();
+                left.next();
+                right.next();
             }
         }
     }
-    (held_only + held.count(), wanted_only + wanted.count())
+    (only_left + left.count(), only_right + right.count())
 }
 
 /// The sorted multiset of live rows the log alone describes: every event that
@@ -278,7 +310,9 @@ async fn log_expected_multiset(held: &HeldLog) -> Result<Vec<[u8; 32]>> {
         return Ok(Vec::new());
     };
     let reader = held.reader()?;
-    let voided = scan_ahead(reader.scan_through(None, head)).await?.voided;
+    let voided = scan_ahead(reader.scan_through(None, head))
+        .await?
+        .into_voided();
     let mut rows = LoggedRows::default();
     let mut records = reader.scan_through(None, head);
     while let Some(record) = records.next().await {
@@ -290,11 +324,17 @@ async fn log_expected_multiset(held: &HeldLog) -> Result<Vec<[u8; 32]>> {
     Ok(rows.live_hashes())
 }
 
-/// The rows the log has produced so far, by id.
+/// The rows the log has produced so far, kept as little as the verdict needs:
+/// the hash of each row that is live, by id.
 #[derive(Default)]
 struct LoggedRows {
-    nodes: HashMap<String, NodeRow>,
-    edges: HashMap<String, EdgeRow>,
+    /// `None` once the node is closed.
+    nodes: HashMap<String, Option<[u8; 32]>>,
+    edges: HashMap<String, Option<[u8; 32]>>,
+    /// The ids of the edges touching each node, so a node's tombstone removes
+    /// them without a scan. An edge removed through its other end or on its own
+    /// stays listed, and removing it again changes nothing.
+    edges_of: HashMap<String, Vec<String>>,
 }
 
 impl LoggedRows {
@@ -319,25 +359,35 @@ impl LoggedRows {
         }
     }
 
-    fn add_node(&mut self, row: NodeRow) {
-        self.nodes.insert(row.id.clone(), row);
+    fn add_node(&mut self, mut row: NodeRow) {
+        row.valid_from_supplied = true;
+        let live = (row.tx_to == FOREVER.0).then(|| node_row_hash(&row));
+        self.nodes.insert(row.id, live);
     }
 
     fn add_edge(&mut self, row: EdgeRow) {
         if row.edge_type == relation::SUPERSEDES {
             if let Some(closed) = self.nodes.get_mut(&row.dst) {
-                closed.tx_to = row.tx_from;
+                *closed = None;
             }
         }
-        self.edges.insert(row.id.clone(), row);
+        for end in [&row.src, &row.dst] {
+            self.edges_of
+                .entry(end.clone())
+                .or_default()
+                .push(row.id.clone());
+        }
+        let live = (row.tx_to == FOREVER.0).then(|| edge_row_hash(&row));
+        self.edges.insert(row.id, live);
     }
 
     fn remove(&mut self, table: TombstoneTable, id: &str) {
         match table {
             TombstoneTable::Nodes => {
                 self.nodes.remove(id);
-                self.edges
-                    .retain(|_, edge| edge.src != id && edge.dst != id);
+                for edge in self.edges_of.remove(id).unwrap_or_default() {
+                    self.edges.remove(&edge);
+                }
             }
             TombstoneTable::Edges => {
                 self.edges.remove(id);
@@ -347,22 +397,11 @@ impl LoggedRows {
     }
 
     fn live_hashes(self) -> Vec<[u8; 32]> {
-        let nodes = self
+        let mut hashes: Vec<_> = self
             .nodes
             .into_values()
-            .filter(|row| row.tx_to == FOREVER.0);
-        let edges = self
-            .edges
-            .into_values()
-            .filter(|row| row.tx_to == FOREVER.0);
-        let mut hashes: Vec<_> = nodes
-            .map(|row| {
-                node_row_hash(&NodeRow {
-                    valid_from_supplied: true,
-                    ..row
-                })
-            })
-            .chain(edges.map(|row| edge_row_hash(&row)))
+            .chain(self.edges.into_values())
+            .flatten()
             .collect();
         hashes.sort_unstable();
         hashes
