@@ -386,9 +386,9 @@ async fn logged_batches_carry_the_clamped_times_and_replay_to_the_same_rows() {
     let replica = graph_at(Millis(1000)).await;
     for event in events(&appended) {
         let mut tx = replica.backend.begin().await.unwrap();
-        apply_steps(&mut *tx, &steps_for(&event.payload))
-            .await
-            .unwrap();
+        let steps = steps_for(&event.payload);
+        let vector_delete = replica.backend.vector_delete_sql();
+        apply_steps(&mut *tx, &steps, vector_delete).await.unwrap();
         tx.commit().await.unwrap();
     }
 

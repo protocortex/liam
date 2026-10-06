@@ -7,6 +7,8 @@
 //! A plan only reads from the transaction. Every statement that changes the
 //! store runs after the append, so a failure while applying is always voided.
 
+use std::collections::BTreeSet;
+
 use liam_log::event::{
     EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTable, CURRENT_SCHEMA_VERSION,
 };
@@ -16,8 +18,8 @@ use uuid::Uuid;
 use super::logged_write::{ready, WriteOutcome};
 use super::projection::{edge_guards, steps_for, Step};
 use super::{
-    collision_producer, edge_refusal, open_by_subject_query, open_node_query, resolve_episode_ref,
-    resolve_node_row, Graph, EMPTY_ATTRIBUTES,
+    collision_producer, edge_exists_message, edge_refusal, open_by_subject_query, open_node_query,
+    resolve_episode_ref, resolve_node_row, Graph, EMPTY_ATTRIBUTES,
 };
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
@@ -54,6 +56,23 @@ impl Table {
             Table::Nodes => "SELECT 1 FROM nodes WHERE id = ?1",
             Table::Edges => "SELECT 1 FROM edges WHERE id = ?1",
             Table::NodeCommunity => "SELECT 1 FROM node_community WHERE node_id = ?1",
+        }
+    }
+
+    /// What removing a row deletes, dependents first so the foreign keys hold.
+    /// A node's vector is the backend's to delete, before these run.
+    pub(super) fn removal_sql(self) -> &'static [&'static str] {
+        match self {
+            // Cascades on a backend that enforces foreign keys; the explicit
+            // deletes guard one that does not. `gc` deletes a node's dependents
+            // in this same order, by subquery, so keep the two in step.
+            Table::Nodes => &[
+                "DELETE FROM edges WHERE src = ?1 OR dst = ?1",
+                "DELETE FROM node_community WHERE node_id = ?1",
+                "DELETE FROM nodes WHERE id = ?1",
+            ],
+            Table::Edges => &["DELETE FROM edges WHERE id = ?1"],
+            Table::NodeCommunity => &["DELETE FROM node_community WHERE node_id = ?1"],
         }
     }
 
@@ -289,24 +308,83 @@ async fn plan_supersede(
     Ok(Plan::supersede(row, &old, now))
 }
 
-/// A `relate`. A dead endpoint is refused before anything is logged. A live
-/// twin is refused too unless the log recorded it, since only an indexed twin
-/// can be answered as a duplicate.
-async fn plan_relate(tx: &mut dyn BackendTx, row: EdgeRow, now: Millis) -> Result<Plan> {
+/// A guarded edge write from `relate` or `link`. A dead endpoint is refused
+/// before anything is logged. So is a live twin that carries other attributes,
+/// since answering it as a duplicate would drop the caller's. Any other live
+/// twin is refused unless the log recorded it, since only an indexed twin can be
+/// answered as a duplicate.
+async fn plan_edge(tx: &mut dyn BackendTx, row: EdgeRow, now: Millis) -> Result<Plan> {
     let [source_live, target_live, twin_live] =
         edge_guards(tx, &row.src, &row.dst, &row.edge_type).await?;
+    let (src, dst) = (NodeId::from_raw(&row.src), NodeId::from_raw(&row.dst));
     let refusal = edge_refusal(
         source_live,
         target_live,
         twin_live,
-        &NodeId::from_raw(&row.src),
-        &NodeId::from_raw(&row.dst),
+        &src,
+        &dst,
         &row.edge_type,
     );
     if !source_live || !target_live {
         return Err(refusal);
     }
+    if twin_live {
+        let stored = twin_attributes(tx, &row).await?;
+        let differing = differing_attributes(&stored, &row.attributes);
+        if !differing.is_empty() {
+            let twin = edge_exists_message(&src, &dst, &row.edge_type);
+            let keys = differing.join(", ");
+            return Err(Error::RelateRefused(format!(
+                "{twin} with different attributes: {keys}"
+            )));
+        }
+    }
     Ok(Plan::edge_write(row, now, twin_live.then_some(refusal)))
+}
+
+/// The attributes of the live edge that already relates `row`'s endpoints.
+async fn twin_attributes(tx: &mut dyn BackendTx, row: &EdgeRow) -> Result<String> {
+    let params = [
+        row.src.as_str().into(),
+        row.dst.as_str().into(),
+        row.edge_type.as_str().into(),
+        FOREVER.into(),
+    ];
+    let twins = tx
+        .query(
+            "SELECT attributes FROM edges
+             WHERE src = ?1 AND dst = ?2 AND type = ?3 AND tx_to = ?4 ORDER BY id LIMIT 1",
+            &params,
+        )
+        .await?;
+    match twins.first() {
+        Some(twin) => twin.get_string(0),
+        None => Err(Error::ConcurrentWrite),
+    }
+}
+
+/// The keys whose values differ between two attribute documents, or a single
+/// placeholder when they are not both objects or cannot be read. Names keys
+/// only, so a refusal never carries a caller's values.
+fn differing_attributes(stored: &str, given: &str) -> Vec<String> {
+    use serde_json::Value::Object;
+
+    if stored == given {
+        return Vec::new();
+    }
+    let parse = |text: &str| serde_json::from_str::<serde_json::Value>(text).ok();
+    match (parse(stored), parse(given)) {
+        (Some(Object(old)), Some(Object(new))) => old
+            .keys()
+            .chain(new.keys())
+            .filter(|key| old.get(*key) != new.get(*key))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        (Some(old), Some(new)) if old == new => Vec::new(),
+        _ => vec!["(whole document)".to_string()],
+    }
 }
 
 /// A node of an episode and what it may replace.
@@ -440,7 +518,7 @@ impl<B: Backend> Graph<B> {
                     tx_from: now.0,
                     tx_to: FOREVER.0,
                 };
-                Box::pin(plan_relate(tx, row, now))
+                Box::pin(plan_edge(tx, row, now))
             })
             .await?;
         Ok((outcome.edge_id(&id), outcome))
@@ -468,19 +546,26 @@ impl<B: Backend> Graph<B> {
         Ok(edge_ids)
     }
 
-    /// A caller's `supersedes` edge would replay as closing its target, which
-    /// the live write does not do, so a logged store keeps the relation for its
-    /// own version history.
+    /// A logged store keeps the `supersedes` relation for its own version
+    /// history, see `refuse_supersedes`.
     fn refuse_reserved<'a>(&self, kinds: impl IntoIterator<Item = &'a str>) -> Result<()> {
-        let reserved = kinds.into_iter().any(|kind| kind == relation::SUPERSEDES);
-        if self.log.is_some() && reserved {
-            return Err(Error::RelateRefused(format!(
-                "'{}' is reserved for the store's version history",
-                relation::SUPERSEDES
-            )));
+        if self.log.is_some() {
+            refuse_supersedes(kinds)?;
         }
         Ok(())
     }
+}
+
+/// A caller's `supersedes` edge would replay as closing its target, which the
+/// live write does not do, so the relation stays the store's own.
+pub(super) fn refuse_supersedes<'a>(kinds: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    if kinds.into_iter().any(|kind| kind == relation::SUPERSEDES) {
+        return Err(Error::RelateRefused(format!(
+            "'{}' is reserved for the store's version history",
+            relation::SUPERSEDES
+        )));
+    }
+    Ok(())
 }
 
 fn episode_nodes(ids: &[NodeId], nodes: &[NewNode], now: Millis) -> Result<Vec<EpisodeNode>> {
@@ -516,4 +601,77 @@ fn episode_edge_rows(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn differing_attributes_names_the_keys_whose_values_changed_added_or_dropped() {
+        // Arrange
+        let stored = r#"{"kept": 1, "changed": 1, "dropped": 1}"#;
+        let given = r#"{"kept": 1, "changed": 2, "added": 1}"#;
+
+        // Act
+        let differing = differing_attributes(stored, given);
+
+        // Assert
+        assert_eq!(differing, ["added", "changed", "dropped"]);
+    }
+
+    #[test]
+    fn differing_attributes_ignores_key_order_and_spacing() {
+        // Arrange
+        let stored = r#"{"a": 1, "b": 2}"#;
+        let given = r#"{"b":2,"a":1}"#;
+
+        // Act
+        let differing = differing_attributes(stored, given);
+
+        // Assert
+        assert!(differing.is_empty(), "{differing:?}");
+    }
+
+    #[test]
+    fn differing_attributes_flags_documents_that_are_not_both_objects() {
+        // Arrange
+        let cases = [("{}", "[1]"), ("[1]", "[2]"), ("not json", "{}")];
+
+        // Act
+        let flagged: Vec<_> = cases
+            .iter()
+            .map(|(stored, given)| differing_attributes(stored, given))
+            .collect();
+
+        // Assert
+        assert!(
+            flagged.iter().all(|keys| keys == &["(whole document)"]),
+            "{flagged:?}"
+        );
+    }
+
+    #[test]
+    fn differing_attributes_accepts_equal_documents_that_are_not_objects() {
+        // Arrange
+        let (stored, given) = ("[1, 2]", "[1,2]");
+
+        // Act
+        let differing = differing_attributes(stored, given);
+
+        // Assert
+        assert!(differing.is_empty(), "{differing:?}");
+    }
+
+    #[test]
+    fn differing_attributes_accepts_identical_text_that_is_not_json() {
+        // Arrange
+        let text = "stored before attributes were json";
+
+        // Act
+        let differing = differing_attributes(text, text);
+
+        // Assert
+        assert!(differing.is_empty(), "{differing:?}");
+    }
 }

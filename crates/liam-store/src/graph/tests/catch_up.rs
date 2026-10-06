@@ -5,31 +5,23 @@
 //! projection leaves it.
 
 use std::io;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use liam_log::dedup::{BloomConfig, HashBloom};
 use liam_log::event::{
     EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTable, TombstoneTarget,
-    CURRENT_SCHEMA_VERSION,
 };
 use liam_log::hash::{edge_row_hash, node_row_hash};
-use liam_log::reader::{LogReader, LogRecord, SequentialScanReader};
+use liam_log::reader::{LogRecord, SequentialScanReader};
 use liam_log::wal::{WalConfig, WalError, WalWriter};
 use liam_log::{LogOffset, LogWriter};
 
-use futures_util::StreamExt;
-
 use super::support::{
-    count, cursor, fact, fact_at, offset_pair, shared, ReembedProbe, StubEmbedder,
+    count, cursor, event, fact, fact_at, has_node, offset_pair, record_counts, shared, Env,
+    ReembedProbe, StubEmbedder, ONE_SEGMENT,
 };
 use super::*;
 use crate::DefaultBackend;
-
-const ONE_SEGMENT: WalConfig = WalConfig {
-    segment_max_bytes: 1 << 20,
-    rotate_interval_secs: 3600,
-};
 
 /// Rotates after every append, so each event sits in a segment of its own.
 const SEGMENT_PER_EVENT: WalConfig = WalConfig {
@@ -52,80 +44,6 @@ impl LogWriter for FullDisk {
 
     fn head(&self) -> Option<LogOffset> {
         self.0.head()
-    }
-}
-
-/// A log directory and the databases that project it.
-struct Env {
-    dir: TempDir,
-}
-
-impl Env {
-    fn new() -> Self {
-        Self {
-            dir: TempDir::new().unwrap(),
-        }
-    }
-
-    fn wal_dir(&self) -> PathBuf {
-        self.dir.path().join("wal")
-    }
-
-    fn db(&self, name: &str) -> String {
-        self.dir.path().join(name).to_str().unwrap().to_owned()
-    }
-
-    /// Appends `events` with a writer of their own that is gone afterwards, so
-    /// no store has projected them.
-    fn append(&self, events: &[LogEvent]) -> Vec<LogOffset> {
-        self.append_with(ONE_SEGMENT, events)
-    }
-
-    fn append_with(&self, config: WalConfig, events: &[LogEvent]) -> Vec<LogOffset> {
-        let mut writer =
-            WalWriter::open_with_system_clock(&self.wal_dir(), config).expect("open wal");
-        events
-            .iter()
-            .map(|event| writer.append(event).expect("append event"))
-            .collect()
-    }
-
-    /// A log over the directory that can be replayed from.
-    fn log(&self, config: WalConfig) -> SharedLog {
-        let writer = WalWriter::open_with_system_clock(&self.wal_dir(), config).expect("open wal");
-        let reader = SequentialScanReader::local(&self.wal_dir()).expect("open reader");
-        let bloom = HashBloom::new(BloomConfig::default());
-        shared(EventLog::new(Box::new(writer), Arc::new(reader), bloom))
-    }
-
-    /// Every record in the log directory, as a rebuild would read it.
-    async fn records(&self) -> Vec<LogRecord> {
-        let reader = SequentialScanReader::local(&self.wal_dir()).expect("open reader");
-        let mut scan = reader.scan(None);
-        let mut records = Vec::new();
-        while let Some(record) = scan.next().await {
-            records.push(record.expect("read record"));
-        }
-        records
-    }
-
-    async fn open<B: Backend>(&self, db: &str, clock: Arc<FixedClock>) -> (Graph<B>, SharedLog) {
-        self.open_over(self.log(ONE_SEGMENT), db, clock).await
-    }
-
-    async fn open_over<B: Backend>(
-        &self,
-        log: SharedLog,
-        db: &str,
-        clock: Arc<FixedClock>,
-    ) -> (Graph<B>, SharedLog) {
-        let graph = Graph::<B>::open_with_clock(&self.db(db), GraphConfig::new(8), clock)
-            .await
-            .expect("open graph")
-            .with_log(Arc::clone(&log))
-            .await
-            .expect("attach log");
-        (graph, log)
     }
 }
 
@@ -163,20 +81,6 @@ fn edge(id: &str, src: &str, dst: &str) -> EdgeRow {
         attributes: "{}".into(),
         tx_from: 1000,
         tx_to: FOREVER.0,
-    }
-}
-
-fn event(event_id: &str, content_hash: [u8; 32], payload: LogPayload) -> LogEvent {
-    LogEvent {
-        event_id: event_id.into(),
-        content_hash,
-        source: "agent-a".into(),
-        trust_score: 0.75,
-        observed_at: 500,
-        ingested_at: 1000,
-        encryption_key_id: None,
-        schema_version: CURRENT_SCHEMA_VERSION,
-        payload,
     }
 }
 
@@ -229,6 +133,17 @@ fn follow_up(event_id: &str, like: &LogEvent, payload: LogPayload) -> LogEvent {
     event(event_id, like.content_hash, payload)
 }
 
+fn tombstone(event_id: &str, targets: &[(TombstoneTable, &str)]) -> LogEvent {
+    let targets = targets
+        .iter()
+        .map(|(table, id)| TombstoneTarget {
+            table: *table,
+            id: (*id).into(),
+        })
+        .collect();
+    event(event_id, [0; 32], LogPayload::Tombstone(targets))
+}
+
 // ---- reading the store back ----
 
 async fn dump<B: Backend>(g: &Graph<B>, table: &str) -> String {
@@ -247,15 +162,6 @@ async fn tx_to<B: Backend>(g: &Graph<B>, id: &str) -> i64 {
         .await
         .unwrap();
     rows.first().expect("node row").get_i64(0).unwrap()
-}
-
-async fn has_node<B: Backend>(g: &Graph<B>, id: &str) -> bool {
-    let rows = g
-        .backend
-        .query("SELECT 1 FROM nodes WHERE id = ?1", &[id.into()])
-        .await
-        .unwrap();
-    !rows.is_empty()
 }
 
 async fn cursor_offset<B: Backend>(g: &Graph<B>) -> Option<(i64, i64)> {
@@ -282,6 +188,69 @@ async fn quarantined<B: Backend>(g: &Graph<B>) -> Vec<(String, i64, i64, String)
         .collect()
 }
 
+async fn lose_cursor<B: Backend>(g: &Graph<B>) {
+    g.backend
+        .execute(
+            "UPDATE log_cursor SET last_segment = NULL, last_index = NULL",
+            &[],
+        )
+        .await
+        .unwrap();
+}
+
+async fn set_community<B: Backend>(g: &Graph<B>, node_id: &NodeId) {
+    g.backend
+        .execute(
+            "INSERT INTO node_community (node_id, community, computed_at) VALUES (?1, 1, 1)",
+            &[node_id.as_str().into()],
+        )
+        .await
+        .unwrap();
+}
+
+/// The tables a replay writes, as one comparable value.
+async fn snapshot<B: Backend>(g: &Graph<B>) -> [String; 3] {
+    [
+        dump(g, "nodes").await,
+        dump(g, "edges").await,
+        dump(g, "log_hash_index").await,
+    ]
+}
+
+/// Appends `tombstone` behind a store that has logged its writes, lets the store
+/// apply it, then puts the cursor back to the start, as a lost cursor write
+/// would. Returns the store, what it held before the replay, and the replay's
+/// report.
+async fn replay_over_an_applied_tombstone(
+    env: &Env,
+    tombstone: LogEvent,
+) -> (Graph<DefaultBackend>, [String; 3], CatchUpReport) {
+    env.append(&[tombstone]);
+    let (g, _log) = env.open::<DefaultBackend>("live.db", clock_at(9000)).await;
+    g.catch_up().await.unwrap();
+    let settled = snapshot(&g).await;
+    lose_cursor(&g).await;
+    let report = g.catch_up().await.unwrap();
+    (g, settled, report)
+}
+
+/// Asserts that a replay over an applied tombstone changed nothing and
+/// refused nothing.
+async fn assert_replayed_without_loss(
+    env: &Env,
+    g: &Graph<DefaultBackend>,
+    settled: &[String; 3],
+    report: CatchUpReport,
+    expected: CatchUpReport,
+) {
+    assert_eq!(record_counts(report), expected);
+    assert!(quarantined(g).await.is_empty(), "nothing is refused");
+    assert!(
+        voided_targets_of(&env.records().await).is_empty(),
+        "nothing is voided in the log"
+    );
+    assert_eq!(&snapshot(g).await, settled);
+}
 async fn set_cursor<B: Backend>(g: &Graph<B>, offset: LogOffset) {
     let (segment, index) = offset_pair(offset);
     g.backend
@@ -308,15 +277,6 @@ fn applied(applied: usize) -> CatchUpReport {
     CatchUpReport {
         applied,
         ..CatchUpReport::default()
-    }
-}
-
-/// The record counts alone: these tests attach no embedder, so every replayed
-/// node also shows up as pending, which they are not about.
-fn record_counts(report: CatchUpReport) -> CatchUpReport {
-    CatchUpReport {
-        reembedded: ReembedReport::default(),
-        ..report
     }
 }
 
@@ -1019,7 +979,7 @@ async fn catch_up_skips_an_event_whose_void_is_in_a_later_segment() {
 }
 
 #[tokio::test]
-async fn catch_up_replays_a_live_episode_and_relate_into_the_same_rows() {
+async fn catch_up_replays_a_live_episode_relate_and_link_into_the_same_rows() {
     // Arrange
     let env = Env::new();
     let (live, _live_log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
@@ -1036,6 +996,9 @@ async fn catch_up_replays_a_live_episode_and_relate_into_the_same_rows() {
     live.relate(&episode.node_ids[1], &episode.node_ids[0], "supports")
         .await
         .unwrap();
+    let cites = NewEdge::new(&episode.node_ids[0], &episode.node_ids[1], "cites")
+        .with_attributes(serde_json::json!({"page": 4, "quote": "same"}));
+    live.link(cites).await.unwrap();
     let (replayed, _log) = env
         .open::<DefaultBackend>("replayed.db", clock_at(9000))
         .await;
@@ -1044,9 +1007,9 @@ async fn catch_up_replays_a_live_episode_and_relate_into_the_same_rows() {
     let report = replayed.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(record_counts(report), applied(2));
+    assert_eq!(record_counts(report), applied(3));
     assert_eq!(count(&replayed, "nodes").await, 2);
-    assert_eq!(count(&replayed, "edges").await, 2);
+    assert_eq!(count(&replayed, "edges").await, 3);
     for table in ["nodes", "edges", "log_hash_index"] {
         assert_eq!(dump(&replayed, table).await, dump(&live, table).await);
     }
@@ -1271,4 +1234,282 @@ async fn catch_up_returns_the_replay_report_when_the_nodes_cannot_be_listed() {
     };
     assert_eq!(report, expected);
     assert_eq!(count(&g, "nodes").await, 1);
+}
+
+#[tokio::test]
+async fn catch_up_applies_a_repeated_node_tombstone_and_takes_its_edges_vector_and_community_row_with_it(
+) {
+    // Arrange: a store with a vector and a community row, then a log that
+    // tombstones the node twice behind its back
+    let env = Env::new();
+    let (a, b) = {
+        let (first, _log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
+        let first = first.with_embedder(StubEmbedder::new(8));
+        let a = first.insert(fact_at("a")).await.unwrap();
+        let b = first.insert(fact_at("b")).await.unwrap();
+        first.relate(&a, &b, "mentions").await.unwrap();
+        first.reembed_missing().await.unwrap();
+        set_community(&first, &a).await;
+        (a, b)
+    };
+    let gone = [(TombstoneTable::Nodes, a.as_str())];
+    env.append(&[
+        tombstone("event-tombstone", &gone),
+        tombstone("event-tombstone-again", &gone),
+    ]);
+    let (live, _log) = env.open::<DefaultBackend>("live.db", clock_at(9000)).await;
+    let live = live.with_embedder(StubEmbedder::new(8));
+
+    // Act
+    let report = live.catch_up().await.unwrap();
+
+    // Assert: the second tombstone finds nothing left and is not an error
+    assert_eq!(record_counts(report), applied(2));
+    assert!(!has_node(&live, a.as_str()).await);
+    assert!(has_node(&live, b.as_str()).await);
+    assert_eq!(count(&live, "edges").await, 0);
+    assert_eq!(count(&live, "node_community").await, 0);
+    assert_eq!(count(&live, "node_vectors").await, 1);
+}
+
+#[tokio::test]
+async fn catch_up_applies_an_edge_tombstone_and_a_community_tombstone_and_keeps_every_other_row() {
+    // Arrange: three nodes, two edges, two community rows, then a log that
+    // tombstones one edge and one community row behind the store's back
+    let env = Env::new();
+    let (a, b, first_edge) = {
+        let (first, _log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
+        let a = first.insert(fact_at("a")).await.unwrap();
+        let b = first.insert(fact_at("b")).await.unwrap();
+        let c = first.insert(fact_at("c")).await.unwrap();
+        let first_edge = first.relate(&a, &b, "mentions").await.unwrap();
+        first.relate(&b, &c, "mentions").await.unwrap();
+        set_community(&first, &a).await;
+        set_community(&first, &b).await;
+        (a, b, first_edge)
+    };
+    env.append(&[
+        tombstone(
+            "event-edge",
+            &[(TombstoneTable::Edges, first_edge.as_str())],
+        ),
+        tombstone(
+            "event-community",
+            &[(TombstoneTable::NodeCommunity, a.as_str())],
+        ),
+    ]);
+    let (g, _log) = env.open::<DefaultBackend>("live.db", clock_at(9000)).await;
+
+    // Act
+    let report = g.catch_up().await.unwrap();
+
+    // Assert
+    assert_eq!(record_counts(report), applied(2));
+    assert_eq!(count(&g, "nodes").await, 3);
+    let edges = g
+        .backend
+        .query("SELECT src, dst FROM edges", &[])
+        .await
+        .unwrap();
+    assert_eq!(edges.len(), 1, "only the tombstoned edge is gone");
+    assert_eq!(edges[0].get_string(0).unwrap(), b.as_str());
+    let communities = g
+        .backend
+        .query("SELECT node_id FROM node_community", &[])
+        .await
+        .unwrap();
+    assert_eq!(communities.len(), 1, "only the tombstoned row is gone");
+    assert_eq!(communities[0].get_string(0).unwrap(), b.as_str());
+}
+
+#[tokio::test]
+async fn catch_up_replays_an_insert_a_relate_and_a_node_tombstone_into_an_empty_store_as_the_live_store_holds_them(
+) {
+    // Arrange: the live store applies the tombstone it did not write itself
+    let env = Env::new();
+    let a = {
+        let (live, _log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
+        let a = live.insert(fact_at("a")).await.unwrap();
+        let b = live.insert(fact_at("b")).await.unwrap();
+        live.relate(&a, &b, "mentions").await.unwrap();
+        a
+    };
+    env.append(&[tombstone(
+        "event-tombstone",
+        &[(TombstoneTable::Nodes, a.as_str())],
+    )]);
+    let (live, _log) = env.open::<DefaultBackend>("live.db", clock_at(9000)).await;
+    live.catch_up().await.unwrap();
+    let (replayed, _log) = env
+        .open::<DefaultBackend>("replayed.db", clock_at(9000))
+        .await;
+
+    // Act
+    let report = replayed.catch_up().await.unwrap();
+
+    // Assert
+    assert_eq!(record_counts(report), applied(4));
+    assert!(quarantined(&replayed).await.is_empty());
+    assert_eq!(count(&replayed, "nodes").await, 1);
+    assert_eq!(count(&replayed, "edges").await, 0);
+    for table in ["nodes", "edges"] {
+        assert_eq!(dump(&replayed, table).await, dump(&live, table).await);
+    }
+}
+
+#[tokio::test]
+async fn catch_up_does_not_quarantine_an_event_whose_supersedes_edge_a_later_tombstone_took_when_the_cursor_lags(
+) {
+    // Arrange: an upsert pair, then a tombstone of the old version, which takes
+    // the `supersedes` edge with it
+    let env = Env::new();
+    let clock = clock_at(1000);
+    let old = {
+        let (live, _log) = env
+            .open::<DefaultBackend>("live.db", Arc::clone(&clock))
+            .await;
+        let old = live
+            .insert(fact_at("v1").with_subject("subject"))
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        live.upsert_by(fact_at("v2").with_subject("subject"))
+            .await
+            .unwrap();
+        old
+    };
+    let gone = tombstone("event-tombstone", &[(TombstoneTable::Nodes, old.as_str())]);
+
+    // Act
+    let (g, settled, report) = replay_over_an_applied_tombstone(&env, gone).await;
+
+    // Assert: the node write and the tombstone run again, the batch is found held
+    let expected = CatchUpReport {
+        applied: 2,
+        already_applied: 1,
+        ..CatchUpReport::default()
+    };
+    assert_replayed_without_loss(&env, &g, &settled, report, expected).await;
+    assert_eq!(count(&g, "nodes").await, 1);
+    assert_eq!(count(&g, "edges").await, 0);
+}
+
+#[tokio::test]
+async fn catch_up_does_not_quarantine_an_episode_whose_edge_a_later_tombstone_took_by_id() {
+    // Arrange
+    let env = Env::new();
+    let edge = {
+        let (live, _log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
+        let mentions = EpisodeEdge {
+            from: EpisodeRef::New(0),
+            to: EpisodeRef::New(1),
+            kind: "mentions".to_string(),
+            attributes: serde_json::json!({}),
+        };
+        let episode = live
+            .ingest_episode(vec![fact_at("x"), fact_at("y")], vec![mentions])
+            .await
+            .unwrap();
+        episode.edge_ids[0].clone()
+    };
+    let gone = tombstone("event-tombstone", &[(TombstoneTable::Edges, edge.as_str())]);
+
+    // Act
+    let (g, settled, report) = replay_over_an_applied_tombstone(&env, gone).await;
+
+    // Assert
+    let expected = CatchUpReport {
+        applied: 1,
+        already_applied: 1,
+        ..CatchUpReport::default()
+    };
+    assert_replayed_without_loss(&env, &g, &settled, report, expected).await;
+    assert_eq!(count(&g, "nodes").await, 2);
+    assert_eq!(count(&g, "edges").await, 0);
+}
+
+#[tokio::test]
+async fn catch_up_does_not_quarantine_an_episode_whose_edge_starts_at_a_node_a_later_tombstone_took(
+) {
+    // Arrange: the edge runs from a node the log wrote earlier to a node of the
+    // episode, and that earlier node is then tombstoned
+    let env = Env::new();
+    let tail = {
+        let (live, _log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
+        let tail = live.insert(fact_at("tail")).await.unwrap();
+        let from_tail = EpisodeEdge {
+            from: EpisodeRef::Existing(tail.clone()),
+            to: EpisodeRef::New(0),
+            kind: "mentions".to_string(),
+            attributes: serde_json::json!({}),
+        };
+        live.ingest_episode(vec![fact_at("head")], vec![from_tail])
+            .await
+            .unwrap();
+        tail
+    };
+    let gone = tombstone("event-tombstone", &[(TombstoneTable::Nodes, tail.as_str())]);
+
+    // Act
+    let (g, settled, report) = replay_over_an_applied_tombstone(&env, gone).await;
+
+    // Assert
+    let expected = CatchUpReport {
+        applied: 2,
+        already_applied: 1,
+        ..CatchUpReport::default()
+    };
+    assert_replayed_without_loss(&env, &g, &settled, report, expected).await;
+    assert_eq!(count(&g, "nodes").await, 1);
+    assert_eq!(count(&g, "edges").await, 0);
+}
+
+#[tokio::test]
+async fn catch_up_still_quarantines_a_half_written_event_when_the_tombstone_that_could_explain_it_was_voided(
+) {
+    // Arrange: a batch that supersedes node-a, replayed once and then left
+    // without its edge, with a tombstone of node-a in the log that never ran
+    let env = Env::new();
+    let mut supersedes = edge("edge-s", "node-b", "node-a");
+    supersedes.edge_type = relation::SUPERSEDES.into();
+    let doomed = tombstone("event-tombstone", &[(TombstoneTable::Nodes, "node-a")]);
+    let void = follow_up(
+        "event-void",
+        &doomed,
+        LogPayload::Voided {
+            target_event_id: doomed.event_id.clone(),
+        },
+    );
+    env.append(&[
+        node_write("node-a", "alpha"),
+        episode("batch", &[node("node-b", "beta")], &[supersedes]),
+        doomed,
+        void,
+    ]);
+    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    g.catch_up().await.unwrap();
+    g.backend
+        .execute("DELETE FROM edges WHERE id = 'edge-s'", &[])
+        .await
+        .unwrap();
+    lose_cursor(&g).await;
+
+    // Act
+    let report = g.catch_up().await.unwrap();
+
+    // Assert
+    let expected = CatchUpReport {
+        already_applied: 1,
+        skipped_voided: 1,
+        quarantined: 1,
+        ..CatchUpReport::default()
+    };
+    assert_eq!(record_counts(report), expected);
+    let held = quarantined(&g).await;
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].0, "event-batch");
+    assert!(
+        has_node(&g, "node-a").await,
+        "the voided tombstone never ran"
+    );
 }

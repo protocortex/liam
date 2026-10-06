@@ -3,8 +3,9 @@
 //! its log record build them from the same payload through `steps_for`, so the
 //! two cannot drift apart.
 
-use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTable, TombstoneTarget};
+use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTarget};
 
+use super::logged_plan::Table;
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
 };
@@ -62,7 +63,13 @@ fn edge_steps(row: &EdgeRow) -> Vec<Step> {
 /// Applies a projection's statements in order. A guarded edge that is refused
 /// fails the whole projection with the reason, and so does a close that finds
 /// no open node, so the write is voided as a unit rather than half applied.
-pub(super) async fn apply_steps(tx: &mut dyn BackendTx, steps: &[Step]) -> Result<()> {
+/// `vector_delete` is the backend's statement for removing a node's vector, as
+/// `Backend::vector_delete_sql` returns it.
+pub(super) async fn apply_steps(
+    tx: &mut dyn BackendTx,
+    steps: &[Step],
+    vector_delete: Option<&str>,
+) -> Result<()> {
     for step in steps {
         match step {
             Step::Close { id, tx_to } => {
@@ -85,30 +92,28 @@ pub(super) async fn apply_steps(tx: &mut dyn BackendTx, steps: &[Step]) -> Resul
                     .await?;
             }
             Step::GuardedEdge(row) => insert_guarded_edge(tx, row).await?,
-            Step::Remove(target) => remove_row(tx, target).await?,
+            Step::Remove(target) => remove_row(tx, target, vector_delete).await?,
         }
     }
     Ok(())
 }
 
-/// What a removal deletes, in the order that satisfies the foreign keys. The
-/// vector table has no cascade, so a node's vector goes before the node.
-fn removal_sql(table: TombstoneTable) -> &'static [&'static str] {
-    match table {
-        TombstoneTable::Nodes => &[
-            "DELETE FROM edges WHERE src = ?1 OR dst = ?1",
-            "DELETE FROM node_community WHERE node_id = ?1",
-            "DELETE FROM node_vectors WHERE node_id = ?1",
-            "DELETE FROM nodes WHERE id = ?1",
-        ],
-        TombstoneTable::Edges => &["DELETE FROM edges WHERE id = ?1"],
-        TombstoneTable::NodeCommunity => &["DELETE FROM node_community WHERE node_id = ?1"],
+/// Deletes a row and what depends on it. The vector table has no cascade, so a
+/// node's vector is deleted before the node. Its edges and community rows
+/// cascade where foreign keys are enforced; `Table::removal_sql` deletes them
+/// explicitly for a backend that does not enforce them, as `gc` does.
+async fn remove_row(
+    tx: &mut dyn BackendTx,
+    target: &TombstoneTarget,
+    vector_delete: Option<&str>,
+) -> Result<()> {
+    let table = Table::from(target.table);
+    let id = [target.id.as_str().into()];
+    if let (Table::Nodes, Some(sql)) = (table, vector_delete) {
+        tx.execute(sql, &id).await?;
     }
-}
-
-async fn remove_row(tx: &mut dyn BackendTx, target: &TombstoneTarget) -> Result<()> {
-    for sql in removal_sql(target.table) {
-        tx.execute(sql, &[target.id.as_str().into()]).await?;
+    for sql in table.removal_sql() {
+        tx.execute(sql, &id).await?;
     }
     Ok(())
 }

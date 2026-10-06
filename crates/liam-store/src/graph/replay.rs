@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use futures_util::StreamExt;
-use liam_log::event::{LogEvent, LogPayload};
+use liam_log::event::{EdgeRow, LogPayload, TombstoneTable, TombstoneTarget};
 use liam_log::hash::content_hashes;
 use liam_log::reader::{LogRecord, LogStream};
 use liam_log::LogOffset;
@@ -107,8 +107,11 @@ impl<B: Backend> Graph<B> {
         let reader = held.reader()?;
         // A `Voided` record follows its target, so the targets are all known
         // before the first record is applied.
-        let voided = voided_targets(reader.scan_through(cursor, head)).await?;
-        tracing::debug!(voided = voided.len(), "replay: void records collected");
+        let ahead = scan_ahead(reader.scan_through(cursor, head)).await?;
+        tracing::debug!(
+            voided = ahead.voided.len(),
+            "replay: void and tombstone records collected"
+        );
 
         let mut report = CatchUpReport::default();
         // Both scans stop at `head`, so the voids a quarantine appends below it
@@ -118,11 +121,12 @@ impl<B: Backend> Graph<B> {
         while let Some(record) = records.next().await {
             let record = record?;
             let event_id = &record.event.event_id;
-            let outcome = if voided.contains(event_id) {
+            let outcome = if ahead.voided.contains(event_id) {
                 log_cursor::advance(&self.backend, held.log_id, record.offset).await?;
                 Outcome::Voided
             } else {
-                self.replay_event(held, &record, &mut last_void).await?
+                self.replay_event(held, &record, &ahead.removed, &mut last_void)
+                    .await?
             };
             tracing::debug!(event = %event_id, offset = %record.offset, "replay: record accounted for");
             report.count(outcome);
@@ -139,6 +143,7 @@ impl<B: Backend> Graph<B> {
         &self,
         held: &mut HeldLog,
         record: &LogRecord,
+        removed: &Removed,
         last_void: &mut Option<LogOffset>,
     ) -> Result<Outcome> {
         let LogRecord { offset, event, .. } = record;
@@ -149,8 +154,17 @@ impl<B: Backend> Graph<B> {
         }
         let carried = content_hashes(event);
         let mut tx = self.backend.begin().await?;
-        let projected =
-            replay_projection(&mut *tx, &steps, &carried, event, held.log_id, *offset).await;
+        let vector_delete = self.backend.vector_delete_sql();
+        let projected = replay_projection(
+            &mut *tx,
+            &steps,
+            &carried,
+            record,
+            held.log_id,
+            removed,
+            vector_delete,
+        )
+        .await;
         match commit_or_abandon(tx, projected).await {
             Ok(outcome) => {
                 held.remember(&carried);
@@ -213,60 +227,135 @@ async fn replay_projection(
     tx: &mut dyn BackendTx,
     steps: &[Step],
     carried: &[([u8; 32], String)],
-    event: &LogEvent,
+    record: &LogRecord,
     log_id: Uuid,
-    offset: LogOffset,
+    removed: &Removed,
+    vector_delete: Option<&str>,
 ) -> Result<Outcome> {
+    let LogRecord { offset, event, .. } = record;
     let rows = written_rows(steps);
     if rows.is_empty() {
         // Only removals: there is no row to look for, and running them again
         // is harmless.
-        project_logged(tx, steps, carried, &event.event_id, log_id, offset).await?;
+        let event_id = &event.event_id;
+        project_logged(tx, steps, carried, event_id, log_id, *offset, vector_delete).await?;
         return Ok(Outcome::Applied);
     }
-    match rows_held(tx, &rows).await? {
-        held if held == rows.len() => {
-            log_cursor::advance_in_tx(tx, log_id, offset).await?;
-            Ok(Outcome::AlreadyApplied)
+    // A row a later tombstone removes may be gone from a store that is ahead of
+    // its cursor, so it says nothing about whether the rest of the event
+    // landed. Only when every row is removed later do they decide.
+    let (kept, doomed): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| !removed.takes(row));
+    let deciding = if kept.is_empty() { doomed } else { kept };
+    let held = rows_held(tx, &deciding).await?;
+    if held == deciding.len() {
+        log_cursor::advance_in_tx(tx, log_id, *offset).await?;
+        return Ok(Outcome::AlreadyApplied);
+    }
+    if held > 0 {
+        return Err(Error::PartlyApplied(event.event_id.clone()));
+    }
+    let event_id = &event.event_id;
+    project_logged(tx, steps, carried, event_id, log_id, *offset, vector_delete).await?;
+    Ok(Outcome::Applied)
+}
+
+/// What a replay range holds besides the events to apply.
+struct Ahead {
+    /// The ids of the events a `Voided` record cancels.
+    voided: HashSet<String>,
+    /// The rows named by the tombstones that ran, so a voided one is left out.
+    removed: Removed,
+}
+
+/// Rows named by a tombstone. Ids are never reused, so once the tombstone has
+/// run a row it names is gone for good.
+#[derive(Default)]
+struct Removed {
+    nodes: HashSet<String>,
+    edges: HashSet<String>,
+}
+
+impl Removed {
+    fn add(&mut self, target: &TombstoneTarget) {
+        match target.table {
+            TombstoneTable::Nodes => self.nodes.insert(target.id.clone()),
+            TombstoneTable::Edges => self.edges.insert(target.id.clone()),
+            // No event writes a community row, so none is looked for.
+            TombstoneTable::NodeCommunity => false,
+        };
+    }
+
+    /// Whether the tombstones remove the row: a node it names, an edge it
+    /// names, or an edge that ends at a node it names.
+    fn takes(&self, row: &WrittenRow<'_>) -> bool {
+        match row {
+            WrittenRow::Node(id) => self.nodes.contains(*id),
+            WrittenRow::Edge(edge) => {
+                self.edges.contains(&edge.id)
+                    || self.nodes.contains(&edge.src)
+                    || self.nodes.contains(&edge.dst)
+            }
         }
-        0 => {
-            project_logged(tx, steps, carried, &event.event_id, log_id, offset).await?;
-            Ok(Outcome::Applied)
-        }
-        _ => Err(Error::PartlyApplied(event.event_id.clone())),
     }
 }
 
-/// The ids a `Voided` record in `records` cancels.
-pub(super) async fn voided_targets(mut records: LogStream) -> Result<HashSet<String>> {
-    let mut targets = HashSet::new();
+async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
+    let mut voided = HashSet::new();
+    let mut tombstones = Vec::new();
     while let Some(record) = records.next().await {
-        if let LogPayload::Voided { target_event_id } = record?.event.payload {
-            targets.insert(target_event_id);
+        let event = record?.event;
+        match event.payload {
+            LogPayload::Voided { target_event_id } => {
+                voided.insert(target_event_id);
+            }
+            LogPayload::Tombstone(targets) => tombstones.push((event.event_id, targets)),
+            _ => {}
         }
     }
-    Ok(targets)
+    let mut removed = Removed::default();
+    tombstones
+        .iter()
+        .filter(|(event_id, _)| !voided.contains(event_id))
+        .flat_map(|(_, targets)| targets)
+        .for_each(|target| removed.add(target));
+    Ok(Ahead { voided, removed })
 }
 
-/// The table and id of every row the steps insert, read from the same steps the
-/// projection runs so the rows checked are the rows written.
-fn written_rows(steps: &[Step]) -> Vec<(Table, &str)> {
+/// A row the steps insert.
+enum WrittenRow<'a> {
+    Node(&'a str),
+    Edge(&'a EdgeRow),
+}
+
+impl WrittenRow<'_> {
+    fn table_and_id(&self) -> (Table, &str) {
+        match self {
+            WrittenRow::Node(id) => (Table::Nodes, id),
+            WrittenRow::Edge(edge) => (Table::Edges, &edge.id),
+        }
+    }
+}
+
+/// Every row the steps insert, read from the same steps the projection runs so
+/// the rows checked are the rows written.
+fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
     steps
         .iter()
         .filter_map(|step| match step {
-            Step::Node(row) => Some((Table::Nodes, row.id.as_str())),
-            Step::Edge(row) | Step::GuardedEdge(row) => Some((Table::Edges, row.id.as_str())),
+            Step::Node(row) => Some(WrittenRow::Node(&row.id)),
+            Step::Edge(row) | Step::GuardedEdge(row) => Some(WrittenRow::Edge(row)),
             Step::Close { .. } | Step::Remove(_) => None,
         })
         .collect()
 }
 
 /// How many of `rows` the store holds, live or superseded.
-async fn rows_held(tx: &mut dyn BackendTx, rows: &[(Table, &str)]) -> Result<usize> {
+async fn rows_held(tx: &mut dyn BackendTx, rows: &[WrittenRow<'_>]) -> Result<usize> {
     let mut held = 0;
-    for (table, id) in rows {
+    for row in rows {
+        let (table, id) = row.table_and_id();
         if !tx
-            .query(table.exists_query(), &[Value::from(*id)])
+            .query(table.exists_query(), &[Value::from(id)])
             .await?
             .is_empty()
         {

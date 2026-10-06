@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use liam_log::event::NodeRow;
 
-use self::logged_plan::Collision;
+use self::logged_plan::{refuse_supersedes, Collision};
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
 pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
@@ -83,15 +83,21 @@ fn edge_refusal(
         return Error::RelateRefused(format!("target node {} is not live", dst.as_str()));
     }
     if edge_exists {
-        return Error::RelateRefused(format!(
-            "{} already relates to {} as '{kind}'",
-            src.as_str(),
-            dst.as_str()
-        ));
+        return Error::RelateRefused(edge_exists_message(src, dst, kind));
     }
     // Every guard passes now, so one of them flipped between the insert and
     // this read. A retry would land.
     Error::ConcurrentWrite
+}
+
+/// The refusal text for a triple that already has a live edge. Retry classifiers
+/// match on its wording, so every refusal over a twin starts with it.
+fn edge_exists_message(src: &NodeId, dst: &NodeId, kind: &str) -> String {
+    format!(
+        "{} already relates to {} as '{kind}'",
+        src.as_str(),
+        dst.as_str()
+    )
 }
 
 /// The three flags of `EDGE_REFUSAL_DIAGNOSTIC_SQL`'s row: source live, target
@@ -624,8 +630,11 @@ impl<B: Backend> Graph<B> {
     }
 
     /// Writes an edge with attributes through the same guarded, logged path as
-    /// `relate`, so it is refused, deduplicated and replayed the same way.
+    /// `relate`, so it is refused, deduplicated and replayed the same way. The
+    /// reserved `supersedes` relation is always refused, and so is a live twin
+    /// that carries other attributes, which a duplicate answer would drop.
     pub async fn link(&self, edge: NewEdge) -> Result<EdgeId> {
+        refuse_supersedes([edge.kind.as_str()])?;
         let attributes = serde_json::to_string(&edge.attributes)?;
         let written = self
             .project_edge(&edge.src, &edge.dst, &edge.kind, &attributes)
@@ -1175,7 +1184,8 @@ impl<B: Backend> Graph<B> {
         for rule in &policy.rules {
             let cutoff = now.0 - rule.max_age.0;
             let params: Vec<Value> = vec![rule.kind.as_str().into(), cutoff.into()];
-            // Rows that REFERENCE the doomed nodes have to go first.
+            // Rows that REFERENCE the doomed nodes have to go first, in the
+            // order `Table::removal_sql` uses for one tombstoned node.
             //
             // libSQL enforces foreign keys by default, which stock SQLite does
             // not, and `edges.src`, `edges.dst` and `node_community.node_id`
@@ -1455,11 +1465,10 @@ impl<B: Backend> Graph<B> {
     /// pass has not already seen. Returns the count of `mentions` edges
     /// actually inserted.
     ///
-    /// The repair insert goes through `relate`, never `link`: both the
-    /// liveness guard and the duplicate-triple guard on `(src, dst, type)`
-    /// have to hold, since two `mentions` edges seeded outside `relate` can
-    /// otherwise race each other onto the same repaired triple within one
-    /// pass. Each `relate` result is classified via `classify_relate_outcome`
+    /// The repair insert goes through `relate`: both the liveness guard and
+    /// the duplicate-triple guard on `(src, dst, type)` have to hold, since
+    /// two `mentions` edges seeded outside `relate` can otherwise race each
+    /// other onto the same repaired triple within one pass. Each `relate` result is classified via `classify_relate_outcome`
     /// and folded per `SUPERSEDES` edge: a real failure on any one repair
     /// keeps that edge's `tx_from` from advancing the watermark, even when a
     /// sibling repair on the same edge succeeded, so a later run revisits
@@ -2159,7 +2168,6 @@ mod tests {
     mod log_open;
     mod log_write;
     mod log_write_faults;
-    mod rebuild;
     mod reembed;
     mod support;
 
@@ -3074,7 +3082,7 @@ mod tests {
         g.link(NewEdge::new(&entity, &mentioned, relation::MENTIONS))
             .await
             .unwrap();
-        g.link(NewEdge::new(&entity, &other, "supersedes"))
+        g.link(NewEdge::new(&entity, &other, "references"))
             .await
             .unwrap();
 
@@ -5019,9 +5027,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_repeated_triple_and_a_self_loop_each_collapse_to_one_edge() {
-        // The exact-duplicate case cannot come from `relate`, whose NOT EXISTS
-        // refuses it, but `link` writes rows without that guard and a `gc` can
-        // leave the table in shapes nothing else produces.
+        // `relate` and `link` refuse an exact duplicate through their NOT EXISTS
+        // guard, so only a row written outside both, an older store's or a raw
+        // insert, can repeat a triple, and a `gc` can leave the table in shapes
+        // nothing else produces.
         let repeated = edge_rows(&[("a", "b", "mentions"), ("a", "b", "mentions")]);
         assert_eq!(build_cluster_input(&repeated).unwrap().1.len(), 1);
 
@@ -5165,6 +5174,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows[0].get_i64(0).unwrap(), 0, "no edge may have landed");
+    }
+
+    #[tokio::test]
+    async fn link_without_a_log_refuses_a_superseded_endpoint_and_a_repeated_triple() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let src = g.insert(NewNode::now("fact", "src", "x")).await.unwrap();
+        let live = g.insert(NewNode::now("fact", "live", "x")).await.unwrap();
+        let old = g
+            .upsert_by(NewNode::now("fact", "Rollout", "first").with_subject("rollout"))
+            .await
+            .unwrap();
+        g.upsert_by(NewNode::now("fact", "Rollout", "second").with_subject("rollout"))
+            .await
+            .unwrap();
+        let version_edges = support::count(&g, "edges").await;
+
+        // Act
+        let dead = g.link(NewEdge::new(&src, &old, "mentions")).await;
+        let first = g.link(NewEdge::new(&src, &live, "mentions")).await;
+        let repeated = g.link(NewEdge::new(&src, &live, "mentions")).await;
+
+        // Assert
+        assert!(
+            matches!(&dead, Err(Error::RelateRefused(m)) if m.contains("not live")),
+            "{dead:?}"
+        );
+        assert!(first.is_ok(), "{first:?}");
+        assert!(
+            matches!(&repeated, Err(Error::RelateRefused(m)) if m.contains("already relates")),
+            "{repeated:?}"
+        );
+        assert_eq!(support::count(&g, "edges").await, version_edges + 1);
+    }
+
+    #[tokio::test]
+    async fn link_without_a_log_refuses_a_twin_with_other_attributes_and_names_only_the_keys() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let src = g.insert(NewNode::now("fact", "src", "x")).await.unwrap();
+        let dst = g.insert(NewNode::now("fact", "dst", "x")).await.unwrap();
+        let weighted = |weight| {
+            NewEdge::new(&src, &dst, "mentions").with_attributes(serde_json::json!({
+                "weight": weight,
+                "note": "same",
+            }))
+        };
+        g.link(weighted(2)).await.unwrap();
+
+        // Act
+        let changed = g.link(weighted(731)).await;
+
+        // Assert
+        let Err(Error::RelateRefused(message)) = &changed else {
+            panic!("expected a refusal: {changed:?}");
+        };
+        assert!(message.contains("already relates to"), "{message}");
+        assert!(message.contains("weight"), "{message}");
+        assert!(
+            !message.contains("note"),
+            "an unchanged key is not named: {message}"
+        );
+        assert!(
+            !message.contains("731"),
+            "a value is never named: {message}"
+        );
+        assert_eq!(support::count(&g, "edges").await, 1);
     }
 
     #[tokio::test]
@@ -6265,6 +6341,9 @@ mod tests {
         }
         async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
             self.0.vector_insert_if_absent(node_id, embedding).await
+        }
+        fn vector_delete_sql(&self) -> Option<&'static str> {
+            self.0.vector_delete_sql()
         }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.0.vector_delete(node_id).await
@@ -7816,6 +7895,9 @@ mod tests {
         async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
             self.inner.vector_insert_if_absent(node_id, embedding).await
         }
+        fn vector_delete_sql(&self) -> Option<&'static str> {
+            self.inner.vector_delete_sql()
+        }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
         }
@@ -7914,6 +7996,9 @@ mod tests {
         }
         async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
             self.inner.vector_insert_if_absent(node_id, embedding).await
+        }
+        fn vector_delete_sql(&self) -> Option<&'static str> {
+            self.inner.vector_delete_sql()
         }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
