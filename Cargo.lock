@@ -2458,6 +2458,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "liam-log",
  "liam-model",
  "liam-store",
  "raunch",

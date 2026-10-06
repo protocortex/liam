@@ -22,6 +22,7 @@ path = "src/bin/liam.rs"
 [dependencies]
 liam-store = { path = "../liam-store" }
 liam-model = { path = "../liam-model" }
+liam-log = { path = "../liam-log" }
 
 async-trait = "0.1"
 anyhow = "1"

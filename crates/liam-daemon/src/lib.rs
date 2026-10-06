@@ -14,9 +14,16 @@
 //! process able to notice. The unexpanded-tilde bug did exactly that once
 //! already, from a single missed call site.
 //!
-//! Everything else the daemon owns (the MCP surface, the socket transport,
-//! the store lock) stays private to the `liamd` binary, because the CLI has
-//! no business reaching into it.
+//! The store lock is shared for a third reason: `liam rebuild` rewrites the
+//! projection, so it must take the same lock the daemon holds for as long as
+//! it runs. The stderr logging setup is shared so `liam` reports failures the
+//! way the daemon does.
+//!
+//! Everything else the daemon owns (the MCP surface, the socket transport)
+//! stays private to the `liamd` binary, because the CLI has no business
+//! reaching into it.
 
 pub mod config;
 pub mod models;
+pub mod storelock;
+pub mod telemetry;

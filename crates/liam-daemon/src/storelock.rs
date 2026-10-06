@@ -1,38 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Exclusive advisory lock so only one process opens the store at a time.
 //!
-//! The plan deliberately keeps plain `liamd` a store-opening stdio server so
-//! existing MCP configs keep working, which means a user who also runs
-//! `liamd serve` ends up with two processes writing the same libSQL file.
-//! `liam-store`'s write mutex only serializes writers WITHIN one process, so
-//! without this lock a second store-opening process would still write
-//! concurrently at the OS level. This lock makes that impossible instead of
-//! merely unlikely.
+//! `liam-store`'s write mutex only serializes writers within one process, so
+//! without this lock a second process opening the same libSQL file would still
+//! write concurrently at the OS level.
 //!
-//! # Why an advisory `flock`, not a PID file
+//! It is an advisory `flock`, not a PID file: the OS releases it when the
+//! holder exits for any reason, so a crash leaves no stale lock to clean up.
 //!
-//! A PID file records who holds a lock but not whether they are still
-//! alive, so a crash leaves a stale file that a fresh process has to detect
-//! and clean up by hand. [`std::fs::File::try_lock`] is `flock`-based on
-//! Unix: the OS releases it the moment the holding process exits, for any
-//! reason including a crash, so there is never a stale lock left to clean
-//! up.
-//!
-//! # Why per process, not per store open
-//!
-//! `spawn_gc` in `main.rs` runs GC and the cluster refresh on the SAME
-//! `Graph` every request handler shares, not a second connection (ADR-0002
-//! Amendment 4). This lock guards against a second PROCESS, so it is
-//! acquired exactly once, in `run`, before the first `DefaultGraph::open`,
-//! and must never be retaken anywhere else in this process: doing so would
-//! have the process deadlock against itself.
-//!
-//! # Contract for the stdio proxy (WU-9)
-//!
-//! The proxy mode opens no store: it only shuttles bytes to the socket a
-//! `serve` process already owns, so it must acquire no lock here. A proxy
-//! that took this lock would fail to start whenever a `serve` process is
-//! already running, which is the one case it exists to support.
+//! A process takes it once, before its first store open. Taking it again in the
+//! same process fails against itself.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -51,9 +28,23 @@ pub struct StoreLock(
 );
 
 impl StoreLock {
-    /// Try to acquire the lock, failing immediately, never blocking, if
-    /// another process already holds it.
+    /// Creates the database's directory, then tries to acquire the lock,
+    /// failing immediately, never blocking, if another process already holds
+    /// it.
     pub fn acquire(database_path: &Path) -> anyhow::Result<Self> {
+        // The lock file lives beside the database, and libSQL will not create
+        // the directory for either.
+        if let Some(parent) = database_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|source| {
+                anyhow::anyhow!(
+                    "failed to create the database directory {}: {source}",
+                    parent.display()
+                )
+            })?;
+        }
         let lock_path = lock_path_for(database_path);
         let file = OpenOptions::new()
             .create(true)
@@ -101,11 +92,8 @@ fn lock_failure_message(lock_path: &Path, error: &std::fs::TryLockError) -> Stri
 
     match error {
         TryLockError::WouldBlock => format!(
-            "could not acquire the store lock at {} ({error}): another \
-             liamd process already holds this lock file. Stop that process, \
-             or if it is the socket daemon, run `liamd proxy` instead: the \
-             proxy shuttles to the running daemon and opens no store of its \
-             own",
+            "could not acquire the store lock at {} ({error}): another liam \
+             process, the daemon or `liam rebuild`, already holds it",
             lock_path.display()
         ),
         TryLockError::Error(source) => format!(
@@ -137,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn a_held_lock_fails_fast_and_names_the_file_and_the_fix() {
+    fn a_held_lock_fails_fast_and_names_the_file_and_any_holder() {
         // Arrange: one process (this test) already holds the lock.
         let dir = tempfile::tempdir().expect("temp dir");
         let database_path = dir.path().join("liam.db");
@@ -149,9 +137,8 @@ mod tests {
         // is needed to pin this behaviour.
         let result = StoreLock::acquire(&database_path);
 
-        // Assert: it fails immediately, names the lock file, and gives both
-        // actionable fixes: stop the other process, or use the proxy, which
-        // is the right answer when the holder is the socket daemon.
+        // Assert: it fails immediately, names the lock file, and does not
+        // assume which kind of process holds it.
         let message = result
             .expect_err("a second acquisition must fail")
             .to_string();
@@ -161,13 +148,27 @@ mod tests {
             "message should name the lock file: {message}"
         );
         assert!(
-            message.contains("Stop that process"),
-            "message should tell the user to stop the other process: {message}"
+            message.contains("another liam process"),
+            "message should say another process holds the lock: {message}"
         );
         assert!(
-            message.contains("liamd proxy"),
-            "message should offer the proxy, the fix when the holder is the daemon: {message}"
+            !message.contains("liamd proxy"),
+            "the holder may be `liam rebuild`, so the proxy is not the library's advice: {message}"
         );
+    }
+
+    #[test]
+    fn acquiring_creates_the_missing_database_directory() {
+        // Arrange: a database path whose directory does not exist yet.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database_path = dir.path().join("fresh").join("liam.db");
+
+        // Act
+        let result = StoreLock::acquire(&database_path);
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert!(database_path.parent().unwrap().is_dir());
     }
 
     #[test]
@@ -201,20 +202,14 @@ mod tests {
         // Act
         let message = lock_failure_message(&lock_path, &std::fs::TryLockError::WouldBlock);
 
-        // Assert: names the lock file, points at the other process, and
-        // offers the proxy for the common case where that process is the
-        // socket daemon rather than a stray duplicate.
+        // Assert: names the lock file and points at the other process.
         assert!(
             message.contains(&lock_path.display().to_string()),
             "message should name the lock file: {message}"
         );
         assert!(
-            message.contains("Stop that process"),
-            "message should tell the user to stop the other process: {message}"
-        );
-        assert!(
-            message.contains("liamd proxy"),
-            "message should offer the proxy as the fix when the daemon holds the lock: {message}"
+            message.contains("another liam process"),
+            "message should say another process holds the lock: {message}"
         );
     }
 
