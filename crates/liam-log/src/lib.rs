@@ -7,6 +7,7 @@
 //! compacted Parquet segments outlive any change to the derived schema.
 
 pub mod event;
+pub mod hash;
 pub mod wal;
 
 use uuid::Uuid;
