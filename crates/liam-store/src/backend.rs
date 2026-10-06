@@ -71,6 +71,11 @@ pub trait Backend: Send + Sync + Sized {
     /// Write. Serializes with every other write; see the trait's
     /// concurrency contract above.
     async fn vector_upsert(&self, node_id: &str, embedding: &[f32]) -> Result<()>;
+    /// Write. Store the vector only when the node has none, and say whether it
+    /// did, so a repair never overwrites one a concurrent write just stored.
+    /// Serializes with every other write; see the trait's concurrency
+    /// contract above.
+    async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool>;
     /// Write. Serializes with every other write; see the trait's
     /// concurrency contract above.
     async fn vector_delete(&self, node_id: &str) -> Result<()>;
@@ -87,6 +92,13 @@ pub trait Backend: Send + Sync + Sized {
         scope: Option<&str>,
         as_of: Millis,
     ) -> Result<Vec<NodeId>>;
+
+    /// Read. Ids of the live nodes (not superseded or closed) that have no
+    /// stored vector, in id order. A node whose content is empty or only
+    /// whitespace is left out: an entity page has nothing to embed. Does not
+    /// serialize with writes or with
+    /// other reads; see the trait's concurrency contract above.
+    async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>>;
 
     /// Write. Remove stored vectors whose node no longer exists (post-GC
     /// cleanup). Serializes with every other write; see the trait's

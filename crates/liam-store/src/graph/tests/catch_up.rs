@@ -20,7 +20,9 @@ use liam_log::{LogOffset, LogWriter};
 
 use futures_util::StreamExt;
 
-use super::support::{count, cursor, fact, fact_at, offset_pair, shared};
+use super::support::{
+    count, cursor, fact, fact_at, offset_pair, shared, ReembedProbe, StubEmbedder,
+};
 use super::*;
 use crate::DefaultBackend;
 
@@ -309,6 +311,15 @@ fn applied(applied: usize) -> CatchUpReport {
     }
 }
 
+/// The record counts alone: these tests attach no embedder, so every replayed
+/// node also shows up as pending, which they are not about.
+fn record_counts(report: CatchUpReport) -> CatchUpReport {
+    CatchUpReport {
+        reembedded: ReembedReport::default(),
+        ..report
+    }
+}
+
 // ---- tests ----
 
 #[tokio::test]
@@ -328,7 +339,7 @@ async fn catch_up_applies_logged_node_edge_and_episode_events_once_after_a_crash
     let report = g.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(report, applied(4));
+    assert_eq!(record_counts(report), applied(4));
     assert_eq!(count(&g, "nodes").await, 4);
     assert_eq!(count(&g, "edges").await, 2);
     assert_eq!(count(&g, "log_hash_index").await, 6);
@@ -355,8 +366,8 @@ async fn catch_up_run_twice_applies_nothing_the_second_time_and_keeps_the_cursor
     let second = g.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(first, applied(2));
-    assert_eq!(second, CatchUpReport::default());
+    assert_eq!(record_counts(first), applied(2));
+    assert_eq!(record_counts(second), CatchUpReport::default());
     let after = (
         dump(&g, "nodes").await,
         dump(&g, "log_cursor").await,
@@ -393,7 +404,7 @@ async fn catch_up_skips_a_voided_event_and_the_cursor_moves_past_it() {
         skipped_voided: 1,
         ..CatchUpReport::default()
     };
-    assert_eq!(report, expected);
+    assert_eq!(record_counts(report), expected);
     assert!(
         !has_node(&g, "node-a").await,
         "a voided write is never applied"
@@ -433,7 +444,7 @@ async fn catch_up_passes_duplicate_of_and_tombstone_records_without_projecting_t
     let report = g.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(report, applied(1));
+    assert_eq!(record_counts(report), applied(1));
     assert_eq!(count(&g, "nodes").await, 1);
     assert_eq!(count(&g, "log_hash_index").await, 1);
     assert_eq!(
@@ -468,7 +479,7 @@ async fn catch_up_replays_a_supersede_into_the_same_rows_as_the_live_write() {
     let report = replayed.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(report, applied(2));
+    assert_eq!(record_counts(report), applied(2));
     assert_eq!(tx_to(&replayed, old.as_str()).await, 2000);
     assert_eq!(tx_to(&replayed, new.as_str()).await, FOREVER.0);
     assert_eq!(dump(&replayed, "nodes").await, dump(&live, "nodes").await);
@@ -517,7 +528,7 @@ async fn catch_up_does_not_insert_rows_the_store_already_holds() {
         already_applied: 2,
         ..CatchUpReport::default()
     };
-    assert_eq!(report, expected);
+    assert_eq!(record_counts(report), expected);
     let after = (
         dump(&g, "nodes").await,
         dump(&g, "edges").await,
@@ -549,7 +560,7 @@ async fn catch_up_quarantines_a_refused_event_and_applies_the_ones_after_it() {
         quarantined: 1,
         ..CatchUpReport::default()
     };
-    assert_eq!(report, expected);
+    assert_eq!(record_counts(report), expected);
     assert!(
         has_node(&g, "node-b").await,
         "events after the refused one still apply"
@@ -583,7 +594,7 @@ async fn catch_up_quarantines_a_refused_event_and_applies_the_ones_after_it() {
     let again = g.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(again, CatchUpReport::default());
+    assert_eq!(record_counts(again), CatchUpReport::default());
     assert_eq!(cursor_offset(&g).await, Some(offset_pair(void_at)));
 
     // Act: a crash left the cursor behind the void
@@ -591,7 +602,7 @@ async fn catch_up_quarantines_a_refused_event_and_applies_the_ones_after_it() {
     let after_crash = g.catch_up().await.unwrap();
 
     // Assert: the void is passed, not read as work and not counted
-    assert_eq!(after_crash, CatchUpReport::default());
+    assert_eq!(record_counts(after_crash), CatchUpReport::default());
     assert_eq!(cursor_offset(&g).await, Some(offset_pair(void_at)));
 }
 
@@ -625,7 +636,7 @@ async fn catch_up_returns_a_transient_backend_error_and_resumes_from_the_last_ap
     let retried = g.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(retried, applied(1));
+    assert_eq!(record_counts(retried), applied(1));
     assert_eq!(count(&g, "nodes").await, 5);
     assert_eq!(cursor_offset(&g).await, Some(offset_pair(offsets[1])));
 }
@@ -679,7 +690,7 @@ async fn catch_up_does_not_read_past_the_writer_head() {
     let report = g.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(report, applied(2));
+    assert_eq!(record_counts(report), applied(2));
     assert!(!has_node(&g, "node-c").await);
     assert_eq!(
         cursor_offset(&g).await,
@@ -725,7 +736,7 @@ async fn catch_up_replays_a_whole_multi_segment_log_into_a_fresh_store() {
 
     // Assert
     assert_eq!(fresh, None);
-    assert_eq!(report, applied(3));
+    assert_eq!(record_counts(report), applied(3));
     assert_eq!(count(&g, "nodes").await, 3);
     assert_eq!(
         cursor_offset(&g).await,
@@ -748,7 +759,7 @@ async fn catch_up_waits_for_the_log_lock_that_writers_take() {
 
     // Assert
     assert!(blocked.is_err(), "catch_up ran while a writer held the log");
-    assert_eq!(report, applied(1));
+    assert_eq!(record_counts(report), applied(1));
 }
 
 #[tokio::test]
@@ -792,7 +803,7 @@ async fn catch_up_voids_a_quarantined_event_so_a_store_rebuilt_from_the_log_skip
         skipped_voided: 1,
         ..CatchUpReport::default()
     };
-    assert_eq!(report, expected);
+    assert_eq!(record_counts(report), expected);
     assert_eq!(dump(&rebuilt, "nodes").await, dump(&first, "nodes").await);
     assert_eq!(dump(&rebuilt, "edges").await, dump(&first, "edges").await);
     assert!(
@@ -821,8 +832,8 @@ async fn catch_up_moves_the_cursor_onto_the_void_when_the_refused_event_is_the_l
         quarantined: 1,
         ..CatchUpReport::default()
     };
-    assert_eq!(first, expected);
-    assert_eq!(second, CatchUpReport::default());
+    assert_eq!(record_counts(first), expected);
+    assert_eq!(record_counts(second), CatchUpReport::default());
     let records = env.records().await;
     let void_at = records.last().expect("the void").offset;
     assert!(matches!(
@@ -852,7 +863,7 @@ async fn catch_up_quarantines_a_foreign_key_violation_and_leaves_no_trace_of_the
         quarantined: 1,
         ..CatchUpReport::default()
     };
-    assert_eq!(report, expected);
+    assert_eq!(record_counts(report), expected);
     assert_eq!(
         tx_to(&g, "node-a").await,
         FOREVER.0,
@@ -885,7 +896,7 @@ async fn catch_up_quarantines_a_supersede_of_a_node_the_log_never_wrote() {
         quarantined: 1,
         ..CatchUpReport::default()
     };
-    assert_eq!(report, expected);
+    assert_eq!(record_counts(report), expected);
     let held = quarantined(&g).await;
     assert_eq!(held.len(), 1);
     assert!(held[0].3.contains("node-ghost"), "{}", held[0].3);
@@ -921,7 +932,7 @@ async fn catch_up_quarantines_an_event_the_store_holds_only_part_of() {
         quarantined: 1,
         ..CatchUpReport::default()
     };
-    assert_eq!(report, expected);
+    assert_eq!(record_counts(report), expected);
     let held = quarantined(&g).await;
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].0, "event-batch");
@@ -963,7 +974,7 @@ async fn catch_up_leaves_the_cursor_on_a_voided_event_when_the_next_one_fails() 
     let retried = g.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(retried, applied(1));
+    assert_eq!(record_counts(retried), applied(1));
     assert!(has_node(&g, "node-x").await);
     assert!(!has_node(&g, "node-a").await);
 }
@@ -998,7 +1009,7 @@ async fn catch_up_skips_an_event_whose_void_is_in_a_later_segment() {
         skipped_voided: 1,
         ..CatchUpReport::default()
     };
-    assert_eq!(report, expected);
+    assert_eq!(record_counts(report), expected);
     assert!(!has_node(&g, "node-a").await);
     assert!(has_node(&g, "node-b").await);
     assert_eq!(
@@ -1033,7 +1044,7 @@ async fn catch_up_replays_a_live_episode_and_relate_into_the_same_rows() {
     let report = replayed.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(report, applied(2));
+    assert_eq!(record_counts(report), applied(2));
     assert_eq!(count(&replayed, "nodes").await, 2);
     assert_eq!(count(&replayed, "edges").await, 2);
     for table in ["nodes", "edges", "log_hash_index"] {
@@ -1055,7 +1066,7 @@ async fn catch_up_replays_a_node_written_without_a_valid_time_as_the_live_write_
     let report = replayed.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(report, applied(1));
+    assert_eq!(record_counts(report), applied(1));
     assert_eq!(dump(&replayed, "nodes").await, dump(&live, "nodes").await);
     let valid_from = replayed
         .backend
@@ -1130,6 +1141,134 @@ async fn catch_up_teaches_the_dedup_filter_the_hashes_of_rows_the_store_already_
         already_applied: 1,
         ..CatchUpReport::default()
     };
-    assert_eq!(report, expected);
+    assert_eq!(record_counts(report), expected);
     assert!(log.lock().await.bloom_might_contain(&hash));
+}
+
+#[tokio::test]
+async fn catch_up_embeds_a_replayed_node_and_does_not_embed_it_again() {
+    // Arrange: a node the log carries without a vector
+    let env = Env::new();
+    env.append(&[node_write("node-a", "alpha")]);
+    let embedder = StubEmbedder::new(8);
+    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    let g = g.with_embedder(embedder.clone());
+
+    // Act
+    let first = g.catch_up().await.unwrap();
+    let second = g.catch_up().await.unwrap();
+
+    // Assert
+    let expected = CatchUpReport {
+        applied: 1,
+        reembedded: ReembedReport {
+            re_embedded: 1,
+            ..ReembedReport::default()
+        },
+        ..CatchUpReport::default()
+    };
+    assert_eq!(first, expected);
+    assert_eq!(second, CatchUpReport::default());
+    assert_eq!(count(&g, "node_vectors").await, 1);
+    assert_eq!(embedder.calls(), ["alpha"]);
+}
+
+#[tokio::test]
+async fn catch_up_reports_a_node_it_could_not_embed_and_still_replays_every_event() {
+    // Arrange
+    let env = Env::new();
+    let offsets = env.append(&[node_write("node-a", "alpha"), node_write("node-b", "beta")]);
+    let embedder = StubEmbedder::new(8);
+    embedder.fail_on(Some("alpha"));
+    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    let g = g.with_embedder(embedder.clone());
+
+    // Act
+    let report = g.catch_up().await.unwrap();
+
+    // Assert
+    let expected = CatchUpReport {
+        applied: 2,
+        reembedded: ReembedReport {
+            re_embedded: 1,
+            failed: 1,
+            ..ReembedReport::default()
+        },
+        ..CatchUpReport::default()
+    };
+    assert_eq!(report, expected);
+    assert_eq!(count(&g, "nodes").await, 2);
+    assert_eq!(
+        cursor_offset(&g).await,
+        offsets.last().map(|o| offset_pair(*o))
+    );
+}
+
+#[tokio::test]
+async fn catch_up_embeds_nodes_replayed_by_an_earlier_run_that_never_got_to_it() {
+    // Arrange: a run that replayed the node with no embedder at hand
+    let env = Env::new();
+    env.append(&[node_write("node-a", "alpha")]);
+    let (first, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    first.catch_up().await.unwrap();
+    drop(first);
+    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    let g = g.with_embedder(StubEmbedder::new(8));
+
+    // Act: nothing is left to replay
+    let report = g.catch_up().await.unwrap();
+
+    // Assert
+    let expected = CatchUpReport {
+        reembedded: ReembedReport {
+            re_embedded: 1,
+            ..ReembedReport::default()
+        },
+        ..CatchUpReport::default()
+    };
+    assert_eq!(report, expected);
+    assert_eq!(count(&g, "node_vectors").await, 1);
+}
+
+#[tokio::test]
+async fn catch_up_without_an_embedder_reports_the_nodes_left_without_a_vector() {
+    // Arrange
+    let env = Env::new();
+    env.append(&[node_write("node-a", "alpha")]);
+    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+
+    // Act
+    let report = g.catch_up().await.unwrap();
+
+    // Assert
+    let expected = CatchUpReport {
+        applied: 1,
+        reembedded: ReembedReport {
+            pending: 1,
+            ..ReembedReport::default()
+        },
+        ..CatchUpReport::default()
+    };
+    assert_eq!(report, expected);
+}
+
+#[tokio::test]
+async fn catch_up_returns_the_replay_report_when_the_nodes_cannot_be_listed() {
+    // Arrange
+    let env = Env::new();
+    env.append(&[node_write("node-a", "alpha")]);
+    let (g, _log) = env.open::<ReembedProbe>("graph.db", clock_at(9000)).await;
+    let g = g.with_embedder(StubEmbedder::new(8));
+    g.backend.fail_listing();
+
+    // Act
+    let report = g.catch_up().await.unwrap();
+
+    // Assert: the replayed event is reported and no embedding is claimed
+    let expected = CatchUpReport {
+        applied: 1,
+        ..CatchUpReport::default()
+    };
+    assert_eq!(report, expected);
+    assert_eq!(count(&g, "nodes").await, 1);
 }

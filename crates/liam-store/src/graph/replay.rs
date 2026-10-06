@@ -13,8 +13,9 @@ use uuid::Uuid;
 
 use super::log_cursor;
 use super::logged_plan::Table;
-use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog};
+use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog, SharedLog};
 use super::projection::{steps_for, Step};
+use super::reembed::ReembedReport;
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
@@ -23,10 +24,10 @@ use crate::value::Value;
 const QUARANTINE_SQL: &str = "INSERT INTO log_quarantine (event_id, segment, seg_index, reason, at)
      VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(event_id) DO NOTHING";
 
-/// What one `catch_up` did with the records past the cursor. Records that carry
-/// no rows to project (`Voided`, `DuplicateOf`, `Tombstone`) only move the
-/// cursor and are in no count, including the `Voided` records a quarantine
-/// appends; a cancelled event is counted once, as voided.
+/// What one `catch_up` did. The four record counts describe log records only:
+/// those that carry no rows to project (`Voided`, `DuplicateOf`, `Tombstone`)
+/// only move the cursor and are in no count, including the `Voided` records a
+/// quarantine appends, and a cancelled event is counted once, as voided.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CatchUpReport {
     /// Events whose rows were projected.
@@ -37,6 +38,9 @@ pub struct CatchUpReport {
     pub skipped_voided: usize,
     /// Events the projection refused, recorded in `log_quarantine`.
     pub quarantined: usize,
+    /// The re-embed pass that follows the replay, which covers every live
+    /// node without a vector, not only the replayed ones.
+    pub reembedded: ReembedReport,
 }
 
 /// What became of one record.
@@ -66,12 +70,26 @@ impl<B: Backend> Graph<B> {
     /// writer's last acknowledged record. A refused event is quarantined and
     /// replay goes on past it; a backend error stops replay with the cursor on
     /// the last record that was accounted for, so a retry resumes from there.
-    /// Holds the log lock throughout, as a write does, and refuses a poisoned
-    /// log, whose tail is unknown until the store is reopened.
+    /// Holds the log lock while it replays, as a write does, and refuses a
+    /// poisoned log, whose tail is unknown until the store is reopened. It then
+    /// re-embeds the live nodes with no vector, replayed ones included.
     pub async fn catch_up(&self) -> Result<CatchUpReport> {
         let Some(log) = &self.log else {
             return Ok(CatchUpReport::default());
         };
+        let mut report = self.replay(log).await?;
+        // The replay has already committed, so a failed listing must not hide
+        // its report.
+        match self.reembed_missing().await {
+            Ok(reembedded) => report.reembedded = reembedded,
+            Err(error) => {
+                tracing::error!(%error, "re-embed pass skipped, the nodes could not be listed")
+            }
+        }
+        Ok(report)
+    }
+
+    async fn replay(&self, log: &SharedLog) -> Result<CatchUpReport> {
         let mut held = HeldLog::acquire(log).await?;
         let cursor = log_cursor::read(&self.backend)
             .await?

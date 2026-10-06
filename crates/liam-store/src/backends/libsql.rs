@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::graph::scope_within;
-use crate::ids::{Millis, NodeId};
+use crate::ids::{Millis, NodeId, FOREVER};
 use crate::value::{Row, Value};
 
 /// Milliseconds a connection waits on `SQLITE_BUSY` before giving up.
@@ -76,6 +76,10 @@ pub struct LibsqlBackend {
     read_pool: Vec<Connection>,
     next_reader: AtomicUsize,
 }
+
+/// What `nodes_missing_vectors` trims from a node's content to decide whether
+/// anything is left to embed: SQLite's own `TRIM` strips only spaces.
+const CONTENT_WHITESPACE: &str = " \t\n\x0b\x0c\r";
 
 /// The low byte of an extended result code is the primary code.
 const PRIMARY_CODE_MASK: i32 = 0xff;
@@ -290,6 +294,22 @@ impl Backend for LibsqlBackend {
         Ok(())
     }
 
+    async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
+        let conn = self.write.lock().await;
+        let inserted = conn
+            .execute(
+                "INSERT INTO node_vectors (node_id, embedding) VALUES (?1, ?2)
+                 ON CONFLICT(node_id) DO NOTHING",
+                libsql::params_from_iter(vec![
+                    libsql::Value::Text(node_id.to_string()),
+                    libsql::Value::Blob(le_bytes(embedding)),
+                ]),
+            )
+            .await
+            .map_err(err)?;
+        Ok(inserted > 0)
+    }
+
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
         let conn = self.write.lock().await;
         conn.execute(
@@ -344,6 +364,22 @@ impl Backend for LibsqlBackend {
         let rows = read_rows(rows).await?;
         rows.iter()
             .map(|r| Ok(NodeId::from_raw(r.get_string(0)?)))
+            .collect()
+    }
+
+    async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
+        let rows = self
+            .query(
+                "SELECT n.id FROM nodes n
+                 LEFT JOIN node_vectors v ON v.node_id = n.id
+                 WHERE n.tx_to = ?1 AND v.node_id IS NULL
+                   AND TRIM(n.content, ?2) != ''
+                 ORDER BY n.id",
+                &[FOREVER.into(), CONTENT_WHITESPACE.into()],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| Ok(NodeId::from_raw(row.get_string(0)?)))
             .collect()
     }
 

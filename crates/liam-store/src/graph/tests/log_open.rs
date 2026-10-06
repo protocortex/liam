@@ -416,6 +416,9 @@ impl Backend for Probed {
     async fn vector_upsert(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
         self.inner.vector_upsert(node_id, embedding).await
     }
+    async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
+        self.inner.vector_insert_if_absent(node_id, embedding).await
+    }
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
         self.inner.vector_delete(node_id).await
     }
@@ -428,6 +431,9 @@ impl Backend for Probed {
         as_of: Millis,
     ) -> Result<Vec<NodeId>> {
         self.inner.vector_search(query, k, kind, scope, as_of).await
+    }
+    async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
+        self.inner.nodes_missing_vectors().await
     }
     async fn vector_sweep_orphans(&self) -> Result<u64> {
         self.inner.vector_sweep_orphans().await
