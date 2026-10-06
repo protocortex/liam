@@ -519,7 +519,12 @@ pub struct Graph<B: Backend> {
     expansion_weight: f64,
     log: Option<SharedLog>,
     embedder: Option<Arc<dyn ContentEmbedder>>,
+    /// Targets one GC tombstone event carries at most.
+    #[allow(dead_code)]
+    gc_chunk: usize,
 }
+
+const GC_CHUNK_TARGETS: usize = 500;
 
 impl<B: Backend> Graph<B> {
     pub async fn open(path: &str, config: GraphConfig) -> Result<Self> {
@@ -564,6 +569,7 @@ impl<B: Backend> Graph<B> {
             expansion_weight: config.expansion_weight,
             log: None,
             embedder: None,
+            gc_chunk: GC_CHUNK_TARGETS,
         })
     }
 
@@ -579,6 +585,12 @@ impl<B: Backend> Graph<B> {
         log_open::check_and_prime(&self.backend, &log).await?;
         self.log = Some(log);
         Ok(self)
+    }
+
+    #[cfg(test)]
+    fn with_gc_chunk(mut self, targets: usize) -> Self {
+        self.gc_chunk = targets;
+        self
     }
 
     // ---- write ----
@@ -2167,6 +2179,7 @@ mod tests {
 
     mod backwards_clock;
     mod catch_up;
+    mod gc_log;
     mod log_open;
     mod log_write;
     mod log_write_faults;
