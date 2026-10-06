@@ -175,8 +175,8 @@ mod tests {
         }
     }
 
-    fn reference_node_hash(node: &NodeContent) -> [u8; 32] {
-        let mut buf = vec![NODE_TAG];
+    fn untagged_node_bytes(node: &NodeContent) -> Vec<u8> {
+        let mut buf = Vec::new();
         put_str(&mut buf, &node.kind);
         put_str(&mut buf, &node.label);
         put_str(&mut buf, &node.content);
@@ -191,15 +191,29 @@ mod tests {
                 buf.extend(millis.to_le_bytes());
             }
         }
-        Sha256::digest(&buf).into()
+        buf
     }
 
-    fn reference_edge_hash(edge: &EdgeContent) -> [u8; 32] {
-        let mut buf = vec![EDGE_TAG];
+    fn untagged_edge_bytes(edge: &EdgeContent) -> Vec<u8> {
+        let mut buf = Vec::new();
         put_str(&mut buf, &edge.src);
         put_str(&mut buf, &edge.dst);
         put_str(&mut buf, &edge.edge_type);
+        buf
+    }
+
+    fn tagged_digest(tag: u8, untagged: &[u8]) -> [u8; 32] {
+        let mut buf = vec![tag];
+        buf.extend(untagged);
         Sha256::digest(&buf).into()
+    }
+
+    fn reference_node_hash(node: &NodeContent) -> [u8; 32] {
+        tagged_digest(NODE_TAG, &untagged_node_bytes(node))
+    }
+
+    fn reference_edge_hash(edge: &EdgeContent) -> [u8; 32] {
+        tagged_digest(EDGE_TAG, &untagged_edge_bytes(edge))
     }
 
     #[test]
@@ -381,7 +395,21 @@ mod tests {
                 scope: None,
                 ..node()
             },
-        ];
+            NodeContent {
+                scope: Some(String::new()),
+                subject: Some(String::new()),
+                ..node()
+            },
+        ]
+        .into_iter()
+        .chain(
+            [i64::MIN, -1, 0, i64::MAX]
+                .into_iter()
+                .map(|millis| NodeContent {
+                    valid_from: Some(millis),
+                    ..node()
+                }),
+        );
 
         for case in cases {
             // Act
@@ -486,14 +514,247 @@ mod tests {
     }
 
     #[test]
-    fn a_node_and_an_edge_never_share_a_hash() {
+    fn a_node_and_an_edge_sharing_leading_fields_hash_differently() {
         // Arrange
-        let (node_content, edge_content) = (node(), edge());
+        let node_content = node();
+        let edge_content = EdgeContent {
+            src: node_content.kind.clone(),
+            dst: node_content.label.clone(),
+            edge_type: node_content.content.clone(),
+        };
 
         // Act
         let (node_hash, edge_hash) = (hash_node(&node_content), hash_edge(&edge_content));
 
         // Assert
         assert_ne!(node_hash, edge_hash);
+    }
+
+    // A node always encodes at least four length-prefixed strings and an edge
+    // three, so their untagged bytes can never be equal. The closest they get
+    // is an edge encoding that is a strict prefix of a node encoding.
+    #[test]
+    fn an_edge_encoding_can_only_be_a_strict_prefix_of_a_node_encoding() {
+        // Arrange
+        let node_content = node();
+        let edge_content = EdgeContent {
+            src: node_content.kind.clone(),
+            dst: node_content.label.clone(),
+            edge_type: node_content.content.clone(),
+        };
+
+        // Act
+        let node_bytes = untagged_node_bytes(&node_content);
+        let edge_bytes = untagged_edge_bytes(&edge_content);
+
+        // Assert
+        assert!(node_bytes.starts_with(&edge_bytes));
+        assert!(node_bytes.len() > edge_bytes.len());
+    }
+
+    #[test]
+    fn the_domain_tag_is_part_of_what_each_hash_covers() {
+        // Arrange
+        let edge_content = edge();
+        let untagged = untagged_edge_bytes(&edge_content);
+
+        // Act
+        let actual = hash_edge(&edge_content);
+
+        // Assert
+        assert_ne!(NODE_TAG, EDGE_TAG);
+        assert_eq!(actual, tagged_digest(EDGE_TAG, &untagged));
+        assert_ne!(actual, tagged_digest(NODE_TAG, &untagged));
+        assert_ne!(actual, content_digest(&untagged));
+    }
+
+    #[test]
+    fn valid_from_boundary_values_hash_distinctly() {
+        // Arrange
+        let values = [None, Some(i64::MIN), Some(-1), Some(0), Some(i64::MAX)];
+
+        // Act
+        let hashes: Vec<[u8; 32]> = values
+            .iter()
+            .map(|valid_from| {
+                hash_node(&NodeContent {
+                    valid_from: *valid_from,
+                    ..node()
+                })
+            })
+            .collect();
+
+        // Assert
+        for (i, first) in hashes.iter().enumerate() {
+            for (j, second) in hashes.iter().enumerate().skip(i + 1) {
+                assert_ne!(
+                    first, second,
+                    "valid_from {:?} and {:?} must hash differently",
+                    values[i], values[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_zero_valid_from_differs_from_an_absent_one() {
+        // Arrange
+        let absent = node();
+        let zero = NodeContent {
+            valid_from: Some(0),
+            ..node()
+        };
+
+        // Act
+        let (absent_hash, zero_hash) = (hash_node(&absent), hash_node(&zero));
+
+        // Assert
+        assert_ne!(absent_hash, zero_hash);
+    }
+
+    #[test]
+    fn valid_from_keeps_its_sign() {
+        // Arrange
+        let negative = NodeContent {
+            valid_from: Some(-1_000),
+            ..node()
+        };
+        let positive = NodeContent {
+            valid_from: Some(1_000),
+            ..node()
+        };
+
+        // Act
+        let (negative_hash, positive_hash) = (hash_node(&negative), hash_node(&positive));
+
+        // Assert
+        assert_ne!(negative_hash, positive_hash);
+    }
+
+    #[test]
+    fn absent_empty_and_present_optional_strings_hash_distinctly() {
+        // Arrange
+        let variants = [None, Some(String::new()), Some("x".to_string())];
+
+        for field in ["scope", "subject"] {
+            // Act
+            let hashes: Vec<[u8; 32]> = variants
+                .iter()
+                .map(|value| {
+                    let mut content = node();
+                    match field {
+                        "scope" => content.scope = value.clone(),
+                        _ => content.subject = value.clone(),
+                    }
+                    hash_node(&content)
+                })
+                .collect();
+
+            // Assert
+            assert_ne!(hashes[0], hashes[1], "{field}: None vs empty");
+            assert_ne!(hashes[0], hashes[2], "{field}: None vs value");
+            assert_ne!(hashes[1], hashes[2], "{field}: empty vs value");
+        }
+    }
+
+    #[test]
+    fn moving_bytes_across_any_adjacent_node_field_boundary_changes_the_hash() {
+        // Arrange
+        let pairs: Vec<(&str, NodeContent, NodeContent)> = vec![
+            (
+                "kind/label",
+                NodeContent {
+                    kind: "ab".into(),
+                    label: "c".into(),
+                    ..node()
+                },
+                NodeContent {
+                    kind: "a".into(),
+                    label: "bc".into(),
+                    ..node()
+                },
+            ),
+            (
+                "content/producer",
+                NodeContent {
+                    content: "ab".into(),
+                    producer: "c".into(),
+                    ..node()
+                },
+                NodeContent {
+                    content: "a".into(),
+                    producer: "bc".into(),
+                    ..node()
+                },
+            ),
+            (
+                "producer/scope",
+                NodeContent {
+                    producer: "ab".into(),
+                    scope: Some("c".into()),
+                    ..node()
+                },
+                NodeContent {
+                    producer: "a".into(),
+                    scope: Some("bc".into()),
+                    ..node()
+                },
+            ),
+            (
+                "scope/subject",
+                NodeContent {
+                    scope: Some("ab".into()),
+                    subject: Some("c".into()),
+                    ..node()
+                },
+                NodeContent {
+                    scope: Some("a".into()),
+                    subject: Some("bc".into()),
+                    ..node()
+                },
+            ),
+            (
+                "subject/attributes",
+                NodeContent {
+                    subject: Some("ab".into()),
+                    attributes: "c".into(),
+                    ..node()
+                },
+                NodeContent {
+                    subject: Some("a".into()),
+                    attributes: "bc".into(),
+                    ..node()
+                },
+            ),
+        ];
+
+        for (boundary, early, late) in pairs {
+            // Act
+            let (early_hash, late_hash) = (hash_node(&early), hash_node(&late));
+
+            // Assert
+            assert_ne!(early_hash, late_hash, "{boundary} boundary must be hashed");
+        }
+    }
+
+    #[test]
+    fn moving_bytes_across_an_edge_field_boundary_changes_the_hash() {
+        // Arrange
+        let early = EdgeContent {
+            src: "ab".into(),
+            dst: "c".into(),
+            ..edge()
+        };
+        let late = EdgeContent {
+            src: "a".into(),
+            dst: "bc".into(),
+            ..edge()
+        };
+
+        // Act
+        let (early_hash, late_hash) = (hash_edge(&early), hash_edge(&late));
+
+        // Assert
+        assert_ne!(early_hash, late_hash);
     }
 }
