@@ -46,6 +46,16 @@ pub enum Error {
     /// Carries the specific reason.
     #[error("invalid scope: {0}")]
     InvalidScope(String),
+
+    /// The event log refused an append.
+    #[error("event log append failed: {0}")]
+    LogAppend(String),
+
+    /// A write was projected, then neither committed nor voided in the log, so
+    /// the log can no longer be trusted to match the store. Reopen the store to
+    /// replay it.
+    #[error("event log is poisoned by an unvoided failed write; reopen the store")]
+    LogPoisoned,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -13,12 +13,17 @@ serde_json = "1"
 thiserror = "2"
 ulid = "2"
 tracing = "0.1"
+liam-log = { path = "../liam-log" }
+# The log's event ids are v7 UUIDs, so they sort by creation time.
+uuid = { version = "1.27.0", default-features = false, features = ["std", "v7"] }
 
 # Local-only: drop default replication/remote/sync/tls features, which pull the
 # hyper-rustls -> rustls-webpki -> webpki-roots stack (unused by this local-first
 # store and the source of several RUSTSEC advisories + a CDLA license).
 libsql = { version = "0.9", optional = true, default-features = false, features = ["core"] }
-tokio = { version = "1", features = ["rt", "sync"], optional = true }
+# Not optional: the injected log handle is a `tokio::sync::Mutex`, and
+# `liam-log` already pulls tokio into every build.
+tokio = { version = "1", features = ["rt", "sync"] }
 # Leiden community detection. Not optional: ADR-0002 makes clustering part of
 # every build, so there is no longer a feature to gate it behind.
 #
@@ -33,11 +38,10 @@ leiden-rs = "=0.8.1"
 
 [features]
 default = ["backend-libsql"]
-# `dep:tokio` is wired to backend-libsql too: the read pool and write mutex in
-# `backends/libsql.rs` need `tokio::sync::Mutex`, and that must not depend on
-# libsql's own tokio features happening to pull it in, because that coupling
-# breaks silently the moment libsql's feature set changes.
-backend-libsql = ["dep:libsql", "dep:tokio"]
+# The read pool and write mutex in `backends/libsql.rs` need
+# `tokio::sync::Mutex`, which this crate depends on directly rather than
+# through libsql's own tokio features.
+backend-libsql = ["dep:libsql"]
 # There is deliberately NO `cluster` feature here, and adding one back would be
 # a regression. It was deleted per ADR-0002
 # (docs/adr/0002-cluster-recompute-cadence.md, milestone M5): clustering is part
@@ -54,3 +58,4 @@ backend-libsql = ["dep:libsql", "dep:tokio"]
 # regression hangs the test instead of the whole suite.
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
+liam-log = { path = "../liam-log", features = ["test-support"] }

@@ -10,6 +10,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use liam_log::LogWriter;
+
+use self::logged_write::{node_row_insert, resolve_node_row, LogState, Logged};
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};
@@ -20,6 +23,8 @@ use crate::types::{
     Fingerprint, GcReport, GraphConfig, Hit, NewEdge, NewNode, Query, RetentionPolicy,
 };
 use crate::value::{Row, Value};
+
+mod logged_write;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
 /// one-character handle answers with something a caller can act on instead of
@@ -411,12 +416,17 @@ fn score_and_rank(
     out
 }
 
+/// The write-ahead log a `Graph` appends to, shared so one lock orders every
+/// append against the commit that follows it.
+pub type SharedLog = Arc<tokio::sync::Mutex<Box<dyn LogWriter>>>;
+
 pub struct Graph<B: Backend> {
     backend: B,
     clock: Arc<dyn Clock>,
     dims: usize,
     rrf_k: f64,
     expansion_weight: f64,
+    log: Option<LogState>,
 }
 
 impl<B: Backend> Graph<B> {
@@ -460,7 +470,15 @@ impl<B: Backend> Graph<B> {
             dims: config.embedding_dims,
             rrf_k: config.rrf_k,
             expansion_weight: config.expansion_weight,
+            log: None,
         })
+    }
+
+    /// Routes writes through `log`. Without one, every write path stays as it
+    /// was before the log existed.
+    pub fn with_log(mut self, log: SharedLog) -> Self {
+        self.log = Some(LogState::new(log));
+        self
     }
 
     // ---- write ----
@@ -469,7 +487,13 @@ impl<B: Backend> Graph<B> {
         node.scope = validate_scope(&node.scope)?;
         let id = NodeId::new();
         let now = self.clock.now();
-        self.write_node(&id, &node, now).await?;
+        match &self.log {
+            None => self.write_node(&id, &node, now).await?,
+            Some(log) => match self.insert_node_logged(log, &id, &node, now).await? {
+                Logged::Written => {}
+                Logged::Duplicate(first) => return Ok(first),
+            },
+        }
         if let Some(embedding) = node.embedding.as_deref() {
             self.check_dims(embedding)?;
             self.backend.vector_upsert(id.as_str(), embedding).await?;
@@ -881,28 +905,7 @@ impl<B: Backend> Graph<B> {
         node: &NewNode,
         now: Millis,
     ) -> Result<(String, Vec<Value>)> {
-        let attrs = serde_json::to_string(&node.attributes)?;
-        let sql = "INSERT INTO nodes
-             (id, kind, label, content, producer, attributes, scope, subject, confidence,
-              valid_from, valid_until, tx_from, tx_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
-            .to_string();
-        let params = vec![
-            id.as_str().into(),
-            node.kind.clone().into(),
-            node.label.clone().into(),
-            node.content.clone().into(),
-            node.producer.clone().into(),
-            attrs.into(),
-            opt_text(node.scope.clone()),
-            opt_text(node.subject.clone()),
-            Value::Real(node.confidence),
-            node.valid_from.unwrap_or(now).into(),
-            FOREVER.into(),
-            now.into(),
-            FOREVER.into(),
-        ];
-        Ok((sql, params))
+        Ok(node_row_insert(&resolve_node_row(id, node, now)?))
     }
 
     async fn write_node(&self, id: &NodeId, node: &NewNode, now: Millis) -> Result<()> {
@@ -2280,6 +2283,8 @@ mod tests {
     use crate::types::relation;
     use crate::DefaultGraph;
     use tempfile::TempDir;
+
+    mod log_write;
 
     async fn graph_at(t: Millis) -> DefaultGraph {
         let clock = Arc::new(FixedClock::new(t));

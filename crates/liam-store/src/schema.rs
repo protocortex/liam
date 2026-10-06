@@ -128,6 +128,33 @@ CREATE TABLE IF NOT EXISTS provenance_repair_state (
   id               INTEGER PRIMARY KEY CHECK (id = 1),
   last_repaired_at INTEGER NOT NULL
 );
+
+-- How far the projection has caught up with the event log. The offsets stay
+-- NULL until the first event is applied; log_id pins the log this database
+-- was built from.
+CREATE TABLE IF NOT EXISTS log_cursor (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  log_id       TEXT    NOT NULL,
+  last_segment INTEGER,
+  last_index   INTEGER
+);
+
+-- Derived from the log: the live carrier of each content hash. row_ids is a
+-- JSON array of the carrier's row ids, because one event can carry several.
+CREATE TABLE IF NOT EXISTS log_hash_index (
+  content_hash   BLOB PRIMARY KEY,
+  first_event_id TEXT NOT NULL,
+  row_ids        TEXT NOT NULL
+);
+
+-- Events replay refused for a deterministic reason, kept for the operator.
+CREATE TABLE IF NOT EXISTS log_quarantine (
+  event_id  TEXT    PRIMARY KEY,
+  segment   INTEGER NOT NULL,
+  seg_index INTEGER NOT NULL,
+  reason    TEXT    NOT NULL,
+  at        INTEGER NOT NULL
+);
 ",
     );
 
