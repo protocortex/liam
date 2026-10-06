@@ -335,6 +335,11 @@ pub(crate) mod fixtures {
 
     pub(crate) const EVENT_HASH_SENTINEL: [u8; 32] = [0xEE; 32];
 
+    /// Bytes one record for `event` occupies in a segment.
+    pub(crate) fn frame_len(event: &LogEvent) -> u64 {
+        (crate::wal::HEADER_BYTES + event.encode().expect("encode event").len()) as u64
+    }
+
     pub(crate) fn sample_hash(index: u32) -> [u8; 32] {
         Sha256::digest(index.to_le_bytes()).into()
     }
