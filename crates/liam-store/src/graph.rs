@@ -10,6 +10,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use liam_log::event::NodeRow;
+
+use self::logged_write::Logged;
+pub use self::logged_write::{EventLog, SharedLog};
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};
@@ -20,6 +24,8 @@ use crate::types::{
     Fingerprint, GcReport, GraphConfig, Hit, NewEdge, NewNode, Query, RetentionPolicy,
 };
 use crate::value::{Row, Value};
+
+mod logged_write;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
 /// one-character handle answers with something a caller can act on instead of
@@ -319,6 +325,52 @@ fn opt_text(v: Option<String>) -> Value {
     v.map(Value::Text).unwrap_or(Value::Null)
 }
 
+/// The row a `NewNode` becomes once ids and times are minted and its scope and
+/// attributes are in stored form. The log hashes and stores this, never the
+/// raw request.
+fn resolve_node_row(id: &NodeId, node: &NewNode, now: Millis) -> Result<NodeRow> {
+    Ok(NodeRow {
+        id: id.as_str().to_string(),
+        kind: node.kind.clone(),
+        label: node.label.clone(),
+        content: node.content.clone(),
+        producer: node.producer.clone(),
+        attributes: serde_json::to_string(&node.attributes)?,
+        scope: node.scope.clone(),
+        subject: node.subject.clone(),
+        confidence: node.confidence,
+        valid_from: node.valid_from.unwrap_or(now).0,
+        valid_from_supplied: node.valid_from.is_some(),
+        valid_until: FOREVER.0,
+        tx_from: now.0,
+        tx_to: FOREVER.0,
+    })
+}
+
+fn node_row_insert(row: &NodeRow) -> (String, Vec<Value>) {
+    let sql = "INSERT INTO nodes
+         (id, kind, label, content, producer, attributes, scope, subject, confidence,
+          valid_from, valid_until, tx_from, tx_to)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+        .to_string();
+    let params = vec![
+        row.id.clone().into(),
+        row.kind.clone().into(),
+        row.label.clone().into(),
+        row.content.clone().into(),
+        row.producer.clone().into(),
+        row.attributes.clone().into(),
+        opt_text(row.scope.clone()),
+        opt_text(row.subject.clone()),
+        Value::Real(row.confidence),
+        row.valid_from.into(),
+        row.valid_until.into(),
+        row.tx_from.into(),
+        row.tx_to.into(),
+    ];
+    (sql, params)
+}
+
 fn decay_factor(valid_from: Millis, now: Millis, half_life: Option<Millis>) -> f64 {
     match half_life {
         Some(h) if h.0 > 0 => {
@@ -417,6 +469,7 @@ pub struct Graph<B: Backend> {
     dims: usize,
     rrf_k: f64,
     expansion_weight: f64,
+    log: Option<SharedLog>,
 }
 
 impl<B: Backend> Graph<B> {
@@ -460,7 +513,19 @@ impl<B: Backend> Graph<B> {
             dims: config.embedding_dims,
             rrf_k: config.rrf_k,
             expansion_weight: config.expansion_weight,
+            log: None,
         })
+    }
+
+    /// Routes `insert` through `log`: each insert is appended to it before it
+    /// is applied. No other write appends yet. Without a log, every write is
+    /// unlogged.
+    pub async fn with_log(mut self, log: SharedLog) -> Result<Self> {
+        // Seam: checking `log`'s id against the database's `log_cursor` and
+        // rebuilding its bloom filter from `log_hash_index` land here, so a
+        // hash written before this process started is deduplicated.
+        self.log = Some(log);
+        Ok(self)
     }
 
     // ---- write ----
@@ -469,7 +534,13 @@ impl<B: Backend> Graph<B> {
         node.scope = validate_scope(&node.scope)?;
         let id = NodeId::new();
         let now = self.clock.now();
-        self.write_node(&id, &node, now).await?;
+        let id = match self.route_node_write(&id, &node, now).await? {
+            Logged::Written => id,
+            Logged::Duplicate(first) => first,
+        };
+        // The vector write takes the write lock a transaction holds, so it
+        // follows the commit. It is idempotent, which lets a retry repair a
+        // vector an earlier attempt committed the node without.
         if let Some(embedding) = node.embedding.as_deref() {
             self.check_dims(embedding)?;
             self.backend.vector_upsert(id.as_str(), embedding).await?;
@@ -881,34 +952,23 @@ impl<B: Backend> Graph<B> {
         node: &NewNode,
         now: Millis,
     ) -> Result<(String, Vec<Value>)> {
-        let attrs = serde_json::to_string(&node.attributes)?;
-        let sql = "INSERT INTO nodes
-             (id, kind, label, content, producer, attributes, scope, subject, confidence,
-              valid_from, valid_until, tx_from, tx_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
-            .to_string();
-        let params = vec![
-            id.as_str().into(),
-            node.kind.clone().into(),
-            node.label.clone().into(),
-            node.content.clone().into(),
-            node.producer.clone().into(),
-            attrs.into(),
-            opt_text(node.scope.clone()),
-            opt_text(node.subject.clone()),
-            Value::Real(node.confidence),
-            node.valid_from.unwrap_or(now).into(),
-            FOREVER.into(),
-            now.into(),
-            FOREVER.into(),
-        ];
-        Ok((sql, params))
+        Ok(node_row_insert(&resolve_node_row(id, node, now)?))
     }
 
     async fn write_node(&self, id: &NodeId, node: &NewNode, now: Millis) -> Result<()> {
         let (sql, params) = self.node_insert(id, node, now)?;
         self.backend.execute(&sql, &params).await?;
         Ok(())
+    }
+
+    async fn route_node_write(&self, id: &NodeId, node: &NewNode, now: Millis) -> Result<Logged> {
+        match &self.log {
+            None => self
+                .write_node(id, node, now)
+                .await
+                .map(|()| Logged::Written),
+            Some(log) => self.insert_node_logged(log, id, node, now).await,
+        }
     }
 
     // ---- read ----
@@ -2280,6 +2340,8 @@ mod tests {
     use crate::types::relation;
     use crate::DefaultGraph;
     use tempfile::TempDir;
+
+    mod log_write;
 
     async fn graph_at(t: Millis) -> DefaultGraph {
         let clock = Arc::new(FixedClock::new(t));
@@ -7760,6 +7822,7 @@ mod tests {
         execute_calls: usize,
         /// The `execute_calls` value (before incrementing) that fails.
         fail_on_execute: usize,
+        probe: &'a TxProbe,
     }
 
     #[async_trait::async_trait]
@@ -7778,10 +7841,44 @@ mod tests {
             self.inner.query(sql, params).await
         }
         async fn commit(self: Box<Self>) -> Result<()> {
+            self.probe.before_commit().await;
             self.inner.commit().await
         }
         async fn rollback(self: Box<Self>) -> Result<()> {
             self.inner.rollback().await
+        }
+    }
+
+    /// Timing hooks for the transactions of a `FailingBackend`, for tests that
+    /// hold or observe a transaction rather than fail it.
+    #[derive(Default)]
+    struct TxProbe {
+        begins: std::sync::atomic::AtomicUsize,
+        delay_odd_begins: std::sync::atomic::AtomicBool,
+        hang_commit: std::sync::atomic::AtomicBool,
+        /// A lock whose held-or-free state is recorded at every commit.
+        watched: std::sync::Mutex<Option<SharedLog>>,
+        commit_lock_held: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl TxProbe {
+        async fn before_begin(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            let nth = self.begins.fetch_add(1, SeqCst);
+            if nth % 2 == 1 && self.delay_odd_begins.load(SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn before_commit(&self) {
+            if self.hang_commit.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            let watched = self.watched.lock().unwrap().clone();
+            if let Some(log) = watched {
+                let held = log.try_lock().is_err();
+                self.commit_lock_held.lock().unwrap().push(held);
+            }
         }
     }
 
@@ -7793,6 +7890,7 @@ mod tests {
     struct FailingBackend {
         inner: crate::backends::DefaultBackend,
         fail_on_execute: std::sync::atomic::AtomicUsize,
+        probe: TxProbe,
     }
 
     impl FailingBackend {
@@ -7808,6 +7906,7 @@ mod tests {
             Ok(Self {
                 inner: crate::backends::DefaultBackend::open(path, read_pool_size).await?,
                 fail_on_execute: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                probe: TxProbe::default(),
             })
         }
         async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
@@ -7845,6 +7944,7 @@ mod tests {
             self.inner.vector_sweep_orphans().await
         }
         async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
+            self.probe.before_begin().await;
             let inner = self.inner.begin().await?;
             let fail_on_execute = self
                 .fail_on_execute
@@ -7853,6 +7953,7 @@ mod tests {
                 inner,
                 execute_calls: 0,
                 fail_on_execute,
+                probe: &self.probe,
             }))
         }
     }

@@ -46,6 +46,21 @@ pub enum Error {
     /// Carries the specific reason.
     #[error("invalid scope: {0}")]
     InvalidScope(String),
+
+    /// The event log refused an append. The source keeps the writer's own
+    /// error, so a poisoned writer stays distinguishable from an I/O failure.
+    #[error("event log append failed: {0}")]
+    LogAppend(#[from] liam_log::wal::WalError),
+
+    /// The blocking task that runs an append panicked or was cancelled, so
+    /// whether the record reached the log is unknown.
+    #[error("event log append task failed: {0}")]
+    LogTask(String),
+
+    /// A write's log record is not reconciled with the projection. The store
+    /// refuses logged writes until it is reopened.
+    #[error("a logged write is not reconciled with the log; reopen the store")]
+    LogPoisoned,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
