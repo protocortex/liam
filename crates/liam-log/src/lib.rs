@@ -11,6 +11,7 @@ pub mod dedup;
 pub mod event;
 pub mod filter_file;
 pub mod hash;
+pub mod reader;
 pub mod wal;
 
 use uuid::Uuid;
@@ -253,13 +254,20 @@ pub mod test_support {
 
 #[cfg(test)]
 pub(crate) mod fixtures {
+    use std::future::Future;
+    use std::path::Path;
+
+    use object_store::local::LocalFileSystem;
     use sha2::{Digest, Sha256};
 
+    use crate::compactor::{write_parquet, Compactor};
     use crate::dedup::{BloomConfig, HashBloom};
     use crate::event::{
         EdgeRow, LogEvent, LogPayload, NodeRow, TombstoneTable, TombstoneTarget,
         CURRENT_SCHEMA_VERSION,
     };
+    use crate::wal::{segment_name, WalConfig, WalWriter};
+    use crate::{LogOffset, LogWriter};
 
     /// Open-ended end of a validity or transaction interval, in epoch millis.
     pub(crate) const FOREVER: i64 = 4_102_444_800_000;
@@ -338,6 +346,57 @@ pub(crate) mod fixtures {
     /// Bytes one record for `event` occupies in a segment.
     pub(crate) fn frame_len(event: &LogEvent) -> u64 {
         (crate::wal::HEADER_BYTES + event.encode().expect("encode event").len()) as u64
+    }
+
+    /// Runs `future` to completion, so a synchronous test can drive the async
+    /// compactor and object store.
+    pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime")
+            .block_on(future)
+    }
+
+    /// Rotates after `events_per_segment` fixture events and never on time.
+    pub(crate) fn rotating_config(events_per_segment: usize) -> WalConfig {
+        WalConfig {
+            segment_max_bytes: events_per_segment as u64 * frame_len(&event(0)),
+            rotate_interval_secs: u64::MAX,
+        }
+    }
+
+    /// Appends `event(0)..event(count)` to a WAL in `dir` and returns each event
+    /// with the offset the writer reported, then closes the writer.
+    pub(crate) fn write_log(
+        dir: &Path,
+        count: usize,
+        events_per_segment: usize,
+    ) -> Vec<(LogOffset, LogEvent)> {
+        let mut writer =
+            WalWriter::open_with_system_clock(dir, rotating_config(events_per_segment))
+                .expect("open wal");
+        (0..count)
+            .map(|index| {
+                let event = event(index);
+                let offset = writer.append(&event).expect("append event");
+                (offset, event)
+            })
+            .collect()
+    }
+
+    /// Compacts each named closed segment into Parquet and removes its WAL file.
+    pub(crate) fn compact_segments(dir: &Path, sequences: &[u64]) {
+        let compactor = Compactor::local(dir).expect("compactor");
+        for sequence in sequences {
+            block_on(compactor.compact_segment(&dir.join(segment_name(*sequence))))
+                .expect("compact segment");
+        }
+    }
+
+    /// Writes the Parquet object for `sequence` holding exactly `events`.
+    pub(crate) fn put_parquet(dir: &Path, sequence: u64, events: &[LogEvent]) {
+        let store = LocalFileSystem::new_with_prefix(dir).expect("local store");
+        block_on(write_parquet(&store, sequence, events)).expect("write parquet");
     }
 
     pub(crate) fn sample_hash(index: u32) -> [u8; 32] {

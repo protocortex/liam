@@ -473,7 +473,7 @@ pub(crate) fn segment_paths(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 }
 
 /// Files of one extension named by `sequence_stem`, in sequence order.
-fn numbered_files(dir: &Path, extension: &str) -> io::Result<Vec<(u64, PathBuf)>> {
+pub(crate) fn numbered_files(dir: &Path, extension: &str) -> io::Result<Vec<(u64, PathBuf)>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();

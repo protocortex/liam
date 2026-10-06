@@ -635,7 +635,7 @@ fn encoded(event: &LogEvent) -> Result<Vec<u8>, CompactError> {
 ///
 /// The writer only closes a segment after appending to it, so an empty one is
 /// damage and is kept rather than turned into an empty Parquet.
-fn read_closed_segment(segment: &Path) -> Result<Option<Vec<LogEvent>>, CompactError> {
+pub(crate) fn read_closed_segment(segment: &Path) -> Result<Option<Vec<LogEvent>>, CompactError> {
     let bytes = match fs::read(segment) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
