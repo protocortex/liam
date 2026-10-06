@@ -14,6 +14,8 @@ pub mod hash;
 pub mod reader;
 pub mod wal;
 
+use std::fmt;
+
 use uuid::Uuid;
 
 use crate::event::LogEvent;
@@ -27,7 +29,14 @@ pub struct LogOffset {
     pub index: u64,
 }
 
-/// The append side of the log, so the store can swap the real WAL for a double.
+impl fmt::Display for LogOffset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "segment {}, record {}", self.segment, self.index)
+    }
+}
+
+/// The writer side of the log, covering where it appends and what it has
+/// acknowledged, so the store can swap the real WAL for a double.
 ///
 /// `append` blocks on fsync, so async callers must offload it with
 /// `spawn_blocking` or `block_in_place`. Callers serialize appends behind one
@@ -42,6 +51,12 @@ pub trait LogWriter: Send {
 
     /// Identifies this log across restarts.
     fn log_id(&self) -> Uuid;
+
+    /// The last acknowledged record: the last one this writer appended, or the
+    /// last one it found when it opened, or `None` for an empty log. It bounds
+    /// `LogReader::scan_through` during catch up, and a store cursor may never
+    /// pass it.
+    fn head(&self) -> Option<LogOffset>;
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -76,6 +91,13 @@ pub mod test_support {
         /// Succeeds for the first `successes` appends, then fails every later one.
         pub fn fail_after(successes: u64) -> Self {
             Self::new(Failure::AfterFirst(successes))
+        }
+
+        /// Reports `log_id` instead of a generated one, to stand in for the
+        /// same log after a restart.
+        pub fn with_log_id(mut self, log_id: Uuid) -> Self {
+            self.log_id = log_id;
+            self
         }
 
         /// Events accepted so far, in append order.
@@ -114,6 +136,14 @@ pub mod test_support {
 
         fn log_id(&self) -> Uuid {
             self.log_id
+        }
+
+        fn head(&self) -> Option<LogOffset> {
+            let index = self.appended.len().checked_sub(1)?;
+            Some(LogOffset {
+                segment: 0,
+                index: index as u64,
+            })
         }
     }
 
@@ -235,6 +265,26 @@ pub mod test_support {
                 matches!(error, WalError::Io(_)),
                 "unexpected error: {error}"
             );
+        }
+
+        #[test]
+        fn head_is_the_last_accepted_append_and_ignores_a_rejected_one() {
+            // Arrange
+            let mut writer = FailingLogWriter::fail_on_nth(2);
+            let empty = writer.head();
+
+            // Act
+            let first = writer.append(&event(0)).expect("first append");
+            let after_first = writer.head();
+            writer.append(&event(1)).expect_err("rejected append");
+            let after_rejected = writer.head();
+            let third = writer.append(&event(2)).expect("third append");
+
+            // Assert
+            assert_eq!(empty, None);
+            assert_eq!(after_first, Some(first));
+            assert_eq!(after_rejected, Some(first));
+            assert_eq!(writer.head(), Some(third));
         }
 
         #[test]
@@ -440,6 +490,21 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_log_offset_reads_as_its_segment_and_record() {
+        // Arrange
+        let offset = crate::LogOffset {
+            segment: 1,
+            index: 3,
+        };
+
+        // Act
+        let shown = offset.to_string();
+
+        // Assert
+        assert_eq!(shown, "segment 1, record 3");
+    }
+
     #[test]
     fn crate_links() {
         assert_eq!(env!("CARGO_PKG_NAME"), "liam-log");

@@ -299,8 +299,23 @@ pub(crate) async fn read_event_count(
     sequence: u64,
 ) -> Result<u64, CompactError> {
     let bytes = store.get(&object_path(sequence)).await?.bytes().await?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
-    let found = builder.schema().metadata().get(EVENT_COUNT_KEY);
+    stamped_event_count(
+        ParquetRecordBatchReaderBuilder::try_new(bytes)?
+            .schema()
+            .metadata(),
+    )
+}
+
+/// `read_event_count` for a Parquet file on the local disk, for callers that
+/// cannot await.
+pub(crate) fn read_event_count_from_file(path: &Path) -> Result<u64, CompactError> {
+    let file = fs::File::open(path).map_err(WalError::from)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    stamped_event_count(builder.schema().metadata())
+}
+
+fn stamped_event_count(metadata: &Metadata) -> Result<u64, CompactError> {
+    let found = metadata.get(EVENT_COUNT_KEY);
     found
         .and_then(|count| count.parse().ok())
         .ok_or_else(|| CompactError::MetadataMismatch {

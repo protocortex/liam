@@ -29,11 +29,23 @@ pub(super) struct RecordingLog {
     inner: FailingLogWriter,
     appended: Appended,
     fail_after_recording: bool,
+    /// The head of the log before this writer started, which its own appends
+    /// continue from.
+    resumed_from: Option<LogOffset>,
 }
 
 impl RecordingLog {
     pub(super) fn new() -> (Self, Appended) {
         Self::over(FailingLogWriter::fail_after(u64::MAX))
+    }
+
+    /// A new writer for the log `log_id`, as after a restart: it reports `head`
+    /// until it appends, and its appends continue after it.
+    pub(super) fn restarted(log_id: Uuid, head: Option<LogOffset>) -> (Self, Appended) {
+        let (mut log, appended) =
+            Self::over(FailingLogWriter::fail_after(u64::MAX).with_log_id(log_id));
+        log.resumed_from = head;
+        (log, appended)
     }
 
     fn over(inner: FailingLogWriter) -> (Self, Appended) {
@@ -42,6 +54,7 @@ impl RecordingLog {
             inner,
             appended: Arc::clone(&appended),
             fail_after_recording: false,
+            resumed_from: None,
         };
         (log, appended)
     }
@@ -51,11 +64,22 @@ impl RecordingLog {
         self.fail_after_recording = true;
         self
     }
+
+    fn place(&self, own: LogOffset) -> LogOffset {
+        match self.resumed_from {
+            Some(head) => LogOffset {
+                segment: head.segment,
+                index: head.index + 1 + own.index,
+            },
+            None => own,
+        }
+    }
 }
 
 impl LogWriter for RecordingLog {
     fn append(&mut self, event: &LogEvent) -> std::result::Result<LogOffset, WalError> {
-        let offset = self.inner.append(event)?;
+        let own = self.inner.append(event)?;
+        let offset = self.place(own);
         self.appended.lock().unwrap().push((offset, event.clone()));
         if self.fail_after_recording {
             return Err(WalError::Io(io::Error::other("failed after recording")));
@@ -66,6 +90,19 @@ impl LogWriter for RecordingLog {
     fn log_id(&self) -> Uuid {
         self.inner.log_id()
     }
+
+    fn head(&self) -> Option<LogOffset> {
+        self.inner
+            .head()
+            .map(|own| self.place(own))
+            .or(self.resumed_from)
+    }
+}
+
+/// The offset of the last record `appended` accepted, which is the head a
+/// restarted writer for the same log finds.
+fn head_of(appended: &Appended) -> Option<LogOffset> {
+    appended.lock().unwrap().last().map(|(offset, _)| *offset)
 }
 
 pub(super) fn share(writer: impl LogWriter + 'static) -> SharedLog {
@@ -230,6 +267,10 @@ pub(super) async fn cursor<B: Backend>(g: &Graph<B>) -> Option<(String, Option<(
         _ => None,
     };
     Some((row.get_string(0).unwrap(), offset))
+}
+
+fn offset_at(segment: u64, index: u64) -> LogOffset {
+    LogOffset { segment, index }
 }
 
 pub(super) fn offset_pair(offset: LogOffset) -> (i64, i64) {
@@ -560,6 +601,7 @@ async fn log_write_a_cancelled_write_poisons_the_log_until_reopen() {
     let path = dir.path().join("graph.db");
     let path = path.to_str().unwrap();
     let (log, appended) = RecordingLog::new();
+    let log_id = log.log_id();
     let g = open_with::<FailingBackend>(path, Millis(1000), share(log)).await;
     g.backend.probe.hang_commit.store(true, Ordering::SeqCst);
 
@@ -579,13 +621,14 @@ async fn log_write_a_cancelled_write_poisons_the_log_until_reopen() {
         "a refused write appends nothing"
     );
 
-    // Act: reopen the same database on a fresh log.
+    // Act: reopen the same database on a fresh writer for the same log.
     drop(g);
-    let (fresh, _) = RecordingLog::new();
+    let (fresh, fresh_appended) = RecordingLog::restarted(log_id, head_of(&appended));
     let reopened = open_with::<DefaultBackend>(path, Millis(1000), share(fresh)).await;
 
-    // Assert
+    // Assert: the restarted log continues after the records already in it.
     assert!(reopened.insert(fact("next")).await.is_ok());
+    assert_eq!(head_of(&fresh_appended), Some(offset_at(0, 1)));
 }
 
 #[tokio::test]
@@ -702,6 +745,7 @@ async fn log_write_a_void_double_fault_poisons_the_log_until_reopen() {
     let path = dir.path().join("graph.db");
     let path = path.to_str().unwrap();
     let (log, appended) = RecordingLog::over(FailingLogWriter::fail_on_nth(2));
+    let log_id = log.log_id();
     let g = open_with::<FailingBackend>(path, Millis(1000), share(log)).await;
     g.backend.set_fail_on_execute(0);
 
@@ -726,13 +770,14 @@ async fn log_write_a_void_double_fault_poisons_the_log_until_reopen() {
     assert_eq!(count(&g, "nodes").await, 0);
     assert_eq!(count(&g, "log_hash_index").await, 0);
 
-    // Act: reopen the same database on a fresh writer.
+    // Act: reopen the same database on a fresh writer for the same log.
     drop(g);
-    let (fresh, _) = RecordingLog::new();
+    let (fresh, fresh_appended) = RecordingLog::restarted(log_id, head_of(&appended));
     let reopened = open_with::<DefaultBackend>(path, Millis(1000), share(fresh)).await;
 
-    // Assert
+    // Assert: the restarted log continues after the records already in it.
     assert!(reopened.insert(fact("second")).await.is_ok());
+    assert_eq!(head_of(&fresh_appended), Some(offset_at(0, 1)));
 }
 
 // ---- the remaining write paths: upsert_by, supersede, relate, ingest_episode ----

@@ -21,33 +21,28 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use liam_log::dedup::{find_first_write, HashBloom, HashIndex, IndexedWrite, PreCheck};
+use liam_log::dedup::{
+    find_first_write, BloomConfig, HashBloom, HashIndex, IndexedWrite, PreCheck,
+};
 use liam_log::event::{LogEvent, LogPayload};
 use liam_log::hash::content_hashes;
 use liam_log::{LogOffset, LogWriter};
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
+use super::log_cursor;
 use super::logged_plan::{Dedup, Plan, Table};
 use super::projection::{apply_steps, Step};
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{EdgeId, Millis, NodeId};
-use crate::value::Value;
 
 const HASH_INDEX_UPSERT_SQL: &str =
     "INSERT INTO log_hash_index (content_hash, first_event_id, row_ids)
      VALUES (?1, ?2, ?3)
      ON CONFLICT(content_hash) DO UPDATE SET
        first_event_id = excluded.first_event_id, row_ids = excluded.row_ids";
-
-// log_id is written once and never overwritten, so a database opened against a
-// different log stays recognisable.
-const CURSOR_UPSERT_SQL: &str = "INSERT INTO log_cursor (id, log_id, last_segment, last_index)
-     VALUES (1, ?1, ?2, ?3)
-     ON CONFLICT(id) DO UPDATE SET
-       last_segment = excluded.last_segment, last_index = excluded.last_index";
 
 pub(super) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -61,6 +56,9 @@ pub(super) fn ready<'a>(plan: Result<Plan>) -> BoxFuture<'a, Result<Plan>> {
 pub struct EventLog {
     writer: Box<dyn LogWriter>,
     bloom: HashBloom,
+    /// What the operator asked for, kept apart from `bloom`'s own sizing so a
+    /// rebuild that grew the filter does not raise the floor for the next one.
+    configured: BloomConfig,
     poisoned: bool,
 }
 
@@ -68,9 +66,33 @@ impl EventLog {
     pub fn new(writer: Box<dyn LogWriter>, bloom: HashBloom) -> Self {
         Self {
             writer,
+            configured: bloom.config().clone(),
             bloom,
             poisoned: false,
         }
+    }
+
+    pub(super) fn log_id(&self) -> Uuid {
+        self.writer.log_id()
+    }
+
+    pub(super) fn head(&self) -> Option<LogOffset> {
+        self.writer.head()
+    }
+
+    /// The sizing the filter was configured with, not the size of the live
+    /// filter, which a rebuild may have grown past it.
+    pub(super) fn bloom_config(&self) -> &BloomConfig {
+        &self.configured
+    }
+
+    pub(super) fn replace_bloom(&mut self, bloom: HashBloom) {
+        self.bloom = bloom;
+    }
+
+    #[cfg(test)]
+    pub(super) fn live_bloom_config(&self) -> &BloomConfig {
+        self.bloom.config()
     }
 
     #[cfg(test)]
@@ -198,8 +220,7 @@ impl<B: Backend> Graph<B> {
         let projected = async {
             apply_steps(&mut *tx, steps).await?;
             index_rows(&mut *tx, &carried, &event_id).await?;
-            let moved = cursor_params(held.log_id, offset);
-            tx.execute(CURSOR_UPSERT_SQL, &moved).await?;
+            log_cursor::advance_in_tx(&mut *tx, held.log_id, offset).await?;
             Ok(())
         }
         .await;
@@ -222,10 +243,7 @@ impl<B: Backend> Graph<B> {
     async fn void_failed_write(&self, held: &mut HeldLog, void: LogEvent) {
         match held.append(void).await {
             Ok(offset) => {
-                let moved = self
-                    .backend
-                    .execute(CURSOR_UPSERT_SQL, &cursor_params(held.log_id, offset))
-                    .await;
+                let moved = log_cursor::advance(&self.backend, held.log_id, offset).await;
                 if let Err(error) = moved {
                     tracing::warn!(%error, "voided write logged but the cursor did not advance");
                 }
@@ -460,14 +478,6 @@ async fn index_rows(
         .await?;
     }
     Ok(())
-}
-
-fn cursor_params(log_id: Uuid, offset: LogOffset) -> [Value; 3] {
-    [
-        log_id.to_string().into(),
-        (offset.segment as i64).into(),
-        (offset.index as i64).into(),
-    ]
 }
 
 async fn commit_or_abandon<T>(tx: Box<dyn BackendTx + '_>, applied: Result<T>) -> Result<T> {

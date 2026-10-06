@@ -26,6 +26,8 @@ use crate::types::{
 };
 use crate::value::{Row, Value};
 
+mod log_cursor;
+mod log_open;
 mod logged_plan;
 mod logged_write;
 mod projection;
@@ -554,10 +556,13 @@ impl<B: Backend> Graph<B> {
     /// Routes `insert`, `upsert_by`, `supersede`, `relate`, and `ingest_episode`
     /// through `log`: each is appended to it before it is applied. `link` and
     /// `gc` do not append yet. Without a log, every write is unlogged.
+    ///
+    /// Refuses a log the store does not belong to (`LogIdMismatch`) and a store
+    /// ahead of the log (`CursorBeyondLog`), then rebuilds the log's dedup
+    /// filter from `log_hash_index` so a hash written before this process
+    /// started is deduplicated.
     pub async fn with_log(mut self, log: SharedLog) -> Result<Self> {
-        // Seam: checking `log`'s id against the database's `log_cursor` and
-        // rebuilding its bloom filter from `log_hash_index` land here, so a
-        // hash written before this process started is deduplicated.
+        log_open::check_and_prime(&self.backend, &log).await?;
         self.log = Some(log);
         Ok(self)
     }
@@ -2146,6 +2151,7 @@ mod tests {
     use tempfile::TempDir;
 
     mod backwards_clock;
+    mod log_open;
     mod log_write;
     mod log_write_faults;
 
