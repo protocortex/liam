@@ -2644,6 +2644,7 @@ name = "liam-log"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "crc32fast",
  "fastbloom",
  "object_store",

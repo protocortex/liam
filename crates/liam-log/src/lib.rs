@@ -6,6 +6,7 @@
 //! the immutable record those are rebuilt from, so a write-ahead log and its
 //! compacted Parquet segments outlive any change to the derived schema.
 
+pub mod dedup;
 pub mod event;
 pub mod hash;
 pub mod wal;
@@ -250,6 +251,9 @@ pub mod test_support {
 
 #[cfg(test)]
 pub(crate) mod fixtures {
+    use sha2::{Digest, Sha256};
+
+    use crate::dedup::{BloomConfig, HashBloom};
     use crate::event::{
         LogEvent, LogPayload, TombstoneTable, TombstoneTarget, CURRENT_SCHEMA_VERSION,
     };
@@ -270,6 +274,26 @@ pub(crate) mod fixtures {
                 id: format!("node-{index:03}"),
             }]),
         }
+    }
+
+    pub(crate) fn sample_hash(index: u32) -> [u8; 32] {
+        Sha256::digest(index.to_le_bytes()).into()
+    }
+
+    pub(crate) fn sample_hashes(range: std::ops::Range<u32>) -> Vec<[u8; 32]> {
+        range.map(sample_hash).collect()
+    }
+
+    pub(crate) fn small_config() -> BloomConfig {
+        BloomConfig::new(5_000, 0.01).expect("valid config")
+    }
+
+    pub(crate) fn filter_with(config: BloomConfig, hashes: &[[u8; 32]]) -> HashBloom {
+        let mut filter = HashBloom::new(config);
+        for hash in hashes {
+            filter.insert(hash);
+        }
+        filter
     }
 }
 
