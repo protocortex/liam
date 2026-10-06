@@ -5,7 +5,8 @@
 //! Parquet files are keyed by the WAL segment sequence, so the file for a
 //! segment is deterministic and a re-run overwrites it instead of duplicating.
 //! A segment is removed only after its Parquet object has been read back and
-//! checked, and the directory entry removal has reached disk.
+//! checked, and the directory entry removal has reached disk. After a crash,
+//! `Compactor::recover` finishes whatever a previous run left behind.
 
 use std::fs::{self, File};
 use std::io::ErrorKind;
@@ -101,6 +102,8 @@ pub enum CompactError {
     },
     #[error("{} is not a wal segment name", segment.display())]
     NotASegment { segment: PathBuf },
+    #[error("wal segment {} is empty and was kept", segment.display())]
+    EmptySegment { segment: PathBuf },
 }
 
 /// Matches the WAL segment stem so a segment and its file pair up by name.
@@ -319,17 +322,121 @@ pub enum Compaction {
     AlreadyCompacted,
 }
 
+/// Deletes a compacted WAL segment. A seam so tests can fail the delete
+/// between the verified Parquet and the removal.
+pub trait SegmentRemover: Send + Sync {
+    fn remove(&self, segment: &Path) -> std::io::Result<()>;
+}
+
+/// Removes the segment and syncs its directory so the removal survives a crash.
+pub struct DurableRemover;
+
+impl SegmentRemover for DurableRemover {
+    fn remove(&self, segment: &Path) -> std::io::Result<()> {
+        fs::remove_file(segment)?;
+        File::open(sync_dir_for(segment))?.sync_all()
+    }
+}
+
+/// A segment that recovery left on disk, and why.
+#[derive(Debug)]
+pub struct SegmentFailure {
+    pub sequence: u64,
+    pub error: CompactError,
+}
+
+/// What `Compactor::recover` did, by segment sequence in ascending order.
+#[derive(Debug, Default)]
+pub struct RecoveryReport {
+    /// No Parquet existed: one was written and the segment removed.
+    pub compacted: Vec<u64>,
+    /// A Parquet that verifies already existed, so only the segment was removed.
+    pub removed_as_done: Vec<u64>,
+    /// A Parquet existed but did not verify: it was rewritten, then the segment removed.
+    pub rewritten: Vec<u64>,
+    /// Segments kept on disk because they could not be compacted.
+    pub failed: Vec<SegmentFailure>,
+}
+
+enum Recovered {
+    Compacted,
+    RemovedAsDone,
+    Rewritten,
+}
+
 /// Turns closed WAL segments into Parquet objects.
 ///
 /// The store must be rooted at the WAL directory so a segment and its Parquet
 /// object sit side by side.
 pub struct Compactor {
     store: Arc<dyn ObjectStore>,
+    remover: Arc<dyn SegmentRemover>,
 }
 
 impl Compactor {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            remover: Arc::new(DurableRemover),
+        }
+    }
+
+    pub fn with_remover(mut self, remover: Arc<dyn SegmentRemover>) -> Self {
+        self.remover = remover;
+        self
+    }
+
+    /// Compacts every segment left behind by an earlier run, except the
+    /// highest-numbered one, which the writer holds open.
+    ///
+    /// Run it after the writer has opened the directory. A segment whose
+    /// Parquet already verifies is only removed; one with a Parquet that does
+    /// not verify is rewritten first. A segment that cannot be compacted is
+    /// kept and reported without stopping the others.
+    pub async fn recover(&self, dir: &Path) -> Result<RecoveryReport, CompactError> {
+        let mut segments = segment_paths(dir).map_err(WalError::Io)?;
+        let open = segments.pop();
+        tracing::info!(
+            stranded = segments.len(),
+            open = open.as_ref().map(|(sequence, _)| *sequence),
+            "recovering wal segments"
+        );
+        let mut report = RecoveryReport::default();
+        for (sequence, path) in segments {
+            match self.recover_segment(&path, sequence).await {
+                Ok(Some(Recovered::Compacted)) => report.compacted.push(sequence),
+                Ok(Some(Recovered::RemovedAsDone)) => report.removed_as_done.push(sequence),
+                Ok(Some(Recovered::Rewritten)) => report.rewritten.push(sequence),
+                Ok(None) => tracing::debug!(sequence, "segment vanished before recovery"),
+                Err(error) => {
+                    tracing::error!(sequence, %error, "segment recovery failed, segment kept");
+                    report.failed.push(SegmentFailure { sequence, error });
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// `None` when the segment is gone. A Parquet that reads back with the
+    /// segment's event count is trusted; anything else is replaced.
+    async fn recover_segment(
+        &self,
+        segment: &Path,
+        sequence: u64,
+    ) -> Result<Option<Recovered>, CompactError> {
+        let Some(events) = read_closed_segment(segment)? else {
+            return Ok(None);
+        };
+        let recovered = match read_parquet(self.store.as_ref(), sequence).await {
+            Ok(stored) if stored.len() == events.len() => {
+                self.remove(segment)?;
+                return Ok(Some(Recovered::RemovedAsDone));
+            }
+            Err(CompactError::Store(object_store::Error::NotFound { .. })) => Recovered::Compacted,
+            _ => Recovered::Rewritten,
+        };
+        self.publish(segment, sequence, &events).await?;
+        Ok(Some(recovered))
     }
 
     /// A compactor over the WAL directory itself, fsyncing every object it writes.
@@ -353,7 +460,19 @@ impl Compactor {
         let Some(events) = read_closed_segment(segment)? else {
             return Ok(Compaction::AlreadyCompacted);
         };
-        write_parquet(self.store.as_ref(), sequence, &events).await?;
+        self.publish(segment, sequence, &events).await?;
+        Ok(Compaction::Compacted)
+    }
+
+    /// Writes the Parquet, checks it reads back with the same event count, and
+    /// only then removes the segment.
+    async fn publish(
+        &self,
+        segment: &Path,
+        sequence: u64,
+        events: &[LogEvent],
+    ) -> Result<(), CompactError> {
+        write_parquet(self.store.as_ref(), sequence, events).await?;
         let stored = read_parquet(self.store.as_ref(), sequence).await?;
         if stored.len() != events.len() {
             return Err(CompactError::ReadBackMismatch {
@@ -362,8 +481,16 @@ impl Compactor {
                 found: stored.len(),
             });
         }
-        remove_durably(segment)?;
-        Ok(Compaction::Compacted)
+        self.remove(segment)
+    }
+
+    fn remove(&self, segment: &Path) -> Result<(), CompactError> {
+        self.remover
+            .remove(segment)
+            .map_err(|source| CompactError::Remove {
+                segment: segment.to_path_buf(),
+                source,
+            })
     }
 
     /// Compacts every notified segment until all senders are gone, then stops.
@@ -407,12 +534,20 @@ fn ensure_closed(segment: &Path, sequence: u64) -> Result<(), CompactError> {
 }
 
 /// Reads every event of a closed segment; `None` when the segment is gone.
+///
+/// The writer only closes a segment after appending to it, so an empty one is
+/// damage and is kept rather than turned into an empty Parquet.
 fn read_closed_segment(segment: &Path) -> Result<Option<Vec<LogEvent>>, CompactError> {
     let bytes = match fs::read(segment) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(WalError::Io(error).into()),
     };
+    if bytes.is_empty() {
+        return Err(CompactError::EmptySegment {
+            segment: segment.to_path_buf(),
+        });
+    }
     let scan = scan_segment(segment, &bytes)?;
     // Only an open segment can have a torn tail, so any here is damage.
     if scan.valid_len != bytes.len() as u64 {
@@ -421,15 +556,6 @@ fn read_closed_segment(segment: &Path) -> Result<Option<Vec<LogEvent>>, CompactE
         });
     }
     Ok(Some(scan.events))
-}
-
-fn remove_durably(segment: &Path) -> Result<(), CompactError> {
-    fs::remove_file(segment)
-        .and_then(|()| File::open(sync_dir_for(segment))?.sync_all())
-        .map_err(|source| CompactError::Remove {
-            segment: segment.to_path_buf(),
-            source,
-        })
 }
 
 /// A `SegmentSink` that forwards closed-segment paths to a compactor task.
@@ -472,7 +598,7 @@ mod tests {
     use super::*;
     use crate::event::{RowEffect, TombstoneTable, TombstoneTarget};
     use crate::fixtures::{edge_row, event, frame_len, log_event, node_row, sample_hash};
-    use crate::wal::{segment_name, SystemClock, WalConfig, WalWriter};
+    use crate::wal::{segment_name, SystemClock, WalConfig, WalWriter, HEADER_BYTES};
     use crate::LogWriter;
 
     const ONE_MIB: usize = 1024 * 1024;
@@ -1341,5 +1467,357 @@ mod tests {
         );
         assert_bytes(&segment.path, &bytes, "damaged segment");
         assert_no_parquet(log.dir.path());
+    }
+
+    // Recovery and the remover seam
+
+    /// Fails the delete of the listed segments and removes the others.
+    struct FaultyRemover {
+        failing: Vec<PathBuf>,
+    }
+
+    impl SegmentRemover for FaultyRemover {
+        fn remove(&self, segment: &Path) -> std::io::Result<()> {
+            if self.failing.iter().any(|failing| failing == segment) {
+                return Err(std::io::Error::other("injected remove fault"));
+            }
+            DurableRemover.remove(segment)
+        }
+    }
+
+    fn compactor_failing_to_remove(dir: &Path, segments: &[&Path]) -> Compactor {
+        let failing = segments.iter().map(|path| path.to_path_buf()).collect();
+        local_compactor(dir).with_remover(Arc::new(FaultyRemover { failing }))
+    }
+
+    /// Every file in the directory with its bytes, to compare before and after.
+    fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        std::fs::read_dir(dir)
+            .expect("list dir")
+            .map(|entry| {
+                let entry = entry.expect("dir entry");
+                let name = entry.file_name().into_string().unwrap();
+                (name, std::fs::read(entry.path()).expect("read file"))
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn assert_report_is_empty(report: &RecoveryReport) {
+        assert!(report.compacted.is_empty(), "compacted {report:?}");
+        assert!(report.removed_as_done.is_empty(), "removed {report:?}");
+        assert!(report.rewritten.is_empty(), "rewritten {report:?}");
+        assert!(report.failed.is_empty(), "failed {report:?}");
+    }
+
+    #[tokio::test]
+    async fn remover_fault_after_the_put_leaves_the_parquet_and_the_wal_on_disk() {
+        // Arrange
+        let log = write_log(1);
+        let segment = &log.closed[0];
+        let wal_bytes = std::fs::read(&segment.path).expect("read segment");
+        let compactor = compactor_failing_to_remove(log.dir.path(), &[&segment.path]);
+
+        // Act
+        let outcome = compactor.compact_segment(&segment.path).await;
+
+        // Assert
+        assert!(
+            matches!(&outcome, Err(CompactError::Remove { segment: failed, .. }) if *failed == segment.path),
+            "outcome {outcome:?}"
+        );
+        assert_bytes(&segment.path, &wal_bytes, "wal segment");
+        assert_eq!(
+            file_names(log.dir.path(), ".parquet"),
+            expected_parquet_names(&[segment])
+        );
+        assert_parquet_holds(&local_store(&log.dir), segment).await;
+    }
+
+    #[tokio::test]
+    async fn task_keeps_compacting_after_a_remover_fault() {
+        // Arrange
+        let log = write_log(2);
+        let (faulted, later) = (&log.closed[0], &log.closed[1]);
+        let compactor = compactor_failing_to_remove(log.dir.path(), &[&faulted.path]);
+
+        // Act
+        compact_all(compactor, &[&faulted.path, &later.path]).await;
+
+        // Assert
+        assert!(faulted.path.exists(), "segment whose delete faulted");
+        assert!(!later.path.exists(), "segment notified after the fault");
+        assert_eq!(
+            file_names(log.dir.path(), ".parquet"),
+            expected_parquet_names(&[faulted, later])
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_after_a_remover_fault_completes_the_segment_with_one_parquet() {
+        // Arrange
+        let log = write_log(1);
+        let segment = &log.closed[0];
+        let faulting = compactor_failing_to_remove(log.dir.path(), &[&segment.path]);
+        let first = faulting.compact_segment(&segment.path).await;
+        assert!(
+            matches!(first, Err(CompactError::Remove { .. })),
+            "the first run must hit the injected fault: {first:?}"
+        );
+
+        // Act
+        let report = local_compactor(log.dir.path())
+            .recover(log.dir.path())
+            .await
+            .expect("recover");
+
+        // Assert
+        assert_eq!(report.removed_as_done, vec![segment.sequence]);
+        assert!(!segment.path.exists(), "wal segment is removed");
+        assert_eq!(
+            file_names(log.dir.path(), ".parquet"),
+            expected_parquet_names(&[segment])
+        );
+        assert_parquet_holds(&local_store(&log.dir), segment).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_compacts_every_segment_without_a_parquet_except_the_open_one() {
+        // Arrange
+        let log = write_log(3);
+        let open_bytes = std::fs::read(&log.open).expect("read open segment");
+        let finished = &log.closed[0];
+        let store = local_store(&log.dir);
+        write_parquet(&store, finished.sequence, &finished.events)
+            .await
+            .expect("earlier run wrote the parquet");
+        std::fs::remove_file(&finished.path).expect("earlier run removed the segment");
+
+        // Act
+        let report = local_compactor(log.dir.path())
+            .recover(log.dir.path())
+            .await
+            .expect("recover");
+
+        // Assert
+        assert_eq!(report.compacted, vec![1, 2]);
+        assert!(report.removed_as_done.is_empty(), "{report:?}");
+        assert!(report.rewritten.is_empty(), "{report:?}");
+        assert!(report.failed.is_empty(), "{report:?}");
+        let all: Vec<&ClosedSegment> = log.closed.iter().collect();
+        assert_eq!(
+            file_names(log.dir.path(), ".parquet"),
+            expected_parquet_names(&all)
+        );
+        assert_eq!(file_names(log.dir.path(), ".wal"), vec![segment_name(3)]);
+        assert_bytes(&log.open, &open_bytes, "open segment");
+        for segment in all {
+            assert_parquet_holds(&store, segment).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_only_removes_a_segment_whose_parquet_verifies() {
+        // Arrange
+        let log = write_log(1);
+        let segment = &log.closed[0];
+        let store = local_store(&log.dir);
+        write_parquet(&store, segment.sequence, &segment.events)
+            .await
+            .expect("crashed run wrote the parquet");
+        let parquet = log.dir.path().join(parquet_name(segment.sequence));
+        let parquet_bytes = std::fs::read(&parquet).expect("read parquet");
+
+        // Act
+        let report = local_compactor(log.dir.path())
+            .recover(log.dir.path())
+            .await
+            .expect("recover");
+
+        // Assert
+        assert_eq!(report.removed_as_done, vec![segment.sequence]);
+        assert!(report.compacted.is_empty(), "{report:?}");
+        assert!(report.rewritten.is_empty(), "{report:?}");
+        assert!(!segment.path.exists(), "wal segment is removed");
+        assert_bytes(&parquet, &parquet_bytes, "parquet that already verified");
+    }
+
+    #[tokio::test]
+    async fn recovery_rewrites_a_parquet_that_does_not_verify_before_removing_the_segment() {
+        // Arrange
+        let current = Some(CURRENT_SCHEMA_VERSION.to_string());
+        let truncated = {
+            let whole = forged_parquet(&[event(0), event(1)], current.clone(), 0, 2);
+            whole[..whole.len() / 2].to_vec()
+        };
+        let cases = [
+            ("truncated file", truncated),
+            (
+                "fewer rows than the segment",
+                forged_parquet(&[event(0)], current.clone(), 0, 1),
+            ),
+            (
+                "sequence stamp of another segment",
+                forged_parquet(&[event(0), event(1)], current.clone(), 9, 2),
+            ),
+            (
+                "event count stamp that disagrees with the rows",
+                forged_parquet(&[event(0), event(1)], current, 0, 5),
+            ),
+        ];
+
+        for (name, bad_parquet) in cases {
+            let log = write_log(1);
+            let segment = &log.closed[0];
+            let store = local_store(&log.dir);
+            put_bytes(&store, segment.sequence, bad_parquet).await;
+
+            // Act
+            let report = local_compactor(log.dir.path())
+                .recover(log.dir.path())
+                .await
+                .expect("recover");
+
+            // Assert
+            assert_eq!(
+                report.rewritten,
+                vec![segment.sequence],
+                "{name}: {report:?}"
+            );
+            assert!(report.compacted.is_empty(), "{name}: {report:?}");
+            assert!(report.removed_as_done.is_empty(), "{name}: {report:?}");
+            assert!(!segment.path.exists(), "{name}: wal segment is removed");
+            assert_parquet_holds(&store, segment).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_reports_each_unreadable_segment_keeps_it_and_compacts_the_rest() {
+        // Arrange
+        let log = write_log(5);
+        let (good_first, corrupt, empty, damaged_tail, good_last) = (
+            &log.closed[0],
+            &log.closed[1],
+            &log.closed[2],
+            &log.closed[3],
+            &log.closed[4],
+        );
+        let mut corrupt_bytes = std::fs::read(&corrupt.path).expect("read segment");
+        // A valid record follows the flipped byte, so this is mid-file damage.
+        corrupt_bytes[HEADER_BYTES + 1] ^= 0xFF;
+        std::fs::write(&corrupt.path, &corrupt_bytes).expect("corrupt the segment");
+        std::fs::write(&empty.path, b"").expect("empty the segment");
+        let mut tail_bytes = std::fs::read(&damaged_tail.path).expect("read segment");
+        *tail_bytes.last_mut().expect("segment is not empty") ^= 0xFF;
+        std::fs::write(&damaged_tail.path, &tail_bytes).expect("damage the last record");
+
+        // Act
+        let report = local_compactor(log.dir.path())
+            .recover(log.dir.path())
+            .await
+            .expect("recover");
+
+        // Assert
+        assert_eq!(
+            report.compacted,
+            vec![good_first.sequence, good_last.sequence]
+        );
+        let failed: Vec<u64> = report.failed.iter().map(|f| f.sequence).collect();
+        assert_eq!(
+            failed,
+            vec![corrupt.sequence, empty.sequence, damaged_tail.sequence]
+        );
+        assert!(
+            matches!(&report.failed[0].error, CompactError::Wal(WalError::Corrupt { segment, .. }) if *segment == corrupt.path),
+            "{:?}",
+            report.failed[0]
+        );
+        assert!(
+            matches!(&report.failed[1].error, CompactError::EmptySegment { segment } if *segment == empty.path),
+            "{:?}",
+            report.failed[1]
+        );
+        assert!(
+            matches!(&report.failed[2].error, CompactError::IncompleteSegment { segment } if *segment == damaged_tail.path),
+            "{:?}",
+            report.failed[2]
+        );
+        assert_bytes(&corrupt.path, &corrupt_bytes, "corrupt segment");
+        assert_bytes(&empty.path, b"", "empty segment");
+        assert_bytes(&damaged_tail.path, &tail_bytes, "damaged tail segment");
+        assert_eq!(
+            file_names(log.dir.path(), ".parquet"),
+            expected_parquet_names(&[good_first, good_last])
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_never_touches_the_highest_wal_even_when_a_parquet_exists_for_it() {
+        // Arrange
+        let log = write_log(1);
+        let open_sequence = 1;
+        let store = local_store(&log.dir);
+        write_parquet(&store, open_sequence, &[event(2)])
+            .await
+            .expect("parquet for the open segment");
+        let open_bytes = std::fs::read(&log.open).expect("read open segment");
+        let parquet = log.dir.path().join(parquet_name(open_sequence));
+        let parquet_bytes = std::fs::read(&parquet).expect("read parquet");
+
+        // Act
+        let report = local_compactor(log.dir.path())
+            .recover(log.dir.path())
+            .await
+            .expect("recover");
+
+        // Assert
+        assert_eq!(report.compacted, vec![0]);
+        assert!(report.removed_as_done.is_empty(), "{report:?}");
+        assert!(report.rewritten.is_empty(), "{report:?}");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_bytes(&log.open, &open_bytes, "open segment");
+        assert_bytes(&parquet, &parquet_bytes, "parquet of the open segment");
+    }
+
+    #[tokio::test]
+    async fn recovery_with_only_the_open_segment_changes_nothing() {
+        // Arrange
+        let log = write_log(0);
+        let before = snapshot(log.dir.path());
+
+        // Act
+        let report = local_compactor(log.dir.path())
+            .recover(log.dir.path())
+            .await
+            .expect("recover");
+
+        // Assert
+        assert_report_is_empty(&report);
+        assert_eq!(snapshot(log.dir.path()), before);
+    }
+
+    #[tokio::test]
+    async fn running_recovery_twice_changes_nothing_the_second_time() {
+        // Arrange
+        let log = write_log(3);
+        let compactor = local_compactor(log.dir.path());
+        let first = compactor.recover(log.dir.path()).await.expect("recover");
+        assert_eq!(
+            first.compacted,
+            vec![0, 1, 2],
+            "the first run does the work"
+        );
+        let after_first = snapshot(log.dir.path());
+
+        // Act
+        let second = compactor
+            .recover(log.dir.path())
+            .await
+            .expect("recover again");
+
+        // Assert
+        assert_report_is_empty(&second);
+        assert_eq!(snapshot(log.dir.path()), after_first);
     }
 }

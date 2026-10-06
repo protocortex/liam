@@ -12,8 +12,8 @@
 //!
 //! The writer owns rotation so a segment is only ever read by others once it
 //! is closed; callers serialize appends themselves. Segments closed before a
-//! crash are not announced again after a reopen: recovering them is added by
-//! a later change.
+//! crash are not announced again after a reopen: `Compactor::recover` finds
+//! them by scanning the directory.
 //!
 //! Known limitation: the time rotation timer is not persisted, so it restarts
 //! on every reopen.
@@ -82,7 +82,7 @@ impl RotationClock for SystemClock {
 /// never reads a segment that is still being appended to.
 ///
 /// A segment closed before a crash is not announced again after a reopen;
-/// recovering those is added by a later change.
+/// `Compactor::recover` finds those by scanning the directory.
 pub trait SegmentSink: Send + Sync {
     fn segment_closed(&self, path: &Path);
 }
