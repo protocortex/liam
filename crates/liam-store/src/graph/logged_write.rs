@@ -7,24 +7,27 @@
 //! The log cursor tracks the last log record the store has accounted for,
 //! whether that record was applied or voided. A write that is appended but
 //! cannot be projected is cancelled with a `Voided` record, and the cursor
-//! moves onto the void only if that append succeeds. If it does not, the log
-//! holds a write the store never applied and cannot be reconciled in this
-//! process, so the log is poisoned until the store is reopened.
+//! moves onto the void only if that append succeeds.
+//!
+//! The log is poisoned from the moment an append starts until the write is
+//! reconciled, meaning committed or voided. A write that never reaches that
+//! point, because its future was dropped, a task panicked, or the void could
+//! not be appended, leaves the log poisoned, and it stays so until the store is
+//! reopened and the log replayed.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use liam_log::dedup::{
-    find_first_write, BloomConfig, HashBloom, HashIndex, IndexedWrite, PreCheck,
-};
+use liam_log::dedup::{find_first_write, HashBloom, HashIndex, IndexedWrite, PreCheck};
 use liam_log::event::{LogEvent, LogPayload, NodeRow, CURRENT_SCHEMA_VERSION};
 use liam_log::hash::node_row_hash;
 use liam_log::{LogOffset, LogWriter};
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
-use super::{opt_text, Graph, SharedLog};
+use super::{node_row_insert, resolve_node_row, Graph};
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{Millis, NodeId, FOREVER};
@@ -44,6 +47,34 @@ const CURSOR_UPSERT_SQL: &str = "INSERT INTO log_cursor (id, log_id, last_segmen
      ON CONFLICT(id) DO UPDATE SET
        last_segment = excluded.last_segment, last_index = excluded.last_index";
 
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The log a `Graph` appends to, with the dedup filter and poison flag that
+/// go with it. Graphs that share one `SharedLog` share all three.
+pub struct EventLog {
+    writer: Box<dyn LogWriter>,
+    bloom: HashBloom,
+    poisoned: bool,
+}
+
+impl EventLog {
+    pub fn new(writer: Box<dyn LogWriter>, bloom: HashBloom) -> Self {
+        Self {
+            writer,
+            bloom,
+            poisoned: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn bloom_might_contain(&self, hash: &[u8; 32]) -> bool {
+        self.bloom.might_contain(hash)
+    }
+}
+
+/// One lock orders every append against the commit that follows it.
+pub type SharedLog = Arc<tokio::sync::Mutex<EventLog>>;
+
 /// What a logged node write did.
 pub(super) enum Logged {
     /// The row was projected; the caller's id is the node's id.
@@ -52,108 +83,113 @@ pub(super) enum Logged {
     Duplicate(NodeId),
 }
 
-/// The log a `Graph` appends to, plus the state that goes with it.
-pub(super) struct LogState {
-    writer: SharedLog,
-    bloom: StdMutex<HashBloom>,
-    poisoned: AtomicBool,
-}
-
-impl LogState {
-    pub(super) fn new(writer: SharedLog) -> Self {
-        Self {
-            writer,
-            bloom: StdMutex::new(bloom_for_open()),
-            poisoned: AtomicBool::new(false),
-        }
-    }
-
-    fn refuse_if_poisoned(&self) -> Result<()> {
-        if self.poisoned.load(Ordering::SeqCst) {
-            return Err(Error::LogPoisoned);
-        }
-        Ok(())
-    }
-
-    fn poison(&self) {
-        self.poisoned.store(true, Ordering::SeqCst);
-    }
-
-    fn remember(&self, hash: &[u8; 32]) {
-        self.bloom
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(hash);
-    }
-}
-
-/// The filter a graph starts with. The open-time rebuild from `log_hash_index`
-/// belongs here: until it exists, a hash written before this process started
-/// is not pre-checked, so such a duplicate is stored rather than deduplicated.
-fn bloom_for_open() -> HashBloom {
-    HashBloom::new(BloomConfig::default())
+/// What a projection changed, for the log's bookkeeping after the commit.
+#[derive(Default)]
+struct RowEffects {
+    /// Content hashes the dedup filter must now know.
+    hashes: Vec<[u8; 32]>,
 }
 
 impl<B: Backend> Graph<B> {
-    /// Logs and projects one node: dedup against the log's live carriers, then
-    /// append, project, and commit under the log lock. The vector write stays
-    /// with the caller because it takes the write lock the transaction holds.
+    /// Logs and projects one node. The vector write stays with the caller
+    /// because it takes the write lock the transaction holds.
     pub(super) async fn insert_node_logged(
         &self,
-        log: &LogState,
+        log: &SharedLog,
         id: &NodeId,
         node: &NewNode,
         now: Millis,
     ) -> Result<Logged> {
-        let pending = PendingNode::resolve(id, node, now)?;
-        let mut held = HeldLog::acquire(&log.writer).await;
-        log.refuse_if_poisoned()?;
-        let mut tx = self.backend.begin().await?;
-        match live_duplicate(&mut *tx, &log.bloom, &pending.hash).await {
-            Ok(Some(first)) => self.record_duplicate(tx, &mut held, &pending, first).await,
-            Ok(None) => self.record_write(log, tx, held, pending).await,
-            Err(error) => {
-                abandon(tx).await;
-                Err(error)
-            }
-        }
+        let row = resolve_node_row(id, node, now)?;
+        let event = node_write_event(&row, now);
+        let hash = event.content_hash;
+        self.transact(log, event, true, move |tx, event_id, _| {
+            Box::pin(async move {
+                let (sql, params) = node_row_insert(&row);
+                tx.execute(&sql, &params).await?;
+                index_hash(tx, &hash, &row.id, event_id).await?;
+                Ok(RowEffects { hashes: vec![hash] })
+            })
+        })
+        .await
     }
 
-    async fn record_duplicate(
+    /// The one path every logged write takes: poison check, log lock, `begin`,
+    /// then append, project, and commit. With `dedup`, content that already has
+    /// a live carrier is logged as a `DuplicateOf` instead of projected.
+    async fn transact<F>(
+        &self,
+        log: &SharedLog,
+        event: LogEvent,
+        dedup: bool,
+        project: F,
+    ) -> Result<Logged>
+    where
+        F: for<'t> FnOnce(
+                &'t mut dyn BackendTx,
+                &'t str,
+                LogOffset,
+            ) -> BoxFuture<'t, Result<RowEffects>>
+            + Send,
+    {
+        let mut held = HeldLog::acquire(log).await?;
+        let mut tx = self.backend.begin().await?;
+        tracing::debug!(event = %event.event_id, "log lock taken, transaction open");
+        if dedup {
+            match live_duplicate(
+                &mut *tx,
+                held.might_contain(&event.content_hash),
+                &event.content_hash,
+            )
+            .await
+            {
+                Ok(Some(first)) => {
+                    let duplicate = follow_up(
+                        &event,
+                        LogPayload::DuplicateOf {
+                            first_event_id: first.event_id,
+                        },
+                    );
+                    self.append_and_commit(tx, &mut held, duplicate, |_, _, _| {
+                        Box::pin(async { Ok(RowEffects::default()) })
+                    })
+                    .await?;
+                    return Ok(Logged::Duplicate(first.row_id));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    abandon(tx).await;
+                    return Err(error);
+                }
+            }
+        }
+        self.append_and_commit(tx, &mut held, event, project)
+            .await?;
+        Ok(Logged::Written)
+    }
+
+    async fn append_and_commit<F>(
         &self,
         mut tx: Box<dyn BackendTx + '_>,
         held: &mut HeldLog,
-        pending: &PendingNode,
-        first: Carrier,
-    ) -> Result<Logged> {
-        let event = pending.event(LogPayload::DuplicateOf {
-            first_event_id: first.event_id,
-        });
-        let offset = match held.append(event).await {
-            Ok(offset) => offset,
-            Err(error) => {
-                abandon(tx).await;
-                return Err(error);
-            }
-        };
-        let moved = advance_cursor(&mut *tx, held.log_id, offset).await;
-        commit_or_abandon(tx, moved).await?;
-        tracing::debug!(
-            node = first.row_id.as_str(),
-            "duplicate write logged, no row written"
-        );
-        Ok(Logged::Duplicate(first.row_id))
-    }
-
-    async fn record_write(
-        &self,
-        log: &LogState,
-        mut tx: Box<dyn BackendTx + '_>,
-        mut held: HeldLog,
-        pending: PendingNode,
-    ) -> Result<Logged> {
-        let event = pending.event(LogPayload::NodeWrite(pending.row.clone()));
+        event: LogEvent,
+        project: F,
+    ) -> Result<()>
+    where
+        F: for<'t> FnOnce(
+                &'t mut dyn BackendTx,
+                &'t str,
+                LogOffset,
+            ) -> BoxFuture<'t, Result<RowEffects>>
+            + Send,
+    {
         let event_id = event.event_id.clone();
+        let void = follow_up(
+            &event,
+            LogPayload::Voided {
+                target_event_id: event_id.clone(),
+            },
+        );
         let offset = match held.append(event).await {
             Ok(offset) => offset,
             Err(error) => {
@@ -161,31 +197,30 @@ impl<B: Backend> Graph<B> {
                 return Err(error);
             }
         };
-        tracing::debug!(node = %pending.row.id, %event_id, "node write appended to the log");
-        let projected = project_node(&mut *tx, &pending, &event_id, held.log_id, offset).await;
+        tracing::debug!(%event_id, "event appended to the log");
+        let projected = async {
+            let effects = project(&mut *tx, &event_id, offset).await?;
+            let moved = cursor_params(held.log_id, offset);
+            tx.execute(CURSOR_UPSERT_SQL, &moved).await?;
+            Ok(effects)
+        }
+        .await;
         match commit_or_abandon(tx, projected).await {
-            Ok(()) => {
-                log.remember(&pending.hash);
-                Ok(Logged::Written)
+            Ok(effects) => {
+                held.reconcile(&effects.hashes);
+                tracing::debug!(%event_id, "projection committed");
+                Ok(())
             }
             Err(error) => {
-                self.void_failed_write(log, &mut held, &pending, event_id)
-                    .await;
+                self.void_failed_write(held, void).await;
                 Err(error)
             }
         }
     }
 
     /// Cancels an appended write the store failed to apply. Never fails: if
-    /// the void cannot be appended the log is poisoned instead.
-    async fn void_failed_write(
-        &self,
-        log: &LogState,
-        held: &mut HeldLog,
-        pending: &PendingNode,
-        target_event_id: String,
-    ) {
-        let void = pending.event(LogPayload::Voided { target_event_id });
+    /// the void cannot be appended the log stays poisoned instead.
+    async fn void_failed_write(&self, held: &mut HeldLog, void: LogEvent) {
         match held.append(void).await {
             Ok(offset) => {
                 let moved = self
@@ -193,109 +228,67 @@ impl<B: Backend> Graph<B> {
                     .execute(CURSOR_UPSERT_SQL, &cursor_params(held.log_id, offset))
                     .await;
                 if let Err(error) = moved {
-                    tracing::warn!(node = %pending.row.id, %error, "voided write logged but the cursor did not advance");
+                    tracing::warn!(%error, "voided write logged but the cursor did not advance");
                 }
+                held.reconcile(&[]);
             }
             Err(error) => {
-                log.poison();
-                tracing::error!(node = %pending.row.id, %error, "could not void a failed write, the log is poisoned until reopen");
+                held.set_poisoned(true);
+                tracing::error!(%error, "could not void a failed write, the log is poisoned until reopen");
             }
         }
     }
 }
 
-/// A node resolved to the row the store will hold, with its content hash.
-struct PendingNode {
-    row: NodeRow,
-    hash: [u8; 32],
-    now: Millis,
-}
-
-impl PendingNode {
-    fn resolve(id: &NodeId, node: &NewNode, now: Millis) -> Result<Self> {
-        let row = resolve_node_row(id, node, now)?;
-        let hash = node_row_hash(&row);
-        Ok(Self { row, hash, now })
-    }
-
-    /// The log record around `payload`: the row's producer is the source, its
-    /// confidence the trust, and its valid time the observation time.
-    fn event(&self, payload: LogPayload) -> LogEvent {
-        LogEvent {
-            event_id: Uuid::now_v7().to_string(),
-            content_hash: self.hash,
-            source: self.row.producer.clone(),
-            trust_score: self.row.confidence,
-            observed_at: self.row.valid_from,
-            ingested_at: self.now.0,
-            encryption_key_id: None,
-            schema_version: CURRENT_SCHEMA_VERSION,
-            payload,
-        }
+/// The log record for a new node: the row's producer is the source, its
+/// confidence the trust, and its valid time the observation time.
+fn node_write_event(row: &NodeRow, now: Millis) -> LogEvent {
+    LogEvent {
+        event_id: Uuid::now_v7().to_string(),
+        content_hash: node_row_hash(row),
+        source: row.producer.clone(),
+        trust_score: row.confidence,
+        observed_at: row.valid_from,
+        ingested_at: now.0,
+        encryption_key_id: None,
+        schema_version: CURRENT_SCHEMA_VERSION,
+        payload: LogPayload::NodeWrite(row.clone()),
     }
 }
 
-/// The row a `NewNode` becomes once ids and times are minted and its scope and
-/// attributes are in stored form. The log hashes and stores this, never the
-/// raw request.
-pub(super) fn resolve_node_row(id: &NodeId, node: &NewNode, now: Millis) -> Result<NodeRow> {
-    Ok(NodeRow {
-        id: id.as_str().to_string(),
-        kind: node.kind.clone(),
-        label: node.label.clone(),
-        content: node.content.clone(),
-        producer: node.producer.clone(),
-        attributes: serde_json::to_string(&node.attributes)?,
-        scope: node.scope.clone(),
-        subject: node.subject.clone(),
-        confidence: node.confidence,
-        valid_from: node.valid_from.unwrap_or(now).0,
-        valid_from_supplied: node.valid_from.is_some(),
-        valid_until: FOREVER.0,
-        tx_from: now.0,
-        tx_to: FOREVER.0,
-    })
+/// A record about `event`, carrying its own source, trust, and times.
+fn follow_up(event: &LogEvent, payload: LogPayload) -> LogEvent {
+    LogEvent {
+        event_id: Uuid::now_v7().to_string(),
+        content_hash: event.content_hash,
+        source: event.source.clone(),
+        trust_score: event.trust_score,
+        observed_at: event.observed_at,
+        ingested_at: event.ingested_at,
+        encryption_key_id: event.encryption_key_id.clone(),
+        schema_version: event.schema_version,
+        payload,
+    }
 }
 
-pub(super) fn node_row_insert(row: &NodeRow) -> (String, Vec<Value>) {
-    let sql = "INSERT INTO nodes
-         (id, kind, label, content, producer, attributes, scope, subject, confidence,
-          valid_from, valid_until, tx_from, tx_to)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
-        .to_string();
-    let params = vec![
-        row.id.clone().into(),
-        row.kind.clone().into(),
-        row.label.clone().into(),
-        row.content.clone().into(),
-        row.producer.clone().into(),
-        row.attributes.clone().into(),
-        opt_text(row.scope.clone()),
-        opt_text(row.subject.clone()),
-        Value::Real(row.confidence),
-        row.valid_from.into(),
-        row.valid_until.into(),
-        row.tx_from.into(),
-        row.tx_to.into(),
-    ];
-    (sql, params)
-}
-
-/// The log writer, locked for the whole transaction. `append` blocks on fsync,
-/// so it runs on the blocking pool with the guard moved in and back out.
+/// The log lock, held for the whole transaction. `append` blocks on fsync, so
+/// it runs on the blocking pool with the guard moved in and back out.
 struct HeldLog {
-    guard: Option<OwnedMutexGuard<Box<dyn LogWriter>>>,
+    guard: Option<OwnedMutexGuard<EventLog>>,
     log_id: Uuid,
 }
 
 impl HeldLog {
-    async fn acquire(writer: &SharedLog) -> Self {
-        let guard = Arc::clone(writer).lock_owned().await;
-        let log_id = guard.log_id();
-        Self {
+    async fn acquire(log: &SharedLog) -> Result<Self> {
+        let guard = Arc::clone(log).lock_owned().await;
+        if guard.poisoned {
+            return Err(Error::LogPoisoned);
+        }
+        let log_id = guard.writer.log_id();
+        Ok(Self {
             guard: Some(guard),
             log_id,
-        }
+        })
     }
 
     async fn append(&mut self, event: LogEvent) -> Result<LogOffset> {
@@ -303,14 +296,49 @@ impl HeldLog {
             return Err(Error::LogPoisoned);
         };
         let joined = tokio::task::spawn_blocking(move || {
-            let appended = guard.append(&event);
+            // Set before the append and cleared only by `reconcile` or a
+            // failed append, so a dropped future or a panic from here on
+            // leaves it set, and a record that did land is never orphaned.
+            guard.poisoned = true;
+            let appended = guard.writer.append(&event);
             (guard, appended)
         })
         .await;
-        let (guard, appended) =
-            joined.map_err(|error| Error::LogAppend(format!("append task failed: {error}")))?;
+        let (guard, appended) = joined.map_err(|error| Error::LogTask(error.to_string()))?;
         self.guard = Some(guard);
-        appended.map_err(|error| Error::LogAppend(error.to_string()))
+        if appended.is_err() {
+            self.set_poisoned(false);
+        }
+        Ok(appended?)
+    }
+
+    fn might_contain(&self, hash: &[u8; 32]) -> bool {
+        self.guard
+            .as_deref()
+            .is_some_and(|log| log.bloom.might_contain(hash))
+    }
+
+    fn reconcile(&mut self, hashes: &[[u8; 32]]) {
+        if let Some(log) = self.guard.as_deref_mut() {
+            hashes.iter().for_each(|hash| log.bloom.insert(hash));
+            log.poisoned = false;
+        }
+    }
+
+    fn set_poisoned(&mut self, poisoned: bool) {
+        if let Some(log) = self.guard.as_deref_mut() {
+            log.poisoned = poisoned;
+        }
+    }
+}
+
+/// The filter's answer for one hash, taken from the held log before the
+/// transaction's reads begin.
+struct Seen(bool);
+
+impl PreCheck for Seen {
+    fn might_contain(&self, _hash: &[u8; 32]) -> bool {
+        self.0
     }
 }
 
@@ -325,12 +353,12 @@ struct Carrier {
 /// repoints the index at itself.
 async fn live_duplicate(
     tx: &mut dyn BackendTx,
-    bloom: &StdMutex<HashBloom>,
+    bloom_hit: bool,
     hash: &[u8; 32],
 ) -> Result<Option<Carrier>> {
     let hit = {
         let mut index = TxHashIndex { tx: &mut *tx };
-        find_first_write(&BloomHandle(bloom), &mut index, hash).await?
+        find_first_write(&Seen(bloom_hit), &mut index, hash).await?
     };
     let Some(IndexedWrite {
         first_event_id,
@@ -361,19 +389,6 @@ async fn is_live(tx: &mut dyn BackendTx, node_id: &str) -> Result<bool> {
     Ok(!rows.is_empty())
 }
 
-/// The bloom filter as a `PreCheck`, locked only for the instant of each probe
-/// so no std guard lives across an await.
-struct BloomHandle<'a>(&'a StdMutex<HashBloom>);
-
-impl PreCheck for BloomHandle<'_> {
-    fn might_contain(&self, hash: &[u8; 32]) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .might_contain(hash)
-    }
-}
-
 /// The `log_hash_index` table, read inside the write transaction.
 struct TxHashIndex<'a> {
     tx: &'a mut dyn BackendTx,
@@ -401,37 +416,18 @@ impl HashIndex for TxHashIndex<'_> {
     }
 }
 
-/// Projection statements for a new node. The node insert comes first.
-async fn project_node(
+async fn index_hash(
     tx: &mut dyn BackendTx,
-    pending: &PendingNode,
+    hash: &[u8; 32],
+    row_id: &str,
     event_id: &str,
-    log_id: Uuid,
-    offset: LogOffset,
 ) -> Result<()> {
-    let (sql, params) = node_row_insert(&pending.row);
-    tx.execute(&sql, &params).await?;
-    index_hash(tx, pending, event_id).await?;
-    advance_cursor(tx, log_id, offset).await
-}
-
-async fn index_hash(tx: &mut dyn BackendTx, pending: &PendingNode, event_id: &str) -> Result<()> {
-    let row_ids = serde_json::to_string(&[&pending.row.id])?;
+    let row_ids = serde_json::to_string(&[row_id])?;
     tx.execute(
         HASH_INDEX_UPSERT_SQL,
-        &[
-            pending.hash.to_vec().into(),
-            event_id.into(),
-            row_ids.into(),
-        ],
+        &[hash.to_vec().into(), event_id.into(), row_ids.into()],
     )
     .await?;
-    Ok(())
-}
-
-async fn advance_cursor(tx: &mut dyn BackendTx, log_id: Uuid, offset: LogOffset) -> Result<()> {
-    tx.execute(CURSOR_UPSERT_SQL, &cursor_params(log_id, offset))
-        .await?;
     Ok(())
 }
 
@@ -443,9 +439,9 @@ fn cursor_params(log_id: Uuid, offset: LogOffset) -> [Value; 3] {
     ]
 }
 
-async fn commit_or_abandon(tx: Box<dyn BackendTx + '_>, applied: Result<()>) -> Result<()> {
+async fn commit_or_abandon<T>(tx: Box<dyn BackendTx + '_>, applied: Result<T>) -> Result<T> {
     match applied {
-        Ok(()) => tx.commit().await,
+        Ok(applied) => tx.commit().await.map(|()| applied),
         Err(error) => {
             abandon(tx).await;
             Err(error)
