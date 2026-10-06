@@ -15,6 +15,7 @@ use liam_log::event::NodeRow;
 use self::logged_plan::{refuse_supersedes, Collision};
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
+pub use self::rebuild::{RebuildMode, RebuildReport};
 pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
 pub use self::replay::CatchUpReport;
 use crate::backend::Backend;
@@ -33,6 +34,7 @@ mod log_open;
 mod logged_plan;
 mod logged_write;
 mod projection;
+mod rebuild;
 mod reembed;
 mod replay;
 
@@ -2168,6 +2170,7 @@ mod tests {
     mod log_open;
     mod log_write;
     mod log_write_faults;
+    mod rebuild;
     mod reembed;
     mod support;
 
@@ -6345,6 +6348,9 @@ mod tests {
         fn vector_delete_sql(&self) -> Option<&'static str> {
             self.0.vector_delete_sql()
         }
+        fn vector_clear_sql(&self) -> Option<&'static str> {
+            self.0.vector_clear_sql()
+        }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.0.vector_delete(node_id).await
         }
@@ -7898,6 +7904,9 @@ mod tests {
         fn vector_delete_sql(&self) -> Option<&'static str> {
             self.inner.vector_delete_sql()
         }
+        fn vector_clear_sql(&self) -> Option<&'static str> {
+            self.inner.vector_clear_sql()
+        }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
         }
@@ -7999,6 +8008,9 @@ mod tests {
         }
         fn vector_delete_sql(&self) -> Option<&'static str> {
             self.inner.vector_delete_sql()
+        }
+        fn vector_clear_sql(&self) -> Option<&'static str> {
+            self.inner.vector_clear_sql()
         }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await

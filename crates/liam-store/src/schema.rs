@@ -161,6 +161,33 @@ CREATE TABLE IF NOT EXISTS log_quarantine (
     sql
 }
 
+/// When a rebuild empties a derived table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Clear {
+    Always,
+    /// Only when the store takes on another log: the rows say nothing the new
+    /// log could recreate or vouch for, and the old log's own are kept otherwise.
+    OnAdoption,
+}
+
+/// The tables the log derives, in the order a rebuild empties them: edges and
+/// community rows before the nodes they reference. `cluster_state` goes with
+/// the assignments, otherwise its fingerprint would vouch for communities that
+/// are no longer there. The backend's vector table goes before all of them, as
+/// `Backend::vector_clear_sql` returns it.
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 8] = [
+    ("node_community", Clear::Always),
+    ("cluster_state", Clear::Always),
+    ("edges", Clear::Always),
+    ("nodes", Clear::Always),
+    ("log_hash_index", Clear::Always),
+    // Repair is idempotent, so a stale watermark would only skip work it owes.
+    ("provenance_repair_state", Clear::Always),
+    // The operator's refusal reasons, which the log cannot recreate.
+    ("log_quarantine", Clear::OnAdoption),
+    ("entity_mention_state", Clear::OnAdoption),
+];
+
 #[cfg(all(test, feature = "backend-libsql"))]
 mod tests {
     use super::*;

@@ -422,6 +422,9 @@ impl Backend for Probed {
     fn vector_delete_sql(&self) -> Option<&'static str> {
         self.inner.vector_delete_sql()
     }
+    fn vector_clear_sql(&self) -> Option<&'static str> {
+        self.inner.vector_clear_sql()
+    }
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
         self.inner.vector_delete(node_id).await
     }

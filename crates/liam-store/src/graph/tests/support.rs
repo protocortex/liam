@@ -7,7 +7,10 @@ use std::sync::Mutex as StdMutex;
 
 use futures_util::{stream, StreamExt};
 use liam_log::dedup::{BloomConfig, HashBloom};
-use liam_log::event::{LogEvent, LogPayload, CURRENT_SCHEMA_VERSION};
+use liam_log::event::{
+    EdgeRow, LogEvent, LogPayload, NodeRow, TombstoneTable, TombstoneTarget, CURRENT_SCHEMA_VERSION,
+};
+use liam_log::hash::{edge_row_hash, node_row_hash};
 use liam_log::reader::{LogReader, LogRecord, LogStream, SequentialScanReader};
 use liam_log::wal::{WalConfig, WalWriter};
 use liam_log::{LogOffset, LogWriter};
@@ -156,6 +159,9 @@ impl Backend for ReembedProbe {
     fn vector_delete_sql(&self) -> Option<&'static str> {
         self.inner.vector_delete_sql()
     }
+    fn vector_clear_sql(&self) -> Option<&'static str> {
+        self.inner.vector_clear_sql()
+    }
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
         self.inner.vector_delete(node_id).await
     }
@@ -256,6 +262,12 @@ pub(super) const ONE_SEGMENT: WalConfig = WalConfig {
     rotate_interval_secs: 3600,
 };
 
+/// Rotates after every append, so each event sits in a segment of its own.
+pub(super) const SEGMENT_PER_EVENT: WalConfig = WalConfig {
+    segment_max_bytes: 1,
+    rotate_interval_secs: 3600,
+};
+
 /// A log directory and the databases that project it.
 pub(super) struct Env {
     dir: TempDir,
@@ -348,6 +360,66 @@ pub(super) fn event(event_id: &str, content_hash: [u8; 32], payload: LogPayload)
     }
 }
 
+pub(super) fn node(id: &str, content: &str) -> NodeRow {
+    NodeRow {
+        id: id.into(),
+        kind: "fact".into(),
+        label: "label".into(),
+        content: content.into(),
+        producer: "agent-a".into(),
+        attributes: "{}".into(),
+        scope: Some("proj/a".into()),
+        subject: None,
+        confidence: 0.75,
+        valid_from: 500,
+        valid_from_supplied: true,
+        valid_until: FOREVER.0,
+        tx_from: 1000,
+        tx_to: FOREVER.0,
+    }
+}
+
+pub(super) fn edge(id: &str, src: &str, dst: &str) -> EdgeRow {
+    EdgeRow {
+        id: id.into(),
+        src: src.into(),
+        dst: dst.into(),
+        edge_type: "mentions".into(),
+        attributes: "{}".into(),
+        tx_from: 1000,
+        tx_to: FOREVER.0,
+    }
+}
+
+pub(super) fn node_write(id: &str, content: &str) -> LogEvent {
+    let row = node(id, content);
+    event(
+        &format!("event-{id}"),
+        node_row_hash(&row),
+        LogPayload::NodeWrite(row),
+    )
+}
+
+pub(super) fn edge_write(id: &str, src: &str, dst: &str) -> LogEvent {
+    let row = edge(id, src, dst);
+    event(
+        &format!("event-{id}"),
+        edge_row_hash(&row),
+        LogPayload::EdgeWrite(row),
+    )
+}
+
+pub(super) fn tombstone(event_id: &str, targets: &[(TombstoneTable, &str)]) -> LogEvent {
+    let targets = targets
+        .iter()
+        .map(|(table, id)| TombstoneTarget {
+            table: *table,
+            id: (*id).into(),
+        })
+        .collect();
+    event(event_id, [0; 32], LogPayload::Tombstone(targets))
+}
+
 pub(super) async fn has_node<B: Backend>(g: &Graph<B>, id: &str) -> bool {
     let rows = g
         .backend
@@ -355,6 +427,27 @@ pub(super) async fn has_node<B: Backend>(g: &Graph<B>, id: &str) -> bool {
         .await
         .unwrap();
     !rows.is_empty()
+}
+
+/// Every quarantined event as `(event, segment, index, reason)`, by event id.
+pub(super) async fn quarantined<B: Backend>(g: &Graph<B>) -> Vec<(String, i64, i64, String)> {
+    g.backend
+        .query(
+            "SELECT event_id, segment, seg_index, reason FROM log_quarantine ORDER BY event_id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get_string(0).unwrap(),
+                row.get_i64(1).unwrap(),
+                row.get_i64(2).unwrap(),
+                row.get_string(3).unwrap(),
+            )
+        })
+        .collect()
 }
 
 /// The record counts alone: these tests attach no embedder, so every replayed

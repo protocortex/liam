@@ -14,12 +14,17 @@ const READ_SQL: &str = "SELECT log_id, last_segment, last_index FROM log_cursor 
 const CREATE_SQL: &str = "INSERT INTO log_cursor (id, log_id, last_segment, last_index)
      VALUES (1, ?1, NULL, NULL) ON CONFLICT(id) DO NOTHING";
 
-// log_id is written once and never overwritten, so a database opened against a
-// different log stays recognisable.
+// Advancing never rewrites log_id, so a database opened against a different log
+// stays recognisable. Only a rebuild's restart does.
 const ADVANCE_SQL: &str = "INSERT INTO log_cursor (id, log_id, last_segment, last_index)
      VALUES (1, ?1, ?2, ?3)
      ON CONFLICT(id) DO UPDATE SET
        last_segment = excluded.last_segment, last_index = excluded.last_index";
+
+const RESTART_SQL: &str = "INSERT INTO log_cursor (id, log_id, last_segment, last_index)
+     VALUES (1, ?1, NULL, NULL)
+     ON CONFLICT(id) DO UPDATE SET
+       log_id = excluded.log_id, last_segment = NULL, last_index = NULL";
 
 /// The stored cursor. `last` is `None` until a record has been accounted for.
 pub(super) struct Cursor {
@@ -64,6 +69,14 @@ pub(super) async fn advance_in_tx(
     offset: LogOffset,
 ) -> Result<()> {
     tx.execute(ADVANCE_SQL, &advance_params(log_id, offset)?)
+        .await?;
+    Ok(())
+}
+
+/// Puts the cursor at the start of `log_id`'s log inside `tx`, taking over the
+/// store for that log when it belonged to another.
+pub(super) async fn restart_in_tx(tx: &mut dyn BackendTx, log_id: Uuid) -> Result<()> {
+    tx.execute(RESTART_SQL, &[log_id.to_string().into()])
         .await?;
     Ok(())
 }

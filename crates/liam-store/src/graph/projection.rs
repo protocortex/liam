@@ -49,6 +49,8 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
     }
 }
 
+// `LoggedRows` in rebuild.rs repeats this supersede rule on purpose, to check a
+// replay independently of it, so the two must change together.
 fn edge_steps(row: &EdgeRow) -> Vec<Step> {
     if row.edge_type == relation::SUPERSEDES {
         let close = Step::Close {
