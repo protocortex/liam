@@ -29,6 +29,10 @@ pub struct LogOffset {
 /// lock; the trait takes `&mut self` to say so.
 pub trait LogWriter: Send {
     /// Appends one event durably and returns the position it was written at.
+    ///
+    /// After an `Err` from a writer that then reports `WalError::Poisoned`, the
+    /// outcome is unknown: the record may still exist after a reopen. Callers
+    /// must dedupe by `event_id` when replaying.
     fn append(&mut self, event: &LogEvent) -> Result<LogOffset, WalError>;
 
     /// Identifies this log across restarts.

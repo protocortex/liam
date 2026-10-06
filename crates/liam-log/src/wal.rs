@@ -1,9 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Write-ahead log segments: length-prefixed postcard records, fsynced per append.
+//! Write-ahead log segments: checksummed postcard records, fsynced per append.
+//!
+//! A record is `[len u32 LE][header_crc u32 LE][payload_crc u32 LE][payload]`.
+//! `header_crc` covers the 4 length bytes, so a damaged length is told apart
+//! from a torn payload; `payload_crc` covers the payload. On open, damage at
+//! the final position is a torn tail and is truncated away, unless a complete
+//! valid frame follows it: then the damage is mid-file and fails the open with
+//! the file untouched. A record that checks out but cannot be decoded also
+//! fails the open and is never truncated.
 //!
 //! The writer owns rotation so a segment is only ever read by others once it
-//! is closed; callers serialize appends themselves.
+//! is closed; callers serialize appends themselves. Segments closed before a
+//! crash are not announced again after a reopen: the compactor recovers them
+//! by scanning the log directory when it starts.
+//!
+//! Known limitation: the time rotation timer is not persisted, so it restarts
+//! on every reopen.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -18,6 +31,8 @@ use crate::{LogOffset, LogWriter};
 const SEGMENT_EXTENSION: &str = "wal";
 const MANIFEST_NAME: &str = "log.id";
 const LENGTH_PREFIX_BYTES: usize = 4;
+const CRC_BYTES: usize = 4;
+const HEADER_BYTES: usize = LENGTH_PREFIX_BYTES + 2 * CRC_BYTES;
 const SEQUENCE_DIGITS: usize = 20;
 
 /// Why a WAL operation failed.
@@ -31,6 +46,16 @@ pub enum WalError {
     RecordTooLarge(usize),
     #[error("wal segment {} has a corrupt record at offset {offset}", segment.display())]
     Corrupt { segment: PathBuf, offset: u64 },
+    #[error("wal segment {} has an undecodable record at offset {offset}: {source}", segment.display())]
+    Decode {
+        segment: PathBuf,
+        offset: u64,
+        source: EventError,
+    },
+    #[error("wal segment {} already exists and is not empty", segment.display())]
+    SegmentNotEmpty { segment: PathBuf },
+    #[error("wal writer is poisoned by an earlier failed append and must be reopened")]
+    Poisoned,
     #[error("wal log id manifest {} does not hold a uuid", manifest.display())]
     InvalidLogId { manifest: PathBuf },
 }
@@ -54,6 +79,9 @@ impl RotationClock for SystemClock {
 
 /// Told about each segment once the writer has fully closed it, so a consumer
 /// never reads a segment that is still being appended to.
+///
+/// A segment closed before a crash is not announced again after a reopen; a
+/// consumer must scan the log directory on startup to find those.
 pub trait SegmentSink: Send + Sync {
     fn segment_closed(&self, path: &Path);
 }
@@ -63,6 +91,34 @@ pub trait SegmentSink: Send + Sync {
 pub struct WalConfig {
     pub segment_max_bytes: u64,
     pub rotate_interval_secs: u64,
+}
+
+/// The disk operations a writer performs, so tests can inject failures.
+pub(crate) trait FileOps: Send {
+    fn write_all(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()>;
+    fn sync_file(&mut self, file: &File) -> io::Result<()>;
+    fn truncate(&mut self, file: &File, len: u64) -> io::Result<()>;
+    fn sync_dir(&mut self, dir: &Path) -> io::Result<()>;
+}
+
+struct OsFileOps;
+
+impl FileOps for OsFileOps {
+    fn write_all(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
+        file.write_all(bytes)
+    }
+
+    fn sync_file(&mut self, file: &File) -> io::Result<()> {
+        file.sync_all()
+    }
+
+    fn truncate(&mut self, file: &File, len: u64) -> io::Result<()> {
+        file.set_len(len)
+    }
+
+    fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
+        File::open(dir)?.sync_all()
+    }
 }
 
 struct OpenSegment {
@@ -81,6 +137,9 @@ pub struct WalWriter<C: RotationClock> {
     log_id: Uuid,
     segment: OpenSegment,
     sink: Option<Box<dyn SegmentSink>>,
+    ops: Box<dyn FileOps>,
+    /// Set when the file may hold bytes the writer cannot account for.
+    failed: bool,
 }
 
 impl WalWriter<SystemClock> {
@@ -93,11 +152,23 @@ impl WalWriter<SystemClock> {
 impl<C: RotationClock> WalWriter<C> {
     /// Opens the log directory, creating the first segment when none exists.
     pub fn open(dir: &Path, config: WalConfig, clock: C) -> Result<Self, WalError> {
-        fs::create_dir_all(dir)?;
-        let log_id = load_or_create_log_id(dir)?;
+        Self::open_with_file_ops(dir, config, clock, OsFileOps)
+    }
+
+    fn open_with_file_ops(
+        dir: &Path,
+        config: WalConfig,
+        clock: C,
+        ops: impl FileOps + 'static,
+    ) -> Result<Self, WalError> {
+        let mut ops: Box<dyn FileOps> = Box::new(ops);
+        create_dir_all_durably(dir, ops.as_mut())?;
+        let log_id = load_or_create_log_id(dir, ops.as_mut())?;
         let segment = match segment_paths(dir)?.last() {
-            Some((sequence, path)) => reopen_segment(path, *sequence, clock.now_secs())?,
-            None => create_segment(dir, 0, clock.now_secs())?,
+            Some((sequence, path)) => {
+                reopen_segment(path, *sequence, clock.now_secs(), ops.as_mut())?
+            }
+            None => create_segment(dir, 0, clock.now_secs(), ops.as_mut())?,
         };
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -106,7 +177,15 @@ impl<C: RotationClock> WalWriter<C> {
             log_id,
             segment,
             sink: None,
+            ops,
+            failed: false,
         })
+    }
+
+    #[cfg(test)]
+    fn with_file_ops(mut self, ops: impl FileOps + 'static) -> Self {
+        self.ops = Box::new(ops);
+        self
     }
 
     /// Delivers a notification to `sink` for every segment closed from now on.
@@ -123,34 +202,69 @@ impl<C: RotationClock> WalWriter<C> {
 
     fn rotate(&mut self) -> Result<(), WalError> {
         let closed = self.dir.join(segment_name(self.segment.sequence));
-        self.segment = create_segment(&self.dir, self.segment.sequence + 1, self.clock.now_secs())?;
+        self.segment = create_segment(
+            &self.dir,
+            self.segment.sequence + 1,
+            self.clock.now_secs(),
+            self.ops.as_mut(),
+        )?;
         // Every append is already fsynced, so the closed segment is complete here.
         if let Some(sink) = &self.sink {
             sink.segment_closed(&closed);
         }
         Ok(())
     }
+
+    /// Writes and fsyncs one framed record, undoing a failed attempt.
+    ///
+    /// The writer is poisoned when the file may keep bytes it cannot account
+    /// for: the rollback failed, or fsync failed and left the data's fate unknown.
+    fn write_durably(&mut self, record: &[u8]) -> io::Result<()> {
+        let (error, sync_failed) = match self.ops.write_all(&mut self.segment.file, record) {
+            Err(error) => (error, false),
+            Ok(()) => match self.ops.sync_file(&self.segment.file) {
+                Ok(()) => return Ok(()),
+                Err(error) => (error, true),
+            },
+        };
+        tracing::warn!(segment = self.segment.sequence, %error, "wal append failed, rolling back");
+        let rolled_back = self.rollback();
+        if let Err(rollback_error) = &rolled_back {
+            tracing::warn!(segment = self.segment.sequence, error = %rollback_error, "wal rollback failed");
+        }
+        self.failed = sync_failed || rolled_back.is_err();
+        Err(error)
+    }
+
+    fn rollback(&mut self) -> io::Result<()> {
+        self.ops.truncate(&self.segment.file, self.segment.size)?;
+        self.ops.sync_file(&self.segment.file)
+    }
 }
 
 impl<C: RotationClock + Send> LogWriter for WalWriter<C> {
     fn append(&mut self, event: &LogEvent) -> Result<LogOffset, WalError> {
+        if self.failed {
+            return Err(WalError::Poisoned);
+        }
         let payload = event.encode()?;
         let length = record_length(payload.len())?;
-        let mut record = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
-        record.extend_from_slice(&length.to_le_bytes());
-        record.extend_from_slice(&payload);
+        let record = encode_frame(length, &payload);
 
         let offset = LogOffset {
             segment: self.segment.sequence,
             index: self.segment.records,
         };
-        self.segment.file.write_all(&record)?;
-        self.segment.file.sync_all()?;
+        self.write_durably(&record)?;
         self.segment.size += record.len() as u64;
         self.segment.records += 1;
 
+        // The record is durable, so a rotation failure must not fail the append;
+        // the next append retries because the thresholds still hold.
         if self.should_rotate() {
-            self.rotate()?;
+            if let Err(error) = self.rotate() {
+                tracing::warn!(segment = self.segment.sequence, %error, "wal rotation failed, will retry on the next append");
+            }
         }
         Ok(offset)
     }
@@ -159,6 +273,16 @@ impl<C: RotationClock + Send> LogWriter for WalWriter<C> {
     fn log_id(&self) -> Uuid {
         self.log_id
     }
+}
+
+fn encode_frame(length: u32, payload: &[u8]) -> Vec<u8> {
+    let length_bytes = length.to_le_bytes();
+    let mut frame = Vec::with_capacity(HEADER_BYTES + payload.len());
+    frame.extend_from_slice(&length_bytes);
+    frame.extend_from_slice(&crc32fast::hash(&length_bytes).to_le_bytes());
+    frame.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
 }
 
 /// The length prefix value for a payload, rejecting one the prefix cannot hold.
@@ -178,29 +302,41 @@ pub(crate) fn replay(dir: &Path) -> Result<Vec<LogEvent>, WalError> {
 
 struct Scan {
     events: Vec<LogEvent>,
-    /// Length of the prefix made of complete, decodable records.
+    /// Length of the prefix made of complete, valid records.
     valid_len: u64,
 }
 
 /// Decodes records until the bytes end or a torn final record is reached.
 ///
-/// An undecodable record that is followed by more data cannot be a torn write,
-/// so it is reported instead of being dropped.
+/// Damage followed by more data cannot be a torn write, so it is reported
+/// instead of dropped. A record whose checksums hold but whose payload does
+/// not decode is also reported: it is valid data this build cannot read, such
+/// as an event from a newer schema, and must never be truncated.
 fn scan_segment(path: &Path, bytes: &[u8]) -> Result<Scan, WalError> {
     let mut events = Vec::new();
     let mut offset = 0;
-    while let Some((payload, remainder)) = split_record(&bytes[offset..]) {
-        match LogEvent::decode(payload) {
-            Ok(event) => events.push(event),
-            Err(_) if remainder.is_empty() => break,
-            Err(_) => {
+    while offset < bytes.len() {
+        let rest = &bytes[offset..];
+        match read_frame(rest) {
+            Frame::Valid { payload, len } => {
+                let event = LogEvent::decode(payload).map_err(|source| WalError::Decode {
+                    segment: path.to_path_buf(),
+                    offset: offset as u64,
+                    source,
+                })?;
+                events.push(event);
+                offset += len;
+            }
+            Frame::TornPayload => break,
+            Frame::BadPayloadChecksum { len } if len == rest.len() => break,
+            Frame::BadHeader if is_torn_tail(rest) => break,
+            Frame::BadPayloadChecksum { .. } | Frame::BadHeader => {
                 return Err(WalError::Corrupt {
                     segment: path.to_path_buf(),
                     offset: offset as u64,
                 })
             }
         }
-        offset = bytes.len() - remainder.len();
     }
     Ok(Scan {
         events,
@@ -208,18 +344,54 @@ fn scan_segment(path: &Path, bytes: &[u8]) -> Result<Scan, WalError> {
     })
 }
 
-/// Splits off the first record, or returns `None` when it is incomplete.
-fn split_record(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
-    let (prefix, body) = bytes.split_at_checked(LENGTH_PREFIX_BYTES)?;
+/// Whether a damaged header at the start of `rest` is a torn tail: zero fill,
+/// or no complete valid frame anywhere after it.
+fn is_torn_tail(rest: &[u8]) -> bool {
+    rest.iter().all(|byte| *byte == 0)
+        || !(1..rest.len()).any(|start| matches!(read_frame(&rest[start..]), Frame::Valid { .. }))
+}
+
+enum Frame<'a> {
+    Valid {
+        payload: &'a [u8],
+        len: usize,
+    },
+    /// The header is intact but claims more payload than the bytes hold.
+    TornPayload,
+    /// The header is incomplete or fails its checksum, so its length is untrusted.
+    BadHeader,
+    BadPayloadChecksum {
+        len: usize,
+    },
+}
+
+/// Classifies the record at the start of `bytes`.
+fn read_frame(bytes: &[u8]) -> Frame<'_> {
+    let Some((header, body)) = bytes.split_at_checked(HEADER_BYTES) else {
+        return Frame::BadHeader;
+    };
+    let (prefix, checksums) = header.split_at(LENGTH_PREFIX_BYTES);
+    let (header_crc, payload_crc) = checksums.split_at(CRC_BYTES);
+    if crc32fast::hash(prefix).to_le_bytes() != header_crc {
+        return Frame::BadHeader;
+    }
     let length = u32::from_le_bytes(prefix.try_into().expect("prefix is 4 bytes")) as usize;
-    body.split_at_checked(length)
+    let Some((payload, _)) = body.split_at_checked(length) else {
+        return Frame::TornPayload;
+    };
+    let len = HEADER_BYTES + length;
+    if crc32fast::hash(payload).to_le_bytes() == payload_crc {
+        Frame::Valid { payload, len }
+    } else {
+        Frame::BadPayloadChecksum { len }
+    }
 }
 
 /// Reads the log identity, creating it on first open.
 ///
 /// The id is staged in a temp file and renamed so a crash never leaves a
 /// half-written manifest that a later open would mistake for the identity.
-fn load_or_create_log_id(dir: &Path) -> Result<Uuid, WalError> {
+fn load_or_create_log_id(dir: &Path, ops: &mut dyn FileOps) -> Result<Uuid, WalError> {
     let manifest = dir.join(MANIFEST_NAME);
     match fs::read_to_string(&manifest) {
         Ok(text) => {
@@ -234,7 +406,7 @@ fn load_or_create_log_id(dir: &Path) -> Result<Uuid, WalError> {
     file.write_all(log_id.hyphenated().to_string().as_bytes())?;
     file.sync_all()?;
     fs::rename(&staged, &manifest)?;
-    File::open(dir)?.sync_all()?;
+    ops.sync_dir(dir)?;
     Ok(log_id)
 }
 
@@ -267,13 +439,49 @@ fn segment_paths(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(segments)
 }
 
-fn create_segment(dir: &Path, sequence: u64, now: u64) -> io::Result<OpenSegment> {
-    let file = OpenOptions::new()
-        .create_new(true)
-        .append(true)
-        .open(dir.join(segment_name(sequence)))?;
+/// Creates the directory and fsyncs every directory it newly created plus the
+/// first pre-existing ancestor, so no new entry is lost to a crash.
+fn create_dir_all_durably(dir: &Path, ops: &mut dyn FileOps) -> io::Result<()> {
+    let created: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|ancestor| !ancestor.as_os_str().is_empty() && !ancestor.exists())
+        .collect();
+    let Some(topmost) = created.last() else {
+        return Ok(());
+    };
+    fs::create_dir_all(dir)?;
+    for path in &created {
+        ops.sync_dir(path)?;
+    }
+    match topmost.parent() {
+        None => Ok(()),
+        // A bare relative name has an empty parent, which means the current directory.
+        Some(parent) if parent.as_os_str().is_empty() => ops.sync_dir(Path::new(".")),
+        Some(parent) => ops.sync_dir(parent),
+    }
+}
+
+/// Creates the segment, adopting an empty file left by an earlier failed attempt.
+fn create_segment(
+    dir: &Path,
+    sequence: u64,
+    now: u64,
+    ops: &mut dyn FileOps,
+) -> Result<OpenSegment, WalError> {
+    let path = dir.join(segment_name(sequence));
+    let file = match OpenOptions::new().create_new(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let file = OpenOptions::new().append(true).open(&path)?;
+            if file.metadata()?.len() != 0 {
+                return Err(WalError::SegmentNotEmpty { segment: path });
+            }
+            file
+        }
+        Err(error) => return Err(error.into()),
+    };
     // The new directory entry must be durable, not just the file contents.
-    File::open(dir)?.sync_all()?;
+    ops.sync_dir(dir)?;
     Ok(OpenSegment {
         file,
         sequence,
@@ -284,7 +492,12 @@ fn create_segment(dir: &Path, sequence: u64, now: u64) -> io::Result<OpenSegment
 }
 
 /// Reopens a segment, truncating a torn final record so the next append lands cleanly.
-fn reopen_segment(path: &Path, sequence: u64, now: u64) -> Result<OpenSegment, WalError> {
+fn reopen_segment(
+    path: &Path,
+    sequence: u64,
+    now: u64,
+    ops: &mut dyn FileOps,
+) -> Result<OpenSegment, WalError> {
     let file = OpenOptions::new().append(true).open(path)?;
     let on_disk = file.metadata()?.len();
     let scan = scan_segment(path, &fs::read(path)?)?;
@@ -295,8 +508,8 @@ fn reopen_segment(path: &Path, sequence: u64, now: u64) -> Result<OpenSegment, W
             dropped_bytes = on_disk - valid,
             "truncating torn final wal record"
         );
-        file.set_len(valid)?;
-        file.sync_all()?;
+        ops.truncate(&file, valid)?;
+        ops.sync_file(&file)?;
     }
     Ok(OpenSegment {
         file,
@@ -314,6 +527,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::event::CURRENT_SCHEMA_VERSION;
     use crate::fixtures::event;
     use crate::LogOffset;
 
@@ -343,11 +557,17 @@ mod tests {
         }
     }
 
-    fn frame(event: &LogEvent) -> Vec<u8> {
-        let payload = event.encode().expect("encode event");
-        let mut bytes = (payload.len() as u32).to_le_bytes().to_vec();
+    fn frame_payload(payload: &[u8]) -> Vec<u8> {
+        let length = (payload.len() as u32).to_le_bytes();
+        let mut bytes = length.to_vec();
+        bytes.extend(crc32fast::hash(&length).to_le_bytes());
+        bytes.extend(crc32fast::hash(payload).to_le_bytes());
         bytes.extend(payload);
         bytes
+    }
+
+    fn frame(event: &LogEvent) -> Vec<u8> {
+        frame_payload(&event.encode().expect("encode event"))
     }
 
     fn frame_len(event: &LogEvent) -> u64 {
@@ -493,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn record_is_a_little_endian_length_prefix_then_the_encoded_event() {
+    fn record_is_a_length_prefix_then_a_header_crc_then_a_payload_crc_then_the_encoded_event() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let mut writer = open(dir.path(), LARGE, &FakeClock::default());
@@ -507,8 +727,13 @@ mod tests {
         // Assert
         assert_eq!(files.len(), 1);
         let bytes = fs::read(&files[0]).expect("read segment");
-        let (prefix, body) = bytes.split_at(LENGTH_PREFIX_BYTES);
+        let (prefix, rest) = bytes.split_at(LENGTH_PREFIX_BYTES);
+        let (header_crc, rest) = rest.split_at(CRC_BYTES);
+        let (payload_crc, body) = rest.split_at(CRC_BYTES);
+        assert_eq!(HEADER_BYTES, 12);
         assert_eq!(prefix, (payload.len() as u32).to_le_bytes());
+        assert_eq!(header_crc, crc32fast::hash(prefix).to_le_bytes());
+        assert_eq!(payload_crc, crc32fast::hash(&payload).to_le_bytes());
         assert_eq!(body, payload);
     }
 
@@ -703,13 +928,12 @@ mod tests {
     }
 
     #[test]
-    fn truncation_inside_the_length_prefix_or_before_the_payload_is_a_recoverable_tail() {
-        // 1 to 3 bytes of the 4 byte prefix, then the full prefix with 0 payload bytes.
-        for kept_bytes in [1, 2, 3, 4] {
+    fn every_cut_point_of_a_torn_final_record_is_a_recoverable_tail() {
+        let (valid, torn, next) = (event(0), event(1), event(2));
+        for kept_bytes in 1..frame(&torn).len() {
             // Arrange
             let dir = tempfile::tempdir().expect("tempdir");
             let clock = FakeClock::default();
-            let (valid, torn, next) = (event(0), event(1), event(2));
             write_events(dir.path(), std::slice::from_ref(&valid), &clock);
             let segment = segment_files(dir.path()).remove(0);
             append_raw(&segment, &frame(&torn)[..kept_bytes]);
@@ -728,7 +952,7 @@ mod tests {
             );
             assert_eq!(
                 replay(dir.path()).expect("replay"),
-                vec![valid, next],
+                vec![valid.clone(), next.clone()],
                 "kept {kept_bytes} bytes"
             );
         }
@@ -745,7 +969,10 @@ mod tests {
             let (valid, next) = (event(0), event(1));
             write_events(dir.path(), std::slice::from_ref(&valid), &clock);
             let segment = segment_files(dir.path()).remove(0);
-            let mut bogus = claimed.to_le_bytes().to_vec();
+            let prefix = claimed.to_le_bytes();
+            let mut bogus = prefix.to_vec();
+            bogus.extend(crc32fast::hash(&prefix).to_le_bytes());
+            bogus.extend(0xDEAD_BEEF_u32.to_le_bytes());
             bogus.extend([0xAB; REMAINING as usize]);
             append_raw(&segment, &bogus);
 
@@ -781,7 +1008,7 @@ mod tests {
         let segment = segment_files(dir).remove(0);
         let mut bytes = fs::read(&segment).expect("read segment");
         let corrupt_start = frame_len(&first) as usize;
-        let payload_start = corrupt_start + LENGTH_PREFIX_BYTES;
+        let payload_start = corrupt_start + HEADER_BYTES;
         bytes[payload_start..corrupt_start + frame_len(&second) as usize].fill(0xFF);
         fs::write(&segment, &bytes).expect("write corrupted segment");
         (segment, bytes, corrupt_start)
@@ -819,6 +1046,726 @@ mod tests {
         assert!(
             matches!(&result, Err(WalError::Corrupt { offset, .. }) if *offset == corrupt_start as u64),
             "unexpected result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bad_checksum_on_the_last_record_is_a_torn_tail_that_is_truncated() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let (first, last, next) = (event(0), event(1), event(2));
+        write_events(dir.path(), &[first.clone(), last], &clock);
+        let segment = segment_files(dir.path()).remove(0);
+        let mut bytes = fs::read(&segment).expect("read segment");
+        let last_payload_byte = bytes.len() - 1;
+        bytes[last_payload_byte] ^= 0xFF;
+        fs::write(&segment, &bytes).expect("write corrupted segment");
+
+        // Act
+        let mut writer = open(dir.path(), LARGE, &clock);
+        let size_after_open = fs::metadata(&segment).expect("segment metadata").len();
+        writer.append(&next).expect("append after recovery");
+        drop(writer);
+
+        // Assert
+        assert_eq!(size_after_open, frame_len(&first));
+        assert_eq!(replay(dir.path()).expect("replay"), vec![first, next]);
+    }
+
+    #[test]
+    fn zero_filled_tails_are_a_torn_tail_that_is_truncated() {
+        // A header cut short, a whole zeroed header, then more zeros.
+        for zero_bytes in [4, 8, HEADER_BYTES, 64] {
+            // Arrange
+            let dir = tempfile::tempdir().expect("tempdir");
+            let clock = FakeClock::default();
+            let (valid, next) = (event(0), event(1));
+            write_events(dir.path(), std::slice::from_ref(&valid), &clock);
+            let segment = segment_files(dir.path()).remove(0);
+            append_raw(&segment, &vec![0; zero_bytes]);
+
+            // Act
+            let mut writer = open(dir.path(), LARGE, &clock);
+            let size_after_open = fs::metadata(&segment).expect("segment metadata").len();
+            writer.append(&next).expect("append after recovery");
+            drop(writer);
+
+            // Assert
+            assert_eq!(
+                size_after_open,
+                frame_len(&valid),
+                "{zero_bytes} zero bytes"
+            );
+            assert_eq!(
+                replay(dir.path()).expect("replay"),
+                vec![valid, next],
+                "{zero_bytes} zero bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn zeroed_header_followed_by_data_with_no_valid_frame_is_a_torn_tail() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let (valid, next) = (event(0), event(1));
+        write_events(dir.path(), std::slice::from_ref(&valid), &clock);
+        let segment = segment_files(dir.path()).remove(0);
+        let mut tail = vec![0; HEADER_BYTES];
+        tail.extend([1, 2, 3]);
+        append_raw(&segment, &tail);
+
+        // Act
+        let mut writer = open(dir.path(), LARGE, &clock);
+        let size_after_open = fs::metadata(&segment).expect("segment metadata").len();
+        writer.append(&next).expect("append after recovery");
+        drop(writer);
+
+        // Assert
+        assert_eq!(size_after_open, frame_len(&valid));
+        assert_eq!(replay(dir.path()).expect("replay"), vec![valid, next]);
+    }
+
+    /// Writes `events` and returns the segment, its bytes, and each record's start offset.
+    fn write_segment(
+        dir: &Path,
+        events: &[LogEvent],
+        clock: &FakeClock,
+    ) -> (PathBuf, Vec<u8>, Vec<usize>) {
+        write_events(dir, events, clock);
+        let segment = segment_files(dir).remove(0);
+        let starts = events
+            .iter()
+            .scan(0, |start, appended| {
+                let current = *start;
+                *start += frame(appended).len();
+                Some(current)
+            })
+            .collect();
+        let bytes = fs::read(&segment).expect("read segment");
+        (segment, bytes, starts)
+    }
+
+    #[test]
+    fn damaged_length_prefix_of_a_middle_record_is_corrupt_and_leaves_the_segment_unchanged() {
+        let events: Vec<LogEvent> = (0..3).map(event).collect();
+        let length = (frame(&events[1]).len() - HEADER_BYTES) as u32;
+        // One byte down and up, a large claim, and the largest prefix.
+        for damaged in [length - 1, length + 1, length + 1_000, u32::MAX] {
+            // Arrange
+            let dir = tempfile::tempdir().expect("tempdir");
+            let clock = FakeClock::default();
+            let (segment, mut bytes, starts) = write_segment(dir.path(), &events, &clock);
+            bytes[starts[1]..starts[1] + LENGTH_PREFIX_BYTES]
+                .copy_from_slice(&damaged.to_le_bytes());
+            fs::write(&segment, &bytes).expect("write damaged segment");
+
+            // Act
+            let error = open_error(dir.path(), &clock);
+
+            // Assert
+            assert!(
+                matches!(&error, WalError::Corrupt { offset, .. } if *offset == starts[1] as u64),
+                "damaged {damaged}: unexpected error: {error}"
+            );
+            assert_eq!(fs::read(&segment).expect("read segment"), bytes);
+        }
+    }
+
+    #[test]
+    fn flipped_crc_bytes_of_the_final_record_are_a_torn_tail_that_is_truncated() {
+        // The four header_crc bytes, then the four payload_crc bytes.
+        for flipped in LENGTH_PREFIX_BYTES..HEADER_BYTES {
+            // Arrange
+            let dir = tempfile::tempdir().expect("tempdir");
+            let clock = FakeClock::default();
+            let (first, last, next) = (event(0), event(1), event(2));
+            let (segment, mut bytes, starts) =
+                write_segment(dir.path(), &[first.clone(), last], &clock);
+            bytes[starts[1] + flipped] ^= 0xFF;
+            fs::write(&segment, &bytes).expect("write damaged segment");
+
+            // Act
+            let mut writer = open(dir.path(), LARGE, &clock);
+            let size_after_open = fs::metadata(&segment).expect("segment metadata").len();
+            writer.append(&next).expect("append after recovery");
+            drop(writer);
+
+            // Assert
+            assert_eq!(size_after_open, frame_len(&first), "byte {flipped}");
+            assert_eq!(
+                replay(dir.path()).expect("replay"),
+                vec![first, next],
+                "byte {flipped}"
+            );
+        }
+    }
+
+    #[test]
+    fn flipped_crc_bytes_of_a_middle_record_are_corrupt_and_leave_the_segment_unchanged() {
+        for flipped in LENGTH_PREFIX_BYTES..HEADER_BYTES {
+            // Arrange
+            let dir = tempfile::tempdir().expect("tempdir");
+            let clock = FakeClock::default();
+            let events: Vec<LogEvent> = (0..3).map(event).collect();
+            let (segment, mut bytes, starts) = write_segment(dir.path(), &events, &clock);
+            bytes[starts[1] + flipped] ^= 0xFF;
+            fs::write(&segment, &bytes).expect("write damaged segment");
+
+            // Act
+            let error = open_error(dir.path(), &clock);
+
+            // Assert
+            assert!(
+                matches!(&error, WalError::Corrupt { offset, .. } if *offset == starts[1] as u64),
+                "byte {flipped}: unexpected error: {error}"
+            );
+            assert_eq!(fs::read(&segment).expect("read segment"), bytes);
+        }
+    }
+
+    #[test]
+    fn valid_checksum_with_a_newer_schema_version_fails_open_and_keeps_the_frame() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        write_events(dir.path(), &[event(0)], &clock);
+        let segment = segment_files(dir.path()).remove(0);
+        let mut payload = event(1).encode().expect("encode event");
+        payload[0] = u8::try_from(CURRENT_SCHEMA_VERSION + 1).expect("one byte version");
+        append_raw(&segment, &frame_payload(&payload));
+        let bytes = fs::read(&segment).expect("read segment");
+
+        // Act
+        let error = open_error(dir.path(), &clock);
+
+        // Assert
+        assert!(
+            matches!(
+                &error,
+                WalError::Decode {
+                    source: EventError::UnsupportedSchemaVersion { .. },
+                    offset,
+                    ..
+                } if *offset == frame_len(&event(0))
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read(&segment).expect("read segment"), bytes);
+    }
+
+    #[test]
+    fn valid_checksum_over_an_undecodable_final_payload_fails_open_and_keeps_the_frame() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        write_events(dir.path(), &[event(0)], &clock);
+        let segment = segment_files(dir.path()).remove(0);
+        append_raw(&segment, &frame_payload(&[0xFF; 5]));
+        let bytes = fs::read(&segment).expect("read segment");
+
+        // Act
+        let error = open_error(dir.path(), &clock);
+
+        // Assert
+        assert!(
+            matches!(&error, WalError::Decode { offset, .. } if *offset == frame_len(&event(0))),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read(&segment).expect("read segment"), bytes);
+    }
+
+    /// Fails the next call of each armed operation exactly once, then behaves normally.
+    #[derive(Default)]
+    struct FaultyOps {
+        /// Bytes that reach the file before the next write fails.
+        partial_write: Option<usize>,
+        fail_sync: bool,
+        fail_truncate: bool,
+        fail_dir_sync: bool,
+    }
+
+    fn injected(operation: &str) -> io::Error {
+        io::Error::other(format!("injected {operation} failure"))
+    }
+
+    impl FileOps for FaultyOps {
+        fn write_all(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
+            match self.partial_write.take() {
+                Some(kept) => {
+                    file.write_all(&bytes[..kept])?;
+                    Err(injected("write"))
+                }
+                None => file.write_all(bytes),
+            }
+        }
+
+        fn sync_file(&mut self, file: &File) -> io::Result<()> {
+            if std::mem::take(&mut self.fail_sync) {
+                return Err(injected("sync"));
+            }
+            file.sync_all()
+        }
+
+        fn truncate(&mut self, file: &File, len: u64) -> io::Result<()> {
+            if std::mem::take(&mut self.fail_truncate) {
+                return Err(injected("truncate"));
+            }
+            file.set_len(len)
+        }
+
+        fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
+            if std::mem::take(&mut self.fail_dir_sync) {
+                return Err(injected("directory sync"));
+            }
+            File::open(dir)?.sync_all()
+        }
+    }
+
+    #[test]
+    fn failed_write_is_rolled_back_so_the_next_append_lands_at_the_correct_offset() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let (first, lost, next) = (event(0), event(1), event(2));
+        let mut writer = open(dir.path(), LARGE, &clock);
+        writer.append(&first).expect("append first");
+        writer.ops = Box::new(FaultyOps {
+            partial_write: Some(HEADER_BYTES + 3),
+            ..FaultyOps::default()
+        });
+
+        // Act
+        let failure = writer.append(&lost).expect_err("write should fail");
+        let offset = writer.append(&next).expect("append after rollback");
+        drop(writer);
+
+        // Assert
+        assert!(matches!(failure, WalError::Io(_)), "unexpected: {failure}");
+        assert_eq!(
+            offset,
+            LogOffset {
+                segment: 0,
+                index: 1
+            }
+        );
+        let segment = segment_files(dir.path()).remove(0);
+        let expected: Vec<u8> = [&first, &next].into_iter().flat_map(frame).collect();
+        assert_eq!(fs::read(&segment).expect("read segment"), expected);
+    }
+
+    #[test]
+    fn failed_write_with_a_failed_rollback_poisons_the_writer_until_reopen_recovers_the_tail() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let (first, lost, next) = (event(0), event(1), event(2));
+        let mut writer = open(dir.path(), LARGE, &clock);
+        writer.append(&first).expect("append first");
+        writer.ops = Box::new(FaultyOps {
+            partial_write: Some(HEADER_BYTES + 3),
+            fail_truncate: true,
+            ..FaultyOps::default()
+        });
+
+        // Act
+        let failure = writer.append(&lost).expect_err("write should fail");
+        let blocked = writer.append(&next).expect_err("poisoned append");
+        drop(writer);
+        let mut reopened = open(dir.path(), LARGE, &clock);
+        let offset = reopened.append(&next).expect("append after reopen");
+
+        // Assert
+        assert!(matches!(failure, WalError::Io(_)), "unexpected: {failure}");
+        assert!(
+            matches!(blocked, WalError::Poisoned),
+            "unexpected: {blocked}"
+        );
+        assert_eq!(
+            offset,
+            LogOffset {
+                segment: 0,
+                index: 1
+            }
+        );
+        assert_eq!(replay(dir.path()).expect("replay"), vec![first, next]);
+    }
+
+    #[test]
+    fn failed_sync_poisons_the_writer_even_when_the_rollback_succeeds() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = open(dir.path(), LARGE, &FakeClock::default()).with_file_ops(FaultyOps {
+            fail_sync: true,
+            ..FaultyOps::default()
+        });
+
+        // Act
+        let failure = writer.append(&event(0)).expect_err("sync should fail");
+        let blocked = writer.append(&event(1)).expect_err("poisoned append");
+
+        // Assert
+        assert!(matches!(failure, WalError::Io(_)), "unexpected: {failure}");
+        assert!(
+            matches!(blocked, WalError::Poisoned),
+            "unexpected: {blocked}"
+        );
+        assert!(replay(dir.path()).expect("replay").is_empty());
+    }
+
+    #[test]
+    fn rotation_adopts_a_pre_created_empty_successor_segment() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (first, second) = (event(0), event(1));
+        let mut writer = open(dir.path(), frame_len(&first), &FakeClock::default());
+        let successor = dir.path().join(segment_name(1));
+        File::create(&successor).expect("pre-create successor");
+
+        // Act
+        let rotating = writer.append(&first).expect("append that rotates");
+        let adopted = writer
+            .append(&second)
+            .expect("append to the adopted segment");
+
+        // Assert
+        assert_eq!(
+            rotating,
+            LogOffset {
+                segment: 0,
+                index: 0
+            }
+        );
+        assert_eq!(
+            adopted,
+            LogOffset {
+                segment: 1,
+                index: 0
+            }
+        );
+        assert_eq!(
+            fs::read(&successor).expect("read successor"),
+            frame(&second)
+        );
+    }
+
+    #[test]
+    fn directory_sync_failure_during_rotation_still_acknowledges_the_append_and_retries_next() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = RecordingSink::default();
+        let events: Vec<LogEvent> = (0..3).map(event).collect();
+        let mut writer = open_with_sink(
+            dir.path(),
+            frame_len(&events[0]),
+            &FakeClock::default(),
+            &sink,
+        )
+        .with_file_ops(FaultyOps {
+            fail_dir_sync: true,
+            ..FaultyOps::default()
+        });
+
+        // Act
+        let first = writer
+            .append(&events[0])
+            .expect("append survives the failed rotation");
+        let notified_after_failure = sink.received().len();
+        let second = writer
+            .append(&events[1])
+            .expect("append retries the rotation");
+        let third = writer
+            .append(&events[2])
+            .expect("append to the rotated segment");
+
+        // Assert
+        assert_eq!(
+            first,
+            LogOffset {
+                segment: 0,
+                index: 0
+            }
+        );
+        assert_eq!(notified_after_failure, 0);
+        assert_eq!(
+            second,
+            LogOffset {
+                segment: 0,
+                index: 1
+            }
+        );
+        assert_eq!(
+            third,
+            LogOffset {
+                segment: 1,
+                index: 0
+            }
+        );
+        let files = segment_files(dir.path());
+        assert_eq!(sink.paths(), files[..2].to_vec());
+        assert_eq!(replay(dir.path()).expect("replay"), events);
+    }
+
+    #[test]
+    fn creating_a_segment_over_a_non_empty_file_is_an_error() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = dir.path().join(segment_name(1));
+        fs::write(&existing, b"data").expect("pre-create non-empty successor");
+
+        // Act
+        let result = create_segment(dir.path(), 1, 0, &mut OsFileOps);
+
+        // Assert
+        assert!(
+            matches!(&result, Err(WalError::SegmentNotEmpty { segment }) if *segment == existing),
+            "unexpected result: {:?}",
+            result.err()
+        );
+        assert_eq!(fs::read(&existing).expect("read existing"), b"data");
+    }
+
+    #[test]
+    fn rotation_onto_a_non_empty_successor_keeps_the_append_and_does_not_notify() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = RecordingSink::default();
+        let appended = event(0);
+        let mut writer = open_with_sink(
+            dir.path(),
+            frame_len(&appended),
+            &FakeClock::default(),
+            &sink,
+        );
+        let foreign = dir.path().join(segment_name(1));
+        fs::write(&foreign, b"data").expect("pre-create successor");
+
+        // Act
+        let offset = writer
+            .append(&appended)
+            .expect("append survives failed rotation");
+        let next_offset = writer
+            .append(&event(1))
+            .expect("append stays in the unrotated segment");
+
+        // Assert
+        assert_eq!(
+            offset,
+            LogOffset {
+                segment: 0,
+                index: 0
+            }
+        );
+        assert_eq!(
+            next_offset,
+            LogOffset {
+                segment: 0,
+                index: 1
+            }
+        );
+        assert_eq!(fs::read(&foreign).expect("read foreign file"), b"data");
+        assert!(sink.received().is_empty());
+    }
+
+    /// A file operation as seen by `RecordingOps`.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Op {
+        /// `manifest_renamed` is whether `log.id` was in place, with no staged copy, in `dir`.
+        SyncDir {
+            dir: PathBuf,
+            manifest_renamed: bool,
+        },
+        SyncFile,
+        Truncate(u64),
+    }
+
+    /// Delegates to the real disk while recording the order of durability operations.
+    #[derive(Clone, Default)]
+    struct RecordingOps(Arc<Mutex<Vec<Op>>>);
+
+    impl RecordingOps {
+        fn recorded(&self) -> Vec<Op> {
+            self.0.lock().expect("ops lock").clone()
+        }
+
+        fn push(&self, op: Op) {
+            self.0.lock().expect("ops lock").push(op);
+        }
+    }
+
+    impl FileOps for RecordingOps {
+        fn write_all(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
+            file.write_all(bytes)
+        }
+
+        fn sync_file(&mut self, file: &File) -> io::Result<()> {
+            self.push(Op::SyncFile);
+            file.sync_all()
+        }
+
+        fn truncate(&mut self, file: &File, len: u64) -> io::Result<()> {
+            self.push(Op::Truncate(len));
+            file.set_len(len)
+        }
+
+        fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
+            self.push(Op::SyncDir {
+                dir: dir.to_path_buf(),
+                manifest_renamed: dir.join(MANIFEST_NAME).exists()
+                    && !dir.join(format!("{MANIFEST_NAME}.tmp")).exists(),
+            });
+            File::open(dir)?.sync_all()
+        }
+    }
+
+    fn sync_dir_op(dir: &Path, manifest_renamed: bool) -> Op {
+        Op::SyncDir {
+            dir: dir.to_path_buf(),
+            manifest_renamed,
+        }
+    }
+
+    fn open_recording(dir: &Path) -> (WalWriter<FakeClock>, RecordingOps) {
+        let ops = RecordingOps::default();
+        let writer =
+            WalWriter::open_with_file_ops(dir, config(LARGE), FakeClock::default(), ops.clone())
+                .expect("open wal");
+        (writer, ops)
+    }
+
+    #[test]
+    fn open_syncs_the_log_directory_after_the_manifest_rename_and_after_creating_the_segment() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Act
+        let (_writer, ops) = open_recording(dir.path());
+
+        // Assert
+        assert_eq!(
+            ops.recorded(),
+            vec![sync_dir_op(dir.path(), true), sync_dir_op(dir.path(), true)]
+        );
+    }
+
+    #[test]
+    fn open_on_a_nested_new_path_syncs_every_created_directory_and_the_first_existing_one() {
+        // Arrange
+        let root = tempfile::tempdir().expect("tempdir");
+        let (a, b) = (root.path().join("a"), root.path().join("a").join("b"));
+        let nested = b.join("log");
+
+        // Act
+        let (mut writer, ops) = open_recording(&nested);
+        writer.append(&event(0)).expect("append");
+
+        // Assert
+        assert_eq!(
+            ops.recorded()[..4],
+            [
+                sync_dir_op(&nested, false),
+                sync_dir_op(&b, false),
+                sync_dir_op(&a, false),
+                sync_dir_op(root.path(), false),
+            ]
+        );
+        assert_eq!(replay(&nested).expect("replay"), vec![event(0)]);
+    }
+
+    #[test]
+    fn open_on_an_existing_directory_syncs_no_ancestor() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        write_events(dir.path(), &[event(0)], &clock);
+
+        // Act
+        let (_writer, ops) = open_recording(dir.path());
+
+        // Assert
+        assert!(ops.recorded().is_empty(), "{:?}", ops.recorded());
+    }
+
+    #[test]
+    fn recovery_truncate_is_followed_by_a_file_sync() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let (valid, torn) = (event(0), event(1));
+        write_events(dir.path(), std::slice::from_ref(&valid), &clock);
+        append_raw(
+            &segment_files(dir.path()).remove(0),
+            &frame(&torn)[..HEADER_BYTES + 2],
+        );
+
+        // Act
+        let (_writer, ops) = open_recording(dir.path());
+
+        // Assert
+        assert_eq!(
+            ops.recorded(),
+            vec![Op::Truncate(frame_len(&valid)), Op::SyncFile]
+        );
+    }
+
+    #[test]
+    fn failed_recovery_truncate_fails_open_and_leaves_the_segment_unchanged() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        write_events(dir.path(), &[event(0)], &clock);
+        let segment = segment_files(dir.path()).remove(0);
+        append_raw(&segment, &frame(&event(1))[..HEADER_BYTES + 2]);
+        let bytes = fs::read(&segment).expect("read segment");
+        let faulty = FaultyOps {
+            fail_truncate: true,
+            ..FaultyOps::default()
+        };
+
+        // Act
+        let result = WalWriter::open_with_file_ops(dir.path(), config(LARGE), clock, faulty);
+
+        // Assert
+        assert!(
+            matches!(&result, Err(WalError::Io(error)) if error.to_string().contains("truncate")),
+            "unexpected result: {:?}",
+            result.err()
+        );
+        assert_eq!(fs::read(&segment).expect("read segment"), bytes);
+    }
+
+    #[test]
+    fn append_with_failed_sync_and_failed_rollback_may_still_be_recovered_on_reopen() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let (first, unknown) = (event(0), event(1));
+        let mut writer = open(dir.path(), LARGE, &clock);
+        writer.append(&first).expect("append first");
+        writer.ops = Box::new(FaultyOps {
+            fail_sync: true,
+            fail_truncate: true,
+            ..FaultyOps::default()
+        });
+
+        // Act
+        let failure = writer.append(&unknown).expect_err("sync should fail");
+        let blocked = writer.append(&event(2)).expect_err("poisoned append");
+        drop(writer);
+        let _reopened = open(dir.path(), LARGE, &clock);
+
+        // Assert
+        assert!(matches!(failure, WalError::Io(_)), "unexpected: {failure}");
+        assert!(
+            matches!(blocked, WalError::Poisoned),
+            "unexpected: {blocked}"
+        );
+        assert_eq!(
+            replay(dir.path()).expect("replay"),
+            vec![first, unknown],
+            "an Err from a poisoned append does not mean the record is absent"
         );
     }
 
