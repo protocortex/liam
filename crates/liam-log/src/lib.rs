@@ -6,6 +6,7 @@
 //! the immutable record those are rebuilt from, so a write-ahead log and its
 //! compacted Parquet segments outlive any change to the derived schema.
 
+pub mod compactor;
 pub mod dedup;
 pub mod event;
 pub mod filter_file;

@@ -427,12 +427,17 @@ fn load_or_create_log_id(dir: &Path, ops: &mut dyn FileOps) -> Result<Uuid, WalE
     Ok(log_id)
 }
 
-fn segment_name(sequence: u64) -> String {
+pub(crate) fn segment_name(sequence: u64) -> String {
     format!("{sequence:020}.{SEGMENT_EXTENSION}")
 }
 
+/// Decodes the events of one segment, treating a torn final record as the end.
+pub(crate) fn read_segment(path: &Path) -> Result<Vec<LogEvent>, WalError> {
+    Ok(scan_segment(path, &fs::read(path)?)?.events)
+}
+
 /// Only names written by `segment_name` count, so a stray `9.wal` or `+3.wal` is ignored.
-fn segment_sequence(path: &Path) -> Option<u64> {
+pub(crate) fn segment_sequence(path: &Path) -> Option<u64> {
     if path.extension()? != SEGMENT_EXTENSION {
         return None;
     }
