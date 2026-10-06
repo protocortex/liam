@@ -48,6 +48,15 @@ impl From<TombstoneTable> for Table {
 }
 
 impl Table {
+    /// A query that returns a row when `row_id` is in this table, live or closed.
+    pub(super) fn exists_query(self) -> &'static str {
+        match self {
+            Table::Nodes => "SELECT 1 FROM nodes WHERE id = ?1",
+            Table::Edges => "SELECT 1 FROM edges WHERE id = ?1",
+            Table::NodeCommunity => "SELECT 1 FROM node_community WHERE node_id = ?1",
+        }
+    }
+
     /// A query that returns a row when `row_id` is live in this table.
     pub(super) fn live_query(self, row_id: &str) -> (&'static str, Vec<Value>) {
         match self {

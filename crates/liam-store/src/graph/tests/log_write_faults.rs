@@ -10,9 +10,10 @@ use liam_log::hash::content_hashes;
 use liam_log::LogWriter;
 
 use super::log_write::{
-    assert_cursor_at_last_event, count, events, events_since, fact_at, logged_graph, mentions,
-    open_with, race, share, within_deadline, Appended, RecordingLog,
+    assert_cursor_at_last_event, events, events_since, logged_graph, mentions, open_with, race,
+    within_deadline, Appended, RecordingLog,
 };
+use super::support::{count, fact_at, share};
 use super::*;
 use crate::DefaultBackend;
 

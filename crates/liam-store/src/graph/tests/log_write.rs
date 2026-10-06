@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use liam_log::dedup::{BloomConfig, HashBloom};
 use liam_log::event::{EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, CURRENT_SCHEMA_VERSION};
 use liam_log::hash::{content_hashes, edge_row_hash, node_row_hash};
 use liam_log::test_support::FailingLogWriter;
@@ -17,6 +16,7 @@ use liam_log::wal::WalError;
 use liam_log::{LogOffset, LogWriter};
 use uuid::Uuid;
 
+use super::support::{count, cursor, fact, fact_at, offset_pair, share};
 use super::*;
 use crate::graph::projection::{apply_steps, steps_for};
 use crate::DefaultBackend;
@@ -105,14 +105,6 @@ fn head_of(appended: &Appended) -> Option<LogOffset> {
     appended.lock().unwrap().last().map(|(offset, _)| *offset)
 }
 
-pub(super) fn share(writer: impl LogWriter + 'static) -> SharedLog {
-    let bloom = HashBloom::new(BloomConfig::default());
-    Arc::new(tokio::sync::Mutex::new(EventLog::new(
-        Box::new(writer),
-        bloom,
-    )))
-}
-
 async fn open_clocked<B: Backend>(
     path: &str,
     clock: Arc<impl Clock + 'static>,
@@ -196,18 +188,6 @@ async fn wait_for_begins(g: &Graph<FailingBackend>, begins: usize) {
     .await;
 }
 
-fn fact(content: &str) -> NewNode {
-    NewNode::now("fact", "label", content)
-        .with_producer("agent-a")
-        .with_confidence(0.75)
-}
-
-/// `fact` with a supplied valid time, so source, trust, valid time, and ingest
-/// time are four different values on the log record.
-pub(super) fn fact_at(content: &str) -> NewNode {
-    fact(content).with_valid_from(Millis(500))
-}
-
 fn assert_envelope(event: &LogEvent) {
     assert_envelope_at(event, 1000);
 }
@@ -241,40 +221,8 @@ fn node_writes(appended: &Appended) -> Vec<NodeRow> {
         .collect()
 }
 
-pub(super) async fn count<B: Backend>(g: &Graph<B>, table: &str) -> i64 {
-    let rows = g
-        .backend
-        .query(&format!("SELECT COUNT(*) FROM {table}"), &[])
-        .await
-        .unwrap();
-    rows[0].get_i64(0).unwrap()
-}
-
-/// `None` when the cursor row does not exist yet; otherwise its log id and
-/// last applied offset (`None` while the offsets are still NULL).
-pub(super) async fn cursor<B: Backend>(g: &Graph<B>) -> Option<(String, Option<(i64, i64)>)> {
-    let rows = g
-        .backend
-        .query(
-            "SELECT log_id, last_segment, last_index FROM log_cursor",
-            &[],
-        )
-        .await
-        .unwrap();
-    let row = rows.first()?;
-    let offset = match (&row.0[1], &row.0[2]) {
-        (Value::Int(segment), Value::Int(index)) => Some((*segment, *index)),
-        _ => None,
-    };
-    Some((row.get_string(0).unwrap(), offset))
-}
-
 fn offset_at(segment: u64, index: u64) -> LogOffset {
     LogOffset { segment, index }
-}
-
-pub(super) fn offset_pair(offset: LogOffset) -> (i64, i64) {
-    (offset.segment as i64, offset.index as i64)
 }
 
 fn last_offset(appended: &Appended) -> LogOffset {

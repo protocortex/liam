@@ -5,7 +5,8 @@
 
 use liam_log::event::{LogEvent, LogPayload, RowEffect};
 
-use super::log_write::{dump_rows, events, mentions, share, Appended, RecordingLog};
+use super::log_write::{dump_rows, events, mentions, Appended, RecordingLog};
+use super::support::share;
 use super::*;
 use crate::graph::projection::{apply_steps, steps_for};
 

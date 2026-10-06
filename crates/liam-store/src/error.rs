@@ -36,6 +36,17 @@ pub enum Error {
     #[error("relate refused: {0}")]
     RelateRefused(String),
 
+    /// A guard of the conditional edge INSERT flipped between the insert and
+    /// the read that diagnoses it, so a retry would land. Kept apart from
+    /// `RelateRefused` so a replay never mistakes it for a verdict on the data.
+    #[error("a concurrent write took the row, retry")]
+    ConcurrentWrite,
+
+    /// The engine refused a statement on a constraint (foreign key, NOT NULL,
+    /// UNIQUE). The same statement against the same data fails again.
+    #[error("constraint violated: {0}")]
+    Constraint(String),
+
     /// An `EpisodeRef::New(i)` passed to `Graph::ingest_episode` named an
     /// index outside the bounds of that call's own `nodes` list.
     #[error("invalid reference: {0}")]
@@ -85,6 +96,15 @@ pub enum Error {
         cursor: liam_log::LogOffset,
         head: Option<liam_log::LogOffset>,
     },
+
+    /// The log could not be scanned.
+    #[error("event log read failed: {0}")]
+    LogRead(#[from] liam_log::reader::ReaderError),
+
+    /// Replay found some rows of an event in the store and others missing, which
+    /// no write of this store leaves behind.
+    #[error("event {0} is only partly in the store")]
+    PartlyApplied(String),
 
     /// A log table holds a value no write of this store produces, so the
     /// store was edited or damaged outside it.

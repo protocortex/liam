@@ -26,6 +26,7 @@ use liam_log::dedup::{
 };
 use liam_log::event::{LogEvent, LogPayload};
 use liam_log::hash::content_hashes;
+use liam_log::reader::LogReader;
 use liam_log::{LogOffset, LogWriter};
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
@@ -55,6 +56,8 @@ pub(super) fn ready<'a>(plan: Result<Plan>) -> BoxFuture<'a, Result<Plan>> {
 /// go with it. Graphs that share one `SharedLog` share all three.
 pub struct EventLog {
     writer: Box<dyn LogWriter>,
+    /// Reads the log back for replay.
+    reader: Arc<dyn LogReader>,
     bloom: HashBloom,
     /// What the operator asked for, kept apart from `bloom`'s own sizing so a
     /// rebuild that grew the filter does not raise the floor for the next one.
@@ -63,9 +66,10 @@ pub struct EventLog {
 }
 
 impl EventLog {
-    pub fn new(writer: Box<dyn LogWriter>, bloom: HashBloom) -> Self {
+    pub fn new(writer: Box<dyn LogWriter>, reader: Arc<dyn LogReader>, bloom: HashBloom) -> Self {
         Self {
             writer,
+            reader,
             configured: bloom.config().clone(),
             bloom,
             poisoned: false,
@@ -80,6 +84,21 @@ impl EventLog {
         self.writer.head()
     }
 
+    pub(super) fn reader(&self) -> Arc<dyn LogReader> {
+        Arc::clone(&self.reader)
+    }
+
+    /// Whether a write is appended but not yet reconciled, so the log's tail is
+    /// not known to match the store.
+    pub(super) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Teaches the dedup filter the hashes whose rows have committed.
+    pub(super) fn remember(&mut self, carried: &[([u8; 32], String)]) {
+        carried.iter().for_each(|(hash, _)| self.bloom.insert(hash));
+    }
+
     /// The sizing the filter was configured with, not the size of the live
     /// filter, which a rebuild may have grown past it.
     pub(super) fn bloom_config(&self) -> &BloomConfig {
@@ -88,6 +107,11 @@ impl EventLog {
 
     pub(super) fn replace_bloom(&mut self, bloom: HashBloom) {
         self.bloom = bloom;
+    }
+
+    #[cfg(test)]
+    pub(super) fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     #[cfg(test)]
@@ -217,17 +241,11 @@ impl<B: Backend> Graph<B> {
             }
         };
         tracing::debug!(%event_id, "event appended to the log");
-        let projected = async {
-            apply_steps(&mut *tx, steps).await?;
-            index_rows(&mut *tx, &carried, &event_id).await?;
-            log_cursor::advance_in_tx(&mut *tx, held.log_id, offset).await?;
-            Ok(())
-        }
-        .await;
+        let projected =
+            project_logged(&mut *tx, steps, &carried, &event_id, held.log_id, offset).await;
         match commit_or_abandon(tx, projected).await {
             Ok(()) => {
-                let hashes: Vec<_> = carried.iter().map(|(hash, _)| *hash).collect();
-                held.reconcile(&hashes);
+                held.reconcile(&carried);
                 tracing::debug!(%event_id, "projection committed");
                 Ok(())
             }
@@ -257,8 +275,24 @@ impl<B: Backend> Graph<B> {
     }
 }
 
+/// What a logged event does to the store inside its transaction: its rows, the
+/// hash index entries that point at them, and the cursor move onto its record.
+/// A live write and a replay run this one sequence.
+pub(super) async fn project_logged(
+    tx: &mut dyn BackendTx,
+    steps: &[Step],
+    carried: &[([u8; 32], String)],
+    event_id: &str,
+    log_id: Uuid,
+    offset: LogOffset,
+) -> Result<()> {
+    apply_steps(tx, steps).await?;
+    index_rows(tx, carried, event_id).await?;
+    log_cursor::advance_in_tx(tx, log_id, offset).await
+}
+
 /// A record about `event`, carrying its own source, trust, and times.
-fn follow_up(event: &LogEvent, payload: LogPayload) -> LogEvent {
+pub(super) fn follow_up(event: &LogEvent, payload: LogPayload) -> LogEvent {
     LogEvent {
         event_id: Uuid::now_v7().to_string(),
         content_hash: event.content_hash,
@@ -274,15 +308,15 @@ fn follow_up(event: &LogEvent, payload: LogPayload) -> LogEvent {
 
 /// The log lock, held for the whole transaction. `append` blocks on fsync, so
 /// it runs on the blocking pool with the guard moved in and back out.
-struct HeldLog {
+pub(super) struct HeldLog {
     guard: Option<OwnedMutexGuard<EventLog>>,
-    log_id: Uuid,
+    pub(super) log_id: Uuid,
 }
 
 impl HeldLog {
-    async fn acquire(log: &SharedLog) -> Result<Self> {
+    pub(super) async fn acquire(log: &SharedLog) -> Result<Self> {
         let guard = Arc::clone(log).lock_owned().await;
-        if guard.poisoned {
+        if guard.is_poisoned() {
             return Err(Error::LogPoisoned);
         }
         let log_id = guard.writer.log_id();
@@ -292,7 +326,7 @@ impl HeldLog {
         })
     }
 
-    async fn append(&mut self, event: LogEvent) -> Result<LogOffset> {
+    pub(super) async fn append(&mut self, event: LogEvent) -> Result<LogOffset> {
         let Some(mut guard) = self.guard.take() else {
             return Err(Error::LogPoisoned);
         };
@@ -319,14 +353,34 @@ impl HeldLog {
             .is_some_and(|log| log.bloom.might_contain(hash))
     }
 
-    fn reconcile(&mut self, hashes: &[[u8; 32]]) {
+    /// The last record the writer acknowledged. Fails like an append does when
+    /// a lost task took the guard.
+    pub(super) fn head(&self) -> Result<Option<LogOffset>> {
+        self.log().map(EventLog::head)
+    }
+
+    pub(super) fn reader(&self) -> Result<Arc<dyn LogReader>> {
+        self.log().map(EventLog::reader)
+    }
+
+    fn log(&self) -> Result<&EventLog> {
+        self.guard.as_deref().ok_or(Error::LogPoisoned)
+    }
+
+    pub(super) fn remember(&mut self, carried: &[([u8; 32], String)]) {
         if let Some(log) = self.guard.as_deref_mut() {
-            hashes.iter().for_each(|hash| log.bloom.insert(hash));
+            log.remember(carried);
+        }
+    }
+
+    pub(super) fn reconcile(&mut self, carried: &[([u8; 32], String)]) {
+        if let Some(log) = self.guard.as_deref_mut() {
+            log.remember(carried);
             log.poisoned = false;
         }
     }
 
-    fn set_poisoned(&mut self, poisoned: bool) {
+    pub(super) fn set_poisoned(&mut self, poisoned: bool) {
         if let Some(log) = self.guard.as_deref_mut() {
             log.poisoned = poisoned;
         }
@@ -480,7 +534,10 @@ async fn index_rows(
     Ok(())
 }
 
-async fn commit_or_abandon<T>(tx: Box<dyn BackendTx + '_>, applied: Result<T>) -> Result<T> {
+pub(super) async fn commit_or_abandon<T>(
+    tx: Box<dyn BackendTx + '_>,
+    applied: Result<T>,
+) -> Result<T> {
     match applied {
         Ok(applied) => tx.commit().await.map(|()| applied),
         Err(error) => {
@@ -490,7 +547,7 @@ async fn commit_or_abandon<T>(tx: Box<dyn BackendTx + '_>, applied: Result<T>) -
     }
 }
 
-async fn abandon(tx: Box<dyn BackendTx + '_>) {
+pub(super) async fn abandon(tx: Box<dyn BackendTx + '_>) {
     if let Err(error) = tx.rollback().await {
         tracing::warn!(%error, "rollback of an abandoned write failed");
     }
