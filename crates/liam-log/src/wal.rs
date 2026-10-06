@@ -51,6 +51,10 @@ pub enum WalError {
         offset: u64,
         source: EventError,
     },
+    #[error("wal segment {} is closed but empty", segment.display())]
+    EmptySegment { segment: PathBuf },
+    #[error("wal segment {} is closed but has a damaged or truncated tail", segment.display())]
+    IncompleteSegment { segment: PathBuf },
     #[error("wal segment {} already exists and is not empty", segment.display())]
     SegmentNotEmpty { segment: PathBuf },
     #[error("wal writer is poisoned by an earlier failed append and must be reopened")]
@@ -336,9 +340,31 @@ fn record_length(len: usize) -> Result<u32, WalError> {
 pub(crate) fn replay(dir: &Path) -> Result<Vec<LogEvent>, WalError> {
     let mut events = Vec::new();
     for (_, path) in segment_paths(dir)? {
-        events.extend(scan_segment(&path, &fs::read(&path)?)?.events);
+        events.extend(read_segment(&path, false)?.unwrap_or_default());
     }
     Ok(events)
+}
+
+/// Reads every event of a segment; `None` when the file is gone.
+///
+/// The writer only closes a segment after appending to it, so a closed one
+/// that is empty or ends in a torn record is damage. An open segment may end
+/// in an interrupted append, which is dropped.
+pub(crate) fn read_segment(path: &Path, closed: bool) -> Result<Option<Vec<LogEvent>>, WalError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let segment = || path.to_path_buf();
+    if closed && bytes.is_empty() {
+        return Err(WalError::EmptySegment { segment: segment() });
+    }
+    let scan = scan_segment(path, &bytes)?;
+    if closed && scan.valid_len != bytes.len() as u64 {
+        return Err(WalError::IncompleteSegment { segment: segment() });
+    }
+    Ok(Some(scan.events))
 }
 
 pub(crate) struct Scan {
@@ -472,17 +498,36 @@ pub(crate) fn segment_paths(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     numbered_files(dir, SEGMENT_EXTENSION)
 }
 
-/// Files of one extension named by `sequence_stem`, in sequence order.
-fn numbered_files(dir: &Path, extension: &str) -> io::Result<Vec<(u64, PathBuf)>> {
+/// Regular files of one extension named by `sequence_stem`, in sequence
+/// order. A directory with such a name is not a segment.
+pub(crate) fn numbered_files(dir: &Path, extension: &str) -> io::Result<Vec<(u64, PathBuf)>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if let Some(sequence) = segment_sequence(&path, extension) {
-            files.push((sequence, path));
+        match segment_sequence(&path, extension) {
+            Some(sequence) if path.is_file() => files.push((sequence, path)),
+            _ => {}
         }
     }
     files.sort();
     Ok(files)
+}
+
+/// Sequences of the segments a writer may still be appending to, given the
+/// WAL files in ascending order.
+///
+/// The highest segment is open. A rotation that fails after creating the
+/// successor leaves the writer on the lower segment, so an empty highest file
+/// also keeps the one below it open.
+pub(crate) fn open_segment_sequences(wals: &[(u64, PathBuf)]) -> Vec<u64> {
+    let Some(((highest, path), lower)) = wals.split_last() else {
+        return Vec::new();
+    };
+    let mut open = vec![*highest];
+    if fs::metadata(path).is_ok_and(|meta| meta.len() == 0) {
+        open.extend(lower.last().map(|(below, _)| *below));
+    }
+    open
 }
 
 /// Creates the directory and fsyncs every directory it newly created plus the
@@ -573,9 +618,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::compactor::parquet_name;
     use crate::event::CURRENT_SCHEMA_VERSION;
-    use crate::fixtures::{event, frame_len};
+    use crate::fixtures::{event, frame_len, parquet_path, wal_path};
     use crate::LogOffset;
 
     const INTERVAL_SECS: u64 = 60;
@@ -1464,7 +1508,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (first, second) = (event(0), event(1));
         let mut writer = open(dir.path(), frame_len(&first), &FakeClock::default());
-        let successor = dir.path().join(segment_name(1));
+        let successor = wal_path(dir.path(), 1);
         File::create(&successor).expect("pre-create successor");
 
         // Act
@@ -1555,7 +1599,7 @@ mod tests {
     fn creating_a_segment_over_a_non_empty_file_is_an_error() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let existing = dir.path().join(segment_name(1));
+        let existing = wal_path(dir.path(), 1);
         fs::write(&existing, b"data").expect("pre-create non-empty successor");
 
         // Act
@@ -1582,7 +1626,7 @@ mod tests {
             &FakeClock::default(),
             &sink,
         );
-        let foreign = dir.path().join(segment_name(1));
+        let foreign = wal_path(dir.path(), 1);
         fs::write(&foreign, b"data").expect("pre-create successor");
 
         // Act
@@ -1620,14 +1664,14 @@ mod tests {
         let max_bytes = frame_len(&event(0));
         let mut writer = open(dir.path(), max_bytes, &clock);
         let fresh = writer.open_sequence();
-        fs::write(dir.path().join(segment_name(1)), b"data").expect("pre-create successor");
+        fs::write(wal_path(dir.path(), 1), b"data").expect("pre-create successor");
 
         // Act
         writer
             .append(&event(0))
             .expect("append survives failed rotation");
         let after_failed_rotation = writer.open_sequence();
-        fs::write(dir.path().join(segment_name(1)), b"").expect("empty the successor");
+        fs::write(wal_path(dir.path(), 1), b"").expect("empty the successor");
         writer
             .append(&event(1))
             .expect("append retries the rotation");
@@ -2156,10 +2200,10 @@ mod tests {
         for (name, wal, parquet, expected) in cases {
             let dir = tempfile::tempdir().expect("tempdir");
             for sequence in wal {
-                fs::write(dir.path().join(segment_name(*sequence)), b"").expect("write segment");
+                fs::write(wal_path(dir.path(), *sequence), b"").expect("write segment");
             }
             for sequence in parquet {
-                let file = dir.path().join(parquet_name(*sequence));
+                let file = parquet_path(dir.path(), *sequence);
                 fs::write(file, b"parquet").expect("write parquet");
             }
 
@@ -2169,9 +2213,48 @@ mod tests {
 
             // Assert
             assert_eq!(offset.segment, expected, "{name}");
-            let created = dir.path().join(segment_name(expected));
+            let created = wal_path(dir.path(), expected);
             assert!(created.exists(), "{name}: segment {expected} not created");
         }
+    }
+
+    #[test]
+    fn a_directory_named_like_a_segment_is_not_a_segment() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(wal_path(dir.path(), 7)).expect("wal named directory");
+        fs::create_dir(parquet_path(dir.path(), 9)).expect("parquet named directory");
+
+        // Act
+        let mut writer = open(dir.path(), LARGE, &FakeClock::default());
+        let offset = writer.append(&event(0)).expect("append");
+
+        // Assert
+        assert_eq!(offset.segment, 0);
+        assert!(numbered_files(dir.path(), PARQUET_EXTENSION)
+            .expect("list")
+            .is_empty());
+    }
+
+    #[test]
+    fn the_highest_segment_is_open_and_an_empty_one_keeps_the_segment_below_it_open() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wals: Vec<(u64, PathBuf)> = (3..6).map(|n| (n, wal_path(dir.path(), n))).collect();
+        for (_, path) in &wals[..2] {
+            fs::write(path, b"data").expect("write segment");
+        }
+
+        // Act
+        fs::write(&wals[2].1, b"data").expect("write highest");
+        let full = open_segment_sequences(&wals);
+        fs::write(&wals[2].1, b"").expect("empty highest");
+        let empty_highest = open_segment_sequences(&wals);
+
+        // Assert
+        assert_eq!(full, [5]);
+        assert_eq!(empty_highest, [5, 4]);
+        assert!(open_segment_sequences(&[]).is_empty());
     }
 
     #[test]

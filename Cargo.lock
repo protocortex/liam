@@ -2485,6 +2485,7 @@ dependencies = [
  "crc32fast",
  "fastbloom",
  "futures-core",
+ "futures-util",
  "object_store",
  "parquet",
  "postcard",

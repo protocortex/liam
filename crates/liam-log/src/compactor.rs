@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::{LogEvent, LogPayload, CURRENT_SCHEMA_VERSION};
 use crate::wal::{
-    scan_segment, segment_paths, segment_sequence, sequence_stem, sync_dir, sync_dir_for,
+    read_segment, segment_paths, segment_sequence, sequence_stem, sync_dir, sync_dir_for,
     SegmentSink, WalError, PARQUET_EXTENSION, SEGMENT_EXTENSION,
 };
 
@@ -99,6 +99,12 @@ pub enum CompactError {
     NotASegment { segment: PathBuf },
     #[error("wal segment {} is closed but empty", segment.display())]
     EmptySegment { segment: PathBuf },
+    #[error("wal segment {sequence} holds {wal_events} events but its verified parquet holds {parquet_events}")]
+    WalShorterThanParquet {
+        sequence: u64,
+        wal_events: usize,
+        parquet_events: usize,
+    },
 }
 
 /// Matches the WAL segment stem so a segment and its file pair up by name.
@@ -284,6 +290,24 @@ pub(crate) async fn read_parquet(
     }
     ensure_stamp(&metadata, EVENT_COUNT_KEY, events.len() as u64)?;
     Ok(events)
+}
+
+/// The event count stamped in the footer of the object for `sequence`. No row
+/// is decoded, so this says what the file claims, not that it is intact.
+pub(crate) async fn read_event_count(
+    store: &dyn ObjectStore,
+    sequence: u64,
+) -> Result<u64, CompactError> {
+    let bytes = store.get(&object_path(sequence)).await?.bytes().await?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+    let found = builder.schema().metadata().get(EVENT_COUNT_KEY);
+    found
+        .and_then(|count| count.parse().ok())
+        .ok_or_else(|| CompactError::MetadataMismatch {
+            key: EVENT_COUNT_KEY,
+            expected: 0,
+            found: found.cloned(),
+        })
 }
 
 fn ensure_supported_version(metadata: &Metadata) -> Result<(), CompactError> {
@@ -480,16 +504,29 @@ impl Compactor {
         let Some(events) = read_closed_segment(segment)? else {
             return Ok(None);
         };
-        let recovered = match self.verify(sequence, &events).await {
-            Ok(()) => {
-                self.remove(segment)?;
-                return Ok(Some(Recovered::RemovedAsDone));
-            }
+        let rewrite = |reason: CompactError| {
+            tracing::warn!(sequence, %reason, "existing parquet does not verify, rewriting it");
+            Recovered::Rewritten(reason)
+        };
+        let recovered = match read_parquet(self.store.as_ref(), sequence).await {
             Err(CompactError::Store(object_store::Error::NotFound { .. })) => Recovered::Compacted,
-            Err(reason) => {
-                tracing::warn!(sequence, %reason, "existing parquet does not verify, rewriting it");
-                Recovered::Rewritten(reason)
-            }
+            Err(reason) => rewrite(reason),
+            Ok(stored) => match ensure_same_events(sequence, &stored, &events) {
+                Ok(()) => {
+                    self.remove(segment)?;
+                    return Ok(Some(Recovered::RemovedAsDone));
+                }
+                // A verified Parquet with more events than the segment holds
+                // events the segment lost, so rewriting would destroy them.
+                Err(_) if stored.len() > events.len() => {
+                    return Err(CompactError::WalShorterThanParquet {
+                        sequence,
+                        wal_events: events.len(),
+                        parquet_events: stored.len(),
+                    })
+                }
+                Err(reason) => rewrite(reason),
+            },
         };
         self.publish(segment, sequence, &events).await?;
         Ok(Some(recovered))
@@ -528,25 +565,9 @@ impl Compactor {
     }
 
     /// Reads the stored object back and requires exactly the segment's events.
-    ///
-    /// Events are compared by their encoded bytes so float bit patterns count,
-    /// which `==` would miss for `-0.0` and wrongly reject for NaN.
     async fn verify(&self, sequence: u64, expected: &[LogEvent]) -> Result<(), CompactError> {
-        let mismatch = |detail: String| CompactError::ReadBackMismatch { sequence, detail };
         let stored = read_parquet(self.store.as_ref(), sequence).await?;
-        if stored.len() != expected.len() {
-            return Err(mismatch(format!(
-                "it holds {} events, the segment has {}",
-                stored.len(),
-                expected.len()
-            )));
-        }
-        for (index, (stored, expected)) in stored.iter().zip(expected).enumerate() {
-            if encoded(stored)? != encoded(expected)? {
-                return Err(mismatch(format!("event {index} differs from the segment")));
-            }
-        }
-        Ok(())
+        ensure_same_events(sequence, &stored, expected)
     }
 
     fn remove(&self, segment: &Path) -> Result<(), CompactError> {
@@ -568,6 +589,10 @@ impl Compactor {
     /// The live path never compacts the open segment. The writer always has a
     /// successor open once it closes a segment, so the highest-numbered file is
     /// treated as open; recovery gets the exact sequence from the caller instead.
+    ///
+    /// Unlike the reader this does not also hold back the segment below an empty
+    /// highest file: the writer notifies a segment the moment it rotates, when
+    /// its successor is still empty, so that rule would refuse every notification.
     fn ensure_closed(&self, segment: &Path, sequence: u64) -> Result<(), CompactError> {
         let segments = segment_paths(&self.dir).map_err(WalError::Io)?;
         let newest = segments.last().map(|(newest, _)| *newest);
@@ -631,29 +656,37 @@ fn encoded(event: &LogEvent) -> Result<Vec<u8>, CompactError> {
         .map_err(|error| WalError::Encode(error).into())
 }
 
+/// Requires exactly the segment's events, compared by their encoded bytes so
+/// float bit patterns count, which `==` would miss for `-0.0` and wrongly
+/// reject for NaN.
+fn ensure_same_events(
+    sequence: u64,
+    stored: &[LogEvent],
+    expected: &[LogEvent],
+) -> Result<(), CompactError> {
+    let mismatch = |detail: String| CompactError::ReadBackMismatch { sequence, detail };
+    if stored.len() != expected.len() {
+        return Err(mismatch(format!(
+            "it holds {} events, the segment has {}",
+            stored.len(),
+            expected.len()
+        )));
+    }
+    for (index, (stored, expected)) in stored.iter().zip(expected).enumerate() {
+        if encoded(stored)? != encoded(expected)? {
+            return Err(mismatch(format!("event {index} differs from the segment")));
+        }
+    }
+    Ok(())
+}
+
 /// Reads every event of a closed segment; `None` when the segment is gone.
-///
-/// The writer only closes a segment after appending to it, so an empty one is
-/// damage and is kept rather than turned into an empty Parquet.
-fn read_closed_segment(segment: &Path) -> Result<Option<Vec<LogEvent>>, CompactError> {
-    let bytes = match fs::read(segment) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WalError::Io(error).into()),
-    };
-    if bytes.is_empty() {
-        return Err(CompactError::EmptySegment {
-            segment: segment.to_path_buf(),
-        });
-    }
-    let scan = scan_segment(segment, &bytes)?;
-    // Only an open segment can have a torn tail, so any here is damage.
-    if scan.valid_len != bytes.len() as u64 {
-        return Err(CompactError::IncompleteSegment {
-            segment: segment.to_path_buf(),
-        });
-    }
-    Ok(Some(scan.events))
+pub(crate) fn read_closed_segment(segment: &Path) -> Result<Option<Vec<LogEvent>>, CompactError> {
+    read_segment(segment, true).map_err(|error| match error {
+        WalError::EmptySegment { segment } => CompactError::EmptySegment { segment },
+        WalError::IncompleteSegment { segment } => CompactError::IncompleteSegment { segment },
+        other => other.into(),
+    })
 }
 
 /// A `SegmentSink` that forwards closed-segment paths to a compactor task.
@@ -695,7 +728,10 @@ mod tests {
 
     use super::*;
     use crate::event::{RowEffect, TombstoneTable, TombstoneTarget};
-    use crate::fixtures::{edge_row, event, frame_len, log_event, node_row, sample_hash};
+    use crate::fixtures::{
+        edge_row, event, frame_len, log_event, node_row, parquet_path, sample_hash, snapshot,
+        wal_path,
+    };
     use crate::wal::{segment_name, SystemClock, WalConfig, WalWriter, HEADER_BYTES};
     use crate::LogWriter;
 
@@ -1211,12 +1247,12 @@ mod tests {
                 let first = sequence as usize * EVENTS_PER_SEGMENT;
                 ClosedSegment {
                     sequence,
-                    path: dir.path().join(segment_name(sequence)),
+                    path: wal_path(dir.path(), sequence),
                     events: (first..first + EVENTS_PER_SEGMENT).map(event).collect(),
                 }
             })
             .collect();
-        let open = dir.path().join(segment_name(closed_segments));
+        let open = wal_path(dir.path(), closed_segments);
         Log { dir, closed, open }
     }
 
@@ -1321,7 +1357,7 @@ mod tests {
         // Arrange
         let log = write_log(1);
         let compactor = local_compactor(log.dir.path());
-        let gone = log.dir.path().join(segment_name(7));
+        let gone = wal_path(log.dir.path(), 7);
         let before = file_names(log.dir.path(), "");
 
         // Act
@@ -1448,7 +1484,9 @@ mod tests {
         let store = local_store(&dir);
 
         // Act
-        append_events(&mut writer, 0..EVENTS_PER_SEGMENT + 1);
+        // Stops at the rotation, so the closed segment is notified while its
+        // successor is still empty.
+        append_events(&mut writer, 0..EVENTS_PER_SEGMENT);
         drop(writer);
         tokio::time::timeout(TASK_TIMEOUT, handle)
             .await
@@ -1570,7 +1608,7 @@ mod tests {
         }
         let segment = ClosedSegment {
             sequence: 0,
-            path: dir.path().join(segment_name(0)),
+            path: wal_path(dir.path(), 0),
             events: events[..EVENTS_PER_SEGMENT].to_vec(),
         };
 
@@ -1658,20 +1696,6 @@ mod tests {
         local_compactor(dir).with_remover(Arc::new(FaultyRemover { failing, fault }))
     }
 
-    /// Every file in the directory with its bytes, to compare before and after.
-    fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut files: Vec<_> = std::fs::read_dir(dir)
-            .expect("list dir")
-            .map(|entry| {
-                let entry = entry.expect("dir entry");
-                let name = entry.file_name().into_string().unwrap();
-                (name, std::fs::read(entry.path()).expect("read file"))
-            })
-            .collect();
-        files.sort();
-        files
-    }
-
     fn assert_report(
         report: &RecoveryReport,
         compacted: &[u64],
@@ -1705,7 +1729,7 @@ mod tests {
     fn removing_a_segment_that_is_already_gone_succeeds() {
         // Arrange
         let dir = tempfile::tempdir().expect("temp dir");
-        let gone = dir.path().join(segment_name(3));
+        let gone = wal_path(dir.path(), 3);
 
         // Act
         let outcome = DurableRemover.remove(&gone);
@@ -1718,7 +1742,7 @@ mod tests {
     fn a_directory_sync_failure_after_the_unlink_is_reported_as_a_sync_failure() {
         // Arrange
         let dir = tempfile::tempdir().expect("temp dir");
-        let segment = dir.path().join(segment_name(3));
+        let segment = wal_path(dir.path(), 3);
         std::fs::write(&segment, b"data").expect("write segment");
 
         // Act
@@ -1963,7 +1987,7 @@ mod tests {
         // Arrange
         let log = write_log(0);
         let writer_sequence = 0;
-        let successor = log.dir.path().join(segment_name(writer_sequence + 1));
+        let successor = wal_path(log.dir.path(), writer_sequence + 1);
         std::fs::write(&successor, b"").expect("rotation created the successor");
         let before = snapshot(log.dir.path());
 
@@ -1986,7 +2010,7 @@ mod tests {
         let store = local_store(&log.dir);
         let marked = marked_parquet(segment);
         put_bytes(&store, segment.sequence, marked.clone()).await;
-        let parquet = log.dir.path().join(parquet_name(segment.sequence));
+        let parquet = parquet_path(log.dir.path(), segment.sequence);
 
         // Act
         let report = local_compactor(log.dir.path())
@@ -2111,6 +2135,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_keeps_both_files_when_the_wal_holds_fewer_events_than_a_verified_parquet() {
+        // Arrange
+        let log = write_log(1);
+        let segment = &log.closed[0];
+        let longer: Vec<LogEvent> = (0..EVENTS_PER_SEGMENT + 1).map(event).collect();
+        write_parquet(&local_store(&log.dir), segment.sequence, &longer)
+            .await
+            .expect("parquet with an extra event");
+        let before = snapshot(log.dir.path());
+
+        // Act
+        let report = local_compactor(log.dir.path())
+            .recover(log.open_sequence())
+            .await
+            .expect("recover");
+
+        // Assert
+        assert_report(&report, &[], &[], &[], &[segment.sequence]);
+        assert!(
+            matches!(
+                report.failed[0].error,
+                CompactError::WalShorterThanParquet {
+                    sequence: 0,
+                    wal_events: 2,
+                    parquet_events: 3
+                }
+            ),
+            "{:?}",
+            report.failed[0]
+        );
+        assert_eq!(snapshot(log.dir.path()), before);
+    }
+
+    #[tokio::test]
     async fn recovery_never_touches_the_open_wal_even_when_a_parquet_exists_for_it() {
         // Arrange
         let log = write_log(1);
@@ -2120,7 +2178,7 @@ mod tests {
             .await
             .expect("parquet for the open segment");
         let open_bytes = std::fs::read(&log.open).expect("read open segment");
-        let parquet = log.dir.path().join(parquet_name(open_sequence));
+        let parquet = parquet_path(log.dir.path(), open_sequence);
         let parquet_bytes = std::fs::read(&parquet).expect("read parquet");
 
         // Act
@@ -2181,7 +2239,7 @@ mod tests {
             log.dir.path().join("notes.txt"),
             log.dir.path().join("9.wal"),
             log.dir.path().join("00000000000000000099.tmp"),
-            log.dir.path().join(parquet_name(42)),
+            parquet_path(log.dir.path(), 42),
         ];
         for stray in &strays[..3] {
             std::fs::write(stray, b"stray").expect("write stray file");
