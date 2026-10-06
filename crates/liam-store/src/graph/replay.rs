@@ -248,7 +248,10 @@ async fn replay_projection(
     let deciding = if kept.is_empty() { doomed } else { kept };
     let held = rows_held(tx, &deciding).await?;
     if held == deciding.len() {
-        log_cursor::advance_in_tx(tx, log_id, *offset).await?;
+        // The store may hold the rows of an event it never indexed, as a
+        // backfill that stopped after its append leaves them.
+        let event_id = &event.event_id;
+        project_logged(tx, &[], carried, event_id, log_id, *offset, vector_delete).await?;
         return Ok(Outcome::AlreadyApplied);
     }
     if held > 0 {
@@ -350,7 +353,7 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
         .filter_map(|step| match step {
             Step::Node(row) => Some(WrittenRow::Node(&row.id)),
             Step::Edge(row) | Step::GuardedEdge(row) => Some(WrittenRow::Edge(row)),
-            Step::Close { .. } | Step::Remove(_) => None,
+            Step::Close { .. } | Step::Remove(_) | Step::BackfillProgress(_) => None,
         })
         .collect()
 }

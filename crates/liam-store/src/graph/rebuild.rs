@@ -55,10 +55,10 @@ struct LiveRows {
     edges: usize,
 }
 
-const LIVE_NODES_SQL: &str = "SELECT id, kind, label, content, producer, attributes, scope, \
-     subject, confidence, valid_from, valid_until, tx_from, tx_to FROM nodes WHERE tx_to = ?1";
-const LIVE_EDGES_SQL: &str =
-    "SELECT id, src, dst, type, attributes, tx_from, tx_to FROM edges WHERE tx_to = ?1";
+/// The columns `stored_node` and `stored_edge` read, in their order.
+pub(super) const NODE_COLUMNS: &str = "id, kind, label, content, producer, attributes, scope, \
+     subject, confidence, valid_from, valid_until, tx_from, tx_to";
+pub(super) const EDGE_COLUMNS: &str = "id, src, dst, type, attributes, tx_from, tx_to";
 
 impl<B: Backend> Graph<B> {
     /// The sorted multiset of canonical row hashes of every live node and edge.
@@ -179,12 +179,14 @@ impl<B: Backend> Graph<B> {
 
     async fn live_rows(&self) -> Result<LiveRows> {
         let live = [FOREVER.into()];
+        let live_nodes = format!("SELECT {NODE_COLUMNS} FROM nodes WHERE tx_to = ?1");
+        let live_edges = format!("SELECT {EDGE_COLUMNS} FROM edges WHERE tx_to = ?1");
         let mut hashes = Vec::new();
-        for row in self.backend.query(LIVE_NODES_SQL, &live).await? {
+        for row in self.backend.query(&live_nodes, &live).await? {
             hashes.push(node_row_hash(&stored_node(&row)?));
         }
         let nodes = hashes.len();
-        for row in self.backend.query(LIVE_EDGES_SQL, &live).await? {
+        for row in self.backend.query(&live_edges, &live).await? {
             hashes.push(edge_row_hash(&stored_edge(&row)?));
         }
         let edges = hashes.len() - nodes;
@@ -231,7 +233,7 @@ impl<B: Backend> Graph<B> {
 /// The node a stored row holds. The table does not record whether `valid_from`
 /// was supplied, so it is hashed as supplied, which is how a log row is hashed
 /// when the two are compared.
-fn stored_node(row: &Row) -> Result<NodeRow> {
+pub(super) fn stored_node(row: &Row) -> Result<NodeRow> {
     Ok(NodeRow {
         id: row.get_string(0)?,
         kind: row.get_string(1)?,
@@ -250,7 +252,7 @@ fn stored_node(row: &Row) -> Result<NodeRow> {
     })
 }
 
-fn stored_edge(row: &Row) -> Result<EdgeRow> {
+pub(super) fn stored_edge(row: &Row) -> Result<EdgeRow> {
     Ok(EdgeRow {
         id: row.get_string(0)?,
         src: row.get_string(1)?,

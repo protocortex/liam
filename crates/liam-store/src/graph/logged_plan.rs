@@ -30,7 +30,7 @@ use crate::value::Value;
 
 /// Source and trust of a record no producer wrote, such as an edge.
 const STORE_SOURCE: &str = "liam-store";
-const STORE_TRUST: f64 = 1.0;
+pub(super) const STORE_TRUST: f64 = 1.0;
 
 /// A table whose rows a content hash or a tombstone can point at.
 #[derive(Clone, Copy)]
@@ -202,7 +202,7 @@ fn node_event(row: &NodeRow, now: Millis, payload: LogPayload) -> LogEvent {
     event(node_row_hash(row), stamp, row.valid_from, now, payload)
 }
 
-fn event(
+pub(super) fn event(
     content_hash: [u8; 32],
     (source, trust_score): (&str, f64),
     observed_at: i64,

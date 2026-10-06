@@ -159,6 +159,11 @@ pub enum Error {
     /// store was edited or damaged outside it.
     #[error("the log state in the store is corrupt: {0}")]
     CorruptLogState(String),
+
+    /// The store holds a row that cannot be logged so that a replay recreates
+    /// it, so a backfill would leave a rebuild with a different store.
+    #[error("cannot backfill the log: {0}")]
+    BackfillUnreplayable(String),
 }
 
 /// What the log's live rows were compared with when they did not match.
