@@ -17,9 +17,9 @@ use liam_log::wal::{WalError, WalWriter};
 use liam_log::{LogOffset, LogWriter};
 
 use super::support::{
-    count, cursor, edge, edge_write, event, fact, fact_at, has_node, node, node_write, offset_pair,
-    quarantined, record_counts, shared, tombstone, Env, ReembedProbe, StubEmbedder, ONE_SEGMENT,
-    SEGMENT_PER_EVENT,
+    count, cursor_offset, edge, edge_write, event, fact, fact_at, has_node, node, node_write,
+    offset_pair, quarantined, record_counts, shared, tombstone, Env, ReembedProbe, StubEmbedder,
+    ONE_SEGMENT, SEGMENT_PER_EVENT,
 };
 use super::*;
 use crate::DefaultBackend;
@@ -97,10 +97,6 @@ async fn tx_to<B: Backend>(g: &Graph<B>, id: &str) -> i64 {
         .await
         .unwrap();
     rows.first().expect("node row").get_i64(0).unwrap()
-}
-
-async fn cursor_offset<B: Backend>(g: &Graph<B>) -> Option<(i64, i64)> {
-    cursor(g).await.and_then(|(_, offset)| offset)
 }
 
 async fn lose_cursor<B: Backend>(g: &Graph<B>) {

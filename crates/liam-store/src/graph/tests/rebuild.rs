@@ -8,8 +8,9 @@ use liam_log::event::{EdgeRow, LogEvent, LogPayload, NodeRow, TombstoneTable};
 use liam_log::hash::{edge_row_hash, node_row_hash};
 
 use super::support::{
-    count, cursor, edge, edge_write, event, fact, fact_at, has_node, node, node_write, offset_pair,
-    quarantined, record_counts, tombstone, Env, StubEmbedder, ONE_SEGMENT, SEGMENT_PER_EVENT,
+    count, cursor, cursor_offset, edge, edge_write, event, fact, fact_at, has_node, node,
+    node_write, offset_pair, quarantined, record_counts, snapshot, tombstone, Env, StubEmbedder,
+    EDGE_COLUMNS, NODE_COLUMNS, ONE_SEGMENT, SEGMENT_PER_EVENT,
 };
 use super::*;
 use crate::error::MismatchSource;
@@ -172,21 +173,6 @@ async fn populate(opened: &Opened) -> Populated {
 }
 
 // ---- reading the store back ----
-
-const NODE_COLUMNS: &str = "id, kind, label, content, producer, attributes, scope, subject, \
-     confidence, valid_from, valid_until, tx_from, tx_to";
-const EDGE_COLUMNS: &str = "id, src, dst, type, attributes, tx_from, tx_to";
-
-/// Every row of `nodes` and `edges` in full, ordered by id, so two stores can
-/// be compared exactly.
-async fn snapshot<B: Backend>(g: &Graph<B>) -> (String, String) {
-    let nodes = format!("SELECT {NODE_COLUMNS} FROM nodes ORDER BY id");
-    let edges = format!("SELECT {EDGE_COLUMNS} FROM edges ORDER BY id");
-    (
-        format!("{:?}", g.backend.query(&nodes, &[]).await.unwrap()),
-        format!("{:?}", g.backend.query(&edges, &[]).await.unwrap()),
-    )
-}
 
 /// Every table a rebuild touches, in full, so two equal values mean a refused
 /// rebuild changed nothing.
@@ -358,10 +344,6 @@ async fn delete_node<B: Backend>(g: &Graph<B>, id: &NodeId) {
         .execute("DELETE FROM nodes WHERE id = ?1", &[id.as_str().into()])
         .await
         .unwrap();
-}
-
-async fn cursor_offset<B: Backend>(g: &Graph<B>) -> Option<(i64, i64)> {
-    cursor(g).await.and_then(|(_, offset)| offset)
 }
 
 /// A store that applied the first two records of a log that has since grown by

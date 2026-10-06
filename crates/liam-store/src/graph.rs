@@ -520,11 +520,7 @@ pub struct Graph<B: Backend> {
     expansion_weight: f64,
     log: Option<SharedLog>,
     embedder: Option<Arc<dyn ContentEmbedder>>,
-    /// Targets one GC tombstone event carries at most.
-    gc_chunk: usize,
 }
-
-const GC_CHUNK_TARGETS: usize = 500;
 
 impl<B: Backend> Graph<B> {
     pub async fn open(path: &str, config: GraphConfig) -> Result<Self> {
@@ -569,7 +565,6 @@ impl<B: Backend> Graph<B> {
             expansion_weight: config.expansion_weight,
             log: None,
             embedder: None,
-            gc_chunk: GC_CHUNK_TARGETS,
         })
     }
 
@@ -586,12 +581,6 @@ impl<B: Backend> Graph<B> {
         log_open::check_and_prime(&self.backend, &log).await?;
         self.log = Some(log);
         Ok(self)
-    }
-
-    #[cfg(test)]
-    fn with_gc_chunk(mut self, targets: usize) -> Self {
-        self.gc_chunk = targets;
-        self
     }
 
     // ---- write ----
@@ -2118,6 +2107,15 @@ mod tests {
     mod rebuild;
     mod reembed;
     mod support;
+
+    /// A graph whose clock starts at 1000, with a handle to move it.
+    async fn gc_graph() -> (DefaultGraph, Arc<FixedClock>) {
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        (g, clock)
+    }
 
     async fn graph_at(t: Millis) -> DefaultGraph {
         let clock = Arc::new(FixedClock::new(t));
@@ -3792,19 +3790,9 @@ mod tests {
 
     #[tokio::test]
     async fn gc_ages_out_by_kind() {
-        const DAY: i64 = 86_400_000;
-        let g = graph_at(Millis(100 * DAY)).await;
-        g.insert(NewNode::now("episode", "old", "x").with_valid_from(Millis(10 * DAY)))
-            .await
-            .unwrap();
-        g.insert(NewNode::now("decision", "keep", "y").with_valid_from(Millis(10 * DAY)))
-            .await
-            .unwrap();
-        let report = g
-            .gc(&RetentionPolicy::keep("episode", Millis::days(30)).without_reclaim())
-            .await
-            .unwrap();
-        assert_eq!(report.nodes_removed, 1);
+        let (g, clock) = gc_graph().await;
+
+        support::gc_ages_out_by_kind(&g, &clock).await;
     }
 
     #[test]
@@ -5278,90 +5266,60 @@ mod tests {
 
     #[tokio::test]
     async fn gc_sweeps_a_node_that_still_has_an_edge_pointing_at_it() {
-        // Regression. libSQL enforces foreign keys by default, unlike stock
-        // SQLite, and `gc` used to delete nodes before the edges referencing
-        // them. That aborted the whole sweep with "FOREIGN KEY constraint
-        // failed" on ANY store holding an edge, and the daemon's `sweep` logs
-        // the error and continues, so retention silently never ran.
-        let t0 = Millis(1_000_000);
-        let clock = Arc::new(FixedClock::new(t0));
-        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
-            .await
-            .unwrap();
-        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
-        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
-        g.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+        let (g, clock) = gc_graph().await;
 
-        clock.set(Millis(t0.0 + 10_000));
-        let report = g
-            .gc(&RetentionPolicy::keep("fact", Millis(1)))
-            .await
-            .expect("gc must not fail on a store that holds an edge");
-
-        assert_eq!(report.nodes_removed, 2);
-        assert_eq!(report.edges_removed, 1, "the edge goes with its endpoints");
-        let left = g
-            .backend
-            .query("SELECT COUNT(*) FROM edges", &[])
-            .await
-            .unwrap();
-        assert_eq!(left[0].get_i64(0).unwrap(), 0);
+        support::gc_sweeps_a_node_that_still_has_an_edge_pointing_at_it(&g, &clock).await;
     }
 
     #[tokio::test]
     async fn gc_sweeps_a_node_that_still_has_a_community_assignment() {
-        // `node_community.node_id` declares the same REFERENCES, so it is the
-        // second way a doomed node can be pinned. Unreachable from production
-        // today because nothing calls `recompute_communities`, and pinned now
-        // because ADR-0002 is about to wire it to this very tick.
-        let t0 = Millis(1_000_000);
-        let clock = Arc::new(FixedClock::new(t0));
-        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
-            .await
-            .unwrap();
-        let a = g.insert(NewNode::now("fact", "a", "x")).await.unwrap();
-        let b = g.insert(NewNode::now("fact", "b", "x")).await.unwrap();
-        g.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
-        g.recompute_communities().await.unwrap();
-        assert!(
-            !g.communities().await.unwrap().is_empty(),
-            "assignment seeded"
-        );
+        let (g, clock) = gc_graph().await;
 
-        clock.set(Millis(t0.0 + 10_000));
-        g.gc(&RetentionPolicy::keep("fact", Millis(1)))
-            .await
-            .expect("gc must not fail on an assigned node");
-
-        assert!(g.communities().await.unwrap().is_empty());
+        support::gc_sweeps_a_node_that_still_has_a_community_assignment(&g, &clock).await;
     }
 
     #[tokio::test]
     async fn gc_leaves_an_edge_whose_endpoints_both_survive() {
-        // The fix deletes edges by rule before the nodes, so it has to stay
-        // scoped to the doomed set. Deleting more would silently destroy the
-        // graph on every tick.
-        let t0 = Millis(1_000_000);
-        let clock = Arc::new(FixedClock::new(t0));
-        let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+        let (g, clock) = gc_graph().await;
+
+        support::gc_leaves_an_edge_whose_endpoints_both_survive(&g, &clock).await;
+    }
+
+    #[tokio::test]
+    async fn gc_sweeps_a_node_that_has_a_vector() {
+        // Arrange
+        let (g, _clock) = gc_graph().await;
+        g.insert(support::fact_at("embedded").with_embedding(support::embedding()))
             .await
             .unwrap();
-        let a = g.insert(NewNode::now("keep", "a", "x")).await.unwrap();
-        let b = g.insert(NewNode::now("keep", "b", "x")).await.unwrap();
-        g.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+        assert_eq!(support::count(&g, "node_vectors").await, 1);
 
-        clock.set(Millis(t0.0 + 10_000));
-        // A rule for a DIFFERENT kind, so nothing should be swept at all.
+        // Act
+        let swept = g
+            .gc(&RetentionPolicy::keep("fact", Millis(1)).without_reclaim())
+            .await;
+
+        // Assert: the vector went with the node
+        assert_eq!(swept.unwrap().nodes_removed, 1);
+        assert_eq!(support::count(&g, "nodes").await, 0);
+        assert_eq!(support::count(&g, "node_vectors").await, 0);
+    }
+
+    #[tokio::test]
+    async fn gc_removes_an_edge_whose_endpoint_is_gone() {
+        // Arrange
+        let (g, _clock) = gc_graph().await;
+        support::insert_orphan_edge(&g, "orphan").await;
+
+        // Act
         let report = g
             .gc(&RetentionPolicy::keep("fact", Millis(1)))
             .await
             .unwrap();
 
-        assert_eq!(report.nodes_removed, 0);
-        assert_eq!(
-            report.edges_removed, 0,
-            "an unrelated rule swept a live edge"
-        );
+        // Assert
+        assert_eq!((report.nodes_removed, report.edges_removed), (0, 1));
+        assert_eq!(support::count(&g, "edges").await, 0);
     }
 
     // ---- WU-7: the fingerprint seam ----

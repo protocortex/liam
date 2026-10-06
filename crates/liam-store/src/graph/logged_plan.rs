@@ -50,6 +50,16 @@ impl From<TombstoneTable> for Table {
     }
 }
 
+/// The edges a removed node takes with it, with `?1` the node's id. A macro so
+/// `removal_sql` can concatenate it into a literal; `gc` counts a chunk's edges
+/// with the same clause.
+macro_rules! edges_of_node {
+    () => {
+        "src = ?1 OR dst = ?1"
+    };
+}
+pub(super) use edges_of_node;
+
 impl Table {
     /// A query that returns a row when `row_id` is in this table, live or closed.
     pub(super) fn exists_query(self) -> &'static str {
@@ -70,7 +80,7 @@ impl Table {
             // Cascades on a backend that enforces foreign keys; the explicit
             // deletes guard one that does not.
             Table::Nodes => &[
-                "DELETE FROM edges WHERE src = ?1 OR dst = ?1",
+                concat!("DELETE FROM edges WHERE ", edges_of_node!()),
                 "DELETE FROM node_community WHERE node_id = ?1",
                 "DELETE FROM nodes WHERE id = ?1",
             ],

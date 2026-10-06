@@ -81,14 +81,18 @@ impl ContentEmbedder for StubEmbedder {
     }
 }
 
-/// A backend that lets a test interfere with a re-embed pass where it reads
-/// and writes, and otherwise defers to a real one.
+/// A backend that lets a test interfere with a re-embed pass or a sweep where
+/// it reads and writes, and otherwise defers to a real one.
 pub(super) struct ReembedProbe {
     inner: crate::backends::DefaultBackend,
     listing_fails: std::sync::atomic::AtomicBool,
     extra_listed: StdMutex<Option<NodeId>>,
     unreadable: StdMutex<Option<String>>,
     stored_after_listing: StdMutex<Option<(String, Vec<f32>)>>,
+    inserted_after_query: StdMutex<Option<(String, NodeRow)>>,
+    /// A log, and whether it was free when the orphan vectors were swept.
+    watched: StdMutex<Option<SharedLog>>,
+    log_free_at_orphan_sweep: StdMutex<Option<bool>>,
 }
 
 impl ReembedProbe {
@@ -112,6 +116,22 @@ impl ReembedProbe {
     pub(super) fn store_after_listing(&self, id: &NodeId, vector: Vec<f32>) {
         *self.stored_after_listing.lock().unwrap() = Some((id.as_str().to_owned(), vector));
     }
+
+    /// Writes `row` right after the next query that starts with `sql`, as a
+    /// write landing between a read and the changes it drives would.
+    pub(super) fn insert_after_query(&self, sql: &str, row: NodeRow) {
+        *self.inserted_after_query.lock().unwrap() = Some((sql.to_owned(), row));
+    }
+
+    /// Records whether `log` is free when the orphan vectors are swept.
+    pub(super) fn watch_orphan_sweep(&self, log: &SharedLog) {
+        *self.watched.lock().unwrap() = Some(Arc::clone(log));
+    }
+
+    /// `None` until the orphan vectors have been swept.
+    pub(super) fn log_free_at_orphan_sweep(&self) -> Option<bool> {
+        *self.log_free_at_orphan_sweep.lock().unwrap()
+    }
 }
 
 #[async_trait::async_trait]
@@ -123,6 +143,9 @@ impl Backend for ReembedProbe {
             extra_listed: StdMutex::new(None),
             unreadable: StdMutex::new(None),
             stored_after_listing: StdMutex::new(None),
+            inserted_after_query: StdMutex::new(None),
+            watched: StdMutex::new(None),
+            log_free_at_orphan_sweep: StdMutex::new(None),
         })
     }
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
@@ -136,7 +159,19 @@ impl Backend for ReembedProbe {
         if reads_it {
             return Err(Error::Backend("injected content read failure".to_string()));
         }
-        self.inner.query(sql, params).await
+        let rows = self.inner.query(sql, params).await?;
+        let landed = {
+            let mut pending = self.inserted_after_query.lock().unwrap();
+            match pending.as_ref() {
+                Some((prefix, _)) if sql.starts_with(prefix.as_str()) => pending.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, row)) = landed {
+            let (insert, params) = node_row_insert(&row);
+            self.inner.execute(&insert, &params).await?;
+        }
+        Ok(rows)
     }
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         self.inner.execute(sql, params).await
@@ -188,6 +223,10 @@ impl Backend for ReembedProbe {
         Ok(listed)
     }
     async fn vector_sweep_orphans(&self) -> Result<u64> {
+        let watched = self.watched.lock().unwrap().clone();
+        if let Some(log) = watched {
+            *self.log_free_at_orphan_sweep.lock().unwrap() = Some(log.try_lock().is_ok());
+        }
         self.inner.vector_sweep_orphans().await
     }
     async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
@@ -429,6 +468,31 @@ pub(super) async fn has_node<B: Backend>(g: &Graph<B>, id: &str) -> bool {
     !rows.is_empty()
 }
 
+pub(super) const NODE_COLUMNS: &str = "id, kind, label, content, producer, attributes, scope, \
+     subject, confidence, valid_from, valid_until, tx_from, tx_to";
+pub(super) const EDGE_COLUMNS: &str = "id, src, dst, type, attributes, tx_from, tx_to";
+
+/// Every row of `nodes` and `edges` in full, ordered by id, so two stores can
+/// be compared exactly.
+pub(super) async fn snapshot<B: Backend>(g: &Graph<B>) -> (String, String) {
+    let nodes = format!("SELECT {NODE_COLUMNS} FROM nodes ORDER BY id");
+    let edges = format!("SELECT {EDGE_COLUMNS} FROM edges ORDER BY id");
+    (
+        format!("{:?}", g.backend.query(&nodes, &[]).await.unwrap()),
+        format!("{:?}", g.backend.query(&edges, &[]).await.unwrap()),
+    )
+}
+
+/// The offset the store's cursor sits on.
+pub(super) async fn cursor_offset<B: Backend>(g: &Graph<B>) -> Option<(i64, i64)> {
+    cursor(g).await.and_then(|(_, offset)| offset)
+}
+
+/// Whether `error` is one a test backend or log injected.
+pub(super) fn injected(error: &Error) -> bool {
+    matches!(error, Error::Backend(message) if message.contains("injected"))
+}
+
 /// Every quarantined event as `(event, segment, index, reason)`, by event id.
 pub(super) async fn quarantined<B: Backend>(g: &Graph<B>) -> Vec<(String, i64, i64, String)> {
     g.backend
@@ -457,4 +521,121 @@ pub(super) fn record_counts(report: CatchUpReport) -> CatchUpReport {
         reembedded: ReembedReport::default(),
         ..report
     }
+}
+
+pub(super) fn embedding() -> Vec<f32> {
+    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+/// An edge whose ends are no nodes, which a store that enforces foreign keys
+/// cannot be made to hold except with enforcement off.
+pub(super) async fn insert_orphan_edge<B: Backend>(g: &Graph<B>, id: &str) {
+    let insert = format!(
+        "PRAGMA foreign_keys=OFF;
+         INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
+         VALUES ('{id}', 'gone-src', 'gone-dst', 'mentions', '{{}}', 1000, {});
+         PRAGMA foreign_keys=ON;",
+        FOREVER.0
+    );
+    g.backend.execute_batch(&insert).await.unwrap();
+}
+
+// ---- gc scenarios, run against a graph with a log and one without ----
+//
+// Each sweeps, asserts what the sweep reports and leaves behind, and returns
+// the nodes it expects to have been swept. `clock` is the graph's, which starts
+// at 1000.
+
+pub(super) async fn gc_ages_out_by_kind<B: Backend>(
+    g: &Graph<B>,
+    clock: &FixedClock,
+) -> Vec<NodeId> {
+    const DAY: i64 = 86_400_000;
+    clock.set(Millis(100 * DAY));
+    let episode = g
+        .insert(NewNode::now("episode", "old", "x").with_valid_from(Millis(10 * DAY)))
+        .await
+        .unwrap();
+    g.insert(NewNode::now("decision", "keep", "y").with_valid_from(Millis(10 * DAY)))
+        .await
+        .unwrap();
+
+    let report = g
+        .gc(&RetentionPolicy::keep("episode", Millis::days(30)).without_reclaim())
+        .await
+        .unwrap();
+
+    assert_eq!(report.nodes_removed, 1);
+    vec![episode]
+}
+
+/// Regression: libSQL enforces foreign keys, unlike stock SQLite, and a sweep
+/// that deleted nodes before the edges naming them failed on any store holding
+/// an edge, which the daemon logs and carries on from.
+pub(super) async fn gc_sweeps_a_node_that_still_has_an_edge_pointing_at_it<B: Backend>(
+    g: &Graph<B>,
+    clock: &FixedClock,
+) -> Vec<NodeId> {
+    let a = g.insert(NewNode::now("fact", "a", "x1")).await.unwrap();
+    let b = g.insert(NewNode::now("fact", "b", "x2")).await.unwrap();
+    g.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+    clock.set(Millis(11_000));
+
+    let report = g
+        .gc(&RetentionPolicy::keep("fact", Millis(1)))
+        .await
+        .expect("gc must not fail on a store that holds an edge");
+
+    assert_eq!(report.nodes_removed, 2);
+    assert_eq!(report.edges_removed, 1, "the edge goes with its endpoints");
+    assert_eq!(count(g, "edges").await, 0);
+    vec![a, b]
+}
+
+/// `node_community.node_id` declares the same foreign key, so it is the second
+/// way a doomed node can be pinned.
+pub(super) async fn gc_sweeps_a_node_that_still_has_a_community_assignment<B: Backend>(
+    g: &Graph<B>,
+    clock: &FixedClock,
+) -> Vec<NodeId> {
+    let a = g.insert(NewNode::now("fact", "a", "x1")).await.unwrap();
+    let b = g.insert(NewNode::now("fact", "b", "x2")).await.unwrap();
+    g.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+    g.recompute_communities().await.unwrap();
+    assert!(
+        !g.communities().await.unwrap().is_empty(),
+        "assignment seeded"
+    );
+    clock.set(Millis(11_000));
+
+    g.gc(&RetentionPolicy::keep("fact", Millis(1)))
+        .await
+        .expect("gc must not fail on an assigned node");
+
+    assert!(g.communities().await.unwrap().is_empty());
+    vec![a, b]
+}
+
+/// A sweep scoped to the doomed set, not to every edge.
+pub(super) async fn gc_leaves_an_edge_whose_endpoints_both_survive<B: Backend>(
+    g: &Graph<B>,
+    clock: &FixedClock,
+) -> Vec<NodeId> {
+    let a = g.insert(NewNode::now("keep", "a", "x1")).await.unwrap();
+    let b = g.insert(NewNode::now("keep", "b", "x2")).await.unwrap();
+    g.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+    clock.set(Millis(11_000));
+
+    // A rule for a different kind, so nothing is swept at all.
+    let report = g
+        .gc(&RetentionPolicy::keep("fact", Millis(1)))
+        .await
+        .unwrap();
+
+    assert_eq!(report.nodes_removed, 0);
+    assert_eq!(
+        report.edges_removed, 0,
+        "an unrelated rule swept a live edge"
+    );
+    Vec::new()
 }

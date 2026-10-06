@@ -13,7 +13,7 @@ use super::log_write::{
     assert_cursor_at_last_event, events, events_since, logged_graph, mentions, open_with, race,
     within_deadline, Appended, RecordingLog,
 };
-use super::support::{count, fact_at, share};
+use super::support::{count, fact_at, injected, share};
 use super::*;
 use crate::DefaultBackend;
 
@@ -214,20 +214,17 @@ async fn statement_count(op: Op) -> usize {
                 assert_eq!(index, op.statements(), "{op:?}: statements it ran");
                 return index;
             }
-            Err(_) => assert!(injected(&result), "{op:?}, statement {index}: {result:?}"),
+            Err(ref error) => assert!(injected(error), "{op:?}, statement {index}: {result:?}"),
         }
     }
     panic!("{op:?} still fails after 40 statements");
 }
 
-fn injected(result: &Result<()>) -> bool {
-    matches!(result, Err(Error::Backend(message)) if message.contains("injected"))
-}
-
 /// The fault fired, nothing committed, and the log holds the write followed by
 /// its void with the cursor on the void.
 async fn assert_voided(faulted: &Faulted, context: &str) {
-    assert!(injected(&faulted.result), "{context}: {:?}", faulted.result);
+    let fired = faulted.result.as_ref().is_err_and(injected);
+    assert!(fired, "{context}: {:?}", faulted.result);
     assert_eq!(snapshot(&faulted.g).await, faulted.before, "{context}");
     let logged = events_since(&faulted.appended, faulted.seeded_events);
     assert_eq!(logged.len(), 2, "{context}: the write, then its void");
