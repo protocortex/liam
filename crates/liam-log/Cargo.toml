@@ -5,6 +5,10 @@ edition = "2021"
 description = "Event log crate for write-ahead logging and Parquet compaction."
 license = "Apache-2.0"
 
+[features]
+# Exposes the failing LogWriter double to other crates' tests.
+test-support = []
+
 [dependencies]
 arrow = { version = "60.0.0", default-features = false }
 fastbloom = { version = "0.17.0", default-features = false, features = ["serde"] }
@@ -17,3 +21,6 @@ thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 tracing.workspace = true
 uuid = { version = "1.27.0", default-features = false, features = ["std", "v7"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
