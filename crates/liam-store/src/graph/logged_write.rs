@@ -57,7 +57,6 @@ pub(super) fn ready<'a>(plan: Result<Plan>) -> BoxFuture<'a, Result<Plan>> {
 pub struct EventLog {
     writer: Box<dyn LogWriter>,
     /// Reads the log back for replay; a log without one cannot be caught up from.
-    #[allow(dead_code)]
     reader: Option<Arc<dyn LogReader>>,
     bloom: HashBloom,
     /// What the operator asked for, kept apart from `bloom`'s own sizing so a
@@ -89,6 +88,15 @@ impl EventLog {
 
     pub(super) fn head(&self) -> Option<LogOffset> {
         self.writer.head()
+    }
+
+    pub(super) fn reader(&self) -> Option<Arc<dyn LogReader>> {
+        self.reader.clone()
+    }
+
+    /// Teaches the dedup filter hashes whose rows have committed.
+    pub(super) fn remember(&mut self, hashes: &[[u8; 32]]) {
+        hashes.iter().for_each(|hash| self.bloom.insert(hash));
     }
 
     /// The sizing the filter was configured with, not the size of the live
@@ -332,7 +340,7 @@ impl HeldLog {
 
     fn reconcile(&mut self, hashes: &[[u8; 32]]) {
         if let Some(log) = self.guard.as_deref_mut() {
-            hashes.iter().for_each(|hash| log.bloom.insert(hash));
+            log.remember(hashes);
             log.poisoned = false;
         }
     }
@@ -471,7 +479,7 @@ impl HashIndex for TxHashIndex<'_> {
 
 /// Points each carried hash at the rows that carry it, in write order, so the
 /// first carrier of a hash repeated within one event stays first.
-async fn index_rows(
+pub(super) async fn index_rows(
     tx: &mut dyn BackendTx,
     carried: &[([u8; 32], String)],
     event_id: &str,
@@ -491,7 +499,10 @@ async fn index_rows(
     Ok(())
 }
 
-async fn commit_or_abandon<T>(tx: Box<dyn BackendTx + '_>, applied: Result<T>) -> Result<T> {
+pub(super) async fn commit_or_abandon<T>(
+    tx: Box<dyn BackendTx + '_>,
+    applied: Result<T>,
+) -> Result<T> {
     match applied {
         Ok(applied) => tx.commit().await.map(|()| applied),
         Err(error) => {
@@ -501,7 +512,7 @@ async fn commit_or_abandon<T>(tx: Box<dyn BackendTx + '_>, applied: Result<T>) -
     }
 }
 
-async fn abandon(tx: Box<dyn BackendTx + '_>) {
+pub(super) async fn abandon(tx: Box<dyn BackendTx + '_>) {
     if let Err(error) = tx.rollback().await {
         tracing::warn!(%error, "rollback of an abandoned write failed");
     }

@@ -86,6 +86,18 @@ pub enum Error {
         head: Option<liam_log::LogOffset>,
     },
 
+    /// The log was handed to the store without a reader, so replay cannot
+    /// scan it.
+    #[error(
+        "the event log has no reader, so it cannot be replayed; \
+         build the log with EventLog::with_reader before calling catch_up"
+    )]
+    LogReaderMissing,
+
+    /// The log could not be scanned.
+    #[error("event log read failed: {0}")]
+    LogRead(#[from] liam_log::reader::ReaderError),
+
     /// A log table holds a value no write of this store produces, so the
     /// store was edited or damaged outside it.
     #[error("the log state in the store is corrupt: {0}")]

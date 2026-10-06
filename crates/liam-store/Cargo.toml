@@ -14,6 +14,8 @@ thiserror = "2"
 ulid = "2"
 tracing = "0.1"
 liam-log = { path = "../liam-log" }
+# Replay pulls the log reader's record stream.
+futures-util = { version = "0.3", default-features = false }
 # The log's event ids are v7 UUIDs, so they sort by creation time.
 uuid = { version = "1.27.0", default-features = false, features = ["std", "v7"] }
 
