@@ -120,9 +120,11 @@ const REBUILD_WAL: WalConfig = WalConfig {
     rotate_interval_secs: 3600,
 };
 
-/// GC does not record what it deletes yet, so a rebuild cannot know it.
-const GC_WARNING: &str = "warning: a store that ran GC before the log recorded deletions can get \
-     the rows GC removed back from the log. Back up the database before relying on a rebuild.";
+/// A sweep is tombstoned only when the store has a log attached; any other
+/// sweep is invisible to a rebuild.
+const GC_WARNING: &str = "warning: GC sweeps made without a log attached are not in the log, so a \
+     rebuild can bring back the rows they removed. Back up the database before relying on a \
+     rebuild.";
 
 /// `<database stem>.log` beside the database, until the config names a log
 /// directory.
@@ -988,7 +990,10 @@ mod tests {
 
         // Assert
         assert_eq!(code, 0, "stderr: {err}");
-        assert!(err.contains("GC"), "{err}");
+        assert!(
+            err.contains("GC sweeps made without a log attached"),
+            "{err}"
+        );
         assert!(err.contains("Back up"), "{err}");
     }
 
