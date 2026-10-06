@@ -728,12 +728,12 @@ async fn log_write_a_void_double_fault_poisons_the_log_until_reopen() {
     assert_eq!(head_of(&fresh_appended), Some(offset_at(0, 1)));
 }
 
-// ---- the remaining write paths: upsert_by, supersede, relate, ingest_episode ----
+// ---- the remaining write paths: upsert_by, supersede, relate, link, ingest_episode ----
 //
 // Payload shapes these tests pin, so a replay can rebuild the store from the
 // log alone:
 // - insert, and an upsert_by with no live competitor: `NodeWrite`.
-// - relate: `EdgeWrite`.
+// - relate and link: `EdgeWrite`.
 // - supersede, and an upsert_by that finds a live competitor: one
 //   `EpisodeBatch` of `[Node(new row), Edge(supersedes new -> old)]`. The batch
 //   has no row-close effect, so the close is implied: replaying a `supersedes`
@@ -992,6 +992,31 @@ async fn log_write_relate_appends_one_edge_write_equal_to_the_stored_row() {
     assert_eq!(event.encryption_key_id, None);
     assert_cursor_at_last_event(&g, &appended, &log_id).await;
     assert_indexed_with(&g, event).await;
+}
+
+#[tokio::test]
+async fn log_write_link_appends_one_edge_write_carrying_its_attributes() {
+    // Arrange
+    let (g, appended, log_id, clock) = clocked_graph::<DefaultBackend>(Millis(1000)).await;
+    let src = g.insert(fact_at("src")).await.unwrap();
+    let dst = g.insert(fact_at("dst")).await.unwrap();
+    let since = events(&appended).len();
+    clock.set(Millis(2000));
+    let edge = NewEdge::new(&src, &dst, "mentions").with_attributes(serde_json::json!({"w": 2}));
+
+    // Act
+    let id = g.link(edge).await.unwrap();
+
+    // Assert
+    let logged = events_since(&appended, since);
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let stored = stored_edge(&g, id.as_str()).await;
+    assert_eq!(stored.attributes, r#"{"w":2}"#);
+    assert_eq!(stored.tx_from, 2000);
+    assert_eq!(logged[0].payload, LogPayload::EdgeWrite(stored.clone()));
+    assert_eq!(logged[0].content_hash, edge_row_hash(&stored));
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+    assert_indexed_with(&g, &logged[0]).await;
 }
 
 #[tokio::test]
@@ -1331,6 +1356,69 @@ async fn log_write_a_second_identical_relate_returns_the_first_edge_and_logs_dup
     assert_cursor_at_last_event(&g, &appended, &log_id).await;
 }
 
+#[tokio::test]
+async fn log_write_a_second_identical_link_returns_the_first_edge_and_logs_duplicate_of() {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let src = g.insert(fact_at("src")).await.unwrap();
+    let dst = g.insert(fact_at("dst")).await.unwrap();
+    let since = events(&appended).len();
+    let first = g.link(NewEdge::new(&src, &dst, "mentions")).await;
+
+    // Act
+    let second = g.link(NewEdge::new(&src, &dst, "mentions")).await;
+
+    // Assert
+    assert!(first.is_ok(), "{first:?}");
+    assert_eq!(second.as_ref().ok(), first.as_ref().ok(), "{second:?}");
+    assert_eq!(count(&g, "edges").await, 1);
+    let logged = events_since(&appended, since);
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    assert!(matches!(logged[0].payload, LogPayload::EdgeWrite(_)));
+    assert_eq!(
+        logged[1].payload,
+        LogPayload::DuplicateOf {
+            first_event_id: logged[0].event_id.clone()
+        }
+    );
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+}
+
+#[tokio::test]
+async fn log_write_a_link_with_the_attributes_of_its_live_twin_deduplicates_and_other_attributes_are_refused(
+) {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let src = g.insert(fact_at("src")).await.unwrap();
+    let dst = g.insert(fact_at("dst")).await.unwrap();
+    let weighted = |weight| {
+        NewEdge::new(&src, &dst, "mentions").with_attributes(serde_json::json!({"weight": weight}))
+    };
+    let first = g.link(weighted(2)).await.unwrap();
+    let since = events(&appended).len();
+
+    // Act
+    let same = g.link(weighted(2)).await;
+    let other = g.link(weighted(3)).await;
+
+    // Assert
+    assert_eq!(same.as_ref().ok(), Some(&first), "{same:?}");
+    assert!(
+        matches!(&other, Err(Error::RelateRefused(m)) if m.contains("weight")),
+        "{other:?}"
+    );
+    let logged = events_since(&appended, since);
+    assert_eq!(logged.len(), 1, "only the duplicate is logged: {logged:?}");
+    assert!(matches!(logged[0].payload, LogPayload::DuplicateOf { .. }));
+    assert_eq!(
+        stored_edge(&g, first.as_str()).await.attributes,
+        r#"{"weight":2}"#
+    );
+    assert_eq!(count(&g, "edges").await, 1);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+    assert!(g.insert(fact_at("next")).await.is_ok(), "log not poisoned");
+}
+
 // ---- write time, the close safety net, and the reserved relation ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1490,6 +1578,73 @@ async fn log_write_relate_refuses_the_supersedes_relation_before_anything_is_app
 }
 
 #[tokio::test]
+async fn log_write_link_refuses_the_supersedes_relation_and_a_dead_endpoint_before_logging() {
+    // Arrange
+    let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let src = g.insert(fact_at("src")).await.unwrap();
+    let dst = g.insert(fact_at("dst").with_subject("s")).await.unwrap();
+    g.supersede(&dst, fact_at("dst2").with_subject("s"))
+        .await
+        .unwrap();
+    let since = events(&appended).len();
+
+    // Act
+    let reserved = g.link(NewEdge::new(&src, &dst, relation::SUPERSEDES)).await;
+    let dead = g.link(NewEdge::new(&src, &dst, "mentions")).await;
+
+    // Assert
+    assert_reserved_refused(&reserved);
+    assert!(
+        matches!(&dead, Err(Error::RelateRefused(m)) if m.contains("not live")),
+        "{dead:?}"
+    );
+    assert_eq!(events(&appended).len(), since);
+    assert!(g.insert(fact_at("next")).await.is_ok(), "log not poisoned");
+}
+
+#[tokio::test]
+async fn link_refuses_the_supersedes_relation_with_and_without_a_log() {
+    // Arrange
+    let (logged, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let unlogged = graph_at(Millis(1000)).await;
+    let mut refused = Vec::new();
+    let since = events(&appended).len();
+
+    // Act
+    for g in [&logged, &unlogged] {
+        let src = g.insert(fact_at("src")).await.unwrap();
+        let dst = g.insert(fact_at("dst")).await.unwrap();
+        refused.push((
+            g.link(NewEdge::new(&src, &dst, relation::SUPERSEDES)).await,
+            dst,
+        ));
+    }
+
+    // Assert
+    for (result, _) in &refused {
+        assert_reserved_refused(result);
+    }
+    assert_eq!(count(&logged, "edges").await, 0);
+    assert_eq!(count(&unlogged, "edges").await, 0);
+    let target = refused[1].1.as_str();
+    let closed = unlogged
+        .backend
+        .query("SELECT tx_to FROM nodes WHERE id = ?1", &[target.into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        closed[0].get_i64(0).unwrap(),
+        FOREVER.0,
+        "the target stays open"
+    );
+    assert_eq!(
+        events_since(&appended, since).len(),
+        2,
+        "only the two inserts"
+    );
+}
+
+#[tokio::test]
 async fn log_write_an_episode_refuses_a_supersedes_edge_before_anything_is_appended() {
     // Arrange
     let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
@@ -1600,9 +1755,9 @@ async fn log_write_replaying_the_logged_payloads_reproduces_the_live_rows() {
     let replica = graph_at(Millis(1000)).await;
     for event in events(&appended) {
         let mut tx = replica.backend.begin().await.unwrap();
-        apply_steps(&mut *tx, &steps_for(&event.payload))
-            .await
-            .unwrap();
+        let steps = steps_for(&event.payload);
+        let vector_delete = replica.backend.vector_delete_sql();
+        apply_steps(&mut *tx, &steps, vector_delete).await.unwrap();
         tx.commit().await.unwrap();
     }
 

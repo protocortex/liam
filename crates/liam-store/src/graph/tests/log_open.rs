@@ -419,6 +419,9 @@ impl Backend for Probed {
     async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
         self.inner.vector_insert_if_absent(node_id, embedding).await
     }
+    fn vector_delete_sql(&self) -> Option<&'static str> {
+        self.inner.vector_delete_sql()
+    }
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
         self.inner.vector_delete(node_id).await
     }

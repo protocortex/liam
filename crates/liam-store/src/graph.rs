@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use liam_log::event::NodeRow;
 
-use self::logged_plan::Collision;
+use self::logged_plan::{refuse_supersedes, Collision};
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
 pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
@@ -83,15 +83,21 @@ fn edge_refusal(
         return Error::RelateRefused(format!("target node {} is not live", dst.as_str()));
     }
     if edge_exists {
-        return Error::RelateRefused(format!(
-            "{} already relates to {} as '{kind}'",
-            src.as_str(),
-            dst.as_str()
-        ));
+        return Error::RelateRefused(edge_exists_message(src, dst, kind));
     }
     // Every guard passes now, so one of them flipped between the insert and
     // this read. A retry would land.
     Error::ConcurrentWrite
+}
+
+/// The refusal text for a triple that already has a live edge. Retry classifiers
+/// match on its wording, so every refusal over a twin starts with it.
+fn edge_exists_message(src: &NodeId, dst: &NodeId, kind: &str) -> String {
+    format!(
+        "{} already relates to {} as '{kind}'",
+        src.as_str(),
+        dst.as_str()
+    )
 }
 
 /// The three flags of `EDGE_REFUSAL_DIAGNOSTIC_SQL`'s row: source live, target
@@ -559,9 +565,9 @@ impl<B: Backend> Graph<B> {
         })
     }
 
-    /// Routes `insert`, `upsert_by`, `supersede`, `relate`, and `ingest_episode`
-    /// through `log`: each is appended to it before it is applied. `link` and
-    /// `gc` do not append yet. Without a log, every write is unlogged.
+    /// Routes `insert`, `upsert_by`, `supersede`, `relate`, `link`, and
+    /// `ingest_episode` through `log`: each is appended to it before it is
+    /// applied. `gc` does not append yet. Without a log, every write is unlogged.
     ///
     /// Refuses a log the store does not belong to (`LogIdMismatch`) and a store
     /// ahead of the log (`CursorBeyondLog`), then rebuilds the log's dedup
@@ -623,26 +629,17 @@ impl<B: Backend> Graph<B> {
         Ok(new_id)
     }
 
+    /// Writes an edge with attributes through the same guarded, logged path as
+    /// `relate`, so it is refused, deduplicated and replayed the same way. The
+    /// reserved `supersedes` relation is always refused, and so is a live twin
+    /// that carries other attributes, which a duplicate answer would drop.
     pub async fn link(&self, edge: NewEdge) -> Result<EdgeId> {
-        let id = EdgeId::new();
-        let now = self.clock.now();
-        let attrs = serde_json::to_string(&edge.attributes)?;
-        self.backend
-            .execute(
-                "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    id.as_str().into(),
-                    edge.src.as_str().into(),
-                    edge.dst.as_str().into(),
-                    edge.kind.into(),
-                    attrs.into(),
-                    now.into(),
-                    FOREVER.into(),
-                ],
-            )
+        refuse_supersedes([edge.kind.as_str()])?;
+        let attributes = serde_json::to_string(&edge.attributes)?;
+        let written = self
+            .project_edge(&edge.src, &edge.dst, &edge.kind, &attributes)
             .await?;
-        Ok(id)
+        Ok(written.0)
     }
 
     /// Assert a semantic edge between two live nodes, idempotently.
@@ -668,7 +665,7 @@ impl<B: Backend> Graph<B> {
     /// oversight: see ADR-0001 Amendment 2 before "fixing" it, because widening
     /// it changes the guarantee rather than tightening it.
     pub async fn relate(&self, src: &NodeId, dst: &NodeId, kind: &str) -> Result<EdgeId> {
-        Ok(self.project_relate(src, dst, kind).await?.0)
+        Ok(self.project_edge(src, dst, kind, EMPTY_ATTRIBUTES).await?.0)
     }
 
     /// Write a batch of nodes and the edges between them as one atomic unit:
@@ -1187,7 +1184,8 @@ impl<B: Backend> Graph<B> {
         for rule in &policy.rules {
             let cutoff = now.0 - rule.max_age.0;
             let params: Vec<Value> = vec![rule.kind.as_str().into(), cutoff.into()];
-            // Rows that REFERENCE the doomed nodes have to go first.
+            // Rows that REFERENCE the doomed nodes have to go first, in the
+            // order `Table::removal_sql` uses for one tombstoned node.
             //
             // libSQL enforces foreign keys by default, which stock SQLite does
             // not, and `edges.src`, `edges.dst` and `node_community.node_id`
@@ -1467,11 +1465,10 @@ impl<B: Backend> Graph<B> {
     /// pass has not already seen. Returns the count of `mentions` edges
     /// actually inserted.
     ///
-    /// The repair insert goes through `relate`, never `link`: both the
-    /// liveness guard and the duplicate-triple guard on `(src, dst, type)`
-    /// have to hold, since two `mentions` edges seeded outside `relate` can
-    /// otherwise race each other onto the same repaired triple within one
-    /// pass. Each `relate` result is classified via `classify_relate_outcome`
+    /// The repair insert goes through `relate`: both the liveness guard and
+    /// the duplicate-triple guard on `(src, dst, type)` have to hold, since
+    /// two `mentions` edges seeded outside `relate` can otherwise race each
+    /// other onto the same repaired triple within one pass. Each `relate` result is classified via `classify_relate_outcome`
     /// and folded per `SUPERSEDES` edge: a real failure on any one repair
     /// keeps that edge's `tx_from` from advancing the watermark, even when a
     /// sibling repair on the same edge succeeded, so a later run revisits
@@ -1512,7 +1509,12 @@ impl<B: Backend> Graph<B> {
             for mention_row in &mention_rows {
                 let mentioning = NodeId::from_raw(mention_row.get_string(0)?);
                 let result = self
-                    .project_relate(&mentioning, &terminal, crate::types::relation::MENTIONS)
+                    .project_edge(
+                        &mentioning,
+                        &terminal,
+                        crate::types::relation::MENTIONS,
+                        EMPTY_ATTRIBUTES,
+                    )
                     .await;
                 fold_repair_outcome(
                     repair_outcome(result),
@@ -1543,7 +1545,12 @@ impl<B: Backend> Graph<B> {
             for mention_row in &own_mention_rows {
                 let mentioned = NodeId::from_raw(mention_row.get_string(0)?);
                 let result = self
-                    .project_relate(&terminal, &mentioned, crate::types::relation::MENTIONS)
+                    .project_edge(
+                        &terminal,
+                        &mentioned,
+                        crate::types::relation::MENTIONS,
+                        EMPTY_ATTRIBUTES,
+                    )
                     .await;
                 fold_repair_outcome(
                     repair_outcome(result),
@@ -2169,6 +2176,26 @@ mod tests {
         DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock)
             .await
             .unwrap()
+    }
+
+    /// A live edge row written behind the guards of `relate` and `link`, for a
+    /// test that needs a state those refuse to create.
+    async fn insert_edge_row(g: &DefaultGraph, src: &NodeId, dst: &NodeId, kind: &str) {
+        g.backend
+            .execute(
+                "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
+                 VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)",
+                &[
+                    EdgeId::new().as_str().into(),
+                    src.as_str().into(),
+                    dst.as_str().into(),
+                    kind.into(),
+                    g.clock.now().into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
     }
 
     /// Runs `f`'s future to completion on a dedicated OS thread with its own
@@ -3055,7 +3082,7 @@ mod tests {
         g.link(NewEdge::new(&entity, &mentioned, relation::MENTIONS))
             .await
             .unwrap();
-        g.link(NewEdge::new(&entity, &other, "supersedes"))
+        g.link(NewEdge::new(&entity, &other, "references"))
             .await
             .unwrap();
 
@@ -5000,9 +5027,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_repeated_triple_and_a_self_loop_each_collapse_to_one_edge() {
-        // The exact-duplicate case cannot come from `relate`, whose NOT EXISTS
-        // refuses it, but `link` writes rows without that guard and a `gc` can
-        // leave the table in shapes nothing else produces.
+        // `relate` and `link` refuse an exact duplicate through their NOT EXISTS
+        // guard, so only a row written outside both, an older store's or a raw
+        // insert, can repeat a triple, and a `gc` can leave the table in shapes
+        // nothing else produces.
         let repeated = edge_rows(&[("a", "b", "mentions"), ("a", "b", "mentions")]);
         assert_eq!(build_cluster_input(&repeated).unwrap().1.len(), 1);
 
@@ -5146,6 +5174,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows[0].get_i64(0).unwrap(), 0, "no edge may have landed");
+    }
+
+    #[tokio::test]
+    async fn link_without_a_log_refuses_a_superseded_endpoint_and_a_repeated_triple() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let src = g.insert(NewNode::now("fact", "src", "x")).await.unwrap();
+        let live = g.insert(NewNode::now("fact", "live", "x")).await.unwrap();
+        let old = g
+            .upsert_by(NewNode::now("fact", "Rollout", "first").with_subject("rollout"))
+            .await
+            .unwrap();
+        g.upsert_by(NewNode::now("fact", "Rollout", "second").with_subject("rollout"))
+            .await
+            .unwrap();
+        let version_edges = support::count(&g, "edges").await;
+
+        // Act
+        let dead = g.link(NewEdge::new(&src, &old, "mentions")).await;
+        let first = g.link(NewEdge::new(&src, &live, "mentions")).await;
+        let repeated = g.link(NewEdge::new(&src, &live, "mentions")).await;
+
+        // Assert
+        assert!(
+            matches!(&dead, Err(Error::RelateRefused(m)) if m.contains("not live")),
+            "{dead:?}"
+        );
+        assert!(first.is_ok(), "{first:?}");
+        assert!(
+            matches!(&repeated, Err(Error::RelateRefused(m)) if m.contains("already relates")),
+            "{repeated:?}"
+        );
+        assert_eq!(support::count(&g, "edges").await, version_edges + 1);
+    }
+
+    #[tokio::test]
+    async fn link_without_a_log_refuses_a_twin_with_other_attributes_and_names_only_the_keys() {
+        // Arrange
+        let g = graph_at(Millis(1000)).await;
+        let src = g.insert(NewNode::now("fact", "src", "x")).await.unwrap();
+        let dst = g.insert(NewNode::now("fact", "dst", "x")).await.unwrap();
+        let weighted = |weight| {
+            NewEdge::new(&src, &dst, "mentions").with_attributes(serde_json::json!({
+                "weight": weight,
+                "note": "same",
+            }))
+        };
+        g.link(weighted(2)).await.unwrap();
+
+        // Act
+        let changed = g.link(weighted(731)).await;
+
+        // Assert
+        let Err(Error::RelateRefused(message)) = &changed else {
+            panic!("expected a refusal: {changed:?}");
+        };
+        assert!(message.contains("already relates to"), "{message}");
+        assert!(message.contains("weight"), "{message}");
+        assert!(
+            !message.contains("note"),
+            "an unchanged key is not named: {message}"
+        );
+        assert!(
+            !message.contains("731"),
+            "a value is never named: {message}"
+        );
+        assert_eq!(support::count(&g, "edges").await, 1);
     }
 
     #[tokio::test]
@@ -5483,6 +5578,7 @@ mod tests {
             .await
             .unwrap();
         let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        let other = g.insert(NewNode::now("fact", "memo", "x")).await.unwrap();
         clock.set(Millis(2000));
         g.link(NewEdge::new(
             &global,
@@ -5502,7 +5598,7 @@ mod tests {
         clock.set(Millis(4000));
         g.link(NewEdge::new(
             &scoped,
-            &fact,
+            &other,
             crate::types::relation::MENTIONS,
         ))
         .await
@@ -6245,6 +6341,9 @@ mod tests {
         }
         async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
             self.0.vector_insert_if_absent(node_id, embedding).await
+        }
+        fn vector_delete_sql(&self) -> Option<&'static str> {
+            self.0.vector_delete_sql()
         }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.0.vector_delete(node_id).await
@@ -7796,6 +7895,9 @@ mod tests {
         async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
             self.inner.vector_insert_if_absent(node_id, embedding).await
         }
+        fn vector_delete_sql(&self) -> Option<&'static str> {
+            self.inner.vector_delete_sql()
+        }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
         }
@@ -7894,6 +7996,9 @@ mod tests {
         }
         async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
             self.inner.vector_insert_if_absent(node_id, embedding).await
+        }
+        fn vector_delete_sql(&self) -> Option<&'static str> {
+            self.inner.vector_delete_sql()
         }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
@@ -8240,20 +8345,16 @@ mod tests {
     #[tokio::test]
     async fn repair_lets_relates_own_duplicate_guard_absorb_a_second_attempt_within_one_pass() {
         // Arrange: two live mentions edges from the same entity to the same
-        // original node, seeded via `link` directly since `link` carries no
-        // duplicate guard, unlike `relate`. Both fall inside one repair pass.
+        // original node, inserted as rows since `link` and `relate` both refuse
+        // a duplicate. Both fall inside one repair pass.
         let clock = Arc::new(FixedClock::new(Millis(1000)));
         let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
             .await
             .unwrap();
         let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
         let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
-        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
-            .await
-            .unwrap();
-        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
-            .await
-            .unwrap();
+        insert_edge_row(&g, &entity, &fact, relation::MENTIONS).await;
+        insert_edge_row(&g, &entity, &fact, relation::MENTIONS).await;
         clock.set(Millis(2000));
         let fact2 = g
             .supersede(&fact, NewNode::now("fact", "second", "x"))
@@ -8307,9 +8408,7 @@ mod tests {
             .await
             .unwrap();
         clock.set(Millis(3000));
-        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
-            .await
-            .unwrap();
+        insert_edge_row(&g, &entity, &fact, relation::MENTIONS).await;
 
         // Act
         let repaired = g.repair_superseded_mentions().await.unwrap();

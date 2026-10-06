@@ -180,7 +180,7 @@ impl<B: Backend> Graph<B> {
             if let Some(refusal) = plan.dedup.and_then(|dedup| dedup.refusal_if_absent) {
                 return Err(refusal);
             }
-            apply_steps(&mut *tx, &plan.steps).await
+            apply_steps(&mut *tx, &plan.steps, self.backend.vector_delete_sql()).await
         }
         .await;
         commit_or_abandon(tx, applied).await?;
@@ -241,8 +241,17 @@ impl<B: Backend> Graph<B> {
             }
         };
         tracing::debug!(%event_id, "event appended to the log");
-        let projected =
-            project_logged(&mut *tx, steps, &carried, &event_id, held.log_id, offset).await;
+        let vector_delete = self.backend.vector_delete_sql();
+        let projected = project_logged(
+            &mut *tx,
+            steps,
+            &carried,
+            &event_id,
+            held.log_id,
+            offset,
+            vector_delete,
+        )
+        .await;
         match commit_or_abandon(tx, projected).await {
             Ok(()) => {
                 held.reconcile(&carried);
@@ -285,8 +294,9 @@ pub(super) async fn project_logged(
     event_id: &str,
     log_id: Uuid,
     offset: LogOffset,
+    vector_delete: Option<&str>,
 ) -> Result<()> {
-    apply_steps(tx, steps).await?;
+    apply_steps(tx, steps, vector_delete).await?;
     index_rows(tx, carried, event_id).await?;
     log_cursor::advance_in_tx(tx, log_id, offset).await
 }

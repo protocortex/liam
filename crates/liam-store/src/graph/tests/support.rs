@@ -2,11 +2,14 @@
 //! Helpers the log tests share: a log to hand to a graph, and reads of what the
 //! store holds.
 
+use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 
-use futures_util::stream;
+use futures_util::{stream, StreamExt};
 use liam_log::dedup::{BloomConfig, HashBloom};
-use liam_log::reader::{LogReader, LogStream};
+use liam_log::event::{LogEvent, LogPayload, CURRENT_SCHEMA_VERSION};
+use liam_log::reader::{LogReader, LogRecord, LogStream, SequentialScanReader};
+use liam_log::wal::{WalConfig, WalWriter};
 use liam_log::{LogOffset, LogWriter};
 
 use super::*;
@@ -150,6 +153,9 @@ impl Backend for ReembedProbe {
     async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
         self.inner.vector_insert_if_absent(node_id, embedding).await
     }
+    fn vector_delete_sql(&self) -> Option<&'static str> {
+        self.inner.vector_delete_sql()
+    }
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
         self.inner.vector_delete(node_id).await
     }
@@ -243,4 +249,119 @@ pub(super) async fn cursor<B: Backend>(g: &Graph<B>) -> Option<(String, Option<(
 
 pub(super) fn offset_pair(offset: LogOffset) -> (i64, i64) {
     (offset.segment as i64, offset.index as i64)
+}
+
+pub(super) const ONE_SEGMENT: WalConfig = WalConfig {
+    segment_max_bytes: 1 << 20,
+    rotate_interval_secs: 3600,
+};
+
+/// A log directory and the databases that project it.
+pub(super) struct Env {
+    dir: TempDir,
+}
+
+impl Env {
+    pub(super) fn new() -> Self {
+        Self {
+            dir: TempDir::new().unwrap(),
+        }
+    }
+
+    pub(super) fn wal_dir(&self) -> PathBuf {
+        self.dir.path().join("wal")
+    }
+
+    pub(super) fn db(&self, name: &str) -> String {
+        self.dir.path().join(name).to_str().unwrap().to_owned()
+    }
+
+    /// Appends `events` with a writer of their own that is gone afterwards, so
+    /// no store has projected them.
+    pub(super) fn append(&self, events: &[LogEvent]) -> Vec<LogOffset> {
+        self.append_with(ONE_SEGMENT, events)
+    }
+
+    pub(super) fn append_with(&self, config: WalConfig, events: &[LogEvent]) -> Vec<LogOffset> {
+        let mut writer =
+            WalWriter::open_with_system_clock(&self.wal_dir(), config).expect("open wal");
+        events
+            .iter()
+            .map(|event| writer.append(event).expect("append event"))
+            .collect()
+    }
+
+    /// A log over the directory that can be replayed from.
+    pub(super) fn log(&self, config: WalConfig) -> SharedLog {
+        let writer = WalWriter::open_with_system_clock(&self.wal_dir(), config).expect("open wal");
+        let reader = SequentialScanReader::local(&self.wal_dir()).expect("open reader");
+        let bloom = HashBloom::new(BloomConfig::default());
+        shared(EventLog::new(Box::new(writer), Arc::new(reader), bloom))
+    }
+
+    /// Every record in the log directory, as a rebuild would read it.
+    pub(super) async fn records(&self) -> Vec<LogRecord> {
+        let reader = SequentialScanReader::local(&self.wal_dir()).expect("open reader");
+        let mut scan = reader.scan(None);
+        let mut records = Vec::new();
+        while let Some(record) = scan.next().await {
+            records.push(record.expect("read record"));
+        }
+        records
+    }
+
+    pub(super) async fn open<B: Backend>(
+        &self,
+        db: &str,
+        clock: Arc<FixedClock>,
+    ) -> (Graph<B>, SharedLog) {
+        self.open_over(self.log(ONE_SEGMENT), db, clock).await
+    }
+
+    pub(super) async fn open_over<B: Backend>(
+        &self,
+        log: SharedLog,
+        db: &str,
+        clock: Arc<FixedClock>,
+    ) -> (Graph<B>, SharedLog) {
+        let graph = Graph::<B>::open_with_clock(&self.db(db), GraphConfig::new(8), clock)
+            .await
+            .expect("open graph")
+            .with_log(Arc::clone(&log))
+            .await
+            .expect("attach log");
+        (graph, log)
+    }
+}
+
+pub(super) fn event(event_id: &str, content_hash: [u8; 32], payload: LogPayload) -> LogEvent {
+    LogEvent {
+        event_id: event_id.into(),
+        content_hash,
+        source: "agent-a".into(),
+        trust_score: 0.75,
+        observed_at: 500,
+        ingested_at: 1000,
+        encryption_key_id: None,
+        schema_version: CURRENT_SCHEMA_VERSION,
+        payload,
+    }
+}
+
+pub(super) async fn has_node<B: Backend>(g: &Graph<B>, id: &str) -> bool {
+    let rows = g
+        .backend
+        .query("SELECT 1 FROM nodes WHERE id = ?1", &[id.into()])
+        .await
+        .unwrap();
+    !rows.is_empty()
+}
+
+/// The record counts alone: these tests attach no embedder, so every replayed
+/// node also shows up as pending, which they are not about.
+pub(super) fn record_counts(report: CatchUpReport) -> CatchUpReport {
+    CatchUpReport {
+        reembedded: ReembedReport::default(),
+        ..report
+    }
 }

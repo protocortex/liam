@@ -30,6 +30,10 @@ const BUSY_TIMEOUT_MS: i64 = 5000;
 /// of producing an empty pool.
 const MIN_READ_POOL_SIZE: usize = 1;
 
+/// The vector table has no cascade from `nodes`, so a node's vector is deleted
+/// on its own, also by a removal that runs inside a caller's transaction.
+const VECTOR_DELETE_SQL: &str = "DELETE FROM node_vectors WHERE node_id = ?1";
+
 /// Whether `path` can safely back a multi-connection read pool: true only
 /// for a plain filesystem path, one that does not start with `file:` and
 /// is not the bare `:memory:` spelling. `database_path` comes from user
@@ -310,10 +314,14 @@ impl Backend for LibsqlBackend {
         Ok(inserted > 0)
     }
 
+    fn vector_delete_sql(&self) -> Option<&'static str> {
+        Some(VECTOR_DELETE_SQL)
+    }
+
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
         let conn = self.write.lock().await;
         conn.execute(
-            "DELETE FROM node_vectors WHERE node_id = ?1",
+            VECTOR_DELETE_SQL,
             libsql::params_from_iter(vec![libsql::Value::Text(node_id.to_string())]),
         )
         .await

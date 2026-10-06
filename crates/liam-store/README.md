@@ -62,14 +62,20 @@ intervals use a `FOREVER` sentinel, so every currency check is positive.
 let graph = DefaultGraph::open("graph.db", GraphConfig::new(768)).await?;
 
 let id = graph.insert(NewNode::now("decision", "Use libSQL", "single file")).await?;
-let next = graph.supersede(&id, NewNode::now("decision", "Use libSQL v2", "...")).await?;
-graph.link(NewEdge::new(&next, &id, "references")).await?;
+let other = graph.insert(NewNode::now("decision", "Pin libSQL", "version")).await?;
+graph.link(NewEdge::new(&id, &other, "references")).await?;
+graph.supersede(&id, NewNode::now("decision", "Use libSQL v2", "...")).await?;
 
 let hits = graph.query(&Query::text("libSQL").with_k(8)).await?;
 graph.gc(&RetentionPolicy::keep("episode", Millis::days(30))).await?;
 
 graph.recompute_communities().await?;
 ```
+
+`link` refuses an endpoint that is not live, such as `id` once it is
+superseded, and a duplicate triple: a second edge with the same source, target,
+and type. It also refuses the reserved `supersedes` relation, which only
+`supersede` writes.
 
 ## Features
 

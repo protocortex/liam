@@ -3,8 +3,9 @@
 //! its log record build them from the same payload through `steps_for`, so the
 //! two cannot drift apart.
 
-use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect};
+use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTarget};
 
+use super::logged_plan::Table;
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
 };
@@ -25,6 +26,9 @@ pub(super) enum Step {
     Edge(EdgeRow),
     /// An edge written only while both ends are live and no live twin exists.
     GuardedEdge(EdgeRow),
+    /// Deletes a row and what depends on it. Removing a row that is already
+    /// gone changes nothing, so a replay can run it again.
+    Remove(TombstoneTarget),
 }
 
 /// The statements that project a logged payload. A `supersedes` edge closes its
@@ -40,9 +44,8 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
                 RowEffect::Edge(row) => edge_steps(row),
             })
             .collect(),
-        LogPayload::Tombstone(_) | LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. } => {
-            Vec::new()
-        }
+        LogPayload::Tombstone(targets) => targets.iter().cloned().map(Step::Remove).collect(),
+        LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. } => Vec::new(),
     }
 }
 
@@ -60,7 +63,13 @@ fn edge_steps(row: &EdgeRow) -> Vec<Step> {
 /// Applies a projection's statements in order. A guarded edge that is refused
 /// fails the whole projection with the reason, and so does a close that finds
 /// no open node, so the write is voided as a unit rather than half applied.
-pub(super) async fn apply_steps(tx: &mut dyn BackendTx, steps: &[Step]) -> Result<()> {
+/// `vector_delete` is the backend's statement for removing a node's vector, as
+/// `Backend::vector_delete_sql` returns it.
+pub(super) async fn apply_steps(
+    tx: &mut dyn BackendTx,
+    steps: &[Step],
+    vector_delete: Option<&str>,
+) -> Result<()> {
     for step in steps {
         match step {
             Step::Close { id, tx_to } => {
@@ -83,7 +92,28 @@ pub(super) async fn apply_steps(tx: &mut dyn BackendTx, steps: &[Step]) -> Resul
                     .await?;
             }
             Step::GuardedEdge(row) => insert_guarded_edge(tx, row).await?,
+            Step::Remove(target) => remove_row(tx, target, vector_delete).await?,
         }
+    }
+    Ok(())
+}
+
+/// Deletes a row and what depends on it. The vector table has no cascade, so a
+/// node's vector is deleted before the node. Its edges and community rows
+/// cascade where foreign keys are enforced; `Table::removal_sql` deletes them
+/// explicitly for a backend that does not enforce them, as `gc` does.
+async fn remove_row(
+    tx: &mut dyn BackendTx,
+    target: &TombstoneTarget,
+    vector_delete: Option<&str>,
+) -> Result<()> {
+    let table = Table::from(target.table);
+    let id = [target.id.as_str().into()];
+    if let (Table::Nodes, Some(sql)) = (table, vector_delete) {
+        tx.execute(sql, &id).await?;
+    }
+    for sql in table.removal_sql() {
+        tx.execute(sql, &id).await?;
     }
     Ok(())
 }

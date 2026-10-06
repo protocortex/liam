@@ -79,6 +79,10 @@ pub trait Backend: Send + Sync + Sized {
     /// Write. Serializes with every other write; see the trait's
     /// concurrency contract above.
     async fn vector_delete(&self, node_id: &str) -> Result<()>;
+    /// The statement that deletes one node's vector, `?1` being the node id,
+    /// for a caller that must do it inside a transaction of its own. `None` for
+    /// a backend whose vectors go with their node.
+    fn vector_delete_sql(&self) -> Option<&'static str>;
 
     /// Read. Nearest node ids to `query`, restricted to the live set at
     /// `as_of` and, when given, to `kind` and `scope`. Each backend applies
