@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::log_cursor;
 use super::logged_plan::Table;
-use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog, SharedLog};
+use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog};
 use super::projection::{steps_for, Step};
 use super::reembed::ReembedReport;
 use super::Graph;
@@ -25,12 +25,12 @@ const QUARANTINE_SQL: &str = "INSERT INTO log_quarantine (event_id, segment, seg
      VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(event_id) DO NOTHING";
 
 /// What one `catch_up` did. The four record counts describe log records only:
-/// those that carry no rows to project (`Voided`, `DuplicateOf`, `Tombstone`)
-/// only move the cursor and are in no count, including the `Voided` records a
-/// quarantine appends, and a cancelled event is counted once, as voided.
+/// those that carry no rows to project (`Voided`, `DuplicateOf`) only move the
+/// cursor and are in no count, including the `Voided` records a quarantine
+/// appends, and a cancelled event is counted once, as voided.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CatchUpReport {
-    /// Events whose rows were projected.
+    /// Events whose rows were projected, tombstones included.
     pub applied: usize,
     /// Events whose rows the store already held.
     pub already_applied: usize,
@@ -77,20 +77,27 @@ impl<B: Backend> Graph<B> {
         let Some(log) = &self.log else {
             return Ok(CatchUpReport::default());
         };
-        let mut report = self.replay(log).await?;
-        // The replay has already committed, so a failed listing must not hide
-        // its report.
+        let report = {
+            let mut held = HeldLog::acquire(log).await?;
+            self.replay(&mut held).await?
+        };
+        Ok(self.reembedded(report).await)
+    }
+
+    /// Adds the re-embed pass to a replay's report. The replay has already
+    /// committed, so a failed listing must not hide its report.
+    pub(super) async fn reembedded(&self, mut report: CatchUpReport) -> CatchUpReport {
         match self.reembed_missing().await {
             Ok(reembedded) => report.reembedded = reembedded,
             Err(error) => {
                 tracing::error!(%error, "re-embed pass skipped, the nodes could not be listed")
             }
         }
-        Ok(report)
+        report
     }
 
-    async fn replay(&self, log: &SharedLog) -> Result<CatchUpReport> {
-        let mut held = HeldLog::acquire(log).await?;
+    /// The replay itself, for a caller that already holds the log lock.
+    pub(super) async fn replay(&self, held: &mut HeldLog) -> Result<CatchUpReport> {
         let cursor = log_cursor::read(&self.backend)
             .await?
             .and_then(|cursor| cursor.last);
@@ -115,8 +122,7 @@ impl<B: Backend> Graph<B> {
                 log_cursor::advance(&self.backend, held.log_id, record.offset).await?;
                 Outcome::Voided
             } else {
-                self.replay_event(&mut held, &record, &mut last_void)
-                    .await?
+                self.replay_event(held, &record, &mut last_void).await?
             };
             tracing::debug!(event = %event_id, offset = %record.offset, "replay: record accounted for");
             report.count(outcome);
@@ -212,6 +218,12 @@ async fn replay_projection(
     offset: LogOffset,
 ) -> Result<Outcome> {
     let rows = written_rows(steps);
+    if rows.is_empty() {
+        // Only removals: there is no row to look for, and running them again
+        // is harmless.
+        project_logged(tx, steps, carried, &event.event_id, log_id, offset).await?;
+        return Ok(Outcome::Applied);
+    }
     match rows_held(tx, &rows).await? {
         held if held == rows.len() => {
             log_cursor::advance_in_tx(tx, log_id, offset).await?;
@@ -226,7 +238,7 @@ async fn replay_projection(
 }
 
 /// The ids a `Voided` record in `records` cancels.
-async fn voided_targets(mut records: LogStream) -> Result<HashSet<String>> {
+pub(super) async fn voided_targets(mut records: LogStream) -> Result<HashSet<String>> {
     let mut targets = HashSet::new();
     while let Some(record) = records.next().await {
         if let LogPayload::Voided { target_event_id } = record?.event.payload {
@@ -244,7 +256,7 @@ fn written_rows(steps: &[Step]) -> Vec<(Table, &str)> {
         .filter_map(|step| match step {
             Step::Node(row) => Some((Table::Nodes, row.id.as_str())),
             Step::Edge(row) | Step::GuardedEdge(row) => Some((Table::Edges, row.id.as_str())),
-            Step::Close { .. } => None,
+            Step::Close { .. } | Step::Remove(_) => None,
         })
         .collect()
 }

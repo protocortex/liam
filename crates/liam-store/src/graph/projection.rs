@@ -3,7 +3,7 @@
 //! its log record build them from the same payload through `steps_for`, so the
 //! two cannot drift apart.
 
-use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect};
+use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTable, TombstoneTarget};
 
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
@@ -25,6 +25,9 @@ pub(super) enum Step {
     Edge(EdgeRow),
     /// An edge written only while both ends are live and no live twin exists.
     GuardedEdge(EdgeRow),
+    /// Deletes a row and what depends on it. Removing a row that is already
+    /// gone changes nothing, so a replay can run it again.
+    Remove(TombstoneTarget),
 }
 
 /// The statements that project a logged payload. A `supersedes` edge closes its
@@ -40,9 +43,8 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
                 RowEffect::Edge(row) => edge_steps(row),
             })
             .collect(),
-        LogPayload::Tombstone(_) | LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. } => {
-            Vec::new()
-        }
+        LogPayload::Tombstone(targets) => targets.iter().cloned().map(Step::Remove).collect(),
+        LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. } => Vec::new(),
     }
 }
 
@@ -83,7 +85,30 @@ pub(super) async fn apply_steps(tx: &mut dyn BackendTx, steps: &[Step]) -> Resul
                     .await?;
             }
             Step::GuardedEdge(row) => insert_guarded_edge(tx, row).await?,
+            Step::Remove(target) => remove_row(tx, target).await?,
         }
+    }
+    Ok(())
+}
+
+/// What a removal deletes, in the order that satisfies the foreign keys. The
+/// vector table has no cascade, so a node's vector goes before the node.
+fn removal_sql(table: TombstoneTable) -> &'static [&'static str] {
+    match table {
+        TombstoneTable::Nodes => &[
+            "DELETE FROM edges WHERE src = ?1 OR dst = ?1",
+            "DELETE FROM node_community WHERE node_id = ?1",
+            "DELETE FROM node_vectors WHERE node_id = ?1",
+            "DELETE FROM nodes WHERE id = ?1",
+        ],
+        TombstoneTable::Edges => &["DELETE FROM edges WHERE id = ?1"],
+        TombstoneTable::NodeCommunity => &["DELETE FROM node_community WHERE node_id = ?1"],
+    }
+}
+
+async fn remove_row(tx: &mut dyn BackendTx, target: &TombstoneTarget) -> Result<()> {
+    for sql in removal_sql(target.table) {
+        tx.execute(sql, &[target.id.as_str().into()]).await?;
     }
     Ok(())
 }

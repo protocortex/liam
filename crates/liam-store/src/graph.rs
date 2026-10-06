@@ -559,9 +559,9 @@ impl<B: Backend> Graph<B> {
         })
     }
 
-    /// Routes `insert`, `upsert_by`, `supersede`, `relate`, and `ingest_episode`
-    /// through `log`: each is appended to it before it is applied. `link` and
-    /// `gc` do not append yet. Without a log, every write is unlogged.
+    /// Routes `insert`, `upsert_by`, `supersede`, `relate`, `link`, and
+    /// `ingest_episode` through `log`: each is appended to it before it is
+    /// applied. `gc` does not append yet. Without a log, every write is unlogged.
     ///
     /// Refuses a log the store does not belong to (`LogIdMismatch`) and a store
     /// ahead of the log (`CursorBeyondLog`), then rebuilds the log's dedup
@@ -623,26 +623,14 @@ impl<B: Backend> Graph<B> {
         Ok(new_id)
     }
 
+    /// Writes an edge with attributes through the same guarded, logged path as
+    /// `relate`, so it is refused, deduplicated and replayed the same way.
     pub async fn link(&self, edge: NewEdge) -> Result<EdgeId> {
-        let id = EdgeId::new();
-        let now = self.clock.now();
-        let attrs = serde_json::to_string(&edge.attributes)?;
-        self.backend
-            .execute(
-                "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    id.as_str().into(),
-                    edge.src.as_str().into(),
-                    edge.dst.as_str().into(),
-                    edge.kind.into(),
-                    attrs.into(),
-                    now.into(),
-                    FOREVER.into(),
-                ],
-            )
+        let attributes = serde_json::to_string(&edge.attributes)?;
+        let written = self
+            .project_edge(&edge.src, &edge.dst, &edge.kind, &attributes)
             .await?;
-        Ok(id)
+        Ok(written.0)
     }
 
     /// Assert a semantic edge between two live nodes, idempotently.
@@ -668,7 +656,7 @@ impl<B: Backend> Graph<B> {
     /// oversight: see ADR-0001 Amendment 2 before "fixing" it, because widening
     /// it changes the guarantee rather than tightening it.
     pub async fn relate(&self, src: &NodeId, dst: &NodeId, kind: &str) -> Result<EdgeId> {
-        Ok(self.project_relate(src, dst, kind).await?.0)
+        Ok(self.project_edge(src, dst, kind, EMPTY_ATTRIBUTES).await?.0)
     }
 
     /// Write a batch of nodes and the edges between them as one atomic unit:
@@ -1512,7 +1500,12 @@ impl<B: Backend> Graph<B> {
             for mention_row in &mention_rows {
                 let mentioning = NodeId::from_raw(mention_row.get_string(0)?);
                 let result = self
-                    .project_relate(&mentioning, &terminal, crate::types::relation::MENTIONS)
+                    .project_edge(
+                        &mentioning,
+                        &terminal,
+                        crate::types::relation::MENTIONS,
+                        EMPTY_ATTRIBUTES,
+                    )
                     .await;
                 fold_repair_outcome(
                     repair_outcome(result),
@@ -1543,7 +1536,12 @@ impl<B: Backend> Graph<B> {
             for mention_row in &own_mention_rows {
                 let mentioned = NodeId::from_raw(mention_row.get_string(0)?);
                 let result = self
-                    .project_relate(&terminal, &mentioned, crate::types::relation::MENTIONS)
+                    .project_edge(
+                        &terminal,
+                        &mentioned,
+                        crate::types::relation::MENTIONS,
+                        EMPTY_ATTRIBUTES,
+                    )
                     .await;
                 fold_repair_outcome(
                     repair_outcome(result),
@@ -2161,6 +2159,7 @@ mod tests {
     mod log_open;
     mod log_write;
     mod log_write_faults;
+    mod rebuild;
     mod reembed;
     mod support;
 
@@ -2169,6 +2168,26 @@ mod tests {
         DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock)
             .await
             .unwrap()
+    }
+
+    /// A live edge row written behind the guards of `relate` and `link`, for a
+    /// test that needs a state those refuse to create.
+    async fn insert_edge_row(g: &DefaultGraph, src: &NodeId, dst: &NodeId, kind: &str) {
+        g.backend
+            .execute(
+                "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
+                 VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)",
+                &[
+                    EdgeId::new().as_str().into(),
+                    src.as_str().into(),
+                    dst.as_str().into(),
+                    kind.into(),
+                    g.clock.now().into(),
+                    FOREVER.into(),
+                ],
+            )
+            .await
+            .unwrap();
     }
 
     /// Runs `f`'s future to completion on a dedicated OS thread with its own
@@ -5483,6 +5502,7 @@ mod tests {
             .await
             .unwrap();
         let fact = g.insert(NewNode::now("fact", "note", "x")).await.unwrap();
+        let other = g.insert(NewNode::now("fact", "memo", "x")).await.unwrap();
         clock.set(Millis(2000));
         g.link(NewEdge::new(
             &global,
@@ -5502,7 +5522,7 @@ mod tests {
         clock.set(Millis(4000));
         g.link(NewEdge::new(
             &scoped,
-            &fact,
+            &other,
             crate::types::relation::MENTIONS,
         ))
         .await
@@ -8240,20 +8260,16 @@ mod tests {
     #[tokio::test]
     async fn repair_lets_relates_own_duplicate_guard_absorb_a_second_attempt_within_one_pass() {
         // Arrange: two live mentions edges from the same entity to the same
-        // original node, seeded via `link` directly since `link` carries no
-        // duplicate guard, unlike `relate`. Both fall inside one repair pass.
+        // original node, inserted as rows since `link` and `relate` both refuse
+        // a duplicate. Both fall inside one repair pass.
         let clock = Arc::new(FixedClock::new(Millis(1000)));
         let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
             .await
             .unwrap();
         let entity = g.insert(NewNode::entity("person", "Ada")).await.unwrap();
         let fact = g.insert(NewNode::now("fact", "first", "x")).await.unwrap();
-        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
-            .await
-            .unwrap();
-        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
-            .await
-            .unwrap();
+        insert_edge_row(&g, &entity, &fact, relation::MENTIONS).await;
+        insert_edge_row(&g, &entity, &fact, relation::MENTIONS).await;
         clock.set(Millis(2000));
         let fact2 = g
             .supersede(&fact, NewNode::now("fact", "second", "x"))
@@ -8307,9 +8323,7 @@ mod tests {
             .await
             .unwrap();
         clock.set(Millis(3000));
-        g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
-            .await
-            .unwrap();
+        insert_edge_row(&g, &entity, &fact, relation::MENTIONS).await;
 
         // Act
         let repaired = g.repair_superseded_mentions().await.unwrap();

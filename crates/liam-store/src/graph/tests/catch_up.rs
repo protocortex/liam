@@ -418,7 +418,7 @@ async fn catch_up_skips_a_voided_event_and_the_cursor_moves_past_it() {
 }
 
 #[tokio::test]
-async fn catch_up_passes_duplicate_of_and_tombstone_records_without_projecting_them() {
+async fn catch_up_passes_a_duplicate_of_record_and_applies_a_tombstone() {
     // Arrange
     let env = Env::new();
     let first = node_write("node-a", "alpha");
@@ -444,8 +444,8 @@ async fn catch_up_passes_duplicate_of_and_tombstone_records_without_projecting_t
     let report = g.catch_up().await.unwrap();
 
     // Assert
-    assert_eq!(record_counts(report), applied(1));
-    assert_eq!(count(&g, "nodes").await, 1);
+    assert_eq!(record_counts(report), applied(2));
+    assert_eq!(count(&g, "nodes").await, 0);
     assert_eq!(count(&g, "log_hash_index").await, 1);
     assert_eq!(
         cursor_offset(&g).await,

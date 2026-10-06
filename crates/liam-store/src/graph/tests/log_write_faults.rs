@@ -67,15 +67,17 @@ enum Op {
     UpsertSupersede,
     Supersede,
     Relate,
+    Link,
     Episode,
 }
 
-const OPS: [Op; 6] = [
+const OPS: [Op; 7] = [
     Op::Insert,
     Op::UpsertInsert,
     Op::UpsertSupersede,
     Op::Supersede,
     Op::Relate,
+    Op::Link,
     Op::Episode,
 ];
 
@@ -84,7 +86,7 @@ impl Op {
     /// index upsert per distinct row hash it carries, and the cursor last.
     fn statements(self) -> usize {
         match self {
-            Op::Insert | Op::UpsertInsert | Op::Relate => 3,
+            Op::Insert | Op::UpsertInsert | Op::Relate | Op::Link => 3,
             Op::UpsertSupersede | Op::Supersede => 6,
             Op::Episode => 12,
         }
@@ -130,6 +132,10 @@ async fn run_op<B: Backend>(g: &Graph<B>, op: Op, seeded: &Seeded) -> Result<()>
             .await
             .map(drop),
         Op::Relate => g.relate(&seeded.x, &seeded.y, "mentions").await.map(drop),
+        Op::Link => g
+            .link(NewEdge::new(&seeded.x, &seeded.y, "mentions"))
+            .await
+            .map(drop),
         Op::Episode => {
             let cites = EpisodeEdge {
                 from: EpisodeRef::New(1),
@@ -333,6 +339,7 @@ write_path_fault_tests! {
     upsert_by_supersede => Op::UpsertSupersede,
     supersede => Op::Supersede,
     relate => Op::Relate,
+    link => Op::Link,
     ingest_episode => Op::Episode,
 }
 

@@ -420,11 +420,12 @@ impl<B: Backend> Graph<B> {
 
     /// The edge's id, which is the first edge's when the relation was already
     /// recorded, and what the write did.
-    pub(super) async fn project_relate(
+    pub(super) async fn project_edge(
         &self,
         src: &NodeId,
         dst: &NodeId,
         kind: &str,
+        attributes: &str,
     ) -> Result<(EdgeId, WriteOutcome)> {
         self.refuse_reserved([kind])?;
         let id = EdgeId::new();
@@ -435,7 +436,7 @@ impl<B: Backend> Graph<B> {
                     src: src.as_str().to_string(),
                     dst: dst.as_str().to_string(),
                     edge_type: kind.to_string(),
-                    attributes: EMPTY_ATTRIBUTES.to_string(),
+                    attributes: attributes.to_string(),
                     tx_from: now.0,
                     tx_to: FOREVER.0,
                 };
