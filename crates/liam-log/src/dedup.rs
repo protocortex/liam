@@ -138,6 +138,7 @@ pub async fn find_first_write<P: PreCheck + ?Sized, I: HashIndex + ?Sized>(
 #[derive(Debug, Clone, PartialEq)]
 pub struct HashBloom {
     filter: BloomFilter,
+    config: BloomConfig,
 }
 
 impl HashBloom {
@@ -145,7 +146,26 @@ impl HashBloom {
         let filter = BloomFilter::with_false_pos(config.false_positive_rate)
             .seed(&BLOOM_SEED)
             .expected_items(config.expected_items);
-        Self { filter }
+        Self { filter, config }
+    }
+
+    /// Rebuilds a filter from persisted bits, under the same pinned seed.
+    /// `bits` must be non-empty and `num_hashes` at least 1.
+    pub(crate) fn from_parts(bits: Vec<u64>, num_hashes: u32, config: BloomConfig) -> Self {
+        let filter = BloomFilter::from_vec(bits)
+            .seed(&BLOOM_SEED)
+            .hashes(num_hashes);
+        Self { filter, config }
+    }
+
+    /// The bit words and hash count, the inverse of `from_parts`.
+    pub(crate) fn to_parts(&self) -> (Vec<u64>, u32) {
+        (self.filter.iter().collect(), self.filter.num_hashes())
+    }
+
+    /// The sizing this filter was built with.
+    pub(crate) fn config(&self) -> &BloomConfig {
+        &self.config
     }
 
     pub fn insert(&mut self, hash: &[u8; 32]) {
