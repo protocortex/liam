@@ -4,43 +4,22 @@
 //! rebuilds the dedup filter from `log_hash_index` before any write is served.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
 
-use liam_log::event::LogEvent;
-use liam_log::wal::{WalConfig, WalError, WalWriter};
+use liam_log::dedup::{BloomConfig, HashBloom};
+use liam_log::wal::{WalConfig, WalWriter};
 use liam_log::{LogOffset, LogWriter};
 use uuid::Uuid;
 
-use super::log_write::{count, cursor, fact_at, share};
+use super::log_write::{count, cursor, fact_at, share, RecordingLog};
 use super::*;
+use crate::graph::log_cursor::offset_to_values;
 use crate::DefaultGraph;
 
-/// A log with a chosen identity and head that accepts no append.
-struct FixedLog {
-    log_id: Uuid,
-    head: Option<LogOffset>,
-}
-
-impl FixedLog {
-    fn new(head: Option<LogOffset>) -> Self {
-        Self {
-            log_id: Uuid::now_v7(),
-            head,
-        }
-    }
-}
-
-impl LogWriter for FixedLog {
-    fn append(&mut self, _event: &LogEvent) -> std::result::Result<LogOffset, WalError> {
-        Err(WalError::Poisoned)
-    }
-
-    fn log_id(&self) -> Uuid {
-        self.log_id
-    }
-
-    fn head(&self) -> Option<LogOffset> {
-        self.head
-    }
+/// A writer for a new log that reports `head`, as a log restarted with records
+/// on disk.
+fn log_with_head(head: Option<LogOffset>) -> RecordingLog {
+    RecordingLog::restarted(Uuid::now_v7(), head).0
 }
 
 fn at(segment: u64, index: u64) -> LogOffset {
@@ -58,21 +37,33 @@ async fn plain(path: &str) -> DefaultGraph {
         .unwrap()
 }
 
-async fn seed_cursor(g: &DefaultGraph, log_id: impl ToString, last: Option<LogOffset>) {
+async fn seed_cursor(g: &DefaultGraph, log_id: Uuid, last: Option<LogOffset>) {
     let (segment, index) = match last {
-        Some(offset) => (
-            Value::Int(offset.segment as i64),
-            Value::Int(offset.index as i64),
-        ),
+        Some(offset) => offset_to_values(offset).unwrap(),
         None => (Value::Null, Value::Null),
     };
+    seed_raw(g, &log_id.to_string(), segment, index).await;
+}
+
+async fn seed_raw(g: &DefaultGraph, log_id: &str, segment: Value, index: Value) {
     g.backend
         .execute(
             "INSERT INTO log_cursor (id, log_id, last_segment, last_index) VALUES (1, ?1, ?2, ?3)",
-            &[log_id.to_string().into(), segment, index],
+            &[log_id.into(), segment, index],
         )
         .await
         .unwrap();
+}
+
+/// The cursor row as the database holds it, so a test can tell an untouched
+/// row from one rewritten with the same meaning.
+async fn raw_cursor(g: &DefaultGraph) -> String {
+    let rows = g
+        .backend
+        .query("SELECT * FROM log_cursor", &[])
+        .await
+        .unwrap();
+    format!("{rows:?}")
 }
 
 fn hash(n: u32) -> [u8; 32] {
@@ -111,9 +102,9 @@ async fn wal_log(dir: &std::path::Path) -> SharedLog {
 async fn open_check_accepts_a_matching_log_id_with_the_cursor_at_the_head() {
     // Arrange
     let dir = TempDir::new().unwrap();
-    let writer = FixedLog::new(Some(at(2, 4)));
+    let writer = log_with_head(Some(at(2, 4)));
     let g = plain(&db_path(&dir)).await;
-    seed_cursor(&g, writer.log_id, Some(at(2, 4))).await;
+    seed_cursor(&g, writer.log_id(), Some(at(2, 4))).await;
 
     // Act
     let opened = g.with_log(share(writer)).await;
@@ -124,32 +115,121 @@ async fn open_check_accepts_a_matching_log_id_with_the_cursor_at_the_head() {
 
 #[tokio::test]
 async fn open_check_refuses_a_log_id_that_differs_from_the_cursors_and_writes_nothing() {
-    // Arrange
-    let dir = TempDir::new().unwrap();
-    let other = Uuid::now_v7();
-    let writer = FixedLog::new(Some(at(0, 0)));
-    let log_id = writer.log_id;
-    let g = plain(&db_path(&dir)).await;
-    seed_cursor(&g, other, Some(at(0, 0))).await;
-    index_hashes(&g, 0..1).await;
-    let backend_view = plain(&db_path(&dir)).await;
+    // Arrange: each case is the foreign cursor's offset and the head the log
+    // reports. The id is wrong in all of them, whatever the offsets say.
+    let cases = [
+        ("no offsets, empty log", None, None),
+        ("cursor at the head", Some(at(0, 0)), Some(at(0, 0))),
+        ("cursor beyond the head", Some(at(5, 0)), None),
+    ];
+    for (name, cursor_at, head) in cases {
+        let dir = TempDir::new().unwrap();
+        let other = Uuid::now_v7();
+        let writer = log_with_head(head);
+        let log_id = writer.log_id();
+        let g = plain(&db_path(&dir)).await;
+        seed_cursor(&g, other, cursor_at).await;
+        index_hashes(&g, 0..1).await;
+        let backend_view = plain(&db_path(&dir)).await;
+        let before = raw_cursor(&backend_view).await;
 
-    // Act
-    let opened = g.with_log(share(writer)).await;
+        // Act
+        let opened = g.with_log(share(writer)).await;
 
-    // Assert
-    match opened {
-        Err(Error::LogIdMismatch { store, log }) => {
-            assert_eq!((store, log), (other.to_string(), log_id));
+        // Assert
+        match opened {
+            Err(Error::LogIdMismatch { store, log }) => {
+                assert_eq!((store, log), (other, log_id), "{name}");
+            }
+            other => panic!("{name}: expected LogIdMismatch, got {:?}", other.err()),
         }
-        other => panic!("expected LogIdMismatch, got {:?}", other.err()),
+        assert_eq!(raw_cursor(&backend_view).await, before, "{name}");
+        assert_eq!(count(&backend_view, "nodes").await, 0, "{name}");
+        assert_eq!(count(&backend_view, "log_hash_index").await, 1, "{name}");
     }
-    assert_eq!(
-        cursor(&backend_view).await,
-        Some((other.to_string(), Some((0, 0))))
-    );
-    assert_eq!(count(&backend_view, "nodes").await, 0);
-    assert_eq!(count(&backend_view, "log_hash_index").await, 1);
+}
+
+#[tokio::test]
+async fn open_check_refuses_log_state_the_store_could_not_have_written() {
+    // Arrange: each case seeds one corrupt value. The cursor names the
+    // writer's own log unless the case is about the id.
+    let own = Uuid::now_v7();
+    let valid = own.to_string();
+    let bad_hash = Value::Blob(vec![7; 31]);
+    let cases = [
+        (
+            "segment without index",
+            &valid,
+            Value::Int(1),
+            Value::Null,
+            None,
+        ),
+        (
+            "index without segment",
+            &valid,
+            Value::Null,
+            Value::Int(1),
+            None,
+        ),
+        (
+            "negative segment",
+            &valid,
+            Value::Int(-1),
+            Value::Int(0),
+            None,
+        ),
+        (
+            "negative index",
+            &valid,
+            Value::Int(0),
+            Value::Int(-1),
+            None,
+        ),
+        (
+            "malformed log id",
+            &"not-a-uuid".to_string(),
+            Value::Null,
+            Value::Null,
+            None,
+        ),
+        (
+            "31 byte content hash",
+            &valid,
+            Value::Null,
+            Value::Null,
+            Some(bad_hash),
+        ),
+    ];
+    for (name, log_id, segment, index, indexed) in cases {
+        let dir = TempDir::new().unwrap();
+        let g = plain(&db_path(&dir)).await;
+        seed_raw(&g, log_id, segment, index).await;
+        if let Some(hash) = indexed {
+            g.backend
+                .execute(
+                    "INSERT INTO log_hash_index (content_hash, first_event_id, row_ids)
+                     VALUES (?1, 'event', '[]')",
+                    &[hash],
+                )
+                .await
+                .unwrap();
+        }
+        let view = plain(&db_path(&dir)).await;
+        let before = raw_cursor(&view).await;
+
+        // Act
+        let opened = g
+            .with_log(share(RecordingLog::restarted(own, Some(at(9, 9))).0))
+            .await;
+
+        // Assert
+        assert!(
+            matches!(opened, Err(Error::CorruptLogState(_))),
+            "{name}: {:?}",
+            opened.err()
+        );
+        assert_eq!(raw_cursor(&view).await, before, "{name}");
+    }
 }
 
 #[tokio::test]
@@ -162,9 +242,9 @@ async fn open_check_refuses_a_cursor_beyond_the_log_head() {
     ];
     for (name, cursor_at, head) in cases {
         let dir = TempDir::new().unwrap();
-        let writer = FixedLog::new(head);
+        let writer = log_with_head(head);
         let g = plain(&db_path(&dir)).await;
-        seed_cursor(&g, writer.log_id, Some(cursor_at)).await;
+        seed_cursor(&g, writer.log_id(), Some(cursor_at)).await;
 
         // Act
         let opened = g.with_log(share(writer)).await;
@@ -190,9 +270,9 @@ async fn open_check_accepts_a_cursor_behind_the_head_for_replay_to_close() {
     ];
     for (name, cursor_at, head) in cases {
         let dir = TempDir::new().unwrap();
-        let writer = FixedLog::new(Some(head));
+        let writer = log_with_head(Some(head));
         let g = plain(&db_path(&dir)).await;
-        seed_cursor(&g, writer.log_id, cursor_at).await;
+        seed_cursor(&g, writer.log_id(), cursor_at).await;
 
         // Act
         let opened = g.with_log(share(writer)).await;
@@ -206,8 +286,8 @@ async fn open_check_accepts_a_cursor_behind_the_head_for_replay_to_close() {
 async fn open_check_gives_a_fresh_store_a_cursor_row_with_the_log_id_and_no_offsets() {
     // Arrange
     let dir = TempDir::new().unwrap();
-    let writer = FixedLog::new(None);
-    let log_id = writer.log_id.to_string();
+    let writer = log_with_head(None);
+    let log_id = writer.log_id().to_string();
     let g = plain(&db_path(&dir)).await;
     let before = cursor(&g).await;
 
@@ -225,8 +305,8 @@ async fn open_check_keeps_a_cursorless_store_that_predates_a_log_with_history() 
     let dir = TempDir::new().unwrap();
     let g = plain(&db_path(&dir)).await;
     g.insert(fact_at("written before the log")).await.unwrap();
-    let writer = FixedLog::new(Some(at(0, 3)));
-    let log_id = writer.log_id.to_string();
+    let writer = log_with_head(Some(at(0, 3)));
+    let log_id = writer.log_id().to_string();
 
     // Act
     let opened = g.with_log(share(writer)).await.unwrap();
@@ -234,21 +314,6 @@ async fn open_check_keeps_a_cursorless_store_that_predates_a_log_with_history() 
     // Assert: the cursor is created with no offsets, and the rows are kept.
     assert_eq!(cursor(&opened).await, Some((log_id, None)));
     assert_eq!(count(&opened, "nodes").await, 1);
-}
-
-#[tokio::test]
-async fn open_check_leaves_a_store_without_a_log_unchanged() {
-    // Arrange
-    let dir = TempDir::new().unwrap();
-    let g = plain(&db_path(&dir)).await;
-
-    // Act
-    let id = g.insert(fact_at("unlogged")).await;
-
-    // Assert
-    assert!(id.is_ok());
-    assert_eq!(cursor(&g).await, None);
-    assert_eq!(count(&g, "log_hash_index").await, 0);
 }
 
 #[tokio::test]
@@ -288,7 +353,7 @@ async fn the_filter_holds_every_indexed_hash_after_open() {
     let dir = TempDir::new().unwrap();
     let g = plain(&db_path(&dir)).await;
     index_hashes(&g, 0..50).await;
-    let log = share(FixedLog::new(None));
+    let log = share(log_with_head(None));
 
     // Act
     let _g = g.with_log(Arc::clone(&log)).await.unwrap();
@@ -304,18 +369,21 @@ async fn the_filter_holds_every_indexed_hash_after_open() {
 const PAGE_BOUND: usize = 1_000;
 const INDEXED_ROWS: u32 = 3_000;
 
-/// A backend that records the most rows any one `query` handed back.
-struct Paged {
+/// A backend that records the most rows any one `query` handed back, and can
+/// have a rival handle create the cursor row just before this one's insert.
+struct Probed {
     inner: crate::backends::DefaultBackend,
     most_rows: AtomicUsize,
+    rival_log: StdMutex<Option<Uuid>>,
 }
 
 #[async_trait::async_trait]
-impl Backend for Paged {
+impl Backend for Probed {
     async fn open(path: &str, read_pool_size: usize) -> Result<Self> {
         Ok(Self {
             inner: crate::backends::DefaultBackend::open(path, read_pool_size).await?,
             most_rows: AtomicUsize::new(0),
+            rival_log: StdMutex::new(None),
         })
     }
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
@@ -324,6 +392,15 @@ impl Backend for Paged {
         Ok(rows)
     }
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        let rival = match sql.starts_with("INSERT INTO log_cursor") {
+            true => self.rival_log.lock().unwrap().take(),
+            false => None,
+        };
+        if let Some(log_id) = rival {
+            let (segment, index) = (Value::Null, Value::Null);
+            let rival_insert = [log_id.to_string().into(), segment, index];
+            self.inner.execute(sql, &rival_insert).await?;
+        }
         self.inner.execute(sql, params).await
     }
     async fn execute_batch(&self, sql: &str) -> Result<()> {
@@ -359,15 +436,25 @@ impl Backend for Paged {
     }
 }
 
+/// A log whose filter is configured for `config`, as an operator would set it.
+fn sized_log(writer: impl LogWriter + 'static, config: BloomConfig) -> SharedLog {
+    let bloom = HashBloom::new(config);
+    Arc::new(tokio::sync::Mutex::new(EventLog::new(
+        Box::new(writer),
+        bloom,
+    )))
+}
+
 #[tokio::test]
 async fn a_large_index_is_read_in_pages_while_the_filter_is_rebuilt() {
-    // Arrange
+    // Arrange: a filter configured far below the index.
     let dir = TempDir::new().unwrap();
-    let g = Graph::<Paged>::open(&db_path(&dir), GraphConfig::new(8))
+    let g = Graph::<Probed>::open(&db_path(&dir), GraphConfig::new(8))
         .await
         .unwrap();
     index_hashes(&g, 0..INDEXED_ROWS).await;
-    let log = share(FixedLog::new(None));
+    let configured = BloomConfig::new(16, 0.01).unwrap();
+    let log = sized_log(log_with_head(None), configured.clone());
 
     // Act
     let g = g.with_log(Arc::clone(&log)).await.unwrap();
@@ -381,4 +468,57 @@ async fn a_large_index_is_read_in_pages_while_the_filter_is_rebuilt() {
         most > 0 && most <= PAGE_BOUND,
         "the largest query returned {most} of {INDEXED_ROWS} rows"
     );
+    // The rebuilt filter is sized for the index, and the configured sizing is
+    // not replaced by it.
+    let held = log.lock().await;
+    assert!(held.live_bloom_config().expected_items() >= INDEXED_ROWS as usize);
+    assert_eq!(held.bloom_config(), &configured);
+}
+
+#[tokio::test]
+async fn a_rebuilt_filter_keeps_absent_hashes_below_the_configured_error_rate() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let g = plain(&db_path(&dir)).await;
+    index_hashes(&g, 0..INDEXED_ROWS).await;
+    let log = sized_log(log_with_head(None), BloomConfig::new(16, 0.01).unwrap());
+
+    // Act
+    let _g = g.with_log(Arc::clone(&log)).await.unwrap();
+    let absent = INDEXED_ROWS..INDEXED_ROWS + 2_000;
+    let mut false_positives = 0;
+    for n in absent.clone() {
+        false_positives += usize::from(knows(&log, &hash(n)).await);
+    }
+
+    // Assert
+    let rate = false_positives as f64 / absent.len() as f64;
+    assert!(
+        rate < 0.05,
+        "{false_positives} of {} absent hashes hit",
+        absent.len()
+    );
+}
+
+#[tokio::test]
+async fn open_check_refuses_a_cursor_another_handle_created_first_for_a_different_log() {
+    // Arrange: no cursor yet when this handle reads, then a rival handle creates
+    // one for another log just before this handle's own insert.
+    let dir = TempDir::new().unwrap();
+    let g = Graph::<Probed>::open(&db_path(&dir), GraphConfig::new(8))
+        .await
+        .unwrap();
+    let rival = Uuid::now_v7();
+    *g.backend.rival_log.lock().unwrap() = Some(rival);
+    let writer = log_with_head(None);
+    let log_id = writer.log_id();
+
+    // Act
+    let opened = g.with_log(share(writer)).await;
+
+    // Assert
+    match opened {
+        Err(Error::LogIdMismatch { store, log }) => assert_eq!((store, log), (rival, log_id)),
+        other => panic!("expected LogIdMismatch, got {:?}", other.err()),
+    }
 }

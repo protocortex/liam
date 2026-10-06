@@ -16,7 +16,6 @@
 //! Known limitation: the time rotation timer is not persisted, so it restarts
 //! on every reopen.
 
-use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -63,6 +62,12 @@ pub enum WalError {
     Poisoned,
     #[error("wal log id manifest {} does not hold a uuid", manifest.display())]
     InvalidLogId { manifest: PathBuf },
+    #[error(
+        "segment {sequence} is missing below the open segment, so the log head cannot be found"
+    )]
+    MissingSegment { sequence: u64 },
+    #[error("parquet segment {sequence} could not be counted to find the log head: {reason}")]
+    UncountableSegment { sequence: u64, reason: String },
 }
 
 /// Source of the current time, injected so rotation tests never sleep.
@@ -214,7 +219,10 @@ impl<C: RotationClock> WalWriter<C> {
                 create_segment(dir, next, clock.now_secs(), ops.as_mut())?
             }
         };
-        let head = segment_head(&segment).or_else(|| last_record_below(dir, segment.sequence));
+        let head = match segment_head(&segment) {
+            Some(head) => Some(head),
+            None => last_record_below(dir, segment.sequence)?,
+        };
         Ok(Self {
             dir: dir.to_path_buf(),
             config,
@@ -345,27 +353,21 @@ fn segment_head(segment: &OpenSegment) -> Option<LogOffset> {
 /// head when the writer opens on an empty segment. A segment is counted from
 /// its WAL file, or from its Parquet footer once compaction removed the WAL.
 ///
-/// The search ends at a missing segment or one that cannot be counted, so a
-/// damaged log reports an earlier head or none; the reader names the damage.
-fn last_record_below(dir: &Path, open: u64) -> Option<LogOffset> {
+/// A segment that is missing or cannot be counted fails the open: reporting an
+/// earlier head would make a healthy store look ahead of its log.
+fn last_record_below(dir: &Path, open: u64) -> Result<Option<LogOffset>, WalError> {
     for segment in (0..open).rev() {
-        let count = match segment_record_count(dir, segment) {
-            Ok(Some(count)) => count,
-            Ok(None) => return None,
-            Err(reason) => {
-                tracing::warn!(segment, %reason, "cannot count the records of a segment, the log head may be reported too low");
-                return None;
-            }
-        };
+        let count = segment_record_count(dir, segment)?
+            .ok_or(WalError::MissingSegment { sequence: segment })?;
         if let Some(index) = count.checked_sub(1) {
-            return Some(LogOffset { segment, index });
+            return Ok(Some(LogOffset { segment, index }));
         }
     }
-    None
+    Ok(None)
 }
 
 /// `None` when neither a WAL file nor a Parquet file exists for `sequence`.
-fn segment_record_count(dir: &Path, sequence: u64) -> Result<Option<u64>, Box<dyn Error>> {
+fn segment_record_count(dir: &Path, sequence: u64) -> Result<Option<u64>, WalError> {
     let wal = dir.join(segment_name(sequence));
     match fs::read(&wal) {
         Ok(bytes) => return Ok(Some(scan_segment(&wal, &bytes)?.events.len() as u64)),
@@ -376,7 +378,12 @@ fn segment_record_count(dir: &Path, sequence: u64) -> Result<Option<u64>, Box<dy
     if !parquet.exists() {
         return Ok(None);
     }
-    Ok(Some(read_event_count_from_file(&parquet)?))
+    read_event_count_from_file(&parquet)
+        .map(Some)
+        .map_err(|error| WalError::UncountableSegment {
+            sequence,
+            reason: error.to_string(),
+        })
 }
 
 fn encode_frame(length: u32, payload: &[u8]) -> Vec<u8> {
@@ -678,7 +685,9 @@ mod tests {
 
     use super::*;
     use crate::event::CURRENT_SCHEMA_VERSION;
-    use crate::fixtures::{compact_segments, event, frame_len, parquet_path, wal_path, write_log};
+    use crate::fixtures::{
+        compact_segments, event, frame_len, parquet_path, put_parquet, wal_path, write_log,
+    };
     use crate::LogOffset;
 
     const INTERVAL_SECS: u64 = 60;
@@ -1852,6 +1861,95 @@ mod tests {
         assert_eq!(writer.head(), Some(at(0, 2)));
     }
 
+    #[test]
+    fn a_failed_append_leaves_the_head_where_it_was() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = open(dir.path(), LARGE, &FakeClock::default());
+        writer.append(&event(0)).expect("append first");
+        let before = writer.head();
+        writer.ops = Box::new(FaultyOps {
+            partial_write: Some(HEADER_BYTES + 3),
+            ..FaultyOps::default()
+        });
+
+        // Act
+        writer.append(&event(1)).expect_err("write should fail");
+
+        // Assert
+        assert_eq!(before, Some(at(0, 0)));
+        assert_eq!(writer.head(), before);
+    }
+
+    #[test]
+    fn head_after_reopen_skips_empty_segments_to_the_last_record_below_them() {
+        // Arrange: segment 0 holds three records, segments 1 and 2 are empty.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_log(dir.path(), 3, 10);
+        File::create(wal_path(dir.path(), 1)).expect("create segment 1");
+        File::create(wal_path(dir.path(), 2)).expect("create segment 2");
+
+        // Act
+        let reopened = open(dir.path(), LARGE, &FakeClock::default());
+
+        // Assert
+        assert_eq!(reopened.open_sequence(), 2);
+        assert_eq!(reopened.head(), Some(at(0, 2)));
+    }
+
+    #[test]
+    fn open_fails_when_a_segment_below_the_open_one_is_missing() {
+        // Arrange: four records, two a segment, so segment 2 is open and empty.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_log(dir.path(), 4, 2);
+        fs::remove_file(wal_path(dir.path(), 1)).expect("remove segment 1");
+
+        // Act
+        let error = open_error(dir.path(), &FakeClock::default());
+
+        // Assert
+        assert!(
+            matches!(error, WalError::MissingSegment { sequence: 1 }),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn open_fails_when_a_wal_segment_below_the_open_one_is_corrupt() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let (_, _, corrupt_start) = write_with_corrupt_second_record(dir.path(), &clock);
+        File::create(wal_path(dir.path(), 1)).expect("create segment 1");
+
+        // Act
+        let error = open_error(dir.path(), &clock);
+
+        // Assert
+        assert!(
+            matches!(&error, WalError::Corrupt { offset, .. } if *offset == corrupt_start as u64),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_fails_when_a_compacted_segment_below_the_open_one_cannot_be_counted() {
+        // Arrange: segment 1 is compacted, then its Parquet file is damaged.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_log(dir.path(), 4, 2);
+        compact_segments(dir.path(), &[0, 1]).await;
+        fs::write(parquet_path(dir.path(), 1), b"not parquet").expect("damage parquet");
+
+        // Act
+        let error = open_error(dir.path(), &FakeClock::default());
+
+        // Assert
+        assert!(
+            matches!(error, WalError::UncountableSegment { sequence: 1, .. }),
+            "unexpected error: {error}"
+        );
+    }
+
     /// A file operation as seen by `RecordingOps`.
     #[derive(Debug, Clone, PartialEq)]
     enum Op {
@@ -2351,13 +2449,24 @@ mod tests {
         assert_eq!(replay(dir.path()).expect("replay"), expected);
     }
 
-    #[test]
-    fn open_never_reuses_a_sequence_that_a_parquet_file_already_carries() {
-        // Arrange
+    #[tokio::test]
+    async fn open_never_reuses_a_sequence_that_a_parquet_file_already_carries() {
+        // Arrange: every sequence below the open one is present, because open
+        // reads the head from them.
         let cases: [(&str, &[u64], &[u64], u64); 3] = [
-            ("only compacted files remain", &[], &[0, 5], 6),
-            ("compacted file past the newest segment", &[2], &[5], 6),
-            ("newest segment past the compacted files", &[2, 5], &[2], 5),
+            ("only compacted files remain", &[], &[0, 1, 2], 3),
+            (
+                "compacted file past the newest segment",
+                &[2],
+                &[0, 1, 3],
+                4,
+            ),
+            (
+                "newest segment past the compacted files",
+                &[3],
+                &[0, 1, 2],
+                3,
+            ),
         ];
 
         for (name, wal, parquet, expected) in cases {
@@ -2366,8 +2475,7 @@ mod tests {
                 fs::write(wal_path(dir.path(), *sequence), b"").expect("write segment");
             }
             for sequence in parquet {
-                let file = parquet_path(dir.path(), *sequence);
-                fs::write(file, b"parquet").expect("write parquet");
+                put_parquet(dir.path(), *sequence, &[event(0)]).await;
             }
 
             // Act

@@ -26,6 +26,7 @@ use crate::types::{
 };
 use crate::value::{Row, Value};
 
+mod log_cursor;
 mod log_open;
 mod logged_plan;
 mod logged_write;

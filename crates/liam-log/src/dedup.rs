@@ -24,6 +24,10 @@ const DEFAULT_FALSE_POSITIVE_RATE: f64 = 0.01;
 /// About 600 MB at the default rate, so a mistyped capacity cannot ask for tens of GiB.
 const MAX_EXPECTED_ITEMS: usize = 500_000_000;
 
+/// A grown filter holds this many times the hashes it starts with, so writes
+/// after open do not push it past its false positive rate at once.
+const HEADROOM_FACTOR: usize = 2;
+
 /// Below this the filter needs over 43 bits per hash, which defeats a cheap pre-check.
 const MIN_FALSE_POSITIVE_RATE: f64 = 1e-9;
 
@@ -79,6 +83,17 @@ impl BloomConfig {
 
     pub fn false_positive_rate(&self) -> f64 {
         self.false_positive_rate
+    }
+
+    /// The sizing for a filter that starts with `items` hashes: never below
+    /// this one, with headroom above `items`, and clamped to the maximum
+    /// instead of refused.
+    pub fn grown_to(&self, items: usize) -> BloomConfig {
+        let wanted = items.saturating_mul(HEADROOM_FACTOR);
+        Self {
+            expected_items: self.expected_items.max(wanted).min(MAX_EXPECTED_ITEMS),
+            false_positive_rate: self.false_positive_rate,
+        }
     }
 }
 
@@ -478,6 +493,29 @@ mod tests {
 
             // Assert
             assert_eq!(result, expected, "items {items}, rate {rate}");
+        }
+    }
+
+    #[test]
+    fn grown_to_sizes_for_the_items_with_headroom_and_never_below_the_configured_floor() {
+        // Arrange
+        let floor = BloomConfig::new(1_000, 0.02).expect("valid config");
+        let cases = [
+            ("below the floor", 100, 1_000),
+            ("just below the floor with headroom", 499, 1_000),
+            ("above the floor, doubled", 10_000, 20_000),
+            ("empty", 0, 1_000),
+            ("past the maximum", MAX_EXPECTED_ITEMS, MAX_EXPECTED_ITEMS),
+            ("overflowing", usize::MAX, MAX_EXPECTED_ITEMS),
+        ];
+
+        for (name, items, expected) in cases {
+            // Act
+            let grown = floor.grown_to(items);
+
+            // Assert
+            assert_eq!(grown.expected_items(), expected, "{name}");
+            assert_eq!(grown.false_positive_rate(), 0.02, "{name}");
         }
     }
 
