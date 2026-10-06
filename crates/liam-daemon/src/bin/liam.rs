@@ -120,9 +120,11 @@ const REBUILD_WAL: WalConfig = WalConfig {
     rotate_interval_secs: 3600,
 };
 
-/// GC does not record what it deletes yet, so a rebuild cannot know it.
-const GC_WARNING: &str = "warning: a store that ran GC before the log recorded deletions can get \
-     the rows GC removed back from the log. Back up the database before relying on a rebuild.";
+/// GC records what it deletes now, but a sweep made before that is in no log, so
+/// a rebuild cannot know it.
+const GC_WARNING: &str = "warning: only GC sweeps made before the log recorded deletions are \
+     missing from it, so a store that ran GC back then can get the rows those sweeps removed back \
+     from the log. Back up the database before relying on a rebuild.";
 
 /// `<database stem>.log` beside the database, until the config names a log
 /// directory.
@@ -976,7 +978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_warns_that_gc_deletions_are_not_in_the_log() {
+    async fn rebuild_warns_that_gc_deletions_made_before_logging_are_not_in_the_log() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
         let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
@@ -988,7 +990,10 @@ mod tests {
 
         // Assert
         assert_eq!(code, 0, "stderr: {err}");
-        assert!(err.contains("GC"), "{err}");
+        assert!(
+            err.contains("GC sweeps made before the log recorded"),
+            "{err}"
+        );
         assert!(err.contains("Back up"), "{err}");
     }
 

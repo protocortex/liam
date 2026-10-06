@@ -25,10 +25,11 @@ use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
 use crate::schema::schema;
 use crate::types::{
     Change, ClusterMember, ClusterState, EpisodeEdge, EpisodeRef, EpisodeResult, ExplainedHit,
-    Fingerprint, GcReport, GraphConfig, Hit, NewEdge, NewNode, Query, RetentionPolicy,
+    Fingerprint, GraphConfig, Hit, NewEdge, NewNode, Query,
 };
 use crate::value::{Row, Value};
 
+mod gc;
 mod log_cursor;
 mod log_open;
 mod logged_plan;
@@ -520,7 +521,6 @@ pub struct Graph<B: Backend> {
     log: Option<SharedLog>,
     embedder: Option<Arc<dyn ContentEmbedder>>,
     /// Targets one GC tombstone event carries at most.
-    #[allow(dead_code)]
     gc_chunk: usize,
 }
 
@@ -573,9 +573,10 @@ impl<B: Backend> Graph<B> {
         })
     }
 
-    /// Routes `insert`, `upsert_by`, `supersede`, `relate`, `link`, and
-    /// `ingest_episode` through `log`: each is appended to it before it is
-    /// applied. `gc` does not append yet. Without a log, every write is unlogged.
+    /// Routes `insert`, `upsert_by`, `supersede`, `relate`, `link`,
+    /// `ingest_episode`, and `gc` through `log`: each is appended to it before it
+    /// is applied, a sweep as chunked tombstones. Without a log, every write is
+    /// unlogged.
     ///
     /// Refuses a log the store does not belong to (`LogIdMismatch`) and a store
     /// ahead of the log (`CursorBeyondLog`), then rebuilds the log's dedup
@@ -1182,75 +1183,6 @@ impl<B: Backend> Graph<B> {
             });
         }
         Ok(out)
-    }
-
-    // ---- retention ----
-
-    pub async fn gc(&self, policy: &RetentionPolicy) -> Result<GcReport> {
-        /// The nodes one retention rule is about to remove. Referenced more
-        /// than once per statement below; SQLite reuses numbered parameters, so
-        /// every use binds the same `kind` and `cutoff`.
-        const DOOMED: &str = "SELECT id FROM nodes WHERE kind = ?1 AND valid_from < ?2";
-
-        let now = self.clock.now();
-        let mut nodes_removed = 0u64;
-        let mut edges_removed = 0u64;
-        for rule in &policy.rules {
-            let cutoff = now.0 - rule.max_age.0;
-            let params: Vec<Value> = vec![rule.kind.as_str().into(), cutoff.into()];
-            // Rows that REFERENCE the doomed nodes have to go first, in the
-            // order `Table::removal_sql` uses for one tombstoned node.
-            //
-            // libSQL enforces foreign keys by default, which stock SQLite does
-            // not, and `edges.src`, `edges.dst` and `node_community.node_id`
-            // all declare `REFERENCES nodes(id)` (`schema.rs`). Deleting a node
-            // while anything still points at it fails the whole statement with
-            // "FOREIGN KEY constraint failed", and `sweep` in the daemon logs
-            // that and carries on, so retention silently stopped running on any
-            // store holding an edge. The orphan sweep below is still useful for
-            // rows orphaned by another path, but it ran too late to prevent it.
-            edges_removed += self
-                .backend
-                .execute(
-                    &format!("DELETE FROM edges WHERE src IN ({DOOMED}) OR dst IN ({DOOMED})"),
-                    &params,
-                )
-                .await?;
-            self.backend
-                .execute(
-                    &format!("DELETE FROM node_community WHERE node_id IN ({DOOMED})"),
-                    &params,
-                )
-                .await?;
-            nodes_removed += self
-                .backend
-                .execute(
-                    "DELETE FROM nodes WHERE kind = ?1 AND valid_from < ?2",
-                    &params,
-                )
-                .await?;
-        }
-        edges_removed += self
-            .backend
-            .execute(
-                "DELETE FROM edges
-                 WHERE src NOT IN (SELECT id FROM nodes)
-                    OR dst NOT IN (SELECT id FROM nodes)",
-                &[],
-            )
-            .await?;
-        self.backend.vector_sweep_orphans().await?;
-        if policy.reclaim {
-            self.backend
-                .execute("PRAGMA incremental_vacuum", &[])
-                .await?;
-        }
-        let report = GcReport {
-            nodes_removed,
-            edges_removed,
-        };
-        tracing::info!(?report, "gc swept");
-        Ok(report)
     }
 }
 
@@ -2173,7 +2105,7 @@ fn intern(index: &mut HashMap<String, usize>, labels: &mut Vec<String>, id: Stri
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
-    use crate::types::relation;
+    use crate::types::{relation, RetentionPolicy};
     use crate::DefaultGraph;
     use tempfile::TempDir;
 

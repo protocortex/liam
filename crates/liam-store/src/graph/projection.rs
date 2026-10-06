@@ -103,7 +103,7 @@ pub(super) async fn apply_steps(
 /// Deletes a row and what depends on it. The vector table has no cascade, so a
 /// node's vector is deleted before the node. Its edges and community rows
 /// cascade where foreign keys are enforced; `Table::removal_sql` deletes them
-/// explicitly for a backend that does not enforce them, as `gc` does.
+/// explicitly for a backend that does not enforce them.
 async fn remove_row(
     tx: &mut dyn BackendTx,
     target: &TombstoneTarget,

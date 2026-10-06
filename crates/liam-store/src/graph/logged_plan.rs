@@ -10,7 +10,8 @@
 use std::collections::BTreeSet;
 
 use liam_log::event::{
-    EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTable, CURRENT_SCHEMA_VERSION,
+    EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTable, TombstoneTarget,
+    CURRENT_SCHEMA_VERSION,
 };
 use liam_log::hash::{edge_row_hash, node_row_hash};
 use uuid::Uuid;
@@ -67,8 +68,7 @@ impl Table {
     pub(super) fn removal_sql(self) -> &'static [&'static str] {
         match self {
             // Cascades on a backend that enforces foreign keys; the explicit
-            // deletes guard one that does not. `gc` deletes a node's dependents
-            // in this same order, by subquery, so keep the two in step.
+            // deletes guard one that does not.
             Table::Nodes => &[
                 "DELETE FROM edges WHERE src = ?1 OR dst = ?1",
                 "DELETE FROM node_community WHERE node_id = ?1",
@@ -177,6 +177,12 @@ fn effect_hash(effect: &RowEffect) -> [u8; 32] {
         RowEffect::Node(row) => node_row_hash(row),
         RowEffect::Edge(row) => edge_row_hash(row),
     }
+}
+
+/// A record that removes `targets`. It covers no content, so its hash is empty.
+pub(super) fn tombstone_event(targets: Vec<TombstoneTarget>, now: Millis) -> LogEvent {
+    let stamp = (STORE_SOURCE, STORE_TRUST);
+    event([0; 32], stamp, now.0, now, LogPayload::Tombstone(targets))
 }
 
 /// A record for a node row: the row's producer is the source, its confidence

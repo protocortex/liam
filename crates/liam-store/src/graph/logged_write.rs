@@ -218,7 +218,7 @@ impl<B: Backend> Graph<B> {
         Ok(logged)
     }
 
-    async fn append_and_commit(
+    pub(super) async fn append_and_commit(
         &self,
         mut tx: Box<dyn BackendTx + '_>,
         held: &mut HeldLog,
