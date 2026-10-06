@@ -12,8 +12,8 @@
 //!
 //! The writer owns rotation so a segment is only ever read by others once it
 //! is closed; callers serialize appends themselves. Segments closed before a
-//! crash are not announced again after a reopen: the compactor recovers them
-//! by scanning the log directory when it starts.
+//! crash are not announced again after a reopen: recovering them is added by
+//! a later change.
 //!
 //! Known limitation: the time rotation timer is not persisted, so it restarts
 //! on every reopen.
@@ -28,11 +28,12 @@ use uuid::Uuid;
 use crate::event::{EventError, LogEvent};
 use crate::{LogOffset, LogWriter};
 
-const SEGMENT_EXTENSION: &str = "wal";
+pub(crate) const SEGMENT_EXTENSION: &str = "wal";
+pub(crate) const PARQUET_EXTENSION: &str = "parquet";
 const MANIFEST_NAME: &str = "log.id";
 const LENGTH_PREFIX_BYTES: usize = 4;
 const CRC_BYTES: usize = 4;
-const HEADER_BYTES: usize = LENGTH_PREFIX_BYTES + 2 * CRC_BYTES;
+pub(crate) const HEADER_BYTES: usize = LENGTH_PREFIX_BYTES + 2 * CRC_BYTES;
 const SEQUENCE_DIGITS: usize = 20;
 
 /// Why a WAL operation failed.
@@ -80,8 +81,8 @@ impl RotationClock for SystemClock {
 /// Told about each segment once the writer has fully closed it, so a consumer
 /// never reads a segment that is still being appended to.
 ///
-/// A segment closed before a crash is not announced again after a reopen; a
-/// consumer must scan the log directory on startup to find those.
+/// A segment closed before a crash is not announced again after a reopen;
+/// recovering those is added by a later change.
 pub trait SegmentSink: Send + Sync {
     fn segment_closed(&self, path: &Path);
 }
@@ -136,7 +137,7 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8], ops: &mut dyn FileOps)
 
 /// The directory whose entry for `path` must reach disk. A bare file name has
 /// an empty parent, which means the current directory.
-fn sync_dir_for(path: &Path) -> &Path {
+pub(crate) fn sync_dir_for(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -186,11 +187,20 @@ impl<C: RotationClock> WalWriter<C> {
         let mut ops: Box<dyn FileOps> = Box::new(ops);
         create_dir_all_durably(dir, ops.as_mut())?;
         let log_id = load_or_create_log_id(dir, ops.as_mut())?;
-        let segment = match segment_paths(dir)?.last() {
-            Some((sequence, path)) => {
-                reopen_segment(path, *sequence, clock.now_secs(), ops.as_mut())?
+        let highest_wal = segment_paths(dir)?.pop();
+        let highest_parquet = numbered_files(dir, PARQUET_EXTENSION)?
+            .pop()
+            .map(|(sequence, _)| sequence);
+        let segment = match highest_wal {
+            // A sequence a Parquet file already uses is never handed out again.
+            Some((sequence, path)) if highest_parquet.is_none_or(|parquet| parquet < sequence) => {
+                reopen_segment(&path, sequence, clock.now_secs(), ops.as_mut())?
             }
-            None => create_segment(dir, 0, clock.now_secs(), ops.as_mut())?,
+            wal => {
+                let highest = wal.map(|(sequence, _)| sequence).max(highest_parquet);
+                let next = highest.map_or(0, |sequence| sequence + 1);
+                create_segment(dir, next, clock.now_secs(), ops.as_mut())?
+            }
         };
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -322,10 +332,10 @@ pub(crate) fn replay(dir: &Path) -> Result<Vec<LogEvent>, WalError> {
     Ok(events)
 }
 
-struct Scan {
-    events: Vec<LogEvent>,
+pub(crate) struct Scan {
+    pub(crate) events: Vec<LogEvent>,
     /// Length of the prefix made of complete, valid records.
-    valid_len: u64,
+    pub(crate) valid_len: u64,
 }
 
 /// Decodes records until the bytes end or a torn final record is reached.
@@ -334,7 +344,7 @@ struct Scan {
 /// instead of dropped. A record whose checksums hold but whose payload does
 /// not decode is also reported: it is valid data this build cannot read, such
 /// as an event from a newer schema, and must never be truncated.
-fn scan_segment(path: &Path, bytes: &[u8]) -> Result<Scan, WalError> {
+pub(crate) fn scan_segment(path: &Path, bytes: &[u8]) -> Result<Scan, WalError> {
     let mut events = Vec::new();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -427,13 +437,18 @@ fn load_or_create_log_id(dir: &Path, ops: &mut dyn FileOps) -> Result<Uuid, WalE
     Ok(log_id)
 }
 
-fn segment_name(sequence: u64) -> String {
-    format!("{sequence:020}.{SEGMENT_EXTENSION}")
+/// The zero padded sequence that a segment and its Parquet file share as a name.
+pub(crate) fn sequence_stem(sequence: u64) -> String {
+    format!("{sequence:0SEQUENCE_DIGITS$}")
 }
 
-/// Only names written by `segment_name` count, so a stray `9.wal` or `+3.wal` is ignored.
-fn segment_sequence(path: &Path) -> Option<u64> {
-    if path.extension()? != SEGMENT_EXTENSION {
+pub(crate) fn segment_name(sequence: u64) -> String {
+    format!("{}.{SEGMENT_EXTENSION}", sequence_stem(sequence))
+}
+
+/// Only names written by `sequence_stem` count, so a stray `9.wal` or `+3.wal` is ignored.
+pub(crate) fn segment_sequence(path: &Path, extension: &str) -> Option<u64> {
+    if path.extension()? != extension {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
@@ -444,16 +459,21 @@ fn segment_sequence(path: &Path) -> Option<u64> {
 }
 
 /// Segment files with their sequence, in creation order.
-fn segment_paths(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
-    let mut segments = Vec::new();
+pub(crate) fn segment_paths(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    numbered_files(dir, SEGMENT_EXTENSION)
+}
+
+/// Files of one extension named by `sequence_stem`, in sequence order.
+fn numbered_files(dir: &Path, extension: &str) -> io::Result<Vec<(u64, PathBuf)>> {
+    let mut files = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if let Some(sequence) = segment_sequence(&path) {
-            segments.push((sequence, path));
+        if let Some(sequence) = segment_sequence(&path, extension) {
+            files.push((sequence, path));
         }
     }
-    segments.sort();
-    Ok(segments)
+    files.sort();
+    Ok(files)
 }
 
 /// Creates the directory and fsyncs every directory it newly created plus the
@@ -544,8 +564,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::compactor::parquet_name;
     use crate::event::CURRENT_SCHEMA_VERSION;
-    use crate::fixtures::event;
+    use crate::fixtures::{event, frame_len};
     use crate::LogOffset;
 
     const INTERVAL_SECS: u64 = 60;
@@ -585,10 +606,6 @@ mod tests {
 
     fn frame(event: &LogEvent) -> Vec<u8> {
         frame_payload(&event.encode().expect("encode event"))
-    }
-
-    fn frame_len(event: &LogEvent) -> u64 {
-        frame(event).len() as u64
     }
 
     fn segment_files(dir: &Path) -> Vec<PathBuf> {
@@ -1810,7 +1827,7 @@ mod tests {
     impl SegmentSink for RecordingSink {
         fn segment_closed(&self, path: &Path) {
             let successor = path.with_file_name(segment_name(
-                segment_sequence(path).expect("segment name") + 1,
+                segment_sequence(path, SEGMENT_EXTENSION).expect("segment name") + 1,
             ));
             let notification = Notification {
                 path: path.to_path_buf(),
@@ -2086,6 +2103,36 @@ mod tests {
     }
 
     #[test]
+    fn open_never_reuses_a_sequence_that_a_parquet_file_already_carries() {
+        // Arrange
+        let cases: [(&str, &[u64], &[u64], u64); 3] = [
+            ("only compacted files remain", &[], &[0, 5], 6),
+            ("compacted file past the newest segment", &[2], &[5], 6),
+            ("newest segment past the compacted files", &[2, 5], &[2], 5),
+        ];
+
+        for (name, wal, parquet, expected) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for sequence in wal {
+                fs::write(dir.path().join(segment_name(*sequence)), b"").expect("write segment");
+            }
+            for sequence in parquet {
+                let file = dir.path().join(parquet_name(*sequence));
+                fs::write(file, b"parquet").expect("write parquet");
+            }
+
+            // Act
+            let mut writer = open(dir.path(), LARGE, &FakeClock::default());
+            let offset = writer.append(&event(0)).expect("append");
+
+            // Assert
+            assert_eq!(offset.segment, expected, "{name}");
+            let created = dir.path().join(segment_name(expected));
+            assert!(created.exists(), "{name}: segment {expected} not created");
+        }
+    }
+
+    #[test]
     fn segment_sequence_accepts_only_twenty_digit_stems() {
         // Arrange
         let accepted = Path::new("00000000000000000012.wal");
@@ -2097,13 +2144,17 @@ mod tests {
         ];
 
         // Act
-        let parsed = segment_sequence(accepted);
+        let parsed = segment_sequence(accepted, SEGMENT_EXTENSION);
 
         // Assert
         assert_eq!(parsed, Some(12));
         for name in rejected {
-            assert_eq!(segment_sequence(Path::new(name)), None, "{name}");
+            let parsed = segment_sequence(Path::new(name), SEGMENT_EXTENSION);
+            assert_eq!(parsed, None, "{name}");
         }
+        let parquet = Path::new("00000000000000000012.parquet");
+        assert_eq!(segment_sequence(parquet, PARQUET_EXTENSION), Some(12));
+        assert_eq!(segment_sequence(parquet, SEGMENT_EXTENSION), None);
     }
 
     #[test]
