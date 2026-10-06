@@ -10,6 +10,7 @@
 //! Every loader here is synchronous, so the CLI needs no async runtime to
 //! drive them.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -65,35 +66,63 @@ impl ContentEmbedder for StoreEmbedder {
     }
 }
 
-/// Choose the embedder and reranker from config. The mock pair keeps the base
-/// build runnable; the `local` provider (with the `local` feature) loads
-/// fastembed in-process.
+/// Points fastembed's cache at the configured directory when the embedder is
+/// local, and returns that directory.
 ///
-/// Callers must set `FASTEMBED_CACHE_DIR` before this runs, while the process
-/// is still single-threaded (see `EmbedderConfig::cache_dir`).
-pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
-    if config.embedder.provider == "local" {
-        return build_local(config);
+/// fastembed reads the cache directory from the environment, and mutating the
+/// environment once other threads exist is a data race on POSIX, so callers run
+/// this before starting a runtime. The configured value is resolved first
+/// because fastembed does not expand `~`, and passing it raw downloads models
+/// into a directory named `~`. It sets the reranker's cache; the embedder
+/// reaches the same directory through its own explicit parameter.
+pub fn export_fastembed_cache_dir(config: &Config) -> anyhow::Result<Option<PathBuf>> {
+    if config.embedder.provider != "local" {
+        return Ok(None);
     }
-    Ok((
-        Arc::new(MockEmbedder::new(config.embedding_dims)),
-        Arc::new(IdentityReranker),
-    ))
+    let cache_dir = resolve_config_path("embedder.cache_dir", &config.embedder.cache_dir)?;
+    std::env::set_var("FASTEMBED_CACHE_DIR", &cache_dir);
+    Ok(Some(cache_dir))
+}
+
+/// Choose the embedder from config. The mock keeps the base build runnable; the
+/// `local` provider (with the `local` feature) loads fastembed in-process.
+///
+/// Callers must run `export_fastembed_cache_dir` first.
+pub fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
+    if config.embedder.provider == "local" {
+        return build_local_embedder(config);
+    }
+    Ok(Arc::new(MockEmbedder::new(config.embedding_dims)))
+}
+
+/// The embedder from `build_embedder` and the reranker the same config asks for:
+/// identity for the mock provider, fastembed's for `local`.
+pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
+    let embedder = build_embedder(config)?;
+    let reranker: Arc<dyn Reranker> = if config.embedder.provider == "local" {
+        build_local_reranker()?
+    } else {
+        Arc::new(IdentityReranker)
+    };
+    Ok((embedder, reranker))
 }
 
 #[cfg(feature = "local")]
-fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
-    use liam_model::{FastEmbedEmbedder, FastEmbedReranker};
+fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
+    use liam_model::FastEmbedEmbedder;
     let home = std::env::var("HOME").unwrap_or_default();
     let cache_dir =
         resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
-    let embedder = Arc::new(FastEmbedEmbedder::load(
+    Ok(Arc::new(FastEmbedEmbedder::load(
         &config.embedder.model,
         config.embedding_dims,
         &cache_dir,
-    )?);
-    let reranker = Arc::new(FastEmbedReranker::load()?);
-    Ok((embedder, reranker))
+    )?))
+}
+
+#[cfg(feature = "local")]
+fn build_local_reranker() -> anyhow::Result<Arc<dyn Reranker>> {
+    Ok(Arc::new(liam_model::FastEmbedReranker::load()?))
 }
 
 /// Refuses to start rather than substituting the mock embedder.
@@ -105,7 +134,7 @@ fn build_local(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Re
 /// answers. Failing at startup with the actual fix is what makes a
 /// misconfigured install obvious in the one second it takes to notice.
 #[cfg(not(feature = "local"))]
-fn build_local(_config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
+fn build_local_embedder(_config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
     anyhow::bail!(
         "embedder.provider = \"local\" needs a binary built with the `local` feature, \
          and this one was not. Either install a release build (they ship with it), \
@@ -113,6 +142,12 @@ fn build_local(_config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn R
          actually want the dev embedder. Mock embeddings are random, so recall would \
          be meaningless."
     )
+}
+
+/// Never reached: `build_models` builds the embedder first, and that refuses.
+#[cfg(not(feature = "local"))]
+fn build_local_reranker() -> anyhow::Result<Arc<dyn Reranker>> {
+    anyhow::bail!("embedder.provider = \"local\" needs a binary built with the `local` feature")
 }
 
 /// Choose the LLM from config. Mock keeps the base build runnable; `llama-cpp`
@@ -277,6 +312,53 @@ mod tests {
         assert!(
             message.contains("HOME"),
             "error should say what is missing: {message}"
+        );
+    }
+
+    struct FailingEmbedder;
+
+    #[async_trait]
+    impl Embedder for FailingEmbedder {
+        fn dims(&self) -> usize {
+            8
+        }
+
+        async fn embed(&self, _text: &str) -> liam_model::error::Result<Vec<f32>> {
+            Err(liam_model::error::ModelError::Embed("no model".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_store_embedder_returns_the_vector_its_embedder_made() {
+        // Arrange
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let expected = embedder.embed("alpha").await.unwrap();
+
+        // Act
+        let vector = StoreEmbedder(embedder).embed("alpha").await.unwrap();
+
+        // Assert
+        assert_eq!(vector, expected);
+        assert_eq!(vector.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn the_store_embedder_passes_an_embed_failure_on_as_an_error() {
+        // Act
+        let error = StoreEmbedder(Arc::new(FailingEmbedder))
+            .embed("alpha")
+            .await
+            .expect_err("a failing embedder must not yield a vector");
+
+        // Assert
+        assert!(error.to_string().contains("no model"), "{error}");
+    }
+
+    #[test]
+    fn a_mock_embedder_exports_no_cache_directory() {
+        assert_eq!(
+            export_fastembed_cache_dir(&Config::default()).unwrap(),
+            None
         );
     }
 

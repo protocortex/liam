@@ -16,21 +16,24 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
+use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
 use liam_log::dedup::{BloomConfig, HashBloom};
 use liam_log::reader::SequentialScanReader;
-use liam_log::wal::{WalConfig, WalWriter};
+use liam_log::wal::{WalConfig, WalWriter, MANIFEST_NAME};
+use liam_log::LogWriter;
 use liam_store::{
-    ContentEmbedder, DefaultGraph, Error as StoreError, EventLog, GraphConfig, MismatchSource,
-    RebuildMode, RebuildReport, SharedLog,
+    ContentEmbedder, DefaultGraph, EmbedError, Error as StoreError, EventLog, GraphConfig,
+    MismatchSource, RebuildMode, RebuildReport, SharedLog,
 };
 
 use liam_daemon::config::{resolve_config_source, Config};
 use liam_daemon::models::{self, StoreEmbedder};
 use liam_daemon::storelock::StoreLock;
+use liam_daemon::telemetry;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -85,15 +88,20 @@ fn main() -> anyhow::Result<()> {
         std::env::var("LIAM_CONFIG").ok().as_deref(),
     );
     let config = Config::load(&config_path)?;
+    // Without a subscriber the store's own warnings, such as why a node could
+    // not be embedded, are dropped.
+    telemetry::init("warn");
 
     match cli.command {
         Command::FetchModels => fetch_models(&config, &config_path),
         Command::Rebuild(args) => {
-            export_embedder_cache(&config)?;
+            models::export_fastembed_cache_dir(&config)?;
             let runtime = tokio::runtime::Runtime::new()?;
             let code = runtime.block_on(rebuild(
                 &args,
                 &config,
+                &config_path,
+                store_embedder,
                 &mut std::io::stdout(),
                 &mut std::io::stderr(),
             ));
@@ -125,29 +133,31 @@ fn default_log_dir(database: &Path) -> PathBuf {
     database.with_file_name(name)
 }
 
-/// fastembed reads its cache directory from the environment, which is only safe
-/// to set while the process has a single thread, so this runs before the
-/// runtime starts.
-fn export_embedder_cache(config: &Config) -> anyhow::Result<()> {
-    if config.embedder.provider != "local" {
-        return Ok(());
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let cache_dir =
-        models::resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
-    std::env::set_var("FASTEMBED_CACHE_DIR", cache_dir);
-    Ok(())
+/// Expands `~` in a path flag the way the daemon does for its configured paths.
+fn expand_home(flag: &str, path: &Path) -> anyhow::Result<PathBuf> {
+    let text = path
+        .to_str()
+        .with_context(|| format!("{flag} is not valid UTF-8"))?;
+    models::resolve_config_path(flag, text)
+}
+
+/// Only the embedder: whether the reranker loads has no bearing on a rebuild.
+fn store_embedder(config: &Config) -> anyhow::Result<Arc<dyn ContentEmbedder>> {
+    Ok(Arc::new(StoreEmbedder(models::build_embedder(config)?)))
 }
 
 /// Runs `liam rebuild`: the report goes to `out`, a refusal or a failure to
 /// `err`. Returns the process exit code, non zero on any failure.
+/// `embedder_for` builds the embedder once the store lock is held.
 async fn rebuild(
     args: &RebuildArgs,
     config: &Config,
+    config_path: &Path,
+    embedder_for: impl FnOnce(&Config) -> anyhow::Result<Arc<dyn ContentEmbedder>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    match try_rebuild(args, config, out, err).await {
+    match try_rebuild(args, config, config_path, embedder_for, out, err).await {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(err, "liam rebuild: {error:#}");
@@ -156,62 +166,89 @@ async fn rebuild(
     }
 }
 
-/// The steps in order: the log must exist and the store lock is ours before the
-/// database is opened, and the store's own checks run before it deletes
-/// anything. `--force` only widens the mode after the store refused the safe
-/// one, so a refusal is never skipped unseen.
+/// The steps in order: every check that needs no change comes first, the store
+/// lock is ours before the log or the database is opened, and the embedder is
+/// built before the store deletes anything. A missing config, a path that is not
+/// a log and a log with no records are refused here because each would otherwise
+/// rebuild an empty or wrongly embedded store and report success.
 async fn try_rebuild(
     args: &RebuildArgs,
     config: &Config,
+    config_path: &Path,
+    embedder_for: impl FnOnce(&Config) -> anyhow::Result<Arc<dyn ContentEmbedder>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let log_dir = args
-        .log_dir
-        .clone()
-        .unwrap_or_else(|| default_log_dir(&args.database));
     anyhow::ensure!(
-        log_dir.is_dir(),
-        "the log directory {} does not exist; pass --log-dir if the log lives elsewhere",
+        config_path.exists(),
+        "the config file {} does not exist, so the built-in defaults would embed every \
+         restored node with the mock embedder; pass --config or set LIAM_CONFIG",
+        config_path.display()
+    );
+    let database = expand_home("--database", &args.database)?;
+    let log_dir = match &args.log_dir {
+        Some(dir) => expand_home("--log-dir", dir)?,
+        None => default_log_dir(&database),
+    };
+    anyhow::ensure!(
+        log_dir.join(MANIFEST_NAME).is_file(),
+        "{} is not an event log, it has no {MANIFEST_NAME} file; pass --log-dir if the log \
+         lives elsewhere",
         log_dir.display()
     );
-    if let Some(parent) = args.database.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-    }
-    let _lock = StoreLock::acquire(&args.database)?;
+    let _lock = StoreLock::acquire(&database)
+        .context("liam rebuild needs the store to itself: stop liamd, then rerun")?;
     tracing::debug!("rebuild: store lock taken");
 
-    let log = open_log(&log_dir)?;
-    let embedder = store_embedder(config, err)?;
-    let graph = open_graph(args, config, embedder.as_ref()).await?;
-    let mode = if graph.projection_hash_multiset().await?.is_empty() {
-        RebuildMode::RequireEmpty
-    } else {
-        RebuildMode::ResetChecked
-    };
+    let embedder = Arc::new(FirstFailure::new(embedder_for(config).context(
+        "the embedder could not be built: fix the model setup or run `liam fetch-models`, then \
+         rerun. Nothing was changed",
+    )?));
+    let writer = open_writer(&log_dir)?;
+    // An empty log would rebuild an empty store and report success, which is
+    // not what a lost database needs.
+    anyhow::ensure!(
+        writer.head().is_some(),
+        "the log in {} holds no records, so there is nothing to rebuild from",
+        log_dir.display()
+    );
+    let log = shared_log(writer, &log_dir)?;
+    let report = replay_log(
+        &database,
+        config.embedding_dims,
+        log,
+        embedder.clone(),
+        args.force,
+        err,
+    )
+    .await?;
+    print_report(
+        out,
+        config_path,
+        &config.embedder.provider,
+        &database,
+        &log_dir,
+        &report,
+    )?;
 
-    writeln!(err, "{GC_WARNING}")?;
-    let rebuilt = match graph.rebuild_from_log(log.clone(), mode).await {
-        Err(refusal) if args.force && is_forceable(&refusal) => {
-            writeln!(err, "{}", force_warning(&refusal))?;
-            // The refused store was consumed, so the replacing run opens its own.
-            open_graph(args, config, embedder.as_ref())
-                .await?
-                .rebuild_from_log(log, RebuildMode::Replace)
-                .await
-        }
-        other => other,
-    };
-    let (_graph, report) = rebuilt.map_err(explain_refusal)?;
-    tracing::debug!("rebuild: done");
-    print_report(out, &args.database, &log_dir, &report)?;
+    let failed = report.replayed.reembedded.failed;
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} node embeddings failed ({}); the rebuild is incomplete, rerun it once the \
+         cause is fixed",
+        embedder
+            .first_failure()
+            .unwrap_or("reasons are logged above")
+    );
     Ok(())
 }
 
-fn open_log(log_dir: &Path) -> anyhow::Result<SharedLog> {
-    let writer = WalWriter::open_with_system_clock(log_dir, REBUILD_WAL)
-        .with_context(|| format!("could not open the log in {}", log_dir.display()))?;
+fn open_writer(log_dir: &Path) -> anyhow::Result<impl LogWriter + 'static> {
+    WalWriter::open_with_system_clock(log_dir, REBUILD_WAL)
+        .with_context(|| format!("could not open the log in {}", log_dir.display()))
+}
+
+fn shared_log(writer: impl LogWriter + 'static, log_dir: &Path) -> anyhow::Result<SharedLog> {
     let reader = SequentialScanReader::local(log_dir)
         .with_context(|| format!("could not read the log in {}", log_dir.display()))?;
     let log = EventLog::new(
@@ -222,43 +259,85 @@ fn open_log(log_dir: &Path) -> anyhow::Result<SharedLog> {
     Ok(Arc::new(tokio::sync::Mutex::new(log)))
 }
 
-/// The embedder restored nodes are embedded with, or none after a warning: the
-/// rebuild still succeeds and reports the nodes left pending.
-fn store_embedder(
-    config: &Config,
-    err: &mut dyn Write,
-) -> anyhow::Result<Option<Arc<dyn ContentEmbedder>>> {
-    match models::build_models(config) {
-        Ok((embedder, _reranker)) => Ok(Some(Arc::new(StoreEmbedder(embedder)))),
-        Err(error) => {
-            writeln!(
-                err,
-                "warning: no embedder ({error:#}); restored nodes stay without a vector until a \
-                 later pass embeds them"
-            )?;
-            Ok(None)
+/// Remembers the first embed failure, because the store only counts them.
+struct FirstFailure {
+    inner: Arc<dyn ContentEmbedder>,
+    first: OnceLock<String>,
+}
+
+impl FirstFailure {
+    fn new(inner: Arc<dyn ContentEmbedder>) -> Self {
+        Self {
+            inner,
+            first: OnceLock::new(),
         }
     }
+
+    fn first_failure(&self) -> Option<&str> {
+        self.first.get().map(String::as_str)
+    }
+}
+
+#[async_trait]
+impl ContentEmbedder for FirstFailure {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        let embedded = self.inner.embed(text).await;
+        if let Err(error) = &embedded {
+            let _ = self.first.set(error.to_string());
+        }
+        embedded
+    }
+}
+
+/// Rebuilds the database from `log`. `--force` only widens the mode after the
+/// store refused the safe one, so a refusal is never skipped unseen.
+async fn replay_log(
+    database: &Path,
+    dims: usize,
+    log: SharedLog,
+    embedder: Arc<dyn ContentEmbedder>,
+    force: bool,
+    err: &mut dyn Write,
+) -> anyhow::Result<RebuildReport> {
+    let graph = open_graph(database, dims, &embedder).await?;
+    let mode = if graph.projection_hash_multiset().await?.is_empty() {
+        RebuildMode::RequireEmpty
+    } else {
+        RebuildMode::ResetChecked
+    };
+
+    writeln!(err, "{GC_WARNING}")?;
+    let rebuilt = match graph.rebuild_from_log(log.clone(), mode).await {
+        Err(refusal) if force && is_forceable(&refusal) => {
+            writeln!(err, "{}", force_warning(&refusal))?;
+            // The refused store was consumed, so the replacing run opens its own.
+            open_graph(database, dims, &embedder)
+                .await?
+                .rebuild_from_log(log, RebuildMode::Replace)
+                .await
+        }
+        other => other,
+    };
+    let (_graph, report) = rebuilt.map_err(explain_refusal)?;
+    tracing::debug!("rebuild: done");
+    Ok(report)
 }
 
 /// The database with no log attached: `rebuild_from_log` attaches it only once
 /// the rebuild has been checked.
 async fn open_graph(
-    args: &RebuildArgs,
-    config: &Config,
-    embedder: Option<&Arc<dyn ContentEmbedder>>,
+    database: &Path,
+    dims: usize,
+    embedder: &Arc<dyn ContentEmbedder>,
 ) -> anyhow::Result<DefaultGraph> {
     let graph = DefaultGraph::open(
-        args.database
+        database
             .to_str()
             .context("the database path is not UTF-8")?,
-        GraphConfig::new(config.embedding_dims),
+        GraphConfig::new(dims),
     )
     .await?;
-    Ok(match embedder {
-        Some(embedder) => graph.with_embedder(Arc::clone(embedder)),
-        None => graph,
-    })
+    Ok(graph.with_embedder(Arc::clone(embedder)))
 }
 
 /// Refusals made before anything was deleted, over rows only the database
@@ -286,7 +365,10 @@ fn force_warning(refusal: &StoreError) -> String {
     }
 }
 
-/// Puts a refusal or failure of the store in terms of the command line.
+/// Puts a refusal or failure of the store in terms of the command line. Only
+/// the errors that can arise before the projection is cleared claim that
+/// nothing was changed; a backend or log read failure may come from either side
+/// of it, so it cannot.
 fn explain_refusal(error: StoreError) -> anyhow::Error {
     match error {
         StoreError::RebuildMismatch {
@@ -308,9 +390,16 @@ fn explain_refusal(error: StoreError) -> anyhow::Error {
              log anyway"
         ),
         refused @ (StoreError::EmptyLogWouldWipe { .. }
-        | StoreError::ForeignLogWouldWipe { .. }) => {
+        | StoreError::ForeignLogWouldWipe { .. }
+        | StoreError::CorruptLogState(_)) => {
             anyhow::Error::new(refused).context("the rebuild was refused and nothing was changed")
         }
+        // Raised after the replay, so the database holds its result.
+        unverified @ StoreError::RebuildMismatch {
+            against: MismatchSource::Log,
+            ..
+        } => anyhow::Error::new(unverified)
+            .context("the rebuild finished but its result does not match the log"),
         other => anyhow::Error::new(other).context(
             "the rebuild did not finish cleanly and the database may hold a partial rebuild; \
              run it again with --force to start over from the log, or restore a backup",
@@ -320,11 +409,15 @@ fn explain_refusal(error: StoreError) -> anyhow::Error {
 
 fn print_report(
     out: &mut dyn Write,
+    config_path: &Path,
+    provider: &str,
     database: &Path,
     log_dir: &Path,
     report: &RebuildReport,
 ) -> std::io::Result<()> {
     let (replayed, embedded) = (&report.replayed, &report.replayed.reembedded);
+    writeln!(out, "config: {}", config_path.display())?;
+    writeln!(out, "embedder: {provider}")?;
     writeln!(
         out,
         "rebuilt {} from {}",
@@ -387,18 +480,10 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
     let home = std::env::var("HOME").unwrap_or_default();
 
     if wants_embedder {
-        let cache_dir = models::resolve_path_with_home(
-            "embedder.cache_dir",
-            &config.embedder.cache_dir,
-            &home,
-        )?;
         println!("embedder: {}", config.embedder.model);
-        println!("  cache_dir -> {cache_dir}");
-        // The same single-threaded requirement `liamd` documents in `main`:
-        // fastembed reads this out of the environment, and mutating the
-        // environment once other threads exist is a data race on POSIX.
-        // Nothing above has spawned one, and this binary starts no runtime.
-        std::env::set_var("FASTEMBED_CACHE_DIR", &cache_dir);
+        if let Some(cache_dir) = models::export_fastembed_cache_dir(config)? {
+            println!("  cache_dir -> {}", cache_dir.display());
+        }
         // Pulls the reranker too, which is a second download the daemon
         // needs and nobody would think to ask for by name.
         let (_embedder, _reranker) = models::build_models(config)?;
@@ -428,10 +513,9 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    use liam_log::dedup::{BloomConfig, HashBloom};
-    use liam_log::reader::SequentialScanReader;
-    use liam_log::wal::{WalConfig, WalWriter};
-    use liam_store::{DefaultGraph, EventLog, GraphConfig, NewNode, SharedLog};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use liam_store::{Backend, DefaultBackend, NewNode, FOREVER};
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("arguments must parse")
@@ -541,139 +625,32 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_defaults_the_log_directory_to_a_sibling_named_after_the_database() {
-        assert_eq!(
-            default_log_dir(Path::new("/data/liam.db")),
-            PathBuf::from("/data/liam.log")
-        );
-    }
-
-    // ---- running a rebuild against a real store and log ----
-
-    const DIMS: usize = 8;
-
-    fn config() -> Config {
-        Config {
-            embedding_dims: DIMS,
-            ..Config::default()
+    fn the_default_log_directory_is_a_sibling_named_after_the_database_stem() {
+        for (database, log_dir) in [
+            ("/data/work.db", "/data/work.log"),
+            ("liam.db", "liam.log"),
+            ("/data/store", "/data/store.log"),
+        ] {
+            assert_eq!(
+                default_log_dir(Path::new(database)),
+                PathBuf::from(log_dir),
+                "{database}"
+            );
         }
     }
 
-    /// A store with two nodes and an edge, written through a real log, and the
-    /// multiset of live row hashes it holds.
-    async fn logged_store(database: &Path, log_dir: &Path) -> Vec<[u8; 32]> {
-        let writer = WalWriter::open_with_system_clock(
-            log_dir,
-            WalConfig {
-                segment_max_bytes: 1 << 20,
-                rotate_interval_secs: 3600,
-            },
-        )
-        .expect("open the wal");
-        let reader = SequentialScanReader::local(log_dir).expect("open the reader");
-        let log: SharedLog = std::sync::Arc::new(tokio::sync::Mutex::new(EventLog::new(
-            Box::new(writer),
-            std::sync::Arc::new(reader),
-            HashBloom::new(BloomConfig::default()),
-        )));
-        let store = DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(DIMS))
-            .await
-            .expect("open the store")
-            .with_log(log)
-            .await
-            .expect("attach the log");
-        let alpha = store
-            .insert(NewNode::now("fact", "label", "alpha"))
-            .await
-            .unwrap();
-        let beta = store
-            .insert(NewNode::now("fact", "label", "beta"))
-            .await
-            .unwrap();
-        store.relate(&alpha, &beta, "mentions").await.unwrap();
-        store.projection_hash_multiset().await.unwrap()
-    }
-
-    /// The database's live row hashes, read without a log.
-    async fn stored_multiset(database: &Path) -> Vec<[u8; 32]> {
-        DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(DIMS))
-            .await
-            .expect("open the store")
-            .projection_hash_multiset()
-            .await
-            .unwrap()
-    }
-
-    /// Deletes the database file and its sidecar files, leaving the log.
-    fn delete_database(dir: &Path) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            let is_database = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("liam.db"));
-            if is_database && path.is_file() {
-                std::fs::remove_file(path).unwrap();
-            }
+    #[test]
+    fn a_mistyped_rebuild_flag_is_a_usage_error_with_exit_code_two() {
+        for flag in ["--logdir", "--forse"] {
+            let error = Cli::try_parse_from(["liam", "rebuild", "--database", "liam.db", flag])
+                .expect_err("an unknown flag must not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+            assert_eq!(error.exit_code(), 2, "{flag}");
         }
-    }
-
-    async fn run_rebuild(args: &RebuildArgs) -> (i32, String, String) {
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = rebuild(args, &config(), &mut out, &mut err).await;
-        (
-            code,
-            String::from_utf8(out).unwrap(),
-            String::from_utf8(err).unwrap(),
-        )
-    }
-
-    fn rebuild_of(database: &Path, log_dir: Option<&Path>) -> RebuildArgs {
-        RebuildArgs {
-            database: database.to_path_buf(),
-            log_dir: log_dir.map(Path::to_path_buf),
-            force: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn rebuild_after_the_database_is_deleted_restores_it_from_the_log() {
-        // Arrange: the log sits at the default place beside the database
-        let dir = tempfile::tempdir().unwrap();
-        let database = dir.path().join("liam.db");
-        let before = logged_store(&database, &dir.path().join("liam.log")).await;
-        delete_database(dir.path());
-
-        // Act
-        let (code, out, err) = run_rebuild(&rebuild_of(&database, None)).await;
-
-        // Assert
-        assert_eq!(code, 0, "stderr: {err}");
-        assert!(out.contains("nodes: 2"), "{out}");
-        assert!(out.contains("edges: 1"), "{out}");
-        assert_eq!(before.len(), 3, "two nodes and an edge");
-        assert_eq!(stored_multiset(&database).await, before);
-    }
-
-    #[tokio::test]
-    async fn rebuild_exits_non_zero_when_the_rebuilt_hashes_do_not_match_the_store() {
-        // Arrange: a row only the store knows about, written without the log
-        let dir = tempfile::tempdir().unwrap();
-        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
-        logged_store(&database, &log_dir).await;
-        DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(DIMS))
-            .await
-            .unwrap()
-            .insert(NewNode::now("fact", "label", "unlogged"))
-            .await
-            .unwrap();
-
-        // Act
-        let (code, _out, err) = run_rebuild(&rebuild_of(&database, Some(&log_dir))).await;
-
-        // Assert
-        assert_ne!(code, 0);
-        assert!(err.to_lowercase().contains("mismatch"), "{err}");
     }
 
     #[test]
@@ -691,55 +668,311 @@ mod tests {
         assert!(args.force);
     }
 
-    /// A store whose database also holds a row written without the log.
-    async fn store_with_an_unlogged_row(dir: &Path) -> (PathBuf, PathBuf, Vec<[u8; 32]>) {
-        let (database, log_dir) = (dir.join("liam.db"), dir.join("wal"));
-        let logged = logged_store(&database, &log_dir).await;
+    // ---- running a rebuild against a real store and log ----
+
+    const DIMS: usize = 8;
+
+    fn config() -> Config {
+        Config {
+            embedding_dims: DIMS,
+            ..Config::default()
+        }
+    }
+
+    fn log_at(log_dir: &Path) -> SharedLog {
+        shared_log(open_writer(log_dir).unwrap(), log_dir).unwrap()
+    }
+
+    /// A store written through a real log: two nodes, an edge, and a supersede
+    /// of the first node, which closes it and adds a `supersedes` edge.
+    async fn logged_store(database: &Path, log_dir: &Path) {
+        let store = DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(DIMS))
+            .await
+            .expect("open the store")
+            .with_log(log_at(log_dir))
+            .await
+            .expect("attach the log");
+        let alpha = store
+            .insert(NewNode::now("fact", "label", "alpha"))
+            .await
+            .unwrap();
+        let beta = store
+            .insert(NewNode::now("fact", "label", "beta"))
+            .await
+            .unwrap();
+        store.relate(&alpha, &beta, "mentions").await.unwrap();
+        store
+            .supersede(&alpha, NewNode::now("fact", "label", "alpha two"))
+            .await
+            .unwrap();
+    }
+
+    /// Every column of every node and edge row, in id order, so a restore that
+    /// differs in anything but the hashed fields shows.
+    async fn dump(database: &Path) -> String {
+        let backend = DefaultBackend::open(database.to_str().unwrap(), 1)
+            .await
+            .expect("open the database");
+        let mut dump = String::new();
+        for table in ["nodes", "edges"] {
+            let rows = backend
+                .query(&format!("SELECT * FROM {table} ORDER BY id"), &[])
+                .await
+                .unwrap();
+            dump.push_str(&format!("{rows:?}\n"));
+        }
+        dump
+    }
+
+    /// How many live nodes have no vector.
+    async fn nodes_without_vectors(database: &Path) -> usize {
+        DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(DIMS))
+            .await
+            .expect("open the store")
+            .reembed_missing()
+            .await
+            .unwrap()
+            .pending
+    }
+
+    async fn insert_without_the_log(database: &Path, content: &str) {
         DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(DIMS))
             .await
             .unwrap()
-            .insert(NewNode::now("fact", "label", "unlogged"))
+            .insert(NewNode::now("fact", "label", content))
             .await
             .unwrap();
-        (database, log_dir, logged)
+    }
+
+    /// Deletes the database file and its sidecar files, leaving the log.
+    fn delete_database(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let is_database = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("liam.db"));
+            if is_database && path.is_file() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    /// `rebuild` needs a config file that exists; its content is not read here.
+    fn config_file(dir: &Path) -> PathBuf {
+        let path = dir.join("liam.toml");
+        std::fs::write(&path, "").unwrap();
+        path
+    }
+
+    async fn run_with(
+        args: &RebuildArgs,
+        config_path: &Path,
+        embedder_for: impl FnOnce(&Config) -> anyhow::Result<Arc<dyn ContentEmbedder>>,
+    ) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = rebuild(
+            args,
+            &config(),
+            config_path,
+            embedder_for,
+            &mut out,
+            &mut err,
+        )
+        .await;
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    /// A rebuild with the embedder the config asks for, configured in `dir`.
+    async fn run_rebuild(dir: &Path, args: &RebuildArgs) -> (i32, String, String) {
+        run_with(args, &config_file(dir), store_embedder).await
+    }
+
+    fn rebuild_of(database: &Path, log_dir: Option<&Path>) -> RebuildArgs {
+        RebuildArgs {
+            database: database.to_path_buf(),
+            log_dir: log_dir.map(Path::to_path_buf),
+            force: false,
+        }
+    }
+
+    fn assert_lock_released(database: &Path) {
+        StoreLock::acquire(database).expect("the rebuild must release the store lock");
+    }
+
+    #[tokio::test]
+    async fn rebuild_after_the_database_is_deleted_restores_every_row_from_the_log() {
+        // Arrange: the log sits at the default place beside the database
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        logged_store(&database, &dir.path().join("liam.log")).await;
+        let before = dump(&database).await;
+        delete_database(dir.path());
+
+        // Act
+        let (code, out, err) = run_rebuild(dir.path(), &rebuild_of(&database, None)).await;
+
+        // Assert: the report says what was done and every column is back
+        assert_eq!(code, 0, "stderr: {err}");
+        let lines: Vec<_> = out.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!("config: {}", dir.path().join("liam.toml").display())
+        );
+        assert_eq!(lines[1], "embedder: mock");
+        assert!(lines[2].starts_with("rebuilt "), "{out}");
+        assert_eq!(
+            lines[3..],
+            [
+                "nodes: 2",
+                "edges: 2",
+                "events: 4 applied, 0 voided, 0 quarantined",
+                "embeddings: 2 restored, 0 failed, 0 pending",
+            ],
+            "{out}"
+        );
+        assert_eq!(dump(&database).await, before);
+        assert_eq!(nodes_without_vectors(&database).await, 0);
+        assert_lock_released(&database);
+    }
+
+    #[tokio::test]
+    async fn rebuild_of_a_caught_up_store_changes_nothing_and_repeats_identically() {
+        // Arrange: a store that is exactly what its log says
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        let before = dump(&database).await;
+        let args = rebuild_of(&database, Some(&log_dir));
+
+        // Act
+        let (first_code, first_out, first_err) = run_rebuild(dir.path(), &args).await;
+        let after_first = dump(&database).await;
+        let (second_code, second_out, _) = run_rebuild(dir.path(), &args).await;
+
+        // Assert
+        assert_eq!(first_code, 0, "stderr: {first_err}");
+        assert_eq!(after_first, before);
+        assert_eq!(second_code, 0);
+        assert_eq!(second_out, first_out);
+        assert_eq!(dump(&database).await, before);
     }
 
     #[tokio::test]
     async fn rebuild_names_the_rows_the_log_does_not_record_and_deletes_nothing_without_force() {
-        // Arrange
+        // Arrange: one of the live rows is unlogged
         let dir = tempfile::tempdir().unwrap();
-        let (database, log_dir, _) = store_with_an_unlogged_row(dir.path()).await;
-        let held = stored_multiset(&database).await;
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        insert_without_the_log(&database, "unlogged").await;
+        let held = dump(&database).await;
 
         // Act
-        let (code, out, err) = run_rebuild(&rebuild_of(&database, Some(&log_dir))).await;
+        let (code, out, err) =
+            run_rebuild(dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
 
-        // Assert: one of the four live rows is unlogged, and the database is as it was
+        // Assert: refused, said so, and the database is as it was
         assert_ne!(code, 0);
-        assert!(err.contains("1 of the 4 live rows"), "{err}");
+        assert!(err.to_lowercase().contains("mismatch"), "{err}");
+        assert!(err.contains("1 of the 5 live rows"), "{err}");
         assert!(err.contains("--force"), "{err}");
         assert!(out.is_empty(), "{out}");
-        assert_eq!(stored_multiset(&database).await, held);
+        assert_eq!(dump(&database).await, held);
+        assert_lock_released(&database);
     }
 
     #[tokio::test]
     async fn rebuild_with_force_deletes_the_unlogged_rows_and_keeps_what_the_log_holds() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let (database, log_dir, logged) = store_with_an_unlogged_row(dir.path()).await;
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        let logged = dump(&database).await;
+        insert_without_the_log(&database, "unlogged").await;
         let args = RebuildArgs {
             force: true,
             ..rebuild_of(&database, Some(&log_dir))
         };
 
         // Act
-        let (code, out, err) = run_rebuild(&args).await;
+        let (code, out, err) = run_rebuild(dir.path(), &args).await;
 
         // Assert
         assert_eq!(code, 0, "stderr: {err}");
-        assert!(err.contains("deleting 1 of 4"), "{err}");
+        assert!(err.contains("deleting 1 of 5"), "{err}");
         assert!(out.contains("nodes: 2"), "{out}");
-        assert_eq!(stored_multiset(&database).await, logged);
+        assert_eq!(dump(&database).await, logged);
+    }
+
+    /// A store none of whose rows is live, which the log may not fully record.
+    async fn store_with_only_superseded_rows(dir: &Path) -> (PathBuf, PathBuf, String) {
+        let (database, log_dir) = (dir.join("liam.db"), dir.join("wal"));
+        logged_store(&database, &log_dir).await;
+        let backend = DefaultBackend::open(database.to_str().unwrap(), 1)
+            .await
+            .unwrap();
+        for table in ["nodes", "edges"] {
+            backend
+                .execute(
+                    &format!("UPDATE {table} SET tx_to = 5 WHERE tx_to = {}", FOREVER.0),
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+        let held = dump(&database).await;
+        (database, log_dir, held)
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_a_store_with_only_superseded_rows_without_force() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir, held) = store_with_only_superseded_rows(dir.path()).await;
+
+        // Act
+        let (code, out, err) =
+            run_rebuild(dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
+
+        // Assert
+        assert_ne!(code, 0);
+        assert!(err.contains("superseded"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(dump(&database).await, held);
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_force_replaces_the_superseded_rows_from_the_log() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir, held) = store_with_only_superseded_rows(dir.path()).await;
+        let args = RebuildArgs {
+            force: true,
+            ..rebuild_of(&database, Some(&log_dir))
+        };
+
+        // Act
+        let (code, out, err) = run_rebuild(dir.path(), &args).await;
+
+        // Assert
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(err.contains("replacing superseded rows"), "{err}");
+        assert!(out.contains("nodes: 2"), "{out}");
+        assert_ne!(dump(&database).await, held);
+    }
+
+    #[test]
+    fn a_superseded_only_store_is_forceable_and_explained_in_its_own_terms() {
+        assert!(is_forceable(&StoreError::ProjectionNotEmpty));
+        assert!(force_warning(&StoreError::ProjectionNotEmpty).contains("superseded"));
+        assert!(explain_refusal(StoreError::ProjectionNotEmpty)
+            .to_string()
+            .contains("superseded"));
     }
 
     #[tokio::test]
@@ -750,7 +983,8 @@ mod tests {
         logged_store(&database, &log_dir).await;
 
         // Act
-        let (code, _out, err) = run_rebuild(&rebuild_of(&database, Some(&log_dir))).await;
+        let (code, _out, err) =
+            run_rebuild(dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
 
         // Assert
         assert_eq!(code, 0, "stderr: {err}");
@@ -759,63 +993,370 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_refuses_a_store_a_live_daemon_holds_and_deletes_nothing() {
+    async fn rebuild_refuses_a_store_another_process_holds_and_deletes_nothing() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
         let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
-        let before = logged_store(&database, &log_dir).await;
-        let daemon = liam_daemon::storelock::StoreLock::acquire(&database).expect("take the lock");
+        logged_store(&database, &log_dir).await;
+        let before = dump(&database).await;
+        let holder = StoreLock::acquire(&database).expect("take the lock");
 
         // Act
-        let (code, out, err) = run_rebuild(&rebuild_of(&database, Some(&log_dir))).await;
+        let (code, out, err) =
+            run_rebuild(dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
 
         // Assert
         assert_ne!(code, 0);
         assert!(err.contains("lock"), "{err}");
+        assert!(err.contains("stop liamd, then rerun"), "{err}");
         assert!(out.is_empty(), "{out}");
-        drop(daemon);
-        assert_eq!(stored_multiset(&database).await, before);
+        drop(holder);
+        assert_eq!(dump(&database).await, before);
+    }
+
+    /// Records, while it embeds, whether the store lock was still free.
+    struct LockProbe {
+        database: PathBuf,
+        embedded: AtomicUsize,
+        lock_was_free: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContentEmbedder for LockProbe {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            self.embedded.fetch_add(1, Ordering::SeqCst);
+            if StoreLock::acquire(&self.database).is_ok() {
+                self.lock_was_free.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(vec![0.5; DIMS])
+        }
     }
 
     #[tokio::test]
-    async fn rebuild_refuses_a_missing_log_directory_instead_of_rebuilding_from_nothing() {
-        // Arrange: a populated store and a log path that does not exist
+    async fn rebuild_holds_the_store_lock_while_it_embeds() {
+        // Arrange
         let dir = tempfile::tempdir().unwrap();
         let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
-        let before = logged_store(&database, &log_dir).await;
+        logged_store(&database, &log_dir).await;
+        let probe = Arc::new(LockProbe {
+            database: database.clone(),
+            embedded: AtomicUsize::new(0),
+            lock_was_free: AtomicUsize::new(0),
+        });
+        let injected = Arc::clone(&probe);
+
+        // Act
+        let (code, _out, err) = run_with(
+            &rebuild_of(&database, Some(&log_dir)),
+            &config_file(dir.path()),
+            move |_| Ok(injected),
+        )
+        .await;
+
+        // Assert
+        assert_eq!(code, 0, "stderr: {err}");
+        assert_eq!(probe.embedded.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.lock_was_free.load(Ordering::SeqCst), 0);
+    }
+
+    struct FailingEmbedder;
+
+    #[async_trait]
+    impl ContentEmbedder for FailingEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            Err("no model loaded".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_exits_non_zero_and_names_the_first_reason_when_embeddings_fail() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+
+        // Act
+        let (code, out, err) = run_with(
+            &rebuild_of(&database, Some(&log_dir)),
+            &config_file(dir.path()),
+            |_| Ok(Arc::new(FailingEmbedder)),
+        )
+        .await;
+
+        // Assert: the rows are restored and reported, and the run says it is incomplete
+        assert_eq!(code, 1);
+        assert!(
+            out.contains("embeddings: 0 restored, 2 failed, 0 pending"),
+            "{out}"
+        );
+        assert!(
+            err.contains("2 node embeddings failed (no model loaded)"),
+            "{err}"
+        );
+        assert!(err.contains("rerun"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_before_any_change_when_the_embedder_cannot_be_built() {
+        // Arrange: a store that already has its vectors
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        let args = rebuild_of(&database, Some(&log_dir));
+        assert_eq!(run_rebuild(dir.path(), &args).await.0, 0);
+        let before = dump(&database).await;
+
+        // Act
+        let (code, out, err) = run_with(&args, &config_file(dir.path()), |_| {
+            Err(anyhow::anyhow!("model files are missing"))
+        })
+        .await;
+
+        // Assert: nothing was deleted, vectors included
+        assert_ne!(code, 0);
+        assert!(err.contains("model files are missing"), "{err}");
+        assert!(err.contains("liam fetch-models"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(dump(&database).await, before);
+        assert_eq!(nodes_without_vectors(&database).await, 0);
+    }
+
+    #[cfg(not(feature = "local"))]
+    #[test]
+    fn a_local_embedder_this_build_lacks_is_an_error_not_a_mock() {
+        let mut config = config();
+        config.embedder.provider = "local".to_string();
+
+        assert!(store_embedder(&config).is_err());
+        assert!(store_embedder(&Config::default()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_a_missing_config_file_before_it_touches_anything() {
+        // Arrange: a config path that does not exist, so the built-in mock
+        // embedder would be used
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        let before = dump(&database).await;
+        let missing = dir.path().join("no-such.toml");
+
+        // Act
+        let (code, out, err) = run_with(
+            &rebuild_of(&database, Some(&log_dir)),
+            &missing,
+            store_embedder,
+        )
+        .await;
+
+        // Assert
+        assert_ne!(code, 0);
+        assert!(err.contains("no-such.toml"), "{err}");
+        assert!(err.contains("--config"), "{err}");
+        assert!(err.contains("LIAM_CONFIG"), "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(!dir.path().join("liam.db.lock").exists());
+        assert_eq!(dump(&database).await, before);
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_a_missing_log_directory_and_creates_nothing() {
+        // Arrange: a database path in a directory that does not exist either
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("fresh").join("liam.db");
         let missing = dir.path().join("no-such-log");
 
         // Act
-        let (code, _out, err) = run_rebuild(&rebuild_of(&database, Some(&missing))).await;
+        let (code, _out, err) =
+            run_rebuild(dir.path(), &rebuild_of(&database, Some(&missing))).await;
 
-        // Assert: it fails, creates nothing, and leaves the database alone
+        // Assert
         assert_ne!(code, 0);
         assert!(err.contains("no-such-log"), "{err}");
         assert!(!missing.exists());
-        assert_eq!(stored_multiset(&database).await, before);
+        assert!(!dir.path().join("fresh").exists());
     }
 
     #[tokio::test]
-    async fn rebuild_with_force_still_refuses_to_wipe_a_database_for_another_logs_directory() {
-        // Arrange: a populated store and the directory of a different, empty log
+    async fn rebuild_refuses_a_directory_that_is_not_a_log_and_leaves_it_as_it_was() {
+        // Arrange: a directory with something in it and no log manifest
+        let dir = tempfile::tempdir().unwrap();
+        let (database, plain) = (dir.path().join("liam.db"), dir.path().join("plain"));
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("notes.txt"), "keep").unwrap();
+
+        // Act
+        let (code, _out, err) = run_rebuild(dir.path(), &rebuild_of(&database, Some(&plain))).await;
+
+        // Assert: refused, and neither the directory nor the database was created into
+        assert_ne!(code, 0);
+        assert!(err.contains("not an event log"), "{err}");
+        let names: Vec<_> = std::fs::read_dir(&plain)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["notes.txt"]);
+        assert!(!database.exists());
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_a_log_with_no_records_instead_of_rebuilding_an_empty_store() {
+        // Arrange: a log that was opened and never written to
+        let dir = tempfile::tempdir().unwrap();
+        let (database, empty) = (dir.path().join("liam.db"), dir.path().join("empty-log"));
+        drop(log_at(&empty));
+
+        // Act
+        let (code, out, err) = run_rebuild(dir.path(), &rebuild_of(&database, Some(&empty))).await;
+
+        // Assert
+        assert_ne!(code, 0);
+        assert!(err.contains("no records"), "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(!database.exists());
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_the_store_locked_and_no_database_creates_no_database() {
+        // Arrange: a log to rebuild from, a database that does not exist, and a lock on it
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("wal");
+        logged_store(&dir.path().join("other.db"), &log_dir).await;
+        let database = dir.path().join("liam.db");
+        let _holder = StoreLock::acquire(&database).expect("take the lock");
+
+        // Act
+        let (code, _out, _err) =
+            run_rebuild(dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
+
+        // Assert
+        assert_ne!(code, 0);
+        assert!(!database.exists());
+    }
+
+    /// The command line refuses an empty log before the store sees it, so this
+    /// drives the core to pin what the store's own refusal turns into.
+    #[tokio::test]
+    async fn a_forced_rebuild_from_an_empty_log_deletes_nothing() {
+        // Arrange: rows no log records, and a log with no records
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        insert_without_the_log(&database, "unlogged").await;
+        let before = dump(&database).await;
+        let empty = log_at(&dir.path().join("empty-log"));
+
+        // Act
+        let result = replay_log(
+            &database,
+            DIMS,
+            empty,
+            store_embedder(&config()).unwrap(),
+            true,
+            &mut Vec::new(),
+        )
+        .await;
+
+        // Assert
+        let message = format!("{:#}", result.expect_err("the wipe must be refused"));
+        assert!(message.contains("nothing was changed"), "{message}");
+        assert!(message.contains("log is empty"), "{message}");
+        assert_eq!(dump(&database).await, before);
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_force_still_refuses_to_wipe_a_database_for_another_log() {
+        // Arrange: a populated store and the directory of a different, populated log
         let dir = tempfile::tempdir().unwrap();
         let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
-        let before = logged_store(&database, &log_dir).await;
-        let empty = dir.path().join("empty-log");
-        std::fs::create_dir(&empty).unwrap();
+        logged_store(&database, &log_dir).await;
+        let before = dump(&database).await;
+        let other = dir.path().join("other-log");
+        logged_store(&dir.path().join("other.db"), &other).await;
         let args = RebuildArgs {
             force: true,
-            ..rebuild_of(&database, Some(&empty))
+            ..rebuild_of(&database, Some(&other))
         };
 
         // Act
-        let (code, out, err) = run_rebuild(&args).await;
+        let (code, out, err) = run_rebuild(dir.path(), &args).await;
 
         // Assert: the replacing rebuild is refused and the database is as it was
         assert_ne!(code, 0);
         assert!(err.contains("belongs to log"), "{err}");
         assert!(err.contains("nothing was changed"), "{err}");
         assert!(out.is_empty(), "{out}");
-        assert_eq!(stored_multiset(&database).await, before);
+        assert_eq!(dump(&database).await, before);
+    }
+
+    #[test]
+    fn only_a_failure_after_the_reset_says_the_database_may_hold_a_partial_rebuild() {
+        // Arrange
+        let before_the_reset = [
+            StoreError::EmptyLogWouldWipe {
+                rows_unknown_to_log: 1,
+            },
+            StoreError::CorruptLogState("log_cursor holds the offset -1".into()),
+        ];
+
+        // Act
+        let after_replay = format!(
+            "{:#}",
+            explain_refusal(StoreError::Backend("disk full".into()))
+        );
+        let unverified = format!(
+            "{:#}",
+            explain_refusal(StoreError::RebuildMismatch {
+                against: MismatchSource::Log,
+                expected: 3,
+                found: 2,
+                missing: 1,
+                unexpected: 0,
+            })
+        );
+
+        // Assert
+        for refused in before_the_reset {
+            let message = format!("{:#}", explain_refusal(refused));
+            assert!(message.contains("nothing was changed"), "{message}");
+            assert!(!message.contains("partial"), "{message}");
+        }
+        assert!(after_replay.contains("partial rebuild"), "{after_replay}");
+        assert!(
+            unverified.contains("restore the missing log segments"),
+            "{unverified}"
+        );
+        assert!(!unverified.contains("nothing was changed"), "{unverified}");
+        assert!(!unverified.contains("--force"), "{unverified}");
+    }
+
+    /// A torn final record was never acknowledged, so the log's own open drops it
+    /// and the command has nothing to report: no quarantine, no failure.
+    #[tokio::test]
+    async fn rebuild_drops_a_torn_last_record_without_reporting_it() {
+        // Arrange: the last record of the last segment is cut short
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        let segment = log_dir.join("00000000000000000000.wal");
+        let length = segment.metadata().unwrap().len();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment)
+            .unwrap();
+        file.set_len(length - 5).unwrap();
+        delete_database(dir.path());
+
+        // Act
+        let (code, out, _err) =
+            run_rebuild(dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
+
+        // Assert: the supersede in the torn record is gone, and the run says nothing of it
+        assert_eq!(code, 0);
+        assert!(out.contains("nodes: 2\nedges: 1\n"), "{out}");
+        assert!(
+            out.contains("events: 3 applied, 0 voided, 0 quarantined"),
+            "{out}"
+        );
     }
 }

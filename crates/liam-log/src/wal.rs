@@ -29,7 +29,8 @@ use crate::{LogOffset, LogWriter};
 
 pub(crate) const SEGMENT_EXTENSION: &str = "wal";
 pub(crate) const PARQUET_EXTENSION: &str = "parquet";
-const MANIFEST_NAME: &str = "log.id";
+/// The file that marks a directory as a log: it holds the log's identity.
+pub const MANIFEST_NAME: &str = "log.id";
 const LENGTH_PREFIX_BYTES: usize = 4;
 const CRC_BYTES: usize = 4;
 pub(crate) const HEADER_BYTES: usize = LENGTH_PREFIX_BYTES + 2 * CRC_BYTES;

@@ -18,7 +18,6 @@ mod mcp;
 #[cfg(test)]
 mod retrieval_eval;
 mod synthesis;
-mod telemetry;
 /// Grounding eval for remember/recall/relate; test-only, see the module docs to run each tier.
 #[cfg(test)]
 mod tool_eval;
@@ -26,6 +25,8 @@ mod transport;
 mod tuning;
 
 use std::sync::Arc;
+
+use anyhow::Context;
 
 use liam_store::{DefaultGraph, GraphConfig};
 
@@ -37,8 +38,10 @@ use liam_store::{DefaultGraph, GraphConfig};
 pub use liam_daemon::config;
 
 use config::Config;
-use liam_daemon::models::{build_llm, build_models, resolve_config_path, resolve_path_with_home};
-use liam_daemon::storelock;
+use liam_daemon::models::{
+    build_llm, build_models, export_fastembed_cache_dir, resolve_config_path,
+};
+use liam_daemon::{storelock, telemetry};
 use liam_model::{Embedder, Llm, Reranker};
 use mcp::MemoryServer;
 
@@ -53,26 +56,9 @@ fn main() -> anyhow::Result<()> {
     let config_path = cli.config_path(std::env::var("LIAM_CONFIG").ok().as_deref());
 
     let config = Config::load(config_path.as_ref())?;
-    // Set fastembed's cache dir before the async runtime starts. Mutating the
-    // environment once worker threads exist is a data race on POSIX (and
-    // `unsafe` on edition 2024), so it must happen while single-threaded.
-    // Skipped for the proxy, which loads no model.
-    if mode != cli::Mode::Proxy && config.embedder.provider == "local" {
-        // fastembed does not expand `~`, and no std path API does either, so
-        // passing the configured value through raw creates a directory
-        // literally named `~` under the process's working directory. Under
-        // the launchd job that is `WorkingDirectory`, so models the user
-        // already fetched are invisible and get re-downloaded to the wrong
-        // place. `socket_path` and `database_path` were always expanded; the
-        // two model cache dirs were missed, and the shipped mock defaults hid
-        // it because a mock embedder never reads the cache dir at all.
-        //
-        // This sets the reranker's cache dir via the env var; the embedder
-        // lands under the same directory too, via its own explicit parameter.
-        let home = std::env::var("HOME").unwrap_or_default();
-        let cache_dir =
-            resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
-        std::env::set_var("FASTEMBED_CACHE_DIR", cache_dir);
+    // Before the runtime starts; skipped for the proxy, which loads no model.
+    if mode != cli::Mode::Proxy {
+        export_fastembed_cache_dir(&config)?;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -119,22 +105,12 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
     // Bound to a named variable so it lives for the rest of the process:
     // `let _ = ...` would drop it immediately and release the lock right
     // away. See `storelock` for why this is a real advisory `flock` and not
-    // a PID file, and for the contract the future `liamd proxy` mode (which
-    // opens no store) must follow.
+    // a PID file.
     let database_path = resolve_config_path("database_path", &config.database_path)?;
-    // A fresh install has no ~/.liam yet, and libSQL will not create a parent
-    // directory for the database the way `socket::bind` does for the socket.
-    if let Some(parent) = database_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|source| {
-                anyhow::anyhow!(
-                    "failed to create the database directory {}: {source}",
-                    parent.display()
-                )
-            })?;
-        }
-    }
-    let _lock = storelock::StoreLock::acquire(&database_path)?;
+    let _lock = storelock::StoreLock::acquire(&database_path).context(
+        "liamd needs the store to itself; if the holder is another liamd, `liamd proxy` \
+         shuttles to it and opens no store",
+    )?;
 
     let store = DefaultGraph::open(
         database_path.to_str().unwrap_or(&config.database_path),
