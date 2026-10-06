@@ -11,9 +11,7 @@
 //! fails the open and is never truncated.
 //!
 //! The writer owns rotation so a segment is only ever read by others once it
-//! is closed; callers serialize appends themselves. Segments closed before a
-//! crash are not announced again after a reopen: recovering them is added by
-//! a later change.
+//! is closed; callers serialize appends themselves.
 //!
 //! Known limitation: the time rotation timer is not persisted, so it restarts
 //! on every reopen.
@@ -82,7 +80,7 @@ impl RotationClock for SystemClock {
 /// never reads a segment that is still being appended to.
 ///
 /// A segment closed before a crash is not announced again after a reopen;
-/// recovering those is added by a later change.
+/// `Compactor::recover` finds those by scanning the directory.
 pub trait SegmentSink: Send + Sync {
     fn segment_closed(&self, path: &Path);
 }
@@ -118,8 +116,13 @@ impl FileOps for OsFileOps {
     }
 
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
-        File::open(dir)?.sync_all()
+        sync_dir(dir)
     }
+}
+
+/// Flushes a directory so entries created or removed in it survive a crash.
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 /// Writes `bytes` to a temp file beside `path` and renames it into place, so a
@@ -218,6 +221,12 @@ impl<C: RotationClock> WalWriter<C> {
     fn with_file_ops(mut self, ops: impl FileOps + 'static) -> Self {
         self.ops = Box::new(ops);
         self
+    }
+
+    /// The sequence of the segment being appended to. It stays on the old
+    /// segment when a rotation fails, even if the next file was already created.
+    pub fn open_sequence(&self) -> u64 {
+        self.segment.sequence
     }
 
     /// Delivers a notification to `sink` for every segment closed from now on.
@@ -1601,6 +1610,39 @@ mod tests {
         );
         assert_eq!(fs::read(&foreign).expect("read foreign file"), b"data");
         assert!(sink.received().is_empty());
+    }
+
+    #[test]
+    fn open_sequence_follows_the_segment_appended_to_through_rotation_and_reopen() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let max_bytes = frame_len(&event(0));
+        let mut writer = open(dir.path(), max_bytes, &clock);
+        let fresh = writer.open_sequence();
+        fs::write(dir.path().join(segment_name(1)), b"data").expect("pre-create successor");
+
+        // Act
+        writer
+            .append(&event(0))
+            .expect("append survives failed rotation");
+        let after_failed_rotation = writer.open_sequence();
+        fs::write(dir.path().join(segment_name(1)), b"").expect("empty the successor");
+        writer
+            .append(&event(1))
+            .expect("append retries the rotation");
+        let after_rotation = writer.open_sequence();
+        drop(writer);
+        let reopened = open(dir.path(), LARGE, &clock).open_sequence();
+
+        // Assert
+        assert_eq!(fresh, 0, "fresh log");
+        assert_eq!(
+            after_failed_rotation, 0,
+            "next segment exists but is not adopted"
+        );
+        assert_eq!(after_rotation, 1, "rotation succeeded");
+        assert_eq!(reopened, 1, "reopen adopts the highest segment");
     }
 
     /// A file operation as seen by `RecordingOps`.
