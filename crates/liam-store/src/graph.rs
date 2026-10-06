@@ -15,7 +15,7 @@ use liam_log::event::NodeRow;
 use self::logged_plan::Collision;
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
-pub use self::replay::CatchUp;
+pub use self::replay::CatchUpReport;
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};
@@ -89,7 +89,7 @@ fn edge_refusal(
     }
     // Every guard passes now, so one of them flipped between the insert and
     // this read. A retry would land.
-    Error::RelateRefused("a concurrent write took the row, retry".to_string())
+    Error::ConcurrentWrite
 }
 
 /// The three flags of `EDGE_REFUSAL_DIAGNOSTIC_SQL`'s row: source live, target
@@ -2157,6 +2157,7 @@ mod tests {
     mod log_open;
     mod log_write;
     mod log_write_faults;
+    mod support;
 
     async fn graph_at(t: Millis) -> DefaultGraph {
         let clock = Arc::new(FixedClock::new(t));
@@ -7637,6 +7638,7 @@ mod tests {
         execute_calls: usize,
         /// The `execute_calls` value (before incrementing) that fails.
         fail_on_execute: usize,
+        fail_on_row: Option<String>,
         probe: &'a TxProbe,
     }
 
@@ -7646,7 +7648,12 @@ mod tests {
             let call = self.execute_calls;
             self.execute_calls += 1;
             self.probe.executed.lock().unwrap().push(sql.to_string());
-            if call == self.fail_on_execute {
+            let touches_row = self.fail_on_row.as_deref().is_some_and(|row| {
+                params
+                    .iter()
+                    .any(|param| matches!(param, Value::Text(text) if text == row))
+            });
+            if call == self.fail_on_execute || touches_row {
                 return Err(Error::Backend(
                     "injected mid-transaction failure".to_string(),
                 ));
@@ -7724,6 +7731,9 @@ mod tests {
     struct FailingBackend {
         inner: crate::backends::DefaultBackend,
         fail_on_execute: std::sync::atomic::AtomicUsize,
+        /// Fails the first statement of a transaction that binds this row id,
+        /// whatever its position in the transaction.
+        fail_on_row: std::sync::Mutex<Option<String>>,
         probe: TxProbe,
     }
 
@@ -7731,6 +7741,10 @@ mod tests {
         fn set_fail_on_execute(&self, n: usize) {
             self.fail_on_execute
                 .store(n, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_fail_on_row(&self, row_id: Option<&str>) {
+            *self.fail_on_row.lock().unwrap() = row_id.map(str::to_owned);
         }
 
         fn set_fail_commit(&self, fail: bool) {
@@ -7746,6 +7760,7 @@ mod tests {
             Ok(Self {
                 inner: crate::backends::DefaultBackend::open(path, read_pool_size).await?,
                 fail_on_execute: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                fail_on_row: std::sync::Mutex::new(None),
                 probe: TxProbe::default(),
             })
         }
@@ -7793,6 +7808,7 @@ mod tests {
                 inner,
                 execute_calls: 0,
                 fail_on_execute,
+                fail_on_row: self.fail_on_row.lock().unwrap().clone(),
                 probe: &self.probe,
             }))
         }
@@ -7878,6 +7894,18 @@ mod tests {
         async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
             self.inner.begin().await
         }
+    }
+
+    #[test]
+    fn an_edge_refusal_with_every_guard_passing_is_a_retry_not_a_verdict_on_the_edge() {
+        // Arrange
+        let (src, dst) = (NodeId::new(), NodeId::new());
+
+        // Act
+        let error = edge_refusal(true, true, false, &src, &dst, "mentions");
+
+        // Assert
+        assert!(matches!(error, Error::ConcurrentWrite), "{error:?}");
     }
 
     #[test]

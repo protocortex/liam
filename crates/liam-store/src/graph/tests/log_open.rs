@@ -6,12 +6,13 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 
-use liam_log::dedup::{BloomConfig, HashBloom};
+use liam_log::dedup::BloomConfig;
 use liam_log::wal::{WalConfig, WalWriter};
 use liam_log::{LogOffset, LogWriter};
 use uuid::Uuid;
 
-use super::log_write::{count, cursor, fact_at, share, RecordingLog};
+use super::log_write::RecordingLog;
+use super::support::{count, cursor, fact_at, share, share_sized};
 use super::*;
 use crate::graph::log_cursor::offset_to_values;
 use crate::DefaultGraph;
@@ -436,15 +437,6 @@ impl Backend for Probed {
     }
 }
 
-/// A log whose filter is configured for `config`, as an operator would set it.
-fn sized_log(writer: impl LogWriter + 'static, config: BloomConfig) -> SharedLog {
-    let bloom = HashBloom::new(config);
-    Arc::new(tokio::sync::Mutex::new(EventLog::new(
-        Box::new(writer),
-        bloom,
-    )))
-}
-
 #[tokio::test]
 async fn a_large_index_is_read_in_pages_while_the_filter_is_rebuilt() {
     // Arrange: a filter configured far below the index.
@@ -454,7 +446,7 @@ async fn a_large_index_is_read_in_pages_while_the_filter_is_rebuilt() {
         .unwrap();
     index_hashes(&g, 0..INDEXED_ROWS).await;
     let configured = BloomConfig::new(16, 0.01).unwrap();
-    let log = sized_log(log_with_head(None), configured.clone());
+    let log = share_sized(log_with_head(None), configured.clone());
 
     // Act
     let g = g.with_log(Arc::clone(&log)).await.unwrap();
@@ -481,7 +473,7 @@ async fn a_rebuilt_filter_keeps_absent_hashes_below_the_configured_error_rate() 
     let dir = TempDir::new().unwrap();
     let g = plain(&db_path(&dir)).await;
     index_hashes(&g, 0..INDEXED_ROWS).await;
-    let log = sized_log(log_with_head(None), BloomConfig::new(16, 0.01).unwrap());
+    let log = share_sized(log_with_head(None), BloomConfig::new(16, 0.01).unwrap());
 
     // Act
     let _g = g.with_log(Arc::clone(&log)).await.unwrap();

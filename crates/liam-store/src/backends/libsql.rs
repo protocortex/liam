@@ -77,8 +77,18 @@ pub struct LibsqlBackend {
     next_reader: AtomicUsize,
 }
 
+/// The low byte of an extended result code is the primary code.
+const PRIMARY_CODE_MASK: i32 = 0xff;
+
 fn err(e: libsql::Error) -> Error {
-    Error::Backend(e.to_string())
+    match e {
+        libsql::Error::SqliteFailure(code, message)
+            if code & PRIMARY_CODE_MASK == libsql::ffi::SQLITE_CONSTRAINT =>
+        {
+            Error::Constraint(message)
+        }
+        other => Error::Backend(other.to_string()),
+    }
 }
 
 /// Applies the pragmas that describe connection state rather than database
@@ -428,6 +438,31 @@ mod tests {
     /// `a_configured_read_pool_size_is_honoured_for_a_file_backed_database`)
     /// use their own explicit, meaningful values instead.
     const ARBITRARY_POOL_SIZE: usize = 4;
+
+    #[test]
+    fn a_constraint_failure_is_told_apart_from_a_busy_or_io_failure() {
+        // Arrange: the extended code of a foreign key violation keeps the
+        // primary constraint code in its low byte.
+        let foreign_key = libsql::ffi::SQLITE_CONSTRAINT | (3 << 8);
+        let cases = [
+            (libsql::ffi::SQLITE_CONSTRAINT, true),
+            (foreign_key, true),
+            (libsql::ffi::SQLITE_BUSY, false),
+            (libsql::ffi::SQLITE_IOERR, false),
+        ];
+
+        for (code, is_constraint) in cases {
+            // Act
+            let mapped = err(libsql::Error::SqliteFailure(code, "failed".into()));
+
+            // Assert
+            assert_eq!(
+                matches!(mapped, Error::Constraint(_)),
+                is_constraint,
+                "code {code}: {mapped:?}"
+            );
+        }
+    }
 
     #[test]
     fn can_pool_reads_is_true_only_for_a_plain_filesystem_path() {
