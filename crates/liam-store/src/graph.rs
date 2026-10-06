@@ -15,6 +15,7 @@ use liam_log::event::NodeRow;
 use self::logged_plan::Collision;
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
+pub use self::replay::CatchUp;
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};
@@ -31,6 +32,7 @@ mod log_open;
 mod logged_plan;
 mod logged_write;
 mod projection;
+mod replay;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
 /// one-character handle answers with something a caller can act on instead of
@@ -2151,6 +2153,7 @@ mod tests {
     use tempfile::TempDir;
 
     mod backwards_clock;
+    mod catch_up;
     mod log_open;
     mod log_write;
     mod log_write_faults;

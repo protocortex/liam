@@ -26,6 +26,7 @@ use liam_log::dedup::{
 };
 use liam_log::event::{LogEvent, LogPayload};
 use liam_log::hash::content_hashes;
+use liam_log::reader::LogReader;
 use liam_log::{LogOffset, LogWriter};
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
@@ -55,6 +56,9 @@ pub(super) fn ready<'a>(plan: Result<Plan>) -> BoxFuture<'a, Result<Plan>> {
 /// go with it. Graphs that share one `SharedLog` share all three.
 pub struct EventLog {
     writer: Box<dyn LogWriter>,
+    /// Reads the log back for replay; a log without one cannot be caught up from.
+    #[allow(dead_code)]
+    reader: Option<Arc<dyn LogReader>>,
     bloom: HashBloom,
     /// What the operator asked for, kept apart from `bloom`'s own sizing so a
     /// rebuild that grew the filter does not raise the floor for the next one.
@@ -66,10 +70,17 @@ impl EventLog {
     pub fn new(writer: Box<dyn LogWriter>, bloom: HashBloom) -> Self {
         Self {
             writer,
+            reader: None,
             configured: bloom.config().clone(),
             bloom,
             poisoned: false,
         }
+    }
+
+    /// Names the reader replay scans the log with.
+    pub fn with_reader(mut self, reader: Arc<dyn LogReader>) -> Self {
+        self.reader = Some(reader);
+        self
     }
 
     pub(super) fn log_id(&self) -> Uuid {
