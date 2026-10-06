@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::log_cursor;
 use super::logged_plan::Table;
-use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog};
+use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog, SharedLog};
 use super::projection::{steps_for, Step};
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
@@ -37,6 +37,10 @@ pub struct CatchUpReport {
     pub skipped_voided: usize,
     /// Events the projection refused, recorded in `log_quarantine`.
     pub quarantined: usize,
+    /// Nodes that had no vector and now have one.
+    pub re_embedded: usize,
+    /// Nodes that still have no vector because embedding them failed.
+    pub embed_failed: usize,
 }
 
 /// What became of one record.
@@ -66,12 +70,21 @@ impl<B: Backend> Graph<B> {
     /// writer's last acknowledged record. A refused event is quarantined and
     /// replay goes on past it; a backend error stops replay with the cursor on
     /// the last record that was accounted for, so a retry resumes from there.
-    /// Holds the log lock throughout, as a write does, and refuses a poisoned
-    /// log, whose tail is unknown until the store is reopened.
+    /// Holds the log lock while it replays, as a write does, and refuses a
+    /// poisoned log, whose tail is unknown until the store is reopened. It then
+    /// re-embeds the live nodes with no vector, replayed ones included.
     pub async fn catch_up(&self) -> Result<CatchUpReport> {
         let Some(log) = &self.log else {
             return Ok(CatchUpReport::default());
         };
+        let mut report = self.replay(log).await?;
+        let embedded = self.reembed_missing().await?;
+        report.re_embedded = embedded.re_embedded;
+        report.embed_failed = embedded.failed;
+        Ok(report)
+    }
+
+    async fn replay(&self, log: &SharedLog) -> Result<CatchUpReport> {
         let mut held = HeldLog::acquire(log).await?;
         let cursor = log_cursor::read(&self.backend)
             .await?

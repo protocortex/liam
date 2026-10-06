@@ -15,6 +15,7 @@ use liam_log::event::NodeRow;
 use self::logged_plan::Collision;
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
+pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
 pub use self::replay::CatchUpReport;
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
@@ -32,6 +33,7 @@ mod log_open;
 mod logged_plan;
 mod logged_write;
 mod projection;
+mod reembed;
 mod replay;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
@@ -508,6 +510,7 @@ pub struct Graph<B: Backend> {
     rrf_k: f64,
     expansion_weight: f64,
     log: Option<SharedLog>,
+    embedder: Option<Arc<dyn ContentEmbedder>>,
 }
 
 impl<B: Backend> Graph<B> {
@@ -552,6 +555,7 @@ impl<B: Backend> Graph<B> {
             rrf_k: config.rrf_k,
             expansion_weight: config.expansion_weight,
             log: None,
+            embedder: None,
         })
     }
 
@@ -583,10 +587,14 @@ impl<B: Backend> Graph<B> {
     /// earlier attempt committed the node without.
     async fn store_vector(&self, id: &NodeId, node: &NewNode) -> Result<()> {
         if let Some(embedding) = node.embedding.as_deref() {
-            self.check_dims(embedding)?;
-            self.backend.vector_upsert(id.as_str(), embedding).await?;
+            self.put_vector(id, embedding).await?;
         }
         Ok(())
+    }
+
+    async fn put_vector(&self, id: &NodeId, embedding: &[f32]) -> Result<()> {
+        self.check_dims(embedding)?;
+        self.backend.vector_upsert(id.as_str(), embedding).await
     }
 
     /// Insert, or supersede a competing live node with the same collision
@@ -2157,6 +2165,7 @@ mod tests {
     mod log_open;
     mod log_write;
     mod log_write_faults;
+    mod reembed;
     mod support;
 
     async fn graph_at(t: Millis) -> DefaultGraph {
@@ -6251,6 +6260,9 @@ mod tests {
         ) -> Result<Vec<NodeId>> {
             self.0.vector_search(query, k, kind, scope, as_of).await
         }
+        async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
+            self.0.nodes_missing_vectors().await
+        }
         async fn vector_sweep_orphans(&self) -> Result<u64> {
             self.0.vector_sweep_orphans().await
         }
@@ -7795,6 +7807,9 @@ mod tests {
         ) -> Result<Vec<NodeId>> {
             self.inner.vector_search(query, k, kind, scope, as_of).await
         }
+        async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
+            self.inner.nodes_missing_vectors().await
+        }
         async fn vector_sweep_orphans(&self) -> Result<u64> {
             self.inner.vector_sweep_orphans().await
         }
@@ -7887,6 +7902,9 @@ mod tests {
             as_of: Millis,
         ) -> Result<Vec<NodeId>> {
             self.inner.vector_search(query, k, kind, scope, as_of).await
+        }
+        async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
+            self.inner.nodes_missing_vectors().await
         }
         async fn vector_sweep_orphans(&self) -> Result<u64> {
             self.inner.vector_sweep_orphans().await

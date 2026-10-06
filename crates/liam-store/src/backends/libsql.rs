@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::graph::scope_within;
-use crate::ids::{Millis, NodeId};
+use crate::ids::{Millis, NodeId, FOREVER};
 use crate::value::{Row, Value};
 
 /// Milliseconds a connection waits on `SQLITE_BUSY` before giving up.
@@ -344,6 +344,21 @@ impl Backend for LibsqlBackend {
         let rows = read_rows(rows).await?;
         rows.iter()
             .map(|r| Ok(NodeId::from_raw(r.get_string(0)?)))
+            .collect()
+    }
+
+    async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
+        let rows = self
+            .query(
+                "SELECT n.id FROM nodes n
+                 LEFT JOIN node_vectors v ON v.node_id = n.id
+                 WHERE n.tx_to = ?1 AND v.node_id IS NULL
+                 ORDER BY n.id",
+                &[FOREVER.into()],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| Ok(NodeId::from_raw(row.get_string(0)?)))
             .collect()
     }
 

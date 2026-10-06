@@ -429,6 +429,9 @@ impl Backend for Probed {
     ) -> Result<Vec<NodeId>> {
         self.inner.vector_search(query, k, kind, scope, as_of).await
     }
+    async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
+        self.inner.nodes_missing_vectors().await
+    }
     async fn vector_sweep_orphans(&self) -> Result<u64> {
         self.inner.vector_sweep_orphans().await
     }

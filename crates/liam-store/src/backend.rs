@@ -88,6 +88,11 @@ pub trait Backend: Send + Sync + Sized {
         as_of: Millis,
     ) -> Result<Vec<NodeId>>;
 
+    /// Read. Ids of the live nodes (not superseded or closed) that have no
+    /// stored vector, in id order. Does not serialize with writes or with
+    /// other reads; see the trait's concurrency contract above.
+    async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>>;
+
     /// Write. Remove stored vectors whose node no longer exists (post-GC
     /// cleanup). Serializes with every other write; see the trait's
     /// concurrency contract above.

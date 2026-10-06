@@ -20,7 +20,7 @@ use liam_log::{LogOffset, LogWriter};
 
 use futures_util::StreamExt;
 
-use super::support::{count, cursor, fact, fact_at, offset_pair, shared};
+use super::support::{count, cursor, fact, fact_at, offset_pair, shared, StubEmbedder};
 use super::*;
 use crate::DefaultBackend;
 
@@ -1132,4 +1132,80 @@ async fn catch_up_teaches_the_dedup_filter_the_hashes_of_rows_the_store_already_
     };
     assert_eq!(report, expected);
     assert!(log.lock().await.bloom_might_contain(&hash));
+}
+
+#[tokio::test]
+async fn catch_up_embeds_a_replayed_node_and_does_not_embed_it_again() {
+    // Arrange: a node the log carries without a vector
+    let env = Env::new();
+    env.append(&[node_write("node-a", "alpha")]);
+    let embedder = StubEmbedder::new(8);
+    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    let g = g.with_embedder(embedder.clone());
+
+    // Act
+    let first = g.catch_up().await.unwrap();
+    let second = g.catch_up().await.unwrap();
+
+    // Assert
+    let expected = CatchUpReport {
+        applied: 1,
+        re_embedded: 1,
+        ..CatchUpReport::default()
+    };
+    assert_eq!(first, expected);
+    assert_eq!(second, CatchUpReport::default());
+    assert_eq!(count(&g, "node_vectors").await, 1);
+    assert_eq!(embedder.calls(), ["alpha"]);
+}
+
+#[tokio::test]
+async fn catch_up_reports_a_node_it_could_not_embed_and_still_replays_every_event() {
+    // Arrange
+    let env = Env::new();
+    let offsets = env.append(&[node_write("node-a", "alpha"), node_write("node-b", "beta")]);
+    let embedder = StubEmbedder::new(8);
+    embedder.fail_on(Some("alpha"));
+    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    let g = g.with_embedder(embedder.clone());
+
+    // Act
+    let report = g.catch_up().await.unwrap();
+
+    // Assert
+    let expected = CatchUpReport {
+        applied: 2,
+        re_embedded: 1,
+        embed_failed: 1,
+        ..CatchUpReport::default()
+    };
+    assert_eq!(report, expected);
+    assert_eq!(count(&g, "nodes").await, 2);
+    assert_eq!(
+        cursor_offset(&g).await,
+        offsets.last().map(|o| offset_pair(*o))
+    );
+}
+
+#[tokio::test]
+async fn catch_up_embeds_nodes_replayed_by_an_earlier_run_that_never_got_to_it() {
+    // Arrange: a run that replayed the node with no embedder at hand
+    let env = Env::new();
+    env.append(&[node_write("node-a", "alpha")]);
+    let (first, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    first.catch_up().await.unwrap();
+    drop(first);
+    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    let g = g.with_embedder(StubEmbedder::new(8));
+
+    // Act: nothing is left to replay
+    let report = g.catch_up().await.unwrap();
+
+    // Assert
+    let expected = CatchUpReport {
+        re_embedded: 1,
+        ..CatchUpReport::default()
+    };
+    assert_eq!(report, expected);
+    assert_eq!(count(&g, "node_vectors").await, 1);
 }

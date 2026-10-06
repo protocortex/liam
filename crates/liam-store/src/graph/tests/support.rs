@@ -2,6 +2,8 @@
 //! Helpers the log tests share: a log to hand to a graph, and reads of what the
 //! store holds.
 
+use std::sync::Mutex as StdMutex;
+
 use futures_util::stream;
 use liam_log::dedup::{BloomConfig, HashBloom};
 use liam_log::reader::{LogReader, LogStream};
@@ -19,6 +21,46 @@ impl LogReader for EmptyReader {
 
     fn scan_through(&self, _from: Option<LogOffset>, _through: LogOffset) -> LogStream {
         Box::pin(stream::empty())
+    }
+}
+
+/// An embedder that gives every text the same vector, records what it was
+/// asked to embed, and can be told to fail on one text.
+pub(super) struct StubEmbedder {
+    dims: usize,
+    calls: StdMutex<Vec<String>>,
+    failing_on: StdMutex<Option<String>>,
+}
+
+impl StubEmbedder {
+    pub(super) fn new(dims: usize) -> Arc<Self> {
+        Arc::new(Self {
+            dims,
+            calls: StdMutex::default(),
+            failing_on: StdMutex::default(),
+        })
+    }
+
+    pub(super) fn fail_on(&self, text: Option<&str>) {
+        *self.failing_on.lock().unwrap() = text.map(str::to_owned);
+    }
+
+    /// The texts embedded so far, sorted.
+    pub(super) fn calls(&self) -> Vec<String> {
+        let mut calls = self.calls.lock().unwrap().clone();
+        calls.sort();
+        calls
+    }
+}
+
+#[async_trait::async_trait]
+impl ContentEmbedder for StubEmbedder {
+    async fn embed(&self, text: &str) -> std::result::Result<Vec<f32>, EmbedError> {
+        self.calls.lock().unwrap().push(text.to_owned());
+        if self.failing_on.lock().unwrap().as_deref() == Some(text) {
+            return Err("injected embed failure".into());
+        }
+        Ok(vec![1.0; self.dims])
     }
 }
 
