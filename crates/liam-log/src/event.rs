@@ -42,7 +42,8 @@ pub struct NodeRow {
     pub confidence: f64,
     pub valid_from: i64,
     /// False when the caller left `valid_from` unset and the store filled in a
-    /// default, so dedup hashing can ignore the minted value.
+    /// default, so dedup hashing can ignore the minted value. Backfilled rows
+    /// default to true, because hashing the stored value never dedupes wrongly.
     pub valid_from_supplied: bool,
     pub valid_until: i64,
     pub tx_from: i64,

@@ -4,6 +4,15 @@
 //!
 //! The hash covers what the caller asked to store, never server-minted ids or
 //! timestamps, so the same request always hashes the same.
+//!
+//! A node is SHA-256 over `0x01`, then in this order: `kind`, `label`,
+//! `content`, `producer` (each a u64 LE byte length then the UTF-8 bytes),
+//! `scope` and `subject` (a 0/1 presence byte, then the string when present),
+//! `attributes` (length-prefixed), `valid_from` (a 0/1 presence byte, then
+//! the i64 LE value when present), and `confidence` (the f64 bits as u64 LE,
+//! with -0.0 folded to 0.0 and every NaN folded to one canonical NaN). An edge
+//! is SHA-256 over `0x02`, then `src`, `dst`, and `edge_type`, each
+//! length-prefixed.
 
 use sha2::{Digest, Sha256};
 
@@ -21,6 +30,7 @@ pub struct NodeContent {
     pub subject: Option<String>,
     pub attributes: String,
     pub valid_from: Option<i64>,
+    pub confidence: f64,
 }
 
 /// What an edge write asks to store. An edge is identified by its endpoints
@@ -34,13 +44,32 @@ pub struct EdgeContent {
 
 const NODE_TAG: u8 = 0x01;
 const EDGE_TAG: u8 = 0x02;
+// Quiet NaN with an empty payload, the one bit pattern every NaN folds to.
+const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
 
+// The only place bytes become a hash, so a keyed digest replaces it here.
 fn content_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
 /// Content hash over the canonical encoding of a node write.
+///
+/// The input must be the resolved, normalized row (scope trimmed, attributes
+/// serialized), so the write path should hash through [`node_row_hash`] after
+/// minting rather than call this on raw request values.
 pub fn hash_node(node: &NodeContent) -> [u8; 32] {
+    content_digest(&encode_node(node))
+}
+
+/// Content hash over the canonical encoding of an edge write.
+///
+/// The input must be the resolved row, so the write path should hash through
+/// [`edge_row_hash`] after minting rather than call this on raw request values.
+pub fn hash_edge(edge: &EdgeContent) -> [u8; 32] {
+    content_digest(&encode_edge(edge))
+}
+
+pub(crate) fn encode_node(node: &NodeContent) -> Vec<u8> {
     let mut buf = vec![NODE_TAG];
     put_str(&mut buf, &node.kind);
     put_str(&mut buf, &node.label);
@@ -56,20 +85,20 @@ pub fn hash_node(node: &NodeContent) -> [u8; 32] {
             buf.extend(millis.to_le_bytes());
         }
     }
-    content_digest(&buf)
+    buf.extend(canonical_f64_bits(node.confidence).to_le_bytes());
+    buf
 }
 
-/// Content hash over the canonical encoding of an edge write.
-pub fn hash_edge(edge: &EdgeContent) -> [u8; 32] {
+pub(crate) fn encode_edge(edge: &EdgeContent) -> Vec<u8> {
     let mut buf = vec![EDGE_TAG];
     put_str(&mut buf, &edge.src);
     put_str(&mut buf, &edge.dst);
     put_str(&mut buf, &edge.edge_type);
-    content_digest(&buf)
+    buf
 }
 
 // Length prefixes keep field boundaries unambiguous, so moving bytes between
-// adjacent fields changes the hash.
+// adjacent fields changes the hash. The length counts bytes, not chars.
 fn put_str(buf: &mut Vec<u8>, value: &str) {
     buf.extend((value.len() as u64).to_le_bytes());
     buf.extend(value.as_bytes());
@@ -82,6 +111,18 @@ fn put_opt_str(buf: &mut Vec<u8>, value: Option<&str>) {
             buf.push(1);
             put_str(buf, text);
         }
+    }
+}
+
+// Values that compare equal must hash equal, but -0.0 and 0.0 differ in bits
+// and NaN payloads vary by producer.
+fn canonical_f64_bits(value: f64) -> u64 {
+    if value.is_nan() {
+        CANONICAL_NAN_BITS
+    } else if value == 0.0 {
+        0.0_f64.to_bits()
+    } else {
+        value.to_bits()
     }
 }
 
@@ -103,6 +144,7 @@ pub fn content_hashes(event: &LogEvent) -> Vec<([u8; 32], String)> {
     }
 }
 
+/// Hash of the node a resolved row stores, ignoring ids and transaction times.
 pub fn node_row_hash(row: &NodeRow) -> [u8; 32] {
     hash_node(&NodeContent {
         kind: row.kind.clone(),
@@ -113,9 +155,11 @@ pub fn node_row_hash(row: &NodeRow) -> [u8; 32] {
         subject: row.subject.clone(),
         attributes: row.attributes.clone(),
         valid_from: row.valid_from_supplied.then_some(row.valid_from),
+        confidence: row.confidence,
     })
 }
 
+/// Hash of the edge a resolved row stores, ignoring ids, attributes, and times.
 pub fn edge_row_hash(row: &EdgeRow) -> [u8; 32] {
     hash_edge(&EdgeContent {
         src: row.src.clone(),
@@ -129,9 +173,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-
-    const NODE_TAG: u8 = 0x01;
-    const EDGE_TAG: u8 = 0x02;
+    use crate::event::{TombstoneTable, TombstoneTarget, CURRENT_SCHEMA_VERSION};
 
     fn node() -> NodeContent {
         NodeContent {
@@ -143,6 +185,52 @@ mod tests {
             subject: None,
             attributes: "{}".into(),
             valid_from: None,
+            confidence: 0.75,
+        }
+    }
+
+    fn node_row() -> NodeRow {
+        NodeRow {
+            id: "node-1".into(),
+            kind: "fact".into(),
+            label: "label".into(),
+            content: "content".into(),
+            producer: "agent-a".into(),
+            attributes: "{}".into(),
+            scope: Some("proj/a".into()),
+            subject: None,
+            confidence: 0.75,
+            valid_from: 1_000,
+            valid_from_supplied: true,
+            valid_until: 4_102_444_800_000,
+            tx_from: 2_000,
+            tx_to: 4_102_444_800_000,
+        }
+    }
+
+    fn edge_row() -> EdgeRow {
+        EdgeRow {
+            id: "edge-1".into(),
+            src: "node-1".into(),
+            dst: "node-2".into(),
+            edge_type: "relates_to".into(),
+            attributes: "{}".into(),
+            tx_from: 2_000,
+            tx_to: 4_102_444_800_000,
+        }
+    }
+
+    fn event_with(payload: LogPayload) -> LogEvent {
+        LogEvent {
+            event_id: "event-1".into(),
+            content_hash: [0; 32],
+            source: "agent-a".into(),
+            trust_score: 0.9,
+            observed_at: 1_000,
+            ingested_at: 2_000,
+            encryption_key_id: None,
+            schema_version: CURRENT_SCHEMA_VERSION,
+            payload,
         }
     }
 
@@ -159,7 +247,8 @@ mod tests {
     }
 
     // Independent of the production encoder on purpose: strings are a u64 LE
-    // length then bytes, options are a 0/1 presence byte then the value.
+    // length then bytes, options are a 0/1 presence byte then the value, and a
+    // float is its bits as u64 LE with -0.0 and every NaN folded to one pattern.
     fn put_str(buf: &mut Vec<u8>, value: &str) {
         buf.extend((value.len() as u64).to_le_bytes());
         buf.extend(value.as_bytes());
@@ -191,6 +280,14 @@ mod tests {
                 buf.extend(millis.to_le_bytes());
             }
         }
+        let bits = if node.confidence.is_nan() {
+            0x7ff8_0000_0000_0000
+        } else if node.confidence == 0.0 {
+            0
+        } else {
+            node.confidence.to_bits()
+        };
+        buf.extend(bits.to_le_bytes());
         buf
     }
 
@@ -324,6 +421,13 @@ mod tests {
                     ..node()
                 },
             ),
+            (
+                "confidence",
+                NodeContent {
+                    confidence: 0.9,
+                    ..node()
+                },
+            ),
         ];
         let baseline = hash_node(&node());
 
@@ -400,6 +504,11 @@ mod tests {
                 subject: Some(String::new()),
                 ..node()
             },
+            NodeContent {
+                label: "café".into(),
+                content: "日本".into(),
+                ..node()
+            },
         ]
         .into_iter()
         .chain(
@@ -409,6 +518,22 @@ mod tests {
                     valid_from: Some(millis),
                     ..node()
                 }),
+        )
+        .chain(
+            [
+                0.0,
+                -0.0,
+                0.3,
+                1.0,
+                f64::NAN,
+                f64::INFINITY,
+                f64::MIN_POSITIVE,
+            ]
+            .into_iter()
+            .map(|confidence| NodeContent {
+                confidence,
+                ..node()
+            }),
         );
 
         for case in cases {
@@ -418,6 +543,72 @@ mod tests {
             // Assert
             assert_eq!(hex(&actual), hex(&reference_node_hash(&case)));
         }
+    }
+
+    // Hand-written from the encoding in the module doc, not produced by any
+    // encoder. The domain tag is prepended separately where it is checked.
+    #[rustfmt::skip]
+    const NODE_PREIMAGE: [u8; 90] = [
+        0x04, 0, 0, 0, 0, 0, 0, 0, b'f', b'a', b'c', b't',                      // kind
+        0x05, 0, 0, 0, 0, 0, 0, 0, b'l', b'a', b'b', b'e', b'l',                // label
+        0x07, 0, 0, 0, 0, 0, 0, 0, b'c', b'o', b'n', b't', b'e', b'n', b't',    // content
+        0x07, 0, 0, 0, 0, 0, 0, 0, b'a', b'g', b'e', b'n', b't', b'-', b'a',    // producer
+        0x01, 0x06, 0, 0, 0, 0, 0, 0, 0, b'p', b'r', b'o', b'j', b'/', b'a',    // scope: present, then value
+        0x00,                                                                   // subject: absent
+        0x02, 0, 0, 0, 0, 0, 0, 0, b'{', b'}',                                  // attributes
+        0x00,                                                                   // valid_from: absent
+        0, 0, 0, 0, 0, 0, 0xe8, 0x3f,                                           // confidence 0.75 = 0x3fe8000000000000, LE
+    ];
+
+    #[rustfmt::skip]
+    const EDGE_PREIMAGE: [u8; 46] = [
+        0x06, 0, 0, 0, 0, 0, 0, 0, b'n', b'o', b'd', b'e', b'-', b'1',          // src
+        0x06, 0, 0, 0, 0, 0, 0, 0, b'n', b'o', b'd', b'e', b'-', b'2',          // dst
+        0x0a, 0, 0, 0, 0, 0, 0, 0, b'r', b'e', b'l', b'a', b't', b'e', b's', b'_', b't', b'o', // edge_type
+    ];
+
+    #[test]
+    fn the_reference_encoder_produces_the_hand_written_preimages() {
+        // Arrange
+        let (node_content, edge_content) = (node(), edge());
+
+        // Act
+        let (node_bytes, edge_bytes) = (
+            untagged_node_bytes(&node_content),
+            untagged_edge_bytes(&edge_content),
+        );
+
+        // Assert
+        assert_eq!(node_bytes, NODE_PREIMAGE);
+        assert_eq!(edge_bytes, EDGE_PREIMAGE);
+    }
+
+    #[test]
+    fn the_production_encoders_prepend_the_domain_tag_to_the_preimage() {
+        // Arrange
+        let (node_content, edge_content) = (node(), edge());
+
+        // Act
+        let (node_bytes, edge_bytes) = (encode_node(&node_content), encode_edge(&edge_content));
+
+        // Assert
+        assert_eq!(node_bytes[0], 0x01);
+        assert_eq!(node_bytes[1..], NODE_PREIMAGE);
+        assert_eq!(edge_bytes[0], 0x02);
+        assert_eq!(edge_bytes[1..], EDGE_PREIMAGE);
+    }
+
+    #[test]
+    fn hashes_are_the_digest_of_the_tagged_encoding() {
+        // Arrange
+        let (node_content, edge_content) = (node(), edge());
+
+        // Act
+        let (node_hash, edge_hash) = (hash_node(&node_content), hash_edge(&edge_content));
+
+        // Assert
+        assert_eq!(node_hash, content_digest(&encode_node(&node_content)));
+        assert_eq!(edge_hash, content_digest(&encode_edge(&edge_content)));
     }
 
     #[test]
@@ -434,14 +625,38 @@ mod tests {
             (hash_node(&without_valid_from), hash_node(&with_valid_from));
 
         // Assert
+        // printf '0104000000000000006661637405000000000000006c6162656c0700000000000000636f6e74656e7407000000000000006167656e742d6101060000000000000070726f6a2f610002000000000000007b7d00000000000000e83f' | xxd -r -p | shasum -a 256
         assert_eq!(
             hex(&without_hash),
-            "0e3c88bf660ca305d4608bc04f319bc2438485edb4d4fd1f2f9b0b1f0573db3f"
+            "162bc09dda6f46f80c0089a37fefb319033eb2e221e56e8861d0312768e65c28"
         );
+        // printf '0104000000000000006661637405000000000000006c6162656c0700000000000000636f6e74656e7407000000000000006167656e742d6101060000000000000070726f6a2f610002000000000000007b7d01e803000000000000000000000000e83f' | xxd -r -p | shasum -a 256
         assert_eq!(
             hex(&with_hash),
-            "0af6cff7266fa614de625cb976cca8c45707052624be0ec2e085f8e38f6ac7cd"
+            "b7fd1c61e0f751207bd9a17ee6d625feab2671a7937c3a23276de8e9ceae3c03"
         );
+    }
+
+    #[test]
+    fn a_non_ascii_node_hash_counts_bytes_and_is_pinned() {
+        // Arrange
+        let content = NodeContent {
+            label: "café".into(),
+            content: "日本".into(),
+            ..node()
+        };
+
+        // Act
+        let actual = hash_node(&content);
+
+        // Assert
+        // "café" is 5 bytes and "日本" is 6, so the prefixes are 5 and 6, not 4 and 2.
+        // printf '010400000000000000666163740500000000000000636166c3a90600000000000000e697a5e69cac07000000000000006167656e742d6101060000000000000070726f6a2f610002000000000000007b7d00000000000000e83f' | xxd -r -p | shasum -a 256
+        assert_eq!(
+            hex(&actual),
+            "851c615a586d199524ea6f9179a2b9a3f9f1935145b6b7a534b79665b1b2a46b"
+        );
+        assert_eq!(hex(&actual), hex(&reference_node_hash(&content)));
     }
 
     #[test]
@@ -482,6 +697,14 @@ mod tests {
                     ..edge()
                 },
             ),
+            (
+                "src and dst swapped",
+                EdgeContent {
+                    src: "node-2".into(),
+                    dst: "node-1".into(),
+                    ..edge()
+                },
+            ),
         ];
         let baseline = hash_edge(&edge());
 
@@ -507,6 +730,7 @@ mod tests {
 
         // Assert
         assert_eq!(hex(&actual), hex(&reference_edge_hash(&content)));
+        // printf '0206000000000000006e6f64652d3106000000000000006e6f64652d320a0000000000000072656c617465735f746f' | xxd -r -p | shasum -a 256
         assert_eq!(
             hex(&actual),
             "c7de35063da038bb463a5130d216206caafb73b2fd2881b56d901a7c0374683b"
@@ -553,19 +777,9 @@ mod tests {
     }
 
     #[test]
-    fn the_domain_tag_is_part_of_what_each_hash_covers() {
-        // Arrange
-        let edge_content = edge();
-        let untagged = untagged_edge_bytes(&edge_content);
-
-        // Act
-        let actual = hash_edge(&edge_content);
-
+    fn node_and_edge_domain_tags_are_distinct() {
         // Assert
         assert_ne!(NODE_TAG, EDGE_TAG);
-        assert_eq!(actual, tagged_digest(EDGE_TAG, &untagged));
-        assert_ne!(actual, tagged_digest(NODE_TAG, &untagged));
-        assert_ne!(actual, content_digest(&untagged));
     }
 
     #[test]
@@ -756,5 +970,305 @@ mod tests {
 
         // Assert
         assert_ne!(early_hash, late_hash);
+    }
+
+    #[test]
+    fn confidence_changes_the_node_hash() {
+        // Arrange
+        let low = NodeContent {
+            confidence: 0.3,
+            ..node()
+        };
+        let high = NodeContent {
+            confidence: 0.9,
+            ..node()
+        };
+
+        // Act
+        let (low_hash, high_hash) = (hash_node(&low), hash_node(&high));
+
+        // Assert
+        assert_ne!(low_hash, high_hash);
+    }
+
+    #[test]
+    fn negative_and_positive_zero_confidence_hash_equal() {
+        // Arrange
+        let negative = NodeContent {
+            confidence: -0.0,
+            ..node()
+        };
+        let positive = NodeContent {
+            confidence: 0.0,
+            ..node()
+        };
+
+        // Act
+        let (negative_hash, positive_hash) = (hash_node(&negative), hash_node(&positive));
+
+        // Assert
+        assert_eq!(negative_hash, positive_hash);
+    }
+
+    #[test]
+    fn nan_confidences_with_different_payloads_hash_equal() {
+        // Arrange
+        let payloads = [
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            f64::from_bits(0xfff8_0000_0000_0000),
+            f64::from_bits(0x7ff0_0000_0000_0001),
+        ];
+
+        // Act
+        let hashes: Vec<[u8; 32]> = payloads
+            .iter()
+            .map(|confidence| {
+                assert!(confidence.is_nan());
+                hash_node(&NodeContent {
+                    confidence: *confidence,
+                    ..node()
+                })
+            })
+            .collect();
+
+        // Assert
+        assert!(hashes.windows(2).all(|pair| pair[0] == pair[1]));
+        let zero = hash_node(&NodeContent {
+            confidence: 0.0,
+            ..node()
+        });
+        assert_ne!(hashes[0], zero);
+    }
+
+    #[test]
+    fn edge_hash_matches_the_reference_for_a_non_ascii_source() {
+        // Arrange
+        let content = EdgeContent {
+            src: "nœud-1".into(),
+            ..edge()
+        };
+
+        // Act
+        let actual = hash_edge(&content);
+
+        // Assert
+        // "nœud-1" is 7 bytes but 6 chars, so the prefix proves bytes are counted.
+        // printf '0207000000000000006ec59375642d3106000000000000006e6f64652d320a0000000000000072656c617465735f746f' | xxd -r -p | shasum -a 256
+        assert_eq!(
+            hex(&actual),
+            "9374fbc209f33bd94a53eff7050290533f4f9f5a42d3c32db776f3cccd0263e4"
+        );
+        assert_eq!(hex(&actual), hex(&reference_edge_hash(&content)));
+    }
+
+    #[test]
+    fn node_row_hash_without_a_supplied_valid_from_ignores_it() {
+        // Arrange
+        let row = NodeRow {
+            valid_from_supplied: false,
+            valid_from: 12_345,
+            ..node_row()
+        };
+        let expected = hash_node(&node());
+
+        // Act
+        let actual = node_row_hash(&row);
+
+        // Assert
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn node_row_hash_with_a_supplied_valid_from_covers_it() {
+        // Arrange
+        let expected = hash_node(&NodeContent {
+            valid_from: Some(1_000),
+            ..node()
+        });
+
+        // Act
+        let actual = node_row_hash(&node_row());
+
+        // Assert
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn node_row_hash_covers_the_row_confidence() {
+        // Arrange
+        let row = NodeRow {
+            confidence: 0.1,
+            ..node_row()
+        };
+        let expected = hash_node(&NodeContent {
+            valid_from: Some(1_000),
+            confidence: 0.1,
+            ..node()
+        });
+
+        // Act
+        let actual = node_row_hash(&row);
+
+        // Assert
+        assert_eq!(actual, expected);
+        assert_ne!(actual, node_row_hash(&node_row()));
+    }
+
+    #[test]
+    fn node_row_hash_ignores_id_valid_until_and_transaction_times() {
+        // Arrange
+        let other = NodeRow {
+            id: "node-99".into(),
+            valid_until: 5_000,
+            tx_from: 3_000,
+            tx_to: 4_000,
+            ..node_row()
+        };
+
+        // Act
+        let (base_hash, other_hash) = (node_row_hash(&node_row()), node_row_hash(&other));
+
+        // Assert
+        assert_eq!(base_hash, other_hash);
+    }
+
+    #[test]
+    fn node_row_hash_distinguishes_scope_from_subject() {
+        // Arrange
+        let scoped = NodeRow {
+            scope: Some("x".into()),
+            subject: None,
+            ..node_row()
+        };
+        let subjected = NodeRow {
+            scope: None,
+            subject: Some("x".into()),
+            ..node_row()
+        };
+
+        // Act
+        let (scoped_hash, subjected_hash) = (node_row_hash(&scoped), node_row_hash(&subjected));
+
+        // Assert
+        assert_ne!(scoped_hash, subjected_hash);
+    }
+
+    #[test]
+    fn node_row_hash_golden_value_is_pinned() {
+        // Arrange
+        let row = NodeRow {
+            subject: Some("user-1".into()),
+            valid_from_supplied: false,
+            ..node_row()
+        };
+
+        // Act
+        let actual = node_row_hash(&row);
+
+        // Assert
+        // printf '0104000000000000006661637405000000000000006c6162656c0700000000000000636f6e74656e7407000000000000006167656e742d6101060000000000000070726f6a2f61010600000000000000757365722d3102000000000000007b7d00000000000000e83f' | xxd -r -p | shasum -a 256
+        assert_eq!(
+            hex(&actual),
+            "ae43f1b3aa5c0c698b9bf595271bd7b737c6bc58fa75e75405222c6713fc4d96"
+        );
+    }
+
+    #[test]
+    fn edge_row_hash_ignores_id_attributes_and_transaction_times() {
+        // Arrange
+        let other = EdgeRow {
+            id: "edge-99".into(),
+            attributes: "{\"w\":1}".into(),
+            tx_from: 3_000,
+            tx_to: 4_000,
+            ..edge_row()
+        };
+        let expected = hash_edge(&edge());
+
+        // Act
+        let (base_hash, other_hash) = (edge_row_hash(&edge_row()), edge_row_hash(&other));
+
+        // Assert
+        assert_eq!(base_hash, other_hash);
+        assert_eq!(base_hash, expected);
+    }
+
+    #[test]
+    fn content_hashes_lists_each_episode_batch_row_in_order() {
+        // Arrange
+        let first = node_row();
+        let second = EdgeRow {
+            id: "edge-b".into(),
+            ..edge_row()
+        };
+        let third = NodeRow {
+            id: "node-c".into(),
+            label: "other".into(),
+            ..node_row()
+        };
+        let event = event_with(LogPayload::EpisodeBatch(vec![
+            RowEffect::Node(first.clone()),
+            RowEffect::Edge(second.clone()),
+            RowEffect::Node(third.clone()),
+        ]));
+
+        // Act
+        let actual = content_hashes(&event);
+
+        // Assert
+        assert_eq!(
+            actual,
+            vec![
+                (node_row_hash(&first), "node-1".to_string()),
+                (edge_row_hash(&second), "edge-b".to_string()),
+                (node_row_hash(&third), "node-c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn content_hashes_pairs_a_single_row_write_with_its_id() {
+        // Arrange
+        let node_event = event_with(LogPayload::NodeWrite(node_row()));
+        let edge_event = event_with(LogPayload::EdgeWrite(edge_row()));
+
+        // Act
+        let (node_hashes, edge_hashes) = (content_hashes(&node_event), content_hashes(&edge_event));
+
+        // Assert
+        assert_eq!(
+            node_hashes,
+            vec![(node_row_hash(&node_row()), "node-1".to_string())]
+        );
+        assert_eq!(
+            edge_hashes,
+            vec![(edge_row_hash(&edge_row()), "edge-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn content_hashes_is_empty_for_payloads_that_store_no_row() {
+        // Arrange
+        let payloads = [
+            LogPayload::Tombstone(vec![TombstoneTarget {
+                table: TombstoneTable::Nodes,
+                id: "node-1".into(),
+            }]),
+            LogPayload::DuplicateOf {
+                first_event_id: "event-0".into(),
+            },
+            LogPayload::Voided {
+                target_event_id: "event-0".into(),
+            },
+        ];
+
+        for payload in payloads {
+            // Act
+            let hashes = content_hashes(&event_with(payload));
+
+            // Assert
+            assert!(hashes.is_empty());
+        }
     }
 }
