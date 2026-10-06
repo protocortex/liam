@@ -8,6 +8,7 @@
 
 pub mod dedup;
 pub mod event;
+pub mod filter_file;
 pub mod hash;
 pub mod wal;
 

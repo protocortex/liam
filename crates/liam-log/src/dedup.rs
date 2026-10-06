@@ -137,7 +137,7 @@ pub async fn find_first_write<P: PreCheck + ?Sized, I: HashIndex + ?Sized>(
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HashBloom {
-    filter: BloomFilter,
+    pub(crate) filter: BloomFilter,
 }
 
 impl HashBloom {

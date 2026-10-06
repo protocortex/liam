@@ -1430,6 +1430,7 @@ dependencies = [
  "foldhash",
  "libm",
  "portable-atomic",
+ "serde",
  "siphasher",
 ]
 
@@ -3554,6 +3555,9 @@ name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "portable-atomic-util"
@@ -4408,6 +4412,9 @@ name = "siphasher"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "slab"
