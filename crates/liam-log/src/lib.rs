@@ -254,13 +254,15 @@ pub mod test_support {
 
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use std::future::Future;
-    use std::path::Path;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
 
     use object_store::local::LocalFileSystem;
     use sha2::{Digest, Sha256};
 
-    use crate::compactor::{write_parquet, Compactor};
+    use crate::compactor::{parquet_name, write_parquet, Compactor};
     use crate::dedup::{BloomConfig, HashBloom};
     use crate::event::{
         EdgeRow, LogEvent, LogPayload, NodeRow, TombstoneTable, TombstoneTarget,
@@ -348,13 +350,27 @@ pub(crate) mod fixtures {
         (crate::wal::HEADER_BYTES + event.encode().expect("encode event").len()) as u64
     }
 
-    /// Runs `future` to completion, so a synchronous test can drive the async
-    /// compactor and object store.
-    pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("tokio runtime")
-            .block_on(future)
+    pub(crate) fn wal_path(dir: &Path, sequence: u64) -> PathBuf {
+        dir.join(segment_name(sequence))
+    }
+
+    pub(crate) fn parquet_path(dir: &Path, sequence: u64) -> PathBuf {
+        dir.join(parquet_name(sequence))
+    }
+
+    /// Every entry of `dir` with its bytes and modification time, so a test can
+    /// tell a rewrite that restores the same bytes from no write at all.
+    pub(crate) fn snapshot(dir: &Path) -> BTreeMap<String, (Vec<u8>, SystemTime)> {
+        fs::read_dir(dir)
+            .expect("list dir")
+            .map(|entry| {
+                let entry = entry.expect("dir entry");
+                let modified = entry.metadata().and_then(|meta| meta.modified());
+                let bytes = fs::read(entry.path()).unwrap_or_default();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (name, (bytes, modified.expect("mtime")))
+            })
+            .collect()
     }
 
     /// Rotates after `events_per_segment` fixture events and never on time.
@@ -385,18 +401,20 @@ pub(crate) mod fixtures {
     }
 
     /// Compacts each named closed segment into Parquet and removes its WAL file.
-    pub(crate) fn compact_segments(dir: &Path, sequences: &[u64]) {
+    pub(crate) async fn compact_segments(dir: &Path, sequences: &[u64]) {
         let compactor = Compactor::local(dir).expect("compactor");
         for sequence in sequences {
-            block_on(compactor.compact_segment(&dir.join(segment_name(*sequence))))
-                .expect("compact segment");
+            let compacted = compactor.compact_segment(&wal_path(dir, *sequence)).await;
+            compacted.expect("compact segment");
         }
     }
 
     /// Writes the Parquet object for `sequence` holding exactly `events`.
-    pub(crate) fn put_parquet(dir: &Path, sequence: u64, events: &[LogEvent]) {
+    pub(crate) async fn put_parquet(dir: &Path, sequence: u64, events: &[LogEvent]) {
         let store = LocalFileSystem::new_with_prefix(dir).expect("local store");
-        block_on(write_parquet(&store, sequence, events)).expect("write parquet");
+        write_parquet(&store, sequence, events)
+            .await
+            .expect("write parquet");
     }
 
     pub(crate) fn sample_hash(index: u32) -> [u8; 32] {
