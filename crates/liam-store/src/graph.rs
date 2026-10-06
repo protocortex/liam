@@ -212,16 +212,41 @@ pub(crate) fn scope_within(col: &str, n: usize) -> String {
 }
 
 /// SQL + params for "the live node with this subject (and scope, and
-/// producer if given), if any." Run against the write's open transaction by
-/// every write that replaces a competitor, so it sees the rows the transaction
-/// holds.
+/// producer if given), if any" as of `as_of`. For reads: a write replaces the
+/// row `open_by_subject_query` finds, whatever its clock reads.
 fn live_by_subject_query(
     subject: &str,
-    now: Millis,
+    as_of: Millis,
     scope: Option<&str>,
     producer: Option<&str>,
 ) -> (String, Vec<Value>) {
-    let mut params: Vec<Value> = vec![subject.into(), now.into()];
+    by_subject_query(subject, &live_at("nodes", 2), as_of.into(), scope, producer)
+}
+
+/// SQL + params for "the open node with this subject (and scope, and producer
+/// if given), if any", as `(id, tx_from)`. Run against a write's open
+/// transaction by every write that replaces a competitor. Open means
+/// `tx_to = FOREVER`, the row the close step can end, so it is a fact about the
+/// store and never about the caller's clock. Valid time is not tested: it is
+/// the world's time, and every write stamps `valid_until` as `FOREVER`.
+fn open_by_subject_query(
+    subject: &str,
+    scope: Option<&str>,
+    producer: Option<&str>,
+) -> (String, Vec<Value>) {
+    by_subject_query(subject, "nodes.tx_to = ?2", FOREVER.into(), scope, producer)
+}
+
+/// The shared collision key of both subject queries: `liveness` is the
+/// predicate over `nodes` bound to `?2`, which is `liveness_param`.
+fn by_subject_query(
+    subject: &str,
+    liveness: &str,
+    liveness_param: Value,
+    scope: Option<&str>,
+    producer: Option<&str>,
+) -> (String, Vec<Value>) {
+    let mut params: Vec<Value> = vec![subject.into(), liveness_param];
     let mut filters = String::new();
     let mut next = 3;
     if let Some(s) = scope {
@@ -240,17 +265,17 @@ fn live_by_subject_query(
         // happens to share the same subject and scope.
         filters.push_str(" AND content = ''");
     }
-    // If two live nodes ever share a subject+scope, supersede the newest
+    // If two nodes ever share a subject+scope, pick the newest
     // deterministically (tie-break by id) rather than an arbitrary row.
     let sql = format!(
-        "SELECT id FROM nodes WHERE subject = ?1 AND {live}{filters}
+        "SELECT id, tx_from FROM nodes WHERE subject = ?1 AND {liveness}{filters}
          ORDER BY tx_from DESC, id DESC LIMIT 1",
-        live = live_at("nodes", 2),
     );
     (sql, params)
 }
 
 /// SQL + params for "is this node live at `as_of`".
+#[cfg(test)]
 fn live_as_of_query(id: &str, as_of: Millis) -> (String, Vec<Value>) {
     let sql = format!(
         "SELECT 1 FROM nodes WHERE id = ?1 AND {live}",
@@ -259,7 +284,16 @@ fn live_as_of_query(id: &str, as_of: Millis) -> (String, Vec<Value>) {
     (sql, vec![id.into(), as_of.into()])
 }
 
-/// A node's own collision key for `live_by_subject_query`: entity pages collide
+/// SQL + params for the `tx_from` of the node `id` if it is open, which is the
+/// row a supersede of `id` can close.
+fn open_node_query(id: &str) -> (&'static str, Vec<Value>) {
+    (
+        "SELECT tx_from FROM nodes WHERE id = ?1 AND tx_to = ?2",
+        vec![id.into(), FOREVER.into()],
+    )
+}
+
+/// A node's own collision key for the subject queries: entity pages collide
 /// on `(subject, scope)` alone, everything else also keys on `producer`.
 fn collision_producer(node: &NewNode) -> Option<&str> {
     if node.entity_page {
@@ -283,7 +317,7 @@ const MAX_SCOPE_CHARS: usize = 200;
 /// trailing `/` or an empty segment (`//`). `/` separates hierarchy
 /// segments: reads (`lexical`/`fetch_candidates`/`vector_search`) match a
 /// scope plus every descendant, while write-side collision detection
-/// (`live_by_subject_query`) stays exact-match. Called at every
+/// (`open_by_subject_query`) stays exact-match. Called at every
 /// write entry point that accepts a `scope` (`insert`, `upsert_by`,
 /// `supersede`, `ingest_episode`), from the read path (`query_core`), and
 /// from `migrate::normalize_scope_column` to flag data written before this
@@ -2103,6 +2137,7 @@ mod tests {
     use crate::DefaultGraph;
     use tempfile::TempDir;
 
+    mod backwards_clock;
     mod log_write;
     mod log_write_faults;
 
@@ -6994,7 +7029,7 @@ mod tests {
         // Arrange: a live node under a trimmed scope, then an episode whose
         // node names the same scope with trailing whitespace, mirroring
         // `upsert_by_normalizes_scope_before_finding_live_competitor` but
-        // through `ingest_episode`'s own `live_by_subject_query` path.
+        // through `ingest_episode`'s own `open_by_subject_query` path.
         let clock = Arc::new(FixedClock::new(Millis(1000)));
         let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
             .await
