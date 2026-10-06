@@ -61,6 +61,23 @@ pub enum Error {
     /// refuses logged writes until it is reopened.
     #[error("a logged write is not reconciled with the log; reopen the store")]
     LogPoisoned,
+
+    /// The dedup filter could not be sized for the hash index.
+    #[error("dedup filter sizing is invalid: {0}")]
+    BloomConfig(#[from] liam_log::dedup::BloomConfigError),
+
+    /// The store was last written through a different log, so its cursor
+    /// offsets mean nothing to this one.
+    #[error("the store belongs to log {store}, not to the log {log} it was opened with")]
+    LogIdMismatch { store: String, log: uuid::Uuid },
+
+    /// The store has applied records the log does not hold, so the log is
+    /// older than the store or lost its tail.
+    #[error("the store's cursor {cursor:?} is beyond the log head {head:?}")]
+    CursorBeyondLog {
+        cursor: liam_log::LogOffset,
+        head: Option<liam_log::LogOffset>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

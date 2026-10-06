@@ -16,6 +16,7 @@
 //! Known limitation: the time rotation timer is not persisted, so it restarts
 //! on every reopen.
 
+use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
+use crate::compactor::{parquet_name, read_event_count_from_file};
 use crate::event::{EventError, LogEvent};
 use crate::{LogOffset, LogWriter};
 
@@ -166,6 +168,9 @@ pub struct WalWriter<C: RotationClock> {
     clock: C,
     log_id: Uuid,
     segment: OpenSegment,
+    /// The last record appended or found on open; it trails the open segment
+    /// while that segment is still empty.
+    head: Option<LogOffset>,
     sink: Option<Box<dyn SegmentSink>>,
     ops: Box<dyn FileOps>,
     /// Set when the file may hold bytes the writer cannot account for.
@@ -209,12 +214,14 @@ impl<C: RotationClock> WalWriter<C> {
                 create_segment(dir, next, clock.now_secs(), ops.as_mut())?
             }
         };
+        let head = segment_head(&segment).or_else(|| last_record_below(dir, segment.sequence));
         Ok(Self {
             dir: dir.to_path_buf(),
             config,
             clock,
             log_id,
             segment,
+            head,
             sink: None,
             ops,
             failed: false,
@@ -303,6 +310,7 @@ impl<C: RotationClock + Send> LogWriter for WalWriter<C> {
         self.write_durably(&record)?;
         self.segment.size += record.len() as u64;
         self.segment.records += 1;
+        self.head = Some(offset);
 
         // The record is durable, so a rotation failure must not fail the append;
         // the next append retries because the thresholds still hold.
@@ -318,6 +326,57 @@ impl<C: RotationClock + Send> LogWriter for WalWriter<C> {
     fn log_id(&self) -> Uuid {
         self.log_id
     }
+
+    fn head(&self) -> Option<LogOffset> {
+        self.head
+    }
+}
+
+/// The last record of the open segment, or `None` while it is empty.
+fn segment_head(segment: &OpenSegment) -> Option<LogOffset> {
+    let index = segment.records.checked_sub(1)?;
+    Some(LogOffset {
+        segment: segment.sequence,
+        index,
+    })
+}
+
+/// The last record of the nearest non-empty segment below `open`, which is the
+/// head when the writer opens on an empty segment. A segment is counted from
+/// its WAL file, or from its Parquet footer once compaction removed the WAL.
+///
+/// The search ends at a missing segment or one that cannot be counted, so a
+/// damaged log reports an earlier head or none; the reader names the damage.
+fn last_record_below(dir: &Path, open: u64) -> Option<LogOffset> {
+    for segment in (0..open).rev() {
+        let count = match segment_record_count(dir, segment) {
+            Ok(Some(count)) => count,
+            Ok(None) => return None,
+            Err(reason) => {
+                tracing::warn!(segment, %reason, "cannot count the records of a segment, the log head may be reported too low");
+                return None;
+            }
+        };
+        if let Some(index) = count.checked_sub(1) {
+            return Some(LogOffset { segment, index });
+        }
+    }
+    None
+}
+
+/// `None` when neither a WAL file nor a Parquet file exists for `sequence`.
+fn segment_record_count(dir: &Path, sequence: u64) -> Result<Option<u64>, Box<dyn Error>> {
+    let wal = dir.join(segment_name(sequence));
+    match fs::read(&wal) {
+        Ok(bytes) => return Ok(Some(scan_segment(&wal, &bytes)?.events.len() as u64)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parquet = dir.join(parquet_name(sequence));
+    if !parquet.exists() {
+        return Ok(None);
+    }
+    Ok(Some(read_event_count_from_file(&parquet)?))
 }
 
 fn encode_frame(length: u32, payload: &[u8]) -> Vec<u8> {
@@ -619,7 +678,7 @@ mod tests {
 
     use super::*;
     use crate::event::CURRENT_SCHEMA_VERSION;
-    use crate::fixtures::{event, frame_len, parquet_path, wal_path};
+    use crate::fixtures::{compact_segments, event, frame_len, parquet_path, wal_path, write_log};
     use crate::LogOffset;
 
     const INTERVAL_SECS: u64 = 60;
@@ -1687,6 +1746,110 @@ mod tests {
         );
         assert_eq!(after_rotation, 1, "rotation succeeded");
         assert_eq!(reopened, 1, "reopen adopts the highest segment");
+    }
+
+    fn at(segment: u64, index: u64) -> LogOffset {
+        LogOffset { segment, index }
+    }
+
+    #[test]
+    fn head_of_an_empty_log_is_none() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Act
+        let writer = open(dir.path(), LARGE, &FakeClock::default());
+
+        // Assert
+        assert_eq!(writer.head(), None);
+    }
+
+    #[test]
+    fn head_is_the_offset_of_each_append_across_a_rotation() {
+        // Arrange: every append fills its segment, so each one rotates.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = open(dir.path(), frame_len(&event(0)), &FakeClock::default());
+
+        // Act
+        let heads: Vec<_> = (0..3)
+            .map(|index| {
+                let offset = writer.append(&event(index)).expect("append");
+                (offset, writer.head())
+            })
+            .collect();
+
+        // Assert: the open segment is empty after a rotation, so the head
+        // stays on the record in the segment just closed.
+        let expected: Vec<_> = (0..3).map(|n| (at(n, 0), Some(at(n, 0)))).collect();
+        assert_eq!(heads, expected);
+    }
+
+    #[test]
+    fn head_after_reopen_is_the_last_record_of_the_open_segment() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        write_events(dir.path(), &[event(0), event(1), event(2)], &clock);
+
+        // Act
+        let writer = open(dir.path(), LARGE, &clock);
+
+        // Assert
+        assert_eq!(writer.head(), Some(at(0, 2)));
+    }
+
+    #[test]
+    fn head_after_reopen_with_an_empty_highest_segment_is_the_last_record_below_it() {
+        // Arrange: three records a segment, six appended, so the last append
+        // rotated and segment 2 is empty.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let mut writer = open(dir.path(), 3 * frame_len(&event(0)), &clock);
+        (0..6).for_each(|n| {
+            writer.append(&event(n)).expect("append");
+        });
+        drop(writer);
+
+        // Act
+        let reopened = open(dir.path(), LARGE, &clock);
+
+        // Assert
+        assert_eq!(reopened.open_sequence(), 2);
+        assert_eq!(reopened.head(), Some(at(1, 2)));
+    }
+
+    #[tokio::test]
+    async fn head_after_reopen_reads_a_compacted_segment_from_its_parquet() {
+        // Arrange: segments 0 and 1 are full and compacted, segment 2 is empty.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_log(dir.path(), 4, 2);
+        compact_segments(dir.path(), &[0, 1]).await;
+        assert!(!wal_path(dir.path(), 1).exists());
+
+        // Act
+        let reopened = open(dir.path(), LARGE, &FakeClock::default());
+
+        // Assert
+        assert_eq!(reopened.head(), Some(at(1, 1)));
+    }
+
+    #[test]
+    fn head_after_tail_recovery_ignores_the_torn_record() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        write_events(dir.path(), &[event(0), event(1)], &clock);
+        let torn = frame(&event(2));
+        append_raw(&segment_files(dir.path())[0], &torn[..torn.len() / 2]);
+
+        // Act
+        let mut writer = open(dir.path(), LARGE, &clock);
+        let recovered = writer.head();
+        writer.append(&event(3)).expect("append after recovery");
+
+        // Assert
+        assert_eq!(recovered, Some(at(0, 1)));
+        assert_eq!(writer.head(), Some(at(0, 2)));
     }
 
     /// A file operation as seen by `RecordingOps`.

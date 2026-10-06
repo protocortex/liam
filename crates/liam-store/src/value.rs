@@ -64,4 +64,10 @@ impl Row {
             _ => Err(Error::Backend(format!("column {i} is not text"))),
         }
     }
+    pub fn get_blob(&self, i: usize) -> Result<&[u8]> {
+        match self.0.get(i) {
+            Some(Value::Blob(v)) => Ok(v),
+            _ => Err(Error::Backend(format!("column {i} is not a blob"))),
+        }
+    }
 }

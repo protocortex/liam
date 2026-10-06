@@ -164,7 +164,7 @@ impl HashBloom {
     }
 
     /// The sizing this filter was built with.
-    pub(crate) fn config(&self) -> &BloomConfig {
+    pub fn config(&self) -> &BloomConfig {
         &self.config
     }
 

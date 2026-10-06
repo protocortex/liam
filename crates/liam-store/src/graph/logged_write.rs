@@ -21,7 +21,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use liam_log::dedup::{find_first_write, HashBloom, HashIndex, IndexedWrite, PreCheck};
+use liam_log::dedup::{
+    find_first_write, BloomConfig, HashBloom, HashIndex, IndexedWrite, PreCheck,
+};
 use liam_log::event::{LogEvent, LogPayload};
 use liam_log::hash::content_hashes;
 use liam_log::{LogOffset, LogWriter};
@@ -71,6 +73,24 @@ impl EventLog {
             bloom,
             poisoned: false,
         }
+    }
+
+    pub(super) fn log_id(&self) -> Uuid {
+        self.writer.log_id()
+    }
+
+    pub(super) fn head(&self) -> Option<LogOffset> {
+        self.writer.head()
+    }
+
+    /// The sizing the filter was configured with, which a rebuild never
+    /// shrinks below.
+    pub(super) fn bloom_config(&self) -> &BloomConfig {
+        self.bloom.config()
+    }
+
+    pub(super) fn replace_bloom(&mut self, bloom: HashBloom) {
+        self.bloom = bloom;
     }
 
     #[cfg(test)]

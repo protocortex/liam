@@ -36,6 +36,12 @@ impl RecordingLog {
         Self::over(FailingLogWriter::fail_after(u64::MAX))
     }
 
+    /// A new writer for the log `log_id`, as after a restart, with nothing
+    /// appended yet.
+    pub(super) fn reopened(log_id: Uuid) -> (Self, Appended) {
+        Self::over(FailingLogWriter::fail_after(u64::MAX).with_log_id(log_id))
+    }
+
     fn over(inner: FailingLogWriter) -> (Self, Appended) {
         let appended = Appended::default();
         let log = Self {
@@ -65,6 +71,10 @@ impl LogWriter for RecordingLog {
 
     fn log_id(&self) -> Uuid {
         self.inner.log_id()
+    }
+
+    fn head(&self) -> Option<LogOffset> {
+        self.inner.head()
     }
 }
 
@@ -560,6 +570,7 @@ async fn log_write_a_cancelled_write_poisons_the_log_until_reopen() {
     let path = dir.path().join("graph.db");
     let path = path.to_str().unwrap();
     let (log, appended) = RecordingLog::new();
+    let log_id = log.log_id();
     let g = open_with::<FailingBackend>(path, Millis(1000), share(log)).await;
     g.backend.probe.hang_commit.store(true, Ordering::SeqCst);
 
@@ -579,9 +590,9 @@ async fn log_write_a_cancelled_write_poisons_the_log_until_reopen() {
         "a refused write appends nothing"
     );
 
-    // Act: reopen the same database on a fresh log.
+    // Act: reopen the same database on a fresh writer for the same log.
     drop(g);
-    let (fresh, _) = RecordingLog::new();
+    let (fresh, _) = RecordingLog::reopened(log_id);
     let reopened = open_with::<DefaultBackend>(path, Millis(1000), share(fresh)).await;
 
     // Assert
@@ -702,6 +713,7 @@ async fn log_write_a_void_double_fault_poisons_the_log_until_reopen() {
     let path = dir.path().join("graph.db");
     let path = path.to_str().unwrap();
     let (log, appended) = RecordingLog::over(FailingLogWriter::fail_on_nth(2));
+    let log_id = log.log_id();
     let g = open_with::<FailingBackend>(path, Millis(1000), share(log)).await;
     g.backend.set_fail_on_execute(0);
 
@@ -726,9 +738,9 @@ async fn log_write_a_void_double_fault_poisons_the_log_until_reopen() {
     assert_eq!(count(&g, "nodes").await, 0);
     assert_eq!(count(&g, "log_hash_index").await, 0);
 
-    // Act: reopen the same database on a fresh writer.
+    // Act: reopen the same database on a fresh writer for the same log.
     drop(g);
-    let (fresh, _) = RecordingLog::new();
+    let (fresh, _) = RecordingLog::reopened(log_id);
     let reopened = open_with::<DefaultBackend>(path, Millis(1000), share(fresh)).await;
 
     // Assert
