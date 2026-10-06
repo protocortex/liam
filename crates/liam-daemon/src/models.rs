@@ -12,8 +12,10 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use liam_model::llm::DevicePreference;
 use liam_model::{Embedder, IdentityReranker, Llm, MockEmbedder, MockLlm, Reranker};
+use liam_store::{ContentEmbedder, EmbedError};
 
 use crate::config::{self, Config};
 
@@ -50,6 +52,17 @@ pub fn resolve_path_with_home(key: &str, value: &str, home: &str) -> anyhow::Res
         );
     }
     Ok(config::expand_tilde(value, home))
+}
+
+/// Lets the store embed the content of nodes a replay restored, with the same
+/// embedder the daemon serves with.
+pub struct StoreEmbedder(pub Arc<dyn Embedder>);
+
+#[async_trait]
+impl ContentEmbedder for StoreEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        Ok(self.0.embed(text).await?)
+    }
 }
 
 /// Choose the embedder and reranker from config. The mock pair keeps the base

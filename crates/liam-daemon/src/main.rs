@@ -17,7 +17,6 @@ mod mcp;
 /// docs to run each tier.
 #[cfg(test)]
 mod retrieval_eval;
-mod storelock;
 mod synthesis;
 mod telemetry;
 /// Grounding eval for remember/recall/relate; test-only, see the module docs to run each tier.
@@ -39,6 +38,7 @@ pub use liam_daemon::config;
 
 use config::Config;
 use liam_daemon::models::{build_llm, build_models, resolve_config_path, resolve_path_with_home};
+use liam_daemon::storelock;
 use liam_model::{Embedder, Llm, Reranker};
 use mcp::MemoryServer;
 
