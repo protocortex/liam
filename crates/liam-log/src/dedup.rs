@@ -5,7 +5,8 @@
 //! The filter answers "possibly seen" cheaply; the index decides, and a rebuild
 //! from the log restores both after a restart.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
+#[cfg(any(test, feature = "test-support"))]
 use std::convert::Infallible;
 
 use async_trait::async_trait;
@@ -14,20 +15,37 @@ use fastbloom::BloomFilter;
 use crate::event::{LogEvent, LogPayload};
 use crate::hash::content_hashes;
 
-/// Sizing for the bloom filter: capacity and the false-positive rate it is tuned for.
+/// A 100k-hash filter takes about 120 KB, so an empty store costs almost nothing.
+const DEFAULT_EXPECTED_ITEMS: usize = 100_000;
+
+/// At 1% about 99 of 100 new hashes skip the index lookup, for roughly 10 bits per hash.
+const DEFAULT_FALSE_POSITIVE_RATE: f64 = 0.01;
+
+/// About 600 MB at the default rate, so a mistyped capacity cannot ask for tens of GiB.
+const MAX_EXPECTED_ITEMS: usize = 500_000_000;
+
+/// Below this the filter needs over 43 bits per hash, which defeats a cheap pre-check.
+const MIN_FALSE_POSITIVE_RATE: f64 = 1e-9;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BloomConfig {
     expected_items: usize,
     false_positive_rate: f64,
 }
 
-/// Why a bloom filter sizing was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum BloomConfigError {
     #[error("false positive rate {0} must be finite, above 0 and below 1")]
     FalsePositiveRate(f64),
+    #[error(
+        "false positive rate {0} is below the minimum of {min}",
+        min = MIN_FALSE_POSITIVE_RATE
+    )]
+    FalsePositiveRateTooLow(f64),
     #[error("expected items must be at least 1")]
     NoExpectedItems,
+    #[error("expected items {0} exceed the maximum of {max}", max = MAX_EXPECTED_ITEMS)]
+    TooManyExpectedItems(usize),
 }
 
 impl BloomConfig {
@@ -38,8 +56,16 @@ impl BloomConfig {
         {
             return Err(BloomConfigError::FalsePositiveRate(false_positive_rate));
         }
+        if false_positive_rate < MIN_FALSE_POSITIVE_RATE {
+            return Err(BloomConfigError::FalsePositiveRateTooLow(
+                false_positive_rate,
+            ));
+        }
         if expected_items == 0 {
             return Err(BloomConfigError::NoExpectedItems);
+        }
+        if expected_items > MAX_EXPECTED_ITEMS {
+            return Err(BloomConfigError::TooManyExpectedItems(expected_items));
         }
         Ok(Self {
             expected_items,
@@ -59,8 +85,8 @@ impl BloomConfig {
 impl Default for BloomConfig {
     fn default() -> Self {
         Self {
-            expected_items: 100_000,
-            false_positive_rate: 0.01,
+            expected_items: DEFAULT_EXPECTED_ITEMS,
+            false_positive_rate: DEFAULT_FALSE_POSITIVE_RATE,
         }
     }
 }
@@ -70,16 +96,15 @@ const BLOOM_SEED: u128 = 0x6c69_616d_626c_6f6f_6d73_6565_6430_3031;
 
 /// Cheap pre-check in front of the exact lookup. May answer true for a hash
 /// that was never inserted, never false for one that was.
-///
-/// `Sync` so a future borrowing a pre-check can move between threads.
-pub trait PreCheck: Sync {
+pub trait PreCheck {
     fn might_contain(&self, hash: &[u8; 32]) -> bool;
 }
 
-/// The write a hash was first stored by, and the rows that write created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedWrite {
     pub first_event_id: String,
+    /// A batch can carry identical rows, so the store keeps every row id of
+    /// the first carrier.
     pub row_ids: Vec<String>,
 }
 
@@ -93,11 +118,14 @@ pub trait HashIndex {
     async fn lookup(&mut self, hash: &[u8; 32]) -> Result<Option<IndexedWrite>, Self::Error>;
 }
 
-/// The stored write for `hash`, or `None` when it is new: the pre-check
+/// The first write recorded for `hash`, or `None` when it is new. The pre-check
 /// short-circuits a miss without touching the index, and the exact index
 /// decides every pre-check hit.
-pub async fn is_duplicate<I: HashIndex>(
-    pre_check: &dyn PreCheck,
+///
+/// The caller decides liveness: a hit counts as a duplicate only if the indexed
+/// row is still live.
+pub async fn find_first_write<P: PreCheck + ?Sized, I: HashIndex + ?Sized>(
+    pre_check: &P,
     index: &mut I,
     hash: &[u8; 32],
 ) -> Result<Option<IndexedWrite>, I::Error> {
@@ -107,10 +135,8 @@ pub async fn is_duplicate<I: HashIndex>(
     index.lookup(hash).await
 }
 
-/// Bloom filter over content hashes with a pinned seed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HashBloom {
-    config: BloomConfig,
     filter: BloomFilter,
 }
 
@@ -119,7 +145,7 @@ impl HashBloom {
         let filter = BloomFilter::with_false_pos(config.false_positive_rate)
             .seed(&BLOOM_SEED)
             .expected_items(config.expected_items);
-        Self { config, filter }
+        Self { filter }
     }
 
     pub fn insert(&mut self, hash: &[u8; 32]) {
@@ -133,20 +159,20 @@ impl PreCheck for HashBloom {
     }
 }
 
-/// One hash with the write that first carried it and that write's rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
     pub hash: [u8; 32],
-    pub first_event_id: String,
-    pub row_ids: Vec<String>,
+    pub write: IndexedWrite,
 }
 
-/// In-memory `HashIndex`: maps a content hash to the first write that carried it.
+/// Maps a content hash to the first write that carried it.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct InMemoryHashIndex {
     writes: HashMap<[u8; 32], IndexedWrite>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl InMemoryHashIndex {
     pub fn new() -> Self {
         Self::default()
@@ -162,27 +188,11 @@ impl InMemoryHashIndex {
 
     /// Keeps the first write for a hash, so repeats resolve to the original.
     pub fn insert(&mut self, entry: IndexEntry) {
-        self.writes.entry(entry.hash).or_insert(IndexedWrite {
-            first_event_id: entry.first_event_id,
-            row_ids: entry.row_ids,
-        });
-    }
-
-    pub fn first_event_id(&self, hash: &[u8; 32]) -> Option<&str> {
-        self.writes
-            .get(hash)
-            .map(|write| write.first_event_id.as_str())
-    }
-
-    pub fn len(&self) -> usize {
-        self.writes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.writes.is_empty()
+        self.writes.entry(entry.hash).or_insert(entry.write);
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl HashIndex for InMemoryHashIndex {
     type Error = Infallible;
@@ -192,8 +202,8 @@ impl HashIndex for InMemoryHashIndex {
     }
 }
 
-/// What a rebuild yields: the bloom filter every inserted hash went into, and
-/// the index entries for hashes whose first carrier was not voided.
+/// The bloom filter every inserted hash went into, and one index entry per
+/// hash that still has a live carrier.
 #[derive(Debug)]
 pub struct Rebuilt {
     pub bloom: HashBloom,
@@ -203,16 +213,35 @@ pub struct Rebuilt {
 /// Scans every event once, in log order, and returns the bloom filter and
 /// index entries that incremental appends would have produced.
 ///
-/// A `Voided` event drops the index entry of the write it voids, so a retry of
-/// that write becomes the first carrier. The bloom keeps the hash: it cannot
-/// delete, and a stale hit is overruled by the exact index. Tombstone and
-/// duplicate events carry no content, so they add no hash.
-pub fn rebuild_from_log(events: impl Iterator<Item = LogEvent>, config: BloomConfig) -> Rebuilt {
+/// Each hash maps to its last surviving carrier. A write whose hash already
+/// had a live carrier is logged as a `DuplicateOf` and registers nothing, so a
+/// later write of the same hash only exists because every earlier carrier was
+/// dead or voided, and the later write is the one the live index points at.
+/// A `Voided` event removes only its own target, so a retry of a voided write
+/// survives however often the void repeats. Entries come out in the log
+/// order of the surviving carrier.
+///
+/// An event whose id was already seen is a replayed copy and is skipped, as
+/// is one whose id was voided earlier in the scan. The bloom keeps the hash of
+/// a voided write: it cannot delete, and a stale hit is overruled by the exact
+/// index. Tombstone and duplicate events carry no content, so add no hash.
+pub fn rebuild_from_log(
+    events: impl IntoIterator<Item = LogEvent>,
+    config: BloomConfig,
+) -> Rebuilt {
     let mut bloom = HashBloom::new(config);
-    let mut carriers = FirstCarriers::default();
+    let mut carriers = Carriers::default();
+    let mut seen = HashSet::new();
+    let mut voided = HashSet::new();
     for event in events {
-        if let LogPayload::Voided { target_event_id } = &event.payload {
-            carriers.void(target_event_id);
+        if !seen.insert(event.event_id.clone()) {
+            continue;
+        }
+        if let LogPayload::Voided { target_event_id } = event.payload {
+            voided.insert(target_event_id);
+            continue;
+        }
+        if voided.contains(&event.event_id) {
             continue;
         }
         for (hash, row_id) in content_hashes(&event) {
@@ -220,62 +249,61 @@ pub fn rebuild_from_log(events: impl Iterator<Item = LogEvent>, config: BloomCon
             carriers.record(hash, &event.event_id, row_id);
         }
     }
+    drop(seen);
     Rebuilt {
         bloom,
-        entries: carriers.into_entries(),
+        entries: carriers.into_entries(&voided),
     }
 }
 
-/// Index entries keyed by first-carrier order, with the lookups a void needs.
+struct Carrier {
+    event_id: String,
+    row_ids: Vec<String>,
+    position: u64,
+}
+
+/// Every event that carried each hash, oldest first, with the log position
+/// that orders the final entries.
 #[derive(Default)]
-struct FirstCarriers {
+struct Carriers {
     next_position: u64,
-    by_position: BTreeMap<u64, IndexEntry>,
-    position_by_hash: HashMap<[u8; 32], u64>,
-    hashes_by_event: HashMap<String, Vec<[u8; 32]>>,
+    by_hash: HashMap<[u8; 32], Vec<Carrier>>,
 }
 
-impl FirstCarriers {
+impl Carriers {
     fn record(&mut self, hash: [u8; 32], event_id: &str, row_id: String) {
-        if let Some(position) = self.position_by_hash.get(&hash) {
-            if let Some(entry) = self.by_position.get_mut(position) {
-                if entry.first_event_id == event_id {
-                    entry.row_ids.push(row_id);
-                }
-            }
-            return;
-        }
-        let position = self.next_position;
-        self.next_position += 1;
-        self.position_by_hash.insert(hash, position);
-        self.hashes_by_event
-            .entry(event_id.to_owned())
-            .or_default()
-            .push(hash);
-        self.by_position.insert(
-            position,
-            IndexEntry {
-                hash,
-                first_event_id: event_id.to_owned(),
-                row_ids: vec![row_id],
-            },
-        );
-    }
-
-    fn void(&mut self, target_event_id: &str) {
-        for hash in self
-            .hashes_by_event
-            .remove(target_event_id)
-            .unwrap_or_default()
-        {
-            if let Some(position) = self.position_by_hash.remove(&hash) {
-                self.by_position.remove(&position);
+        let carriers = self.by_hash.entry(hash).or_default();
+        match carriers.last_mut() {
+            Some(last) if last.event_id == event_id => last.row_ids.push(row_id),
+            _ => {
+                carriers.push(Carrier {
+                    event_id: event_id.to_owned(),
+                    row_ids: vec![row_id],
+                    position: self.next_position,
+                });
+                self.next_position += 1;
             }
         }
     }
 
-    fn into_entries(self) -> Vec<IndexEntry> {
-        self.by_position.into_values().collect()
+    fn into_entries(self, voided: &HashSet<String>) -> Vec<IndexEntry> {
+        let mut surviving: Vec<(u64, IndexEntry)> = self
+            .by_hash
+            .into_iter()
+            .filter_map(|(hash, carriers)| {
+                let carrier = carriers
+                    .into_iter()
+                    .rev()
+                    .find(|carrier| !voided.contains(&carrier.event_id))?;
+                let write = IndexedWrite {
+                    first_event_id: carrier.event_id,
+                    row_ids: carrier.row_ids,
+                };
+                Some((carrier.position, IndexEntry { hash, write }))
+            })
+            .collect();
+        surviving.sort_unstable_by_key(|(position, _)| *position);
+        surviving.into_iter().map(|(_, entry)| entry).collect()
     }
 }
 
@@ -336,10 +364,21 @@ mod tests {
         }
     }
 
-    fn indexed_write(event_id: &str, row_id: &str) -> IndexedWrite {
+    fn assert_send<T: Send>(value: T) -> T {
+        value
+    }
+
+    fn indexed_write(event_id: &str, row_ids: &[&str]) -> IndexedWrite {
         IndexedWrite {
             first_event_id: event_id.into(),
-            row_ids: vec![row_id.into()],
+            row_ids: row_ids.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    fn entry(hash: [u8; 32], event_id: &str, row_ids: &[&str]) -> IndexEntry {
+        IndexEntry {
+            hash,
+            write: indexed_write(event_id, row_ids),
         }
     }
 
@@ -381,12 +420,45 @@ mod tests {
     }
 
     #[test]
-    fn bloom_config_rejects_zero_expected_items() {
-        // Arrange / Act
-        let result = BloomConfig::new(0, 0.01);
+    fn bloom_config_enforces_the_item_and_rate_limits_at_their_boundaries() {
+        // Arrange
+        let below_floor = MIN_FALSE_POSITIVE_RATE * 0.9;
+        let cases = [
+            (1, 0.01, Ok(())),
+            (MAX_EXPECTED_ITEMS, 0.01, Ok(())),
+            (100, MIN_FALSE_POSITIVE_RATE, Ok(())),
+            (0, 0.01, Err(BloomConfigError::NoExpectedItems)),
+            (
+                MAX_EXPECTED_ITEMS + 1,
+                0.01,
+                Err(BloomConfigError::TooManyExpectedItems(
+                    MAX_EXPECTED_ITEMS + 1,
+                )),
+            ),
+            (
+                usize::MAX,
+                0.01,
+                Err(BloomConfigError::TooManyExpectedItems(usize::MAX)),
+            ),
+            (
+                100,
+                below_floor,
+                Err(BloomConfigError::FalsePositiveRateTooLow(below_floor)),
+            ),
+            (
+                100,
+                f64::MIN_POSITIVE,
+                Err(BloomConfigError::FalsePositiveRateTooLow(f64::MIN_POSITIVE)),
+            ),
+        ];
 
-        // Assert
-        assert_eq!(result, Err(BloomConfigError::NoExpectedItems));
+        for (items, rate, expected) in cases {
+            // Act
+            let result = BloomConfig::new(items, rate).map(|_| ());
+
+            // Assert
+            assert_eq!(result, expected, "items {items}, rate {rate}");
+        }
     }
 
     #[test]
@@ -404,12 +476,12 @@ mod tests {
     }
 
     #[test]
-    fn default_config_targets_a_one_percent_false_positive_rate() {
+    fn the_default_config_is_the_named_defaults_and_passes_validation() {
         // Arrange / Act
-        let config = BloomConfig::default();
+        let validated = BloomConfig::new(DEFAULT_EXPECTED_ITEMS, DEFAULT_FALSE_POSITIVE_RATE);
 
         // Assert
-        assert_eq!(config.false_positive_rate(), 0.01);
+        assert_eq!(validated, Ok(BloomConfig::default()));
     }
 
     #[test]
@@ -472,11 +544,10 @@ mod tests {
     }
 
     #[test]
-    fn false_positive_rate_on_absent_hashes_stays_within_a_band_around_the_configured_rate() {
-        // Arrange: the seed and the probe set are fixed, so the measured rate
-        // is one repeatable value (about 0.0104). The band is 0.5x to 2x of the
-        // configured 0.01, far wider than the 0.0007 sampling spread, and still
-        // catches a filter sized too small or far too large.
+    fn the_pinned_seed_gives_the_recorded_false_positive_count() {
+        // Arrange: the seed and the probe set are fixed, so the count is one
+        // repeatable value, 207 of 20000 (about 0.0104 for a configured 0.01).
+        // A changed seed, hasher, or sizing moves it.
         let filter = filter_with(small_config(), &sample_hashes(0..5_000));
         let absent = sample_hashes(1_000_000..1_020_000);
 
@@ -485,12 +556,32 @@ mod tests {
             .iter()
             .filter(|hash| filter.might_contain(hash))
             .count();
-        let rate = false_positives as f64 / absent.len() as f64;
 
         // Assert
-        assert!(
-            (0.005..=0.02).contains(&rate),
-            "rate {rate} outside 0.005..=0.02 for a configured 0.01"
+        assert_eq!(false_positives, 207);
+    }
+
+    #[test]
+    fn the_pinned_seed_gives_the_recorded_answers_for_a_fixed_absent_set() {
+        // Arrange: 1 marks an absent hash the filter wrongly reports present.
+        let filter = filter_with(small_config(), &sample_hashes(0..5_000));
+        let absent = sample_hashes(1_000_000..1_000_200);
+
+        // Act
+        let answers: String = absent
+            .iter()
+            .map(|hash| if filter.might_contain(hash) { '1' } else { '0' })
+            .collect();
+
+        // Assert
+        assert_eq!(
+            answers,
+            concat!(
+                "00000000000000000000000000000000000000000000000000",
+                "00000000000000000000000000000000000000000000000001",
+                "00000000000000100000000000000000000000000000000000",
+                "00000000000100000000000000000000000000000000000000",
+            )
         );
     }
 
@@ -501,7 +592,7 @@ mod tests {
         let never_stored = sample_hash(42);
 
         // Act
-        let found = is_duplicate(&AlwaysTrue, &mut index, &never_stored).await;
+        let found = find_first_write(&AlwaysTrue, &mut index, &never_stored).await;
 
         // Assert
         assert_eq!(
@@ -516,14 +607,14 @@ mod tests {
     async fn a_pre_check_hit_for_a_stored_hash_returns_the_stored_write() {
         // Arrange
         let stored = sample_hash(7);
-        let write = indexed_write("event-7", "node-7");
+        let write = indexed_write("event-7", &["node-7"]);
         let mut index = CountingIndex {
             stored: vec![(stored, write.clone())],
             ..CountingIndex::default()
         };
 
         // Act
-        let found = is_duplicate(&AlwaysTrue, &mut index, &stored).await;
+        let found = find_first_write(&AlwaysTrue, &mut index, &stored).await;
 
         // Assert
         assert_eq!(found, Ok(Some(write)));
@@ -535,7 +626,7 @@ mod tests {
         let mut index = CountingIndex::default();
 
         // Act
-        let found = is_duplicate(&AlwaysFalse, &mut index, &sample_hash(1)).await;
+        let found = find_first_write(&AlwaysFalse, &mut index, &sample_hash(1)).await;
 
         // Assert
         assert_eq!(found, Ok(None));
@@ -548,10 +639,31 @@ mod tests {
         let mut index = FailingIndex;
 
         // Act
-        let found = is_duplicate(&AlwaysTrue, &mut index, &sample_hash(1)).await;
+        let found = find_first_write(&AlwaysTrue, &mut index, &sample_hash(1)).await;
 
         // Assert
         assert_eq!(found, Err("index unavailable"));
+    }
+
+    #[tokio::test]
+    async fn the_lookup_future_is_send_and_accepts_trait_objects() {
+        // Arrange
+        let stored = sample_hash(7);
+        let write = indexed_write("event-7", &["node-7"]);
+        let mut index = CountingIndex {
+            stored: vec![(stored, write.clone())],
+            ..CountingIndex::default()
+        };
+        let dyn_pre_check: &dyn PreCheck = &AlwaysTrue;
+        let dyn_index: &mut dyn HashIndex<Error = Infallible> = &mut index;
+
+        // Act
+        let via_objects = find_first_write(dyn_pre_check, dyn_index, &stored).await;
+        let send_future = assert_send(find_first_write(&AlwaysTrue, &mut index, &stored));
+
+        // Assert
+        assert_eq!(via_objects, Ok(Some(write.clone())));
+        assert_eq!(send_future.await, Ok(Some(write)));
     }
 
     fn voided(event_id: &str, target: &str) -> LogEvent {
@@ -563,6 +675,10 @@ mod tests {
         )
     }
 
+    fn node_write(event_id: &str, row_id: &str, content: &str) -> LogEvent {
+        log_event(event_id, LogPayload::NodeWrite(node_row(row_id, content)))
+    }
+
     fn expected_node_hash(row: &NodeRow) -> [u8; 32] {
         content_hashes(&log_event("probe", LogPayload::NodeWrite(row.clone())))[0].0
     }
@@ -571,37 +687,22 @@ mod tests {
         content_hashes(&log_event("probe", LogPayload::EdgeWrite(row.clone())))[0].0
     }
 
+    fn alpha_hash() -> [u8; 32] {
+        expected_node_hash(&node_row("any", "alpha"))
+    }
+
     fn entry_for<'a>(rebuilt: &'a Rebuilt, hash: &[u8; 32]) -> Option<&'a IndexEntry> {
         rebuilt.entries.iter().find(|entry| &entry.hash == hash)
     }
 
-    #[test]
-    fn an_inserted_entry_is_found_with_its_event_id() {
-        // Arrange
-        let mut index = InMemoryHashIndex::new();
-        let hash = sample_hash(1);
-
-        // Act
-        index.insert(IndexEntry {
-            hash,
-            first_event_id: "event-1".into(),
-            row_ids: vec!["node-1".into()],
-        });
-
-        // Assert
-        assert_eq!(index.first_event_id(&hash), Some("event-1"));
-        assert_eq!(index.len(), 1);
-        assert!(!index.is_empty());
-    }
-
     #[tokio::test]
-    async fn the_in_memory_index_looks_up_the_stored_write() {
+    async fn the_in_memory_index_looks_up_the_full_stored_write() {
         // Arrange
-        let mut index = InMemoryHashIndex::from_entries([IndexEntry {
-            hash: sample_hash(1),
-            first_event_id: "event-1".into(),
-            row_ids: vec!["node-1".into(), "edge-1".into()],
-        }]);
+        let mut index = InMemoryHashIndex::from_entries([entry(
+            sample_hash(1),
+            "event-1",
+            &["node-1", "edge-1"],
+        )]);
 
         // Act
         let hit = index.lookup(&sample_hash(1)).await;
@@ -610,61 +711,50 @@ mod tests {
         // Assert
         assert_eq!(
             hit,
-            Ok(Some(IndexedWrite {
-                first_event_id: "event-1".into(),
-                row_ids: vec!["node-1".into(), "edge-1".into()],
-            }))
+            Ok(Some(indexed_write("event-1", &["node-1", "edge-1"])))
         );
         assert_eq!(miss, Ok(None));
     }
 
-    #[test]
-    fn a_second_insert_of_the_same_hash_keeps_the_first_event_id() {
+    #[tokio::test]
+    async fn a_second_insert_of_the_same_hash_keeps_the_first_write_and_its_row_ids() {
         // Arrange
         let mut index = InMemoryHashIndex::new();
         let hash = sample_hash(1);
-        let entry = |event_id: &str| IndexEntry {
-            hash,
-            first_event_id: event_id.into(),
-            row_ids: Vec::new(),
-        };
-        index.insert(entry("event-1"));
+        index.insert(entry(hash, "event-1", &["node-1", "node-1b"]));
 
         // Act
-        index.insert(entry("event-2"));
+        index.insert(entry(hash, "event-2", &["node-2"]));
 
         // Assert
-        assert_eq!(index.first_event_id(&hash), Some("event-1"));
-        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index.lookup(&hash).await,
+            Ok(Some(indexed_write("event-1", &["node-1", "node-1b"])))
+        );
     }
 
-    #[test]
-    fn an_index_built_from_entries_holds_each_hash() {
+    #[tokio::test]
+    async fn from_entries_keeps_the_first_entry_of_a_repeated_hash() {
         // Arrange
-        let entries = (1..=2).map(|n| IndexEntry {
-            hash: sample_hash(n),
-            first_event_id: format!("event-{n}"),
-            row_ids: Vec::new(),
-        });
+        let entries = [
+            entry(sample_hash(1), "event-1", &["node-1"]),
+            entry(sample_hash(2), "event-2", &["node-2"]),
+            entry(sample_hash(1), "event-3", &["node-3"]),
+        ];
 
         // Act
-        let index = InMemoryHashIndex::from_entries(entries);
+        let mut index = InMemoryHashIndex::from_entries(entries);
 
         // Assert
-        assert_eq!(index.first_event_id(&sample_hash(1)), Some("event-1"));
-        assert_eq!(index.first_event_id(&sample_hash(2)), Some("event-2"));
-        assert_eq!(index.first_event_id(&sample_hash(3)), None);
-        assert_eq!(index.len(), 2);
-    }
-
-    #[test]
-    fn an_empty_index_reports_empty() {
-        // Arrange / Act
-        let index = InMemoryHashIndex::new();
-
-        // Assert
-        assert!(index.is_empty());
-        assert_eq!(index.len(), 0);
+        assert_eq!(
+            index.lookup(&sample_hash(1)).await,
+            Ok(Some(indexed_write("event-1", &["node-1"])))
+        );
+        assert_eq!(
+            index.lookup(&sample_hash(2)).await,
+            Ok(Some(indexed_write("event-2", &["node-2"])))
+        );
+        assert_eq!(index.lookup(&sample_hash(3)).await, Ok(None));
     }
 
     #[test]
@@ -673,7 +763,7 @@ mod tests {
         let events: Vec<LogEvent> = Vec::new();
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert_eq!(rebuilt.bloom, HashBloom::new(small_config()));
@@ -692,7 +782,7 @@ mod tests {
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         let node_hash = hash_node(&NodeContent {
@@ -714,16 +804,8 @@ mod tests {
         assert_eq!(
             rebuilt.entries,
             vec![
-                IndexEntry {
-                    hash: node_hash,
-                    first_event_id: "event-1".into(),
-                    row_ids: vec!["node-1".into()],
-                },
-                IndexEntry {
-                    hash: edge_hash,
-                    first_event_id: "event-2".into(),
-                    row_ids: vec!["edge-1".into()],
-                },
+                entry(node_hash, "event-1", &["node-1"]),
+                entry(edge_hash, "event-2", &["edge-1"]),
             ]
         );
         assert!(rebuilt.bloom.might_contain(&node_hash));
@@ -746,7 +828,7 @@ mod tests {
         );
 
         // Act
-        let rebuilt = rebuild_from_log(vec![batch].into_iter(), small_config());
+        let rebuilt = rebuild_from_log(vec![batch], small_config());
 
         // Assert
         for (hash, row_id) in [
@@ -754,9 +836,10 @@ mod tests {
             (expected_node_hash(&second), "node-2"),
             (expected_edge_hash(&edge), "edge-1"),
         ] {
-            let entry = entry_for(&rebuilt, &hash).expect("entry for batch row");
-            assert_eq!(entry.first_event_id, "event-1");
-            assert_eq!(entry.row_ids, vec![row_id.to_owned()]);
+            assert_eq!(
+                entry_for(&rebuilt, &hash),
+                Some(&entry(hash, "event-1", &[row_id]))
+            );
             assert!(rebuilt.bloom.might_contain(&hash));
         }
         assert_eq!(rebuilt.entries.len(), 3);
@@ -775,16 +858,16 @@ mod tests {
         );
 
         // Act
-        let rebuilt = rebuild_from_log(vec![batch].into_iter(), small_config());
+        let rebuilt = rebuild_from_log(vec![batch], small_config());
 
         // Assert
         assert_eq!(
             rebuilt.entries,
-            vec![IndexEntry {
-                hash: expected_node_hash(&first),
-                first_event_id: "event-1".into(),
-                row_ids: vec!["node-1".into(), "node-2".into()],
-            }]
+            vec![entry(
+                expected_node_hash(&first),
+                "event-1",
+                &["node-1", "node-2"]
+            )]
         );
     }
 
@@ -794,7 +877,7 @@ mod tests {
         let batch = log_event("event-1", LogPayload::EpisodeBatch(Vec::new()));
 
         // Act
-        let rebuilt = rebuild_from_log(vec![batch].into_iter(), small_config());
+        let rebuilt = rebuild_from_log(vec![batch], small_config());
 
         // Assert
         assert!(rebuilt.entries.is_empty());
@@ -802,27 +885,30 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_maps_a_repeated_hash_to_the_first_event_that_carried_it() {
-        // Arrange
+    fn a_hash_rewritten_after_a_supersede_maps_to_its_last_carrier() {
+        // Arrange: X, then Y superseding it, then X again. The third write
+        // exists only because the first carrier of X was no longer live.
         let first = node_row("node-1", "alpha");
-        let repeat = node_row("node-2", "alpha");
         let events = vec![
-            log_event("event-1", LogPayload::NodeWrite(first.clone())),
-            log_event("event-2", LogPayload::NodeWrite(repeat.clone())),
+            node_write("event-1", "node-1", "alpha"),
+            node_write("event-2", "node-2", "beta"),
+            node_write("event-3", "node-3", "alpha"),
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
-        assert_eq!(expected_node_hash(&first), expected_node_hash(&repeat));
         assert_eq!(
             rebuilt.entries,
-            vec![IndexEntry {
-                hash: expected_node_hash(&first),
-                first_event_id: "event-1".into(),
-                row_ids: vec!["node-1".into()],
-            }]
+            vec![
+                entry(
+                    expected_node_hash(&node_row("node-2", "beta")),
+                    "event-2",
+                    &["node-2"]
+                ),
+                entry(expected_node_hash(&first), "event-3", &["node-3"]),
+            ]
         );
     }
 
@@ -840,32 +926,41 @@ mod tests {
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert_eq!(rebuilt.entries.len(), 1);
-        assert_eq!(rebuilt.entries[0].first_event_id, "event-1");
+        assert_eq!(rebuilt.entries[0].write.first_event_id, "event-2");
     }
 
     #[test]
-    fn entries_follow_the_order_their_first_carriers_were_written() {
-        // Arrange
-        let events = vec![
-            log_event("event-1", LogPayload::NodeWrite(node_row("node-1", "c"))),
-            log_event("event-2", LogPayload::NodeWrite(node_row("node-2", "a"))),
-            log_event("event-3", LogPayload::NodeWrite(node_row("node-3", "b"))),
+    fn entries_follow_the_log_order_of_their_carriers_not_the_order_of_their_ids() {
+        // Arrange: the ids sort differently as text (event-10 before event-2
+        // before event-9) than they appear in the log.
+        let ids = [
+            "event-9",
+            "event-10",
+            "event-2",
+            "event-33",
+            "event-4",
+            "event-100",
         ];
+        let events: Vec<LogEvent> = ids
+            .iter()
+            .enumerate()
+            .map(|(position, id)| node_write(id, &format!("node-{position}"), id))
+            .collect();
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         let order: Vec<&str> = rebuilt
             .entries
             .iter()
-            .map(|entry| entry.first_event_id.as_str())
+            .map(|entry| entry.write.first_event_id.as_str())
             .collect();
-        assert_eq!(order, ["event-1", "event-2", "event-3"]);
+        assert_eq!(order, ids);
     }
 
     #[test]
@@ -887,7 +982,7 @@ mod tests {
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert!(rebuilt.entries.is_empty());
@@ -897,47 +992,105 @@ mod tests {
     #[test]
     fn a_voided_event_removes_its_index_entry_but_the_bloom_keeps_the_hash() {
         // Arrange
-        let node = node_row("node-1", "alpha");
         let events = vec![
-            log_event("event-1", LogPayload::NodeWrite(node.clone())),
+            node_write("event-1", "node-1", "alpha"),
             voided("event-2", "event-1"),
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert!(rebuilt.entries.is_empty());
-        assert!(rebuilt.bloom.might_contain(&expected_node_hash(&node)));
+        assert!(rebuilt.bloom.might_contain(&alpha_hash()));
     }
 
     #[test]
-    fn a_retry_after_a_void_becomes_the_first_carrier() {
+    fn a_retry_after_a_void_becomes_the_carrier() {
         // Arrange
-        let first = node_row("node-1", "alpha");
-        let retry = node_row("node-2", "alpha");
         let events = vec![
-            log_event("event-1", LogPayload::NodeWrite(first.clone())),
+            node_write("event-1", "node-1", "alpha"),
             voided("event-2", "event-1"),
-            log_event("event-3", LogPayload::NodeWrite(retry)),
+            node_write("event-3", "node-2", "alpha"),
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert_eq!(
             rebuilt.entries,
-            vec![IndexEntry {
-                hash: expected_node_hash(&first),
-                first_event_id: "event-3".into(),
-                row_ids: vec!["node-2".into()],
-            }]
+            vec![entry(alpha_hash(), "event-3", &["node-2"])]
         );
     }
 
     #[test]
-    fn voiding_a_batch_removes_every_entry_it_was_first_to_carry() {
+    fn a_repeated_void_of_the_same_target_keeps_the_retry() {
+        // Arrange
+        let events = vec![
+            node_write("event-1", "node-1", "alpha"),
+            voided("event-2", "event-1"),
+            node_write("event-3", "node-2", "alpha"),
+            voided("event-4", "event-1"),
+        ];
+
+        // Act
+        let rebuilt = rebuild_from_log(events, small_config());
+
+        // Assert
+        assert_eq!(
+            rebuilt.entries,
+            vec![entry(alpha_hash(), "event-3", &["node-2"])]
+        );
+    }
+
+    #[test]
+    fn a_replayed_event_id_is_applied_once() {
+        // Arrange
+        let batch = log_event(
+            "event-1",
+            LogPayload::EpisodeBatch(vec![
+                RowEffect::Node(node_row("node-1", "alpha")),
+                RowEffect::Node(node_row("node-2", "beta")),
+            ]),
+        );
+        let events = vec![batch.clone(), batch];
+
+        // Act
+        let rebuilt = rebuild_from_log(events, small_config());
+
+        // Assert
+        assert_eq!(
+            rebuilt.entries,
+            vec![
+                entry(alpha_hash(), "event-1", &["node-1"]),
+                entry(
+                    expected_node_hash(&node_row("node-2", "beta")),
+                    "event-1",
+                    &["node-2"]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_event_voided_earlier_in_the_scan_is_skipped() {
+        // Arrange
+        let events = vec![
+            voided("event-1", "event-2"),
+            node_write("event-2", "node-1", "alpha"),
+        ];
+
+        // Act
+        let rebuilt = rebuild_from_log(events, small_config());
+
+        // Assert
+        assert!(rebuilt.entries.is_empty());
+        assert_eq!(rebuilt.bloom, HashBloom::new(small_config()));
+    }
+
+    #[test]
+    fn voiding_a_batch_removes_every_entry_it_carried() {
         // Arrange
         let (first, second) = (node_row("node-1", "alpha"), node_row("node-2", "beta"));
         let events = vec![
@@ -949,36 +1102,28 @@ mod tests {
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert!(rebuilt.entries.is_empty());
     }
 
     #[test]
-    fn voiding_a_later_carrier_leaves_the_first_carriers_entry_alone() {
+    fn voiding_a_later_carrier_leaves_the_earlier_carriers_entry() {
         // Arrange
-        let node = node_row("node-1", "alpha");
         let events = vec![
-            log_event("event-1", LogPayload::NodeWrite(node.clone())),
-            log_event(
-                "event-2",
-                LogPayload::NodeWrite(node_row("node-2", "alpha")),
-            ),
+            node_write("event-1", "node-1", "alpha"),
+            node_write("event-2", "node-2", "alpha"),
             voided("event-3", "event-2"),
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert_eq!(
             rebuilt.entries,
-            vec![IndexEntry {
-                hash: expected_node_hash(&node),
-                first_event_id: "event-1".into(),
-                row_ids: vec!["node-1".into()],
-            }]
+            vec![entry(alpha_hash(), "event-1", &["node-1"])]
         );
     }
 
@@ -986,15 +1131,12 @@ mod tests {
     fn a_void_for_an_unknown_event_changes_nothing() {
         // Arrange
         let events = vec![
-            log_event(
-                "event-1",
-                LogPayload::NodeWrite(node_row("node-1", "alpha")),
-            ),
+            node_write("event-1", "node-1", "alpha"),
             voided("event-2", "event-404"),
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert_eq!(rebuilt.entries.len(), 1);
@@ -1025,17 +1167,13 @@ mod tests {
         let events = vec![log_event("event-1", LogPayload::NodeWrite(row))];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert_eq!(rebuilt.bloom, incremental);
         assert_eq!(
             rebuilt.entries,
-            vec![IndexEntry {
-                hash: write_path_hash,
-                first_event_id: "event-1".into(),
-                row_ids: vec!["node-1".into()],
-            }]
+            vec![entry(write_path_hash, "event-1", &["node-1"])]
         );
     }
 
@@ -1053,7 +1191,7 @@ mod tests {
         ];
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert_eq!(rebuilt.entries.len(), 2);
@@ -1086,19 +1224,12 @@ mod tests {
                 incremental.insert(&hash);
             }
         }
-        let probes: Vec<[u8; 32]> = sample_hashes(3_000_000..3_001_000);
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config()).bloom;
+        let rebuilt = rebuild_from_log(events, small_config()).bloom;
 
         // Assert
         assert_eq!(rebuilt, incremental);
-        let rebuilt_answers: Vec<bool> = probes.iter().map(|h| rebuilt.might_contain(h)).collect();
-        let incremental_answers: Vec<bool> = probes
-            .iter()
-            .map(|h| incremental.might_contain(h))
-            .collect();
-        assert_eq!(rebuilt_answers, incremental_answers);
     }
 
     #[test]
@@ -1115,7 +1246,7 @@ mod tests {
             .collect();
 
         // Act
-        let rebuilt = rebuild_from_log(events.into_iter(), small_config());
+        let rebuilt = rebuild_from_log(events, small_config());
 
         // Assert
         assert_eq!(expected.len(), 300 + 100);
