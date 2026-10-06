@@ -30,7 +30,7 @@ use crate::DefaultBackend;
 
 /// What a test does to the log writer while a sweep runs.
 #[derive(Default)]
-struct Control {
+pub(super) struct Control {
     seen: AtomicU64,
     /// The append, counted from `fail_nth_from_now`, that fails. Zero never.
     fail_on: AtomicU64,
@@ -40,14 +40,14 @@ struct Control {
 
 impl Control {
     /// Fails the `n`th append from now on, `n` counting from 1.
-    fn fail_nth_from_now(&self, n: u64) {
+    pub(super) fn fail_nth_from_now(&self, n: u64) {
         self.seen.store(0, Ordering::SeqCst);
         self.fail_on.store(n, Ordering::SeqCst);
     }
 
     /// Makes the next append announce itself and wait. The notification says the
     /// append is running; sending on the returned sender lets it go on.
-    fn hold_next_append(&self) -> (Arc<Notify>, mpsc::Sender<()>) {
+    pub(super) fn hold_next_append(&self) -> (Arc<Notify>, mpsc::Sender<()>) {
         let (release, wait) = mpsc::channel();
         let reached = Arc::new(Notify::new());
         *self.gate.lock().unwrap() = Some((Arc::clone(&reached), wait));
@@ -84,7 +84,7 @@ impl LogWriter for Controlled {
     }
 }
 
-fn controlled_log(env: &Env) -> (SharedLog, Arc<Control>) {
+pub(super) fn controlled_log(env: &Env) -> (SharedLog, Arc<Control>) {
     let control = Arc::new(Control::default());
     let inner = WalWriter::open_with_system_clock(&env.wal_dir(), ONE_SEGMENT).expect("open wal");
     let reader = SequentialScanReader::local(&env.wal_dir()).expect("open reader");

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use liam_log::event::NodeRow;
 
+pub use self::backfill::BackfillReport;
 use self::logged_plan::{refuse_supersedes, Collision};
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
@@ -29,6 +30,7 @@ use crate::types::{
 };
 use crate::value::{Row, Value};
 
+mod backfill;
 mod gc;
 mod log_cursor;
 mod log_open;
@@ -2098,6 +2100,7 @@ mod tests {
     use crate::DefaultGraph;
     use tempfile::TempDir;
 
+    mod backfill;
     mod backwards_clock;
     mod catch_up;
     mod gc_log;
