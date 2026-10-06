@@ -101,7 +101,7 @@ pub(crate) trait FileOps: Send {
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()>;
 }
 
-struct OsFileOps;
+pub(crate) struct OsFileOps;
 
 impl FileOps for OsFileOps {
     fn write_all(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
@@ -118,6 +118,28 @@ impl FileOps for OsFileOps {
 
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
         File::open(dir)?.sync_all()
+    }
+}
+
+/// Writes `bytes` to a temp file beside `path` and renames it into place, so a
+/// crash leaves the old file or the new one, never a partial write.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8], ops: &mut dyn FileOps) -> io::Result<()> {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".tmp");
+    let staged = PathBuf::from(staged);
+    let mut file = File::create(&staged)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&staged, path)?;
+    ops.sync_dir(sync_dir_for(path))
+}
+
+/// The directory whose entry for `path` must reach disk. A bare file name has
+/// an empty parent, which means the current directory.
+fn sync_dir_for(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     }
 }
 
@@ -401,12 +423,7 @@ fn load_or_create_log_id(dir: &Path, ops: &mut dyn FileOps) -> Result<Uuid, WalE
         Err(error) => return Err(error.into()),
     }
     let log_id = Uuid::now_v7();
-    let staged = dir.join(format!("{MANIFEST_NAME}.tmp"));
-    let mut file = File::create(&staged)?;
-    file.write_all(log_id.hyphenated().to_string().as_bytes())?;
-    file.sync_all()?;
-    fs::rename(&staged, &manifest)?;
-    ops.sync_dir(dir)?;
+    write_atomically(&manifest, log_id.hyphenated().to_string().as_bytes(), ops)?;
     Ok(log_id)
 }
 
@@ -2108,6 +2125,24 @@ mod tests {
             matches!(result, Err(WalError::RecordTooLarge(len)) if len == too_large),
             "unexpected result: {result:?}"
         );
+    }
+
+    #[test]
+    fn a_bare_file_name_syncs_the_current_directory() {
+        // Act
+        let dir = sync_dir_for(Path::new("bloom.bin"));
+
+        // Assert
+        assert_eq!(dir, Path::new("."));
+    }
+
+    #[test]
+    fn a_nested_path_syncs_its_parent_directory() {
+        // Act
+        let dir = sync_dir_for(Path::new("a/b.bin"));
+
+        // Assert
+        assert_eq!(dir, Path::new("a"));
     }
 
     #[test]

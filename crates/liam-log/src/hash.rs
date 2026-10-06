@@ -47,6 +47,11 @@ const EDGE_TAG: u8 = 0x02;
 // Quiet NaN with an empty payload, the one bit pattern every NaN folds to.
 const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
 
+/// Version of the canonical encoding and digest behind every content hash. A
+/// persisted bloom filter stores it, so changing the encoding above or the
+/// digest below requires bumping it.
+pub const CONTENT_HASH_SCHEME: u32 = 1;
+
 // The only place bytes become a hash, so a keyed digest replaces it here.
 fn content_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()

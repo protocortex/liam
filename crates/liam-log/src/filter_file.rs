@@ -6,24 +6,35 @@
 //! position it was built under, so a mismatch is detected and the caller
 //! rebuilds from the log rather than trusting a filter that no longer fits.
 
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::mem::size_of;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::dedup::{BloomConfig, HashBloom};
+use crate::hash::CONTENT_HASH_SCHEME;
+use crate::wal::{write_atomically, OsFileOps};
 use crate::LogOffset;
 
-/// Version of the canonical encoding and digest behind every content hash.
-/// It is stored with a persisted filter, so changing either must bump it.
-pub const CONTENT_HASH_SCHEME: u32 = 1;
+/// The trailing digit of the file magic. Bump it whenever the encoding below or
+/// the bloom seed (`BLOOM_SEED` in `dedup`) changes, so an old file is rejected
+/// instead of being read as bits that no longer mean the same thing.
+const FORMAT_VERSION: u8 = 2;
 
-/// What lands on disk: everything the filter was built under travels alongside
-/// it, so a changed hash scheme, config, log or log position is detected
-/// instead of silently misread.
+const FILE_MAGIC: [u8; 4] = [b'L', b'B', b'F', b'0' + FORMAT_VERSION];
+const HEADER_LEN: usize = FILE_MAGIC.len() + size_of::<u32>();
+
+/// A rate of 1e-9, the lowest `BloomConfig` allows, needs 30 hashes, so a stored
+/// count above this is damage and would make every lookup needlessly slow.
+const MAX_NUM_HASHES: u32 = 64;
+
+const WORD_BYTES: usize = size_of::<u64>();
+
+/// Field order is part of the format. `bits` stays last so a truncated file
+/// fails to decode; it holds the filter's `u64` words as little-endian bytes.
 #[derive(Serialize, Deserialize)]
 struct PersistedFilter {
     scheme: u32,
@@ -33,59 +44,43 @@ struct PersistedFilter {
     /// `(segment, index)` of the last event folded into the filter.
     folded_through: Option<(u64, u64)>,
     num_hashes: u32,
-    bits: Vec<u64>,
+    bits: Vec<u8>,
 }
 
-/// A rate of 1e-9, the lowest `BloomConfig` allows, needs 30 hashes, so a stored
-/// count above this is damage and would make every lookup needlessly slow.
-const MAX_NUM_HASHES: u32 = 64;
-
-const FILE_MAGIC: [u8; 4] = *b"LBF1";
-const HEADER_LEN: usize = FILE_MAGIC.len() + size_of::<u32>();
-
 impl HashBloom {
-    /// Records `config`, the sizing this filter was built with, alongside it.
-    /// Writes magic, checksum, then the encoded filter to a temp file beside
-    /// `path` and renames it into place, so a crash never leaves a partial file.
-    /// `folded_through` is the offset of the last event the filter has seen, or
-    /// `None` for an empty log.
+    /// Writes magic, checksum, then the filter and the config it was built
+    /// with to a temp file beside `path` and renames it into place, so a crash
+    /// never leaves a partial file. `folded_through` is the offset of the last
+    /// event the filter has seen, or `None` for an empty log.
     pub fn save(
         &self,
         path: &Path,
-        config: &BloomConfig,
         log_id: Uuid,
         folded_through: Option<LogOffset>,
     ) -> io::Result<()> {
+        let (words, num_hashes) = self.to_parts();
+        let config = self.config();
         let persisted = PersistedFilter {
             scheme: CONTENT_HASH_SCHEME,
             expected_items: config.expected_items() as u64,
             false_positive_rate: config.false_positive_rate(),
             log_id: log_id.into_bytes(),
             folded_through: folded_through.map(|offset| (offset.segment, offset.index)),
-            num_hashes: self.filter.num_hashes(),
-            bits: self.filter.iter().collect(),
+            num_hashes,
+            bits: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
         };
-        let bytes = frame(&persisted)?;
-
-        let mut staged = path.as_os_str().to_owned();
-        staged.push(".tmp");
-        let staged = PathBuf::from(staged);
-        let mut file = File::create(&staged)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&staged, path)?;
-        let dir = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        File::open(dir)?.sync_all()
+        write_atomically(path, &frame(&persisted)?, &mut OsFileOps)
     }
 
     /// Never panics: any unreadable, damaged, differently configured, foreign
     /// or out of date file comes back as `Stale` so the caller rebuilds from
     /// the log. `head` is the offset of the log's last event, or `None` when
-    /// the log is empty. A filter saved ahead of `head` is kept: it can only
-    /// add false positives, which the exact index overrules.
+    /// the log is empty.
+    ///
+    /// A filter saved ahead of `head` is stale too, although it could only add
+    /// false positives. The WAL reissues offsets after a loss, so events
+    /// appended since then may carry hashes the kept filter never saw, and it
+    /// would answer a definite "new" for a hash already in the log.
     pub fn load(
         path: &Path,
         config: &BloomConfig,
@@ -107,6 +102,10 @@ impl HashBloom {
             }
         };
         let Some(persisted) = decode(&bytes) else {
+            tracing::warn!(
+                path = %path.display(),
+                "bloom filter file is damaged, rebuilding from the log"
+            );
             return FilterLoad::Stale(StaleReason::Corrupt);
         };
         if persisted.scheme != CONTENT_HASH_SCHEME
@@ -124,21 +123,30 @@ impl HashBloom {
         if folded_through < head {
             return FilterLoad::Stale(StaleReason::BehindLog);
         }
-        FilterLoad::Fresh(Self::from_parts(persisted.bits, persisted.num_hashes))
+        if folded_through > head {
+            return FilterLoad::Stale(StaleReason::AheadOfLog);
+        }
+        FilterLoad::Fresh(Self::from_parts(
+            bit_words(&persisted.bits),
+            persisted.num_hashes,
+            config.clone(),
+        ))
     }
 }
 
+/// Encodes straight after a reserved header, so the payload is not copied again.
 fn frame(persisted: &PersistedFilter) -> io::Result<Vec<u8>> {
-    let payload = postcard::to_stdvec(persisted).map_err(io::Error::other)?;
-    Ok(frame_payload(&payload))
+    let mut bytes =
+        postcard::to_extend(persisted, vec![0; HEADER_LEN]).map_err(io::Error::other)?;
+    seal(&mut bytes);
+    Ok(bytes)
 }
 
-fn frame_payload(payload: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
-    bytes.extend(FILE_MAGIC);
-    bytes.extend(crc32fast::hash(payload).to_le_bytes());
-    bytes.extend(payload);
-    bytes
+/// Fills the reserved header with the magic and the checksum of the payload.
+fn seal(bytes: &mut [u8]) {
+    let checksum = crc32fast::hash(&bytes[HEADER_LEN..]).to_le_bytes();
+    bytes[..FILE_MAGIC.len()].copy_from_slice(&FILE_MAGIC);
+    bytes[FILE_MAGIC.len()..HEADER_LEN].copy_from_slice(&checksum);
 }
 
 fn decode(bytes: &[u8]) -> Option<PersistedFilter> {
@@ -151,9 +159,18 @@ fn decode(bytes: &[u8]) -> Option<PersistedFilter> {
     // filter with no bits or a wild hash count would panic or crawl on first use.
     // Postcard sizes the bit vector from the bytes actually present, so a
     // corrupt length prefix fails to decode instead of allocating.
-    let persisted: PersistedFilter = postcard::from_bytes(payload).ok()?;
-    let usable = !persisted.bits.is_empty() && (1..=MAX_NUM_HASHES).contains(&persisted.num_hashes);
+    let (persisted, rest): (PersistedFilter, &[u8]) = postcard::take_from_bytes(payload).ok()?;
+    let usable = rest.is_empty()
+        && !persisted.bits.is_empty()
+        && persisted.bits.len() % WORD_BYTES == 0
+        && (1..=MAX_NUM_HASHES).contains(&persisted.num_hashes);
     usable.then_some(persisted)
+}
+
+/// `bits` must be a multiple of the word size, which `decode` guarantees.
+fn bit_words(bits: &[u8]) -> Vec<u64> {
+    let (words, _) = bits.as_chunks::<WORD_BYTES>();
+    words.iter().map(|word| u64::from_le_bytes(*word)).collect()
 }
 
 /// Why a persisted filter cannot be used as is.
@@ -169,6 +186,8 @@ pub enum StaleReason {
     LogMismatch,
     /// The log holds events the saved filter has not seen.
     BehindLog,
+    /// The saved filter has seen events the log no longer holds.
+    AheadOfLog,
 }
 
 /// Result of loading a persisted filter: usable, or stale so the caller
@@ -182,16 +201,25 @@ pub enum FilterLoad {
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
-    use std::sync::{Arc, Mutex};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, Once};
 
     use sha2::{Digest, Sha256};
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
+    use tracing::subscriber::Interest;
     use tracing::{Event, Level, Metadata, Subscriber};
 
     use super::*;
     use crate::dedup::PreCheck;
-    use crate::fixtures::{filter_with, sample_hashes, small_config};
+    use crate::fixtures::{filter_with, sample_hash, sample_hashes, small_config};
+
+    const PINNED_FALSE_POSITIVES: [u32; 21] = [
+        5001, 5106, 5172, 5504, 5565, 5590, 5638, 5660, 5701, 5718, 5738, 5992, 6285, 6409, 6563,
+        6722, 6778, 6790, 6795, 6810, 6820,
+    ];
+    const PINNED_FILE_DIGEST: &str =
+        "2015c3f075bb22e8075c067b4f0b9a9d6d5d917fcbe881d476d0f8611672d224";
 
     fn log_id() -> Uuid {
         Uuid::from_u128(0x1234)
@@ -219,13 +247,32 @@ mod tests {
     fn save_real_filter(dir: &Path) -> (PathBuf, Vec<u8>) {
         let path = dir.join("bloom.bin");
         filter_with(small_config(), &sample_hashes(0..500))
-            .save(&path, &small_config(), log_id(), None)
+            .save(&path, log_id(), None)
             .expect("save");
         let bytes = fs::read(&path).expect("read back");
         (path, bytes)
     }
 
-    fn persisted(bits: Vec<u64>, num_hashes: u32) -> PersistedFilter {
+    fn frame_payload(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; HEADER_LEN];
+        bytes.extend(payload);
+        seal(&mut bytes);
+        bytes
+    }
+
+    /// Postcard's varint for an unsigned integer: seven bits per byte, low
+    /// group first, high bit set while more bytes follow.
+    fn varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        while value >= 0x80 {
+            out.push((value & 0x7f) as u8 | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+        out
+    }
+
+    fn persisted(bits: Vec<u8>, num_hashes: u32) -> PersistedFilter {
         let config = small_config();
         PersistedFilter {
             scheme: CONTENT_HASH_SCHEME,
@@ -246,6 +293,19 @@ mod tests {
     #[derive(Clone, Default)]
     struct WarnCapture(Arc<Mutex<Vec<String>>>);
 
+    impl WarnCapture {
+        /// Runs `body` with this capture as the thread's subscriber. A global
+        /// subscriber is installed first so that a callsite first reached by a
+        /// parallel test is never cached as disabled before the capture is set.
+        fn run<T>(&self, body: impl FnOnce() -> T) -> T {
+            static GLOBAL: Once = Once::new();
+            GLOBAL.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(WarnCapture::default());
+            });
+            tracing::subscriber::with_default(self.clone(), body)
+        }
+    }
+
     struct Message(String);
 
     impl Visit for Message {
@@ -257,6 +317,9 @@ mod tests {
     }
 
     impl Subscriber for WarnCapture {
+        fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+            Interest::always()
+        }
         fn enabled(&self, _: &Metadata<'_>) -> bool {
             true
         }
@@ -286,9 +349,7 @@ mod tests {
         let head = Some(offset(2, 40));
 
         // Act
-        original
-            .save(&path, &small_config(), log_id(), head)
-            .expect("save");
+        original.save(&path, log_id(), head).expect("save");
         let loaded = HashBloom::load(&path, &small_config(), log_id(), head);
 
         // Assert
@@ -303,7 +364,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bloom.bin");
         HashBloom::new(small_config())
-            .save(&path, &small_config(), log_id(), None)
+            .save(&path, log_id(), None)
             .expect("save");
 
         // Act
@@ -333,7 +394,7 @@ mod tests {
         let capture = WarnCapture::default();
 
         // Act
-        let loaded = tracing::subscriber::with_default(capture.clone(), || load_small(dir.path()));
+        let loaded = capture.run(|| load_small(dir.path()));
 
         // Assert
         assert_stale(loaded, StaleReason::Unreadable);
@@ -352,9 +413,7 @@ mod tests {
         let capture = WarnCapture::default();
 
         // Act
-        tracing::subscriber::with_default(capture.clone(), || {
-            load_small(&dir.path().join("absent.bin"))
-        });
+        capture.run(|| load_small(&dir.path().join("absent.bin")));
 
         // Assert
         assert!(capture.0.lock().expect("capture lock").is_empty());
@@ -464,33 +523,62 @@ mod tests {
     }
 
     #[test]
-    fn the_on_disk_format_and_hash_seed_are_pinned() {
+    fn the_on_disk_format_is_pinned_byte_for_byte() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bloom.bin");
-        let filter = filter_with(small_config(), &sample_hashes(0..10));
+        let filter = filter_with(small_config(), &sample_hashes(0..5_000));
+        let (words, num_hashes) = filter.to_parts();
+        assert!(num_hashes < 0x80, "the hash count must fit one varint byte");
+        let bit_bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
 
         // Act
         filter
-            .save(&path, &small_config(), log_id(), Some(offset(2, 40)))
+            .save(&path, log_id(), Some(offset(2, 40)))
             .expect("save");
-        let digest = Sha256::digest(fs::read(&path).expect("read back"));
-        let answers: String = sample_hashes(0..64)
-            .iter()
-            .map(|hash| if filter.might_contain(hash) { '1' } else { '0' })
+        let bytes = fs::read(&path).expect("read back");
+
+        // Assert: header, then every payload field written out by hand.
+        assert_eq!(&bytes[..4], b"LBF2");
+        assert_eq!(bytes[4..8], crc32fast::hash(&bytes[8..]).to_le_bytes());
+        let mut payload = vec![0x01]; // scheme 1
+        payload.extend([0x88, 0x27]); // expected_items 5000 = 0x27 << 7 | 0x08
+        payload.extend(0.01_f64.to_le_bytes());
+        payload.extend(log_id().into_bytes());
+        payload.extend([0x01, 0x02, 0x28]); // Some((2, 40))
+        payload.push(num_hashes as u8);
+        payload.extend(varint(bit_bytes.len() as u64));
+        payload.extend(&bit_bytes);
+        assert!(bytes[8..] == payload[..], "payload differs from the spec");
+    }
+
+    #[test]
+    fn the_bloom_seed_is_pinned_through_a_save_and_load() {
+        // Arrange: near capacity, false positives depend on the seed and the
+        // loaded filter must reproduce them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bloom.bin");
+        let inserted = sample_hashes(0..5_000);
+        let head = Some(offset(2, 40));
+        filter_with(small_config(), &inserted)
+            .save(&path, log_id(), head)
+            .expect("save");
+
+        // Act
+        let loaded = assert_fresh(HashBloom::load(&path, &small_config(), log_id(), head));
+        let false_positives: Vec<u32> = (5_000..7_000)
+            .filter(|index| loaded.might_contain(&sample_hash(*index)))
             .collect();
 
-        // Assert: a change here means saved filters no longer load as they were
-        // built, so the format version must be bumped with it.
+        // Assert: the indices below and the digest were recorded from a run of
+        // this test (printing them, then `Sha256` over the saved file); a
+        // change means saved filters no longer load as built, so bump
+        // FORMAT_VERSION with it.
+        assert!(inserted.iter().all(|hash| loaded.might_contain(hash)));
+        assert_eq!(false_positives, PINNED_FALSE_POSITIVES);
+        let digest = Sha256::digest(fs::read(&path).expect("read back"));
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(
-            hex,
-            "5bfeb3bc399079b6c6521368cdd5385a40171b534e56e82ba4e8f2280cf80abe"
-        );
-        assert_eq!(
-            answers,
-            "1111111111000000000000000000000000000000000000000000000000000000"
-        );
+        assert_eq!(hex, PINNED_FILE_DIGEST);
     }
 
     #[test]
@@ -526,7 +614,7 @@ mod tests {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bloom.bin");
-        let mut other_scheme = persisted(vec![0; 8], 3);
+        let mut other_scheme = persisted(vec![0; 64], 3);
         other_scheme.scheme = CONTENT_HASH_SCHEME + 1;
         fs::write(&path, frame(&other_scheme).expect("frame")).expect("write");
 
@@ -546,13 +634,11 @@ mod tests {
         let second = filter_with(small_config(), &sample_hashes(100..200));
         let head = Some(offset(0, 2));
         first
-            .save(&path, &small_config(), log_id(), Some(offset(0, 1)))
+            .save(&path, log_id(), Some(offset(0, 1)))
             .expect("save first");
 
         // Act
-        second
-            .save(&path, &small_config(), log_id(), head)
-            .expect("save second");
+        second.save(&path, log_id(), head).expect("save second");
         let loaded = HashBloom::load(&path, &small_config(), log_id(), head);
 
         // Assert
@@ -587,7 +673,7 @@ mod tests {
         for num_hashes in [0, MAX_NUM_HASHES + 1, u32::MAX] {
             fs::write(
                 &path,
-                frame(&persisted(vec![0; 8], num_hashes)).expect("frame"),
+                frame(&persisted(vec![0; 64], num_hashes)).expect("frame"),
             )
             .expect("write");
 
@@ -627,7 +713,7 @@ mod tests {
         let path = dir.path().join("bloom.bin");
         let head = Some(offset(0, 5));
         filter_with(small_config(), &sample_hashes(0..500))
-            .save(&path, &small_config(), log_id(), head)
+            .save(&path, log_id(), head)
             .expect("save");
 
         // Act
@@ -643,7 +729,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bloom.bin");
         filter_with(small_config(), &sample_hashes(0..500))
-            .save(&path, &small_config(), log_id(), Some(offset(1, 9)))
+            .save(&path, log_id(), Some(offset(1, 9)))
             .expect("save");
 
         for head in [offset(1, 10), offset(2, 0)] {
@@ -661,7 +747,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bloom.bin");
         HashBloom::new(small_config())
-            .save(&path, &small_config(), log_id(), None)
+            .save(&path, log_id(), None)
             .expect("save");
 
         // Act
@@ -678,7 +764,7 @@ mod tests {
         let path = dir.path().join("bloom.bin");
         let head = Some(offset(3, 7));
         filter_with(small_config(), &sample_hashes(0..500))
-            .save(&path, &small_config(), log_id(), head)
+            .save(&path, log_id(), head)
             .expect("save");
 
         // Act
@@ -689,18 +775,175 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_ahead_of_the_log_head_is_kept() {
+    fn a_filter_ahead_of_the_log_head_is_stale() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bloom.bin");
         filter_with(small_config(), &sample_hashes(0..500))
-            .save(&path, &small_config(), log_id(), Some(offset(3, 7)))
+            .save(&path, log_id(), Some(offset(3, 7)))
+            .expect("save");
+
+        for head in [offset(3, 6), offset(2, 99)] {
+            // Act
+            let loaded = HashBloom::load(&path, &small_config(), log_id(), Some(head));
+
+            // Assert
+            assert_stale(loaded, StaleReason::AheadOfLog);
+        }
+    }
+
+    #[test]
+    fn a_filter_with_a_position_is_ahead_of_an_empty_log() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bloom.bin");
+        filter_with(small_config(), &sample_hashes(0..500))
+            .save(&path, log_id(), Some(offset(0, 0)))
             .expect("save");
 
         // Act
-        let loaded = HashBloom::load(&path, &small_config(), log_id(), Some(offset(3, 6)));
+        let loaded = load_small(&path);
 
         // Assert
-        assert_fresh(loaded);
+        assert_stale(loaded, StaleReason::AheadOfLog);
+    }
+
+    #[test]
+    fn a_checksummed_payload_with_trailing_bytes_is_corrupt() {
+        // Arrange: the checksum covers the extra byte, so only the decoder can object.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bloom.bin");
+        let mut payload = postcard::to_stdvec(&persisted(vec![0; 64], 3)).expect("encode");
+        payload.push(0);
+        fs::write(&path, frame_payload(&payload)).expect("write");
+
+        // Act
+        let loaded = load_small(&path);
+
+        // Assert
+        assert_stale(loaded, StaleReason::Corrupt);
+    }
+
+    #[test]
+    fn a_checksummed_bit_vector_that_is_not_whole_words_is_corrupt() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bloom.bin");
+
+        for len in [1, 7, 9, 63] {
+            fs::write(&path, frame(&persisted(vec![0; len], 3)).expect("frame")).expect("write");
+
+            // Act
+            let loaded = load_small(&path);
+
+            // Assert
+            assert!(
+                matches!(&loaded, FilterLoad::Stale(StaleReason::Corrupt)),
+                "{len} bytes: got {loaded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_smallest_and_largest_hash_counts_load_fresh() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bloom.bin");
+
+        for num_hashes in [1, MAX_NUM_HASHES] {
+            fs::write(
+                &path,
+                frame(&persisted(vec![0; 64], num_hashes)).expect("frame"),
+            )
+            .expect("write");
+
+            // Act
+            let loaded = load_small(&path);
+
+            // Assert
+            let filter = assert_fresh(loaded);
+            assert_eq!(filter.to_parts().1, num_hashes);
+        }
+    }
+
+    #[test]
+    fn a_checksum_mismatch_is_corrupt_wherever_the_flip_lands() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, saved) = save_real_filter(dir.path());
+        let positions = [HEADER_LEN, saved.len() / 2, saved.len() - 1];
+
+        for position in positions {
+            let mut damaged = saved.clone();
+            damaged[position] ^= 0x01;
+            fs::write(&path, &damaged).expect("write damaged file");
+
+            // Act
+            let loaded = load_small(&path);
+
+            // Assert
+            assert!(
+                matches!(&loaded, FilterLoad::Stale(StaleReason::Corrupt)),
+                "flip at {position}: got {loaded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_damaged_filter_file_warns_with_its_path() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bloom.bin");
+        fs::write(&path, b"this is not a bloom filter").expect("write garbage");
+        let capture = WarnCapture::default();
+
+        // Act
+        capture.run(|| load_small(&path));
+
+        // Assert
+        let warnings = capture.0.lock().expect("capture lock");
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert!(warnings[0].contains("is damaged"), "got {warnings:?}");
+    }
+
+    // The save path syncs the file and its directory, but an fsync is not
+    // observable from inside the process, so durability itself is a known gap
+    // here; these tests cover only that a failed or repeated save never leaves
+    // a mixed file behind.
+    #[test]
+    fn a_save_replaces_the_file_without_writing_into_the_old_one() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bloom.bin");
+        let old = dir.path().join("old.bin");
+        let first = filter_with(small_config(), &sample_hashes(0..100));
+        let second = filter_with(small_config(), &sample_hashes(100..200));
+        first.save(&path, log_id(), None).expect("save first");
+        fs::hard_link(&path, &old).expect("link old");
+
+        // Act
+        second.save(&path, log_id(), None).expect("save second");
+
+        // Assert: an in-place write would have changed the linked old file.
+        assert_eq!(assert_fresh(load_small(&old)), first);
+        assert_eq!(assert_fresh(load_small(&path)), second);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_previous_file_intact() {
+        // Arrange: a directory squats on the staging name, so the save fails.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bloom.bin");
+        let first = filter_with(small_config(), &sample_hashes(0..100));
+        first.save(&path, log_id(), None).expect("save first");
+        fs::create_dir(dir.path().join("bloom.bin.tmp")).expect("block staging");
+
+        // Act
+        let result =
+            filter_with(small_config(), &sample_hashes(100..200)).save(&path, log_id(), None);
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(assert_fresh(load_small(&path)), first);
     }
 }
