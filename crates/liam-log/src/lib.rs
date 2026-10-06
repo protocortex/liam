@@ -255,8 +255,12 @@ pub(crate) mod fixtures {
 
     use crate::dedup::{BloomConfig, HashBloom};
     use crate::event::{
-        LogEvent, LogPayload, TombstoneTable, TombstoneTarget, CURRENT_SCHEMA_VERSION,
+        EdgeRow, LogEvent, LogPayload, NodeRow, TombstoneTable, TombstoneTarget,
+        CURRENT_SCHEMA_VERSION,
     };
+
+    /// Open-ended end of a validity or transaction interval, in epoch millis.
+    pub(crate) const FOREVER: i64 = 4_102_444_800_000;
 
     /// A distinct event per index; every index encodes to the same byte length.
     pub(crate) fn event(index: usize) -> LogEvent {
@@ -275,6 +279,59 @@ pub(crate) mod fixtures {
             }]),
         }
     }
+
+    /// A resolved node row whose hashed content is set by `content`, so rows
+    /// with equal `content` hash alike whatever their ids.
+    pub(crate) fn node_row(id: &str, content: &str) -> NodeRow {
+        NodeRow {
+            id: id.into(),
+            kind: "fact".into(),
+            label: "label".into(),
+            content: content.into(),
+            producer: "agent-a".into(),
+            attributes: "{}".into(),
+            scope: Some("proj/a".into()),
+            subject: None,
+            confidence: 0.75,
+            valid_from: 1_000,
+            valid_from_supplied: true,
+            valid_until: FOREVER,
+            tx_from: 2_000,
+            tx_to: FOREVER,
+        }
+    }
+
+    /// A resolved edge row whose hashed content is set by `dst`.
+    pub(crate) fn edge_row(id: &str, dst: &str) -> EdgeRow {
+        EdgeRow {
+            id: id.into(),
+            src: "node-1".into(),
+            dst: dst.into(),
+            edge_type: "relates_to".into(),
+            attributes: "{}".into(),
+            tx_from: 2_000,
+            tx_to: FOREVER,
+        }
+    }
+
+    /// An event around `payload`. Its source differs from the rows' producer
+    /// and its content hash is a sentinel, so a rebuild that reads either
+    /// instead of the row content shows up as a wrong hash.
+    pub(crate) fn log_event(event_id: &str, payload: LogPayload) -> LogEvent {
+        LogEvent {
+            event_id: event_id.into(),
+            content_hash: EVENT_HASH_SENTINEL,
+            source: "log-writer".into(),
+            trust_score: 0.9,
+            observed_at: 1_000,
+            ingested_at: 2_000,
+            encryption_key_id: None,
+            schema_version: CURRENT_SCHEMA_VERSION,
+            payload,
+        }
+    }
+
+    pub(crate) const EVENT_HASH_SENTINEL: [u8; 32] = [0xEE; 32];
 
     pub(crate) fn sample_hash(index: u32) -> [u8; 32] {
         Sha256::digest(index.to_le_bytes()).into()

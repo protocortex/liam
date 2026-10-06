@@ -122,17 +122,6 @@ impl HashBloom {
         Self { config, filter }
     }
 
-    pub fn from_hashes<'a>(
-        config: BloomConfig,
-        hashes: impl IntoIterator<Item = &'a [u8; 32]>,
-    ) -> Self {
-        let mut bloom = Self::new(config);
-        for hash in hashes {
-            bloom.insert(hash);
-        }
-        bloom
-    }
-
     pub fn insert(&mut self, hash: &[u8; 32]) {
         self.filter.insert(hash);
     }
@@ -293,11 +282,12 @@ impl FirstCarriers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{
-        EdgeRow, NodeRow, RowEffect, TombstoneTable, TombstoneTarget, CURRENT_SCHEMA_VERSION,
+    use crate::event::{EdgeRow, NodeRow, RowEffect, TombstoneTable, TombstoneTarget};
+    use crate::fixtures::{
+        edge_row, filter_with, log_event, node_row, sample_hash, sample_hashes, small_config,
+        EVENT_HASH_SENTINEL,
     };
-    use crate::fixtures::{filter_with, sample_hash, sample_hashes, small_config};
-    use crate::hash::{hash_edge, hash_node, EdgeContent, NodeContent};
+    use crate::hash::{content_hashes, hash_edge, hash_node, EdgeContent, NodeContent};
 
     struct AlwaysTrue;
 
@@ -424,18 +414,24 @@ mod tests {
 
     #[test]
     fn filters_built_from_the_same_hashes_are_equal_in_any_insertion_order() {
-        // Arrange
+        // Arrange: 7919 is prime and shares no factor with 2000, so the stride
+        // visits every hash once in an order unlike forward or reverse.
         let hashes = sample_hashes(0..2_000);
+        let strided: Vec<[u8; 32]> = (0..hashes.len())
+            .map(|position| hashes[position * 7_919 % hashes.len()])
+            .collect();
         let reversed: Vec<[u8; 32]> = hashes.iter().rev().copied().collect();
+        assert_ne!(strided, hashes, "the stride must reorder the hashes");
+        assert_ne!(strided, reversed, "the stride must differ from reversing");
 
         // Act
         let forward_filter = filter_with(small_config(), &hashes);
+        let strided_filter = filter_with(small_config(), &strided);
         let reversed_filter = filter_with(small_config(), &reversed);
-        let separate_instance = filter_with(small_config(), &hashes);
 
         // Assert
+        assert_eq!(forward_filter, strided_filter);
         assert_eq!(forward_filter, reversed_filter);
-        assert_eq!(forward_filter, separate_instance);
     }
 
     #[test]
@@ -476,8 +472,11 @@ mod tests {
     }
 
     #[test]
-    fn false_positive_rate_on_absent_hashes_stays_near_the_configured_rate() {
-        // Arrange
+    fn false_positive_rate_on_absent_hashes_stays_within_a_band_around_the_configured_rate() {
+        // Arrange: the seed and the probe set are fixed, so the measured rate
+        // is one repeatable value (about 0.0104). The band is 0.5x to 2x of the
+        // configured 0.01, far wider than the 0.0007 sampling spread, and still
+        // catches a filter sized too small or far too large.
         let filter = filter_with(small_config(), &sample_hashes(0..5_000));
         let absent = sample_hashes(1_000_000..1_020_000);
 
@@ -489,35 +488,10 @@ mod tests {
         let rate = false_positives as f64 / absent.len() as f64;
 
         // Assert
-        assert!(rate > 0.0, "a bloom filter at 1% must show some collisions");
-        assert!(rate < 0.03, "rate {rate} far above the configured 1%");
-    }
-
-    #[test]
-    fn rebuilt_filter_equals_the_incrementally_built_one_on_a_held_out_probe_set() {
-        // Arrange
-        let stored = sample_hashes(0..2_000);
-        let probes: Vec<[u8; 32]> = sample_hashes(0..100)
-            .into_iter()
-            .chain(sample_hashes(2_000_000..2_001_000))
-            .collect();
-        let incremental = filter_with(small_config(), &stored);
-
-        // Act
-        let rebuilt = HashBloom::from_hashes(small_config(), &stored);
-
-        // Assert
-        let incremental_answers: Vec<bool> = probes
-            .iter()
-            .map(|h| incremental.might_contain(h))
-            .collect();
-        let rebuilt_answers: Vec<bool> = probes.iter().map(|h| rebuilt.might_contain(h)).collect();
         assert!(
-            incremental_answers[..100].iter().all(|present| *present),
-            "known-present probes must be found"
+            (0.005..=0.02).contains(&rate),
+            "rate {rate} outside 0.005..=0.02 for a configured 0.01"
         );
-        assert_eq!(rebuilt_answers, incremental_answers);
-        assert_eq!(rebuilt, incremental);
     }
 
     #[tokio::test]
@@ -580,55 +554,6 @@ mod tests {
         assert_eq!(found, Err("index unavailable"));
     }
 
-    fn node_row(id: &str, content: &str) -> NodeRow {
-        NodeRow {
-            id: id.into(),
-            kind: "fact".into(),
-            label: "label".into(),
-            content: content.into(),
-            producer: "agent-a".into(),
-            attributes: "{}".into(),
-            scope: Some("proj/a".into()),
-            subject: None,
-            confidence: 0.75,
-            valid_from: 1_000,
-            valid_from_supplied: true,
-            valid_until: 4_102_444_800_000,
-            tx_from: 2_000,
-            tx_to: 4_102_444_800_000,
-        }
-    }
-
-    fn edge_row(id: &str, dst: &str) -> EdgeRow {
-        EdgeRow {
-            id: id.into(),
-            src: "node-1".into(),
-            dst: dst.into(),
-            edge_type: "relates_to".into(),
-            attributes: "{}".into(),
-            tx_from: 2_000,
-            tx_to: 4_102_444_800_000,
-        }
-    }
-
-    // Sentinel content_hash: rebuild must derive hashes from the row content,
-    // so this value must never end up in the filter or the index.
-    const EVENT_HASH_SENTINEL: [u8; 32] = [0xEE; 32];
-
-    fn log_event(event_id: &str, payload: LogPayload) -> LogEvent {
-        LogEvent {
-            event_id: event_id.into(),
-            content_hash: EVENT_HASH_SENTINEL,
-            source: "agent-a".into(),
-            trust_score: 0.9,
-            observed_at: 1_000,
-            ingested_at: 2_000,
-            encryption_key_id: None,
-            schema_version: CURRENT_SCHEMA_VERSION,
-            payload,
-        }
-    }
-
     fn voided(event_id: &str, target: &str) -> LogEvent {
         log_event(
             event_id,
@@ -638,28 +563,12 @@ mod tests {
         )
     }
 
-    // A row's hash is what the write path computed for the same request:
-    // valid_from counts only when the caller supplied it.
     fn expected_node_hash(row: &NodeRow) -> [u8; 32] {
-        hash_node(&NodeContent {
-            kind: row.kind.clone(),
-            label: row.label.clone(),
-            content: row.content.clone(),
-            producer: row.producer.clone(),
-            scope: row.scope.clone(),
-            subject: row.subject.clone(),
-            attributes: row.attributes.clone(),
-            valid_from: row.valid_from_supplied.then_some(row.valid_from),
-            confidence: row.confidence,
-        })
+        content_hashes(&log_event("probe", LogPayload::NodeWrite(row.clone())))[0].0
     }
 
     fn expected_edge_hash(row: &EdgeRow) -> [u8; 32] {
-        hash_edge(&EdgeContent {
-            src: row.src.clone(),
-            dst: row.dst.clone(),
-            edge_type: row.edge_type.clone(),
-        })
+        content_hashes(&log_event("probe", LogPayload::EdgeWrite(row.clone())))[0].0
     }
 
     fn entry_for<'a>(rebuilt: &'a Rebuilt, hash: &[u8; 32]) -> Option<&'a IndexEntry> {
@@ -786,7 +695,22 @@ mod tests {
         let rebuilt = rebuild_from_log(events.into_iter(), small_config());
 
         // Assert
-        let (node_hash, edge_hash) = (expected_node_hash(&node), expected_edge_hash(&edge));
+        let node_hash = hash_node(&NodeContent {
+            kind: "fact".into(),
+            label: "label".into(),
+            content: "alpha".into(),
+            producer: "agent-a".into(),
+            scope: Some("proj/a".into()),
+            subject: None,
+            attributes: "{}".into(),
+            valid_from: Some(1_000),
+            confidence: 0.75,
+        });
+        let edge_hash = hash_edge(&EdgeContent {
+            src: "node-1".into(),
+            dst: "node-2".into(),
+            edge_type: "relates_to".into(),
+        });
         assert_eq!(
             rebuilt.entries,
             vec![
@@ -1086,15 +1010,15 @@ mod tests {
             ..node_row("node-1", "alpha")
         };
         let write_path_hash = hash_node(&NodeContent {
-            kind: row.kind.clone(),
-            label: row.label.clone(),
-            content: row.content.clone(),
-            producer: row.producer.clone(),
-            scope: row.scope.clone(),
-            subject: row.subject.clone(),
-            attributes: row.attributes.clone(),
+            kind: "fact".into(),
+            label: "label".into(),
+            content: "alpha".into(),
+            producer: "agent-a".into(),
+            scope: Some("proj/a".into()),
+            subject: None,
+            attributes: "{}".into(),
             valid_from: None,
-            confidence: row.confidence,
+            confidence: 0.75,
         });
         let mut incremental = HashBloom::new(small_config());
         incremental.insert(&write_path_hash);
@@ -1152,28 +1076,13 @@ mod tests {
             .collect()
     }
 
-    fn appended_hashes(event: &LogEvent) -> Vec<[u8; 32]> {
-        match &event.payload {
-            LogPayload::NodeWrite(row) => vec![expected_node_hash(row)],
-            LogPayload::EdgeWrite(row) => vec![expected_edge_hash(row)],
-            LogPayload::EpisodeBatch(effects) => effects
-                .iter()
-                .map(|effect| match effect {
-                    RowEffect::Node(row) => expected_node_hash(row),
-                    RowEffect::Edge(row) => expected_edge_hash(row),
-                })
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-
     #[test]
     fn rebuilt_filter_equals_the_one_built_incrementally_during_the_same_appends() {
         // Arrange
         let events = mixed_events(300);
         let mut incremental = HashBloom::new(small_config());
         for event in &events {
-            for hash in appended_hashes(event) {
+            for (hash, _) in content_hashes(event) {
                 incremental.insert(&hash);
             }
         }
@@ -1199,9 +1108,9 @@ mod tests {
         let expected: Vec<([u8; 32], String)> = events
             .iter()
             .flat_map(|event| {
-                appended_hashes(event)
+                content_hashes(event)
                     .into_iter()
-                    .map(|hash| (hash, event.event_id.clone()))
+                    .map(|(hash, _)| (hash, event.event_id.clone()))
             })
             .collect();
 
