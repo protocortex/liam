@@ -15,23 +15,24 @@
 //! not be appended, leaves the log poisoned, and it stays so until the store is
 //! reopened and the log replayed.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use liam_log::dedup::{find_first_write, HashBloom, HashIndex, IndexedWrite, PreCheck};
-use liam_log::event::{LogEvent, LogPayload, NodeRow, CURRENT_SCHEMA_VERSION};
-use liam_log::hash::node_row_hash;
+use liam_log::event::{LogEvent, LogPayload};
+use liam_log::hash::content_hashes;
 use liam_log::{LogOffset, LogWriter};
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
-use super::{node_row_insert, resolve_node_row, Graph};
+use super::logged_plan::{apply_steps, Plan, Step, Table};
+use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
-use crate::ids::{Millis, NodeId, FOREVER};
-use crate::types::NewNode;
+use crate::ids::{EdgeId, NodeId, FOREVER};
 use crate::value::Value;
 
 const HASH_INDEX_UPSERT_SQL: &str =
@@ -75,115 +76,72 @@ impl EventLog {
 /// One lock orders every append against the commit that follows it.
 pub type SharedLog = Arc<tokio::sync::Mutex<EventLog>>;
 
-/// What a logged node write did.
+/// What a logged write did.
 pub(super) enum Logged {
-    /// The row was projected; the caller's id is the node's id.
+    /// The rows were projected; the caller's ids are the rows' ids.
     Written,
     /// The content already has a live carrier, which is the id to return.
-    Duplicate(NodeId),
+    Duplicate(String),
 }
 
-/// What a projection changed, for the log's bookkeeping after the commit.
-#[derive(Default)]
-struct RowEffects {
-    /// Content hashes the dedup filter must now know.
-    hashes: Vec<[u8; 32]>,
+impl Logged {
+    pub(super) fn node_id(self, written: NodeId) -> NodeId {
+        match self {
+            Logged::Written => written,
+            Logged::Duplicate(first) => NodeId::from_raw(first),
+        }
+    }
+
+    pub(super) fn edge_id(self, written: EdgeId) -> EdgeId {
+        match self {
+            Logged::Written => written,
+            Logged::Duplicate(first) => EdgeId::from_raw(first),
+        }
+    }
 }
 
 impl<B: Backend> Graph<B> {
-    /// Logs and projects one node. The vector write stays with the caller
-    /// because it takes the write lock the transaction holds.
-    pub(super) async fn insert_node_logged(
-        &self,
-        log: &SharedLog,
-        id: &NodeId,
-        node: &NewNode,
-        now: Millis,
-    ) -> Result<Logged> {
-        let row = resolve_node_row(id, node, now)?;
-        let event = node_write_event(&row, now);
-        let hash = event.content_hash;
-        self.transact(log, event, true, move |tx, event_id, _| {
-            Box::pin(async move {
-                let (sql, params) = node_row_insert(&row);
-                tx.execute(&sql, &params).await?;
-                index_hash(tx, &hash, &row.id, event_id).await?;
-                Ok(RowEffects { hashes: vec![hash] })
-            })
-        })
-        .await
-    }
-
     /// The one path every logged write takes: poison check, log lock, `begin`,
-    /// then append, project, and commit. With `dedup`, content that already has
-    /// a live carrier is logged as a `DuplicateOf` instead of projected.
-    async fn transact<F>(
-        &self,
-        log: &SharedLog,
-        event: LogEvent,
-        dedup: bool,
-        project: F,
-    ) -> Result<Logged>
+    /// then plan, deduplicate, append, project, and commit. `prepare` reads the
+    /// transaction to build the write's `Plan` and may refuse the write before
+    /// anything is appended.
+    pub(super) async fn transact<F>(&self, log: &SharedLog, prepare: F) -> Result<Logged>
     where
-        F: for<'t> FnOnce(
-                &'t mut dyn BackendTx,
-                &'t str,
-                LogOffset,
-            ) -> BoxFuture<'t, Result<RowEffects>>
-            + Send,
+        F: for<'t> FnOnce(&'t mut dyn BackendTx) -> BoxFuture<'t, Result<Plan>> + Send,
     {
         let mut held = HeldLog::acquire(log).await?;
         let mut tx = self.backend.begin().await?;
-        tracing::debug!(event = %event.event_id, "log lock taken, transaction open");
-        if dedup {
-            match live_duplicate(
-                &mut *tx,
-                held.might_contain(&event.content_hash),
-                &event.content_hash,
-            )
-            .await
-            {
-                Ok(Some(first)) => {
-                    let duplicate = follow_up(
-                        &event,
-                        LogPayload::DuplicateOf {
-                            first_event_id: first.event_id,
-                        },
-                    );
-                    self.append_and_commit(tx, &mut held, duplicate, |_, _, _| {
-                        Box::pin(async { Ok(RowEffects::default()) })
-                    })
-                    .await?;
-                    return Ok(Logged::Duplicate(first.row_id));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    abandon(tx).await;
-                    return Err(error);
-                }
+        let resolved = match prepare(&mut *tx).await {
+            Ok(plan) => {
+                let bloom_hit = held.might_contain(&plan.event.content_hash);
+                resolve_plan(&mut *tx, plan, bloom_hit).await
             }
-        }
-        self.append_and_commit(tx, &mut held, event, project)
-            .await?;
-        Ok(Logged::Written)
+            Err(error) => Err(error),
+        };
+        let (event, steps, logged) = match resolved {
+            Ok(Resolved::Fresh(plan)) => (plan.event, plan.steps, Logged::Written),
+            Ok(Resolved::Duplicate { event, first }) => {
+                (event, Vec::new(), Logged::Duplicate(first.row_id))
+            }
+            Err(error) => {
+                abandon(tx).await;
+                return Err(error);
+            }
+        };
+        tracing::debug!(event = %event.event_id, "log lock taken, transaction open");
+        self.append_and_commit(tx, &mut held, event, &steps).await?;
+        Ok(logged)
     }
 
-    async fn append_and_commit<F>(
+    async fn append_and_commit(
         &self,
         mut tx: Box<dyn BackendTx + '_>,
         held: &mut HeldLog,
         event: LogEvent,
-        project: F,
-    ) -> Result<()>
-    where
-        F: for<'t> FnOnce(
-                &'t mut dyn BackendTx,
-                &'t str,
-                LogOffset,
-            ) -> BoxFuture<'t, Result<RowEffects>>
-            + Send,
-    {
+        steps: &[Step],
+    ) -> Result<()> {
         let event_id = event.event_id.clone();
+        let carried = content_hashes(&event);
         let void = follow_up(
             &event,
             LogPayload::Voided {
@@ -199,15 +157,17 @@ impl<B: Backend> Graph<B> {
         };
         tracing::debug!(%event_id, "event appended to the log");
         let projected = async {
-            let effects = project(&mut *tx, &event_id, offset).await?;
+            apply_steps(&mut *tx, steps).await?;
+            index_rows(&mut *tx, &carried, &event_id).await?;
             let moved = cursor_params(held.log_id, offset);
             tx.execute(CURSOR_UPSERT_SQL, &moved).await?;
-            Ok(effects)
+            Ok(())
         }
         .await;
         match commit_or_abandon(tx, projected).await {
-            Ok(effects) => {
-                held.reconcile(&effects.hashes);
+            Ok(()) => {
+                let hashes: Vec<_> = carried.iter().map(|(hash, _)| *hash).collect();
+                held.reconcile(&hashes);
                 tracing::debug!(%event_id, "projection committed");
                 Ok(())
             }
@@ -237,22 +197,6 @@ impl<B: Backend> Graph<B> {
                 tracing::error!(%error, "could not void a failed write, the log is poisoned until reopen");
             }
         }
-    }
-}
-
-/// The log record for a new node: the row's producer is the source, its
-/// confidence the trust, and its valid time the observation time.
-fn node_write_event(row: &NodeRow, now: Millis) -> LogEvent {
-    LogEvent {
-        event_id: Uuid::now_v7().to_string(),
-        content_hash: node_row_hash(row),
-        source: row.producer.clone(),
-        trust_score: row.confidence,
-        observed_at: row.valid_from,
-        ingested_at: now.0,
-        encryption_key_id: None,
-        schema_version: CURRENT_SCHEMA_VERSION,
-        payload: LogPayload::NodeWrite(row.clone()),
     }
 }
 
@@ -332,6 +276,39 @@ impl HeldLog {
     }
 }
 
+/// A plan after the dedup check.
+enum Resolved {
+    Fresh(Plan),
+    /// The write's content is live already: log a `DuplicateOf` the first
+    /// write instead of the write itself.
+    Duplicate {
+        event: LogEvent,
+        first: Carrier,
+    },
+}
+
+/// Checks a plan against the live carrier of its content, which is read in the
+/// same transaction the write commits in.
+async fn resolve_plan(tx: &mut dyn BackendTx, mut plan: Plan, bloom_hit: bool) -> Result<Resolved> {
+    let refusal = plan.refusal_unless_duplicate.take();
+    let hash = plan.event.content_hash;
+    let carrier = match plan.dedup {
+        Some(table) => live_duplicate(tx, bloom_hit, &hash, table).await?,
+        None => None,
+    };
+    match (carrier, refusal) {
+        (Some(first), _) => {
+            let duplicate = LogPayload::DuplicateOf {
+                first_event_id: first.event_id.clone(),
+            };
+            let event = follow_up(&plan.event, duplicate);
+            Ok(Resolved::Duplicate { event, first })
+        }
+        (None, Some(refusal)) => Err(refusal),
+        (None, None) => Ok(Resolved::Fresh(plan)),
+    }
+}
+
 /// The filter's answer for one hash, taken from the held log before the
 /// transaction's reads begin.
 struct Seen(bool);
@@ -345,7 +322,7 @@ impl PreCheck for Seen {
 /// The live row that already carries a content hash.
 struct Carrier {
     event_id: String,
-    row_id: NodeId,
+    row_id: String,
 }
 
 /// A hit counts only while the indexed row is live. A superseded or
@@ -355,6 +332,7 @@ async fn live_duplicate(
     tx: &mut dyn BackendTx,
     bloom_hit: bool,
     hash: &[u8; 32],
+    table: Table,
 ) -> Result<Option<Carrier>> {
     let hit = {
         let mut index = TxHashIndex { tx: &mut *tx };
@@ -370,20 +348,23 @@ async fn live_duplicate(
     let Some(row_id) = row_ids.into_iter().next() else {
         return Ok(None);
     };
-    if !is_live(tx, &row_id).await? {
+    if !is_live(tx, table, &row_id).await? {
         return Ok(None);
     }
     Ok(Some(Carrier {
         event_id: first_event_id,
-        row_id: NodeId::from_raw(row_id),
+        row_id,
     }))
 }
 
-async fn is_live(tx: &mut dyn BackendTx, node_id: &str) -> Result<bool> {
+async fn is_live(tx: &mut dyn BackendTx, table: Table, row_id: &str) -> Result<bool> {
     let rows = tx
         .query(
-            "SELECT 1 FROM nodes WHERE id = ?1 AND tx_to = ?2",
-            &[node_id.into(), FOREVER.into()],
+            &format!(
+                "SELECT 1 FROM {} WHERE id = ?1 AND tx_to = ?2",
+                table.name()
+            ),
+            &[row_id.into(), FOREVER.into()],
         )
         .await?;
     Ok(!rows.is_empty())
@@ -416,18 +397,25 @@ impl HashIndex for TxHashIndex<'_> {
     }
 }
 
-async fn index_hash(
+/// Points each carried hash at the rows that carry it, in write order, so the
+/// first carrier of a hash repeated within one event stays first.
+async fn index_rows(
     tx: &mut dyn BackendTx,
-    hash: &[u8; 32],
-    row_id: &str,
+    carried: &[([u8; 32], String)],
     event_id: &str,
 ) -> Result<()> {
-    let row_ids = serde_json::to_string(&[row_id])?;
-    tx.execute(
-        HASH_INDEX_UPSERT_SQL,
-        &[hash.to_vec().into(), event_id.into(), row_ids.into()],
-    )
-    .await?;
+    let mut by_hash: BTreeMap<[u8; 32], Vec<&str>> = BTreeMap::new();
+    for (hash, row_id) in carried {
+        by_hash.entry(*hash).or_default().push(row_id);
+    }
+    for (hash, row_ids) in by_hash {
+        let row_ids = serde_json::to_string(&row_ids)?;
+        tx.execute(
+            HASH_INDEX_UPSERT_SQL,
+            &[hash.to_vec().into(), event_id.into(), row_ids.into()],
+        )
+        .await?;
+    }
     Ok(())
 }
 

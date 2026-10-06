@@ -10,8 +10,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use liam_log::event::NodeRow;
+use liam_log::event::{EdgeRow, NodeRow};
 
+use self::logged_plan::Collision;
 use self::logged_write::Logged;
 pub use self::logged_write::{EventLog, SharedLog};
 use crate::backend::Backend;
@@ -25,6 +26,7 @@ use crate::types::{
 };
 use crate::value::{Row, Value};
 
+mod logged_plan;
 mod logged_write;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
@@ -102,16 +104,22 @@ fn edge_refusal_from_rows(rows: Vec<Row>, src: &NodeId, dst: &NodeId, kind: &str
             "no row explains the refusal".to_string(),
         ));
     };
-    let flags: std::result::Result<Vec<i64>, Error> = (0..3).map(|i| row.get_i64(i)).collect();
-    let flags = flags?;
+    let [source_live, target_live, edge_exists] = edge_guard_flags(row)?;
     Ok(edge_refusal(
-        flags[0] != 0,
-        flags[1] != 0,
-        flags[2] != 0,
+        source_live,
+        target_live,
+        edge_exists,
         src,
         dst,
         kind,
     ))
+}
+
+/// The three flags of `EDGE_REFUSAL_DIAGNOSTIC_SQL`'s row: source live, target
+/// live, edge already exists.
+fn edge_guard_flags(row: &Row) -> Result<[bool; 3]> {
+    let flag = |i| row.get_i64(i).map(|value| value != 0);
+    Ok([flag(0)?, flag(1)?, flag(2)?])
 }
 
 /// What a single `relate` attempt resolved to, once a caller replaying a
@@ -260,6 +268,16 @@ fn live_by_subject_query(
         live = live_at("nodes", 2),
     );
     (sql, params)
+}
+
+/// SQL + params for "is this node live at `as_of`", shared by `exists_as_of`
+/// (against `&Backend`) and the logged `supersede` (against an open `BackendTx`).
+fn live_as_of_query(id: &str, as_of: Millis) -> (String, Vec<Value>) {
+    let sql = format!(
+        "SELECT 1 FROM nodes WHERE id = ?1 AND {live}",
+        live = live_at("nodes", 2)
+    );
+    (sql, vec![id.into(), as_of.into()])
 }
 
 /// A node's own collision key for `find_live_by_subject`/`live_by_subject_query`: entity pages
@@ -517,9 +535,9 @@ impl<B: Backend> Graph<B> {
         })
     }
 
-    /// Routes `insert` through `log`: each insert is appended to it before it
-    /// is applied. No other write appends yet. Without a log, every write is
-    /// unlogged.
+    /// Routes `insert`, `upsert_by`, `supersede`, `relate`, and `ingest_episode`
+    /// through `log`: each is appended to it before it is applied. `link` and
+    /// `gc` do not append yet. Without a log, every write is unlogged.
     pub async fn with_log(mut self, log: SharedLog) -> Result<Self> {
         // Seam: checking `log`'s id against the database's `log_cursor` and
         // rebuilding its bloom filter from `log_hash_index` land here, so a
@@ -534,18 +552,20 @@ impl<B: Backend> Graph<B> {
         node.scope = validate_scope(&node.scope)?;
         let id = NodeId::new();
         let now = self.clock.now();
-        let id = match self.route_node_write(&id, &node, now).await? {
-            Logged::Written => id,
-            Logged::Duplicate(first) => first,
-        };
-        // The vector write takes the write lock a transaction holds, so it
-        // follows the commit. It is idempotent, which lets a retry repair a
-        // vector an earlier attempt committed the node without.
+        let id = self.route_node_write(&id, &node, now).await?.node_id(id);
+        self.store_vector(&id, &node).await?;
+        Ok(id)
+    }
+
+    /// The vector write takes the write lock a transaction holds, so it follows
+    /// the commit. It is idempotent, which lets a retry repair a vector an
+    /// earlier attempt committed the node without.
+    async fn store_vector(&self, id: &NodeId, node: &NewNode) -> Result<()> {
         if let Some(embedding) = node.embedding.as_deref() {
             self.check_dims(embedding)?;
             self.backend.vector_upsert(id.as_str(), embedding).await?;
         }
-        Ok(id)
+        Ok(())
     }
 
     /// Insert, or supersede a competing live node with the same collision
@@ -555,6 +575,13 @@ impl<B: Backend> Graph<B> {
     /// to it.
     pub async fn upsert_by(&self, mut node: NewNode) -> Result<NodeId> {
         node.scope = validate_scope(&node.scope)?;
+        // With a log, the competitor is looked up inside the write's
+        // transaction, so concurrent upserts of one subject form a chain.
+        if let (Some(log), Some(collision)) = (&self.log, Collision::of(&node)) {
+            let id = self.upsert_logged(log, &node, collision).await?;
+            self.store_vector(&id, &node).await?;
+            return Ok(id);
+        }
         let subject = match node.subject.clone() {
             Some(s) => s,
             None => return self.insert(node).await,
@@ -573,12 +600,25 @@ impl<B: Backend> Graph<B> {
     pub async fn supersede(&self, old: &NodeId, mut node: NewNode) -> Result<NodeId> {
         node.scope = validate_scope(&node.scope)?;
         let now = self.clock.now();
+        let new_id = match &self.log {
+            None => self.supersede_unlogged(old, &node, now).await?,
+            Some(log) => self.supersede_logged(log, old, &node, now).await?,
+        };
+        self.store_vector(&new_id, &node).await?;
+        Ok(new_id)
+    }
+
+    async fn supersede_unlogged(
+        &self,
+        old: &NodeId,
+        node: &NewNode,
+        now: Millis,
+    ) -> Result<NodeId> {
         if !self.exists_as_of(old, now).await? {
             return Err(Error::NodeNotFound(old.as_str().to_string()));
         }
         let new_id = NodeId::new();
-        let embedding = node.embedding.clone();
-        let (node_sql, node_params) = self.node_insert(&new_id, &node, now)?;
+        let (node_sql, node_params) = self.node_insert(&new_id, node, now)?;
 
         let statements = vec![
             (
@@ -601,13 +641,6 @@ impl<B: Backend> Graph<B> {
             ),
         ];
         self.backend.execute_atomic(&statements).await?;
-
-        if let Some(embedding) = embedding.as_deref() {
-            self.check_dims(embedding)?;
-            self.backend
-                .vector_upsert(new_id.as_str(), embedding)
-                .await?;
-        }
         Ok(new_id)
     }
 
@@ -658,6 +691,29 @@ impl<B: Backend> Graph<B> {
     pub async fn relate(&self, src: &NodeId, dst: &NodeId, kind: &str) -> Result<EdgeId> {
         let id = EdgeId::new();
         let now = self.clock.now();
+        let Some(log) = &self.log else {
+            return self.relate_unlogged(id, src, dst, kind, now).await;
+        };
+        let row = EdgeRow {
+            id: id.as_str().to_string(),
+            src: src.as_str().to_string(),
+            dst: dst.as_str().to_string(),
+            edge_type: kind.to_string(),
+            attributes: "{}".to_string(),
+            tx_from: now.0,
+            tx_to: FOREVER.0,
+        };
+        self.relate_logged(log, row, now).await
+    }
+
+    async fn relate_unlogged(
+        &self,
+        id: EdgeId,
+        src: &NodeId,
+        dst: &NodeId,
+        kind: &str,
+        now: Millis,
+    ) -> Result<EdgeId> {
         let written = self
             .backend
             .execute(
@@ -744,9 +800,60 @@ impl<B: Backend> Graph<B> {
         let ids: Vec<NodeId> = nodes.iter().map(|_| NodeId::new()).collect();
         let now = self.clock.now();
 
+        let edge_ids = match &self.log {
+            None => self.episode_unlogged(&ids, &nodes, &edges, now).await?,
+            Some(log) => self.episode_logged(log, &ids, &nodes, &edges, now).await?,
+        };
+
+        // Vector writes stay outside the transaction, exactly where `insert`
+        // and `supersede` already put them: `BackendTx` never grows a
+        // `vector_upsert` method, so nothing about "having a transaction"
+        // moves this call inside one.
+        //
+        // Unlike `insert`/`supersede`'s single-node `?` shape, a failure here
+        // does not abort the loop or fail the call. By this point the
+        // transaction has already committed, so the meaningful
+        // success/failure boundary for `ingest_episode` is behind us: the row
+        // data is correct and durable, the vector just won't surface in
+        // search until it's retried or backfilled. Aborting on the first
+        // failure would silently orphan every embedding after it; returning
+        // `Err` here would tell a caller the call failed when the durable
+        // write actually succeeded, inviting a retry that mints duplicate
+        // nodes for episodes with no `subject` to dedup against. A dims
+        // mismatch is handled the same way as a `vector_upsert` failure: it's
+        // a real config bug, not transient I/O, but nodes in one call
+        // typically share an embedder config, so continuing just logs the
+        // same problem a few more times rather than compounding any new
+        // risk.
+        for (id, node) in ids.iter().zip(&nodes) {
+            if let Some(embedding) = node.embedding.as_deref() {
+                if let Err(e) = self.check_dims(embedding) {
+                    tracing::error!(?id, error = %e, "episode vector dims check failed, node row committed without a vector");
+                    continue;
+                }
+                if let Err(e) = self.backend.vector_upsert(id.as_str(), embedding).await {
+                    tracing::error!(?id, error = %e, "episode vector upsert failed, node row committed without a vector");
+                }
+            }
+        }
+
+        Ok(EpisodeResult {
+            node_ids: ids,
+            edge_ids,
+        })
+    }
+
+    /// The episode as one transaction, with no log involved.
+    async fn episode_unlogged(
+        &self,
+        ids: &[NodeId],
+        nodes: &[NewNode],
+        edges: &[EpisodeEdge],
+        now: Millis,
+    ) -> Result<Vec<EdgeId>> {
         let mut tx = self.backend.begin().await?;
 
-        for (id, node) in ids.iter().zip(&nodes) {
+        for (id, node) in ids.iter().zip(nodes) {
             let mut superseded: Option<NodeId> = None;
             if let Some(subject) = node.subject.as_deref() {
                 // Same SQL as `find_live_by_subject`, run against the open
@@ -799,9 +906,9 @@ impl<B: Backend> Graph<B> {
         }
 
         let mut edge_ids = Vec::with_capacity(edges.len());
-        for edge in &edges {
-            let src = resolve_episode_ref(&edge.from, &ids);
-            let dst = resolve_episode_ref(&edge.to, &ids);
+        for edge in edges {
+            let src = resolve_episode_ref(&edge.from, ids);
+            let dst = resolve_episode_ref(&edge.to, ids);
             let id = EdgeId::new();
             let attrs = serde_json::to_string(&edge.attributes)?;
             // The same conditional-INSERT-with-WHERE-EXISTS shape `relate`
@@ -852,43 +959,7 @@ impl<B: Backend> Graph<B> {
         }
 
         tx.commit().await?;
-
-        // Vector writes stay outside the transaction, exactly where `insert`
-        // and `supersede` already put them: `BackendTx` never grows a
-        // `vector_upsert` method, so nothing about "having a transaction"
-        // moves this call inside one.
-        //
-        // Unlike `insert`/`supersede`'s single-node `?` shape, a failure here
-        // does not abort the loop or fail the call. By this point the
-        // transaction has already committed, so the meaningful
-        // success/failure boundary for `ingest_episode` is behind us: the row
-        // data is correct and durable, the vector just won't surface in
-        // search until it's retried or backfilled. Aborting on the first
-        // failure would silently orphan every embedding after it; returning
-        // `Err` here would tell a caller the call failed when the durable
-        // write actually succeeded, inviting a retry that mints duplicate
-        // nodes for episodes with no `subject` to dedup against. A dims
-        // mismatch is handled the same way as a `vector_upsert` failure: it's
-        // a real config bug, not transient I/O, but nodes in one call
-        // typically share an embedder config, so continuing just logs the
-        // same problem a few more times rather than compounding any new
-        // risk.
-        for (id, node) in ids.iter().zip(&nodes) {
-            if let Some(embedding) = node.embedding.as_deref() {
-                if let Err(e) = self.check_dims(embedding) {
-                    tracing::error!(?id, error = %e, "episode vector dims check failed, node row committed without a vector");
-                    continue;
-                }
-                if let Err(e) = self.backend.vector_upsert(id.as_str(), embedding).await {
-                    tracing::error!(?id, error = %e, "episode vector upsert failed, node row committed without a vector");
-                }
-            }
-        }
-
-        Ok(EpisodeResult {
-            node_ids: ids,
-            edge_ids,
-        })
+        Ok(edge_ids)
     }
 
     /// Resolve a client-supplied handle to a full node id. A handle is any
@@ -967,7 +1038,7 @@ impl<B: Backend> Graph<B> {
                 .write_node(id, node, now)
                 .await
                 .map(|()| Logged::Written),
-            Some(log) => self.insert_node_logged(log, id, node, now).await,
+            Some(log) => self.insert_logged(log, id, node, now).await,
         }
     }
 
@@ -1304,14 +1375,8 @@ impl<B: Backend> Graph<B> {
     }
 
     async fn exists_as_of(&self, id: &NodeId, as_of: Millis) -> Result<bool> {
-        let sql = format!(
-            "SELECT 1 FROM nodes WHERE id = ?1 AND {live}",
-            live = live_at("nodes", 2)
-        );
-        let rows = self
-            .backend
-            .query(&sql, &[id.as_str().into(), as_of.into()])
-            .await?;
+        let (sql, params) = live_as_of_query(id.as_str(), as_of);
+        let rows = self.backend.query(&sql, &params).await?;
         Ok(!rows.is_empty())
     }
 

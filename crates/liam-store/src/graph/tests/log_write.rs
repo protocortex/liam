@@ -9,8 +9,8 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use liam_log::dedup::{BloomConfig, HashBloom};
-use liam_log::event::{LogEvent, LogPayload, NodeRow, CURRENT_SCHEMA_VERSION};
-use liam_log::hash::node_row_hash;
+use liam_log::event::{EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, CURRENT_SCHEMA_VERSION};
+use liam_log::hash::{content_hashes, edge_row_hash, node_row_hash};
 use liam_log::test_support::FailingLogWriter;
 use liam_log::wal::WalError;
 use liam_log::{LogOffset, LogWriter};
@@ -770,4 +770,377 @@ async fn log_write_a_void_double_fault_poisons_the_log_until_reopen() {
 
     // Assert
     assert!(reopened.insert(fact("second")).await.is_ok());
+}
+
+// ---- the remaining write paths: upsert_by, supersede, relate, ingest_episode ----
+//
+// Payload shapes these tests pin, so a replay can rebuild the store from the
+// log alone:
+// - insert, and an upsert_by with no live competitor: `NodeWrite`.
+// - relate: `EdgeWrite`.
+// - supersede, and an upsert_by that finds a live competitor: one
+//   `EpisodeBatch` of `[Node(new row), Edge(supersedes new -> old)]`. The batch
+//   has no row-close effect, so the close is implied: replaying a `supersedes`
+//   edge closes its `dst` at the edge's `tx_from`.
+// - ingest_episode: one `EpisodeBatch` of every row in write order: for each
+//   node its row and, when it superseded a competitor, that `supersedes` edge,
+//   then the episode's own edges.
+
+async fn stored_edge<B: Backend>(g: &Graph<B>, id: &str) -> EdgeRow {
+    let rows = g
+        .backend
+        .query(
+            "SELECT id, src, dst, type, attributes, tx_from, tx_to FROM edges WHERE id = ?1",
+            &[id.into()],
+        )
+        .await
+        .unwrap();
+    let row = rows.first().expect("stored edge row");
+    EdgeRow {
+        id: row.get_string(0).unwrap(),
+        src: row.get_string(1).unwrap(),
+        dst: row.get_string(2).unwrap(),
+        edge_type: row.get_string(3).unwrap(),
+        attributes: row.get_string(4).unwrap(),
+        tx_from: row.get_i64(5).unwrap(),
+        tx_to: row.get_i64(6).unwrap(),
+    }
+}
+
+async fn edge_between<B: Backend>(g: &Graph<B>, src: &str, dst: &str, kind: &str) -> EdgeRow {
+    let rows = g
+        .backend
+        .query(
+            "SELECT id FROM edges WHERE src = ?1 AND dst = ?2 AND type = ?3",
+            &[src.into(), dst.into(), kind.into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one {kind} edge from {src} to {dst}");
+    stored_edge(g, &rows[0].get_string(0).unwrap()).await
+}
+
+async fn index_entry<B: Backend>(g: &Graph<B>, hash: &[u8; 32]) -> Option<(String, Vec<String>)> {
+    let rows = g
+        .backend
+        .query(
+            "SELECT first_event_id, row_ids FROM log_hash_index WHERE content_hash = ?1",
+            &[hash.to_vec().into()],
+        )
+        .await
+        .unwrap();
+    let row = rows.first()?;
+    let row_ids = serde_json::from_str(&row.get_string(1).unwrap()).unwrap();
+    Some((row.get_string(0).unwrap(), row_ids))
+}
+
+/// Every row the event carries is in the hash index under the event's id.
+async fn assert_indexed_with<B: Backend>(g: &Graph<B>, event: &LogEvent) {
+    let carried = content_hashes(event);
+    assert!(!carried.is_empty(), "the event carries rows: {event:?}");
+    for (hash, row_id) in carried {
+        let entry = index_entry(g, &hash).await;
+        assert!(entry.is_some(), "row {row_id} is not in the hash index");
+        let (first_event_id, row_ids) = entry.unwrap();
+        assert_eq!(first_event_id, event.event_id, "row {row_id}");
+        assert!(row_ids.contains(&row_id), "row {row_id} in {row_ids:?}");
+    }
+}
+
+async fn assert_cursor_at_last_event<B: Backend>(g: &Graph<B>, appended: &Appended, log_id: &str) {
+    assert_eq!(
+        cursor(g).await,
+        Some((log_id.to_string(), Some(offset_pair(last_offset(appended)))))
+    );
+}
+
+fn events_since(appended: &Appended, since: usize) -> Vec<LogEvent> {
+    events(appended).split_off(since)
+}
+
+fn has_duplicate_of(logged: &[LogEvent]) -> bool {
+    logged
+        .iter()
+        .any(|event| matches!(event.payload, LogPayload::DuplicateOf { .. }))
+}
+
+fn batch_effects(event: &LogEvent) -> Vec<RowEffect> {
+    match &event.payload {
+        LogPayload::EpisodeBatch(effects) => effects.clone(),
+        other => panic!("expected an EpisodeBatch, found {other:?}"),
+    }
+}
+
+async fn live_ids_with_subject<B: Backend>(g: &Graph<B>, subject: &str) -> Vec<String> {
+    g.backend
+        .query(
+            "SELECT id FROM nodes WHERE subject = ?1 AND tx_to = ?2 ORDER BY rowid",
+            &[subject.into(), FOREVER.into()],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get_string(0).unwrap())
+        .collect()
+}
+
+fn mentions(from: usize, to: usize) -> EpisodeEdge {
+    EpisodeEdge {
+        from: EpisodeRef::New(from),
+        to: EpisodeRef::New(to),
+        kind: "mentions".to_string(),
+        attributes: serde_json::json!({"w": 1}),
+    }
+}
+
+/// One supersede is one event: the new row and the `supersedes` edge, with the
+/// old row closed at the edge's start.
+async fn assert_supersede_logged<B: Backend>(
+    g: &Graph<B>,
+    appended: &Appended,
+    since: usize,
+    old: &NodeId,
+    new: &NodeId,
+    log_id: &str,
+) {
+    let logged = events_since(appended, since);
+    assert_eq!(logged.len(), 1, "one event for the supersede: {logged:?}");
+    let event = &logged[0];
+    let new_row = stored_row(g, new, true).await;
+    let edge = edge_between(g, new.as_str(), old.as_str(), relation::SUPERSEDES).await;
+    assert_eq!(
+        event.payload,
+        LogPayload::EpisodeBatch(vec![
+            RowEffect::Node(new_row.clone()),
+            RowEffect::Edge(edge.clone())
+        ])
+    );
+    assert_eq!(event.content_hash, node_row_hash(&new_row));
+    assert_envelope(event);
+    assert_eq!(edge.tx_from, 1000);
+    assert_eq!(
+        stored_row(g, old, true).await.tx_to,
+        edge.tx_from,
+        "the old row closes where the supersedes edge starts"
+    );
+    assert_cursor_at_last_event(g, appended, log_id).await;
+    assert_indexed_with(g, event).await;
+}
+
+#[tokio::test]
+async fn log_write_upsert_by_without_a_live_competitor_appends_one_node_write_equal_to_the_stored_row(
+) {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let node = fact_at("content")
+        .with_scope(" proj/a ")
+        .with_subject("subject-1")
+        .with_attributes(serde_json::json!({"k": "v"}));
+
+    // Act
+    let id = g.upsert_by(node).await.unwrap();
+
+    // Assert
+    let logged = events(&appended);
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let stored = stored_row(&g, &id, true).await;
+    assert_eq!(logged[0].payload, LogPayload::NodeWrite(stored.clone()));
+    assert_eq!(logged[0].content_hash, node_row_hash(&stored));
+    assert_envelope(&logged[0]);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+    assert_indexed_with(&g, &logged[0]).await;
+}
+
+#[tokio::test]
+async fn log_write_supersede_appends_one_batch_of_the_new_row_and_its_supersedes_edge() {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let old = g.insert(fact_at("old").with_subject("s")).await.unwrap();
+    let since = events(&appended).len();
+
+    // Act
+    let new = g
+        .supersede(&old, fact_at("new").with_subject("s"))
+        .await
+        .unwrap();
+
+    // Assert
+    assert_supersede_logged(&g, &appended, since, &old, &new, &log_id).await;
+}
+
+#[tokio::test]
+async fn log_write_upsert_by_over_a_live_subject_logs_the_same_batch_as_supersede() {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let old = g.upsert_by(fact_at("old").with_subject("s")).await.unwrap();
+    let since = events(&appended).len();
+
+    // Act
+    let new = g.upsert_by(fact_at("new").with_subject("s")).await.unwrap();
+
+    // Assert
+    assert_ne!(new, old);
+    assert_supersede_logged(&g, &appended, since, &old, &new, &log_id).await;
+}
+
+#[tokio::test]
+async fn log_write_relate_appends_one_edge_write_equal_to_the_stored_row() {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let src = g.insert(fact_at("src")).await.unwrap();
+    let dst = g.insert(fact_at("dst")).await.unwrap();
+    let since = events(&appended).len();
+
+    // Act
+    let id = g.relate(&src, &dst, "mentions").await.unwrap();
+
+    // Assert
+    let logged = events_since(&appended, since);
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let event = &logged[0];
+    let stored = stored_edge(&g, id.as_str()).await;
+    assert_eq!(event.payload, LogPayload::EdgeWrite(stored.clone()));
+    assert_eq!(event.content_hash, edge_row_hash(&stored));
+    assert_eq!((event.observed_at, event.ingested_at), (1000, 1000));
+    assert_eq!(event.schema_version, CURRENT_SCHEMA_VERSION);
+    assert_eq!(event.encryption_key_id, None);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+    assert_indexed_with(&g, event).await;
+}
+
+#[tokio::test]
+async fn log_write_each_episode_is_one_batch_event() {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+
+    // Act
+    g.ingest_episode(vec![fact_at("a"), fact_at("b")], vec![mentions(0, 1)])
+        .await
+        .unwrap();
+    g.ingest_episode(vec![fact_at("c")], vec![]).await.unwrap();
+
+    // Assert
+    let logged = events(&appended);
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    assert_eq!(batch_effects(&logged[0]).len(), 3);
+    assert_eq!(batch_effects(&logged[1]).len(), 1);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+}
+
+#[tokio::test]
+async fn log_write_an_episode_is_not_deduplicated_against_live_content() {
+    // Arrange
+    let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let live = g.insert(fact_at("same")).await.unwrap();
+
+    // Act
+    let result = g
+        .ingest_episode(vec![fact_at("same")], vec![])
+        .await
+        .unwrap();
+
+    // Assert: a batch applies as a whole, so it never becomes a partial duplicate.
+    let logged = events(&appended);
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    assert!(matches!(logged[1].payload, LogPayload::EpisodeBatch(_)));
+    assert!(!has_duplicate_of(&logged));
+    assert_ne!(result.node_ids[0], live);
+    assert_eq!(count(&g, "nodes").await, 2);
+}
+
+// ---- live-row rule for upsert_by and supersede ----
+
+#[tokio::test]
+async fn log_write_upsert_by_with_the_content_of_a_live_row_returns_it_and_logs_duplicate_of() {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let first = g
+        .upsert_by(fact_at("same").with_subject("s"))
+        .await
+        .unwrap();
+
+    // Act
+    let second = g
+        .upsert_by(fact_at("same").with_subject("s"))
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(second, first);
+    assert_eq!(count(&g, "nodes").await, 1);
+    assert_eq!(count(&g, "edges").await, 0);
+    let logged = events(&appended);
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    assert_eq!(
+        logged[1].payload,
+        LogPayload::DuplicateOf {
+            first_event_id: logged[0].event_id.clone()
+        }
+    );
+    assert_envelope(&logged[1]);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+}
+
+#[tokio::test]
+async fn log_write_supersede_with_content_already_live_still_closes_old_and_repoints_the_index() {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let x = g.insert(fact_at("X").with_subject("s")).await.unwrap();
+    let y = g.insert(fact_at("Y").with_subject("t")).await.unwrap();
+    let since = events(&appended).len();
+
+    // Act: the replacement's content already has a live carrier, but the caller
+    // asked for a state change, so it is never deduplicated.
+    let z = g
+        .supersede(&x, fact_at("Y").with_subject("t"))
+        .await
+        .unwrap();
+
+    // Assert: x is closed, z is a new live row, y is untouched, and the index
+    // follows the newest write.
+    assert_ne!(z, y);
+    assert_supersede_logged(&g, &appended, since, &x, &z, &log_id).await;
+    assert_eq!(stored_row(&g, &y, true).await.tx_to, FOREVER.0);
+    assert_eq!(
+        live_ids_with_subject(&g, "t").await,
+        vec![y.as_str(), z.as_str()]
+    );
+    let logged = events(&appended);
+    assert!(!has_duplicate_of(&logged), "{logged:?}");
+    let hash = node_row_hash(&stored_row(&g, &z, true).await);
+    assert_eq!(
+        index_entry(&g, &hash).await,
+        Some((logged[2].event_id.clone(), vec![z.as_str().to_string()]))
+    );
+}
+
+// ---- relate dedup ----
+
+#[tokio::test]
+async fn log_write_a_second_identical_relate_returns_the_first_edge_and_logs_duplicate_of() {
+    // Arrange
+    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let src = g.insert(fact_at("src")).await.unwrap();
+    let dst = g.insert(fact_at("dst")).await.unwrap();
+    let since = events(&appended).len();
+    let first = g.relate(&src, &dst, "mentions").await;
+
+    // Act
+    let second = g.relate(&src, &dst, "mentions").await;
+
+    // Assert
+    assert!(first.is_ok(), "{first:?}");
+    assert_eq!(second.as_ref().ok(), first.as_ref().ok(), "{second:?}");
+    assert_eq!(count(&g, "edges").await, 1);
+    let logged = events_since(&appended, since);
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    assert!(matches!(logged[0].payload, LogPayload::EdgeWrite(_)));
+    assert_eq!(
+        logged[1].payload,
+        LogPayload::DuplicateOf {
+            first_event_id: logged[0].event_id.clone()
+        }
+    );
+    assert_eq!(logged[1].content_hash, logged[0].content_hash);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
 }
