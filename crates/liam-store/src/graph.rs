@@ -7593,6 +7593,7 @@ mod tests {
         async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
             let call = self.execute_calls;
             self.execute_calls += 1;
+            self.probe.executed.lock().unwrap().push(sql.to_string());
             if call == self.fail_on_execute {
                 return Err(Error::Backend(
                     "injected mid-transaction failure".to_string(),
@@ -7634,6 +7635,9 @@ mod tests {
         /// A lock whose held-or-free state is recorded at every commit.
         watched: std::sync::Mutex<Option<SharedLog>>,
         commit_lock_held: std::sync::Mutex<Vec<bool>>,
+        /// Every statement a transaction was asked to execute, the one that
+        /// was made to fail included.
+        executed: std::sync::Mutex<Vec<String>>,
     }
 
     impl TxProbe {

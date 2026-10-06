@@ -5,14 +5,13 @@
 
 use std::sync::atomic::Ordering;
 
-use liam_log::event::LogPayload;
+use liam_log::event::{LogEvent, LogPayload};
 use liam_log::hash::content_hashes;
 use liam_log::LogWriter;
 
 use super::log_write::{
-    assert_cursor_at_last_event, count, cursor, events, events_since, fact, fact_at,
-    live_ids_with_subject, logged_graph, mentions, offset_pair, open_with, share, Appended,
-    RecordingLog,
+    assert_cursor_at_last_event, count, events, events_since, fact_at, logged_graph, mentions,
+    open_with, race, share, within_deadline, Appended, RecordingLog,
 };
 use super::*;
 use crate::DefaultBackend;
@@ -24,7 +23,7 @@ use crate::DefaultBackend;
 struct Snapshot {
     nodes: Vec<(String, i64)>,
     edges: Vec<(String, i64)>,
-    index: Vec<(Vec<u8>, String, String)>,
+    index: Vec<(String, String, String)>,
 }
 
 async fn id_and_tx_to<B: Backend>(g: &Graph<B>, table: &str) -> Vec<(String, i64)> {
@@ -41,20 +40,16 @@ async fn snapshot<B: Backend>(g: &Graph<B>) -> Snapshot {
     let index = g
         .backend
         .query(
-            "SELECT content_hash, first_event_id, row_ids FROM log_hash_index
+            "SELECT hex(content_hash), first_event_id, row_ids FROM log_hash_index
              ORDER BY content_hash",
             &[],
         )
         .await
         .unwrap()
         .iter()
-        .map(|row| match &row.0[0] {
-            Value::Blob(hash) => (
-                hash.clone(),
-                row.get_string(1).unwrap(),
-                row.get_string(2).unwrap(),
-            ),
-            other => panic!("content_hash is not a blob: {other:?}"),
+        .map(|row| {
+            let column = |i| row.get_string(i).unwrap();
+            (column(0), column(1), column(2))
         })
         .collect();
     Snapshot {
@@ -66,6 +61,7 @@ async fn snapshot<B: Backend>(g: &Graph<B>) -> Snapshot {
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
+    Insert,
     UpsertInsert,
     UpsertSupersede,
     Supersede,
@@ -73,42 +69,63 @@ enum Op {
     Episode,
 }
 
+const OPS: [Op; 6] = [
+    Op::Insert,
+    Op::UpsertInsert,
+    Op::UpsertSupersede,
+    Op::Supersede,
+    Op::Relate,
+    Op::Episode,
+];
+
 impl Op {
-    /// The fewest statements the path's transaction runs: its rows, one hash
-    /// index upsert per row it carries, and the cursor. A count below this means
-    /// the harness stopped before the end of the write.
-    fn min_statements(self) -> usize {
+    /// How many statements the path's transaction runs: its rows, one hash
+    /// index upsert per distinct row hash it carries, and the cursor last.
+    fn statements(self) -> usize {
         match self {
-            Op::UpsertInsert | Op::Relate => 3,
+            Op::Insert | Op::UpsertInsert | Op::Relate => 3,
             Op::UpsertSupersede | Op::Supersede => 6,
             Op::Episode => 12,
         }
     }
 }
 
-/// A live node `x` (subject "s") and a live peer `y`, written before a fault
-/// is armed.
+/// A live node `x` (subject "subject-{tag}") and a live peer `y`, written before
+/// a fault is armed. Writes with different tags touch different rows.
 struct Seeded {
+    tag: usize,
     x: NodeId,
     y: NodeId,
 }
 
-async fn seed<B: Backend>(g: &Graph<B>) -> Seeded {
+async fn seed<B: Backend>(g: &Graph<B>, tag: usize) -> Seeded {
     Seeded {
-        x: g.insert(fact_at("v1").with_subject("s")).await.unwrap(),
-        y: g.insert(fact_at("peer")).await.unwrap(),
+        tag,
+        x: g.insert(fact_at(&format!("v1-{tag}")).with_subject(format!("subject-{tag}")))
+            .await
+            .unwrap(),
+        y: g.insert(fact_at(&format!("peer-{tag}"))).await.unwrap(),
     }
 }
 
 async fn run_op<B: Backend>(g: &Graph<B>, op: Op, seeded: &Seeded) -> Result<()> {
+    let tag = seeded.tag;
+    let subject = format!("subject-{tag}");
     match op {
+        Op::Insert => g.insert(fact_at(&format!("new-{tag}"))).await.map(drop),
         Op::UpsertInsert => g
-            .upsert_by(fact_at("new").with_subject("other"))
+            .upsert_by(fact_at(&format!("new-{tag}")).with_subject(format!("other-{tag}")))
             .await
             .map(drop),
-        Op::UpsertSupersede => g.upsert_by(fact_at("v2").with_subject("s")).await.map(drop),
+        Op::UpsertSupersede => g
+            .upsert_by(fact_at(&format!("v2-{tag}")).with_subject(subject))
+            .await
+            .map(drop),
         Op::Supersede => g
-            .supersede(&seeded.x, fact_at("v2").with_subject("s"))
+            .supersede(
+                &seeded.x,
+                fact_at(&format!("v2-{tag}")).with_subject(subject),
+            )
             .await
             .map(drop),
         Op::Relate => g.relate(&seeded.x, &seeded.y, "mentions").await.map(drop),
@@ -119,12 +136,13 @@ async fn run_op<B: Backend>(g: &Graph<B>, op: Op, seeded: &Seeded) -> Result<()>
                 kind: "cites".to_string(),
                 attributes: serde_json::json!({}),
             };
-            g.ingest_episode(
-                vec![fact_at("v2").with_subject("s"), fact_at("ep-peer")],
-                vec![mentions(0, 1), cites],
-            )
-            .await
-            .map(drop)
+            let nodes = vec![
+                fact_at(&format!("v2-{tag}")).with_subject(subject),
+                fact_at(&format!("ep-peer-{tag}")),
+            ];
+            g.ingest_episode(nodes, vec![mentions(0, 1), cites])
+                .await
+                .map(drop)
         }
     }
 }
@@ -155,9 +173,10 @@ async fn run_with_fault(op: Op, fault: Fault) -> Faulted {
     let log_id = log.log_id().to_string();
     let shared = share(log);
     let g = open_with::<FailingBackend>(":memory:", Millis(1000), Arc::clone(&shared)).await;
-    let seeded = seed(&g).await;
+    let seeded = seed(&g, 0).await;
     let before = snapshot(&g).await;
     let seeded_events = events(&appended).len();
+    g.backend.probe.executed.lock().unwrap().clear();
     match fault {
         Fault::Statement(index) => g.backend.set_fail_on_execute(index),
         Fault::Commit => g.backend.set_fail_commit(true),
@@ -175,20 +194,17 @@ async fn run_with_fault(op: Op, fault: Fault) -> Faulted {
     }
 }
 
-/// How many statements `op` runs in its transaction: the first failing index
-/// that no longer fires. Every index below it must have failed with the
+/// Finds how many statements `op` runs in its transaction: the first failing
+/// index that no longer fires. Every index below it must have failed with the
 /// injector's own error, so a fault that went unnoticed, or a write that failed
-/// for another reason, cannot shorten the count.
+/// for another reason, cannot shorten the count. The count must be exactly
+/// `Op::statements`, so a write that skips a statement fails here.
 async fn statement_count(op: Op) -> usize {
     for index in 0..40 {
         let result = run_with_fault(op, Fault::Statement(index)).await.result;
         match result {
             Ok(()) => {
-                let at_least = op.min_statements();
-                assert!(
-                    index >= at_least,
-                    "{op:?} ran {index} statements, expected {at_least}"
-                );
+                assert_eq!(index, op.statements(), "{op:?}: statements it ran");
                 return index;
             }
             Err(_) => assert!(injected(&result), "{op:?}, statement {index}: {result:?}"),
@@ -215,6 +231,15 @@ async fn assert_voided(faulted: &Faulted, context: &str) {
         },
         "{context}"
     );
+    let envelope = |event: &LogEvent| {
+        (
+            event.source.clone(),
+            event.trust_score,
+            event.observed_at,
+            event.ingested_at,
+        )
+    };
+    assert_eq!(envelope(&logged[1]), envelope(&logged[0]), "{context}");
     assert_cursor_at_last_event(&faulted.g, &faulted.appended, &faulted.log_id).await;
     let bloom = faulted.shared.lock().await;
     for (hash, row_id) in content_hashes(&logged[0]) {
@@ -225,7 +250,9 @@ async fn assert_voided(faulted: &Faulted, context: &str) {
     }
 }
 
-/// A retry once the fault clears is a first write, not a duplicate.
+/// A retry once the fault clears is a first write, not a duplicate: the log
+/// holds the write, its void, and the same kind of write again, with the cursor
+/// on the last of them.
 async fn assert_retry_is_a_first_write(faulted: &Faulted, op: Op, context: &str) {
     faulted.g.backend.set_fail_on_execute(usize::MAX);
     faulted.g.backend.set_fail_commit(false);
@@ -233,24 +260,38 @@ async fn assert_retry_is_a_first_write(faulted: &Faulted, op: Op, context: &str)
     let retried = run_op(&faulted.g, op, &faulted.seeded).await;
 
     assert!(retried.is_ok(), "{context}: {retried:?}");
-    let last = events(&faulted.appended).pop().unwrap();
+    let logged = events_since(&faulted.appended, faulted.seeded_events);
+    assert_eq!(logged.len(), 3, "{context}: write, void, retry: {logged:?}");
     assert!(
-        !matches!(
-            last.payload,
-            LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. }
-        ),
-        "{context}: {last:?}"
+        matches!(logged[1].payload, LogPayload::Voided { .. }),
+        "{context}: {logged:?}"
     );
+    assert_eq!(
+        std::mem::discriminant(&logged[2].payload),
+        std::mem::discriminant(&logged[0].payload),
+        "{context}: {logged:?}"
+    );
+    assert_cursor_at_last_event(&faulted.g, &faulted.appended, &faulted.log_id).await;
     assert_ne!(snapshot(&faulted.g).await, faulted.before, "{context}");
 }
 
 async fn assert_failure_at_every_statement_is_voided(op: Op) {
-    for index in 0..statement_count(op).await {
+    let statements = statement_count(op).await;
+    for index in 0..statements {
         // Arrange and Act
         let faulted = run_with_fault(op, Fault::Statement(index)).await;
 
-        // Assert
+        // Assert: the cursor is the last statement, so failing it undoes the
+        // projection with it.
         let context = format!("{op:?}, failing execute {index}");
+        let executed = faulted.g.backend.probe.executed.lock().unwrap().clone();
+        assert_eq!(executed.len(), index + 1, "{context}: {executed:?}");
+        assert_eq!(
+            executed[index].contains("log_cursor"),
+            index == statements - 1,
+            "{context}: {}",
+            executed[index]
+        );
         assert_voided(&faulted, &context).await;
         assert_retry_is_a_first_write(&faulted, op, &context).await;
     }
@@ -266,305 +307,146 @@ async fn assert_commit_failure_is_voided(op: Op) {
     assert_retry_is_a_first_write(&faulted, op, &context).await;
 }
 
-/// The cursor is the last statement of the write's transaction, so failing it
-/// must undo the projection with it.
-async fn assert_cursor_failure_commits_nothing(op: Op) {
-    // Arrange
-    let statements = statement_count(op).await;
+/// The fault tests every write path gets, in a module named for it.
+macro_rules! write_path_fault_tests {
+    ($($module:ident => $op:expr),* $(,)?) => {$(
+        mod $module {
+            use super::*;
 
-    // Act
-    let faulted = run_with_fault(op, Fault::Statement(statements - 1)).await;
+            #[tokio::test]
+            async fn log_write_projection_failure_voids_the_write() {
+                within_deadline(assert_failure_at_every_statement_is_voided($op)).await;
+            }
 
-    // Assert
-    assert_voided(&faulted, &format!("{op:?}, failing the cursor statement")).await;
-    let write_offset = faulted.appended.lock().unwrap()[faulted.seeded_events].0;
-    assert_ne!(
-        cursor(&faulted.g).await.and_then(|(_, offset)| offset),
-        Some(offset_pair(write_offset)),
-        "the cursor must not sit on the voided write"
-    );
+            #[tokio::test]
+            async fn log_write_commit_failure_is_voided() {
+                within_deadline(assert_commit_failure_is_voided($op)).await;
+            }
+        }
+    )*};
 }
 
-#[tokio::test]
-async fn log_write_upsert_by_projection_failure_voids_the_insert() {
-    assert_failure_at_every_statement_is_voided(Op::UpsertInsert).await;
-}
-
-#[tokio::test]
-async fn log_write_upsert_by_projection_failure_voids_the_supersede() {
-    assert_failure_at_every_statement_is_voided(Op::UpsertSupersede).await;
-}
-
-#[tokio::test]
-async fn log_write_supersede_projection_failure_voids_the_batch() {
-    assert_failure_at_every_statement_is_voided(Op::Supersede).await;
-}
-
-#[tokio::test]
-async fn log_write_relate_projection_failure_voids_the_edge_write() {
-    assert_failure_at_every_statement_is_voided(Op::Relate).await;
-}
-
-#[tokio::test]
-async fn log_write_ingest_episode_projection_failure_voids_the_whole_batch() {
-    assert_failure_at_every_statement_is_voided(Op::Episode).await;
-}
-
-#[tokio::test]
-async fn log_write_upsert_by_insert_cursor_failure_commits_nothing() {
-    assert_cursor_failure_commits_nothing(Op::UpsertInsert).await;
-}
-
-#[tokio::test]
-async fn log_write_upsert_by_supersede_cursor_failure_commits_nothing() {
-    assert_cursor_failure_commits_nothing(Op::UpsertSupersede).await;
-}
-
-#[tokio::test]
-async fn log_write_supersede_cursor_failure_commits_nothing() {
-    assert_cursor_failure_commits_nothing(Op::Supersede).await;
-}
-
-#[tokio::test]
-async fn log_write_relate_cursor_failure_commits_nothing() {
-    assert_cursor_failure_commits_nothing(Op::Relate).await;
-}
-
-#[tokio::test]
-async fn log_write_ingest_episode_cursor_failure_commits_nothing() {
-    assert_cursor_failure_commits_nothing(Op::Episode).await;
-}
-
-#[tokio::test]
-async fn log_write_upsert_by_insert_commit_failure_is_voided() {
-    assert_commit_failure_is_voided(Op::UpsertInsert).await;
-}
-
-#[tokio::test]
-async fn log_write_upsert_by_supersede_commit_failure_is_voided() {
-    assert_commit_failure_is_voided(Op::UpsertSupersede).await;
-}
-
-#[tokio::test]
-async fn log_write_supersede_commit_failure_is_voided() {
-    assert_commit_failure_is_voided(Op::Supersede).await;
-}
-
-#[tokio::test]
-async fn log_write_relate_commit_failure_is_voided() {
-    assert_commit_failure_is_voided(Op::Relate).await;
-}
-
-#[tokio::test]
-async fn log_write_ingest_episode_commit_failure_is_voided() {
-    assert_commit_failure_is_voided(Op::Episode).await;
+write_path_fault_tests! {
+    insert => Op::Insert,
+    upsert_by_insert => Op::UpsertInsert,
+    upsert_by_supersede => Op::UpsertSupersede,
+    supersede => Op::Supersede,
+    relate => Op::Relate,
+    ingest_episode => Op::Episode,
 }
 
 // ---- concurrency ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn log_write_concurrent_upsert_by_calls_look_up_the_live_row_inside_the_transaction() {
-    // Arrange: one live row, then writers that all upsert its subject at once.
-    const WRITERS: usize = 8;
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("graph.db");
-    let (log, appended) = RecordingLog::new();
-    let g = Arc::new(
-        open_with::<FailingBackend>(path.to_str().unwrap(), Millis(1000), share(log)).await,
-    );
-    g.upsert_by(fact("v-seed").with_subject("s")).await.unwrap();
-    let since = events(&appended).len();
-    let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+async fn log_write_mixed_concurrent_writes_keep_wal_order_equal_to_commit_order() {
+    within_deadline(async {
+        // Arrange: the first `begin` of each pair is slow, so a write that appended
+        // before its `begin` and let go of the log lock would be overtaken by the
+        // second, and the log order would no longer be the commit order. Each write
+        // path runs against rows of its own.
+        const PAIRS: usize = 12;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.db");
+        let (log, appended) = RecordingLog::new();
+        let shared = share(log);
+        let g = Arc::new(
+            open_with::<FailingBackend>(path.to_str().unwrap(), Millis(1000), Arc::clone(&shared))
+                .await,
+        );
+        let mut seeded = Vec::new();
+        for tag in 0..PAIRS * 2 {
+            seeded.push(seed(&*g, tag).await);
+        }
+        let seeded = Arc::new(seeded);
+        let since = events(&appended).len();
+        g.backend.probe.begins.store(0, Ordering::SeqCst);
+        g.backend
+            .probe
+            .delay_even_begins
+            .store(true, Ordering::SeqCst);
+        *g.backend.probe.watched.lock().unwrap() = Some(shared);
 
-    // Act
-    let tasks: Vec<_> = (0..WRITERS)
-        .map(|writer| {
-            let (g, barrier) = (Arc::clone(&g), Arc::clone(&barrier));
-            tokio::spawn(async move {
-                barrier.wait().await;
-                g.upsert_by(fact(&format!("v-{writer}")).with_subject("s"))
-                    .await
+        // Act
+        for pair in 0..PAIRS {
+            let written = race(2, |side| {
+                let tag = pair * 2 + side;
+                let op = OPS[(pair + side) % OPS.len()];
+                let (g, seeded) = (Arc::clone(&g), Arc::clone(&seeded));
+                async move { run_op(&g, op, &seeded[tag]).await }
             })
-        })
-        .collect();
-    let mut results = Vec::new();
-    for task in tasks {
-        results.push(task.await.unwrap());
-    }
+            .await;
+            assert!(written.iter().all(Result::is_ok), "{written:?}");
+        }
 
-    // Assert: each write superseded the row the one before it left live, so
-    // the versions form one chain with one live end.
-    assert!(results.iter().all(Result::is_ok), "{results:?}");
-    let logged = events_since(&appended, since);
-    assert_eq!(logged.len(), WRITERS, "{logged:?}");
-    assert!(logged
-        .iter()
-        .all(|event| matches!(event.payload, LogPayload::EpisodeBatch(_))));
-    assert_eq!(live_ids_with_subject(&g, "s").await.len(), 1);
-    let closed = g
-        .backend
-        .query(
-            "SELECT COUNT(DISTINCT dst) FROM edges WHERE type = ?1",
-            &[relation::SUPERSEDES.into()],
-        )
-        .await
-        .unwrap();
-    assert_eq!(closed[0].get_i64(0).unwrap(), WRITERS as i64);
-}
-
-#[derive(Clone, Copy)]
-enum Kind {
-    Upsert,
-    Supersede,
-    Relate,
-    Episode,
-}
-
-const KINDS: [Kind; 4] = [Kind::Upsert, Kind::Supersede, Kind::Relate, Kind::Episode];
-
-async fn mixed_write(
-    g: &Graph<FailingBackend>,
-    kind: Kind,
-    tag: usize,
-    (target, a, b): (&NodeId, &NodeId, &NodeId),
-) -> Result<()> {
-    match kind {
-        Kind::Upsert => g
-            .upsert_by(fact(&format!("up-{tag}")).with_subject(format!("subject-{tag}")))
-            .await
-            .map(drop),
-        Kind::Supersede => g
-            .supersede(target, fact(&format!("sup-{tag}")))
-            .await
-            .map(drop),
-        Kind::Relate => g.relate(a, b, &format!("rel-{tag}")).await.map(drop),
-        Kind::Episode => g
-            .ingest_episode(
-                vec![fact(&format!("ep-{tag}-0")), fact(&format!("ep-{tag}-1"))],
-                vec![mentions(0, 1)],
+        // Assert: each write registers its rows in the hash index inside its own
+        // transaction, so the index's row order is the commit order.
+        let wal_order: Vec<String> = events_since(&appended, since)
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect();
+        assert_eq!(wal_order.len(), PAIRS * 2);
+        let mut commit_order: Vec<String> = g
+            .backend
+            .query(
+                "SELECT first_event_id FROM log_hash_index ORDER BY rowid",
+                &[],
             )
             .await
-            .map(drop),
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn log_write_mixed_concurrent_writes_keep_wal_order_equal_to_commit_order() {
-    // Arrange: the first `begin` of each pair is slow, so a write that appended
-    // before its `begin` and let go of the log lock would be overtaken by the
-    // second, and the log order would no longer be the commit order. Each write
-    // type runs against a row of its own.
-    const PAIRS: usize = 12;
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("graph.db");
-    let (log, appended) = RecordingLog::new();
-    let shared = share(log);
-    let g = Arc::new(
-        open_with::<FailingBackend>(path.to_str().unwrap(), Millis(1000), Arc::clone(&shared))
-            .await,
-    );
-    let mut targets = Vec::new();
-    for tag in 0..PAIRS * 2 {
-        let seed = fact(&format!("seed-{tag}")).with_subject(format!("subject-{tag}"));
-        targets.push(g.upsert_by(seed).await.unwrap());
-    }
-    let targets = Arc::new(targets);
-    let a = g.insert(fact("relate-a")).await.unwrap();
-    let b = g.insert(fact("relate-b")).await.unwrap();
-    let since = events(&appended).len();
-    g.backend.probe.begins.store(0, Ordering::SeqCst);
-    g.backend
-        .probe
-        .delay_even_begins
-        .store(true, Ordering::SeqCst);
-    *g.backend.probe.watched.lock().unwrap() = Some(shared);
-
-    // Act
-    for pair in 0..PAIRS {
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let tasks: Vec<_> = (0..2)
-            .map(|side| {
-                let tag = pair * 2 + side;
-                let kind = KINDS[(pair + side) % KINDS.len()];
-                let (g, barrier, targets) =
-                    (Arc::clone(&g), Arc::clone(&barrier), Arc::clone(&targets));
-                let (a, b) = (a.clone(), b.clone());
-                tokio::spawn(async move {
-                    barrier.wait().await;
-                    mixed_write(&g, kind, tag, (&targets[tag], &a, &b)).await
-                })
-            })
+            .unwrap()
+            .iter()
+            .map(|row| row.get_string(0).unwrap())
+            .filter(|event_id| wal_order.contains(event_id))
             .collect();
-        for task in tasks {
-            let written = task.await.unwrap();
-            assert!(written.is_ok(), "{written:?}");
-        }
-    }
-
-    // Assert: each write registers its rows in the hash index inside its own
-    // transaction, so the index's row order is the commit order.
-    let wal_order: Vec<String> = events_since(&appended, since)
-        .into_iter()
-        .map(|event| event.event_id)
-        .collect();
-    assert_eq!(wal_order.len(), PAIRS * 2);
-    let mut commit_order: Vec<String> = g
-        .backend
-        .query(
-            "SELECT first_event_id FROM log_hash_index ORDER BY rowid",
-            &[],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|row| row.get_string(0).unwrap())
-        .filter(|event_id| wal_order.contains(event_id))
-        .collect();
-    commit_order.dedup();
-    assert_eq!(wal_order, commit_order);
-    let lock_held = g.backend.probe.commit_lock_held.lock().unwrap().clone();
-    assert_eq!(lock_held, vec![true; PAIRS * 2]);
+        commit_order.dedup();
+        assert_eq!(wal_order, commit_order);
+        let lock_held = g.backend.probe.commit_lock_held.lock().unwrap().clone();
+        assert_eq!(lock_held, vec![true; PAIRS * 2]);
+    })
+    .await;
 }
 
 // ---- ingest_episode atomicity ----
 
 #[tokio::test]
 async fn log_write_a_failing_episode_edge_voids_the_whole_batch_and_keeps_no_node() {
-    // Arrange: the same edge twice, so the second insert is refused after both
-    // nodes and the first edge were written.
-    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
-    g.insert(fact_at("seed")).await.unwrap();
-    let before = snapshot(&g).await;
-    let since = events(&appended).len();
+    within_deadline(async {
+        // Arrange: the same edge twice, so the second insert is refused after both
+        // nodes and the first edge were written.
+        let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+        g.insert(fact_at("seed")).await.unwrap();
+        let before = snapshot(&g).await;
+        let since = events(&appended).len();
 
-    // Act
-    let failed = g
-        .ingest_episode(
-            vec![fact_at("a"), fact_at("b")],
-            vec![mentions(0, 1), mentions(0, 1)],
-        )
-        .await;
+        // Act
+        let failed = g
+            .ingest_episode(
+                vec![fact_at("a"), fact_at("b")],
+                vec![mentions(0, 1), mentions(0, 1)],
+            )
+            .await;
 
-    // Assert
-    assert!(matches!(failed, Err(Error::RelateRefused(_))), "{failed:?}");
-    assert_eq!(snapshot(&g).await, before, "no node, edge, or index entry");
-    let logged = events_since(&appended, since);
-    assert_eq!(logged.len(), 2, "the batch, then its void: {logged:?}");
-    assert!(matches!(logged[0].payload, LogPayload::EpisodeBatch(_)));
-    assert_eq!(
-        logged[1].payload,
-        LogPayload::Voided {
-            target_event_id: logged[0].event_id.clone()
-        }
-    );
-    assert_cursor_at_last_event(&g, &appended, &log_id).await;
+        // Assert
+        assert!(matches!(failed, Err(Error::RelateRefused(_))), "{failed:?}");
+        assert_eq!(snapshot(&g).await, before, "no node, edge, or index entry");
+        let logged = events_since(&appended, since);
+        assert_eq!(logged.len(), 2, "the batch, then its void: {logged:?}");
+        assert!(matches!(logged[0].payload, LogPayload::EpisodeBatch(_)));
+        assert_eq!(
+            logged[1].payload,
+            LogPayload::Voided {
+                target_event_id: logged[0].event_id.clone()
+            }
+        );
+        assert_cursor_at_last_event(&g, &appended, &log_id).await;
 
-    // Act: a valid episode afterwards is a first write.
-    let retried = g
-        .ingest_episode(vec![fact_at("a"), fact_at("b")], vec![mentions(0, 1)])
-        .await;
+        // Act: a valid episode afterwards is a first write.
+        let retried = g
+            .ingest_episode(vec![fact_at("a"), fact_at("b")], vec![mentions(0, 1)])
+            .await;
 
-    // Assert
-    assert!(retried.is_ok(), "{retried:?}");
-    assert_eq!(count(&g, "nodes").await, 3);
+        // Assert
+        assert!(retried.is_ok(), "{retried:?}");
+        assert_eq!(count(&g, "nodes").await, 3);
+    })
+    .await;
 }
