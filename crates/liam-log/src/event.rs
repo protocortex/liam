@@ -41,6 +41,9 @@ pub struct NodeRow {
     pub subject: Option<String>,
     pub confidence: f64,
     pub valid_from: i64,
+    /// False when the caller left `valid_from` unset and the store filled in a
+    /// default, so dedup hashing can ignore the minted value.
+    pub valid_from_supplied: bool,
     pub valid_until: i64,
     pub tx_from: i64,
     pub tx_to: i64,
@@ -169,6 +172,7 @@ mod tests {
             subject: None,
             confidence: 0.75,
             valid_from: 1_000,
+            valid_from_supplied: true,
             valid_until: 4_102_444_800_000,
             tx_from: 2_000,
             tx_to: 4_102_444_800_000,
@@ -223,6 +227,17 @@ mod tests {
     fn edge_write_round_trips() {
         // Arrange
         let event = event_with(LogPayload::EdgeWrite(edge_row()));
+
+        // Act and Assert
+        assert_round_trips(event);
+    }
+
+    #[test]
+    fn node_write_with_unsupplied_valid_from_round_trips() {
+        // Arrange
+        let mut node = node_row();
+        node.valid_from_supplied = false;
+        let event = event_with(LogPayload::NodeWrite(node));
 
         // Act and Assert
         assert_round_trips(event);
@@ -517,6 +532,7 @@ mod tests {
             subject: Some(String::new()),
             confidence: 0.0,
             valid_from: i64::MIN,
+            valid_from_supplied: false,
             valid_until: i64::MAX,
             tx_from: i64::MIN,
             tx_to: i64::MAX,
@@ -584,14 +600,14 @@ mod tests {
     fn v1_wire_format_is_pinned() {
         // Arrange: one fixed event per payload variant, in declaration order.
         let golden = [
-            (LogPayload::NodeWrite(node_row()), "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f0000066e6f64652d310466616374056c6162656c07636f6e74656e74076167656e742d61027b7d010670726f6a2f6100000000000000e83fd00f80e09ecce5ee01a01f80e09ecce5ee01"),
+            (LogPayload::NodeWrite(node_row()), "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f0000066e6f64652d310466616374056c6162656c07636f6e74656e74076167656e742d61027b7d010670726f6a2f6100000000000000e83fd00f0180e09ecce5ee01a01f80e09ecce5ee01"),
             (LogPayload::EdgeWrite(edge_row()), "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f000106656467652d31066e6f64652d31066e6f64652d320a72656c617465735f746f027b7da01f80e09ecce5ee01"),
             (
                 LogPayload::EpisodeBatch(vec![
                     RowEffect::Node(node_row()),
                     RowEffect::Edge(edge_row()),
                 ]),
-                "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f00020200066e6f64652d310466616374056c6162656c07636f6e74656e74076167656e742d61027b7d010670726f6a2f6100000000000000e83fd00f80e09ecce5ee01a01f80e09ecce5ee010106656467652d31066e6f64652d31066e6f64652d320a72656c617465735f746f027b7da01f80e09ecce5ee01",
+                "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f00020200066e6f64652d310466616374056c6162656c07636f6e74656e74076167656e742d61027b7d010670726f6a2f6100000000000000e83fd00f0180e09ecce5ee01a01f80e09ecce5ee010106656467652d31066e6f64652d31066e6f64652d320a72656c617465735f746f027b7da01f80e09ecce5ee01",
             ),
             (
                 LogPayload::Tombstone(tombstone_targets()),
