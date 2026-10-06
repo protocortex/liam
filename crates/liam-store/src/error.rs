@@ -106,6 +106,33 @@ pub enum Error {
     #[error("event {0} is only partly in the store")]
     PartlyApplied(String),
 
+    /// A rebuild or a log check needs an event log and the store has none.
+    #[error("the store has no event log attached; open it with the log it was written through")]
+    NoEventLog,
+
+    /// A rebuild asked to start from an empty projection found rows in it.
+    #[error(
+        "the store already holds projected rows; a rebuild resets them first, \
+         so ask for the reset explicitly if that is what you want"
+    )]
+    ProjectionNotEmpty,
+
+    /// The rows a rebuild produced are not the rows that were expected: the
+    /// hash multiset of the live nodes and edges differs, even when the counts
+    /// agree. The store stays as the replay left it.
+    #[error(
+        "the rebuilt projection does not match: expected {expected} live rows, \
+         found {found}, with {missing} missing and {unexpected} unexpected; \
+         the log and the store disagree, so restore the missing log segments \
+         or the database from a backup before trusting this store"
+    )]
+    RebuildMismatch {
+        expected: usize,
+        found: usize,
+        missing: usize,
+        unexpected: usize,
+    },
+
     /// A log table holds a value no write of this store produces, so the
     /// store was edited or damaged outside it.
     #[error("the log state in the store is corrupt: {0}")]

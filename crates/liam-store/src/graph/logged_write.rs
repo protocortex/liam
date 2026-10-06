@@ -390,6 +390,14 @@ impl HeldLog {
         }
     }
 
+    /// Empties the dedup filter, for a store whose hash index was just cleared.
+    pub(super) fn forget_hashes(&mut self) {
+        if let Some(log) = self.guard.as_deref_mut() {
+            let empty = HashBloom::new(log.bloom_config().clone());
+            log.replace_bloom(empty);
+        }
+    }
+
     pub(super) fn set_poisoned(&mut self, poisoned: bool) {
         if let Some(log) = self.guard.as_deref_mut() {
             log.poisoned = poisoned;

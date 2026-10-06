@@ -260,9 +260,9 @@ async fn replay_projection(
 }
 
 /// What a replay range holds besides the events to apply.
-struct Ahead {
+pub(super) struct Ahead {
     /// The ids of the events a `Voided` record cancels.
-    voided: HashSet<String>,
+    pub(super) voided: HashSet<String>,
     /// The rows named by the tombstones that ran, so a voided one is left out.
     removed: Removed,
 }
@@ -299,7 +299,7 @@ impl Removed {
     }
 }
 
-async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
+pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
     let mut voided = HashSet::new();
     let mut tombstones = Vec::new();
     while let Some(record) = records.next().await {

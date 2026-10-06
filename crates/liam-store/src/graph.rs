@@ -15,6 +15,7 @@ use liam_log::event::NodeRow;
 use self::logged_plan::{refuse_supersedes, Collision};
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
+pub use self::rebuild::{RebuildMode, RebuildReport};
 pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
 pub use self::replay::CatchUpReport;
 use crate::backend::Backend;
@@ -33,6 +34,7 @@ mod log_open;
 mod logged_plan;
 mod logged_write;
 mod projection;
+mod rebuild;
 mod reembed;
 mod replay;
 
@@ -2168,6 +2170,7 @@ mod tests {
     mod log_open;
     mod log_write;
     mod log_write_faults;
+    mod rebuild;
     mod reembed;
     mod support;
 
