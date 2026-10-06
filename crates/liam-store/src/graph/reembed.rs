@@ -27,8 +27,21 @@ pub trait ContentEmbedder: Send + Sync {
 pub struct ReembedReport {
     /// Nodes that now have a vector.
     pub re_embedded: usize,
-    /// Nodes that still have none: the embedder or the vector write failed.
+    /// Nodes that still have none: the embedder, the content read or the
+    /// vector write failed, or the vector's size does not match the store's.
     pub failed: usize,
+    /// Nodes that have none and were not embedded because no embedder is
+    /// configured.
+    pub pending: usize,
+}
+
+/// What became of one listed node.
+enum Outcome {
+    Stored,
+    /// A concurrent write stored a vector first, and it is kept.
+    AlreadyHeld,
+    /// The node was removed after it was listed.
+    Gone,
 }
 
 impl<B: Backend> Graph<B> {
@@ -38,34 +51,29 @@ impl<B: Backend> Graph<B> {
         self
     }
 
-    /// The live nodes with no stored vector, in id order.
-    pub async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
-        self.backend.nodes_missing_vectors().await
-    }
-
     /// Embeds the content of every live node that has no vector and stores it
-    /// the way a live write does. Like a live write after its commit, a failed
-    /// embed leaves the node as it is, but this pass counts the failure
-    /// instead of returning it, so one bad node does not hide the rest; the
-    /// node is found again by the next pass. Does nothing without an embedder.
+    /// unless a concurrent write stored one first. A node that cannot be
+    /// embedded is left as it is and counted instead of returned, so one bad
+    /// node does not hide the rest; the next pass finds it again. Without an
+    /// embedder it only counts the nodes it would have embedded. Fails only
+    /// when the nodes cannot be listed.
     pub async fn reembed_missing(&self) -> Result<ReembedReport> {
         let mut report = ReembedReport::default();
+        let missing = self.backend.nodes_missing_vectors().await?;
         let Some(embedder) = &self.embedder else {
+            report.pending = missing.len();
+            if report.pending > 0 {
+                tracing::warn!(
+                    pending = report.pending,
+                    "nodes have no vector and no embedder is configured"
+                );
+            }
             return Ok(report);
         };
-        for id in self.nodes_missing_vectors().await? {
-            let Some(content) = self.node_content(&id).await? else {
-                continue;
-            };
-            let stored = match embedder.embed(&content).await {
-                Ok(embedding) => self
-                    .put_vector(&id, &embedding)
-                    .await
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
-            match stored {
-                Ok(()) => report.re_embedded += 1,
+        for id in missing {
+            match self.reembed_one(embedder.as_ref(), &id).await {
+                Ok(Outcome::Stored) => report.re_embedded += 1,
+                Ok(Outcome::AlreadyHeld | Outcome::Gone) => {}
                 Err(reason) => {
                     tracing::error!(node = id.as_str(), %reason, "re-embedding failed, the node stays without a vector");
                     report.failed += 1;
@@ -73,6 +81,28 @@ impl<B: Backend> Graph<B> {
             }
         }
         Ok(report)
+    }
+
+    async fn reembed_one(
+        &self,
+        embedder: &dyn ContentEmbedder,
+        id: &NodeId,
+    ) -> std::result::Result<Outcome, String> {
+        let Some(content) = self.node_content(id).await.map_err(|e| e.to_string())? else {
+            return Ok(Outcome::Gone);
+        };
+        let embedding = embedder.embed(&content).await.map_err(|e| e.to_string())?;
+        self.check_dims(&embedding).map_err(|e| e.to_string())?;
+        let stored = self
+            .backend
+            .vector_insert_if_absent(id.as_str(), &embedding)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(if stored {
+            Outcome::Stored
+        } else {
+            Outcome::AlreadyHeld
+        })
     }
 
     /// `None` when the node was removed since it was listed.

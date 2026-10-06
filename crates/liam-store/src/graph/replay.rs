@@ -15,6 +15,7 @@ use super::log_cursor;
 use super::logged_plan::Table;
 use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog, SharedLog};
 use super::projection::{steps_for, Step};
+use super::reembed::ReembedReport;
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
@@ -23,10 +24,10 @@ use crate::value::Value;
 const QUARANTINE_SQL: &str = "INSERT INTO log_quarantine (event_id, segment, seg_index, reason, at)
      VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(event_id) DO NOTHING";
 
-/// What one `catch_up` did with the records past the cursor. Records that carry
-/// no rows to project (`Voided`, `DuplicateOf`, `Tombstone`) only move the
-/// cursor and are in no count, including the `Voided` records a quarantine
-/// appends; a cancelled event is counted once, as voided.
+/// What one `catch_up` did. The four record counts describe log records only:
+/// those that carry no rows to project (`Voided`, `DuplicateOf`, `Tombstone`)
+/// only move the cursor and are in no count, including the `Voided` records a
+/// quarantine appends, and a cancelled event is counted once, as voided.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CatchUpReport {
     /// Events whose rows were projected.
@@ -37,10 +38,9 @@ pub struct CatchUpReport {
     pub skipped_voided: usize,
     /// Events the projection refused, recorded in `log_quarantine`.
     pub quarantined: usize,
-    /// Nodes that had no vector and now have one.
-    pub re_embedded: usize,
-    /// Nodes that still have no vector because embedding them failed.
-    pub embed_failed: usize,
+    /// The re-embed pass that follows the replay, which covers every live
+    /// node without a vector, not only the replayed ones.
+    pub reembedded: ReembedReport,
 }
 
 /// What became of one record.
@@ -78,9 +78,14 @@ impl<B: Backend> Graph<B> {
             return Ok(CatchUpReport::default());
         };
         let mut report = self.replay(log).await?;
-        let embedded = self.reembed_missing().await?;
-        report.re_embedded = embedded.re_embedded;
-        report.embed_failed = embedded.failed;
+        // The replay has already committed, so a failed listing must not hide
+        // its report.
+        match self.reembed_missing().await {
+            Ok(reembedded) => report.reembedded = reembedded,
+            Err(error) => {
+                tracing::error!(%error, "re-embed pass skipped, the nodes could not be listed")
+            }
+        }
         Ok(report)
     }
 

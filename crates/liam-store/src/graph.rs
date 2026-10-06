@@ -733,12 +733,8 @@ impl<B: Backend> Graph<B> {
         // risk.
         for (id, node) in ids.iter().zip(&nodes) {
             if let Some(embedding) = node.embedding.as_deref() {
-                if let Err(e) = self.check_dims(embedding) {
-                    tracing::error!(?id, error = %e, "episode vector dims check failed, node row committed without a vector");
-                    continue;
-                }
-                if let Err(e) = self.backend.vector_upsert(id.as_str(), embedding).await {
-                    tracing::error!(?id, error = %e, "episode vector upsert failed, node row committed without a vector");
+                if let Err(e) = self.put_vector(id, embedding).await {
+                    tracing::error!(?id, error = %e, "episode vector write failed, node row committed without a vector");
                 }
             }
         }
@@ -6247,6 +6243,9 @@ mod tests {
         async fn vector_upsert(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
             self.0.vector_upsert(node_id, embedding).await
         }
+        async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
+            self.0.vector_insert_if_absent(node_id, embedding).await
+        }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.0.vector_delete(node_id).await
         }
@@ -7794,6 +7793,9 @@ mod tests {
         async fn vector_upsert(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
             self.inner.vector_upsert(node_id, embedding).await
         }
+        async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
+            self.inner.vector_insert_if_absent(node_id, embedding).await
+        }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
         }
@@ -7889,6 +7891,9 @@ mod tests {
                 return Err(Error::Backend("injected vector_upsert failure".to_string()));
             }
             self.inner.vector_upsert(node_id, embedding).await
+        }
+        async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
+            self.inner.vector_insert_if_absent(node_id, embedding).await
         }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
