@@ -227,8 +227,11 @@ fn live_by_subject_query(
 /// if given), if any", as `(id, tx_from)`. Run against a write's open
 /// transaction by every write that replaces a competitor. Open means
 /// `tx_to = FOREVER`, the row the close step can end, so it is a fact about the
-/// store and never about the caller's clock. Valid time is not tested: it is
-/// the world's time, and every write stamps `valid_until` as `FOREVER`.
+/// store and never about the caller's clock. Valid time is not tested, so a
+/// write replaces an open row even when its `valid_from` is in the future. A
+/// `valid_from <= now` guard cannot be added: a row written at clock 3000 has
+/// `valid_from` 3000 by default, so it would hide that row from a write at 1000
+/// and leave two open rows for the subject, the backwards-clock bug again.
 fn open_by_subject_query(
     subject: &str,
     scope: Option<&str>,
@@ -1553,6 +1556,11 @@ impl<B: Backend> Graph<B> {
         }
 
         if let Some(new_watermark) = next_watermark(&processed) {
+            // A `supersedes` edge clamped to its predecessor's start can be later
+            // than the clock. Persisting that would skip every supersession
+            // until the clock caught up, so such edges are rescanned instead,
+            // which is safe because a repeated repair is a no-op.
+            let new_watermark = new_watermark.min(self.clock.now());
             if new_watermark > watermark {
                 self.persist_repair_watermark(new_watermark).await?;
             }
