@@ -148,6 +148,15 @@ impl HashBloom {
         Self { filter }
     }
 
+    /// Rebuilds a filter from persisted bits, under the same pinned seed.
+    /// `bits` must be non-empty and `num_hashes` at least 1.
+    pub(crate) fn from_parts(bits: Vec<u64>, num_hashes: u32) -> Self {
+        let filter = BloomFilter::from_vec(bits)
+            .seed(&BLOOM_SEED)
+            .hashes(num_hashes);
+        Self { filter }
+    }
+
     pub fn insert(&mut self, hash: &[u8; 32]) {
         self.filter.insert(hash);
     }
