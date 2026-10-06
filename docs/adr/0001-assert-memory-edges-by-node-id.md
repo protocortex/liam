@@ -416,7 +416,7 @@ Not a defect, recorded so nobody "fixes" it and silently changes the guarantee.
 
 The mandated `EXISTS (SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?7)` tests one column.
 The store's own liveness predicate, `live_at` (`graph.rs:24-29`), tests four, adding
-`valid_from` and `valid_until`. `exists_as_of`, which `supersede` uses, applies all four.
+`valid_from` and `valid_until`. `exists_as_of`, which `supersede` used, applied all four.
 
 So `relate` accepts a node whose valid time has ended or has not yet begun, which is a node
 `recall` would not return. Both threats this record actually names are still covered: a
@@ -424,6 +424,13 @@ concurrent `supersede` sets `tx_to`, and `gc` deletes the row, so `EXISTS` fails
 
 This is a definitional gap rather than a race. Widening it to `live_at` would be a different
 guarantee, arguably a better one, and it needs deciding rather than assuming.
+
+**Amendment note (2026-10-07).** Decided: `supersede` and `upsert_by` now find their target
+with the same `tx_to`-only test as `relate`. A write replaces the node that is open
+(`tx_to = FOREVER`), found inside the write's own transaction, even when its `valid_from` is
+still in the future. Valid time is not consulted by writes. A `valid_from <= now` guard cannot
+be added: a row written at clock 3000 has `valid_from` 3000 by default, so a write at clock 1000
+would not find it and would leave two open rows for one subject. Reads keep `live_at`.
 
 ### Amendment 3: recall renders a 13-character handle, and `relate` resolves any unambiguous prefix (2026-08-22)
 

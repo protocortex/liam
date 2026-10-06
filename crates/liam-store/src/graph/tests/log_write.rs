@@ -1381,49 +1381,50 @@ async fn graph_with_a_stepped_back_clock() -> (DefaultGraph, Appended, String, N
     (g, appended, log_id, old, current)
 }
 
-async fn assert_voided_with_one_live_row(
-    (g, appended, log_id): (&DefaultGraph, &Appended, &str),
-    current: &NodeId,
-    failed: Result<NodeId>,
-) {
-    assert!(matches!(failed, Err(Error::NodeNotFound(_))), "{failed:?}");
-    assert_eq!(live_ids_with_subject(g, "s").await, vec![current.as_str()]);
-    let logged = events(appended);
-    let [.., write, void] = logged.as_slice() else {
-        panic!("the write and its void are logged: {logged:?}");
-    };
-    assert!(matches!(write.payload, LogPayload::EpisodeBatch(_)));
-    assert_eq!(
-        void.payload,
-        LogPayload::Voided {
-            target_event_id: write.event_id.clone()
-        }
-    );
-    assert_cursor_at_last_event(g, appended, log_id).await;
-}
-
 #[tokio::test]
-async fn log_write_a_clock_stepping_back_voids_an_upsert_instead_of_leaving_two_live_rows() {
+async fn log_write_a_clock_stepping_back_upserts_onto_the_open_row_instead_of_voiding() {
     // Arrange
     let (g, appended, log_id, _, current) = graph_with_a_stepped_back_clock().await;
+    let since = events(&appended).len();
 
-    // Act: the competitor the earlier time finds is closed already.
-    let failed = g.upsert_by(fact_at("v3").with_subject("s")).await;
+    // Act: the open row is `current`, whatever the earlier time reads.
+    let written = g.upsert_by(fact_at("v3").with_subject("s")).await.unwrap();
 
-    // Assert
-    assert_voided_with_one_live_row((&g, &appended, &log_id), &current, failed).await;
+    // Assert: one batch that replaces `current`, never the closed `old`, and
+    // nothing voided.
+    assert_eq!(live_ids_with_subject(&g, "s").await, vec![written.as_str()]);
+    let logged = events_since(&appended, since);
+    let [batch] = logged.as_slice() else {
+        panic!("one batch and no void: {logged:?}");
+    };
+    let LogPayload::EpisodeBatch(effects) = &batch.payload else {
+        panic!("the supersede is one batch: {batch:?}");
+    };
+    let closes: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            RowEffect::Edge(edge) => Some(edge.dst.as_str()),
+            RowEffect::Node(_) => None,
+        })
+        .collect();
+    assert_eq!(closes, vec![current.as_str()]);
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
 }
 
 #[tokio::test]
-async fn log_write_a_supersede_of_a_row_closed_since_is_voided_not_a_silent_no_op() {
+async fn log_write_a_supersede_of_a_row_closed_since_is_refused_before_anything_is_logged() {
     // Arrange
     let (g, appended, log_id, old, current) = graph_with_a_stepped_back_clock().await;
+    let since = events(&appended).len();
 
-    // Act
+    // Act: at 2500 `old` still reads as live, but it is closed.
     let failed = g.supersede(&old, fact_at("v3").with_subject("s")).await;
 
     // Assert
-    assert_voided_with_one_live_row((&g, &appended, &log_id), &current, failed).await;
+    assert!(matches!(failed, Err(Error::NodeNotFound(_))), "{failed:?}");
+    assert_eq!(live_ids_with_subject(&g, "s").await, vec![current.as_str()]);
+    assert!(events_since(&appended, since).is_empty());
+    assert_cursor_at_last_event(&g, &appended, &log_id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1568,7 +1569,7 @@ async fn log_write_repair_counts_only_the_mentions_it_wrote() {
 }
 
 /// Every stored column of the store's two bitemporal tables, in write order.
-async fn dump_rows<B: Backend>(g: &Graph<B>) -> String {
+pub(super) async fn dump_rows<B: Backend>(g: &Graph<B>) -> String {
     let nodes = "SELECT id, kind, label, content, producer, attributes, scope, subject,
                         confidence, valid_from, valid_until, tx_from, tx_to
                  FROM nodes ORDER BY rowid";

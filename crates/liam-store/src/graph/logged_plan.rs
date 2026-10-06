@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! What each write records and applies. A `Plan` pairs the log event with the
 //! statements that project it, built inside the write transaction so the reads
-//! it depends on, such as the live competitor of a subject, cannot go stale
+//! it depends on, such as the open competitor of a subject, cannot go stale
 //! before the append.
 //!
 //! A plan only reads from the transaction. Every statement that changes the
@@ -16,7 +16,7 @@ use uuid::Uuid;
 use super::logged_write::{ready, WriteOutcome};
 use super::projection::{edge_guards, steps_for, Step};
 use super::{
-    collision_producer, edge_refusal, live_as_of_query, live_by_subject_query, resolve_episode_ref,
+    collision_producer, edge_refusal, open_by_subject_query, open_node_query, resolve_episode_ref,
     resolve_node_row, Graph, EMPTY_ATTRIBUTES,
 };
 use crate::backend::{Backend, BackendTx};
@@ -111,8 +111,8 @@ impl Plan {
     /// Writes `row` and links it to `old`, which the link closes. The batch
     /// carries the `supersedes` edge so the log alone says which row the new one
     /// replaced.
-    fn supersede(row: NodeRow, old: &str, now: Millis) -> Self {
-        let edge = supersedes_edge(&row.id, old, now);
+    fn supersede(mut row: NodeRow, old: &OpenRow, now: Millis) -> Self {
+        let edge = succeed(&mut row, old, now);
         let effects = vec![RowEffect::Node(row.clone()), RowEffect::Edge(edge)];
         Self::new(node_event(&row, now, LogPayload::EpisodeBatch(effects)))
     }
@@ -175,19 +175,31 @@ fn event(
     }
 }
 
-fn supersedes_edge(new: &str, old: &str, now: Millis) -> EdgeRow {
+/// A node that has not been closed, and when its transaction time began.
+pub(super) struct OpenRow {
+    id: String,
+    tx_from: i64,
+}
+
+/// Starts `row` as the version after `old` and returns the `supersedes` edge
+/// that closes `old`. The versions of one subject must have non-decreasing
+/// transaction times, so a clock that stepped back cannot start `row` before
+/// the row it closes. The row, the edge, and the close, which replay takes from
+/// the edge, share that one time.
+fn succeed(row: &mut NodeRow, old: &OpenRow, now: Millis) -> EdgeRow {
+    row.tx_from = now.0.max(old.tx_from);
     EdgeRow {
         id: EdgeId::new().as_str().to_string(),
-        src: new.to_string(),
-        dst: old.to_string(),
+        src: row.id.clone(),
+        dst: old.id.clone(),
         edge_type: relation::SUPERSEDES.to_string(),
         attributes: EMPTY_ATTRIBUTES.to_string(),
-        tx_from: now.0,
+        tx_from: row.tx_from,
         tx_to: FOREVER.0,
     }
 }
 
-/// What makes a live node the one a new node replaces: the same subject and
+/// What makes an open node the one a new node replaces: the same subject and
 /// scope, and the same producer for a fact or empty content for an entity page.
 pub(super) struct Collision {
     subject: String,
@@ -214,24 +226,26 @@ impl Collision {
             }
     }
 
-    /// The newest live row this collides with, as the transaction sees it.
-    async fn find_live(&self, tx: &mut dyn BackendTx, now: Millis) -> Result<Option<String>> {
-        let (sql, params) = live_by_subject_query(
+    /// The newest open row this collides with, as the transaction sees it.
+    async fn find_open(&self, tx: &mut dyn BackendTx) -> Result<Option<OpenRow>> {
+        let (sql, params) = open_by_subject_query(
             &self.subject,
-            now,
             self.scope.as_deref(),
             self.producer.as_deref(),
         );
         let rows = tx.query(&sql, &params).await?;
-        rows.first().map(|row| row.get_string(0)).transpose()
+        rows.first()
+            .map(|row| {
+                Ok(OpenRow {
+                    id: row.get_string(0)?,
+                    tx_from: row.get_i64(1)?,
+                })
+            })
+            .transpose()
     }
 }
 
-fn is_live_at(row: &NodeRow, now: Millis) -> bool {
-    row.tx_from <= now.0 && row.tx_to > now.0 && row.valid_from <= now.0 && row.valid_until > now.0
-}
-
-/// An `upsert_by` over a subject: a plain write when nothing live collides, a
+/// An `upsert_by` over a subject: a plain write when nothing open collides, a
 /// supersede otherwise, and a duplicate when the content is already live.
 async fn plan_upsert(
     tx: &mut dyn BackendTx,
@@ -239,7 +253,7 @@ async fn plan_upsert(
     collision: Collision,
     now: Millis,
 ) -> Result<Plan> {
-    let plan = match collision.find_live(tx, now).await? {
+    let plan = match collision.find_open(tx).await? {
         Some(old) => Plan::supersede(row, &old, now).deduplicated(Table::Nodes, None),
         None => Plan::node_write(row, now),
     };
@@ -247,18 +261,23 @@ async fn plan_upsert(
 }
 
 /// A `supersede`. The caller asked for a state change, so it is never
-/// deduplicated, only refused when `old` is not live.
+/// deduplicated, only refused when `old` is not open.
 async fn plan_supersede(
     tx: &mut dyn BackendTx,
     row: NodeRow,
     old: &NodeId,
     now: Millis,
 ) -> Result<Plan> {
-    let (sql, params) = live_as_of_query(old.as_str(), now);
-    if tx.query(&sql, &params).await?.is_empty() {
+    let (sql, params) = open_node_query(old.as_str());
+    let rows = tx.query(sql, &params).await?;
+    let Some(open) = rows.first() else {
         return Err(Error::NodeNotFound(old.as_str().to_string()));
-    }
-    Ok(Plan::supersede(row, old.as_str(), now))
+    };
+    let old = OpenRow {
+        id: old.as_str().to_string(),
+        tx_from: open.get_i64(0)?,
+    };
+    Ok(Plan::supersede(row, &old, now))
 }
 
 /// A `relate`. A dead endpoint is refused before anything is logged. A live
@@ -310,40 +329,37 @@ async fn stage_node(
     now: Millis,
 ) -> Result<()> {
     let superseded = match &node.collision {
-        Some(collision) => find_competitor(tx, effects, collision, now).await?,
+        Some(collision) => find_competitor(tx, effects, collision).await?,
         None => None,
     };
-    let new_id = node.row.id.clone();
-    effects.push(RowEffect::Node(node.row));
-    if let Some(old) = superseded {
-        effects.push(RowEffect::Edge(supersedes_edge(&new_id, &old, now)));
-    }
+    let mut row = node.row;
+    let link = superseded.map(|old| succeed(&mut row, &old, now));
+    effects.push(RowEffect::Node(row));
+    effects.extend(link.map(RowEffect::Edge));
     Ok(())
 }
 
-/// The live row `collision` names, whether the store holds it or an earlier node
+/// The open row `collision` names, whether the store holds it or an earlier node
 /// of this episode staged it. The `supersedes` edge staged for it closes it.
 async fn find_competitor(
     tx: &mut dyn BackendTx,
     effects: &[RowEffect],
     collision: &Collision,
-    now: Millis,
-) -> Result<Option<String>> {
+) -> Result<Option<OpenRow>> {
     let staged = effects.iter().rev().find_map(|effect| match effect {
-        RowEffect::Node(row)
-            if collision.matches(row)
-                && is_live_at(row, now)
-                && !is_superseded(effects, &row.id) =>
-        {
-            Some(row.id.clone())
+        RowEffect::Node(row) if collision.matches(row) && !is_superseded(effects, &row.id) => {
+            Some(OpenRow {
+                id: row.id.clone(),
+                tx_from: row.tx_from,
+            })
         }
         _ => None,
     });
     if staged.is_some() {
         return Ok(staged);
     }
-    let stored = collision.find_live(tx, now).await?;
-    Ok(stored.filter(|id| !is_superseded(effects, id)))
+    let stored = collision.find_open(tx).await?;
+    Ok(stored.filter(|open| !is_superseded(effects, &open.id)))
 }
 
 fn is_superseded(effects: &[RowEffect], node_id: &str) -> bool {
