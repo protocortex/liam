@@ -10,10 +10,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use liam_log::event::{EdgeRow, NodeRow};
+use liam_log::event::NodeRow;
 
 use self::logged_plan::Collision;
-use self::logged_write::Logged;
+use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
@@ -28,34 +28,28 @@ use crate::value::{Row, Value};
 
 mod logged_plan;
 mod logged_write;
+mod projection;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
 /// one-character handle answers with something a caller can act on instead of
 /// every live node in the store.
 const HANDLE_MATCH_LIMIT: usize = 8;
 
-/// The combined guard `relate` conditions its edge INSERT on, and the
-/// diagnostic `relate_refusal` (and `Graph::ingest_episode`'s mirrored
-/// per-edge check) re-runs to name which of the three failed: source live,
-/// target live, edge already exists. Shared as one literal so the two call
-/// sites, one against `&Backend`, one against an open `BackendTx`, can never
-/// drift apart on the SQL itself. Bind order: src, dst, `FOREVER`, kind.
+/// The combined guard an edge INSERT conditions on, and the diagnostic that
+/// names which of the three failed: source live, target live, edge already
+/// exists. Shared as one literal so the guard and its diagnosis can never drift
+/// apart on the SQL itself. Bind order: src, dst, `FOREVER`, kind.
 const EDGE_REFUSAL_DIAGNOSTIC_SQL: &str = "SELECT
    EXISTS(SELECT 1 FROM nodes WHERE id = ?1 AND tx_to = ?3),
    EXISTS(SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?3),
    EXISTS(SELECT 1 FROM edges
           WHERE src = ?1 AND dst = ?2 AND type = ?4 AND tx_to = ?3)";
 
-/// The conditional edge INSERT `relate` and `Graph::ingest_episode`'s
-/// per-edge write both run: insert the row only if the source is live, the
-/// target is live, and no identical edge already exists for the ordered
-/// triple (src, dst, type). Shared as one literal, matching
-/// `EDGE_REFUSAL_DIAGNOSTIC_SQL` above, so the two call sites, one against
-/// `&Backend`, one against an open `BackendTx`, can never drift apart on the
-/// guard itself. `relate` binds its attributes as the literal text `"{}"`
-/// rather than a caller-supplied value, since a `relate` edge never carries
-/// attributes; `ingest_episode` binds the episode edge's real attributes
-/// JSON. Bind order: id, src, dst, type, attributes, tx_from, tx_to, FOREVER.
+/// The conditional edge INSERT: insert the row only if the source is live, the
+/// target is live, and no identical edge already exists for the ordered triple
+/// (src, dst, type). Shared as one literal, matching
+/// `EDGE_REFUSAL_DIAGNOSTIC_SQL`, so the guard and its diagnosis can never drift
+/// apart. Bind order: id, src, dst, type, attributes, tx_from, tx_to, FOREVER.
 const EDGE_INSERT_SQL: &str = "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
      WHERE EXISTS     (SELECT 1 FROM nodes WHERE id = ?2 AND tx_to = ?8)
@@ -63,10 +57,11 @@ const EDGE_INSERT_SQL: &str = "INSERT INTO edges (id, src, dst, type, attributes
        AND NOT EXISTS (SELECT 1 FROM edges
                        WHERE src = ?2 AND dst = ?3 AND type = ?4 AND tx_to = ?8)";
 
+/// The attributes of an edge no caller described, such as one `relate` writes.
+const EMPTY_ATTRIBUTES: &str = "{}";
+
 /// The specific refusal message for a failed edge write, given the three
-/// flags `EDGE_REFUSAL_DIAGNOSTIC_SQL` produces. A free function, not a
-/// `Graph` method, since `Graph::ingest_episode` needs it against a
-/// `BackendTx` query result too, not just `&Backend`.
+/// flags `EDGE_REFUSAL_DIAGNOSTIC_SQL` produces.
 fn edge_refusal(
     source_live: bool,
     target_live: bool,
@@ -91,28 +86,6 @@ fn edge_refusal(
     // Every guard passes now, so one of them flipped between the insert and
     // this read. A retry would land.
     Error::RelateRefused("a concurrent write took the row, retry".to_string())
-}
-
-/// Parses `EDGE_REFUSAL_DIAGNOSTIC_SQL`'s result rows into the refusal
-/// message they explain. A read fault (an absent row, or a non-integer
-/// column) surfaces as itself: `unwrap_or(0)` here would read as "this guard
-/// failed", and since column 0 is tested first, every backend fault would
-/// come back as a dead source node, a specific, confident, wrong diagnosis.
-fn edge_refusal_from_rows(rows: Vec<Row>, src: &NodeId, dst: &NodeId, kind: &str) -> Result<Error> {
-    let Some(row) = rows.first() else {
-        return Ok(Error::RelateRefused(
-            "no row explains the refusal".to_string(),
-        ));
-    };
-    let [source_live, target_live, edge_exists] = edge_guard_flags(row)?;
-    Ok(edge_refusal(
-        source_live,
-        target_live,
-        edge_exists,
-        src,
-        dst,
-        kind,
-    ))
 }
 
 /// The three flags of `EDGE_REFUSAL_DIAGNOSTIC_SQL`'s row: source live, target
@@ -152,6 +125,16 @@ pub fn classify_relate_outcome(result: &Result<EdgeId>) -> EdgeOutcome {
             EdgeOutcome::NotLive
         }
         Err(_) => EdgeOutcome::RealFailure,
+    }
+}
+
+/// `classify_relate_outcome` for a write that reports what it did. A relate that
+/// deduplicated against an indexed twin returns the first edge's id but writes
+/// nothing, so it is not an insert.
+fn repair_outcome(result: Result<(EdgeId, WriteOutcome)>) -> EdgeOutcome {
+    match result {
+        Ok((_, WriteOutcome::Duplicate(_))) => EdgeOutcome::AlreadyPresent,
+        other => classify_relate_outcome(&other.map(|(id, _)| id)),
     }
 }
 
@@ -229,12 +212,9 @@ pub(crate) fn scope_within(col: &str, n: usize) -> String {
 }
 
 /// SQL + params for "the live node with this subject (and scope, and
-/// producer if given), if any." Shared by `find_live_by_subject` (run
-/// against `&Backend`, for `upsert_by`) and `Graph::ingest_episode`'s
-/// per-node supersede check (run against an open `BackendTx`, so it also
-/// sees writes from earlier in the same episode's own transaction). Sharing
-/// the SQL-building here, not the whole method, since the `&Backend` vs
-/// `&mut BackendTx` split makes sharing the execution itself awkward.
+/// producer if given), if any." Run against the write's open transaction by
+/// every write that replaces a competitor, so it sees the rows the transaction
+/// holds.
 fn live_by_subject_query(
     subject: &str,
     now: Millis,
@@ -270,8 +250,7 @@ fn live_by_subject_query(
     (sql, params)
 }
 
-/// SQL + params for "is this node live at `as_of`", shared by `exists_as_of`
-/// (against `&Backend`) and the logged `supersede` (against an open `BackendTx`).
+/// SQL + params for "is this node live at `as_of`".
 fn live_as_of_query(id: &str, as_of: Millis) -> (String, Vec<Value>) {
     let sql = format!(
         "SELECT 1 FROM nodes WHERE id = ?1 AND {live}",
@@ -280,8 +259,8 @@ fn live_as_of_query(id: &str, as_of: Millis) -> (String, Vec<Value>) {
     (sql, vec![id.into(), as_of.into()])
 }
 
-/// A node's own collision key for `find_live_by_subject`/`live_by_subject_query`: entity pages
-/// collide on `(subject, scope)` alone, everything else also keys on `producer`.
+/// A node's own collision key for `live_by_subject_query`: entity pages collide
+/// on `(subject, scope)` alone, everything else also keys on `producer`.
 fn collision_producer(node: &NewNode) -> Option<&str> {
     if node.entity_page {
         None
@@ -550,9 +529,7 @@ impl<B: Backend> Graph<B> {
 
     pub async fn insert(&self, mut node: NewNode) -> Result<NodeId> {
         node.scope = validate_scope(&node.scope)?;
-        let id = NodeId::new();
-        let now = self.clock.now();
-        let id = self.route_node_write(&id, &node, now).await?.node_id(id);
+        let id = self.project_insert(&NodeId::new(), &node).await?;
         self.store_vector(&id, &node).await?;
         Ok(id)
     }
@@ -575,72 +552,22 @@ impl<B: Backend> Graph<B> {
     /// to it.
     pub async fn upsert_by(&self, mut node: NewNode) -> Result<NodeId> {
         node.scope = validate_scope(&node.scope)?;
-        // With a log, the competitor is looked up inside the write's
-        // transaction, so concurrent upserts of one subject form a chain.
-        if let (Some(log), Some(collision)) = (&self.log, Collision::of(&node)) {
-            let id = self.upsert_logged(log, &node, collision).await?;
-            self.store_vector(&id, &node).await?;
-            return Ok(id);
-        }
-        let subject = match node.subject.clone() {
-            Some(s) => s,
-            None => return self.insert(node).await,
+        let Some(collision) = Collision::of(&node) else {
+            return self.insert(node).await;
         };
-        match self
-            .find_live_by_subject(&subject, node.scope.as_deref(), collision_producer(&node))
-            .await?
-        {
-            Some(existing) => self.supersede(&existing, node).await,
-            None => self.insert(node).await,
-        }
+        // The competitor is looked up inside the write's transaction, so
+        // concurrent upserts of one subject form a chain.
+        let id = self.project_upsert(&node, collision).await?;
+        self.store_vector(&id, &node).await?;
+        Ok(id)
     }
 
     /// Close the old node in transaction time, insert the new one, link them
     /// with a reserved `supersedes` edge.
     pub async fn supersede(&self, old: &NodeId, mut node: NewNode) -> Result<NodeId> {
         node.scope = validate_scope(&node.scope)?;
-        let now = self.clock.now();
-        let new_id = match &self.log {
-            None => self.supersede_unlogged(old, &node, now).await?,
-            Some(log) => self.supersede_logged(log, old, &node, now).await?,
-        };
+        let new_id = self.project_supersede(old, &node).await?;
         self.store_vector(&new_id, &node).await?;
-        Ok(new_id)
-    }
-
-    async fn supersede_unlogged(
-        &self,
-        old: &NodeId,
-        node: &NewNode,
-        now: Millis,
-    ) -> Result<NodeId> {
-        if !self.exists_as_of(old, now).await? {
-            return Err(Error::NodeNotFound(old.as_str().to_string()));
-        }
-        let new_id = NodeId::new();
-        let (node_sql, node_params) = self.node_insert(&new_id, node, now)?;
-
-        let statements = vec![
-            (
-                "UPDATE nodes SET tx_to = ?1 WHERE id = ?2 AND tx_to = ?3".to_string(),
-                vec![now.into(), old.as_str().into(), FOREVER.into()],
-            ),
-            (node_sql, node_params),
-            (
-                "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
-                 VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)"
-                    .to_string(),
-                vec![
-                    EdgeId::new().as_str().into(),
-                    new_id.as_str().into(),
-                    old.as_str().into(),
-                    crate::types::relation::SUPERSEDES.into(),
-                    now.into(),
-                    FOREVER.into(),
-                ],
-            ),
-        ];
-        self.backend.execute_atomic(&statements).await?;
         Ok(new_id)
     }
 
@@ -689,75 +616,7 @@ impl<B: Backend> Graph<B> {
     /// oversight: see ADR-0001 Amendment 2 before "fixing" it, because widening
     /// it changes the guarantee rather than tightening it.
     pub async fn relate(&self, src: &NodeId, dst: &NodeId, kind: &str) -> Result<EdgeId> {
-        let id = EdgeId::new();
-        let now = self.clock.now();
-        let Some(log) = &self.log else {
-            return self.relate_unlogged(id, src, dst, kind, now).await;
-        };
-        let row = EdgeRow {
-            id: id.as_str().to_string(),
-            src: src.as_str().to_string(),
-            dst: dst.as_str().to_string(),
-            edge_type: kind.to_string(),
-            attributes: "{}".to_string(),
-            tx_from: now.0,
-            tx_to: FOREVER.0,
-        };
-        self.relate_logged(log, row, now).await
-    }
-
-    async fn relate_unlogged(
-        &self,
-        id: EdgeId,
-        src: &NodeId,
-        dst: &NodeId,
-        kind: &str,
-        now: Millis,
-    ) -> Result<EdgeId> {
-        let written = self
-            .backend
-            .execute(
-                EDGE_INSERT_SQL,
-                &[
-                    id.as_str().into(),
-                    src.as_str().into(),
-                    dst.as_str().into(),
-                    kind.into(),
-                    "{}".into(),
-                    now.into(),
-                    FOREVER.into(),
-                    FOREVER.into(),
-                ],
-            )
-            .await?;
-        if written == 1 {
-            return Ok(id);
-        }
-        Err(self.relate_refusal(src, dst, kind).await)
-    }
-
-    /// Name the guard that refused the write. Runs only after a refusal and
-    /// races nothing, because it never decides whether to write: the write
-    /// already happened, or already did not, and this only shapes the message.
-    async fn relate_refusal(&self, src: &NodeId, dst: &NodeId, kind: &str) -> Error {
-        let rows = self
-            .backend
-            .query(
-                EDGE_REFUSAL_DIAGNOSTIC_SQL,
-                &[
-                    src.as_str().into(),
-                    dst.as_str().into(),
-                    FOREVER.into(),
-                    kind.into(),
-                ],
-            )
-            .await;
-        match rows {
-            Ok(rows) => match edge_refusal_from_rows(rows, src, dst, kind) {
-                Ok(e) | Err(e) => e,
-            },
-            Err(e) => e,
-        }
+        Ok(self.project_relate(src, dst, kind).await?.0)
     }
 
     /// Write a batch of nodes and the edges between them as one atomic unit:
@@ -798,12 +657,7 @@ impl<B: Backend> Graph<B> {
         // Pre-generate every node's id (a ULID, no DB round-trip) so edges
         // can resolve `EpisodeRef::New(i)` to a real id before any row lands.
         let ids: Vec<NodeId> = nodes.iter().map(|_| NodeId::new()).collect();
-        let now = self.clock.now();
-
-        let edge_ids = match &self.log {
-            None => self.episode_unlogged(&ids, &nodes, &edges, now).await?,
-            Some(log) => self.episode_logged(log, &ids, &nodes, &edges, now).await?,
-        };
+        let edge_ids = self.project_episode(&ids, &nodes, &edges).await?;
 
         // Vector writes stay outside the transaction, exactly where `insert`
         // and `supersede` already put them: `BackendTx` never grows a
@@ -841,125 +695,6 @@ impl<B: Backend> Graph<B> {
             node_ids: ids,
             edge_ids,
         })
-    }
-
-    /// The episode as one transaction, with no log involved.
-    async fn episode_unlogged(
-        &self,
-        ids: &[NodeId],
-        nodes: &[NewNode],
-        edges: &[EpisodeEdge],
-        now: Millis,
-    ) -> Result<Vec<EdgeId>> {
-        let mut tx = self.backend.begin().await?;
-
-        for (id, node) in ids.iter().zip(nodes) {
-            let mut superseded: Option<NodeId> = None;
-            if let Some(subject) = node.subject.as_deref() {
-                // Same SQL as `find_live_by_subject`, run against the open
-                // `tx` instead of `&self.backend` so it sees writes from
-                // earlier in this same episode (an earlier node that
-                // already superseded something).
-                let (sql, params) = live_by_subject_query(
-                    subject,
-                    now,
-                    node.scope.as_deref(),
-                    collision_producer(node),
-                );
-                let rows = tx.query(&sql, &params).await?;
-                if let Some(old_id) = rows
-                    .first()
-                    .map(|r| NodeId::from_raw(r.get_string(0).unwrap_or_default()))
-                {
-                    // Close the old row now, targeting the exact id the
-                    // query just returned. The `supersedes` edge itself is
-                    // inserted after the new node's own row below, since
-                    // `edges.src` references `nodes(id)` and the new node
-                    // does not exist yet.
-                    tx.execute(
-                        "UPDATE nodes SET tx_to = ?1 WHERE id = ?2 AND tx_to = ?3",
-                        &[now.into(), old_id.as_str().into(), FOREVER.into()],
-                    )
-                    .await?;
-                    superseded = Some(old_id);
-                }
-            }
-            let (sql, params) = self.node_insert(id, node, now)?;
-            tx.execute(&sql, &params).await?;
-            if let Some(old_id) = superseded {
-                // Mirrors `supersede`'s own edge-insert shape: link new ->
-                // old with a reserved `supersedes` edge.
-                tx.execute(
-                    "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)
-                     VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)",
-                    &[
-                        EdgeId::new().as_str().into(),
-                        id.as_str().into(),
-                        old_id.as_str().into(),
-                        crate::types::relation::SUPERSEDES.into(),
-                        now.into(),
-                        FOREVER.into(),
-                    ],
-                )
-                .await?;
-            }
-        }
-
-        let mut edge_ids = Vec::with_capacity(edges.len());
-        for edge in edges {
-            let src = resolve_episode_ref(&edge.from, ids);
-            let dst = resolve_episode_ref(&edge.to, ids);
-            let id = EdgeId::new();
-            let attrs = serde_json::to_string(&edge.attributes)?;
-            // The same conditional-INSERT-with-WHERE-EXISTS shape `relate`
-            // uses, checked and written one edge at a time so edge N+1's
-            // NOT EXISTS sees edge N's own insert: never a batch check
-            // followed by a batch write.
-            let written = tx
-                .execute(
-                    EDGE_INSERT_SQL,
-                    &[
-                        id.as_str().into(),
-                        src.as_str().into(),
-                        dst.as_str().into(),
-                        edge.kind.clone().into(),
-                        attrs.into(),
-                        now.into(),
-                        FOREVER.into(),
-                        FOREVER.into(),
-                    ],
-                )
-                .await?;
-            if written != 1 {
-                // Mirrors `relate_refusal`'s combined check, run against the
-                // still-open transaction instead of `&self.backend`, so it
-                // sees this same call's own writes.
-                let rows = tx
-                    .query(
-                        EDGE_REFUSAL_DIAGNOSTIC_SQL,
-                        &[
-                            src.as_str().into(),
-                            dst.as_str().into(),
-                            FOREVER.into(),
-                            edge.kind.clone().into(),
-                        ],
-                    )
-                    .await?;
-                let err = match edge_refusal_from_rows(rows, src, dst, &edge.kind) {
-                    Ok(e) | Err(e) => e,
-                };
-                // Explicit, not a bare drop: readable at the call site and
-                // does not lean on Drop timing being right for this caller
-                // too, even though WU-1 already proved the implicit-drop
-                // path rolls back correctly.
-                tx.rollback().await?;
-                return Err(err);
-            }
-            edge_ids.push(id);
-        }
-
-        tx.commit().await?;
-        Ok(edge_ids)
     }
 
     /// Resolve a client-supplied handle to a full node id. A handle is any
@@ -1014,31 +749,6 @@ impl<B: Backend> Graph<B> {
                     .filter_map(|r| r.get_string(0).ok())
                     .collect::<Vec<_>>(),
             }),
-        }
-    }
-
-    fn node_insert(
-        &self,
-        id: &NodeId,
-        node: &NewNode,
-        now: Millis,
-    ) -> Result<(String, Vec<Value>)> {
-        Ok(node_row_insert(&resolve_node_row(id, node, now)?))
-    }
-
-    async fn write_node(&self, id: &NodeId, node: &NewNode, now: Millis) -> Result<()> {
-        let (sql, params) = self.node_insert(id, node, now)?;
-        self.backend.execute(&sql, &params).await?;
-        Ok(())
-    }
-
-    async fn route_node_write(&self, id: &NodeId, node: &NewNode, now: Millis) -> Result<Logged> {
-        match &self.log {
-            None => self
-                .write_node(id, node, now)
-                .await
-                .map(|()| Logged::Written),
-            Some(log) => self.insert_logged(log, id, node, now).await,
         }
     }
 
@@ -1360,20 +1070,7 @@ impl<B: Backend> Graph<B> {
         Ok(out)
     }
 
-    async fn find_live_by_subject(
-        &self,
-        subject: &str,
-        scope: Option<&str>,
-        producer: Option<&str>,
-    ) -> Result<Option<NodeId>> {
-        let now = self.clock.now();
-        let (sql, params) = live_by_subject_query(subject, now, scope, producer);
-        let rows = self.backend.query(&sql, &params).await?;
-        Ok(rows
-            .first()
-            .map(|r| NodeId::from_raw(r.get_string(0).unwrap_or_default())))
-    }
-
+    #[cfg(test)]
     async fn exists_as_of(&self, id: &NodeId, as_of: Millis) -> Result<bool> {
         let (sql, params) = live_as_of_query(id.as_str(), as_of);
         let rows = self.backend.query(&sql, &params).await?;
@@ -1767,10 +1464,10 @@ impl<B: Backend> Graph<B> {
             for mention_row in &mention_rows {
                 let mentioning = NodeId::from_raw(mention_row.get_string(0)?);
                 let result = self
-                    .relate(&mentioning, &terminal, crate::types::relation::MENTIONS)
+                    .project_relate(&mentioning, &terminal, crate::types::relation::MENTIONS)
                     .await;
                 fold_repair_outcome(
-                    classify_relate_outcome(&result),
+                    repair_outcome(result),
                     &mut inserted,
                     &mut saw_insert,
                     &mut saw_failure,
@@ -1798,10 +1495,10 @@ impl<B: Backend> Graph<B> {
             for mention_row in &own_mention_rows {
                 let mentioned = NodeId::from_raw(mention_row.get_string(0)?);
                 let result = self
-                    .relate(&terminal, &mentioned, crate::types::relation::MENTIONS)
+                    .project_relate(&terminal, &mentioned, crate::types::relation::MENTIONS)
                     .await;
                 fold_repair_outcome(
-                    classify_relate_outcome(&result),
+                    repair_outcome(result),
                     &mut inserted,
                     &mut saw_insert,
                     &mut saw_failure,
@@ -6932,7 +6629,7 @@ mod tests {
         // Act
         let err = g.ingest_episode(nodes, edges).await.unwrap_err();
 
-        // Assert: matches relate_refusal's exact wording, not a generic message.
+        // Assert: matches edge_refusal's exact wording, not a generic message.
         assert!(
             matches!(&err, Error::RelateRefused(m)
                 if m.contains("is not live") && m.contains(old.as_str())),
@@ -7200,7 +6897,7 @@ mod tests {
         let err = g.ingest_episode(nodes, edges).await.unwrap_err();
 
         // Assert: the whole call fails, naming a specific (not generic) id,
-        // matching relate_refusal's wording. Node 0's real id is generated
+        // matching edge_refusal's wording. Node 0's real id is generated
         // inside ingest_episode and never returned on failure since the
         // whole episode rolls back, so this checks message shape (a real
         // 26-character ULID, not a placeholder) rather than equality
@@ -7949,9 +7646,8 @@ mod tests {
 
     /// Wraps a real `Backend`; its own `begin` returns a `FailingTx`, unlike
     /// `Interposing::begin`'s plain pass-through. `fail_on_execute` defaults
-    /// to "never" (`usize::MAX`) so every other test using this type (none,
-    /// today) would see ordinary behavior; the one test that needs a fault
-    /// sets it explicitly after `open`.
+    /// to "never" (`usize::MAX`), so a test that needs a fault sets it
+    /// explicitly after `open` and any other test sees ordinary behavior.
     struct FailingBackend {
         inner: crate::backends::DefaultBackend,
         fail_on_execute: std::sync::atomic::AtomicUsize,

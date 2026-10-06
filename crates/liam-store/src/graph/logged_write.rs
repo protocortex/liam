@@ -28,11 +28,12 @@ use liam_log::{LogOffset, LogWriter};
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
-use super::logged_plan::{apply_steps, Plan, Step, Table};
+use super::logged_plan::{Dedup, Plan, Table};
+use super::projection::{apply_steps, Step};
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
-use crate::ids::{EdgeId, NodeId, FOREVER};
+use crate::ids::{EdgeId, Millis, NodeId};
 use crate::value::Value;
 
 const HASH_INDEX_UPSERT_SQL: &str =
@@ -48,7 +49,12 @@ const CURSOR_UPSERT_SQL: &str = "INSERT INTO log_cursor (id, log_id, last_segmen
      ON CONFLICT(id) DO UPDATE SET
        last_segment = excluded.last_segment, last_index = excluded.last_index";
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(super) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A plan that needs no read from the transaction.
+pub(super) fn ready<'a>(plan: Result<Plan>) -> BoxFuture<'a, Result<Plan>> {
+    Box::pin(std::future::ready(plan))
+}
 
 /// The log a `Graph` appends to, with the dedup filter and poison flag that
 /// go with it. Graphs that share one `SharedLog` share all three.
@@ -76,42 +82,75 @@ impl EventLog {
 /// One lock orders every append against the commit that follows it.
 pub type SharedLog = Arc<tokio::sync::Mutex<EventLog>>;
 
-/// What a logged write did.
-pub(super) enum Logged {
+/// What a write did.
+pub(super) enum WriteOutcome {
     /// The rows were projected; the caller's ids are the rows' ids.
     Written,
     /// The content already has a live carrier, which is the id to return.
     Duplicate(String),
 }
 
-impl Logged {
-    pub(super) fn node_id(self, written: NodeId) -> NodeId {
+impl WriteOutcome {
+    pub(super) fn node_id(&self, written: &NodeId) -> NodeId {
         match self {
-            Logged::Written => written,
-            Logged::Duplicate(first) => NodeId::from_raw(first),
+            WriteOutcome::Written => written.clone(),
+            WriteOutcome::Duplicate(first) => NodeId::from_raw(first),
         }
     }
 
-    pub(super) fn edge_id(self, written: EdgeId) -> EdgeId {
+    pub(super) fn edge_id(&self, written: &EdgeId) -> EdgeId {
         match self {
-            Logged::Written => written,
-            Logged::Duplicate(first) => EdgeId::from_raw(first),
+            WriteOutcome::Written => written.clone(),
+            WriteOutcome::Duplicate(first) => EdgeId::from_raw(first),
         }
     }
 }
 
 impl<B: Backend> Graph<B> {
-    /// The one path every logged write takes: poison check, log lock, `begin`,
-    /// then plan, deduplicate, append, project, and commit. `prepare` reads the
-    /// transaction to build the write's `Plan` and may refuse the write before
-    /// anything is appended.
-    pub(super) async fn transact<F>(&self, log: &SharedLog, prepare: F) -> Result<Logged>
+    /// The one path every write takes. `prepare` reads the transaction to build
+    /// the write's `Plan` and may refuse the write before anything changes. It
+    /// is given the write's timestamp, read once the transaction is open, so no
+    /// write is stamped earlier than a commit it follows.
+    pub(super) async fn project<F>(&self, prepare: F) -> Result<WriteOutcome>
     where
-        F: for<'t> FnOnce(&'t mut dyn BackendTx) -> BoxFuture<'t, Result<Plan>> + Send,
+        F: for<'t> FnOnce(&'t mut dyn BackendTx, Millis) -> BoxFuture<'t, Result<Plan>> + Send,
+    {
+        match &self.log {
+            Some(log) => self.transact(log, prepare).await,
+            None => self.apply_unlogged(prepare).await,
+        }
+    }
+
+    /// The same plan and projection without a log: nothing is recorded, indexed,
+    /// or deduplicated, so a live twin the plan found is always a refusal.
+    async fn apply_unlogged<F>(&self, prepare: F) -> Result<WriteOutcome>
+    where
+        F: for<'t> FnOnce(&'t mut dyn BackendTx, Millis) -> BoxFuture<'t, Result<Plan>> + Send,
+    {
+        let mut tx = self.backend.begin().await?;
+        let now = self.clock.now();
+        let applied = async {
+            let plan = prepare(&mut *tx, now).await?;
+            if let Some(refusal) = plan.dedup.and_then(|dedup| dedup.refusal_if_absent) {
+                return Err(refusal);
+            }
+            apply_steps(&mut *tx, &plan.steps).await
+        }
+        .await;
+        commit_or_abandon(tx, applied).await?;
+        Ok(WriteOutcome::Written)
+    }
+
+    /// The logged path: poison check, log lock, `begin`, then plan, deduplicate,
+    /// append, project, and commit.
+    async fn transact<F>(&self, log: &SharedLog, prepare: F) -> Result<WriteOutcome>
+    where
+        F: for<'t> FnOnce(&'t mut dyn BackendTx, Millis) -> BoxFuture<'t, Result<Plan>> + Send,
     {
         let mut held = HeldLog::acquire(log).await?;
         let mut tx = self.backend.begin().await?;
-        let resolved = match prepare(&mut *tx).await {
+        let now = self.clock.now();
+        let resolved = match prepare(&mut *tx, now).await {
             Ok(plan) => {
                 let bloom_hit = held.might_contain(&plan.event.content_hash);
                 resolve_plan(&mut *tx, plan, bloom_hit).await
@@ -119,9 +158,9 @@ impl<B: Backend> Graph<B> {
             Err(error) => Err(error),
         };
         let (event, steps, logged) = match resolved {
-            Ok(Resolved::Fresh(plan)) => (plan.event, plan.steps, Logged::Written),
+            Ok(Resolved::Fresh { event, steps }) => (event, steps, WriteOutcome::Written),
             Ok(Resolved::Duplicate { event, first }) => {
-                (event, Vec::new(), Logged::Duplicate(first.row_id))
+                (event, Vec::new(), WriteOutcome::Duplicate(first.row_id))
             }
             Err(error) => {
                 abandon(tx).await;
@@ -278,7 +317,10 @@ impl HeldLog {
 
 /// A plan after the dedup check.
 enum Resolved {
-    Fresh(Plan),
+    Fresh {
+        event: LogEvent,
+        steps: Vec<Step>,
+    },
     /// The write's content is live already: log a `DuplicateOf` the first
     /// write instead of the write itself.
     Duplicate {
@@ -289,23 +331,31 @@ enum Resolved {
 
 /// Checks a plan against the live carrier of its content, which is read in the
 /// same transaction the write commits in.
-async fn resolve_plan(tx: &mut dyn BackendTx, mut plan: Plan, bloom_hit: bool) -> Result<Resolved> {
-    let refusal = plan.refusal_unless_duplicate.take();
-    let hash = plan.event.content_hash;
-    let carrier = match plan.dedup {
-        Some(table) => live_duplicate(tx, bloom_hit, &hash, table).await?,
-        None => None,
+async fn resolve_plan(tx: &mut dyn BackendTx, plan: Plan, bloom_hit: bool) -> Result<Resolved> {
+    let Plan {
+        event,
+        steps,
+        dedup,
+    } = plan;
+    let Some(Dedup {
+        table,
+        refusal_if_absent,
+    }) = dedup
+    else {
+        return Ok(Resolved::Fresh { event, steps });
     };
-    match (carrier, refusal) {
-        (Some(first), _) => {
+    match live_duplicate(tx, bloom_hit, &event.content_hash, table).await? {
+        Some(first) => {
             let duplicate = LogPayload::DuplicateOf {
                 first_event_id: first.event_id.clone(),
             };
-            let event = follow_up(&plan.event, duplicate);
+            let event = follow_up(&event, duplicate);
             Ok(Resolved::Duplicate { event, first })
         }
-        (None, Some(refusal)) => Err(refusal),
-        (None, None) => Ok(Resolved::Fresh(plan)),
+        None => match refusal_if_absent {
+            Some(refusal) => Err(refusal),
+            None => Ok(Resolved::Fresh { event, steps }),
+        },
     }
 }
 
@@ -325,9 +375,11 @@ struct Carrier {
     row_id: String,
 }
 
-/// A hit counts only while the indexed row is live. A superseded or
-/// garbage-collected carrier is not a duplicate, and the write that follows
-/// repoints the index at itself.
+/// A hit counts only while an indexed row is live, and the first live one is
+/// the carrier: a hash repeated within one episode points at every row that
+/// carries it, and an earlier one may be superseded by a later one. A
+/// superseded or garbage-collected carrier is not a duplicate, and the write
+/// that follows repoints the index at itself.
 async fn live_duplicate(
     tx: &mut dyn BackendTx,
     bloom_hit: bool,
@@ -345,29 +397,20 @@ async fn live_duplicate(
     else {
         return Ok(None);
     };
-    let Some(row_id) = row_ids.into_iter().next() else {
-        return Ok(None);
-    };
-    if !is_live(tx, table, &row_id).await? {
-        return Ok(None);
+    for row_id in row_ids {
+        if is_live(tx, table, &row_id).await? {
+            return Ok(Some(Carrier {
+                event_id: first_event_id,
+                row_id,
+            }));
+        }
     }
-    Ok(Some(Carrier {
-        event_id: first_event_id,
-        row_id,
-    }))
+    Ok(None)
 }
 
 async fn is_live(tx: &mut dyn BackendTx, table: Table, row_id: &str) -> Result<bool> {
-    let rows = tx
-        .query(
-            &format!(
-                "SELECT 1 FROM {} WHERE id = ?1 AND tx_to = ?2",
-                table.name()
-            ),
-            &[row_id.into(), FOREVER.into()],
-        )
-        .await?;
-    Ok(!rows.is_empty())
+    let (sql, params) = table.live_query(row_id);
+    Ok(!tx.query(sql, &params).await?.is_empty())
 }
 
 /// The `log_hash_index` table, read inside the write transaction.

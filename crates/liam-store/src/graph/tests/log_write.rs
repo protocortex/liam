@@ -4,7 +4,7 @@
 //! what it accepted so a test can compare the log against the projection.
 
 use std::io;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use liam_log::{LogOffset, LogWriter};
 use uuid::Uuid;
 
 use super::*;
+use crate::graph::projection::{apply_steps, steps_for};
 use crate::DefaultBackend;
 
 type Appended = Arc<StdMutex<Vec<(LogOffset, LogEvent)>>>;
@@ -74,19 +75,44 @@ fn share(writer: impl LogWriter + 'static) -> SharedLog {
     )))
 }
 
-async fn open_with<B: Backend>(path: &str, t: Millis, log: SharedLog) -> Graph<B> {
-    let clock = Arc::new(FixedClock::new(t));
+async fn open_clocked<B: Backend>(
+    path: &str,
+    clock: Arc<impl Clock + 'static>,
+    log: SharedLog,
+) -> Graph<B> {
     let graph = Graph::<B>::open_with_clock(path, GraphConfig::new(8), clock)
         .await
         .expect("open graph");
     graph.with_log(log).await.expect("attach log")
 }
 
-/// A logged in-memory graph, the log's recorder, and the log's id.
-async fn logged_graph<B: Backend>(t: Millis) -> (Graph<B>, Appended, String) {
+async fn open_with<B: Backend>(path: &str, t: Millis, log: SharedLog) -> Graph<B> {
+    open_clocked(path, Arc::new(FixedClock::new(t)), log).await
+}
+
+/// Like `logged_graph`, with the clock a test moves between writes so a time
+/// the store reads twice for one write shows up as two different times.
+async fn clocked_graph<B: Backend>(t: Millis) -> (Graph<B>, Appended, String, Arc<FixedClock>) {
     let (log, appended) = RecordingLog::new();
     let log_id = log.log_id().to_string();
-    (open_with(":memory:", t, share(log)).await, appended, log_id)
+    let clock = Arc::new(FixedClock::new(t));
+    let graph = open_clocked(":memory:", Arc::clone(&clock), share(log)).await;
+    (graph, appended, log_id, clock)
+}
+
+/// A logged in-memory graph, the log's recorder, and the log's id.
+async fn logged_graph<B: Backend>(t: Millis) -> (Graph<B>, Appended, String) {
+    let (graph, appended, log_id, _) = clocked_graph(t).await;
+    (graph, appended, log_id)
+}
+
+/// A clock that reads one millisecond later every time it is read.
+struct TickingClock(AtomicI64);
+
+impl Clock for TickingClock {
+    fn now(&self) -> Millis {
+        Millis(self.0.fetch_add(1, Ordering::SeqCst))
+    }
 }
 
 fn fact(content: &str) -> NewNode {
@@ -102,13 +128,17 @@ fn fact_at(content: &str) -> NewNode {
 }
 
 fn assert_envelope(event: &LogEvent) {
+    assert_envelope_at(event, 1000);
+}
+
+fn assert_envelope_at(event: &LogEvent, ingested_at: i64) {
     let envelope = (
         event.source.as_str(),
         event.trust_score,
         event.observed_at,
         event.ingested_at,
     );
-    assert_eq!(envelope, ("agent-a", 0.75, 500, 1000), "{event:?}");
+    assert_eq!(envelope, ("agent-a", 0.75, 500, ingested_at), "{event:?}");
 }
 
 fn events(appended: &Appended) -> Vec<LogEvent> {
@@ -354,8 +384,7 @@ async fn log_write_a_caller_supplied_valid_from_is_flagged_and_changes_the_hash(
 
 #[tokio::test]
 async fn log_write_hash_index_hit_on_a_superseded_row_is_not_a_duplicate() {
-    // Arrange: write X, then supersede it with Y. The supersede path is the
-    // existing unlogged one, which is enough to close X.
+    // Arrange: write X, then supersede it with Y, which closes X.
     let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
     let x = g.insert(fact("X").with_subject("subject-1")).await.unwrap();
     g.supersede(&x, fact("Y").with_subject("subject-1"))
@@ -627,7 +656,7 @@ async fn log_write_a_cancelled_write_poisons_the_log_until_reopen() {
 
 #[tokio::test]
 async fn log_write_graphs_on_one_log_share_the_dedup_filter_and_the_poison_flag() {
-    // Arrange: two handles on one database and one log. The log's third append,
+    // Arrange: two handles on one database and one log. The log's fourth append,
     // the void of a failed write, fails.
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("graph.db");
@@ -893,15 +922,14 @@ fn mentions(from: usize, to: usize) -> EpisodeEdge {
     }
 }
 
-/// One supersede is one event: the new row and the `supersedes` edge, with the
-/// old row closed at the edge's start.
+/// One supersede at `at` is one event: the new row and the `supersedes` edge,
+/// with the old row closed at the edge's start.
 async fn assert_supersede_logged<B: Backend>(
     g: &Graph<B>,
     appended: &Appended,
     since: usize,
-    old: &NodeId,
-    new: &NodeId,
-    log_id: &str,
+    (old, new): (&NodeId, &NodeId),
+    (log_id, at): (&str, i64),
 ) {
     let logged = events_since(appended, since);
     assert_eq!(logged.len(), 1, "one event for the supersede: {logged:?}");
@@ -916,8 +944,9 @@ async fn assert_supersede_logged<B: Backend>(
         ])
     );
     assert_eq!(event.content_hash, node_row_hash(&new_row));
-    assert_envelope(event);
-    assert_eq!(edge.tx_from, 1000);
+    assert_envelope_at(event, at);
+    assert_eq!(edge.tx_from, at);
+    assert_eq!(new_row.tx_from, at);
     assert_eq!(
         stored_row(g, old, true).await.tx_to,
         edge.tx_from,
@@ -953,10 +982,12 @@ async fn log_write_upsert_by_without_a_live_competitor_appends_one_node_write_eq
 
 #[tokio::test]
 async fn log_write_supersede_appends_one_batch_of_the_new_row_and_its_supersedes_edge() {
-    // Arrange
-    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    // Arrange: the clock moves after the setup write, so the write under test
+    // cannot take a time from anything but its own read.
+    let (g, appended, log_id, clock) = clocked_graph::<DefaultBackend>(Millis(1000)).await;
     let old = g.insert(fact_at("old").with_subject("s")).await.unwrap();
     let since = events(&appended).len();
+    clock.set(Millis(2000));
 
     // Act
     let new = g
@@ -965,31 +996,33 @@ async fn log_write_supersede_appends_one_batch_of_the_new_row_and_its_supersedes
         .unwrap();
 
     // Assert
-    assert_supersede_logged(&g, &appended, since, &old, &new, &log_id).await;
+    assert_supersede_logged(&g, &appended, since, (&old, &new), (&log_id, 2000)).await;
 }
 
 #[tokio::test]
 async fn log_write_upsert_by_over_a_live_subject_logs_the_same_batch_as_supersede() {
     // Arrange
-    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let (g, appended, log_id, clock) = clocked_graph::<DefaultBackend>(Millis(1000)).await;
     let old = g.upsert_by(fact_at("old").with_subject("s")).await.unwrap();
     let since = events(&appended).len();
+    clock.set(Millis(2000));
 
     // Act
     let new = g.upsert_by(fact_at("new").with_subject("s")).await.unwrap();
 
     // Assert
     assert_ne!(new, old);
-    assert_supersede_logged(&g, &appended, since, &old, &new, &log_id).await;
+    assert_supersede_logged(&g, &appended, since, (&old, &new), (&log_id, 2000)).await;
 }
 
 #[tokio::test]
 async fn log_write_relate_appends_one_edge_write_equal_to_the_stored_row() {
     // Arrange
-    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let (g, appended, log_id, clock) = clocked_graph::<DefaultBackend>(Millis(1000)).await;
     let src = g.insert(fact_at("src")).await.unwrap();
     let dst = g.insert(fact_at("dst")).await.unwrap();
     let since = events(&appended).len();
+    clock.set(Millis(2000));
 
     // Act
     let id = g.relate(&src, &dst, "mentions").await.unwrap();
@@ -1001,7 +1034,12 @@ async fn log_write_relate_appends_one_edge_write_equal_to_the_stored_row() {
     let stored = stored_edge(&g, id.as_str()).await;
     assert_eq!(event.payload, LogPayload::EdgeWrite(stored.clone()));
     assert_eq!(event.content_hash, edge_row_hash(&stored));
-    assert_eq!((event.observed_at, event.ingested_at), (1000, 1000));
+    assert_eq!((event.observed_at, event.ingested_at), (2000, 2000));
+    assert_eq!(stored.tx_from, 2000);
+    assert_eq!(
+        (event.source.as_str(), event.trust_score),
+        ("liam-store", 1.0)
+    );
     assert_eq!(event.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(event.encryption_key_id, None);
     assert_cursor_at_last_event(&g, &appended, &log_id).await;
@@ -1009,20 +1047,35 @@ async fn log_write_relate_appends_one_edge_write_equal_to_the_stored_row() {
 }
 
 #[tokio::test]
-async fn log_write_each_episode_is_one_batch_event() {
+async fn log_write_each_episode_is_one_batch_event_of_the_stored_rows() {
     // Arrange
     let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
 
     // Act
-    g.ingest_episode(vec![fact_at("a"), fact_at("b")], vec![mentions(0, 1)])
+    let first = g
+        .ingest_episode(vec![fact_at("a"), fact_at("b")], vec![mentions(0, 1)])
         .await
         .unwrap();
     g.ingest_episode(vec![fact_at("c")], vec![]).await.unwrap();
 
-    // Assert
+    // Assert: the first batch is the stored rows in write order.
     let logged = events(&appended);
     assert_eq!(logged.len(), 2, "{logged:?}");
-    assert_eq!(batch_effects(&logged[0]).len(), 3);
+    let a = stored_row(&g, &first.node_ids[0], true).await;
+    let b = stored_row(&g, &first.node_ids[1], true).await;
+    let edge = stored_edge(&g, first.edge_ids[0].as_str()).await;
+    assert_eq!(
+        logged[0].payload,
+        LogPayload::EpisodeBatch(vec![
+            RowEffect::Node(a.clone()),
+            RowEffect::Node(b),
+            RowEffect::Edge(edge)
+        ])
+    );
+    assert_eq!(logged[0].content_hash, node_row_hash(&a));
+    let stamp = (&logged[0].source, logged[0].trust_score);
+    assert_eq!(stamp, (&"agent-a".to_string(), 0.75));
+    assert_eq!((logged[0].observed_at, logged[0].ingested_at), (1000, 1000));
     assert_eq!(batch_effects(&logged[1]).len(), 1);
     assert_cursor_at_last_event(&g, &appended, &log_id).await;
 }
@@ -1084,10 +1137,11 @@ async fn log_write_upsert_by_with_the_content_of_a_live_row_returns_it_and_logs_
 #[tokio::test]
 async fn log_write_supersede_with_content_already_live_still_closes_old_and_repoints_the_index() {
     // Arrange
-    let (g, appended, log_id) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let (g, appended, log_id, clock) = clocked_graph::<DefaultBackend>(Millis(1000)).await;
     let x = g.insert(fact_at("X").with_subject("s")).await.unwrap();
     let y = g.insert(fact_at("Y").with_subject("t")).await.unwrap();
     let since = events(&appended).len();
+    clock.set(Millis(2000));
 
     // Act: the replacement's content already has a live carrier, but the caller
     // asked for a state change, so it is never deduplicated.
@@ -1099,7 +1153,7 @@ async fn log_write_supersede_with_content_already_live_still_closes_old_and_repo
     // Assert: x is closed, z is a new live row, y is untouched, and the index
     // follows the newest write.
     assert_ne!(z, y);
-    assert_supersede_logged(&g, &appended, since, &x, &z, &log_id).await;
+    assert_supersede_logged(&g, &appended, since, (&x, &z), (&log_id, 2000)).await;
     assert_eq!(stored_row(&g, &y, true).await.tx_to, FOREVER.0);
     assert_eq!(
         live_ids_with_subject(&g, "t").await,
@@ -1143,4 +1197,279 @@ async fn log_write_a_second_identical_relate_returns_the_first_edge_and_logs_dup
     );
     assert_eq!(logged[1].content_hash, logged[0].content_hash);
     assert_cursor_at_last_event(&g, &appended, &log_id).await;
+}
+
+// ---- write time, the close safety net, and the reserved relation ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_write_the_write_time_is_read_after_the_log_lock_and_the_transaction() {
+    // Arrange: the write lock is held, so the insert holds the log lock and
+    // waits in `begin`.
+    let (log, appended) = RecordingLog::new();
+    let clock = Arc::new(FixedClock::new(Millis(1000)));
+    let shared = share(log);
+    let g = Arc::new(open_clocked::<DefaultBackend>(":memory:", Arc::clone(&clock), shared).await);
+    let held = g.backend.begin().await.unwrap();
+    let insert = tokio::spawn({
+        let g = Arc::clone(&g);
+        async move { g.insert(fact("late")).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Act: the clock moves while the write waits, then the write goes ahead.
+    clock.set(Millis(5000));
+    held.rollback().await.unwrap();
+    let id = insert.await.unwrap().unwrap();
+
+    // Assert
+    assert_eq!(stored_row(&g, &id, false).await.tx_from, 5000);
+    assert_eq!(events(&appended)[0].ingested_at, 5000);
+}
+
+/// `old` was superseded by `current` at 3000, and the clock has since stepped
+/// back to 2500, a time at which `old` still reads as live although it is closed.
+async fn graph_with_a_stepped_back_clock() -> (DefaultGraph, Appended, String, NodeId, NodeId) {
+    let (g, appended, log_id, clock) = clocked_graph(Millis(1000)).await;
+    let old = g.insert(fact_at("v1").with_subject("s")).await.unwrap();
+    clock.set(Millis(3000));
+    let current = g.upsert_by(fact_at("v2").with_subject("s")).await.unwrap();
+    clock.set(Millis(2500));
+    (g, appended, log_id, old, current)
+}
+
+async fn assert_voided_with_one_live_row(
+    (g, appended, log_id): (&DefaultGraph, &Appended, &str),
+    current: &NodeId,
+    failed: Result<NodeId>,
+) {
+    assert!(matches!(failed, Err(Error::NodeNotFound(_))), "{failed:?}");
+    assert_eq!(live_ids_with_subject(g, "s").await, vec![current.as_str()]);
+    let logged = events(appended);
+    let [.., write, void] = logged.as_slice() else {
+        panic!("the write and its void are logged: {logged:?}");
+    };
+    assert!(matches!(write.payload, LogPayload::EpisodeBatch(_)));
+    assert_eq!(
+        void.payload,
+        LogPayload::Voided {
+            target_event_id: write.event_id.clone()
+        }
+    );
+    assert_cursor_at_last_event(g, appended, log_id).await;
+}
+
+#[tokio::test]
+async fn log_write_a_clock_stepping_back_voids_an_upsert_instead_of_leaving_two_live_rows() {
+    // Arrange
+    let (g, appended, log_id, _, current) = graph_with_a_stepped_back_clock().await;
+
+    // Act: the competitor the earlier time finds is closed already.
+    let failed = g.upsert_by(fact_at("v3").with_subject("s")).await;
+
+    // Assert
+    assert_voided_with_one_live_row((&g, &appended, &log_id), &current, failed).await;
+}
+
+#[tokio::test]
+async fn log_write_a_supersede_of_a_row_closed_since_is_voided_not_a_silent_no_op() {
+    // Arrange
+    let (g, appended, log_id, old, current) = graph_with_a_stepped_back_clock().await;
+
+    // Act
+    let failed = g.supersede(&old, fact_at("v3").with_subject("s")).await;
+
+    // Assert
+    assert_voided_with_one_live_row((&g, &appended, &log_id), &current, failed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_write_concurrent_upserts_of_one_subject_never_leave_two_live_rows() {
+    // Arrange: every second `begin` is slow, and every clock read is later than
+    // the one before, so a write stamped before it holds the log lock would be
+    // blind to a row the other committed first.
+    const SUBJECTS: usize = 20;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("graph.db");
+    let (log, _) = RecordingLog::new();
+    let clock = Arc::new(TickingClock(AtomicI64::new(1000)));
+    let g =
+        Arc::new(open_clocked::<FailingBackend>(path.to_str().unwrap(), clock, share(log)).await);
+    g.backend
+        .probe
+        .delay_odd_begins
+        .store(true, Ordering::SeqCst);
+
+    for subject in 0..SUBJECTS {
+        // Act
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let tasks: Vec<_> = (0..2)
+            .map(|side| {
+                let (g, barrier) = (Arc::clone(&g), Arc::clone(&barrier));
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    let node = fact(&format!("side-{side}")).with_subject(format!("s-{subject}"));
+                    g.upsert_by(node).await
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        // Assert
+        let live = live_ids_with_subject(&g, &format!("s-{subject}")).await;
+        assert_eq!(live.len(), 1, "subject {subject}: {live:?}");
+    }
+    assert_eq!(count(&g, "nodes").await, (SUBJECTS * 2) as i64);
+}
+
+fn assert_reserved_refused(refused: &Result<impl std::fmt::Debug>) {
+    assert!(
+        matches!(refused, Err(Error::RelateRefused(message)) if message.contains("reserved")),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn log_write_relate_refuses_the_supersedes_relation_before_anything_is_appended() {
+    // Arrange
+    let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let src = g.insert(fact_at("src")).await.unwrap();
+    let dst = g.insert(fact_at("dst")).await.unwrap();
+    let since = events(&appended).len();
+
+    // Act
+    let refused = g.relate(&src, &dst, relation::SUPERSEDES).await;
+
+    // Assert: refused up front, so the log is untouched and not poisoned.
+    assert_reserved_refused(&refused);
+    assert_eq!(events(&appended).len(), since);
+    assert_eq!(count(&g, "edges").await, 0);
+    assert!(g.insert(fact_at("next")).await.is_ok());
+    let unlogged = graph_at(Millis(1000)).await;
+    let a = unlogged.insert(fact_at("a")).await.unwrap();
+    let b = unlogged.insert(fact_at("b")).await.unwrap();
+    assert!(unlogged.relate(&a, &b, relation::SUPERSEDES).await.is_ok());
+}
+
+#[tokio::test]
+async fn log_write_an_episode_refuses_a_supersedes_edge_before_anything_is_appended() {
+    // Arrange
+    let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let edge = EpisodeEdge {
+        kind: relation::SUPERSEDES.to_string(),
+        ..mentions(0, 1)
+    };
+
+    // Act
+    let refused = g
+        .ingest_episode(vec![fact_at("a"), fact_at("b")], vec![edge])
+        .await;
+
+    // Assert
+    assert_reserved_refused(&refused);
+    assert!(events(&appended).is_empty());
+    assert_eq!(count(&g, "nodes").await, 0);
+    assert!(g.insert(fact_at("next")).await.is_ok());
+}
+
+// ---- duplicates, repair, and replay ----
+
+#[tokio::test]
+async fn log_write_a_duplicate_is_the_live_row_among_those_an_episode_wrote_under_one_hash() {
+    // Arrange: the episode's second node supersedes its identical first one, so
+    // the hash index lists a closed row before the live one.
+    let (g, appended, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let node = || fact_at("same").with_subject("s");
+    let episode = g
+        .ingest_episode(vec![node(), node()], vec![])
+        .await
+        .unwrap();
+    let live = &episode.node_ids[1];
+    assert_eq!(live_ids_with_subject(&g, "s").await, vec![live.as_str()]);
+
+    // Act
+    let again = g.insert(node()).await.unwrap();
+
+    // Assert
+    assert_eq!(&again, live);
+    assert!(has_duplicate_of(&events(&appended)));
+    assert_eq!(count(&g, "nodes").await, 2);
+}
+
+#[tokio::test]
+async fn log_write_repair_counts_only_the_mentions_it_wrote() {
+    // Arrange: m mentions both a and b, which c replaced in turn, so repairing
+    // the two supersedes edges relates m to c twice and writes it once.
+    let (g, _, _) = logged_graph::<DefaultBackend>(Millis(1000)).await;
+    let m = g.insert(fact_at("m")).await.unwrap();
+    let a = g.insert(fact_at("a").with_subject("s")).await.unwrap();
+    g.relate(&m, &a, relation::MENTIONS).await.unwrap();
+    let b = g
+        .supersede(&a, fact_at("b").with_subject("s"))
+        .await
+        .unwrap();
+    g.relate(&m, &b, relation::MENTIONS).await.unwrap();
+    let c = g
+        .supersede(&b, fact_at("c").with_subject("s"))
+        .await
+        .unwrap();
+
+    // Act
+    let repaired = g.repair_superseded_mentions().await.unwrap();
+
+    // Assert
+    assert_eq!(repaired, 1);
+    let live = edge_between(&g, m.as_str(), c.as_str(), relation::MENTIONS).await;
+    assert_eq!(live.tx_to, FOREVER.0);
+}
+
+/// Every stored column of the store's two bitemporal tables, in write order.
+async fn dump_rows<B: Backend>(g: &Graph<B>) -> String {
+    let nodes = "SELECT id, kind, label, content, producer, attributes, scope, subject,
+                        confidence, valid_from, valid_until, tx_from, tx_to
+                 FROM nodes ORDER BY rowid";
+    let edges = "SELECT id, src, dst, type, attributes, tx_from, tx_to FROM edges ORDER BY rowid";
+    let mut dump = String::new();
+    for sql in [nodes, edges] {
+        dump += &format!("{:?}\n", g.backend.query(sql, &[]).await.unwrap());
+    }
+    dump
+}
+
+#[tokio::test]
+async fn log_write_replaying_the_logged_payloads_reproduces_the_live_rows() {
+    // Arrange: one history with every write shape, including an episode whose
+    // second node supersedes its first and a third that supersedes a stored row.
+    let (g, appended, _, clock) = clocked_graph::<DefaultBackend>(Millis(1000)).await;
+    let a = g.insert(fact_at("a").with_subject("s1")).await.unwrap();
+    clock.set(Millis(2000));
+    let a2 = g
+        .supersede(&a, fact_at("a2").with_subject("s1"))
+        .await
+        .unwrap();
+    clock.set(Millis(3000));
+    let b = g.insert(fact_at("b")).await.unwrap();
+    g.relate(&a2, &b, relation::MENTIONS).await.unwrap();
+    clock.set(Millis(4000));
+    let nodes = vec![
+        fact_at("e0").with_subject("s2"),
+        fact_at("e1").with_subject("s2"),
+        fact_at("e2").with_subject("s1"),
+    ];
+    g.ingest_episode(nodes, vec![mentions(1, 2)]).await.unwrap();
+
+    // Act: apply each payload's own statements to an empty store.
+    let replica = graph_at(Millis(1000)).await;
+    for event in events(&appended) {
+        let mut tx = replica.backend.begin().await.unwrap();
+        apply_steps(&mut *tx, &steps_for(&event.payload))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Assert
+    assert_eq!(count(&replica, "edges").await, 5);
+    assert_eq!(dump_rows(&replica).await, dump_rows(&g).await);
 }
