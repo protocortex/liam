@@ -24,6 +24,14 @@ interval_hours         = 6
 reclaim                = true
 run_on_start           = false
 
+# Every write is recorded in an event log before it reaches the database. The
+# database is a projection of that log and `liam rebuild` can recreate it.
+[log]
+# dir = "~/.liam/liam.log"      # default: <database stem>.log beside the database
+wal_segment_max_bytes    = 8388608   # close and compact a WAL segment at this size
+wal_rotate_interval_secs = 300       # ...or when it is this old
+bloom_fpr                = 0.01      # false positive rate of the dedup filter
+
 [embedder]
 provider  = "mock"                       # "mock" (dev) or "local" (in-process)
 model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"

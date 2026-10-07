@@ -24,6 +24,7 @@
 //! reaching into it.
 
 pub mod config;
+pub mod event_log;
 pub mod models;
 pub mod storelock;
 pub mod telemetry;

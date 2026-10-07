@@ -12,6 +12,7 @@ mod clusters;
 /// Grounding eval for `ask`; test-only, see the module docs to run it.
 #[cfg(test)]
 mod eval;
+mod log_startup;
 mod mcp;
 /// Retrieval-quality benchmark for `Graph::query`; test-only, see the module
 /// docs to run each tier.
@@ -28,7 +29,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
-use liam_store::{DefaultGraph, GraphConfig};
+use liam_store::DefaultGraph;
 
 // Re-exported at this crate's root, not merely imported, so the existing
 // `crate::config::...` paths keep resolving now that the module itself lives
@@ -112,14 +113,10 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
          shuttles to it and opens no store",
     )?;
 
-    let store = DefaultGraph::open(
-        database_path.to_str().unwrap_or(&config.database_path),
-        GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size),
-    )
-    .await?;
+    let (embedder, reranker) = build_models(&config)?;
+    let store = log_startup::open_store_with_log(&config, &database_path, embedder.clone()).await?;
     let store = Arc::new(store);
 
-    let (embedder, reranker) = build_models(&config)?;
     let llm = build_llm(&config)?;
     if config.llm.warmup {
         let started = std::time::Instant::now();
@@ -336,6 +333,8 @@ async fn maintenance_tick(
     full_synthesis_max_new_tokens: usize,
 ) {
     let store = server.store_handle();
+    // A leftover event applied after the sweep would outlive it.
+    catch_up(&store).await;
     sweep(&store, policy).await;
     repair_mentions(&store).await;
     refresh_clusters(&store).await;
@@ -459,6 +458,16 @@ async fn repair_mentions(store: &DefaultGraph) {
     match store.repair_superseded_mentions().await {
         Ok(repaired) => tracing::info!(repaired, "provenance repair completed"),
         Err(e) => tracing::warn!(error = %e, "provenance repair failed"),
+    }
+}
+
+async fn catch_up(store: &DefaultGraph) {
+    match store.catch_up().await {
+        Ok(report) if report.applied > 0 || report.quarantined > 0 => {
+            tracing::info!(?report, "event log caught up")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "event log catch up failed"),
     }
 }
 
@@ -1393,5 +1402,141 @@ mod tests {
             Some(mcp::ENTITY_SYNTHESIS_MAX_NEW_TOKENS),
             "an entity below the mention threshold must get the baseline budget"
         );
+    }
+    // ---- the tick over a store with an event log ----
+
+    mod with_a_log {
+        use super::*;
+        use crate::log_startup::test_support::{
+            append_unapplied_node, database_in, log_dir_in, logged_events, standalone_log, DIMS,
+        };
+        use liam_log::event::{LogPayload, TombstoneTable};
+        use liam_store::NodeId;
+
+        const DAY: i64 = 86_400_000;
+
+        /// The store over the standalone log, with no catch-up: whatever the
+        /// log holds past the cursor stays unapplied until something replays it.
+        async fn reopen(
+            dir: &std::path::Path,
+            clock: Arc<FixedClock>,
+        ) -> (Arc<DefaultGraph>, MemoryServer) {
+            let store = DefaultGraph::open_with_clock(
+                database_in(dir).to_str().unwrap(),
+                GraphConfig::new(DIMS),
+                clock,
+            )
+            .await
+            .unwrap()
+            .with_log(standalone_log(&log_dir_in(dir)))
+            .await
+            .unwrap();
+            let store = Arc::new(store);
+            let server = test_server(Arc::clone(&store));
+            (store, server)
+        }
+
+        async fn is_live(store: &DefaultGraph, id: &str) -> bool {
+            store
+                .get(&NodeId::from_raw(id), Millis::now())
+                .await
+                .unwrap()
+                .is_some()
+        }
+
+        fn nothing_to_sweep() -> RetentionPolicy {
+            RetentionPolicy::keep("nonexistent-kind", Millis(1))
+        }
+
+        fn sweep_old_facts() -> RetentionPolicy {
+            RetentionPolicy::keep("fact", Millis::days(30)).without_reclaim()
+        }
+
+        #[tokio::test]
+        async fn the_tick_applies_an_event_the_log_holds_past_the_cursor() {
+            // Arrange: a store that attached its log, then an event that a
+            // double fault left in the log without a projection
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FixedClock::new(Millis(2000)));
+            drop(reopen(dir.path(), clock.clone()).await);
+            append_unapplied_node(&log_dir_in(dir.path()), "leftover", "unapplied");
+            let (store, server) = reopen(dir.path(), clock).await;
+            assert!(!is_live(&store, "leftover").await, "precondition");
+
+            // Act
+            maintenance_tick(&server, &nothing_to_sweep(), 0, 30, true, 8, 512).await;
+
+            // Assert
+            assert!(
+                is_live(&store, "leftover").await,
+                "the tick must replay what the log holds past the cursor"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_tick_catches_up_before_the_sweep() {
+            // Arrange: the leftover is old enough to be swept. Replayed first,
+            // it is swept with the rest; replayed after, it would outlive the sweep.
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FixedClock::new(Millis(100 * DAY)));
+            drop(reopen(dir.path(), clock.clone()).await);
+            append_unapplied_node(&log_dir_in(dir.path()), "stale-leftover", "unapplied");
+            let (store, server) = reopen(dir.path(), clock).await;
+
+            // Act
+            maintenance_tick(&server, &sweep_old_facts(), 0, 30, true, 8, 512).await;
+
+            // Assert: gone from the store, and the log tombstones it
+            assert!(!is_live(&store, "stale-leftover").await);
+            let tombstoned = logged_events(&log_dir_in(dir.path()))
+                .await
+                .into_iter()
+                .any(|event| match event.payload {
+                    LogPayload::Tombstone(targets) => targets.iter().any(|target| {
+                        target.table == TombstoneTable::Nodes && target.id == "stale-leftover"
+                    }),
+                    _ => false,
+                });
+            assert!(
+                tombstoned,
+                "the sweep must have tombstoned the replayed row"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_sweep_in_the_tick_is_logged_as_tombstones() {
+            // Arrange: two facts written through the log, then aged past retention
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FixedClock::new(Millis(100 * DAY)));
+            let (store, server) = reopen(dir.path(), clock).await;
+            let old = |content: &str| {
+                NewNode::now("fact", "label", content).with_valid_from(Millis(10 * DAY))
+            };
+            let first = store.insert(old("first")).await.unwrap();
+            let second = store.insert(old("second")).await.unwrap();
+
+            // Act
+            maintenance_tick(&server, &sweep_old_facts(), 0, 30, true, 8, 512).await;
+
+            // Assert
+            let tombstoned: Vec<String> = logged_events(&log_dir_in(dir.path()))
+                .await
+                .into_iter()
+                .filter_map(|event| match event.payload {
+                    LogPayload::Tombstone(targets) => Some(targets),
+                    _ => None,
+                })
+                .flatten()
+                .map(|target| target.id)
+                .collect();
+            assert!(
+                tombstoned.contains(&first.as_str().to_string()),
+                "{tombstoned:?}"
+            );
+            assert!(
+                tombstoned.contains(&second.as_str().to_string()),
+                "{tombstoned:?}"
+            );
+        }
     }
 }

@@ -21,16 +21,16 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Context;
 use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
-use liam_log::dedup::{BloomConfig, HashBloom};
-use liam_log::reader::SequentialScanReader;
-use liam_log::wal::{WalConfig, WalWriter, MANIFEST_NAME};
+use liam_log::dedup::BloomConfig;
+use liam_log::wal::{WalConfig, MANIFEST_NAME};
 use liam_log::LogWriter;
 use liam_store::{
-    ContentEmbedder, DefaultGraph, EmbedError, Error as StoreError, EventLog, GraphConfig,
-    MismatchSource, RebuildMode, RebuildReport, SharedLog,
+    ContentEmbedder, DefaultGraph, EmbedError, Error as StoreError, GraphConfig, MismatchSource,
+    RebuildMode, RebuildReport, SharedLog,
 };
 
 use liam_daemon::config::{resolve_config_source, Config};
+use liam_daemon::event_log;
 use liam_daemon::models::{self, StoreEmbedder};
 use liam_daemon::storelock::StoreLock;
 use liam_daemon::telemetry;
@@ -70,8 +70,8 @@ struct RebuildArgs {
     #[arg(long, value_name = "PATH")]
     database: PathBuf,
 
-    /// The event log directory. Defaults to `<database stem>.log` beside the
-    /// database.
+    /// The event log directory. Defaults to `[log] dir` from the config, else
+    /// `<database stem>.log` beside the database.
     #[arg(long, value_name = "DIR")]
     log_dir: Option<PathBuf>,
 
@@ -125,15 +125,6 @@ const REBUILD_WAL: WalConfig = WalConfig {
 const GC_WARNING: &str = "warning: GC sweeps made without a log attached are not in the log, so a \
      rebuild can bring back the rows they removed. Back up the database before relying on a \
      rebuild.";
-
-/// `<database stem>.log` beside the database, until the config names a log
-/// directory.
-fn default_log_dir(database: &Path) -> PathBuf {
-    let stem = database.file_stem().unwrap_or(database.as_os_str());
-    let mut name = stem.to_owned();
-    name.push(".log");
-    database.with_file_name(name)
-}
 
 /// Expands `~` in a path flag the way the daemon does for its configured paths.
 fn expand_home(flag: &str, path: &Path) -> anyhow::Result<PathBuf> {
@@ -190,7 +181,7 @@ async fn try_rebuild(
     let database = expand_home("--database", &args.database)?;
     let log_dir = match &args.log_dir {
         Some(dir) => expand_home("--log-dir", dir)?,
-        None => default_log_dir(&database),
+        None => models::resolve_log_dir(config, &database)?,
     };
     anyhow::ensure!(
         log_dir.join(MANIFEST_NAME).is_file(),
@@ -206,7 +197,7 @@ async fn try_rebuild(
         "the embedder could not be built: fix the model setup or run `liam fetch-models`, then \
          rerun. Nothing was changed",
     )?));
-    let writer = open_writer(&log_dir)?;
+    let writer = event_log::open_writer(&log_dir, REBUILD_WAL)?;
     // An empty log would rebuild an empty store and report success, which is
     // not what a lost database needs.
     anyhow::ensure!(
@@ -214,7 +205,7 @@ async fn try_rebuild(
         "the log in {} holds no records, so there is nothing to rebuild from",
         log_dir.display()
     );
-    let log = shared_log(writer, &log_dir)?;
+    let log = event_log::shared_log(writer, &log_dir, BloomConfig::default())?;
     let report = replay_log(
         &database,
         config.embedding_dims,
@@ -243,22 +234,6 @@ async fn try_rebuild(
             .unwrap_or("reasons are logged above")
     );
     Ok(())
-}
-
-fn open_writer(log_dir: &Path) -> anyhow::Result<impl LogWriter + 'static> {
-    WalWriter::open_with_system_clock(log_dir, REBUILD_WAL)
-        .with_context(|| format!("could not open the log in {}", log_dir.display()))
-}
-
-fn shared_log(writer: impl LogWriter + 'static, log_dir: &Path) -> anyhow::Result<SharedLog> {
-    let reader = SequentialScanReader::local(log_dir)
-        .with_context(|| format!("could not read the log in {}", log_dir.display()))?;
-    let log = EventLog::new(
-        Box::new(writer),
-        Arc::new(reader),
-        HashBloom::new(BloomConfig::default()),
-    );
-    Ok(Arc::new(tokio::sync::Mutex::new(log)))
 }
 
 /// Remembers the first embed failure, because the store only counts them.
@@ -627,21 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn the_default_log_directory_is_a_sibling_named_after_the_database_stem() {
-        for (database, log_dir) in [
-            ("/data/work.db", "/data/work.log"),
-            ("liam.db", "liam.log"),
-            ("/data/store", "/data/store.log"),
-        ] {
-            assert_eq!(
-                default_log_dir(Path::new(database)),
-                PathBuf::from(log_dir),
-                "{database}"
-            );
-        }
-    }
-
-    #[test]
     fn a_mistyped_rebuild_flag_is_a_usage_error_with_exit_code_two() {
         for flag in ["--logdir", "--forse"] {
             let error = Cli::try_parse_from(["liam", "rebuild", "--database", "liam.db", flag])
@@ -682,7 +642,8 @@ mod tests {
     }
 
     fn log_at(log_dir: &Path) -> SharedLog {
-        shared_log(open_writer(log_dir).unwrap(), log_dir).unwrap()
+        let writer = event_log::open_writer(log_dir, REBUILD_WAL).unwrap();
+        event_log::shared_log(writer, log_dir, BloomConfig::default()).unwrap()
     }
 
     /// A store written through a real log: two nodes, an edge, and a supersede
@@ -794,6 +755,35 @@ mod tests {
         run_with(args, &config_file(dir), store_embedder).await
     }
 
+    /// A rebuild of a store whose config is `config`, with the embedder it asks for.
+    async fn run_with_config(
+        config: &Config,
+        dir: &Path,
+        args: &RebuildArgs,
+    ) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = rebuild(
+            args,
+            config,
+            &config_file(dir),
+            store_embedder,
+            &mut out,
+            &mut err,
+        )
+        .await;
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    fn config_with_log_dir(log_dir: &Path) -> Config {
+        let mut config = config();
+        config.log.dir = Some(log_dir.to_str().unwrap().to_string());
+        config
+    }
+
     fn rebuild_of(database: &Path, log_dir: Option<&Path>) -> RebuildArgs {
         RebuildArgs {
             database: database.to_path_buf(),
@@ -840,6 +830,46 @@ mod tests {
         assert_eq!(dump(&database).await, before);
         assert_eq!(nodes_without_vectors(&database).await, 0);
         assert_lock_released(&database);
+    }
+
+    #[tokio::test]
+    async fn rebuild_reads_the_log_directory_the_config_names() {
+        // Arrange: the log lives where `[log] dir` says, not beside the database
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        let log_dir = dir.path().join("configured-events");
+        logged_store(&database, &log_dir).await;
+        let before = dump(&database).await;
+        delete_database(dir.path());
+        let config = config_with_log_dir(&log_dir);
+
+        // Act
+        let (code, _out, err) =
+            run_with_config(&config, dir.path(), &rebuild_of(&database, None)).await;
+
+        // Assert
+        assert_eq!(code, 0, "stderr: {err}");
+        assert_eq!(dump(&database).await, before);
+    }
+
+    #[tokio::test]
+    async fn the_log_dir_flag_beats_the_directory_the_config_names() {
+        // Arrange: the config points at a directory with no log in it
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        let log_dir = dir.path().join("wal");
+        logged_store(&database, &log_dir).await;
+        let before = dump(&database).await;
+        delete_database(dir.path());
+        let config = config_with_log_dir(&dir.path().join("elsewhere"));
+
+        // Act
+        let (code, _out, err) =
+            run_with_config(&config, dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
+
+        // Assert
+        assert_eq!(code, 0, "stderr: {err}");
+        assert_eq!(dump(&database).await, before);
     }
 
     #[tokio::test]

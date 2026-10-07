@@ -72,6 +72,8 @@ raunch = "1.0.1"
 [dev-dependencies]
 # storelock tests need an isolated, disposable directory per test.
 tempfile = "3"
+# Startup tests read the event log back as a stream of records.
+futures-util = { version = "0.3", default-features = false }
 # Several tests (synthesis's permit-timeout test, tuning's benchmark tests)
 # drive deadlines with a paused clock instead of a real sleep. `full` (line 28)
 # does not include this; resolver v2 keeps it out of the production build.
