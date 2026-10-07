@@ -579,6 +579,10 @@ impl<B: Backend> Graph<B> {
     /// ahead of the log (`CursorBeyondLog`), then rebuilds the log's dedup
     /// filter from `log_hash_index` so a hash written before this process
     /// started is deduplicated.
+    ///
+    /// A store that holds rows and has not completed its backfill refuses every
+    /// logged write with `BackfillRequired`, until `backfill_log_from_projection`
+    /// completes.
     pub async fn with_log(mut self, log: SharedLog) -> Result<Self> {
         log_open::check_and_prime(&self.backend, &log).await?;
         self.log = Some(log);

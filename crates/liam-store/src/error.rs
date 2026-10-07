@@ -160,10 +160,10 @@ pub enum Error {
     #[error("the log state in the store is corrupt: {0}")]
     CorruptLogState(String),
 
-    /// The store holds a row that cannot be logged so that a replay recreates
-    /// it, so a backfill would leave a rebuild with a different store.
-    #[error("cannot backfill the log: {0}")]
-    BackfillUnreplayable(String),
+    /// The store holds rows the log does not record yet, so a logged write
+    /// would sit ahead of them and a replay could not apply it.
+    #[error("the store has rows the log does not hold yet: run the backfill first")]
+    BackfillRequired,
 }
 
 /// What the log's live rows were compared with when they did not match.

@@ -41,7 +41,7 @@ impl<B: Backend> Graph<B> {
 
     pub(super) async fn sweep(&self, policy: &RetentionPolicy, chunk: usize) -> Result<GcReport> {
         let mut held = match &self.log {
-            Some(log) => Some(HeldLog::acquire(log).await?),
+            Some(log) => Some(HeldLog::acquire_for_write(log).await?),
             None => None,
         };
         let now = self.clock.now();

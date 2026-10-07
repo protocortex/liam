@@ -5,7 +5,6 @@
 
 use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTarget};
 
-use super::backfill::Progress;
 use super::logged_plan::Table;
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
@@ -30,9 +29,6 @@ pub(super) enum Step {
     /// Deletes a row and what depends on it. Removing a row that is already
     /// gone changes nothing, so a replay can run it again.
     Remove(TombstoneTarget),
-    /// Records how far a backfill has got, in the transaction of the row that
-    /// reaches that point.
-    BackfillProgress(Progress),
 }
 
 /// The statements that project a logged payload. A `supersedes` edge closes its
@@ -99,7 +95,6 @@ pub(super) async fn apply_steps(
             }
             Step::GuardedEdge(row) => insert_guarded_edge(tx, row).await?,
             Step::Remove(target) => remove_row(tx, target, vector_delete).await?,
-            Step::BackfillProgress(progress) => progress.save(tx).await?,
         }
     }
     Ok(())

@@ -1774,6 +1774,17 @@ async fn log_write_relate_refuses_a_live_twin_the_log_never_recorded() {
     let src = unlogged.insert(fact_at("src")).await.unwrap();
     let dst = unlogged.insert(fact_at("dst")).await.unwrap();
     unlogged.relate(&src, &dst, "mentions").await.unwrap();
+    // The backfill is marked done by hand, since running it would index the
+    // twin, and a store that owes one refuses writes.
+    unlogged
+        .backend
+        .execute(
+            "INSERT INTO log_backfill_state (id, phase, last_id, completed_at)
+             VALUES (1, 'supersedes', NULL, 1000)",
+            &[],
+        )
+        .await
+        .unwrap();
     let (log, appended) = RecordingLog::new();
     let g = unlogged.with_log(share(log)).await.unwrap();
 

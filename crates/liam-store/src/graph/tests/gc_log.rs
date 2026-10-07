@@ -4,101 +4,19 @@
 //! WAL and reader in a temp directory, and judge a sweep by what the log holds
 //! and by what a store rebuilt from it holds.
 
-use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex as StdMutex};
-
-use liam_log::dedup::{BloomConfig, HashBloom};
 use liam_log::event::{LogEvent, LogPayload, TombstoneTable, TombstoneTarget};
-use liam_log::reader::{LogRecord, SequentialScanReader};
-use liam_log::wal::{SystemClock, WalError, WalWriter};
-use liam_log::{LogOffset, LogWriter};
-use tokio::sync::Notify;
+use liam_log::reader::LogRecord;
 
 use super::log_write::within_deadline;
 use super::support::{
-    count, cursor_offset, embedding, fact, fact_at, gc_ages_out_by_kind,
+    controlled_log, count, cursor_offset, embedding, fact, fact_at, gc_ages_out_by_kind,
     gc_leaves_an_edge_whose_endpoints_both_survive,
     gc_sweeps_a_node_that_still_has_a_community_assignment,
     gc_sweeps_a_node_that_still_has_an_edge_pointing_at_it, has_node, injected, insert_orphan_edge,
-    node, offset_pair, shared, snapshot, Env, ReembedProbe, StubEmbedder, ONE_SEGMENT,
+    node, offset_pair, snapshot, Control, Env, ReembedProbe, StubEmbedder,
 };
 use super::*;
 use crate::DefaultBackend;
-
-// ---- a real log a test can make fail or hold ----
-
-/// What a test does to the log writer while a sweep runs.
-#[derive(Default)]
-pub(super) struct Control {
-    seen: AtomicU64,
-    /// The append, counted from `fail_nth_from_now`, that fails. Zero never.
-    fail_on: AtomicU64,
-    /// Held by the next append until the test releases it.
-    gate: StdMutex<Option<(Arc<Notify>, mpsc::Receiver<()>)>>,
-}
-
-impl Control {
-    /// Fails the `n`th append from now on, `n` counting from 1.
-    pub(super) fn fail_nth_from_now(&self, n: u64) {
-        self.seen.store(0, Ordering::SeqCst);
-        self.fail_on.store(n, Ordering::SeqCst);
-    }
-
-    /// Makes the next append announce itself and wait. The notification says the
-    /// append is running; sending on the returned sender lets it go on.
-    pub(super) fn hold_next_append(&self) -> (Arc<Notify>, mpsc::Sender<()>) {
-        let (release, wait) = mpsc::channel();
-        let reached = Arc::new(Notify::new());
-        *self.gate.lock().unwrap() = Some((Arc::clone(&reached), wait));
-        (reached, release)
-    }
-}
-
-/// A WAL writer that fails or holds an append when its `Control` says so.
-struct Controlled {
-    inner: WalWriter<SystemClock>,
-    control: Arc<Control>,
-}
-
-impl LogWriter for Controlled {
-    fn append(&mut self, event: &LogEvent) -> std::result::Result<LogOffset, WalError> {
-        let held = self.control.gate.lock().unwrap().take();
-        if let Some((reached, release)) = held {
-            reached.notify_one();
-            let _ = release.recv();
-        }
-        let nth = self.control.seen.fetch_add(1, Ordering::SeqCst) + 1;
-        if nth == self.control.fail_on.load(Ordering::SeqCst) {
-            return Err(WalError::Io(io::Error::other("injected append failure")));
-        }
-        self.inner.append(event)
-    }
-
-    fn log_id(&self) -> uuid::Uuid {
-        self.inner.log_id()
-    }
-
-    fn head(&self) -> Option<LogOffset> {
-        self.inner.head()
-    }
-}
-
-pub(super) fn controlled_log(env: &Env) -> (SharedLog, Arc<Control>) {
-    let control = Arc::new(Control::default());
-    let inner = WalWriter::open_with_system_clock(&env.wal_dir(), ONE_SEGMENT).expect("open wal");
-    let reader = SequentialScanReader::local(&env.wal_dir()).expect("open reader");
-    let writer = Controlled {
-        inner,
-        control: Arc::clone(&control),
-    };
-    let log = EventLog::new(
-        Box::new(writer),
-        Arc::new(reader),
-        HashBloom::new(BloomConfig::default()),
-    );
-    (shared(log), control)
-}
 
 // ---- a store over that log ----
 

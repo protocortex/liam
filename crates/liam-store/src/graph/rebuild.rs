@@ -4,14 +4,13 @@
 
 use std::collections::HashMap;
 
-use futures_util::StreamExt;
 use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTable};
 use liam_log::hash::{edge_row_hash, node_row_hash};
 use uuid::Uuid;
 
 use super::log_cursor;
 use super::logged_write::{commit_or_abandon, HeldLog, SharedLog};
-use super::replay::{scan_ahead, CatchUpReport};
+use super::replay::{for_each_unvoided, row_effects, CatchUpReport};
 use super::{opt_string, row_f64, Graph};
 use crate::backend::Backend;
 use crate::error::{Error, MismatchSource, Result};
@@ -133,14 +132,16 @@ impl<B: Backend> Graph<B> {
         previous_log: Option<Uuid>,
     ) -> Result<()> {
         match mode {
-            RebuildMode::RequireEmpty if self.holds_rows().await? => Err(Error::ProjectionNotEmpty),
+            RebuildMode::RequireEmpty if holds_rows(&self.backend).await? => {
+                Err(Error::ProjectionNotEmpty)
+            }
             RebuildMode::RequireEmpty => Ok(()),
             RebuildMode::ResetChecked => {
                 let expected = log_expected_multiset(held).await?;
                 let stored = self.live_rows().await?;
                 verify(MismatchSource::PriorProjection, &expected, &stored.hashes)
             }
-            RebuildMode::Replace if !self.holds_rows().await? => Ok(()),
+            RebuildMode::Replace if !holds_rows(&self.backend).await? => Ok(()),
             RebuildMode::Replace => {
                 if let Some(store) = previous_log {
                     return Err(Error::ForeignLogWouldWipe {
@@ -163,18 +164,6 @@ impl<B: Backend> Graph<B> {
         let known = log_expected_multiset(held).await?;
         let stored = self.live_rows().await?;
         Ok(multiset_difference(&stored.hashes, &known).0)
-    }
-
-    /// Any row at all, superseded ones included.
-    async fn holds_rows(&self) -> Result<bool> {
-        let rows = self
-            .backend
-            .query(
-                "SELECT EXISTS(SELECT 1 FROM nodes) OR EXISTS(SELECT 1 FROM edges)",
-                &[],
-            )
-            .await?;
-        Ok(rows.first().map(|row| row.get_i64(0)).transpose()? == Some(1))
     }
 
     async fn live_rows(&self) -> Result<LiveRows> {
@@ -228,6 +217,17 @@ impl<B: Backend> Graph<B> {
         tracing::info!("rebuild: projection reset, cursor back at the start of the log");
         Ok(())
     }
+}
+
+/// Any row at all, superseded ones included.
+pub(super) async fn holds_rows<B: Backend>(backend: &B) -> Result<bool> {
+    let rows = backend
+        .query(
+            "SELECT EXISTS(SELECT 1 FROM nodes) OR EXISTS(SELECT 1 FROM edges)",
+            &[],
+        )
+        .await?;
+    Ok(rows.first().map(|row| row.get_i64(0)).transpose()? == Some(1))
 }
 
 /// The node a stored row holds. The table does not record whether `valid_from`
@@ -308,21 +308,8 @@ fn multiset_difference(left: &[[u8; 32]], right: &[[u8; 32]]) -> (usize, usize) 
 /// was not voided, applied in order. It is read from the log's own rows instead
 /// of the projection, so it can catch a replay that dropped or invented one.
 async fn log_expected_multiset(held: &HeldLog) -> Result<Vec<[u8; 32]>> {
-    let Some(head) = held.head()? else {
-        return Ok(Vec::new());
-    };
-    let reader = held.reader()?;
-    let voided = scan_ahead(reader.scan_through(None, head))
-        .await?
-        .into_voided();
     let mut rows = LoggedRows::default();
-    let mut records = reader.scan_through(None, head);
-    while let Some(record) = records.next().await {
-        let event = record?.event;
-        if !voided.contains(&event.event_id) {
-            rows.apply(event.payload);
-        }
-    }
+    for_each_unvoided(held.reader()?, held.head()?, |payload| rows.apply(payload)).await?;
     Ok(rows.live_hashes())
 }
 
@@ -342,22 +329,19 @@ struct LoggedRows {
 impl LoggedRows {
     fn apply(&mut self, payload: LogPayload) {
         match payload {
-            LogPayload::NodeWrite(row) => self.add_node(row),
-            LogPayload::EdgeWrite(row) => self.add_edge(row),
-            LogPayload::EpisodeBatch(effects) => {
-                for effect in effects {
+            LogPayload::Tombstone(targets) => {
+                for target in targets {
+                    self.remove(target.table, &target.id);
+                }
+            }
+            written => {
+                for effect in row_effects(written) {
                     match effect {
                         RowEffect::Node(row) => self.add_node(row),
                         RowEffect::Edge(row) => self.add_edge(row),
                     }
                 }
             }
-            LogPayload::Tombstone(targets) => {
-                for target in targets {
-                    self.remove(target.table, &target.id);
-                }
-            }
-            LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. } => {}
         }
     }
 

@@ -6,46 +6,46 @@
 //! edges, then `supersedes` edges, because a replayed `supersedes` edge closes
 //! its target and a plain edge needs both of its ends open. A superseded node is
 //! logged open and left to its `supersedes` edge to close, as it was written.
+//!
+//! A closed node that no live `supersedes` edge closes, such as one whose
+//! superseder a retention sweep removed, is logged as it is stored. A live edge
+//! that a replay would refuse because of it cannot be logged, so it is skipped
+//! and counted: a rebuild then lacks that edge, and its verification names it
+//! as unexpected for as long as the store still holds it.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use liam_log::event::{LogEvent, LogPayload, RowEffect};
 use liam_log::hash::{edge_row_hash, node_row_hash};
 use liam_log::reader::LogReader;
 use liam_log::LogOffset;
 
 use super::logged_plan::{event, STORE_TRUST};
-use super::logged_write::{commit_or_abandon, HeldLog};
-use super::projection::Step;
+use super::logged_write::{abandon, commit_or_abandon, HeldLog};
 use super::rebuild::{stored_edge, stored_node, EDGE_COLUMNS, NODE_COLUMNS};
-use super::replay::scan_ahead;
-use super::{opt_string, opt_text, Graph};
+use super::replay::{for_each_unvoided, row_effects};
+use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{Millis, FOREVER};
 use crate::types::relation;
 use crate::value::{Row, Value};
 
-/// Rows backfilled between two writes of the resume point.
+/// Rows one query reads, and rows logged between two saves of the resume point.
 const BACKFILL_BATCH: usize = 500;
 
 const BACKFILL_SOURCE: &str = "backfill";
 
-const PROGRESS_SQL: &str = "INSERT INTO backfill_state (id, phase, last_id, completed_at)
-     VALUES (1, ?1, ?2, ?3)
-     ON CONFLICT(id) DO UPDATE SET
-       phase = excluded.phase, last_id = excluded.last_id,
-       completed_at = excluded.completed_at";
-
-/// What one backfill run appended to the log.
+/// What one backfill run did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BackfillReport {
     /// Node events appended, superseded nodes included.
-    pub nodes: usize,
+    pub nodes_logged: usize,
     /// Edge events appended.
-    pub edges: usize,
+    pub edges_logged: usize,
+    /// Live edges left out because a replay would refuse them.
+    pub edges_skipped: usize,
     /// Whether the run continued an interrupted one instead of starting over.
     pub resumed: bool,
 }
@@ -73,30 +73,86 @@ impl Phase {
             .into_iter()
             .find(|phase| phase.name() == name)
             .ok_or_else(|| {
-                Error::CorruptLogState(format!("backfill_state holds the phase {name:?}"))
+                Error::CorruptLogState(format!("log_backfill_state holds the phase {name:?}"))
             })
     }
 
-    /// The next `limit` rows of this phase after `after`, by id.
+    /// The next `limit` rows of this phase after `after`, by id, each with one
+    /// trailing flag column that `trailing_flag` reads: for a node, whether a
+    /// live `supersedes` edge closes it; for an edge, whether a replay would
+    /// refuse it.
     fn page_query(self, after: &str, limit: usize) -> (String, Vec<Value>) {
-        let (after, limit) = (after.into(), Value::Int(limit as i64));
-        match self {
+        let live = FOREVER.0;
+        let supersedes = relation::SUPERSEDES;
+        let (columns, table, flag, condition) = match self {
             Phase::Nodes => (
-                format!("SELECT {NODE_COLUMNS} FROM nodes WHERE id > ?1 ORDER BY id LIMIT ?2"),
-                vec![after, limit],
+                NODE_COLUMNS,
+                "nodes",
+                format!("tx_to != {live} AND {}", live_closer("nodes")),
+                String::new(),
             ),
-            Phase::Edges | Phase::Supersedes => {
-                let op = if self == Phase::Edges { "!=" } else { "=" };
-                let sql = format!(
-                    "SELECT {EDGE_COLUMNS} FROM edges
-                     WHERE id > ?1 AND tx_to = ?3 AND type {op} ?4 ORDER BY id LIMIT ?2"
-                );
-                let params = vec![after, limit, FOREVER.into(), relation::SUPERSEDES.into()];
-                (sql, params)
+            Phase::Edges => {
+                // A guarded edge is refused unless both ends are open once the
+                // nodes are logged.
+                let open_end = |end: &str| {
+                    format!(
+                        "EXISTS (SELECT 1 FROM nodes n WHERE n.id = edges.{end}
+                         AND (n.tx_to = {live} OR {}))",
+                        live_closer("n")
+                    )
+                };
+                (
+                    EDGE_COLUMNS,
+                    "edges",
+                    format!("NOT ({} AND {})", open_end("src"), open_end("dst")),
+                    format!("AND tx_to = {live} AND type != '{supersedes}'"),
+                )
             }
-        }
+            Phase::Supersedes => (
+                EDGE_COLUMNS,
+                "edges",
+                // The close it replays fails unless its target is open or this
+                // edge is what closed it.
+                format!(
+                    "NOT EXISTS (SELECT 1 FROM nodes d WHERE d.id = edges.dst
+                     AND d.tx_to IN ({live}, edges.tx_from))"
+                ),
+                format!("AND tx_to = {live} AND type = '{supersedes}'"),
+            ),
+        };
+        let sql = format!(
+            "SELECT {columns}, {flag} FROM {table}
+             WHERE id > ?1 {condition} ORDER BY id LIMIT ?2"
+        );
+        (sql, vec![after.into(), Value::Int(limit as i64)])
     }
 }
+
+/// Whether a live `supersedes` edge closed node `node` at the instant the node
+/// was closed, `node` being the name or alias of a table of nodes in scope.
+fn live_closer(node: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM edges closer WHERE closer.dst = {node}.id
+         AND closer.type = '{}' AND closer.tx_from = {node}.tx_to AND closer.tx_to = {})",
+        relation::SUPERSEDES,
+        FOREVER.0
+    )
+}
+
+fn trailing_flag(row: &Row) -> Result<bool> {
+    match row.0.last() {
+        Some(Value::Int(flag)) => Ok(*flag != 0),
+        _ => Err(Error::Backend("the flag column is not an integer".into())),
+    }
+}
+
+const READ_SQL: &str = "SELECT phase, last_id, completed_at FROM log_backfill_state WHERE id = 1";
+
+const SAVE_SQL: &str = "INSERT INTO log_backfill_state (id, phase, last_id, completed_at)
+     VALUES (1, ?1, ?2, ?3)
+     ON CONFLICT(id) DO UPDATE SET
+       phase = excluded.phase, last_id = excluded.last_id,
+       completed_at = excluded.completed_at";
 
 /// How far the backfill has got: `last_id` is the last row of `phase` accounted
 /// for, and `completed_at` is set once every row is in the log.
@@ -132,10 +188,16 @@ impl Progress {
         }
     }
 
+    /// `None` for a store whose backfill never started.
+    pub(super) async fn load<B: Backend>(backend: &B) -> Result<Option<Self>> {
+        let rows = backend.query(READ_SQL, &[]).await?;
+        rows.first().map(Self::from_row).transpose()
+    }
+
     fn from_row(row: &Row) -> Result<Self> {
         Ok(Self {
             phase: Phase::parse(&row.get_string(0)?)?,
-            last_id: opt_string(row, 1)?,
+            last_id: super::opt_string(row, 1)?,
             completed_at: match row.0[2] {
                 Value::Null => None,
                 _ => Some(row.get_i64(2)?),
@@ -143,26 +205,43 @@ impl Progress {
         })
     }
 
-    pub(super) async fn save(&self, tx: &mut dyn BackendTx) -> Result<()> {
+    pub(super) fn is_complete(&self) -> bool {
+        self.completed_at.is_some()
+    }
+
+    async fn save(&self, tx: &mut dyn BackendTx) -> Result<()> {
         let params = [
             self.phase.name().into(),
-            opt_text(self.last_id.clone()),
+            super::opt_text(self.last_id.clone()),
             self.completed_at.map_or(Value::Null, Value::Int),
         ];
-        tx.execute(PROGRESS_SQL, &params).await?;
+        tx.execute(SAVE_SQL, &params).await?;
         Ok(())
     }
 }
 
-/// A row waiting to be logged, with the id the walk resumes after.
+/// A row read from the store, with the id the walk resumes after. The event is
+/// `None` for a row a replay would refuse.
 struct Pending {
     id: String,
-    event: LogEvent,
+    event: Option<LogEvent>,
+}
+
+/// What a run carries from one phase to the next.
+struct Run {
+    batch: usize,
+    now: Millis,
+    /// The rows the log already holds, whoever wrote them.
+    logged: HashSet<String>,
+    report: BackfillReport,
+    /// Rows logged since the resume point was last saved.
+    unrecorded: usize,
 }
 
 impl<B: Backend> Graph<B> {
     /// Logs every row the log does not hold yet, then marks the backfill complete.
-    /// The log lock is held throughout, so no write lands between the rows.
+    /// The log lock is held throughout, so no write lands between the rows, and
+    /// writes are refused until it completes.
     pub async fn backfill_log_from_projection(&self) -> Result<BackfillReport> {
         self.backfill_in_batches(BACKFILL_BATCH).await
     }
@@ -170,160 +249,162 @@ impl<B: Backend> Graph<B> {
     /// Whether the backfill has not completed for this store.
     pub async fn needs_backfill(&self) -> Result<bool> {
         self.log.as_ref().ok_or(Error::NoEventLog)?;
-        let saved = self.saved_progress().await?;
-        Ok(!saved.is_some_and(|progress| progress.completed_at.is_some()))
+        let saved = Progress::load(&self.backend).await?;
+        Ok(!saved.is_some_and(|progress| progress.is_complete()))
     }
 
     pub(super) async fn backfill_in_batches(&self, batch: usize) -> Result<BackfillReport> {
         let log = self.log.as_ref().ok_or(Error::NoEventLog)?;
         let mut held = HeldLog::acquire(log).await?;
-        let saved = self.saved_progress().await?;
-        if saved.as_ref().is_some_and(|p| p.completed_at.is_some()) {
+        let saved = Progress::load(&self.backend).await?;
+        if saved.as_ref().is_some_and(Progress::is_complete) {
             return Ok(BackfillReport::default());
         }
-        let mut report = BackfillReport {
-            resumed: saved.is_some(),
-            ..BackfillReport::default()
-        };
+        let resumed = saved.is_some();
         let start = saved.unwrap_or_else(Progress::start);
         // Settles any row of an interrupted run that the log holds past the cursor.
         self.replay(&mut held).await?;
-        let logged = logged_row_ids(held.reader()?, held.head()?).await?;
-        let now = self.clock.now();
-        tracing::info!(
-            logged = logged.len(),
-            resumed = report.resumed,
-            "backfill: starting"
-        );
+        let mut run = Run {
+            batch,
+            now: self.clock.now(),
+            logged: logged_row_ids(held.reader()?, held.head()?).await?,
+            report: BackfillReport {
+                resumed,
+                ..BackfillReport::default()
+            },
+            unrecorded: 0,
+        };
+        tracing::info!(logged = run.logged.len(), resumed, "backfill: starting");
 
-        let mut unrecorded = 0;
         for phase in Phase::IN_ORDER
             .into_iter()
             .skip_while(|p| *p != start.phase)
         {
-            let mut after = match phase == start.phase {
-                true => start.last_id.clone().unwrap_or_default(),
-                false => String::new(),
+            let after = if phase == start.phase {
+                start.last_id.clone().unwrap_or_default()
+            } else {
+                String::new()
             };
-            loop {
-                let page = self.pending_page(phase, &after, batch, now).await?;
-                let Some(last) = page.last() else { break };
-                after = last.id.clone();
-                for Pending { id, event } in page {
-                    if logged.contains(&id) {
-                        continue;
-                    }
-                    unrecorded += 1;
-                    let steps = if unrecorded == batch {
-                        unrecorded = 0;
-                        vec![Step::BackfillProgress(Progress::at(phase, &id))]
-                    } else {
-                        Vec::new()
-                    };
-                    let tx = self.backend.begin().await?;
-                    self.append_and_commit(tx, &mut held, event, &steps).await?;
-                    match phase {
-                        Phase::Nodes => report.nodes += 1,
-                        _ => report.edges += 1,
-                    }
-                }
-            }
+            self.log_phase(&mut held, &mut run, phase, after).await?;
             tracing::info!(phase = phase.name(), "backfill: phase logged");
         }
-        self.record_completion(now).await?;
-        tracing::info!(?report, "backfill: complete");
-        Ok(report)
+        self.record_completion(&mut held, run.now).await?;
+        if run.report.edges_skipped > 0 {
+            tracing::warn!(
+                edges_skipped = run.report.edges_skipped,
+                "backfill: edges left out, an end is a closed node no live supersedes edge closes"
+            );
+        }
+        tracing::info!(report = ?run.report, "backfill: complete");
+        Ok(run.report)
     }
 
-    async fn saved_progress(&self) -> Result<Option<Progress>> {
-        let rows = self
-            .backend
-            .query(
-                "SELECT phase, last_id, completed_at FROM backfill_state WHERE id = 1",
-                &[],
-            )
-            .await?;
-        rows.first().map(Progress::from_row).transpose()
+    /// Logs the rows of `phase` after `after` that the log does not hold.
+    async fn log_phase(
+        &self,
+        held: &mut HeldLog,
+        run: &mut Run,
+        phase: Phase,
+        mut after: String,
+    ) -> Result<()> {
+        loop {
+            let page = self.pending_page(phase, &after, run).await?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            after = last.id.clone();
+            for Pending { id, event } in page {
+                if run.logged.contains(&id) {
+                    continue;
+                }
+                let Some(event) = event else {
+                    tracing::debug!(edge = %id, "backfill: edge skipped, a replay would refuse it");
+                    run.report.edges_skipped += 1;
+                    continue;
+                };
+                run.unrecorded += 1;
+                let due = (run.unrecorded == run.batch).then(|| Progress::at(phase, &id));
+                if due.is_some() {
+                    run.unrecorded = 0;
+                }
+                // The resume point commits with the row that reaches it.
+                let tx = self.begin_saving(due.as_ref()).await?;
+                self.append_and_commit(tx, held, event, &[]).await?;
+                match phase {
+                    Phase::Nodes => run.report.nodes_logged += 1,
+                    Phase::Edges | Phase::Supersedes => run.report.edges_logged += 1,
+                }
+            }
+        }
     }
 
-    async fn record_completion(&self, now: Millis) -> Result<()> {
+    async fn begin_saving(&self, progress: Option<&Progress>) -> Result<Box<dyn BackendTx + '_>> {
+        let mut tx = self.backend.begin().await?;
+        if let Some(progress) = progress {
+            if let Err(error) = progress.save(&mut *tx).await {
+                abandon(tx).await;
+                return Err(error);
+            }
+        }
+        Ok(tx)
+    }
+
+    async fn record_completion(&self, held: &mut HeldLog, now: Millis) -> Result<()> {
         let mut tx = self.backend.begin().await?;
         let saved = Progress::complete(now).save(&mut *tx).await;
-        commit_or_abandon(tx, saved).await
+        commit_or_abandon(tx, saved).await?;
+        held.set_backfill_pending(false);
+        Ok(())
     }
 
-    async fn pending_page(
-        &self,
-        phase: Phase,
-        after: &str,
-        limit: usize,
-        now: Millis,
-    ) -> Result<Vec<Pending>> {
-        let (sql, params) = phase.page_query(after, limit);
+    async fn pending_page(&self, phase: Phase, after: &str, run: &Run) -> Result<Vec<Pending>> {
+        let (sql, params) = phase.page_query(after, run.batch);
         let rows = self.backend.query(&sql, &params).await?;
-        let mut page = Vec::with_capacity(rows.len());
-        for row in &rows {
-            page.push(match phase {
-                Phase::Nodes => self.node_pending(row, now).await?,
-                Phase::Edges | Phase::Supersedes => edge_pending(row, now)?,
-            });
-        }
-        Ok(page)
+        rows.iter()
+            .map(|row| match phase {
+                Phase::Nodes => node_pending(row, run.now),
+                Phase::Edges | Phase::Supersedes => edge_pending(row, run.now),
+            })
+            .collect()
     }
+}
 
-    /// A node closed by a `supersedes` edge is logged open, and replaying that
-    /// edge closes it at the same time. One with no such edge would stay open
-    /// after a rebuild, so it is refused.
-    async fn node_pending(&self, row: &Row, now: Millis) -> Result<Pending> {
-        let mut node = stored_node(row)?;
-        if node.tx_to != FOREVER.0 {
-            let closers = self
-                .backend
-                .query(
-                    "SELECT 1 FROM edges
-                     WHERE dst = ?1 AND type = ?2 AND tx_from = ?3 AND tx_to = ?4",
-                    &[
-                        node.id.as_str().into(),
-                        relation::SUPERSEDES.into(),
-                        node.tx_to.into(),
-                        FOREVER.into(),
-                    ],
-                )
-                .await?;
-            if closers.is_empty() {
-                return Err(Error::BackfillUnreplayable(format!(
-                    "node {} is closed but no live supersedes edge closes it",
-                    node.id
-                )));
-            }
-            node.tx_to = FOREVER.0;
-        }
-        let stamp = (BACKFILL_SOURCE, node.confidence);
-        Ok(Pending {
-            id: node.id.clone(),
-            event: event(
-                node_row_hash(&node),
-                stamp,
-                node.valid_from,
-                now,
-                LogPayload::NodeWrite(node),
-            ),
-        })
+/// A node a live `supersedes` edge closes is logged open, and replaying that
+/// edge closes it at the same time. Any other node is logged as stored.
+fn node_pending(row: &Row, now: Millis) -> Result<Pending> {
+    let mut node = stored_node(row)?;
+    if trailing_flag(row)? {
+        node.tx_to = FOREVER.0;
     }
+    let stamp = (BACKFILL_SOURCE, node.confidence);
+    Ok(Pending {
+        id: node.id.clone(),
+        event: Some(event(
+            node_row_hash(&node),
+            stamp,
+            node.valid_from,
+            now,
+            LogPayload::NodeWrite(node),
+        )),
+    })
 }
 
 fn edge_pending(row: &Row, now: Millis) -> Result<Pending> {
     let edge = stored_edge(row)?;
+    let id = edge.id.clone();
+    if trailing_flag(row)? {
+        return Ok(Pending { id, event: None });
+    }
     let stamp = (BACKFILL_SOURCE, STORE_TRUST);
     Ok(Pending {
-        id: edge.id.clone(),
-        event: event(
+        id,
+        event: Some(event(
             edge_row_hash(&edge),
             stamp,
             edge.tx_from,
             now,
             LogPayload::EdgeWrite(edge),
-        ),
+        )),
     })
 }
 
@@ -334,35 +415,13 @@ async fn logged_row_ids(
     reader: Arc<dyn LogReader>,
     head: Option<LogOffset>,
 ) -> Result<HashSet<String>> {
-    let Some(head) = head else {
-        return Ok(HashSet::new());
-    };
-    let voided = scan_ahead(reader.scan_through(None, head))
-        .await?
-        .into_voided();
     let mut ids = HashSet::new();
-    let mut records = reader.scan_through(None, head);
-    while let Some(record) = records.next().await {
-        let event = record?.event;
-        if voided.contains(&event.event_id) {
-            continue;
-        }
-        ids.extend(written_ids(event.payload));
-    }
+    for_each_unvoided(reader, head, |payload| {
+        ids.extend(row_effects(payload).into_iter().map(|effect| match effect {
+            RowEffect::Node(row) => row.id,
+            RowEffect::Edge(row) => row.id,
+        }));
+    })
+    .await?;
     Ok(ids)
-}
-
-fn written_ids(payload: LogPayload) -> Vec<String> {
-    match payload {
-        LogPayload::NodeWrite(row) => vec![row.id],
-        LogPayload::EdgeWrite(row) => vec![row.id],
-        LogPayload::EpisodeBatch(effects) => effects
-            .into_iter()
-            .map(|effect| match effect {
-                RowEffect::Node(row) => row.id,
-                RowEffect::Edge(row) => row.id,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
 }
