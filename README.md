@@ -195,6 +195,10 @@ unknown key fails loudly.
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
 | `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
 | `read_pool_size` | `4` | Read connections. Ignored for an in-memory database. |
+| `log.dir` | `<database stem>.log` beside the database | The event log directory. `~` is expanded. |
+| `log.wal_segment_max_bytes` | `8388608` | A WAL segment is closed and compacted at this size. Must be at least 1. |
+| `log.wal_rotate_interval_secs` | `300` | A WAL segment is closed and compacted at this age. Must be at least 1. |
+| `log.bloom_fpr` | `0.01` | False positive rate of the dedup filter. At least `1e-9` and below `1`. |
 | `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
 | `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
 
@@ -212,6 +216,45 @@ Logs go to stderr. Stdout carries the MCP JSON-RPC stream, so it stays clean.
 The store runs in WAL mode, so libSQL keeps `liam.db-wal` and `liam.db-shm` next
 to the database. Anything that copies or backs up the store by path needs all
 three: the `.db` file alone can be missing recently committed data.
+
+## The event log
+
+Every write goes into an event log before it reaches the database, so the
+database is a projection of the log. `liamd` opens the log at startup, before
+it serves anything, and replays any event the database has not applied yet, such
+as one left by a crash between the two. The maintenance tick does the same
+before each sweep.
+
+The log lives in `log.dir`, which defaults to `<database stem>.log` beside the
+database (`~/.liam/liam.db` logs to `~/.liam/liam.log`). Back it up with the
+database: it is the source of truth that `liam rebuild` reads.
+
+`liam rebuild --database PATH [--log-dir DIR] [--force]` recreates the nodes and
+edges from the log and checks the result against it, row by row. It needs the
+store to itself, so stop `liamd` first. The log directory is `--log-dir`, else
+`log.dir` from the config, else the default beside `--database`.
+
+### Upgrading a database that predates the log
+
+The first start with the log copies every row the database already holds into
+the log, nodes first, then edges. Writes are refused with `BackfillRequired`
+until the copy is done, and since the daemon runs it before serving, clients see
+nothing but a slower start on a large database. An interrupted copy resumes
+where it stopped, and a database that is already logged is not copied again.
+
+### Garbage collection
+
+A sweep is recorded in the log as tombstones before the rows are deleted, so a
+rebuild does not bring swept rows back. The log lock is held for the whole
+sweep, so a very large sweep blocks every writer until it finishes. Chunking
+bounds the size of each event and transaction, not the wait.
+
+### Refused at open
+
+The database remembers which log it belongs to. If you delete the log directory
+and keep the database, `liamd` refuses to start with an error naming both ids,
+because a fresh log would not hold the rows the database has. Restore the log
+directory, point `log.dir` at it, or rebuild from a log that holds the rows.
 
 ## Feature flags
 

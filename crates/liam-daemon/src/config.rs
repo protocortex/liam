@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use liam_log::dedup::BloomConfig;
+use liam_log::wal::WalConfig;
 use liam_store::{Millis, RetentionPolicy};
 use serde::Deserialize;
 
@@ -174,7 +176,30 @@ impl Default for LogConfig {
 impl LogConfig {
     /// Rejects values the log cannot run with, naming the key to fix.
     pub fn validate(&self) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::ensure!(
+            self.wal_segment_max_bytes > 0,
+            "log.wal_segment_max_bytes must be at least 1"
+        );
+        // Zero would rotate the WAL on every append.
+        anyhow::ensure!(
+            self.wal_rotate_interval_secs > 0,
+            "log.wal_rotate_interval_secs must be at least 1"
+        );
+        self.bloom().map(|_| ())
+    }
+
+    pub fn wal(&self) -> WalConfig {
+        WalConfig {
+            segment_max_bytes: self.wal_segment_max_bytes,
+            rotate_interval_secs: self.wal_rotate_interval_secs,
+        }
+    }
+
+    /// The dedup filter at the configured false positive rate, sized for the
+    /// default item count.
+    pub fn bloom(&self) -> anyhow::Result<BloomConfig> {
+        BloomConfig::new(BloomConfig::default().expected_items(), self.bloom_fpr)
+            .map_err(|error| anyhow::anyhow!("log.bloom_fpr is invalid: {error}"))
     }
 }
 
@@ -254,7 +279,10 @@ pub(crate) fn expand_tilde(path: &str, home: &str) -> String {
 /// `<database stem>.log` beside the database: the log directory used when the
 /// config names none. `liam rebuild` derives its default the same way.
 pub fn default_log_dir(database: &Path) -> PathBuf {
-    database.to_path_buf()
+    let stem = database.file_stem().unwrap_or(database.as_os_str());
+    let mut name = stem.to_owned();
+    name.push(".log");
+    database.with_file_name(name)
 }
 
 /// The config file read when neither `--config` nor `LIAM_CONFIG` says

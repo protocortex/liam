@@ -6,22 +6,58 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context;
 use liam_model::Embedder;
 use liam_store::{DefaultGraph, GraphConfig};
 
 use liam_daemon::config::Config;
+use liam_daemon::event_log;
+use liam_daemon::models::{resolve_log_dir, StoreEmbedder};
 
-/// The store at `database_path`, ready to serve through its log.
+/// The store at `database_path`, ready to serve through its log. Every failure
+/// is fatal: serving a store whose log is missing, foreign or unreadable would
+/// accept writes the log never records.
 pub async fn open_store_with_log(
     config: &Config,
     database_path: &Path,
-    _embedder: Arc<dyn Embedder>,
+    embedder: Arc<dyn Embedder>,
 ) -> anyhow::Result<DefaultGraph> {
+    let log_dir = resolve_log_dir(config, database_path)?;
+    tracing::info!(log_dir = %log_dir.display(), "opening the event log");
+    let writer = event_log::open_writer(&log_dir, config.log.wal())?;
+    let log = event_log::shared_log(writer, &log_dir, config.log.bloom()?)?;
+
     let store = DefaultGraph::open(
         database_path.to_str().unwrap_or(&config.database_path),
         GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size),
     )
     .await?;
+    // The embedder goes in before the replay so restored nodes get vectors.
+    let store = store
+        .with_log(log)
+        .await
+        .with_context(|| {
+            format!(
+                "the event log in {} cannot be used with the database {}; the cause is below",
+                log_dir.display(),
+                database_path.display()
+            )
+        })?
+        .with_embedder(Arc::new(StoreEmbedder(embedder)));
+
+    if store.needs_backfill().await? {
+        tracing::info!("logging the rows that predate the event log, writes wait until it is done");
+        let report = store.backfill_log_from_projection().await.context(
+            "copying the existing rows into the event log failed; fix the cause and \
+                 restart, the copy resumes where it stopped",
+        )?;
+        tracing::info!(?report, "backfill completed");
+    }
+    let report = store
+        .catch_up()
+        .await
+        .context("replaying the event log into the database failed")?;
+    tracing::info!(?report, "event log caught up");
     Ok(store)
 }
 
