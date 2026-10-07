@@ -159,6 +159,11 @@ pub enum Error {
     /// store was edited or damaged outside it.
     #[error("the log state in the store is corrupt: {0}")]
     CorruptLogState(String),
+
+    /// The store holds rows the log does not record yet, so a logged write
+    /// would sit ahead of them and a replay could not apply it.
+    #[error("the store has rows the log does not hold yet: run the backfill first")]
+    BackfillRequired,
 }
 
 /// What the log's live rows were compared with when they did not match.

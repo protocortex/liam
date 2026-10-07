@@ -139,6 +139,17 @@ CREATE TABLE IF NOT EXISTS log_cursor (
   last_index   INTEGER
 );
 
+-- How far the one-time copy of pre-log rows into the log has got. phase names
+-- the part of the walk (nodes, edges, supersedes) and last_id the last row of it
+-- that is accounted for, NULL before the first. completed_at stays NULL until
+-- every row is in the log.
+CREATE TABLE IF NOT EXISTS log_backfill_state (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  phase        TEXT    NOT NULL,
+  last_id      TEXT,
+  completed_at INTEGER
+);
+
 -- Derived from the log: the live carrier of each content hash. row_ids is a
 -- JSON array of the carrier's row ids, because one event can carry several.
 CREATE TABLE IF NOT EXISTS log_hash_index (

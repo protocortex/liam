@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //! What opening a store on a log must settle before the first write: the log is
 //! the one the store belongs to, the store has not applied records the log
-//! lacks, and the dedup filter knows every hash the store has indexed.
+//! lacks, the dedup filter knows every hash the store has indexed, and a store
+//! whose backfill is owed is flagged so writes wait for it.
 
 use liam_log::dedup::{BloomConfig, HashBloom};
 use liam_log::LogOffset;
 use uuid::Uuid;
 
+use super::backfill::Progress;
 use super::log_cursor::{self, Cursor};
 use super::logged_write::SharedLog;
+use super::rebuild::holds_rows;
 use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::value::Row;
@@ -39,7 +42,17 @@ pub(super) async fn check_and_prime<B: Backend>(backend: &B, log: &SharedLog) ->
     let bloom = rebuild_bloom(backend, log.bloom_config()).await?;
     log.replace_bloom(bloom);
     tracing::debug!("dedup filter rebuilt from the hash index");
+    let pending = backfill_pending(backend).await?;
+    log.set_backfill_pending(pending);
     Ok(())
+}
+
+/// Whether the store holds rows whose backfill has not completed, so a write
+/// to the log would land ahead of them.
+async fn backfill_pending<B: Backend>(backend: &B) -> Result<bool> {
+    let saved = Progress::load(backend).await?;
+    let complete = saved.as_ref().is_some_and(Progress::is_complete);
+    Ok(!complete && holds_rows(backend).await?)
 }
 
 /// A cursor behind the head is fine: the records between are replayed.

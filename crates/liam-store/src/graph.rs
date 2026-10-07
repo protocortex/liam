@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use liam_log::event::NodeRow;
 
+pub use self::backfill::BackfillReport;
 use self::logged_plan::{refuse_supersedes, Collision};
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, SharedLog};
@@ -29,6 +30,7 @@ use crate::types::{
 };
 use crate::value::{Row, Value};
 
+mod backfill;
 mod gc;
 mod log_cursor;
 mod log_open;
@@ -577,6 +579,10 @@ impl<B: Backend> Graph<B> {
     /// ahead of the log (`CursorBeyondLog`), then rebuilds the log's dedup
     /// filter from `log_hash_index` so a hash written before this process
     /// started is deduplicated.
+    ///
+    /// A store that holds rows and has not completed its backfill refuses every
+    /// logged write with `BackfillRequired`, until `backfill_log_from_projection`
+    /// completes.
     pub async fn with_log(mut self, log: SharedLog) -> Result<Self> {
         log_open::check_and_prime(&self.backend, &log).await?;
         self.log = Some(log);
@@ -2098,6 +2104,7 @@ mod tests {
     use crate::DefaultGraph;
     use tempfile::TempDir;
 
+    mod backfill;
     mod backwards_clock;
     mod catch_up;
     mod gc_log;

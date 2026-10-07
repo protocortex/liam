@@ -3,11 +3,12 @@
 //! cursor are applied once each, in log order.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use futures_util::StreamExt;
-use liam_log::event::{EdgeRow, LogPayload, TombstoneTable, TombstoneTarget};
+use liam_log::event::{EdgeRow, LogPayload, RowEffect, TombstoneTable, TombstoneTarget};
 use liam_log::hash::content_hashes;
-use liam_log::reader::{LogRecord, LogStream};
+use liam_log::reader::{LogReader, LogRecord, LogStream};
 use liam_log::LogOffset;
 use uuid::Uuid;
 
@@ -248,7 +249,10 @@ async fn replay_projection(
     let deciding = if kept.is_empty() { doomed } else { kept };
     let held = rows_held(tx, &deciding).await?;
     if held == deciding.len() {
-        log_cursor::advance_in_tx(tx, log_id, *offset).await?;
+        // The store may hold the rows of an event it never indexed, as a
+        // backfill that stopped after its append leaves them.
+        let event_id = &event.event_id;
+        project_logged(tx, &[], carried, event_id, log_id, *offset, vector_delete).await?;
         return Ok(Outcome::AlreadyApplied);
     }
     if held > 0 {
@@ -325,6 +329,42 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
         .flat_map(|(_, targets)| targets)
         .for_each(|target| removed.add(target));
     Ok(Ahead { voided, removed })
+}
+
+/// Hands `visit` the payload of every record up to `head` that no `Voided`
+/// record cancels, in log order. Takes the reader and head, not the held log,
+/// so a future that calls it stays `Send`.
+pub(super) async fn for_each_unvoided(
+    reader: Arc<dyn LogReader>,
+    head: Option<LogOffset>,
+    mut visit: impl FnMut(LogPayload),
+) -> Result<()> {
+    let Some(head) = head else {
+        return Ok(());
+    };
+    let voided = scan_ahead(reader.scan_through(None, head))
+        .await?
+        .into_voided();
+    let mut records = reader.scan_through(None, head);
+    while let Some(record) = records.next().await {
+        let event = record?.event;
+        if !voided.contains(&event.event_id) {
+            visit(event.payload);
+        }
+    }
+    Ok(())
+}
+
+/// The rows a payload writes, in order.
+pub(super) fn row_effects(payload: LogPayload) -> Vec<RowEffect> {
+    match payload {
+        LogPayload::NodeWrite(row) => vec![RowEffect::Node(row)],
+        LogPayload::EdgeWrite(row) => vec![RowEffect::Edge(row)],
+        LogPayload::EpisodeBatch(effects) => effects,
+        LogPayload::Tombstone(_) | LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. } => {
+            Vec::new()
+        }
+    }
 }
 
 /// A row the steps insert.

@@ -2,8 +2,10 @@
 //! Helpers the log tests share: a log to hand to a graph, and reads of what the
 //! store holds.
 
+use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex as StdMutex};
 
 use futures_util::{stream, StreamExt};
 use liam_log::dedup::{BloomConfig, HashBloom};
@@ -12,8 +14,9 @@ use liam_log::event::{
 };
 use liam_log::hash::{edge_row_hash, node_row_hash};
 use liam_log::reader::{LogReader, LogRecord, LogStream, SequentialScanReader};
-use liam_log::wal::{WalConfig, WalWriter};
+use liam_log::wal::{SystemClock, WalConfig, WalError, WalWriter};
 use liam_log::{LogOffset, LogWriter};
+use tokio::sync::Notify;
 
 use super::*;
 
@@ -232,6 +235,80 @@ impl Backend for ReembedProbe {
     async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
         self.inner.begin().await
     }
+}
+
+// ---- a real log a test can make fail or hold ----
+
+/// What a test does to the log writer while a write runs.
+#[derive(Default)]
+pub(super) struct Control {
+    seen: AtomicU64,
+    /// The append, counted from `fail_nth_from_now`, that fails. Zero never.
+    fail_on: AtomicU64,
+    /// Held by the next append until the test releases it.
+    gate: StdMutex<Option<(Arc<Notify>, mpsc::Receiver<()>)>>,
+}
+
+impl Control {
+    /// Fails the `n`th append from now on, `n` counting from 1.
+    pub(super) fn fail_nth_from_now(&self, n: u64) {
+        self.seen.store(0, Ordering::SeqCst);
+        self.fail_on.store(n, Ordering::SeqCst);
+    }
+
+    /// Makes the next append announce itself and wait. The notification says the
+    /// append is running; sending on the returned sender lets it go on.
+    pub(super) fn hold_next_append(&self) -> (Arc<Notify>, mpsc::Sender<()>) {
+        let (release, wait) = mpsc::channel();
+        let reached = Arc::new(Notify::new());
+        *self.gate.lock().unwrap() = Some((Arc::clone(&reached), wait));
+        (reached, release)
+    }
+}
+
+/// A WAL writer that fails or holds an append when its `Control` says so.
+struct Controlled {
+    inner: WalWriter<SystemClock>,
+    control: Arc<Control>,
+}
+
+impl LogWriter for Controlled {
+    fn append(&mut self, event: &LogEvent) -> std::result::Result<LogOffset, WalError> {
+        let held = self.control.gate.lock().unwrap().take();
+        if let Some((reached, release)) = held {
+            reached.notify_one();
+            let _ = release.recv();
+        }
+        let nth = self.control.seen.fetch_add(1, Ordering::SeqCst) + 1;
+        if nth == self.control.fail_on.load(Ordering::SeqCst) {
+            return Err(WalError::Io(io::Error::other("injected append failure")));
+        }
+        self.inner.append(event)
+    }
+
+    fn log_id(&self) -> uuid::Uuid {
+        self.inner.log_id()
+    }
+
+    fn head(&self) -> Option<LogOffset> {
+        self.inner.head()
+    }
+}
+
+pub(super) fn controlled_log(env: &Env) -> (SharedLog, Arc<Control>) {
+    let control = Arc::new(Control::default());
+    let inner = WalWriter::open_with_system_clock(&env.wal_dir(), ONE_SEGMENT).expect("open wal");
+    let reader = SequentialScanReader::local(&env.wal_dir()).expect("open reader");
+    let writer = Controlled {
+        inner,
+        control: Arc::clone(&control),
+    };
+    let log = EventLog::new(
+        Box::new(writer),
+        Arc::new(reader),
+        HashBloom::new(BloomConfig::default()),
+    );
+    (shared(log), control)
 }
 
 pub(super) fn shared(log: EventLog) -> SharedLog {

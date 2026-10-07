@@ -63,6 +63,9 @@ pub struct EventLog {
     /// rebuild that grew the filter does not raise the floor for the next one.
     configured: BloomConfig,
     poisoned: bool,
+    /// Set while the store holds rows no backfill has logged yet, so a write
+    /// would land ahead of them. Read at every write, so it is not queried.
+    backfill_pending: bool,
 }
 
 impl EventLog {
@@ -73,6 +76,7 @@ impl EventLog {
             configured: bloom.config().clone(),
             bloom,
             poisoned: false,
+            backfill_pending: false,
         }
     }
 
@@ -92,6 +96,10 @@ impl EventLog {
     /// not known to match the store.
     pub(super) fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    pub(super) fn set_backfill_pending(&mut self, pending: bool) {
+        self.backfill_pending = pending;
     }
 
     /// Teaches the dedup filter the hashes whose rows have committed.
@@ -193,7 +201,7 @@ impl<B: Backend> Graph<B> {
     where
         F: for<'t> FnOnce(&'t mut dyn BackendTx, Millis) -> BoxFuture<'t, Result<Plan>> + Send,
     {
-        let mut held = HeldLog::acquire(log).await?;
+        let mut held = HeldLog::acquire_for_write(log).await?;
         let mut tx = self.backend.begin().await?;
         let now = self.clock.now();
         let resolved = match prepare(&mut *tx, now).await {
@@ -336,6 +344,15 @@ impl HeldLog {
         })
     }
 
+    /// `acquire` for a write, which is refused while a backfill is owed.
+    pub(super) async fn acquire_for_write(log: &SharedLog) -> Result<Self> {
+        let held = Self::acquire(log).await?;
+        if held.log()?.backfill_pending {
+            return Err(Error::BackfillRequired);
+        }
+        Ok(held)
+    }
+
     pub(super) async fn append(&mut self, event: LogEvent) -> Result<LogOffset> {
         let Some(mut guard) = self.guard.take() else {
             return Err(Error::LogPoisoned);
@@ -395,6 +412,12 @@ impl HeldLog {
         if let Some(log) = self.guard.as_deref_mut() {
             let empty = HashBloom::new(log.bloom_config().clone());
             log.replace_bloom(empty);
+        }
+    }
+
+    pub(super) fn set_backfill_pending(&mut self, pending: bool) {
+        if let Some(log) = self.guard.as_deref_mut() {
+            log.set_backfill_pending(pending);
         }
     }
 

@@ -335,6 +335,9 @@ async fn a_reopened_store_on_the_same_wal_still_deduplicates() {
         .with_log(Arc::clone(&reopened_log))
         .await
         .unwrap();
+    // A store with rows and no completed backfill refuses writes, and this one
+    // has nothing left to log.
+    g.backfill_log_from_projection().await.unwrap();
     let indexed = g
         .backend
         .query("SELECT content_hash FROM log_hash_index", &[])
