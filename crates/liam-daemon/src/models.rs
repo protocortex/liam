@@ -67,11 +67,14 @@ pub fn resolve_log_dir(config: &Config, database: &std::path::Path) -> anyhow::R
 /// `resolve_log_dir` with `home` passed in, so it is testable without
 /// mutating the process environment.
 pub fn resolve_log_dir_with_home(
-    _config: &Config,
+    config: &Config,
     database: &std::path::Path,
-    _home: &str,
+    home: &str,
 ) -> anyhow::Result<PathBuf> {
-    Ok(config::default_log_dir(database))
+    match &config.log.dir {
+        Some(dir) => resolve_path_with_home("log.dir", dir, home).map(PathBuf::from),
+        None => Ok(config::default_log_dir(database)),
+    }
 }
 
 /// Lets the store embed the content of nodes a replay restored, with the same

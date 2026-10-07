@@ -333,6 +333,8 @@ async fn maintenance_tick(
     full_synthesis_max_new_tokens: usize,
 ) {
     let store = server.store_handle();
+    // A leftover event applied after the sweep would outlive it.
+    catch_up(&store).await;
     sweep(&store, policy).await;
     repair_mentions(&store).await;
     refresh_clusters(&store).await;
@@ -456,6 +458,16 @@ async fn repair_mentions(store: &DefaultGraph) {
     match store.repair_superseded_mentions().await {
         Ok(repaired) => tracing::info!(repaired, "provenance repair completed"),
         Err(e) => tracing::warn!(error = %e, "provenance repair failed"),
+    }
+}
+
+async fn catch_up(store: &DefaultGraph) {
+    match store.catch_up().await {
+        Ok(report) if report.applied > 0 || report.quarantined > 0 => {
+            tracing::info!(?report, "event log caught up")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "event log catch up failed"),
     }
 }
 
