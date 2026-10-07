@@ -794,6 +794,35 @@ mod tests {
         run_with(args, &config_file(dir), store_embedder).await
     }
 
+    /// A rebuild of a store whose config is `config`, with the embedder it asks for.
+    async fn run_with_config(
+        config: &Config,
+        dir: &Path,
+        args: &RebuildArgs,
+    ) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = rebuild(
+            args,
+            config,
+            &config_file(dir),
+            store_embedder,
+            &mut out,
+            &mut err,
+        )
+        .await;
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    fn config_with_log_dir(log_dir: &Path) -> Config {
+        let mut config = config();
+        config.log.dir = Some(log_dir.to_str().unwrap().to_string());
+        config
+    }
+
     fn rebuild_of(database: &Path, log_dir: Option<&Path>) -> RebuildArgs {
         RebuildArgs {
             database: database.to_path_buf(),
@@ -840,6 +869,46 @@ mod tests {
         assert_eq!(dump(&database).await, before);
         assert_eq!(nodes_without_vectors(&database).await, 0);
         assert_lock_released(&database);
+    }
+
+    #[tokio::test]
+    async fn rebuild_reads_the_log_directory_the_config_names() {
+        // Arrange: the log lives where `[log] dir` says, not beside the database
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        let log_dir = dir.path().join("configured-events");
+        logged_store(&database, &log_dir).await;
+        let before = dump(&database).await;
+        delete_database(dir.path());
+        let config = config_with_log_dir(&log_dir);
+
+        // Act
+        let (code, _out, err) =
+            run_with_config(&config, dir.path(), &rebuild_of(&database, None)).await;
+
+        // Assert
+        assert_eq!(code, 0, "stderr: {err}");
+        assert_eq!(dump(&database).await, before);
+    }
+
+    #[tokio::test]
+    async fn the_log_dir_flag_beats_the_directory_the_config_names() {
+        // Arrange: the config points at a directory with no log in it
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        let log_dir = dir.path().join("wal");
+        logged_store(&database, &log_dir).await;
+        let before = dump(&database).await;
+        delete_database(dir.path());
+        let config = config_with_log_dir(&dir.path().join("elsewhere"));
+
+        // Act
+        let (code, _out, err) =
+            run_with_config(&config, dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
+
+        // Assert
+        assert_eq!(code, 0, "stderr: {err}");
+        assert_eq!(dump(&database).await, before);
     }
 
     #[tokio::test]
