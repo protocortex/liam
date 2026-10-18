@@ -15,3 +15,30 @@ to upgrade to. It reaches this project only transitively, through the optional
 it directly. Drop this entry once fastembed and its candle dependencies move off
 `paste`. The same advisory is ignored in deny.toml, with the same reasoning.
 """
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0367"
+reason = """
+Concerns `zip`'s `ZipArchive::extract` only. `zip` 8.x is pinned by the latest
+`candle-core`, so no fixed version is reachable, and nothing in candle or
+fastembed calls `extract`. Drop this entry once candle moves to `zip` 9. The
+same advisory is ignored in deny.toml.
+"""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0368"
+reason = """
+Concerns `zip`'s `ZipArchive::extract` only. `zip` 8.x is pinned by the latest
+`candle-core`, so no fixed version is reachable, and nothing in candle or
+fastembed calls `extract`. Drop this entry once candle moves to `zip` 9. The
+same advisory is ignored in deny.toml.
+"""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0369"
+reason = """
+Concerns `zip`'s `ZipArchive::extract` only. `zip` 8.x is pinned by the latest
+`candle-core`, so no fixed version is reachable, and nothing in candle or
+fastembed calls `extract`. Drop this entry once candle moves to `zip` 9. The
+same advisory is ignored in deny.toml.
+"""

@@ -13,6 +13,14 @@ ignore = [
     # features) has zero advisories; this ignore only affects the optional
     # shipped `local` surface.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained, pulled in transitively by the optional local feature's candle/fastembed tree, not used directly" },
+    # RUSTSEC-2026-0367, -0368 and -0369: all three concern `zip`'s
+    # `ZipArchive::extract` (symlink targets and Unix permissions on
+    # extraction). `zip` 8.x is pinned by the latest `candle-core`, so no fixed
+    # version is reachable. Nothing in candle or fastembed calls `extract`.
+    # Drop these once candle moves to `zip` 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract() only; unreachable, zip pinned ^8 by candle-core" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() only; unreachable, zip pinned ^8 by candle-core" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract() only; unreachable, zip pinned ^8 by candle-core" },
 ]
 
 [licenses]
