@@ -25,7 +25,7 @@ pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::{Error, MismatchSource, Result};
 pub use graph::{
     BackfillReport, Candidate, CatchUpReport, ContentEmbedder, EmbedError, EventLog, Graph,
-    RebuildMode, RebuildReport, ReembedReport, SharedLog,
+    PoisonHook, RebuildMode, RebuildReport, ReembedReport, SharedLog,
 };
 pub use ids::{EdgeId, Millis, NodeId, FOREVER, HANDLE_LEN};
 pub use types::{

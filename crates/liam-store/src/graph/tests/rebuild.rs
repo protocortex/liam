@@ -1007,16 +1007,13 @@ async fn unlogged_pair(env: &Env, db: &str) -> Opened {
 async fn rebuild_over_an_empty_log_in_each_mode_refuses_what_it_would_wipe() {
     // Arrange: a log with no record and a store holding two rows it lacks
     let env = Env::new();
-    let stores = [
-        unlogged_pair(&env, "required.db").await,
-        unlogged_pair(&env, "checked.db").await,
-        unlogged_pair(&env, "replaced.db").await,
-    ];
-    let [required, checked, replaced] = stores;
-
-    // Act: each is checked untouched afterwards
+    // Act: each store is opened only once the one before it is gone, since a
+    // log directory has one writer, and checked untouched afterwards
+    let required = unlogged_pair(&env, "required.db").await;
     let required = refused(&env, "required.db", required, RebuildMode::RequireEmpty).await;
+    let checked = unlogged_pair(&env, "checked.db").await;
     let checked = refused(&env, "checked.db", checked, RebuildMode::ResetChecked).await;
+    let replaced = unlogged_pair(&env, "replaced.db").await;
     let replaced = refused(&env, "replaced.db", replaced, RebuildMode::Replace).await;
 
     // Assert
@@ -1123,9 +1120,9 @@ async fn rebuild_replace_refuses_a_log_the_store_does_not_belong_to_while_it_hol
     let before = full_state(&live.graph).await;
     drop(live);
     second.append(&[node_write("node-a", "alpha")]);
-    let log = second.log(ONE_SEGMENT);
-    let other_log = log.lock().await.log_id();
+    let other_log = second.log(ONE_SEGMENT).lock().await.log_id();
     let graph = open_over_another_log(&first, &second, "live.db").await;
+    let log = second.log(ONE_SEGMENT);
 
     // Act
     let error = graph

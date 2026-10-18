@@ -195,9 +195,9 @@ unknown key fails loudly.
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
 | `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
 | `read_pool_size` | `4` | Read connections. Ignored for an in-memory database. |
-| `log.dir` | `<database stem>.log` beside the database | The event log directory. `~` is expanded. |
-| `log.wal_segment_max_bytes` | `8388608` | A WAL segment is closed and compacted at this size. Must be at least 1. |
-| `log.wal_rotate_interval_secs` | `300` | A WAL segment is closed and compacted at this age. Must be at least 1. |
+| `log.dir` | `<database stem>.log` beside the database | The event log directory. `~` is expanded, and a relative path is taken from the database's directory. Must not be empty. An existing directory must be empty or already a log. |
+| `log.wal_segment_max_bytes` | `8388608` | The open WAL segment is closed by the first write after it reaches this size, then compacted to Parquet. Must be at least 1. |
+| `log.wal_rotate_interval_secs` | `300` | The open WAL segment is closed by the first write after it reaches this age, then compacted to Parquet. Must be at least 1. |
 | `log.bloom_fpr` | `0.01` | False positive rate of the dedup filter. At least `1e-9` and below `1`. |
 | `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
 | `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
@@ -229,6 +229,19 @@ The log lives in `log.dir`, which defaults to `<database stem>.log` beside the
 database (`~/.liam/liam.db` logs to `~/.liam/liam.log`). Back it up with the
 database: it is the source of truth that `liam rebuild` reads.
 
+`liamd` compacts each closed WAL segment into a Parquet file in the background
+and finishes the ones a crash left behind at startup. A segment is closed by the
+first write after it reaches `log.wal_segment_max_bytes` or
+`log.wal_rotate_interval_secs`, so an idle daemon keeps its last segment open.
+
+One writer owns the log directory at a time. A second `liamd`, or a `liam
+rebuild` while `liamd` runs, fails at once with an error naming the directory.
+The lock needs a filesystem with advisory locks, so keep the log on a local disk.
+
+If the log is poisoned, which a failed disk write does, `liamd` logs `the event
+log is poisoned; restart liamd to replay it` at error level and exits with a
+failure. Restarting replays the log into the database.
+
 `liam rebuild --database PATH [--log-dir DIR] [--force]` recreates the nodes and
 edges from the log and checks the result against it, row by row. It needs the
 store to itself, so stop `liamd` first. The log directory is `--log-dir`, else
@@ -239,8 +252,12 @@ store to itself, so stop `liamd` first. The log directory is `--log-dir`, else
 The first start with the log copies every row the database already holds into
 the log, nodes first, then edges. Writes are refused with `BackfillRequired`
 until the copy is done, and since the daemon runs it before serving, clients see
-nothing but a slower start on a large database. An interrupted copy resumes
-where it stopped, and a database that is already logged is not copied again.
+nothing but a slower start on a large database. The cost grows with the number
+of rows: the copy is one log write per row, so expect minutes for millions of
+rows. A client that connects while it runs can time out, so retry once the
+daemon logs `backfill completed`. The log reports `logged/total` at every saved
+resume point. An interrupted copy resumes where it stopped, and a database that
+is already logged is not copied again.
 
 ### Garbage collection
 

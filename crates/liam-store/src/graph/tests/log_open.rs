@@ -301,6 +301,24 @@ async fn open_check_gives_a_fresh_store_a_cursor_row_with_the_log_id_and_no_offs
 }
 
 #[tokio::test]
+async fn the_stored_log_id_is_none_until_a_log_is_attached_and_then_the_logs_id() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let writer = log_with_head(None);
+    let log_id = writer.log_id();
+    let g = plain(&db_path(&dir)).await;
+
+    // Act
+    let before = g.stored_log_id().await.unwrap();
+    let opened = g.with_log(share(writer)).await.unwrap();
+    let after = opened.stored_log_id().await.unwrap();
+
+    // Assert
+    assert_eq!(before, None);
+    assert_eq!(after, Some(log_id));
+}
+
+#[tokio::test]
 async fn open_check_keeps_a_cursorless_store_that_predates_a_log_with_history() {
     // Arrange: rows written before any log existed, and a log that has records.
     let dir = TempDir::new().unwrap();

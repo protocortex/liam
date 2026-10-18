@@ -28,8 +28,11 @@ run_on_start           = false
 # database is a projection of that log and `liam rebuild` can recreate it.
 [log]
 # dir = "~/.liam/liam.log"      # default: <database stem>.log beside the database
-wal_segment_max_bytes    = 8388608   # close and compact a WAL segment at this size
-wal_rotate_interval_secs = 300       # ...or when it is this old
+#                               # relative: from the database's directory; must be empty or a log
+# The first write after the open WAL segment reaches either limit closes it,
+# and the compactor then turns it into Parquet.
+wal_segment_max_bytes    = 8388608   # size limit of the open WAL segment
+wal_rotate_interval_secs = 300       # age limit of the open WAL segment
 bloom_fpr                = 0.01      # false positive rate of the dedup filter
 
 [embedder]

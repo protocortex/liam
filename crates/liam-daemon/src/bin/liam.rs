@@ -21,7 +21,6 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Context;
 use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
-use liam_log::dedup::BloomConfig;
 use liam_log::wal::{WalConfig, MANIFEST_NAME};
 use liam_log::LogWriter;
 use liam_store::{
@@ -184,7 +183,7 @@ async fn try_rebuild(
         None => models::resolve_log_dir(config, &database)?,
     };
     anyhow::ensure!(
-        log_dir.join(MANIFEST_NAME).is_file(),
+        event_log::holds_log(&log_dir),
         "{} is not an event log, it has no {MANIFEST_NAME} file; pass --log-dir if the log \
          lives elsewhere",
         log_dir.display()
@@ -205,7 +204,8 @@ async fn try_rebuild(
         "the log in {} holds no records, so there is nothing to rebuild from",
         log_dir.display()
     );
-    let log = event_log::shared_log(writer, &log_dir, BloomConfig::default())?;
+    // The rebuild's filter is sized like the daemon's, so both dedupe alike.
+    let log = event_log::shared_log(writer, &log_dir, config.log.bloom()?, None)?;
     let report = replay_log(
         &database,
         config.embedding_dims,
@@ -492,6 +492,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use liam_log::dedup::BloomConfig;
     use liam_store::{Backend, DefaultBackend, NewNode, FOREVER};
 
     fn parse(args: &[&str]) -> Cli {
@@ -643,7 +644,7 @@ mod tests {
 
     fn log_at(log_dir: &Path) -> SharedLog {
         let writer = event_log::open_writer(log_dir, REBUILD_WAL).unwrap();
-        event_log::shared_log(writer, log_dir, BloomConfig::default()).unwrap()
+        event_log::shared_log(writer, log_dir, BloomConfig::default(), None).unwrap()
     }
 
     /// A store written through a real log: two nodes, an edge, and a supersede
@@ -870,6 +871,45 @@ mod tests {
         // Assert
         assert_eq!(code, 0, "stderr: {err}");
         assert_eq!(dump(&database).await, before);
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_a_log_another_process_is_writing() {
+        // Arrange: a daemon holds the log, and the rebuild targets another database
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        let log_dir = dir.path().join("wal");
+        logged_store(&database, &log_dir).await;
+        let _daemon_log = log_at(&log_dir);
+        let check = dir.path().join("check.db");
+
+        // Act
+        let (code, _out, err) = run_rebuild(dir.path(), &rebuild_of(&check, Some(&log_dir))).await;
+
+        // Assert
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(err.contains("held by another process"), "{err}");
+        assert!(!check.exists(), "no database may have been created");
+    }
+
+    #[tokio::test]
+    async fn rebuild_sizes_the_dedup_filter_from_the_config() {
+        // Arrange: a filter rate the config validation would have refused
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        let log_dir = dir.path().join("wal");
+        logged_store(&database, &log_dir).await;
+        delete_database(dir.path());
+        let mut config = config_with_log_dir(&log_dir);
+        config.log.bloom_fpr = 2.0;
+
+        // Act
+        let (code, _out, err) =
+            run_with_config(&config, dir.path(), &rebuild_of(&database, None)).await;
+
+        // Assert
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(err.contains("log.bloom_fpr"), "{err}");
     }
 
     #[tokio::test]

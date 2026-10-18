@@ -55,11 +55,14 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct LogConfig {
     /// Where the log lives. Unset means `<database stem>.log` beside the
-    /// database, see `default_log_dir`.
+    /// database, see `default_log_dir`. A relative path is taken from the
+    /// database's directory, not the working directory.
     pub dir: Option<String>,
-    /// A WAL segment is closed and compacted once it reaches this size.
+    /// The open WAL segment is closed by the first write after it reaches this
+    /// size, and the compactor then turns it into Parquet.
     pub wal_segment_max_bytes: u64,
-    /// A WAL segment is closed and compacted once it is this old.
+    /// The open WAL segment is closed by the first write after it is this old,
+    /// and the compactor then turns it into Parquet.
     pub wal_rotate_interval_secs: u64,
     /// False positive rate of the dedup filter in front of the hash index.
     pub bloom_fpr: f64,
@@ -176,6 +179,11 @@ impl Default for LogConfig {
 impl LogConfig {
     /// Rejects values the log cannot run with, naming the key to fix.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // An empty path would put the log in the working directory.
+        anyhow::ensure!(
+            self.dir.as_deref().is_none_or(|dir| !dir.trim().is_empty()),
+            "log.dir must not be empty; remove it to keep the log beside the database"
+        );
         anyhow::ensure!(
             self.wal_segment_max_bytes > 0,
             "log.wal_segment_max_bytes must be at least 1"
@@ -277,8 +285,8 @@ pub(crate) fn expand_tilde(path: &str, home: &str) -> String {
 }
 
 /// `<database stem>.log` beside the database: the log directory used when the
-/// config names none. `liam rebuild` derives its default the same way.
-pub fn default_log_dir(database: &Path) -> PathBuf {
+/// config names none. Both binaries reach it through `models::resolve_log_dir`.
+pub(crate) fn default_log_dir(database: &Path) -> PathBuf {
     let stem = database.file_stem().unwrap_or(database.as_os_str());
     let mut name = stem.to_owned();
     name.push(".log");
@@ -806,5 +814,84 @@ mod tests {
             );
         }
         assert_eq!(c.log, LogConfig::default());
+    }
+
+    #[test]
+    fn the_readme_log_rows_carry_the_code_defaults() {
+        // Arrange
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
+        let text = std::fs::read_to_string(path).expect("read README.md");
+        let defaults = LogConfig::default();
+
+        // Act
+        let row = |key: &str| {
+            let prefix = format!("| `log.{key}` | ");
+            let line = text
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("README must have a row for log.{key}"));
+            line[prefix.len()..]
+                .split('|')
+                .next()
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+
+        // Assert
+        assert_eq!(
+            row("wal_segment_max_bytes"),
+            format!("`{}`", defaults.wal_segment_max_bytes)
+        );
+        assert_eq!(
+            row("wal_rotate_interval_secs"),
+            format!("`{}`", defaults.wal_rotate_interval_secs)
+        );
+        assert_eq!(row("bloom_fpr"), format!("`{}`", defaults.bloom_fpr));
+        assert!(defaults.dir.is_none());
+        assert_eq!(
+            row("dir"),
+            "`<database stem>.log` beside the database",
+            "the unset default is the derived directory"
+        );
+    }
+
+    #[test]
+    fn an_empty_log_dir_is_rejected_naming_the_key() {
+        for empty in ["\"\"", "\"  \""] {
+            // Arrange
+            let path = write_temp_toml(&format!("[log]\ndir = {empty}\n"));
+
+            // Act
+            let error = Config::load(&path).expect_err("an empty log.dir must be rejected");
+
+            // Assert
+            assert!(error.to_string().contains("log.dir"), "{empty}: {error}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn the_log_section_hands_its_values_to_the_wal_and_the_filter() {
+        // Arrange
+        let log = LogConfig {
+            wal_segment_max_bytes: 1234,
+            wal_rotate_interval_secs: 56,
+            bloom_fpr: 0.05,
+            ..LogConfig::default()
+        };
+
+        // Act
+        let wal = log.wal();
+        let bloom = log.bloom().unwrap();
+
+        // Assert
+        assert_eq!(wal.segment_max_bytes, 1234);
+        assert_eq!(wal.rotate_interval_secs, 56);
+        assert_eq!(bloom.false_positive_rate(), 0.05);
+        assert_eq!(
+            bloom.expected_items(),
+            BloomConfig::default().expected_items()
+        );
     }
 }

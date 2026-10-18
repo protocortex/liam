@@ -24,6 +24,27 @@ use super::support::{
 use super::*;
 use crate::DefaultBackend;
 
+/// A writer whose head stays where it was when it was opened, while the test
+/// appends through `inner`: a record the store never acknowledged.
+struct StaleHead {
+    inner: Arc<std::sync::Mutex<WalWriter<liam_log::wal::SystemClock>>>,
+    head: Option<LogOffset>,
+}
+
+impl LogWriter for StaleHead {
+    fn append(&mut self, event: &LogEvent) -> std::result::Result<LogOffset, WalError> {
+        self.inner.lock().unwrap().append(event)
+    }
+
+    fn log_id(&self) -> uuid::Uuid {
+        self.inner.lock().unwrap().log_id()
+    }
+
+    fn head(&self) -> Option<LogOffset> {
+        self.head
+    }
+}
+
 /// A writer that reports the log's head but fails every append, as a full disk
 /// would leave it.
 struct FullDisk(WalWriter<liam_log::wal::SystemClock>);
@@ -330,18 +351,21 @@ async fn catch_up_replays_a_supersede_into_the_same_rows_as_the_live_write() {
     // insert and an episode batch with the `supersedes` edge.
     let env = Env::new();
     let clock = clock_at(1000);
-    let (live, _live_log) = env
-        .open::<DefaultBackend>("live.db", Arc::clone(&clock))
-        .await;
-    let old = live
-        .insert(fact_at("v1").with_subject("subject"))
-        .await
-        .unwrap();
-    clock.set(Millis(2000));
-    let new = live
-        .upsert_by(fact_at("v2").with_subject("subject"))
-        .await
-        .unwrap();
+    let (old, new, live_tables) = {
+        let (live, _live_log) = env
+            .open::<DefaultBackend>("live.db", Arc::clone(&clock))
+            .await;
+        let old = live
+            .insert(fact_at("v1").with_subject("subject"))
+            .await
+            .unwrap();
+        clock.set(Millis(2000));
+        let new = live
+            .upsert_by(fact_at("v2").with_subject("subject"))
+            .await
+            .unwrap();
+        (old, new, snapshot(&live).await)
+    };
     let (replayed, _log) = env
         .open::<DefaultBackend>("replayed.db", clock_at(9000))
         .await;
@@ -353,12 +377,7 @@ async fn catch_up_replays_a_supersede_into_the_same_rows_as_the_live_write() {
     assert_eq!(record_counts(report), applied(2));
     assert_eq!(tx_to(&replayed, old.as_str()).await, 2000);
     assert_eq!(tx_to(&replayed, new.as_str()).await, FOREVER.0);
-    assert_eq!(dump(&replayed, "nodes").await, dump(&live, "nodes").await);
-    assert_eq!(dump(&replayed, "edges").await, dump(&live, "edges").await);
-    assert_eq!(
-        dump(&replayed, "log_hash_index").await,
-        dump(&live, "log_hash_index").await
-    );
+    assert_eq!(snapshot(&replayed).await, live_tables);
 }
 
 #[tokio::test]
@@ -516,17 +535,20 @@ async fn catch_up_returns_a_transient_backend_error_and_resumes_from_the_last_ap
 async fn catch_up_indexes_replayed_rows_so_a_later_identical_insert_deduplicates() {
     // Arrange: a live store writes the node, a fresh one replays it
     let env = Env::new();
-    let (live, _live_log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
-    let first = live.insert(fact_at("same")).await.unwrap();
-    let hash = live
-        .backend
-        .query("SELECT content_hash FROM log_hash_index", &[])
-        .await
-        .unwrap()[0]
-        .get_blob(0)
-        .unwrap()
-        .to_vec();
-    let hash: [u8; 32] = hash.try_into().expect("a 32 byte hash");
+    let (first, hash, live_hash_index) = {
+        let (live, _live_log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
+        let first = live.insert(fact_at("same")).await.unwrap();
+        let hash = live
+            .backend
+            .query("SELECT content_hash FROM log_hash_index", &[])
+            .await
+            .unwrap()[0]
+            .get_blob(0)
+            .unwrap()
+            .to_vec();
+        let hash: [u8; 32] = hash.try_into().expect("a 32 byte hash");
+        (first, hash, dump(&live, "log_hash_index").await)
+    };
     let (replayed, log) = env
         .open::<DefaultBackend>("replayed.db", clock_at(9000))
         .await;
@@ -537,10 +559,7 @@ async fn catch_up_indexes_replayed_rows_so_a_later_identical_insert_deduplicates
 
     // Assert
     assert!(log.lock().await.bloom_might_contain(&hash));
-    assert_eq!(
-        dump(&replayed, "log_hash_index").await,
-        dump(&live, "log_hash_index").await
-    );
+    assert_eq!(dump(&replayed, "log_hash_index").await, live_hash_index);
     assert_eq!(
         again, first,
         "the replayed row is the live carrier of the hash"
@@ -554,8 +573,26 @@ async fn catch_up_does_not_read_past_the_writer_head() {
     // in the same segment behind its back.
     let env = Env::new();
     let offsets = env.append(&[node_write("node-a", "alpha"), node_write("node-b", "beta")]);
-    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
-    env.append(&[node_write("node-c", "gamma")]);
+    let writer = WalWriter::open_with_system_clock(&env.wal_dir(), ONE_SEGMENT).expect("open wal");
+    let stale = StaleHead {
+        head: writer.head(),
+        inner: Arc::new(std::sync::Mutex::new(writer)),
+    };
+    let behind_its_back = Arc::clone(&stale.inner);
+    let reader = SequentialScanReader::local(&env.wal_dir()).expect("open reader");
+    let log = shared(EventLog::new(
+        Box::new(stale),
+        Arc::new(reader),
+        HashBloom::new(BloomConfig::default()),
+    ));
+    let (g, _log) = env
+        .open_over::<DefaultBackend>(log, "graph.db", clock_at(9000))
+        .await;
+    behind_its_back
+        .lock()
+        .unwrap()
+        .append(&node_write("node-c", "gamma"))
+        .unwrap();
 
     // Act
     let report = g.catch_up().await.unwrap();
@@ -659,8 +696,11 @@ async fn catch_up_voids_a_quarantined_event_so_a_store_rebuilt_from_the_log_skip
         edge_write("edge-ghost", "node-a", "node-ghost"),
         node_write("node-b", "beta"),
     ]);
-    let (first, _log) = env.open::<DefaultBackend>("first.db", clock_at(9000)).await;
-    first.catch_up().await.unwrap();
+    let first_tables = {
+        let (first, _first_log) = env.open::<DefaultBackend>("first.db", clock_at(9000)).await;
+        first.catch_up().await.unwrap();
+        snapshot(&first).await
+    };
     let (rebuilt, _log) = env
         .open::<DefaultBackend>("rebuilt.db", clock_at(9000))
         .await;
@@ -675,8 +715,8 @@ async fn catch_up_voids_a_quarantined_event_so_a_store_rebuilt_from_the_log_skip
         ..CatchUpReport::default()
     };
     assert_eq!(record_counts(report), expected);
-    assert_eq!(dump(&rebuilt, "nodes").await, dump(&first, "nodes").await);
-    assert_eq!(dump(&rebuilt, "edges").await, dump(&first, "edges").await);
+    assert_eq!(dump(&rebuilt, "nodes").await, first_tables[0]);
+    assert_eq!(dump(&rebuilt, "edges").await, first_tables[1]);
     assert!(
         quarantined(&rebuilt).await.is_empty(),
         "only the store that refused the event holds the refusal"
@@ -893,23 +933,26 @@ async fn catch_up_skips_an_event_whose_void_is_in_a_later_segment() {
 async fn catch_up_replays_a_live_episode_relate_and_link_into_the_same_rows() {
     // Arrange
     let env = Env::new();
-    let (live, _live_log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
-    let mentions = EpisodeEdge {
-        from: EpisodeRef::New(0),
-        to: EpisodeRef::New(1),
-        kind: "mentions".to_string(),
-        attributes: serde_json::json!({"weight": 2}),
+    let live_tables = {
+        let (live, _live_log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
+        let mentions = EpisodeEdge {
+            from: EpisodeRef::New(0),
+            to: EpisodeRef::New(1),
+            kind: "mentions".to_string(),
+            attributes: serde_json::json!({"weight": 2}),
+        };
+        let episode = live
+            .ingest_episode(vec![fact_at("first"), fact_at("second")], vec![mentions])
+            .await
+            .unwrap();
+        live.relate(&episode.node_ids[1], &episode.node_ids[0], "supports")
+            .await
+            .unwrap();
+        let cites = NewEdge::new(&episode.node_ids[0], &episode.node_ids[1], "cites")
+            .with_attributes(serde_json::json!({"page": 4, "quote": "same"}));
+        live.link(cites).await.unwrap();
+        snapshot(&live).await
     };
-    let episode = live
-        .ingest_episode(vec![fact_at("first"), fact_at("second")], vec![mentions])
-        .await
-        .unwrap();
-    live.relate(&episode.node_ids[1], &episode.node_ids[0], "supports")
-        .await
-        .unwrap();
-    let cites = NewEdge::new(&episode.node_ids[0], &episode.node_ids[1], "cites")
-        .with_attributes(serde_json::json!({"page": 4, "quote": "same"}));
-    live.link(cites).await.unwrap();
     let (replayed, _log) = env
         .open::<DefaultBackend>("replayed.db", clock_at(9000))
         .await;
@@ -921,17 +964,18 @@ async fn catch_up_replays_a_live_episode_relate_and_link_into_the_same_rows() {
     assert_eq!(record_counts(report), applied(3));
     assert_eq!(count(&replayed, "nodes").await, 2);
     assert_eq!(count(&replayed, "edges").await, 3);
-    for table in ["nodes", "edges", "log_hash_index"] {
-        assert_eq!(dump(&replayed, table).await, dump(&live, table).await);
-    }
+    assert_eq!(snapshot(&replayed).await, live_tables);
 }
 
 #[tokio::test]
 async fn catch_up_replays_a_node_written_without_a_valid_time_as_the_live_write_stored_it() {
     // Arrange
     let env = Env::new();
-    let (live, _live_log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
-    live.insert(fact("no valid time")).await.unwrap();
+    let live_nodes = {
+        let (live, _live_log) = env.open::<DefaultBackend>("live.db", clock_at(1000)).await;
+        live.insert(fact("no valid time")).await.unwrap();
+        dump(&live, "nodes").await
+    };
     let (replayed, _log) = env
         .open::<DefaultBackend>("replayed.db", clock_at(9000))
         .await;
@@ -941,7 +985,7 @@ async fn catch_up_replays_a_node_written_without_a_valid_time_as_the_live_write_
 
     // Assert
     assert_eq!(record_counts(report), applied(1));
-    assert_eq!(dump(&replayed, "nodes").await, dump(&live, "nodes").await);
+    assert_eq!(dump(&replayed, "nodes").await, live_nodes);
     let valid_from = replayed
         .backend
         .query("SELECT valid_from FROM nodes", &[])
@@ -994,7 +1038,7 @@ async fn catch_up_teaches_the_dedup_filter_the_hashes_of_rows_the_store_already_
     let event = node_write("node-a", "alpha");
     let hash = event.content_hash;
     env.append(&[event]);
-    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    let (g, first_log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
     g.catch_up().await.unwrap();
     g.backend
         .execute_batch(
@@ -1004,6 +1048,7 @@ async fn catch_up_teaches_the_dedup_filter_the_hashes_of_rows_the_store_already_
         .await
         .unwrap();
     drop(g);
+    drop(first_log);
     let (g, log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
     assert!(!log.lock().await.bloom_might_contain(&hash));
 
@@ -1083,9 +1128,10 @@ async fn catch_up_embeds_nodes_replayed_by_an_earlier_run_that_never_got_to_it()
     // Arrange: a run that replayed the node with no embedder at hand
     let env = Env::new();
     env.append(&[node_write("node-a", "alpha")]);
-    let (first, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+    let (first, first_log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
     first.catch_up().await.unwrap();
     drop(first);
+    drop(first_log);
     let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
     let g = g.with_embedder(StubEmbedder::new(8));
 
@@ -1249,8 +1295,11 @@ async fn catch_up_replays_an_insert_a_relate_and_a_node_tombstone_into_an_empty_
         "event-tombstone",
         &[(TombstoneTable::Nodes, a.as_str())],
     )]);
-    let (live, _log) = env.open::<DefaultBackend>("live.db", clock_at(9000)).await;
-    live.catch_up().await.unwrap();
+    let live_tables = {
+        let (live, _live_log) = env.open::<DefaultBackend>("live.db", clock_at(9000)).await;
+        live.catch_up().await.unwrap();
+        snapshot(&live).await
+    };
     let (replayed, _log) = env
         .open::<DefaultBackend>("replayed.db", clock_at(9000))
         .await;
@@ -1263,9 +1312,8 @@ async fn catch_up_replays_an_insert_a_relate_and_a_node_tombstone_into_an_empty_
     assert!(quarantined(&replayed).await.is_empty());
     assert_eq!(count(&replayed, "nodes").await, 1);
     assert_eq!(count(&replayed, "edges").await, 0);
-    for table in ["nodes", "edges"] {
-        assert_eq!(dump(&replayed, table).await, dump(&live, table).await);
-    }
+    assert_eq!(dump(&replayed, "nodes").await, live_tables[0]);
+    assert_eq!(dump(&replayed, "edges").await, live_tables[1]);
 }
 
 #[tokio::test]

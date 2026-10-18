@@ -27,6 +27,7 @@ use liam_log::dedup::{
 use liam_log::event::{LogEvent, LogPayload};
 use liam_log::hash::content_hashes;
 use liam_log::reader::LogReader;
+use liam_log::wal::WalError;
 use liam_log::{LogOffset, LogWriter};
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
@@ -66,7 +67,13 @@ pub struct EventLog {
     /// Set while the store holds rows no backfill has logged yet, so a write
     /// would land ahead of them. Read at every write, so it is not queried.
     backfill_pending: bool,
+    /// Told each time a write is refused for a poisoned log, which only a
+    /// reopen clears, so the process can restart itself into the replay.
+    on_poisoned: Option<PoisonHook>,
 }
+
+/// What the owner of the log wants done when a write meets a poisoned log.
+pub type PoisonHook = Arc<dyn Fn() + Send + Sync>;
 
 impl EventLog {
     pub fn new(writer: Box<dyn LogWriter>, reader: Arc<dyn LogReader>, bloom: HashBloom) -> Self {
@@ -77,6 +84,19 @@ impl EventLog {
             bloom,
             poisoned: false,
             backfill_pending: false,
+            on_poisoned: None,
+        }
+    }
+
+    /// Calls `hook` every time a write is refused because the log is poisoned.
+    pub fn with_poison_hook(mut self, hook: PoisonHook) -> Self {
+        self.on_poisoned = Some(hook);
+        self
+    }
+
+    fn report_poisoned(&self) {
+        if let Some(hook) = &self.on_poisoned {
+            hook();
         }
     }
 
@@ -335,6 +355,7 @@ impl HeldLog {
     pub(super) async fn acquire(log: &SharedLog) -> Result<Self> {
         let guard = Arc::clone(log).lock_owned().await;
         if guard.is_poisoned() {
+            guard.report_poisoned();
             return Err(Error::LogPoisoned);
         }
         let log_id = guard.writer.log_id();
@@ -368,6 +389,15 @@ impl HeldLog {
         .await;
         let (guard, appended) = joined.map_err(|error| Error::LogTask(error.to_string()))?;
         self.guard = Some(guard);
+        // A writer that refuses every append until reopened is a poisoned log
+        // too, whichever layer noticed.
+        if matches!(appended, Err(WalError::Poisoned)) {
+            self.set_poisoned(true);
+            if let Some(log) = self.guard.as_deref() {
+                log.report_poisoned();
+            }
+            return Err(Error::LogPoisoned);
+        }
         if appended.is_err() {
             self.set_poisoned(false);
         }

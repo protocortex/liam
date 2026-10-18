@@ -56,9 +56,10 @@ pub fn resolve_path_with_home(key: &str, value: &str, home: &str) -> anyhow::Res
 }
 
 /// The directory of the event log for the database at `database`: `[log] dir`
-/// when set, else the default beside the database, with `~` expanded in the
-/// configured one. `liamd` and `liam rebuild` both go through this so they open
-/// the same log.
+/// when set, else the default beside the database. The configured one has `~`
+/// expanded and, when relative, is taken from the database's directory so the
+/// log does not move with the working directory. `liamd` and `liam rebuild`
+/// both go through this so they open the same log.
 pub fn resolve_log_dir(config: &Config, database: &std::path::Path) -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     resolve_log_dir_with_home(config, database, &home)
@@ -66,13 +67,19 @@ pub fn resolve_log_dir(config: &Config, database: &std::path::Path) -> anyhow::R
 
 /// `resolve_log_dir` with `home` passed in, so it is testable without
 /// mutating the process environment.
-pub fn resolve_log_dir_with_home(
+fn resolve_log_dir_with_home(
     config: &Config,
     database: &std::path::Path,
     home: &str,
 ) -> anyhow::Result<PathBuf> {
     match &config.log.dir {
-        Some(dir) => resolve_path_with_home("log.dir", dir, home).map(PathBuf::from),
+        Some(dir) => {
+            let dir = PathBuf::from(resolve_path_with_home("log.dir", dir, home)?);
+            Ok(match database.parent() {
+                Some(parent) if dir.is_relative() => parent.join(dir),
+                _ => dir,
+            })
+        }
         None => Ok(config::default_log_dir(database)),
     }
 }
@@ -567,5 +574,18 @@ mod tests {
 
         // Assert
         assert!(error.to_string().contains("log.dir"), "{error}");
+    }
+
+    #[test]
+    fn a_relative_dir_is_taken_from_the_database_directory() {
+        // Arrange
+        let config = config_with_log_dir(Some("events"));
+
+        // Act
+        let dir =
+            resolve_log_dir_with_home(&config, Path::new("/data/work.db"), "/home/alice").unwrap();
+
+        // Assert
+        assert_eq!(dir, PathBuf::from("/data/events"));
     }
 }
