@@ -1,0 +1,31 @@
+name: Event log soak
+
+# Deliberately no `pull_request` or `push` trigger. The full soak ingests a
+# million rows through the log-first write path and rebuilds them, which takes
+# minutes and would slow every PR. ci.yml's `test` job already runs the 10k-row
+# smoke test of the same helper. `schedule` plus `workflow_dispatch` are the
+# only ways in here; release.yml gates a tag on the same test.
+on:
+  schedule:
+    - cron: '0 7 * * 1' # Monday 07:00 UTC
+  workflow_dispatch:
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Release mode: the run is dominated by fsync and SQLite work, and an
+      # unoptimised build would add hashing time for no extra coverage.
+      - name: Soak (1,000,000 rows ingested, rebuilt, compared)
+        run: cargo test --release -p liam-store soak_full_rebuild_loses_no_record -- --ignored
