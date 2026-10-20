@@ -2122,6 +2122,7 @@ mod tests {
     mod log_write_faults;
     mod rebuild;
     mod reembed;
+    mod soak;
     mod support;
 
     /// A graph whose clock starts at 1000, with a handle to move it.

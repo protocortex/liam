@@ -267,7 +267,7 @@ async fn edge_hashes<B: Backend>(g: &Graph<B>, filter: &str) -> Vec<[u8; 32]> {
 
 /// The sorted multiset of hashes of every live node and edge, computed
 /// independently of the store's own method.
-async fn oracle_multiset<B: Backend>(g: &Graph<B>) -> Vec<[u8; 32]> {
+pub(super) async fn oracle_multiset<B: Backend>(g: &Graph<B>) -> Vec<[u8; 32]> {
     let live = format!("tx_to = {}", FOREVER.0);
     let mut hashes = node_hashes(g, &live).await;
     hashes.extend(edge_hashes(g, &live).await);
