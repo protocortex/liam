@@ -6,7 +6,7 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # Gate: a tag must not publish if the event log loses a record at scale. The
@@ -35,6 +35,9 @@ jobs:
   release:
     needs: soak
     runs-on: macos-latest
+    # Publishing the release asset is the only step that writes.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
