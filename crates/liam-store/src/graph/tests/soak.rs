@@ -85,6 +85,15 @@ async fn write_round(source: &DefaultGraph, round: usize) -> usize {
 /// upsert, the superseding node, the peer, the edge, and the ephemeral node.
 const ROUND_SINGLE_WRITES: usize = 6;
 
+/// Drops a store without closing its connections, which still releases its
+/// hold on the log. libsql intermittently crashes in `sqlite3Close` when a
+/// release build closes connections to a database this size, and that would
+/// fail the soak for a reason unrelated to the log. The process ends with the
+/// test, so nothing outlives it.
+fn leak(graph: DefaultGraph) {
+    std::mem::forget(graph.backend);
+}
+
 /// Ingests at least `events` rows through the real log-first path, rebuilds the
 /// log into a fresh store, and asserts the full sorted multiset of live row
 /// content hashes is identical, so a lost record cannot hide behind a
@@ -110,7 +119,8 @@ async fn ingest_and_rebuild(events: usize) {
     }
     source.gc(&retention).await.unwrap();
     let before = oracle_multiset(&source).await;
-    drop((source, log));
+    leak(source);
+    drop(log);
 
     let (fresh, fresh_log) = env
         .open_over::<DefaultBackend>(env.log(SOAK_WAL), "fresh.db", Arc::clone(&clock))
@@ -122,8 +132,15 @@ async fn ingest_and_rebuild(events: usize) {
 
     // Assert: nothing lost, nothing extra, and rows really were ingested
     assert!(!before.is_empty(), "the soak ingested no live rows");
-    assert_eq!(rebuilt.projection_hash_multiset().await.unwrap(), before);
+    let after = rebuilt.projection_hash_multiset().await.unwrap();
+    assert!(
+        after == before,
+        "{} rows rebuilt, {} expected",
+        after.len(),
+        before.len()
+    );
     assert_eq!(report.live_nodes + report.live_edges, before.len());
+    leak(rebuilt);
 }
 
 #[tokio::test]
