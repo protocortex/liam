@@ -12,12 +12,16 @@ mod clusters;
 /// Grounding eval for `ask`; test-only, see the module docs to run it.
 #[cfg(test)]
 mod eval;
+mod log_startup;
 mod mcp;
 /// Retrieval-quality benchmark for `Graph::query`; test-only, see the module
 /// docs to run each tier.
 #[cfg(test)]
 mod retrieval_eval;
+mod shutdown;
 mod synthesis;
+#[cfg(test)]
+mod test_logs;
 /// Grounding eval for remember/recall/relate; test-only, see the module docs to run each tier.
 #[cfg(test)]
 mod tool_eval;
@@ -25,10 +29,13 @@ mod transport;
 mod tuning;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
-use liam_store::{DefaultGraph, GraphConfig};
+use liam_store::DefaultGraph;
 
 // Re-exported at this crate's root, not merely imported, so the existing
 // `crate::config::...` paths keep resolving now that the module itself lives
@@ -39,11 +46,19 @@ pub use liam_daemon::config;
 
 use config::Config;
 use liam_daemon::models::{
-    build_llm, build_models, export_fastembed_cache_dir, resolve_config_path,
+    build_llm, build_models, export_fastembed_cache_dir, resolve_config_path, resolve_log_dir,
 };
 use liam_daemon::{storelock, telemetry};
 use liam_model::{Embedder, Llm, Reranker};
+use log_startup::StartedStore;
 use mcp::MemoryServer;
+use shutdown::Shutdown;
+
+/// How long the maintenance loop gets to stop once the daemon is stopping, and
+/// then how long the compactor gets to finish what is queued. With the session
+/// drain they stay below the supervisor's grace period.
+const MAINTENANCE_STOP_DEADLINE: Duration = Duration::from_secs(2);
+const COMPACTOR_DRAIN_DEADLINE: Duration = Duration::from_secs(3);
 
 fn main() -> anyhow::Result<()> {
     // Parse BEFORE anything else touches the filesystem or the environment.
@@ -99,6 +114,12 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
 /// Everything that needs the store and the models: the stdio server and the
 /// socket daemon. Both take the per-process store lock.
 async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
+    serve_until(mode, config, Shutdown::default()).await
+}
+
+/// `serve_with_store` that stops when `shutdown`'s token is cancelled, which a
+/// signal or a poisoned event log does.
+async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // Exclusive per-process lock, taken once, before the first store open.
     // `spawn_gc` below shares this same `Graph`, so there is no second
     // connection to reason about; the lock is not retaken for it regardless.
@@ -107,19 +128,23 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
     // away. See `storelock` for why this is a real advisory `flock` and not
     // a PID file.
     let database_path = resolve_config_path("database_path", &config.database_path)?;
+    let log_dir = resolve_log_dir(&config, &database_path)?;
     let _lock = storelock::StoreLock::acquire(&database_path).context(
         "liamd needs the store to itself; if the holder is another liamd, `liamd proxy` \
          shuttles to it and opens no store",
     )?;
 
-    let store = DefaultGraph::open(
-        database_path.to_str().unwrap_or(&config.database_path),
-        GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size),
+    let (embedder, reranker) = build_models(&config)?;
+    let StartedStore { store, compactor } = log_startup::open_store_with_log(
+        &config,
+        &database_path,
+        &log_dir,
+        embedder.clone(),
+        &shutdown,
     )
     .await?;
     let store = Arc::new(store);
 
-    let (embedder, reranker) = build_models(&config)?;
     let llm = build_llm(&config)?;
     if config.llm.warmup {
         let started = std::time::Instant::now();
@@ -162,10 +187,11 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
         )
     };
 
-    spawn_gc(&config, server.clone());
+    let server = server.with_shutdown(shutdown.token());
+    let maintenance = spawn_gc(&config, server.clone());
 
-    match mode {
-        cli::Mode::Serve => serve_socket(&config, server).await,
+    let served = match mode {
+        cli::Mode::Serve => serve_socket(&config, server, shutdown.token()).await,
         // `run` returns on `Proxy` before this function is ever called, and
         // it must stay that way: reaching here would mean the proxy had
         // already opened the store and taken the lock held by the daemon it
@@ -176,12 +202,52 @@ async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()>
             "proxy mode returns in run() before any store setup; \
              reaching serve_with_store means that guard was removed"
         ),
-        cli::Mode::Stdio => {
-            // rmcp stdio serve. Confirm against your pinned rmcp version.
-            use rmcp::ServiceExt;
-            let running = server.serve(rmcp::transport::stdio()).await?;
-            running.waiting().await?;
-            Ok(())
+        cli::Mode::Stdio => serve_stdio(server, shutdown.token()).await,
+    };
+    stop_background_tasks(&shutdown, maintenance, compactor).await;
+    match (served, shutdown.failure()) {
+        (Err(error), _) | (Ok(()), Some(error)) => Err(error),
+        (Ok(()), None) => Ok(()),
+    }
+}
+
+async fn serve_stdio(server: MemoryServer, shutdown: CancellationToken) -> anyhow::Result<()> {
+    // rmcp stdio serve. Confirm against your pinned rmcp version.
+    use rmcp::ServiceExt;
+    let running = server.serve(rmcp::transport::stdio()).await?;
+    let end_session = running.cancellation_token();
+    let watcher = tokio::spawn(async move {
+        shutdown.cancelled().await;
+        end_session.cancel();
+    });
+    let finished = running.waiting().await;
+    watcher.abort();
+    finished?;
+    Ok(())
+}
+
+/// Stops the maintenance loop, whose server handle is the last one that keeps
+/// the store alive, then waits for the compactor, which finishes the segments
+/// already queued once the store and its log writer are gone. Both are bounded:
+/// an interrupted compaction is redone by the next start.
+async fn stop_background_tasks(
+    shutdown: &Shutdown,
+    maintenance: JoinHandle<()>,
+    mut compactor: JoinHandle<()>,
+) {
+    shutdown.token().cancel();
+    if tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, maintenance)
+        .await
+        .is_err()
+    {
+        tracing::warn!("the maintenance loop is still running; leaving it to the exit");
+    }
+    match tokio::time::timeout(COMPACTOR_DRAIN_DEADLINE, &mut compactor).await {
+        Ok(Ok(())) => tracing::info!("compactor stopped"),
+        Ok(Err(error)) => tracing::warn!(%error, "compactor task failed"),
+        Err(_) => {
+            compactor.abort();
+            tracing::warn!("compaction was still queued at exit; the next start recovers it");
         }
     }
 }
@@ -236,12 +302,13 @@ fn build_autotuned_server(
 /// The socket daemon: resolve the listener (activated by launchd, or bound
 /// here), serve it, and stop on SIGTERM or SIGINT through the ordered
 /// shutdown in `transport::shutdown`.
-async fn serve_socket(config: &Config, server: MemoryServer) -> anyhow::Result<()> {
-    use tokio_util::sync::CancellationToken;
-
+async fn serve_socket(
+    config: &Config,
+    server: MemoryServer,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     let socket_path = resolve_config_path("socket_path", &config.socket_path)?;
     let source = transport::activation::resolve(&socket_path).await?;
-    let cancel = CancellationToken::new();
 
     // Signals are watched on their own task so the accept loop owns the
     // main flow. Cancelling the token is all this does; the drain and the
@@ -278,7 +345,7 @@ async fn serve_socket(config: &Config, server: MemoryServer) -> anyhow::Result<(
 /// in-process wait for an opaque SQLite lock timeout. See ADR-0002
 /// Amendment 4. Takes a `MemoryServer` clone, not just its store, so the tick
 /// can also reach the LLM and entity-resynthesis path a later change adds.
-fn spawn_gc(config: &Config, server: MemoryServer) {
+fn spawn_gc(config: &Config, server: MemoryServer) -> JoinHandle<()> {
     let policy = config.gc_policy();
     let interval = config.gc_interval();
     let run_on_start = config.gc.run_on_start;
@@ -292,6 +359,7 @@ fn spawn_gc(config: &Config, server: MemoryServer) {
     // the calibration benchmark for the same permits. Every later tick,
     // periodic or otherwise, resynthesizes normally.
     let skip_first_resynth = run_on_start && config.llm.max_concurrent_generations == 0;
+    let stopping = server.shutdown_token();
     tokio::spawn(async move {
         if run_on_start {
             maintenance_tick(
@@ -308,7 +376,10 @@ fn spawn_gc(config: &Config, server: MemoryServer) {
         let mut tick = tokio::time::interval(interval);
         tick.tick().await; // drop the immediate first tick
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = stopping.cancelled() => return,
+                _ = tick.tick() => {}
+            }
             maintenance_tick(
                 &server,
                 &policy,
@@ -320,12 +391,15 @@ fn spawn_gc(config: &Config, server: MemoryServer) {
             )
             .await;
         }
-    });
+    })
 }
 
-/// Sweep, repair, refresh clusters, then resynthesize stale entities unless
-/// `skip_resynthesis` is set (the run-on-start tick of an autotuning server,
-/// which cannot yet spare generation permits for it).
+/// Replay the log, sweep, repair, refresh clusters, then resynthesize stale
+/// entities unless `skip_resynthesis` is set (the run-on-start tick of an
+/// autotuning server, which cannot yet spare generation permits for it). The
+/// tick stops after any step that left the daemon stopping, as a poisoned log
+/// does: the later steps would only be refused, and resynthesis would spend a
+/// model call on a write that cannot land.
 async fn maintenance_tick(
     server: &MemoryServer,
     policy: &liam_store::RetentionPolicy,
@@ -336,9 +410,24 @@ async fn maintenance_tick(
     full_synthesis_max_new_tokens: usize,
 ) {
     let store = server.store_handle();
+    let stopping = server.shutdown_token();
+    // A leftover event applied after the sweep would outlive it.
+    catch_up(&store).await;
+    if stopping.is_cancelled() {
+        return;
+    }
     sweep(&store, policy).await;
+    if stopping.is_cancelled() {
+        return;
+    }
     repair_mentions(&store).await;
+    if stopping.is_cancelled() {
+        return;
+    }
     refresh_clusters(&store).await;
+    if stopping.is_cancelled() {
+        return;
+    }
     if !skip_resynthesis {
         resynthesize_stale(
             server,
@@ -459,6 +548,16 @@ async fn repair_mentions(store: &DefaultGraph) {
     match store.repair_superseded_mentions().await {
         Ok(repaired) => tracing::info!(repaired, "provenance repair completed"),
         Err(e) => tracing::warn!(error = %e, "provenance repair failed"),
+    }
+}
+
+async fn catch_up(store: &DefaultGraph) {
+    match store.catch_up().await {
+        Ok(report) if report.applied > 0 || report.quarantined > 0 => {
+            tracing::info!(?report, "event log caught up")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "event log catch up failed"),
     }
 }
 
@@ -1393,5 +1492,282 @@ mod tests {
             Some(mcp::ENTITY_SYNTHESIS_MAX_NEW_TOKENS),
             "an entity below the mention threshold must get the baseline budget"
         );
+    }
+    // ---- the tick over a store with an event log ----
+
+    mod with_a_log {
+        use super::*;
+        use crate::log_startup::test_support::{
+            append_unapplied_node, database_in, log_dir_in, log_over, logged_events,
+            standalone_log, FailingReader, ToggledWriter, DIMS,
+        };
+        use crate::shutdown::Shutdown;
+        use liam_log::event::{LogPayload, TombstoneTable};
+        use liam_log::reader::SequentialScanReader;
+        use liam_store::NodeId;
+        use liam_store::SharedLog;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const DAY: i64 = 86_400_000;
+
+        /// The store over the standalone log, with no catch-up: whatever the
+        /// log holds past the cursor stays unapplied until something replays it.
+        async fn reopen(
+            dir: &std::path::Path,
+            clock: Arc<FixedClock>,
+        ) -> (Arc<DefaultGraph>, MemoryServer) {
+            store_over(dir, clock, standalone_log(&log_dir_in(dir))).await
+        }
+
+        async fn store_over(
+            dir: &std::path::Path,
+            clock: Arc<FixedClock>,
+            log: SharedLog,
+        ) -> (Arc<DefaultGraph>, MemoryServer) {
+            let store = DefaultGraph::open_with_clock(
+                database_in(dir).to_str().unwrap(),
+                GraphConfig::new(DIMS),
+                clock,
+            )
+            .await
+            .unwrap()
+            .with_log(log)
+            .await
+            .unwrap();
+            let store = Arc::new(store);
+            let server = test_server(Arc::clone(&store));
+            (store, server)
+        }
+
+        async fn link_two_facts(store: &DefaultGraph) {
+            let a = store.insert(NewNode::now("fact", "a", "x")).await.unwrap();
+            let b = store.insert(NewNode::now("fact", "b", "x")).await.unwrap();
+            store.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
+        }
+
+        /// A store whose log meets poison only once `armed` is set: the log
+        /// first goes bad quietly, as after a failed fsync, so what the tick
+        /// itself reports can be told from what already happened. Returns the
+        /// shutdown the log's hook drives.
+        async fn store_with_a_poisoned_log(
+            dir: &std::path::Path,
+        ) -> (Arc<DefaultGraph>, MemoryServer, Shutdown, Arc<AtomicBool>) {
+            let log_dir = log_dir_in(dir);
+            let shutdown = Shutdown::default();
+            let armed = Arc::new(AtomicBool::new(false));
+            let hook = shutdown.poison_hook();
+            let armed_hook = Arc::clone(&armed);
+            let (writer, bad) = ToggledWriter::open(&log_dir, false);
+            let log = log_over(
+                writer,
+                Arc::new(SequentialScanReader::local(&log_dir).unwrap()),
+                Some(Arc::new(move || {
+                    if armed_hook.load(Ordering::SeqCst) {
+                        hook();
+                    }
+                })),
+            );
+            let (store, server) =
+                store_over(dir, Arc::new(FixedClock::new(Millis(1000))), log).await;
+            link_two_facts(&store).await;
+            bad.store(true, Ordering::SeqCst);
+            let refused = store.insert(NewNode::now("fact", "c", "x")).await;
+            assert!(refused.is_err(), "precondition: the write must be refused");
+            let server = server.with_shutdown(shutdown.token());
+            (store, server, shutdown, armed)
+        }
+
+        async fn is_live(store: &DefaultGraph, id: &str) -> bool {
+            store
+                .get(&NodeId::from_raw(id), Millis::now())
+                .await
+                .unwrap()
+                .is_some()
+        }
+
+        fn nothing_to_sweep() -> RetentionPolicy {
+            RetentionPolicy::keep("nonexistent-kind", Millis(1))
+        }
+
+        fn sweep_old_facts() -> RetentionPolicy {
+            RetentionPolicy::keep("fact", Millis::days(30)).without_reclaim()
+        }
+
+        #[tokio::test]
+        async fn the_tick_applies_an_event_the_log_holds_past_the_cursor() {
+            // Arrange: a store that attached its log, then an event that a
+            // double fault left in the log without a projection
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FixedClock::new(Millis(2000)));
+            drop(reopen(dir.path(), clock.clone()).await);
+            append_unapplied_node(&log_dir_in(dir.path()), "leftover", "unapplied");
+            let (store, server) = reopen(dir.path(), clock).await;
+            assert!(!is_live(&store, "leftover").await, "precondition");
+
+            // Act
+            maintenance_tick(&server, &nothing_to_sweep(), 0, 30, true, 8, 512).await;
+
+            // Assert
+            assert!(
+                is_live(&store, "leftover").await,
+                "the tick must replay what the log holds past the cursor"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_tick_catches_up_before_the_sweep() {
+            // Arrange: the leftover is old enough to be swept. Replayed first,
+            // it is swept with the rest; replayed after, it would outlive the sweep.
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FixedClock::new(Millis(100 * DAY)));
+            drop(reopen(dir.path(), clock.clone()).await);
+            append_unapplied_node(&log_dir_in(dir.path()), "stale-leftover", "unapplied");
+            let (store, server) = reopen(dir.path(), clock).await;
+
+            // Act
+            maintenance_tick(&server, &sweep_old_facts(), 0, 30, true, 8, 512).await;
+
+            // Assert: gone from the store, and the log tombstones it
+            assert!(!is_live(&store, "stale-leftover").await);
+            let tombstoned = logged_events(&log_dir_in(dir.path()))
+                .await
+                .into_iter()
+                .any(|event| match event.payload {
+                    LogPayload::Tombstone(targets) => targets.iter().any(|target| {
+                        target.table == TombstoneTable::Nodes && target.id == "stale-leftover"
+                    }),
+                    _ => false,
+                });
+            assert!(
+                tombstoned,
+                "the sweep must have tombstoned the replayed row"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_poisoned_log_in_the_tick_stops_the_daemon_and_the_rest_of_the_tick() {
+            // Arrange: the log is poisoned, and the tick is the first to say so
+            let dir = tempfile::tempdir().unwrap();
+            let (store, server, shutdown, armed) = store_with_a_poisoned_log(dir.path()).await;
+            armed.store(true, Ordering::SeqCst);
+            assert!(!shutdown.token().is_cancelled(), "precondition");
+            crate::test_logs::capture();
+
+            // Act
+            maintenance_tick(&server, &nothing_to_sweep(), 0, 30, true, 8, 512).await;
+
+            // Assert: the daemon is stopping with a failure, the sweep after
+            // the poisoned replay was not even tried, and the cluster refresh
+            // that follows it never ran
+            assert!(shutdown.token().is_cancelled());
+            let text = crate::test_logs::captured();
+            assert!(!text.contains("gc failed"), "{text}");
+            assert!(shutdown.failure().is_some());
+            assert!(
+                store.refresh_communities().await.unwrap(),
+                "the tick must not have refreshed the clusters"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failing_replay_that_is_not_poison_leaves_the_rest_of_the_tick_running() {
+            // Arrange: an event past the cursor and a reader that cannot read it
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FixedClock::new(Millis(1000)));
+            let (store, first_server) = reopen(dir.path(), clock.clone()).await;
+            link_two_facts(&store).await;
+            drop((store, first_server));
+            append_unapplied_node(&log_dir_in(dir.path()), "leftover", "unapplied");
+            let log_dir = log_dir_in(dir.path());
+            let log = log_over(
+                liam_daemon::event_log::open_writer(
+                    &log_dir,
+                    liam_log::wal::WalConfig {
+                        segment_max_bytes: 1 << 20,
+                        rotate_interval_secs: 3600,
+                    },
+                )
+                .unwrap(),
+                Arc::new(FailingReader),
+                None,
+            );
+            let (store, server) = store_over(dir.path(), clock, log).await;
+            assert!(store.catch_up().await.is_err(), "precondition");
+
+            // Act
+            maintenance_tick(&server, &nothing_to_sweep(), 0, 30, true, 8, 512).await;
+
+            // Assert: the failure was only logged, and the refresh still ran
+            assert!(!server.shutdown_token().is_cancelled());
+            assert!(
+                !store.refresh_communities().await.unwrap(),
+                "the tick must have gone on to refresh the clusters"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_tool_write_that_meets_a_poisoned_log_stops_the_daemon() {
+            // Arrange
+            let dir = tempfile::tempdir().unwrap();
+            let (_store, server, shutdown, armed) = store_with_a_poisoned_log(dir.path()).await;
+            armed.store(true, Ordering::SeqCst);
+            let args = mcp::RememberArgs {
+                kind: "fact".into(),
+                label: "label".into(),
+                content: "after the poison".into(),
+                scope: None,
+                subject: None,
+                attributes: None,
+                valid_from: None,
+                confidence: None,
+                episode: None,
+            };
+
+            // Act
+            let reply = server
+                .remember(rmcp::handler::server::wrapper::Parameters(args))
+                .await;
+
+            // Assert
+            assert!(reply.starts_with("remember failed"), "{reply}");
+            assert!(shutdown.token().is_cancelled());
+            assert!(shutdown.failure().is_some());
+        }
+
+        #[tokio::test]
+        async fn a_sweep_in_the_tick_is_logged_as_tombstones() {
+            // Arrange: two facts written through the log, then aged past retention
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FixedClock::new(Millis(100 * DAY)));
+            let (store, server) = reopen(dir.path(), clock).await;
+            let old = |content: &str| {
+                NewNode::now("fact", "label", content).with_valid_from(Millis(10 * DAY))
+            };
+            let first = store.insert(old("first")).await.unwrap();
+            let second = store.insert(old("second")).await.unwrap();
+
+            // Act
+            maintenance_tick(&server, &sweep_old_facts(), 0, 30, true, 8, 512).await;
+
+            // Assert
+            let tombstoned: Vec<String> = logged_events(&log_dir_in(dir.path()))
+                .await
+                .into_iter()
+                .filter_map(|event| match event.payload {
+                    LogPayload::Tombstone(targets) => Some(targets),
+                    _ => None,
+                })
+                .flatten()
+                .map(|target| target.id)
+                .collect();
+            assert!(
+                tombstoned.contains(&first.as_str().to_string()),
+                "{tombstoned:?}"
+            );
+            assert!(
+                tombstoned.contains(&second.as_str().to_string()),
+                "{tombstoned:?}"
+            );
+        }
     }
 }

@@ -61,3 +61,5 @@ backend-libsql = ["dep:libsql"]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
 liam-log = { path = "../liam-log", features = ["test-support"] }
+# Backfill progress is only observable in the log lines it writes.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

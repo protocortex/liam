@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use liam_log::dedup::BloomConfig;
+use liam_log::wal::WalConfig;
 use liam_store::{Millis, RetentionPolicy};
 use serde::Deserialize;
 
@@ -45,6 +47,25 @@ pub struct Config {
     /// MCP client name to canonical producer id, plus the fallback id for a
     /// client this map does not name (WU-7).
     pub producers: ProducersConfig,
+    /// The event log every write goes through before it reaches the database.
+    pub log: LogConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// Where the log lives. Unset means `<database stem>.log` beside the
+    /// database, see `default_log_dir`. A relative path is taken from the
+    /// database's directory, not the working directory.
+    pub dir: Option<String>,
+    /// The open WAL segment is closed by the first write after it reaches this
+    /// size, and the compactor then turns it into Parquet.
+    pub wal_segment_max_bytes: u64,
+    /// The open WAL segment is closed by the first write after it is this old,
+    /// and the compactor then turns it into Parquet.
+    pub wal_rotate_interval_secs: u64,
+    /// False positive rate of the dedup filter in front of the hash index.
+    pub bloom_fpr: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,7 +160,54 @@ impl Default for Config {
             read_pool_size: 4,
             max_connections: 16,
             producers: ProducersConfig::default(),
+            log: LogConfig::default(),
         }
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            wal_segment_max_bytes: 8_388_608,
+            wal_rotate_interval_secs: 300,
+            bloom_fpr: 0.01,
+        }
+    }
+}
+
+impl LogConfig {
+    /// Rejects values the log cannot run with, naming the key to fix.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // An empty path would put the log in the working directory.
+        anyhow::ensure!(
+            self.dir.as_deref().is_none_or(|dir| !dir.trim().is_empty()),
+            "log.dir must not be empty; remove it to keep the log beside the database"
+        );
+        anyhow::ensure!(
+            self.wal_segment_max_bytes > 0,
+            "log.wal_segment_max_bytes must be at least 1"
+        );
+        // Zero would rotate the WAL on every append.
+        anyhow::ensure!(
+            self.wal_rotate_interval_secs > 0,
+            "log.wal_rotate_interval_secs must be at least 1"
+        );
+        self.bloom().map(|_| ())
+    }
+
+    pub fn wal(&self) -> WalConfig {
+        WalConfig {
+            segment_max_bytes: self.wal_segment_max_bytes,
+            rotate_interval_secs: self.wal_rotate_interval_secs,
+        }
+    }
+
+    /// The dedup filter at the configured false positive rate, sized for the
+    /// default item count.
+    pub fn bloom(&self) -> anyhow::Result<BloomConfig> {
+        BloomConfig::new(BloomConfig::default().expected_items(), self.bloom_fpr)
+            .map_err(|error| anyhow::anyhow!("log.bloom_fpr is invalid: {error}"))
     }
 }
 
@@ -216,6 +284,15 @@ pub(crate) fn expand_tilde(path: &str, home: &str) -> String {
     }
 }
 
+/// `<database stem>.log` beside the database: the log directory used when the
+/// config names none. Both binaries reach it through `models::resolve_log_dir`.
+pub(crate) fn default_log_dir(database: &Path) -> PathBuf {
+    let stem = database.file_stem().unwrap_or(database.as_os_str());
+    let mut name = stem.to_owned();
+    name.push(".log");
+    database.with_file_name(name)
+}
+
 /// The config file read when neither `--config` nor `LIAM_CONFIG` says
 /// otherwise.
 pub const DEFAULT_CONFIG: &str = "liam.toml";
@@ -270,7 +347,9 @@ impl Config {
             );
         }
 
-        Ok(toml::from_str(&text)?)
+        let config: Self = toml::from_str(&text)?;
+        config.log.validate()?;
+        Ok(config)
     }
 
     pub fn gc_policy(&self) -> RetentionPolicy {
@@ -563,6 +642,256 @@ mod tests {
         assert_eq!(
             expand_tilde("/var/run/liamd.sock", "/home/alice"),
             "/var/run/liamd.sock"
+        );
+    }
+
+    // ---- [log] ----
+
+    #[test]
+    fn a_config_with_no_log_section_gets_every_log_default() {
+        // Arrange: a file that never mentions [log]
+        let path = write_temp_toml("[gc]\n");
+
+        // Act
+        let c = Config::load(&path).expect("a config without [log] must parse");
+
+        // Assert: all four keys fall back to their documented defaults
+        assert_eq!(c.log.dir, None);
+        assert_eq!(c.log.wal_segment_max_bytes, 8_388_608);
+        assert_eq!(c.log.wal_rotate_interval_secs, 300);
+        assert_eq!(c.log.bloom_fpr, 0.01);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_log_section_with_one_key_keeps_the_defaults_of_the_others() {
+        // Arrange
+        let path = write_temp_toml("[log]\nwal_rotate_interval_secs = 60\n");
+
+        // Act
+        let c = Config::load(&path).expect("a partial [log] must parse");
+
+        // Assert
+        assert_eq!(c.log.wal_rotate_interval_secs, 60);
+        assert_eq!(c.log.wal_segment_max_bytes, 8_388_608);
+        assert_eq!(c.log.bloom_fpr, 0.01);
+        assert_eq!(c.log.dir, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn every_log_key_can_be_overridden() {
+        // Arrange
+        let path = write_temp_toml(
+            "[log]\ndir = \"/var/liam/events\"\nwal_segment_max_bytes = 1048576\n\
+             wal_rotate_interval_secs = 30\nbloom_fpr = 0.001\n",
+        );
+
+        // Act
+        let c = Config::load(&path).expect("a full [log] must parse");
+
+        // Assert
+        assert_eq!(c.log.dir.as_deref(), Some("/var/liam/events"));
+        assert_eq!(c.log.wal_segment_max_bytes, 1_048_576);
+        assert_eq!(c.log.wal_rotate_interval_secs, 30);
+        assert_eq!(c.log.bloom_fpr, 0.001);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unknown_key_under_log_fails_loudly_naming_the_key() {
+        // Arrange: a typo of wal_segment_max_bytes
+        let path = write_temp_toml("[log]\nwal_segment_max_byte = 1024\n");
+
+        // Act
+        let error = Config::load(&path).expect_err("an unknown [log] key must be rejected");
+
+        // Assert
+        let message = error.to_string();
+        assert!(
+            message.contains("wal_segment_max_byte"),
+            "message: {message}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_bloom_fpr_outside_zero_and_one_is_rejected_naming_the_key() {
+        for bad in ["0.0", "1.0", "-0.5", "1.5", "nan"] {
+            // Arrange
+            let path = write_temp_toml(&format!("[log]\nbloom_fpr = {bad}\n"));
+
+            // Act
+            let error = Config::load(&path)
+                .expect_err(&format!("bloom_fpr = {bad} must be rejected at load"));
+
+            // Assert
+            let message = error.to_string();
+            assert!(message.contains("log.bloom_fpr"), "{bad}: {message}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn a_zero_wal_segment_size_is_rejected_naming_the_key() {
+        // Arrange
+        let path = write_temp_toml("[log]\nwal_segment_max_bytes = 0\n");
+
+        // Act
+        let error = Config::load(&path).expect_err("a zero segment size must be rejected");
+
+        // Assert
+        let message = error.to_string();
+        assert!(message.contains("log.wal_segment_max_bytes"), "{message}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_zero_rotation_interval_is_rejected_naming_the_key() {
+        // Arrange: zero would rotate the WAL on every append
+        let path = write_temp_toml("[log]\nwal_rotate_interval_secs = 0\n");
+
+        // Act
+        let error = Config::load(&path).expect_err("a zero rotation interval must be rejected");
+
+        // Assert
+        let message = error.to_string();
+        assert!(
+            message.contains("log.wal_rotate_interval_secs"),
+            "{message}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_default_log_config_is_valid() {
+        LogConfig::default()
+            .validate()
+            .expect("the shipped defaults must pass their own validation");
+    }
+
+    #[test]
+    fn the_default_log_directory_is_a_sibling_named_after_the_database_stem() {
+        for (database, log_dir) in [
+            ("/data/work.db", "/data/work.log"),
+            ("liam.db", "liam.log"),
+            ("/data/store", "/data/store.log"),
+            ("/home/alice/.liam/liam.db", "/home/alice/.liam/liam.log"),
+        ] {
+            assert_eq!(
+                default_log_dir(Path::new(database)),
+                PathBuf::from(log_dir),
+                "database {database}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_liam_toml_documents_the_log_section_with_the_defaults() {
+        // Arrange
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../liam.toml"));
+        let text = std::fs::read_to_string(path).expect("read shipped liam.toml");
+
+        // Act
+        let c = Config::load(path).expect("shipped liam.toml must parse");
+
+        // Assert: the section is present, names every key, and does not drift
+        // from the built-in defaults
+        assert!(
+            text.contains("[log]"),
+            "liam.toml must carry a [log] section"
+        );
+        for key in [
+            "dir",
+            "wal_segment_max_bytes",
+            "wal_rotate_interval_secs",
+            "bloom_fpr",
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| { line.trim_start_matches('#').trim_start().starts_with(key) }),
+                "liam.toml must document log.{key}"
+            );
+        }
+        assert_eq!(c.log, LogConfig::default());
+    }
+
+    #[test]
+    fn the_readme_log_rows_carry_the_code_defaults() {
+        // Arrange
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
+        let text = std::fs::read_to_string(path).expect("read README.md");
+        let defaults = LogConfig::default();
+
+        // Act
+        let row = |key: &str| {
+            let prefix = format!("| `log.{key}` | ");
+            let line = text
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("README must have a row for log.{key}"));
+            line[prefix.len()..]
+                .split('|')
+                .next()
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+
+        // Assert
+        assert_eq!(
+            row("wal_segment_max_bytes"),
+            format!("`{}`", defaults.wal_segment_max_bytes)
+        );
+        assert_eq!(
+            row("wal_rotate_interval_secs"),
+            format!("`{}`", defaults.wal_rotate_interval_secs)
+        );
+        assert_eq!(row("bloom_fpr"), format!("`{}`", defaults.bloom_fpr));
+        assert!(defaults.dir.is_none());
+        assert_eq!(
+            row("dir"),
+            "`<database stem>.log` beside the database",
+            "the unset default is the derived directory"
+        );
+    }
+
+    #[test]
+    fn an_empty_log_dir_is_rejected_naming_the_key() {
+        for empty in ["\"\"", "\"  \""] {
+            // Arrange
+            let path = write_temp_toml(&format!("[log]\ndir = {empty}\n"));
+
+            // Act
+            let error = Config::load(&path).expect_err("an empty log.dir must be rejected");
+
+            // Assert
+            assert!(error.to_string().contains("log.dir"), "{empty}: {error}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn the_log_section_hands_its_values_to_the_wal_and_the_filter() {
+        // Arrange
+        let log = LogConfig {
+            wal_segment_max_bytes: 1234,
+            wal_rotate_interval_secs: 56,
+            bloom_fpr: 0.05,
+            ..LogConfig::default()
+        };
+
+        // Act
+        let wal = log.wal();
+        let bloom = log.bloom().unwrap();
+
+        // Assert
+        assert_eq!(wal.segment_max_bytes, 1234);
+        assert_eq!(wal.rotate_interval_secs, 56);
+        assert_eq!(bloom.false_positive_rate(), 0.05);
+        assert_eq!(
+            bloom.expected_items(),
+            BloomConfig::default().expected_items()
         );
     }
 }

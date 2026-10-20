@@ -82,6 +82,24 @@ impl Phase {
     /// live `supersedes` edge closes it; for an edge, whether a replay would
     /// refuse it.
     fn page_query(self, after: &str, limit: usize) -> (String, Vec<Value>) {
+        let (columns, table, flag, condition) = self.parts();
+        let sql = format!(
+            "SELECT {columns}, {flag} FROM {table}
+             WHERE id > ?1 {condition} ORDER BY id LIMIT ?2"
+        );
+        (sql, vec![after.into(), Value::Int(limit as i64)])
+    }
+
+    /// How many rows `page_query` walks through for this phase after `after`.
+    fn count_query(self, after: &str) -> (String, Vec<Value>) {
+        let (_, table, _, condition) = self.parts();
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE id > ?1 {condition}");
+        (sql, vec![after.into()])
+    }
+
+    /// The columns, table, trailing flag expression and extra condition that
+    /// select this phase's rows.
+    fn parts(self) -> (&'static str, &'static str, String, String) {
         let live = FOREVER.0;
         let supersedes = relation::SUPERSEDES;
         let (columns, table, flag, condition) = match self {
@@ -120,11 +138,7 @@ impl Phase {
                 format!("AND tx_to = {live} AND type = '{supersedes}'"),
             ),
         };
-        let sql = format!(
-            "SELECT {columns}, {flag} FROM {table}
-             WHERE id > ?1 {condition} ORDER BY id LIMIT ?2"
-        );
-        (sql, vec![after.into(), Value::Int(limit as i64)])
+        (columns, table, flag, condition)
     }
 }
 
@@ -236,6 +250,10 @@ struct Run {
     report: BackfillReport,
     /// Rows logged since the resume point was last saved.
     unrecorded: usize,
+    /// Rows this run walks through, counted before the first is logged.
+    total: usize,
+    /// Rows walked through so far, whether logged, already in the log or skipped.
+    examined: usize,
 }
 
 impl<B: Backend> Graph<B> {
@@ -273,18 +291,35 @@ impl<B: Backend> Graph<B> {
                 ..BackfillReport::default()
             },
             unrecorded: 0,
+            total: 0,
+            examined: 0,
         };
-        tracing::info!(logged = run.logged.len(), resumed, "backfill: starting");
+        let phases = || {
+            Phase::IN_ORDER
+                .into_iter()
+                .skip_while(|p| *p != start.phase)
+                .map(|phase| {
+                    let after = match phase == start.phase {
+                        true => start.last_id.clone().unwrap_or_default(),
+                        false => String::new(),
+                    };
+                    (phase, after)
+                })
+        };
+        for (phase, after) in phases() {
+            run.total += self.count_phase(phase, &after).await?;
+        }
+        // An empty store has nothing to wait for, so a fresh install stays quiet.
+        if run.total > 0 {
+            tracing::info!(
+                rows = run.total,
+                already_logged = run.logged.len(),
+                resumed,
+                "backfill: logging the rows that predate the event log, writes wait until it is done"
+            );
+        }
 
-        for phase in Phase::IN_ORDER
-            .into_iter()
-            .skip_while(|p| *p != start.phase)
-        {
-            let after = if phase == start.phase {
-                start.last_id.clone().unwrap_or_default()
-            } else {
-                String::new()
-            };
+        for (phase, after) in phases() {
             self.log_phase(&mut held, &mut run, phase, after).await?;
             tracing::info!(phase = phase.name(), "backfill: phase logged");
         }
@@ -314,6 +349,7 @@ impl<B: Backend> Graph<B> {
             };
             after = last.id.clone();
             for Pending { id, event } in page {
+                run.examined += 1;
                 if run.logged.contains(&id) {
                     continue;
                 }
@@ -334,8 +370,25 @@ impl<B: Backend> Graph<B> {
                     Phase::Nodes => run.report.nodes_logged += 1,
                     Phase::Edges | Phase::Supersedes => run.report.edges_logged += 1,
                 }
+                if due.is_some() {
+                    tracing::info!(
+                        progress = format!("{}/{}", run.examined, run.total),
+                        phase = phase.name(),
+                        "backfill: resume point saved"
+                    );
+                }
             }
         }
+    }
+
+    async fn count_phase(&self, phase: Phase, after: &str) -> Result<usize> {
+        let (sql, params) = phase.count_query(after);
+        let rows = self.backend.query(&sql, &params).await?;
+        let count = rows
+            .first()
+            .ok_or_else(|| Error::Backend("a count query returned no row".into()))?
+            .get_i64(0)?;
+        Ok(count as usize)
     }
 
     async fn begin_saving(&self, progress: Option<&Progress>) -> Result<Box<dyn BackendTx + '_>> {

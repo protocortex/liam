@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use liam_log::wal::WalError;
 use liam_log::{LogOffset, LogWriter};
 use uuid::Uuid;
 
-use super::support::{count, cursor, fact, fact_at, offset_pair, share};
+use super::support::{count, cursor, fact, fact_at, offset_pair, share, share_with_poison_hook};
 use super::*;
 use crate::graph::projection::{apply_steps, steps_for};
 use crate::DefaultBackend;
@@ -540,6 +540,88 @@ async fn log_write_a_failed_duplicate_append_leaves_the_cursor_where_it_was() {
     assert_eq!(cursor(&g).await, before);
     assert_eq!(node_writes(&appended).len(), 1);
     assert_eq!(events(&appended).len(), 1, "only the NodeWrite is logged");
+}
+
+/// Counts how often the log reported a poisoned write.
+fn poison_counter() -> (PoisonHook, Arc<AtomicUsize>) {
+    let reports = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&reports);
+    let hook: PoisonHook = Arc::new(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+    (hook, reports)
+}
+
+#[tokio::test]
+async fn log_write_a_write_refused_for_a_poisoned_log_calls_the_poison_hook() {
+    // Arrange: a cancelled write leaves the log poisoned
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("graph.db");
+    let (log, _appended) = RecordingLog::new();
+    let (hook, reports) = poison_counter();
+    let g = open_with::<FailingBackend>(
+        path.to_str().unwrap(),
+        Millis(1000),
+        share_with_poison_hook(log, hook),
+    )
+    .await;
+    g.backend.probe.hang_commit.store(true, Ordering::SeqCst);
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(200), g.insert(fact("orphan"))).await;
+    g.backend.probe.hang_commit.store(false, Ordering::SeqCst);
+    assert!(cancelled.is_err(), "the insert must still be pending");
+    assert_eq!(
+        reports.load(Ordering::SeqCst),
+        0,
+        "poisoning is not a refusal"
+    );
+
+    // Act
+    let refused = g.insert(fact("next")).await;
+
+    // Assert
+    assert!(matches!(refused, Err(Error::LogPoisoned)), "{refused:?}");
+    assert_eq!(reports.load(Ordering::SeqCst), 1);
+}
+
+/// A writer that fails the way a `WalWriter` does once an fsync has failed.
+struct PoisonedWriter(Uuid);
+
+impl LogWriter for PoisonedWriter {
+    fn append(&mut self, _event: &LogEvent) -> std::result::Result<LogOffset, WalError> {
+        Err(WalError::Poisoned)
+    }
+
+    fn log_id(&self) -> Uuid {
+        self.0
+    }
+
+    fn head(&self) -> Option<LogOffset> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn log_write_a_writer_poisoned_by_a_failed_sync_surfaces_as_a_poisoned_log() {
+    // Arrange
+    let (hook, reports) = poison_counter();
+    let g = open_with::<DefaultBackend>(
+        ":memory:",
+        Millis(1000),
+        share_with_poison_hook(PoisonedWriter(Uuid::now_v7()), hook),
+    )
+    .await;
+
+    // Act
+    let first = g.insert(fact("one")).await;
+    let second = g.insert(fact("two")).await;
+
+    // Assert: the write the writer refused and the one the store then refuses
+    // both say the log is poisoned, and each reports it
+    assert!(matches!(first, Err(Error::LogPoisoned)), "{first:?}");
+    assert!(matches!(second, Err(Error::LogPoisoned)), "{second:?}");
+    assert_eq!(reports.load(Ordering::SeqCst), 2);
+    assert_eq!(count(&g, "nodes").await, 0);
 }
 
 #[tokio::test]

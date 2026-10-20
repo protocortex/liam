@@ -16,7 +16,7 @@
 //! Known limitation: the time rotation timer is not persisted, so it restarts
 //! on every reopen.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,6 +31,10 @@ pub(crate) const SEGMENT_EXTENSION: &str = "wal";
 pub(crate) const PARQUET_EXTENSION: &str = "parquet";
 /// The file that marks a directory as a log: it holds the log's identity.
 pub const MANIFEST_NAME: &str = "log.id";
+/// The file a writer keeps locked while it is alive, so one directory never has
+/// two writers. It is not a segment, and listing, compaction and reading
+/// ignore it.
+pub const LOCK_NAME: &str = "log.lock";
 const LENGTH_PREFIX_BYTES: usize = 4;
 const CRC_BYTES: usize = 4;
 pub(crate) const HEADER_BYTES: usize = LENGTH_PREFIX_BYTES + 2 * CRC_BYTES;
@@ -61,6 +65,18 @@ pub enum WalError {
     SegmentNotEmpty { segment: PathBuf },
     #[error("wal writer is poisoned by an earlier failed append and must be reopened")]
     Poisoned,
+    #[error(
+        "the log in {} is held by another process, so another liamd or `liam rebuild` \
+         is using it; stop that process before starting this one",
+        dir.display()
+    )]
+    LogInUse { dir: PathBuf },
+    #[error(
+        "the log in {} could not be locked ({source}); the filesystem may not support \
+         advisory locks, which network mounts often lack, so keep the log on a local disk",
+        dir.display()
+    )]
+    LockFailed { dir: PathBuf, source: io::Error },
     #[error("wal log id manifest {} does not hold a uuid", manifest.display())]
     InvalidLogId { manifest: PathBuf },
     #[error(
@@ -181,6 +197,8 @@ pub struct WalWriter<C: RotationClock> {
     ops: Box<dyn FileOps>,
     /// Set when the file may hold bytes the writer cannot account for.
     failed: bool,
+    /// Never read: the OS drops the directory lock when this file closes.
+    _lock: File,
 }
 
 impl WalWriter<SystemClock> {
@@ -204,6 +222,9 @@ impl<C: RotationClock> WalWriter<C> {
     ) -> Result<Self, WalError> {
         let mut ops: Box<dyn FileOps> = Box::new(ops);
         create_dir_all_durably(dir, ops.as_mut())?;
+        // Before the manifest and any torn tail truncation, which a second
+        // writer in the directory would race.
+        let lock = lock_directory(dir)?;
         let log_id = load_or_create_log_id(dir, ops.as_mut())?;
         let highest_wal = segment_paths(dir)?.pop();
         let highest_parquet = numbered_files(dir, PARQUET_EXTENSION)?
@@ -234,6 +255,7 @@ impl<C: RotationClock> WalWriter<C> {
             sink: None,
             ops,
             failed: false,
+            _lock: lock,
         })
     }
 
@@ -518,6 +540,25 @@ fn read_frame(bytes: &[u8]) -> Frame<'_> {
         Frame::Valid { payload, len }
     } else {
         Frame::BadPayloadChecksum { len }
+    }
+}
+
+/// Takes the directory's exclusive advisory lock without blocking.
+fn lock_directory(dir: &Path) -> Result<File, WalError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK_NAME))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(WalError::LogInUse {
+            dir: dir.to_path_buf(),
+        }),
+        Err(TryLockError::Error(source)) => Err(WalError::LockFailed {
+            dir: dir.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -2616,6 +2657,69 @@ mod tests {
         writer.append(&event(0)).expect("append");
 
         // Assert
+        assert_eq!(replay(dir.path()).expect("replay"), vec![event(0)]);
+    }
+
+    #[test]
+    fn a_second_writer_on_a_held_directory_is_refused_until_the_first_is_dropped() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::default();
+        let first = open(dir.path(), LARGE, &clock);
+
+        // Act
+        let refused = WalWriter::open(dir.path(), config(LARGE), clock.clone());
+
+        // Assert: refused with an error that names the directory
+        let error = refused
+            .err()
+            .expect("a held directory must refuse a writer");
+        assert!(matches!(error, WalError::LogInUse { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&dir.path().display().to_string()),
+            "{error}"
+        );
+
+        // Act: release the first writer
+        drop(first);
+
+        // Assert
+        WalWriter::open(dir.path(), config(LARGE), clock).expect("a free directory must open");
+    }
+
+    #[test]
+    fn a_refused_writer_leaves_the_directory_as_it_found_it() {
+        // Arrange: another process holds the lock on a directory with no log yet
+        let dir = tempfile::tempdir().expect("tempdir");
+        let held = lock_directory(dir.path()).expect("take the lock");
+
+        // Act
+        let refused = WalWriter::open(dir.path(), config(LARGE), FakeClock::default());
+
+        // Assert: no identity and no segment were written
+        assert!(matches!(refused.err(), Some(WalError::LogInUse { .. })));
+        assert!(!dir.path().join(MANIFEST_NAME).exists());
+        assert!(segment_paths(dir.path()).expect("list").is_empty());
+        drop(held);
+    }
+
+    #[test]
+    fn the_lock_file_is_not_a_segment_for_listing_or_reading() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = open(dir.path(), LARGE, &FakeClock::default());
+        writer.append(&event(0)).expect("append");
+
+        // Act
+        let wals = segment_paths(dir.path()).expect("list wals");
+        let parquets = numbered_files(dir.path(), PARQUET_EXTENSION).expect("list parquets");
+
+        // Assert
+        assert!(dir.path().join(LOCK_NAME).is_file());
+        assert_eq!(wals.len(), 1);
+        assert!(parquets.is_empty());
         assert_eq!(replay(dir.path()).expect("replay"), vec![event(0)]);
     }
 }

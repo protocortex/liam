@@ -20,6 +20,50 @@ use tokio::sync::Notify;
 
 use super::*;
 
+thread_local! {
+    static CAPTURED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The log lines the current test thread wrote since `capture`. One global
+/// subscriber serves every test, because a subscriber scoped to one test
+/// leaves the callsites other tests reach first cached as disabled.
+pub(super) fn capture_logs() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(ThreadCapture)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("no other global subscriber");
+    });
+    CAPTURED.with(|captured| captured.borrow_mut().clear());
+}
+
+pub(super) fn captured_logs() -> String {
+    CAPTURED.with(|captured| String::from_utf8_lossy(&captured.borrow()).into_owned())
+}
+
+struct ThreadCapture;
+
+impl io::Write for ThreadCapture {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        CAPTURED.with(|captured| captured.borrow_mut().extend_from_slice(bytes));
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadCapture {
+    type Writer = ThreadCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        ThreadCapture
+    }
+}
+
 /// A reader over a log nothing replays from.
 struct EmptyReader;
 
@@ -327,6 +371,21 @@ pub(super) fn share_sized(writer: impl LogWriter + 'static, config: BloomConfig)
         Arc::new(EmptyReader),
         HashBloom::new(config),
     ))
+}
+
+/// `share` with a hook that the log calls whenever a write meets a poisoned log.
+pub(super) fn share_with_poison_hook(
+    writer: impl LogWriter + 'static,
+    hook: PoisonHook,
+) -> SharedLog {
+    shared(
+        EventLog::new(
+            Box::new(writer),
+            Arc::new(EmptyReader),
+            HashBloom::new(BloomConfig::default()),
+        )
+        .with_poison_hook(hook),
+    )
 }
 
 pub(super) fn fact(content: &str) -> NewNode {

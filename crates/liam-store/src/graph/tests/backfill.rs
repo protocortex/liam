@@ -13,8 +13,9 @@ use liam_log::hash::{edge_row_hash, node_row_hash};
 
 use super::log_write::within_deadline;
 use super::support::{
-    controlled_log, count, cursor_offset, event, fact, fact_at, injected, insert_orphan_edge,
-    offset_pair, Control, Env, EDGE_COLUMNS, NODE_COLUMNS, ONE_SEGMENT,
+    capture_logs, captured_logs, controlled_log, count, cursor_offset, event, fact, fact_at,
+    injected, insert_orphan_edge, offset_pair, Control, Env, EDGE_COLUMNS, NODE_COLUMNS,
+    ONE_SEGMENT,
 };
 use super::*;
 use crate::DefaultBackend;
@@ -491,6 +492,74 @@ async fn backfill_covers_a_store_one_row_short_of_a_batch_exactly_and_one_over()
         drop(logged);
         assert_rebuild_equals(&env, &before).await;
     }
+}
+
+// ---- progress reporting ----
+
+#[tokio::test]
+async fn backfill_reports_rows_done_out_of_the_total_at_every_saved_resume_point() {
+    // Arrange: five nodes and a batch of two, so the resume point is saved
+    // after the second and the fourth row
+    let env = Env::new();
+    let clock = clock_at(1000);
+    let pre = pre_log(&env, "live.db", &clock).await;
+    seed_nodes(&pre, &clock, 5).await;
+    drop(pre);
+    let logged = open_logged(&env, "live.db").await;
+    capture_logs();
+
+    // Act
+    logged.graph.backfill_in_batches(BATCH).await.unwrap();
+
+    // Assert
+    let text = captured_logs();
+    assert!(text.contains(r#"progress="2/5""#), "{text}");
+    assert!(text.contains(r#"progress="4/5""#), "{text}");
+    assert_eq!(text.matches("resume point saved").count(), 2, "{text}");
+    assert!(text.contains("predate the event log"), "{text}");
+    assert!(text.contains("rows=5"), "{text}");
+}
+
+#[tokio::test]
+async fn a_resumed_backfill_counts_its_total_from_the_resume_point() {
+    // Arrange: three of the nine standard rows are logged and the resume point
+    // sits after the second node, so seven rows remain, one of them logged
+    let env = Env::new();
+    let clock = clock_at(1000);
+    let pre = pre_log(&env, "live.db", &clock).await;
+    seed_standard(&pre, &clock).await;
+    drop(pre);
+    let logged = open_logged(&env, "live.db").await;
+    logged.control.fail_nth_from_now(4);
+    let failed = logged.graph.backfill_in_batches(BATCH).await;
+    assert!(is_log_append(&failed), "{failed:?}");
+    drop(logged);
+    let resumed = open_logged(&env, "live.db").await;
+    capture_logs();
+
+    // Act
+    resumed.graph.backfill_in_batches(BATCH).await.unwrap();
+
+    // Assert: the node logged past the resume point still counts as walked
+    let text = captured_logs();
+    assert!(text.contains(r#"progress="3/7""#), "{text}");
+    assert!(text.contains(r#"progress="7/7""#), "{text}");
+}
+
+#[tokio::test]
+async fn backfilling_an_empty_store_says_nothing_about_logging_old_rows() {
+    // Arrange
+    let env = Env::new();
+    let logged = open_logged(&env, "live.db").await;
+    capture_logs();
+
+    // Act
+    logged.graph.backfill_in_batches(BATCH).await.unwrap();
+
+    // Assert
+    let text = captured_logs();
+    assert!(!text.contains("predate"), "{text}");
+    assert!(!text.contains("resume point saved"), "{text}");
 }
 
 // ---- what is logged ----
@@ -1278,7 +1347,7 @@ async fn backfill_logs_a_row_again_after_its_commit_failed_and_the_write_was_voi
     seed_standard(&pre, &clock).await;
     let before = live_of(&pre).await;
     drop(pre);
-    let (graph, _log) = env.open::<FailingBackend>("live.db", clock_at(7000)).await;
+    let (graph, log) = env.open::<FailingBackend>("live.db", clock_at(7000)).await;
     graph.backend.set_fail_commit(true);
 
     // Act
@@ -1296,6 +1365,7 @@ async fn backfill_logs_a_row_again_after_its_commit_failed_and_the_write_was_voi
     graph.backend.set_fail_commit(false);
     let report = graph.backfill_log_from_projection().await.unwrap();
     drop(graph);
+    drop(log);
 
     // Assert
     assert_eq!(report.nodes_logged, STANDARD_NODES);

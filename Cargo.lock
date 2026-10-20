@@ -2458,6 +2458,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "futures-util",
  "liam-log",
  "liam-model",
  "liam-store",
@@ -2474,6 +2475,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2532,6 +2534,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "ulid",
  "uuid",
 ]

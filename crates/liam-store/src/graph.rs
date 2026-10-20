@@ -15,7 +15,7 @@ use liam_log::event::NodeRow;
 pub use self::backfill::BackfillReport;
 use self::logged_plan::{refuse_supersedes, Collision};
 use self::logged_write::WriteOutcome;
-pub use self::logged_write::{EventLog, SharedLog};
+pub use self::logged_write::{EventLog, PoisonHook, SharedLog};
 pub use self::rebuild::{RebuildMode, RebuildReport};
 pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
 pub use self::replay::CatchUpReport;
@@ -587,6 +587,15 @@ impl<B: Backend> Graph<B> {
         log_open::check_and_prime(&self.backend, &log).await?;
         self.log = Some(log);
         Ok(self)
+    }
+
+    /// The id of the log this store has been attached to, `None` for a store
+    /// that never was. It lets a caller refuse a log directory that cannot be
+    /// the store's before creating anything in it.
+    pub async fn stored_log_id(&self) -> Result<Option<uuid::Uuid>> {
+        Ok(log_cursor::read(&self.backend)
+            .await?
+            .map(|cursor| cursor.log_id))
     }
 
     // ---- write ----

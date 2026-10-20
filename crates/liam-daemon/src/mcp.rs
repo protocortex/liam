@@ -22,6 +22,7 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::ask::{
     self, build_ask_prompt, clamp_ask_k, estimate_tokens, fallback_answer, fit_evidence_to_budget,
@@ -520,6 +521,9 @@ pub struct MemoryServer {
     /// forever, and a socket connection during the brief window between
     /// `serve` returning and the accept loop's `set_producer` call landing.
     producer: OnceLock<String>,
+    /// Cancelled when the daemon is stopping, so the maintenance tick stops
+    /// at its next step instead of starting work no one will wait for.
+    shutdown: CancellationToken,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -598,8 +602,19 @@ impl MemoryServer {
             evaluating: Arc::new(AtomicBool::new(false)),
             previous_window_average: Arc::new(Mutex::new(None)),
             producer: OnceLock::new(),
+            shutdown: CancellationToken::new(),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Ties this server to the daemon's shutdown token.
+    pub(crate) fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     /// Stamps `id` as this connection's producer through `&self`. The
