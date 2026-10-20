@@ -1,8 +1,8 @@
 name: Event log soak
 
 # Deliberately no `pull_request` or `push` trigger. The full soak ingests a
-# million rows through the log-first write path and rebuilds them, which takes
-# minutes and would slow every PR. ci.yml's `test` job already runs the 10k-row
+# large row count through the log-first write path and rebuilds them, which takes
+# minutes and would slow every PR. ci.yml's `test` job already runs the
 # smoke test of the same helper. `schedule` plus `workflow_dispatch` are the
 # only ways in here; release.yml gates a tag on the same test.
 on:
@@ -27,5 +27,13 @@ jobs:
 
       # Release mode: the run is dominated by fsync and SQLite work, and an
       # unoptimised build would add hashing time for no extra coverage.
-      - name: Soak (1,000,000 rows ingested, rebuilt, compared)
-        run: cargo test --release -p liam-store soak_full_rebuild_loses_no_record -- --ignored
+      - name: Soak (rows ingested, rebuilt, compared)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `cargo test` exits 0 when a filter matches nothing, so require
+          # that the one soak test actually ran and passed.
+          cargo test --release -p liam-store -- --ignored --exact \
+            graph::tests::soak::soak_full_rebuild_loses_no_record \
+            --nocapture 2>&1 | tee soak.log
+          grep -q ' 1 passed' soak.log

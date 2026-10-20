@@ -23,11 +23,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          lookup-only: true
-      - name: Soak (1,000,000 rows ingested, rebuilt, compared)
-        run: cargo test --release -p liam-store soak_full_rebuild_loses_no_record -- --ignored
+      - name: Soak (rows ingested, rebuilt, compared)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `cargo test` exits 0 when a filter matches nothing, so require
+          # that the one soak test actually ran and passed.
+          cargo test --release -p liam-store -- --ignored --exact \
+            graph::tests::soak::soak_full_rebuild_loses_no_record \
+            --nocapture 2>&1 | tee soak.log
+          grep -q ' 1 passed' soak.log
 
   # v1 targets macOS only, so there is one target and no matrix. This workflow
   # previously also built x86_64-unknown-linux-gnu and published it, which

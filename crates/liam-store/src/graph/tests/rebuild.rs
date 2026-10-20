@@ -275,6 +275,15 @@ pub(super) async fn oracle_multiset<B: Backend>(g: &Graph<B>) -> Vec<[u8; 32]> {
     hashes
 }
 
+/// The sorted multiset of hashes of every node and edge row, closed ones
+/// included, so a changed or dropped superseded row shows.
+pub(super) async fn all_rows_multiset<B: Backend>(g: &Graph<B>) -> Vec<[u8; 32]> {
+    let mut hashes = node_hashes(g, "1 = 1").await;
+    hashes.extend(edge_hashes(g, "1 = 1").await);
+    hashes.sort();
+    hashes
+}
+
 async fn node_hash<B: Backend>(g: &Graph<B>, id: &str) -> [u8; 32] {
     node_hashes(g, &format!("id = '{id}'")).await[0]
 }
