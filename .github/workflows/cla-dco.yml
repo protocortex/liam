@@ -44,6 +44,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: main
+          persist-credentials: false
 
       - name: Check DCO (Signed-off-by on all commits)
         if: github.event_name == 'pull_request_target'
@@ -263,9 +264,12 @@ jobs:
       - name: Fail if checks don't pass
         if: github.event_name == 'pull_request_target'
         run: |
-          DCO="${{ steps.dco.outputs.dco_pass }}"
-          CLA="${{ steps.cla.outputs.cla_pass }}"
+          DCO="${STEPS_DCO_OUTPUTS_DCO_PASS}"
+          CLA="${STEPS_CLA_OUTPUTS_CLA_PASS}"
           if [ "$DCO" != "true" ] || [ "$CLA" != "true" ]; then
             echo "DCO: $DCO, CLA: $CLA"
             exit 1
           fi
+        env:
+          STEPS_DCO_OUTPUTS_DCO_PASS: ${{ steps.dco.outputs.dco_pass }}
+          STEPS_CLA_OUTPUTS_CLA_PASS: ${{ steps.cla.outputs.cla_pass }}

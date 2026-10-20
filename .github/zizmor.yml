@@ -1,0 +1,13 @@
+# zizmor configuration. Each ignore states why the finding is accepted.
+rules:
+  dangerous-triggers:
+    ignore:
+      # cla-dco needs `pull_request_target` and `issue_comment` to comment on and
+      # label PRs from forks. It checks out `main` only and never runs PR head
+      # code (see the SAFETY note at the top of the file).
+      - cla-dco.yml
+  template-injection:
+    ignore:
+      # Informational findings in the same workflow: the expanded values are
+      # numeric PR ids and repository names from the event payload.
+      - cla-dco.yml
