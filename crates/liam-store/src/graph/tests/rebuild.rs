@@ -267,10 +267,19 @@ async fn edge_hashes<B: Backend>(g: &Graph<B>, filter: &str) -> Vec<[u8; 32]> {
 
 /// The sorted multiset of hashes of every live node and edge, computed
 /// independently of the store's own method.
-async fn oracle_multiset<B: Backend>(g: &Graph<B>) -> Vec<[u8; 32]> {
+pub(super) async fn oracle_multiset<B: Backend>(g: &Graph<B>) -> Vec<[u8; 32]> {
     let live = format!("tx_to = {}", FOREVER.0);
     let mut hashes = node_hashes(g, &live).await;
     hashes.extend(edge_hashes(g, &live).await);
+    hashes.sort();
+    hashes
+}
+
+/// The sorted multiset of hashes of every node and edge row, closed ones
+/// included, so a changed or dropped superseded row shows.
+pub(super) async fn all_rows_multiset<B: Backend>(g: &Graph<B>) -> Vec<[u8; 32]> {
+    let mut hashes = node_hashes(g, "1 = 1").await;
+    hashes.extend(edge_hashes(g, "1 = 1").await);
     hashes.sort();
     hashes
 }

@@ -1,0 +1,39 @@
+name: Event log soak
+
+# Deliberately no `pull_request` or `push` trigger. The full soak ingests a
+# large row count through the log-first write path and rebuilds them, which takes
+# minutes and would slow every PR. ci.yml's `test` job already runs the
+# smoke test of the same helper. `schedule` plus `workflow_dispatch` are the
+# only ways in here; release.yml gates a tag on the same test.
+on:
+  schedule:
+    - cron: '0 7 * * 1' # Monday 07:00 UTC
+  workflow_dispatch:
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Release mode: the run is dominated by fsync and SQLite work, and an
+      # unoptimised build would add hashing time for no extra coverage.
+      - name: Soak (rows ingested, rebuilt, compared)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `cargo test` exits 0 when a filter matches nothing, so require
+          # that the one soak test actually ran and passed.
+          cargo test --release -p liam-store -- --ignored --exact \
+            graph::tests::soak::soak_full_rebuild_loses_no_record \
+            --nocapture 2>&1 | tee soak.log
+          grep -q ' 1 passed' soak.log

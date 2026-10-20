@@ -6,14 +6,43 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # Gate: a tag must not publish if the event log loses a record at scale. The
+  # same test runs weekly in log-soak.yml; here it blocks the release job.
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Soak (rows ingested, rebuilt, compared)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `cargo test` exits 0 when a filter matches nothing, so require
+          # that the one soak test actually ran and passed.
+          cargo test --release -p liam-store -- --ignored --exact \
+            graph::tests::soak::soak_full_rebuild_loses_no_record \
+            --nocapture 2>&1 | tee soak.log
+          grep -q ' 1 passed' soak.log
+
   # v1 targets macOS only, so there is one target and no matrix. This workflow
   # previously also built x86_64-unknown-linux-gnu and published it, which
   # shipped an artifact for an unsupported platform.
   release:
+    needs: soak
     runs-on: macos-latest
+    # Publishing the release asset is the only step that writes.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
