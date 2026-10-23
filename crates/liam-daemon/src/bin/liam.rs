@@ -32,6 +32,7 @@ use liam_daemon::config::{resolve_config_source, Config};
 use liam_daemon::embedder_fingerprint::{self, EmbedderFingerprint};
 use liam_daemon::event_log;
 use liam_daemon::models::{self, StoreEmbedder};
+use liam_daemon::retrieval_eval::{run_retrieval_eval, EvalModel, EvalReport};
 use liam_daemon::storelock::StoreLock;
 use liam_daemon::telemetry;
 
@@ -62,6 +63,34 @@ enum Command {
     /// result against the log row by row. Refuses while a daemon holds the
     /// store.
     Rebuild(RebuildArgs),
+    /// Measure how well the local models retrieve, on a fixed synthetic
+    /// question set.
+    Eval(EvalArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct EvalArgs {
+    #[command(subcommand)]
+    command: EvalCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum EvalCommand {
+    /// Score retrieval quality, embedder latency and throughput for one
+    /// embedding model. Downloads the model on first use.
+    Retrieval(RetrievalArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct RetrievalArgs {
+    /// The embedding model to evaluate: Qwen/Qwen3-Embedding-0.6B or
+    /// BAAI/bge-m3.
+    #[arg(long, value_name = "ID")]
+    model: EvalModel,
+
+    /// Print the report as JSON instead of text. Latencies are milliseconds.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -110,7 +139,27 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Eval(EvalArgs {
+            command: EvalCommand::Retrieval(args),
+        }) => {
+            tracing::debug!(model = args.model.id(), "eval retrieval: starting");
+            let runtime = tokio::runtime::Runtime::new()?;
+            let report = runtime.block_on(run_retrieval_eval(args.model, &config))?;
+            print!("{}", render_eval_report(&report, args.json)?);
+            Ok(())
+        }
     }
+}
+
+/// The report as `liam eval retrieval` prints it: the harness's text table, or
+/// its serde shape as pretty JSON.
+fn render_eval_report(report: &EvalReport, json: bool) -> anyhow::Result<String> {
+    if !json {
+        return Ok(report.render());
+    }
+    let mut text = serde_json::to_string_pretty(report).context("serializing the report")?;
+    text.push('\n');
+    Ok(text)
 }
 
 /// The segment sizes of the log a rebuild opens. A rebuild appends only the
@@ -496,6 +545,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use liam_daemon::retrieval_eval::evaluate_embedder;
     use liam_log::dedup::BloomConfig;
     use liam_store::{Backend, DefaultBackend, NewNode, FOREVER};
 
@@ -509,6 +559,111 @@ mod tests {
             parse(&["liam", "fetch-models"]).command,
             Command::FetchModels
         );
+    }
+
+    fn retrieval_args(cli: Cli) -> RetrievalArgs {
+        match cli.command {
+            Command::Eval(EvalArgs {
+                command: EvalCommand::Retrieval(args),
+            }) => args,
+            other => panic!("expected the eval retrieval subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_retrieval_takes_a_model_and_prints_text_by_default() {
+        // Arrange / Act
+        let args = retrieval_args(parse(&[
+            "liam",
+            "eval",
+            "retrieval",
+            "--model",
+            "BAAI/bge-m3",
+        ]));
+
+        // Assert
+        assert_eq!(args.model, EvalModel::BgeM3);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn eval_retrieval_takes_a_json_flag() {
+        // Arrange / Act
+        let args = retrieval_args(parse(&[
+            "liam",
+            "eval",
+            "retrieval",
+            "--model",
+            "Qwen/Qwen3-Embedding-0.6B",
+            "--json",
+        ]));
+
+        // Assert
+        assert_eq!(args.model, EvalModel::Qwen3);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn eval_retrieval_requires_a_model() {
+        // Act
+        let error = Cli::try_parse_from(["liam", "eval", "retrieval"])
+            .expect_err("a run with no model must not parse");
+
+        // Assert
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn eval_retrieval_refuses_an_unknown_model_naming_it_and_the_supported_ones() {
+        // Act
+        let error =
+            Cli::try_parse_from(["liam", "eval", "retrieval", "--model", "acme/embed-9000"])
+                .expect_err("an unknown model must not parse");
+
+        // Assert
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert_eq!(error.exit_code(), 2);
+        let message = error.to_string();
+        assert!(message.contains("acme/embed-9000"), "{message}");
+        assert!(message.contains("BAAI/bge-m3"), "{message}");
+    }
+
+    async fn mock_report() -> EvalReport {
+        evaluate_embedder(&liam_model::MockEmbedder::new(8), "mock")
+            .await
+            .expect("mock run succeeds")
+    }
+
+    #[tokio::test]
+    async fn the_text_report_is_the_harness_rendering() {
+        // Arrange
+        let report = mock_report().await;
+
+        // Act
+        let text = render_eval_report(&report, false).expect("renders");
+
+        // Assert
+        assert_eq!(text, report.render());
+    }
+
+    #[tokio::test]
+    async fn the_json_report_is_the_serde_shape_with_latency_in_milliseconds() {
+        // Arrange
+        let report = mock_report().await;
+
+        // Act
+        let text = render_eval_report(&report, true).expect("renders");
+
+        // Assert
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["model_id"], "mock");
+        assert_eq!(value["per_category"].as_array().map(Vec::len), Some(8));
+        assert!(value["timings"]["mean_latency_ms"].is_number());
+        assert!(text.ends_with('\n'));
     }
 
     /// A bare `liam` must not do anything. `liamd` treats no subcommand as

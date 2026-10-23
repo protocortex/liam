@@ -23,8 +23,7 @@ pub const BGE_M3_MODEL_ID: &str = "BAAI/bge-m3";
 
 /// BGE-M3's output width. It has no Matryoshka truncation, so it is also the
 /// only `embedding_dims` this embedder accepts.
-#[cfg(any(test, feature = "local"))]
-const BGE_M3_DIMS: usize = 1024;
+pub const BGE_M3_DIMS: usize = 1024;
 
 /// Inputs per ONNX run. fastembed's default of 256 pads the whole batch to its
 /// longest input, which wastes memory on one long text; a small batch bounds it.
