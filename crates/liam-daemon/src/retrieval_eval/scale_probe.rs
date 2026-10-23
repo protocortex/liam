@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use liam_store::{DefaultGraph, GraphConfig, NewNode, Query};
+use liam_store::{Backend, DefaultBackend, DefaultGraph, GraphConfig, NewNode, Query};
 
 /// Embedding widths to probe: LIAM's configured Qwen3 width and BGE-M3's.
 const PROBE_DIMS: [usize; 2] = [768, 1024];
@@ -72,6 +72,18 @@ fn on_disk_bytes(database: &Path) -> u64 {
         .filter_map(|path| std::fs::metadata(path).ok())
         .map(|meta| meta.len())
         .sum()
+}
+
+/// Folds the write-ahead log into the database file, so the byte counts
+/// compare stored data and not however much log each store happened to hold.
+async fn checkpoint(database: &Path) {
+    let backend = DefaultBackend::open(database.to_str().expect("utf-8 temp path"), 1)
+        .await
+        .expect("open for checkpoint");
+    backend
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+        .await
+        .expect("checkpoint");
 }
 
 async fn filled_store(
@@ -147,6 +159,8 @@ async fn scale_probe() {
         let text_db = dir.path().join("text.db");
         let embedded = filled_store(&embedded_db, dims, DISK_COMPARISON_SIZE, true).await;
         let text_only = filled_store(&text_db, dims, DISK_COMPARISON_SIZE, false).await;
+        checkpoint(&embedded_db).await;
+        checkpoint(&text_db).await;
         let added = on_disk_bytes(&embedded_db).saturating_sub(on_disk_bytes(&text_db));
         let per_vector = added as f64 / DISK_COMPARISON_SIZE as f64;
         println!(

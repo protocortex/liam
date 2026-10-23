@@ -15,7 +15,7 @@
   the two models run on different runtimes (ONNX for BGE-M3, candle for Qwen3),
   so that is a measurement of the stacks, not of the models.
 - BGE-M3 costs more: 2.1 GB of weights against 1.1 GB, and 1024-wide vectors
-  against 768-wide ones (4.64 GB against 4.13 GB on disk per million).
+  against 768-wide ones (4.65 GB against 4.14 GB on disk per million).
 - Brute-force search costs about 3.2 ms per 1,000 stored vectors. It crosses a
   100 ms query budget at roughly 30,000 embedded nodes.
 - **An ANN index is not justified at LIAM's current scale.** The decision rule
@@ -27,7 +27,7 @@
 |---|---|
 | Machine | Apple M1 Pro, 16 GiB RAM |
 | OS | macOS 15.8.1 |
-| Toolchain | rustc 1.99.1, release build, `--features local` |
+| Toolchain | rustc 1.99.0, release build, `--features local` |
 | Code | `main` at `658977e` plus the CLI in this PR |
 | Date | 2026-10-23 |
 | Command | `liam eval retrieval --model <id> [--json]` |
@@ -117,10 +117,10 @@ Which parts are measured and which are arithmetic:
 |---|---|---|---|
 | Model weights on disk | 1.1 GB | 2.1 GB | Measured (`du` of the cache directory) |
 | Raw vector bytes | 3,072 B | 4,096 B | Arithmetic: dims x 4 bytes (f32) |
-| Bytes a vector adds to the database | 4,128 B | 4,640 B | Measured at 10,000 rows: size of an embedded store minus a text-only store with the same nodes, divided by 10,000 |
-| Overhead over raw | 1,056 B (34%) | 544 B (13%) | Arithmetic: row above minus raw |
-| Disk per million vectors | 4.13 GB | 4.64 GB | Arithmetic: measured bytes per vector x 1,000,000 |
-| RAM per million vectors if fully cached | 4.13 GB | 4.64 GB | Arithmetic: assumes the page cache holds every vector page |
+| Bytes a vector adds to the database | 4,142 B | 4,646 B | Measured at 10,000 rows: size of an embedded store minus a text-only store with the same nodes, divided by 10,000 |
+| Overhead over raw | 1,070 B (35%) | 550 B (13%) | Arithmetic: row above minus raw |
+| Disk per million vectors | 4.14 GB | 4.65 GB | Arithmetic: measured bytes per vector x 1,000,000 |
+| RAM per million vectors if fully cached | 4.14 GB | 4.65 GB | Arithmetic: assumes the page cache holds every vector page |
 | Process RAM, model loaded | about 2.0 GB | about 1.9 GB | Measured, see above |
 
 The store scans vectors through SQLite pages, so it does not hold a vector
@@ -200,6 +200,6 @@ an index.
 
 The numbers give no quality reason to change the default. BGE-M3 is faster in
 this daemon and smaller in memory, and larger on disk, and it is fixed at
-1024 dimensions (no truncation), which raises storage per vector by a third.
+1024 dimensions (no truncation), which raises storage per vector by about 12%.
 Qwen3 at 768 dimensions is already configured. Revisit when a larger, less
 synthetic question set exists, since this one cannot rank the two.

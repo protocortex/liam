@@ -545,7 +545,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use liam_daemon::retrieval_eval::evaluate_embedder;
+    use liam_daemon::retrieval_eval::{evaluate_embedder, Category};
     use liam_log::dedup::BloomConfig;
     use liam_store::{Backend, DefaultBackend, NewNode, FOREVER};
 
@@ -633,7 +633,7 @@ mod tests {
     }
 
     async fn mock_report() -> EvalReport {
-        evaluate_embedder(&liam_model::MockEmbedder::new(8), "mock")
+        evaluate_embedder(&liam_model::MockEmbedder::new(DIMS), "mock")
             .await
             .expect("mock run succeeds")
     }
@@ -661,7 +661,10 @@ mod tests {
         // Assert
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
         assert_eq!(value["model_id"], "mock");
-        assert_eq!(value["per_category"].as_array().map(Vec::len), Some(8));
+        assert_eq!(
+            value["per_category"].as_array().map(Vec::len),
+            Some(Category::ALL.len())
+        );
         assert!(value["timings"]["mean_latency_ms"].is_number());
         assert!(text.ends_with('\n'));
     }

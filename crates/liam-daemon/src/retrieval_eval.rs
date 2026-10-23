@@ -146,6 +146,8 @@ use serde::Serialize;
 use crate::config::Config;
 #[cfg(feature = "local")]
 use crate::models;
+#[cfg(any(test, feature = "local"))]
+use crate::models::LOCAL_PROVIDER;
 
 mod golden_set;
 #[cfg(test)]
@@ -797,11 +799,17 @@ pub async fn run_retrieval_eval(model: EvalModel, config: &Config) -> anyhow::Re
 
 #[cfg(feature = "local")]
 fn load_embedder(model: EvalModel, config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
+    models::build_embedder(&eval_config(model, config))
+}
+
+/// `config` rewritten to load `model` in-process at the width it runs at.
+#[cfg(any(test, feature = "local"))]
+fn eval_config(model: EvalModel, config: &Config) -> Config {
     let mut config = config.clone();
     config.embedder.provider = LOCAL_PROVIDER.to_string();
     config.embedder.model = model.id().to_string();
     config.embedding_dims = model.dims(config.embedding_dims);
-    models::build_embedder(&config)
+    config
 }
 
 #[cfg(not(feature = "local"))]
@@ -812,10 +820,6 @@ fn load_embedder(model: EvalModel, _config: &Config) -> anyhow::Result<Arc<dyn E
         model.id()
     )
 }
-
-/// The `embedder.provider` value that selects the in-process models.
-#[cfg(feature = "local")]
-const LOCAL_PROVIDER: &str = "local";
 
 /// Inserts every `CORPUS` fact into `store` and returns label to id.
 ///
@@ -2236,6 +2240,30 @@ mod tests {
         assert_eq!(EvalModel::BgeM3.dims(configured), liam_model::BGE_M3_DIMS);
     }
 
+    #[test]
+    fn eval_config_selects_the_local_provider_model_and_width_for_each_model() {
+        // Arrange
+        let mut base = Config::default();
+        base.embedder.provider = "mock".to_string();
+        base.embedder.model = "other".to_string();
+        base.embedding_dims = 768;
+
+        for model in EvalModel::ALL {
+            // Act
+            let config = eval_config(model, &base);
+
+            // Assert
+            assert_eq!(config.embedder.provider, LOCAL_PROVIDER);
+            assert_eq!(config.embedder.model, model.id());
+            assert_eq!(config.embedding_dims, model.dims(base.embedding_dims));
+        }
+        assert_eq!(
+            eval_config(EvalModel::BgeM3, &base).embedding_dims,
+            liam_model::BGE_M3_DIMS
+        );
+        assert_eq!(eval_config(EvalModel::Qwen3, &base).embedding_dims, 768);
+    }
+
     /// The report fields that depend on wall-clock time: every key of
     /// `timings` except the call and item counts.
     const TIMING_FIELDS: [&str; 3] = ["total_ms", "mean_latency_ms", "throughput_per_sec"];
@@ -2472,7 +2500,8 @@ mod real_embedder_run {
     /// Given the same real model and corpus, when the harness runs twice,
     /// then the ranking-derived metrics match to within `EPSILON`. Not exact
     /// equality: multi-threaded matrix kernels may reduce in a different
-    /// order across runs and flip a near-tied ranking.
+    /// order across runs, and `EPSILON` only tolerates the resulting float
+    /// noise, not a changed ranking.
     #[tokio::test]
     #[ignore = "downloads embedder weights; see module doc for the run command"]
     async fn two_real_runs_agree_on_every_ranking_metric() {
