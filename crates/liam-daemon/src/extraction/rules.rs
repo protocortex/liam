@@ -81,7 +81,6 @@ pub fn extract_rules(
     max_chars: usize,
 ) -> Vec<RuleFact> {
     let scan = Scan::new(text, max_chars);
-    let text = scan.window();
     let event_subject = format!("{EVENT_SUBJECT_PREFIX}{event_id}");
     let fact = |subject: &str, predicate: &str, object: &str| RuleFact {
         subject: subject.to_string(),
@@ -103,7 +102,7 @@ pub fn extract_rules(
         );
     }
     facts.extend(
-        find_entities(text, known_entities)
+        find_entities(&scan, known_entities)
             .iter()
             .map(|key| fact(key, PREDICATE_MENTIONED_IN, &event_subject)),
     );
@@ -258,19 +257,24 @@ fn find_ids(scan: &Scan) -> Vec<String> {
 /// The keys of the known entities that appear as whole words, matched case
 /// insensitively. A key is the entity name trimmed and lower-cased, the same
 /// normalization the store applies to entity pages.
-fn find_entities(text: &str, known_entities: &[String]) -> BTreeSet<String> {
+fn find_entities(scan: &Scan<'_>, known_entities: &[String]) -> BTreeSet<String> {
     if known_entities.is_empty() {
         return BTreeSet::new();
     }
-    let haystack = text.to_lowercase();
+    // Word boundaries are judged on the full text, so a name cut by the cap
+    // is not taken for a shorter whole word; a match must still end inside
+    // the window.
+    let haystack = scan.full.to_lowercase();
+    let window_end = scan.window().to_lowercase().len();
     known_entities
         .iter()
         .map(|name| name.trim().to_lowercase())
         .filter(|key| !key.is_empty())
         .filter(|key| {
-            haystack
-                .match_indices(key.as_str())
-                .any(|(start, found)| is_whole_word(&haystack, start, start + found.len()))
+            haystack.match_indices(key.as_str()).any(|(start, found)| {
+                let end = start + found.len();
+                end <= window_end && is_whole_word(&haystack, start, end)
+            })
         })
         .collect()
 }
@@ -581,6 +585,21 @@ mod tests {
 
         // Assert
         assert_eq!(facts.len(), 2);
+    }
+
+    #[test]
+    fn an_entity_cut_by_the_cap_is_not_taken_for_a_shorter_word() {
+        // Arrange: "Alicex" is cut after "Alice" by the cap
+        let text = "Alicex went home";
+        let cap = "Alice".chars().count();
+
+        // Act
+        let cut = extract_rules(EVENT, text, &["Alice".to_string()], cap);
+        let whole = extract_rules(EVENT, "Alice went home", &["Alice".to_string()], cap);
+
+        // Assert
+        assert!(cut.is_empty(), "{cut:?}");
+        assert_eq!(whole.len(), 1);
     }
 
     #[test]
