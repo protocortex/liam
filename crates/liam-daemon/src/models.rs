@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use liam_model::llm::DevicePreference;
-use liam_model::{Embedder, IdentityReranker, Llm, MockEmbedder, MockLlm, Reranker};
+use liam_model::{Embedder, IdentityReranker, Llm, MockEmbedder, MockLlm, Reranker, TextKind};
 use liam_store::{ContentEmbedder, EmbedError};
 
 use crate::config::{self, Config};
@@ -91,7 +91,7 @@ pub struct StoreEmbedder(pub Arc<dyn Embedder>);
 #[async_trait]
 impl ContentEmbedder for StoreEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        Ok(self.0.embed(text).await?)
+        Ok(self.0.embed(text, TextKind::Document).await?)
     }
 }
 
@@ -353,7 +353,7 @@ mod tests {
             8
         }
 
-        async fn embed(&self, _text: &str) -> liam_model::error::Result<Vec<f32>> {
+        async fn embed(&self, _text: &str, _kind: TextKind) -> liam_model::error::Result<Vec<f32>> {
             Err(liam_model::error::ModelError::Embed("no model".into()))
         }
     }
@@ -362,7 +362,7 @@ mod tests {
     async fn the_store_embedder_returns_the_vector_its_embedder_made() {
         // Arrange
         let embedder = Arc::new(MockEmbedder::new(8));
-        let expected = embedder.embed("alpha").await.unwrap();
+        let expected = embedder.embed("alpha", TextKind::Document).await.unwrap();
 
         // Act
         let vector = StoreEmbedder(embedder).embed("alpha").await.unwrap();
@@ -370,6 +370,38 @@ mod tests {
         // Assert
         assert_eq!(vector, expected);
         assert_eq!(vector.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn the_store_embedder_embeds_as_a_document() {
+        // Arrange
+        struct KindRecorder(std::sync::Mutex<Vec<TextKind>>);
+
+        #[async_trait]
+        impl Embedder for KindRecorder {
+            fn dims(&self) -> usize {
+                8
+            }
+
+            async fn embed(
+                &self,
+                _text: &str,
+                kind: TextKind,
+            ) -> liam_model::error::Result<Vec<f32>> {
+                self.0.lock().unwrap().push(kind);
+                Ok(vec![0.0; 8])
+            }
+        }
+        let recorder = Arc::new(KindRecorder(std::sync::Mutex::new(Vec::new())));
+
+        // Act
+        StoreEmbedder(recorder.clone())
+            .embed("alpha")
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(*recorder.0.lock().unwrap(), vec![TextKind::Document]);
     }
 
     #[tokio::test]

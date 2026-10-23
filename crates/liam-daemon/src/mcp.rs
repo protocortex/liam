@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use liam_model::{Embedder, Llm, Reranker};
+use liam_model::{Embedder, Llm, Reranker, TextKind};
 use liam_store::types::{EpisodeEdge, EpisodeRef};
 use liam_store::{relation, DefaultGraph, NewNode, Query};
 use rmcp::handler::server::wrapper::Parameters;
@@ -773,7 +773,7 @@ impl MemoryServer {
         }
 
         let Some(episode) = args.episode else {
-            let embedding = match self.embedder.embed(&args.content).await {
+            let embedding = match self.embedder.embed(&args.content, TextKind::Document).await {
                 Ok(v) => v,
                 Err(e) => return format!("embed failed: {e}"),
             };
@@ -838,7 +838,7 @@ impl MemoryServer {
         // build the combined node list in order: index 0 is the top-level
         // fact, 1..=fact_count is episode.facts, and
         // 1+fact_count..1+fact_count+entity_count is episode.entities.
-        let embedding = match self.embedder.embed(&args.content).await {
+        let embedding = match self.embedder.embed(&args.content, TextKind::Document).await {
             Ok(v) => v,
             Err(e) => return format!("embed failed: {e}"),
         };
@@ -863,7 +863,7 @@ impl MemoryServer {
         nodes.push(top);
 
         for fact in episode.facts {
-            let embedding = match self.embedder.embed(&fact.content).await {
+            let embedding = match self.embedder.embed(&fact.content, TextKind::Document).await {
                 Ok(v) => v,
                 Err(e) => return format!("embed failed: {e}"),
             };
@@ -1032,7 +1032,7 @@ impl MemoryServer {
             Ok(content) => content,
             Err(e) => return Err(format!("{label}: {e}")),
         };
-        let embedding = match self.embedder.embed(&new_content).await {
+        let embedding = match self.embedder.embed(&new_content, TextKind::Document).await {
             Ok(v) => v,
             Err(e) => return Err(format!("{label}: {e}")),
         };
@@ -1054,7 +1054,7 @@ impl MemoryServer {
     // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Retrieve relevant long-term memory, reranked for precision.")]
     pub(crate) async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
-        let embedding = self.embedder.embed(&args.query).await.ok();
+        let embedding = self.embedder.embed(&args.query, TextKind::Query).await.ok();
         let q = build_query(
             &args.query,
             args.k,
@@ -1332,7 +1332,11 @@ impl MemoryServer {
     // path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
-        let embedding = self.embedder.embed(&args.question).await.ok();
+        let embedding = self
+            .embedder
+            .embed(&args.question, TextKind::Query)
+            .await
+            .ok();
         let k = clamp_ask_k(args.k);
         let q = build_query(
             &args.question,
@@ -1455,27 +1459,32 @@ mod tests {
         }
     }
 
-    /// Wraps a real `Embedder`, counting every `embed` call, so a test can
-    /// assert exactly how many calls one `remember` invocation made.
+    /// Wraps a real `Embedder`, recording every `(text, kind)` it is asked to
+    /// embed, so a test can assert how many calls one handler made and in
+    /// which role.
     /// `MockEmbedder` itself has no counter of its own; this follows the
     /// same small-custom-double pattern as `FailingLlm`/`FailingReranker`
     /// above, delegating the real work to the wrapped embedder instead of
     /// faking a result.
     struct CountingEmbedder {
         inner: liam_model::MockEmbedder,
-        calls: std::sync::atomic::AtomicUsize,
+        calls: std::sync::Mutex<Vec<(String, TextKind)>>,
     }
 
     impl CountingEmbedder {
         fn new(dims: usize) -> Self {
             Self {
                 inner: liam_model::MockEmbedder::new(dims),
-                calls: std::sync::atomic::AtomicUsize::new(0),
+                calls: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn call_count(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+            self.calls().len()
+        }
+
+        fn calls(&self) -> Vec<(String, TextKind)> {
+            self.calls.lock().unwrap().clone()
         }
     }
 
@@ -1484,9 +1493,9 @@ mod tests {
         fn dims(&self) -> usize {
             self.inner.dims()
         }
-        async fn embed(&self, text: &str) -> liam_model::Result<Vec<f32>> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.embed(text).await
+        async fn embed(&self, text: &str, kind: TextKind) -> liam_model::Result<Vec<f32>> {
+            self.calls.lock().unwrap().push((text.to_string(), kind));
+            self.inner.embed(text, kind).await
         }
     }
 
@@ -3332,6 +3341,147 @@ mod tests {
             server.store.resolve_handle(&second_entity_id).await.is_ok(),
             "second entity's id should be live"
         );
+    }
+
+    /// In-memory server over a recording embedder, plus that embedder.
+    async fn server_with_recording_embedder() -> (MemoryServer, Arc<CountingEmbedder>) {
+        server_with_recording_embedder_and_llm(Arc::new(liam_model::MockLlm)).await
+    }
+
+    async fn server_with_recording_embedder_and_llm(
+        llm: Arc<dyn Llm>,
+    ) -> (MemoryServer, Arc<CountingEmbedder>) {
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        let embedder = Arc::new(CountingEmbedder::new(8));
+        let server = MemoryServer::new(
+            Arc::new(store),
+            embedder.clone(),
+            Arc::new(liam_model::IdentityReranker),
+            llm,
+            30,
+            false,
+            8192,
+            1,
+        );
+        (server, embedder)
+    }
+
+    #[tokio::test]
+    async fn recall_embeds_the_query_as_a_query() {
+        // Arrange
+        let (server, embedder) = server_with_recording_embedder().await;
+
+        // Act
+        server
+            .recall(Parameters(RecallArgs {
+                query: "where do I live".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+
+        // Assert
+        assert_eq!(
+            embedder.calls(),
+            vec![("where do I live".to_string(), TextKind::Query)]
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_embeds_the_question_as_a_query() {
+        // Arrange
+        let (server, embedder) = server_with_recording_embedder().await;
+
+        // Act
+        server
+            .ask(Parameters(AskArgs {
+                question: "where do I live".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+            }))
+            .await;
+
+        // Assert
+        assert_eq!(
+            embedder.calls(),
+            vec![("where do I live".to_string(), TextKind::Query)]
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_embeds_the_content_as_a_document() {
+        // Arrange
+        let (server, embedder) = server_with_recording_embedder().await;
+
+        // Act
+        let out = server
+            .remember(Parameters(remember_args("I live in Lisbon")))
+            .await;
+
+        // Assert
+        assert!(!out.contains("failed"), "{out}");
+        assert_eq!(
+            embedder.calls(),
+            vec![("I live in Lisbon".to_string(), TextKind::Document)]
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_episode_embeds_the_top_fact_and_every_nested_fact_as_documents() {
+        // Arrange
+        let (server, embedder) = server_with_recording_embedder().await;
+
+        // Act
+        let out = server
+            .remember(Parameters(RememberArgs {
+                episode: Some(EpisodeArgs {
+                    facts: vec![episode_fact("nested fact content")],
+                    entities: vec![],
+                    edges: vec![],
+                }),
+                ..remember_args("top fact content")
+            }))
+            .await;
+
+        // Assert
+        assert!(!out.contains("failed"), "{out}");
+        assert_eq!(
+            embedder.calls(),
+            vec![
+                ("top fact content".to_string(), TextKind::Document),
+                ("nested fact content".to_string(), TextKind::Document),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resynthesize_entity_embeds_the_new_content_as_a_document() {
+        // Arrange
+        let (server, embedder) =
+            server_with_recording_embedder_and_llm(Arc::new(CountingLlm::new())).await;
+        let entity_id = server
+            .store
+            .upsert_by(NewNode::entity("person", "Kim"))
+            .await
+            .expect("seed entity");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        server
+            .resynthesize_entity(entity_id, deadline, ENTITY_SYNTHESIS_MAX_NEW_TOKENS)
+            .await
+            .expect("resynthesis should succeed");
+
+        // Assert
+        let calls = embedder.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].1, TextKind::Document);
     }
 
     #[tokio::test]

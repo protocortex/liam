@@ -2350,7 +2350,7 @@ mod real_embedder_run {
     async fn real_embedder_tier_scores_every_category_including_vector_semantic() {
         use std::sync::Arc;
 
-        use liam_model::Embedder;
+        use liam_model::{Embedder, TextKind};
         use liam_store::{DefaultGraph, FixedClock, GraphConfig, NewNode};
 
         // Arrange: load the real embedder first, since its output width
@@ -2375,7 +2375,10 @@ mod real_embedder_run {
 
         // Untimed warm-up so one-off model initialisation does not inflate
         // the first timed call.
-        embedder.embed("warm-up").await.expect("warm-up embed");
+        embedder
+            .embed("warm-up", TextKind::Document)
+            .await
+            .expect("warm-up embed");
 
         // Same bitemporal-clock pattern as the text-only tier's test above
         // (see its comment for why `DefaultGraph::open`'s real clock would
@@ -2400,7 +2403,7 @@ mod real_embedder_run {
 
             let started = Instant::now();
             let embedding = embedder
-                .embed(fact.content)
+                .embed(fact.content, TextKind::Document)
                 .await
                 .expect("embed corpus fact");
             timings.record(1, started.elapsed());
@@ -2439,7 +2442,7 @@ mod real_embedder_run {
             let embedding = if question.category == Category::VectorSemantic {
                 let started = Instant::now();
                 let embedding = embedder
-                    .embed(question.query_text)
+                    .embed(question.query_text, TextKind::Query)
                     .await
                     .expect("embed VectorSemantic query");
                 timings.record(1, started.elapsed());

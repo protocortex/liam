@@ -907,7 +907,11 @@ mod tests {
             DIMS
         }
 
-        async fn embed(&self, _text: &str) -> liam_model::Result<Vec<f32>> {
+        async fn embed(
+            &self,
+            _text: &str,
+            _kind: liam_model::TextKind,
+        ) -> liam_model::Result<Vec<f32>> {
             Err(liam_model::ModelError::Embed("injected failure".into()))
         }
     }
@@ -1173,6 +1177,11 @@ mod tests {
         let mut config = config_in(dir.path());
         config.log.dir = Some(other.to_str().unwrap().to_string());
         drop(standalone_log(&other));
+        crate::embedder_fingerprint::record(
+            Path::new(&config.database_path),
+            &crate::embedder_fingerprint::EmbedderFingerprint::from_config(&config),
+        )
+        .unwrap();
 
         // Act: a daemon that went on to serve would never return
         let outcome = tokio::time::timeout(

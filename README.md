@@ -247,6 +247,11 @@ edges from the log and checks the result against it, row by row. It needs the
 store to itself, so stop `liamd` first. The log directory is `--log-dir`, else
 `log.dir` from the config, else the default beside `--database`.
 
+Vectors stored before documents and queries were embedded separately carry the
+`query: ` prefix on documents too. After upgrading, run `liam rebuild --database
+PATH` once: it clears the stored vectors and re-embeds every live node as a
+document, which makes the store consistent.
+
 ### Upgrading a database that predates the log
 
 The first start with the log copies every row the database already holds into
