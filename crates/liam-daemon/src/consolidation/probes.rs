@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use liam_store::{DefaultGraph, NodeId, Query, Result};
+use liam_store::{DefaultGraph, NodeId, Query};
 
 use crate::retrieval_eval::{ndcg_at_10, recall_at_k};
 
@@ -16,11 +16,38 @@ const PROBE_K: usize = 10;
 const MARGIN_EPSILON: f64 = 1e-9;
 
 /// One query and the nodes a correct answer must contain.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Probe {
     pub name: String,
     pub query: String,
     pub relevant: Vec<NodeId>,
+    /// When set, the vector arm runs too; otherwise the probe is lexical only.
+    pub embedding: Option<Vec<f32>>,
+}
+
+/// Why a probe run failed.
+#[derive(Debug)]
+pub enum ProbeError {
+    /// Two probes share a name, so one score would silently replace the other.
+    DuplicateName(String),
+    Store(liam_store::Error),
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateName(name) => write!(f, "probe name {name:?} is used more than once"),
+            Self::Store(err) => write!(f, "the store could not answer a probe: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ProbeError {}
+
+impl From<liam_store::Error> for ProbeError {
+    fn from(err: liam_store::Error) -> Self {
+        Self::Store(err)
+    }
 }
 
 /// How one probe scored.
@@ -40,13 +67,18 @@ pub struct ProbeReport {
 ///
 /// # Errors
 ///
-/// Fails when the store cannot answer a query.
-pub async fn run_probes(store: &DefaultGraph, probes: &[Probe]) -> Result<ProbeReport> {
+/// Fails on a duplicate probe name, or when the store cannot answer a query.
+pub async fn run_probes(store: &DefaultGraph, probes: &[Probe]) -> Result<ProbeReport, ProbeError> {
     let mut report = ProbeReport::default();
     for probe in probes {
-        let hits = store
-            .query(&Query::text(probe.query.as_str()).with_k(PROBE_K))
-            .await?;
+        if report.scores.contains_key(&probe.name) {
+            return Err(ProbeError::DuplicateName(probe.name.clone()));
+        }
+        let mut query = Query::text(probe.query.as_str()).with_k(PROBE_K);
+        if let Some(embedding) = &probe.embedding {
+            query = query.with_embedding(embedding.clone());
+        }
+        let hits = store.query(&query).await?;
         let retrieved: Vec<String> = hits.iter().map(|hit| hit.id.as_str().to_string()).collect();
         let relevant: HashSet<&str> = probe.relevant.iter().map(NodeId::as_str).collect();
         let score = ProbeScore {
@@ -58,14 +90,19 @@ pub async fn run_probes(store: &DefaultGraph, probes: &[Probe]) -> Result<ProbeR
     Ok(report)
 }
 
-/// True when no probe present in both reports lost `margin` or more of its
-/// recall. A drop of exactly `margin` counts as a regression, so the check
-/// fails closed. A probe with no baseline has nothing to regress from.
+/// True when the run kept every baseline probe within `margin` of its recall.
+/// A drop of exactly `margin` counts as a regression, so the check fails
+/// closed. So does anything that leaves nothing to trust: an empty baseline or
+/// current report, a baseline probe missing from the current one, or a
+/// non-finite score or margin. A probe with no baseline is not checked.
 pub fn compare(baseline: &ProbeReport, current: &ProbeReport, margin: f64) -> bool {
-    !current.scores.iter().any(|(name, now)| {
-        baseline.scores.get(name).is_some_and(|before| {
+    if baseline.scores.is_empty() || current.scores.is_empty() || !margin.is_finite() {
+        return false;
+    }
+    baseline.scores.iter().all(|(name, before)| {
+        current.scores.get(name).is_some_and(|now| {
             let drop = before.recall - now.recall;
-            drop > 0.0 && drop + MARGIN_EPSILON >= margin
+            drop.is_finite() && !(drop > 0.0 && drop + MARGIN_EPSILON >= margin)
         })
     })
 }
@@ -181,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_ignores_a_probe_dropped_from_the_current_report() {
+    fn compare_flags_a_baseline_probe_missing_from_the_current_report() {
         // Arrange
         let baseline = report(&[("a", 0.5), ("gone", 1.0)]);
         let current = report(&[("a", 0.5)]);
@@ -190,7 +227,56 @@ mod tests {
         let ok = compare(&baseline, &current, MARGIN);
 
         // Assert
-        assert!(ok);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn compare_flags_an_empty_baseline() {
+        // Arrange
+        let current = report(&[("a", 1.0)]);
+
+        // Act
+        let ok = compare(&ProbeReport::default(), &current, MARGIN);
+
+        // Assert
+        assert!(!ok);
+    }
+
+    #[test]
+    fn compare_flags_an_empty_current_report() {
+        // Arrange
+        let baseline = report(&[("a", 1.0)]);
+
+        // Act
+        let ok = compare(&baseline, &ProbeReport::default(), MARGIN);
+
+        // Assert
+        assert!(!ok);
+    }
+
+    #[test]
+    fn compare_flags_a_non_finite_score() {
+        // Arrange
+        let baseline = report(&[("a", 0.5)]);
+        let current = report(&[("a", f64::NAN)]);
+
+        // Act
+        let ok = compare(&baseline, &current, MARGIN);
+
+        // Assert
+        assert!(!ok);
+    }
+
+    #[test]
+    fn compare_flags_a_non_finite_margin() {
+        // Arrange
+        let baseline = report(&[("a", 0.5)]);
+
+        // Act
+        let ok = compare(&baseline, &baseline, f64::NAN);
+
+        // Assert
+        assert!(!ok);
     }
 
     #[test]
@@ -222,6 +308,7 @@ mod tests {
             name: "quartz".into(),
             query: "quartz".into(),
             relevant: vec![found, missed],
+            embedding: None,
         }];
 
         // Act
@@ -251,6 +338,7 @@ mod tests {
             name: "quartz".into(),
             query: "quartz".into(),
             relevant: vec![a, b],
+            embedding: None,
         }];
         let baseline = run_probes(&before, &probes).await.unwrap();
         let other_dir = tempfile::tempdir().unwrap();
@@ -266,5 +354,59 @@ mod tests {
         // Assert
         assert!((baseline.scores["quartz"].recall - 1.0).abs() < 1e-12);
         assert!(!compare(&baseline, &current, MARGIN));
+    }
+
+    #[tokio::test]
+    async fn run_probes_rejects_a_duplicate_probe_name() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_file_store(&dir).await;
+        let probe = Probe {
+            name: "same".into(),
+            query: "quartz".into(),
+            relevant: Vec::new(),
+            embedding: None,
+        };
+        let probes = [probe.clone(), probe];
+
+        // Act
+        let result = run_probes(&store, &probes).await;
+
+        // Assert
+        assert!(matches!(result, Err(ProbeError::DuplicateName(name)) if name == "same"));
+    }
+
+    #[tokio::test]
+    async fn run_probes_uses_the_embedding_when_present() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_file_store(&dir).await;
+        let near = store
+            .insert(NewNode::now("fact", "near", "alpha").with_embedding(vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        let far = store
+            .insert(NewNode::now("fact", "far", "beta").with_embedding(vec![0.0, 1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        let probe = |name: &str, relevant: &NodeId, embedding: Option<Vec<f32>>| Probe {
+            name: name.into(),
+            query: "no lexical match".into(),
+            relevant: vec![relevant.clone()],
+            embedding,
+        };
+        let probes = [
+            probe("near", &near, Some(vec![1.0, 0.0, 0.0, 0.0])),
+            probe("far", &far, Some(vec![1.0, 0.0, 0.0, 0.0])),
+            probe("lexical", &near, None),
+        ];
+
+        // Act
+        let report = run_probes(&store, &probes).await.unwrap();
+
+        // Assert
+        assert!((report.scores["near"].ndcg - 1.0).abs() < 1e-12);
+        assert!(report.scores["far"].ndcg < 1.0);
+        assert!(report.scores["lexical"].recall.abs() < 1e-12);
     }
 }
