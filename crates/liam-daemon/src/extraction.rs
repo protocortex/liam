@@ -8,7 +8,10 @@
 
 pub mod client;
 pub mod grounding;
+mod http;
 mod iso_date;
 pub mod prompt;
 pub mod response;
 pub mod rules;
+#[cfg(test)]
+mod test_double;

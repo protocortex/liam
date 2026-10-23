@@ -27,6 +27,7 @@ pub enum ExtractError {
         limit: usize,
     },
     Malformed(&'static str),
+    InvalidRequest(&'static str),
     BadEnvelope,
 }
 
@@ -46,6 +47,7 @@ impl fmt::Display for ExtractError {
             Self::Truncated => write!(f, "the sidecar's response ended early"),
             Self::TooLarge { limit } => write!(f, "the sidecar's response is over {limit} bytes"),
             Self::Malformed(why) => write!(f, "the sidecar sent a malformed response: {why}"),
+            Self::InvalidRequest(why) => write!(f, "the request is invalid: {why}"),
             Self::BadEnvelope => write!(f, "the sidecar's response has no completion text"),
         }
     }
