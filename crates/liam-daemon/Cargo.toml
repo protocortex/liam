@@ -37,6 +37,9 @@ sha2 = { version = "0.11.0", default-features = false }
 # NFC composition so an accent typed as a combining mark still grounds.
 # MIT OR Apache-2.0, maintained under the unicode-rs organization.
 unicode-normalization = "0.1"
+# The run's seeded generator. ChaCha8 is portable across platforms and
+# releases, so a seed reproduces the same stream anywhere.
+rand_chacha = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
