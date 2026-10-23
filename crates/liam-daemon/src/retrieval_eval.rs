@@ -39,6 +39,12 @@
 //! `Graph`/`Query` dependency, so they are unit-tested directly below without
 //! opening a store.
 //!
+//! Two headline metrics at k=10 sit beside them: `recall_at_k` at 10
+//! (`recall@10`) and `ndcg_at_10` (`nDCG@10`, binary relevance). The
+//! real-embedder tier also prints an embed timing line (call count, item
+//! count, mean call latency, throughput). One untimed warm-up `embed` call
+//! runs first, so model initialisation is excluded from those timings.
+//!
 //! This is a **scored baseline, not a CI gate**: there are no
 //! quality-threshold assertions on the metric values themselves. What IS
 //! asserted (in WU-3/WU-4's harness tests) is structural: the harness does
@@ -53,16 +59,19 @@
 //! # Qwen/Qwen3-Embedding-0.6B, 768 dims, `cargo test --release ... --ignored
 //! # --nocapture retrieval`)
 //!
-//! | category       | n | precision@4 | precision@8 | recall@4 | recall@8 | MRR   |
-//! |----------------|---|-------------|-------------|----------|----------|-------|
-//! | Lexical        | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
-//! | VectorSemantic | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
-//! | GraphExpansion | 5 | 0.450       | 0.225       | 0.900    | 0.900    | 1.000 |
-//! | KindFilter     | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
-//! | ScopeFilter    | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
-//! | Decay          | 5 | 0.100       | 0.125       | 0.400    | 1.000    | 0.302 |
-//! | Confidence     | 5 | 0.050       | 0.050       | 0.200    | 0.400    | 0.150 |
-//! | AsOf           | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000 |
+//! | category       | n | precision@4 | precision@8 | recall@4 | recall@8 | recall@10 | nDCG@10 | MRR   |
+//! |----------------|---|-------------|-------------|----------|----------|-----------|---------|-------|
+//! | Lexical        | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
+//! | VectorSemantic | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
+//! | GraphExpansion | 5 | 0.450       | 0.225       | 0.900    | 0.900    || 1.000    | -         | -       | 1.000 |
+//! | KindFilter     | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
+//! | ScopeFilter    | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
+//! | Decay          | 5 | 0.100       | 0.125       | 0.400    | 1.000    || 0.302    | -         | -       | 0.302 |
+//! | Confidence     | 5 | 0.050       | 0.050       | 0.200    | 0.400    || 0.150    | -         | -       | 0.150 |
+//! | AsOf           | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
+//!
+//! The recall@10 and nDCG@10 columns were added after this baseline was
+//! taken, so they read `-` until the next real-embedder run fills them in.
 //!
 //! `VectorSemantic` (the category this tier adds over the text-only one)
 //! lands at a perfect 1.000 recall/MRR on this small, single-narrative
@@ -115,13 +124,8 @@ pub fn recall_at_k(retrieved: &[String], relevant: &HashSet<&str>, k: usize) -> 
     hits as f64 / relevant.len() as f64
 }
 
-/// The cutoff for the `recall_at_10` and `ndcg_at_10` headline metrics.
+/// The cutoff for the recall@10 and `ndcg_at_10` headline metrics.
 const HEADLINE_K: usize = 10;
-
-/// `recall_at_k` at the headline cutoff of 10.
-pub fn recall_at_10(retrieved: &[String], relevant: &HashSet<&str>) -> f64 {
-    recall_at_k(retrieved, relevant, HEADLINE_K)
-}
 
 /// Rank discount for a 0-indexed position: `1 / log2(rank + 1)` with rank
 /// 1-indexed.
@@ -1273,7 +1277,7 @@ fn score_question(retrieved: &[String], relevant: &HashSet<&str>) -> CategoryMet
         precision_at_8: precision_at_k(retrieved, relevant, 8),
         recall_at_4: recall_at_k(retrieved, relevant, 4),
         recall_at_8: recall_at_k(retrieved, relevant, 8),
-        recall_at_10: recall_at_10(retrieved, relevant),
+        recall_at_10: recall_at_k(retrieved, relevant, HEADLINE_K),
         ndcg_at_10: ndcg_at_10(retrieved, relevant),
         mrr: reciprocal_rank(retrieved, relevant),
     }
@@ -1417,8 +1421,6 @@ fn assert_metrics_in_unit_range(per_category: &HashMap<Category, Vec<CategoryMet
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     fn fact_by_label(label: &str) -> Option<&'static Fact> {
@@ -1764,8 +1766,8 @@ mod tests {
             precision_at_8: 0.5,
             recall_at_4: 0.0,
             recall_at_8: 1.0,
-            recall_at_10: 1.0,
-            ndcg_at_10: 0.5,
+            recall_at_10: 0.25,
+            ndcg_at_10: 0.25,
             mrr: 0.5,
         };
         let b = CategoryMetrics {
@@ -1773,8 +1775,8 @@ mod tests {
             precision_at_8: 1.0,
             recall_at_4: 1.0,
             recall_at_8: 0.0,
-            recall_at_10: 0.0,
-            ndcg_at_10: 1.0,
+            recall_at_10: 0.75,
+            ndcg_at_10: 0.5,
             mrr: 1.0,
         };
         let c = CategoryMetrics {
@@ -1782,8 +1784,8 @@ mod tests {
             precision_at_8: 0.0,
             recall_at_4: 0.5,
             recall_at_8: 0.5,
-            recall_at_10: 0.5,
-            ndcg_at_10: 0.0,
+            recall_at_10: 1.0,
+            ndcg_at_10: 1.0,
             mrr: 0.0,
         };
 
@@ -1796,8 +1798,10 @@ mod tests {
         assert_eq!(average.precision_at_8, 0.5);
         assert_eq!(average.recall_at_4, 0.5);
         assert_eq!(average.recall_at_8, 0.5);
-        assert_eq!(average.recall_at_10, 0.5);
-        assert_eq!(average.ndcg_at_10, 0.5);
+        // recall@10 and nDCG@10 means (2/3 and 7/12) differ from the recall@8
+        // and MRR means (0.5), so a swapped field fails here.
+        assert!((average.recall_at_10 - 2.0 / 3.0).abs() < 1e-9);
+        assert!((average.ndcg_at_10 - 7.0 / 12.0).abs() < 1e-9);
         assert_eq!(average.mrr, 0.5);
     }
 
@@ -1817,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_at_10_counts_hits_inside_the_first_ten_only() {
+    fn recall_at_k_ten_counts_hits_inside_the_first_ten_only() {
         // Arrange: relevant ids sit at ranks 2, 10 and 11 of 12 results.
         let retrieved = ids(&[
             "x1", "r1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "r2", "r3", "x9",
@@ -1825,33 +1829,33 @@ mod tests {
         let relevant = set(&["r1", "r2", "r3"]);
 
         // Act
-        let recall = recall_at_10(&retrieved, &relevant);
+        let recall = recall_at_k(&retrieved, &relevant, 10);
 
         // Assert: rank 10 is inside the window, rank 11 is not, so 2 of 3.
         assert_eq!(recall, 2.0 / 3.0);
     }
 
     #[test]
-    fn recall_at_10_with_a_list_shorter_than_ten_uses_the_whole_list() {
+    fn recall_at_k_ten_with_a_list_shorter_than_ten_uses_the_whole_list() {
         // Arrange
         let retrieved = ids(&["a", "x", "b"]);
         let relevant = set(&["a", "b"]);
 
         // Act
-        let recall = recall_at_10(&retrieved, &relevant);
+        let recall = recall_at_k(&retrieved, &relevant, 10);
 
         // Assert
         assert_eq!(recall, 1.0);
     }
 
     #[test]
-    fn recall_at_10_is_zero_for_an_empty_relevant_set() {
+    fn recall_at_k_ten_is_zero_for_an_empty_relevant_set() {
         // Arrange
         let retrieved = ids(&["a", "b"]);
         let relevant = set(&[]);
 
         // Act
-        let recall = recall_at_10(&retrieved, &relevant);
+        let recall = recall_at_k(&retrieved, &relevant, 10);
 
         // Assert
         assert_eq!(recall, 0.0);
@@ -1971,15 +1975,34 @@ mod tests {
     #[test]
     fn score_question_fills_recall_at_10_and_ndcg_at_10() {
         // Arrange
-        let retrieved = ids(&["a", "x"]);
+        // The only relevant id sits at rank 9: outside recall@8, inside @10.
+        let retrieved = ids(&["x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "a"]);
         let relevant = set(&["a"]);
 
         // Act
         let metrics = score_question(&retrieved, &relevant);
 
-        // Assert
+        // Assert: recall@10 and nDCG@10 differ from recall@8 and MRR.
+        assert_eq!(metrics.recall_at_8, 0.0);
         assert_eq!(metrics.recall_at_10, 1.0);
-        assert!((metrics.ndcg_at_10 - 1.0).abs() < SCORE_EPSILON);
+        assert!((metrics.ndcg_at_10 - 1.0 / 10f64.log2()).abs() < SCORE_EPSILON);
+        assert!((metrics.mrr - 1.0 / 9.0).abs() < SCORE_EPSILON);
+    }
+
+    #[test]
+    fn a_perfect_top_ten_over_eleven_relevant_ids_has_full_ndcg_and_partial_recall() {
+        // Arrange: eleven relevant ids, the first ten retrieved in order.
+        let all: Vec<String> = (0..11).map(|i| format!("r{i}")).collect();
+        let relevant: HashSet<&str> = all.iter().map(String::as_str).collect();
+        let retrieved: Vec<String> = all[..10].to_vec();
+
+        // Act
+        let ndcg = ndcg_at_10(&retrieved, &relevant);
+        let recall = recall_at_k(&retrieved, &relevant, 10);
+
+        // Assert: the ideal ranking is capped at ten, so nDCG@10 is 1.0.
+        assert!((ndcg - 1.0).abs() < SCORE_EPSILON, "{ndcg}");
+        assert!((recall - 10.0 / 11.0).abs() < SCORE_EPSILON, "{recall}");
     }
 
     #[test]
@@ -2033,9 +2056,10 @@ mod tests {
         let text = format_timing(&summary);
 
         // Assert
-        assert!(text.contains("latency"), "{text}");
-        assert!(text.contains("throughput"), "{text}");
-        assert!(text.contains("10.0"), "{text}");
+        assert_eq!(
+            text,
+            "embedder: 1 calls, 4 items, mean latency 400.0 ms, throughput 10.0 items/s\n"
+        );
     }
 
     fn all_category_scores() -> Vec<CategoryScore> {
@@ -2076,6 +2100,29 @@ mod tests {
         assert!(report.contains("recall@10"), "{report}");
         assert!(report.contains("nDCG@10"), "{report}");
         assert!(report.contains("MRR"), "{report}");
+    }
+
+    #[test]
+    fn format_report_places_recall_at_10_and_ndcg_at_10_in_their_columns() {
+        // Arrange
+        let scores = all_category_scores();
+
+        // Act
+        let report = format_report(&scores);
+
+        // Assert: the row carries the values in header order, between
+        // recall@8 and MRR.
+        let row = report
+            .lines()
+            .find(|l| l.starts_with(Category::Lexical.name()))
+            .expect("Lexical row");
+        let values: Vec<&str> = row.split_whitespace().collect();
+        let n = values.len();
+        assert_eq!(
+            values[n - 4..],
+            ["0.950", "0.970", "0.880", "0.833"],
+            "{row}"
+        );
     }
 
     #[test]
@@ -2326,6 +2373,10 @@ mod real_embedder_run {
         let embedder = liam_model::FastEmbedEmbedder::load(&model_id, dims, &cache_dir)
             .expect("load real embedder");
 
+        // Untimed warm-up so one-off model initialisation does not inflate
+        // the first timed call.
+        embedder.embed("warm-up").await.expect("warm-up embed");
+
         // Same bitemporal-clock pattern as the text-only tier's test above
         // (see its comment for why `DefaultGraph::open`'s real clock would
         // break `Knob::AsOf`), but this tier's own store instance,
@@ -2457,6 +2508,7 @@ mod real_embedder_run {
             .summary()
             .expect("the real tier embeds every corpus fact");
         println!("{}", format_timing(&summary));
+        println!("(timings exclude the untimed warm-up embed call)");
         let vector_semantic_questions = QUESTIONS
             .iter()
             .filter(|q| q.category == Category::VectorSemantic)
