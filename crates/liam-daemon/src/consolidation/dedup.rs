@@ -854,6 +854,67 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Each node's content with the contents it is linked to, sorted, so two
+    /// stores with different ids compare by what they hold.
+    async fn links_by_content(store: &DefaultGraph, ids: &[NodeId]) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        for id in ids {
+            let content = store.get(id, AS_OF).await.unwrap().unwrap().content;
+            let mut linked = Vec::new();
+            for other in store.neighbors(id, AS_OF).await.unwrap() {
+                linked.push(store.get(&other, AS_OF).await.unwrap().unwrap().content);
+            }
+            linked.sort();
+            out.push((content, linked));
+        }
+        out.sort();
+        out
+    }
+
+    async fn tied_store(dir: &tempfile::TempDir) -> (DefaultGraph, Vec<NodeId>) {
+        let (store, _) = open(dir).await;
+        let mut ids = Vec::new();
+        for content in ["a", "b", "c"] {
+            ids.push(insert(&store, content).await);
+        }
+        (store, ids)
+    }
+
+    #[tokio::test]
+    async fn merge_makes_the_same_decisions_in_two_stores_given_a_forced_tie() {
+        // Arrange: c is equally close to a and b, which are far apart
+        let embed = table(&[("a", ONE), ("b", ORTHOGONAL), ("c", [1.0, 1.0])]);
+        let (first_dir, second_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (first, first_ids) = tied_store(&first_dir).await;
+        let (second, second_ids) = tied_store(&second_dir).await;
+
+        // Act
+        run(&first, &embed, 0.5).await;
+        run(&second, &embed, 0.5).await;
+
+        // Assert
+        let decisions = links_by_content(&first, &first_ids).await;
+        assert_eq!(decisions, links_by_content(&second, &second_ids).await);
+        assert!(decisions.contains(&("c".to_string(), vec!["a".to_string()])));
+    }
+
+    #[test]
+    fn plan_merges_gives_the_same_pairs_however_the_groups_interleave() {
+        // Arrange: two producers whose items arrive in different interleavings
+        let (a1, a2) = (in_scope("a1", None, "a", ONE), in_scope("a2", None, "a", ONE));
+        let (b1, b2) = (in_scope("b1", None, "b", ONE), in_scope("b2", None, "b", ONE));
+        let grouped = [a1.clone(), a2.clone(), b1.clone(), b2.clone()];
+        let woven = [b1, a1, b2, a2];
+
+        // Act
+        let from_grouped = plan_merges(&grouped, THRESHOLD);
+        let from_woven = plan_merges(&woven, THRESHOLD);
+
+        // Assert
+        assert_eq!(from_grouped.len(), 2);
+        assert_eq!(from_grouped, from_woven);
+    }
+
     #[tokio::test]
     async fn merge_edges_are_logged_with_the_consolidation_source() {
         // Arrange
