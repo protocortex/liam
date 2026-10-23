@@ -2463,6 +2463,7 @@ dependencies = [
  "liam-model",
  "liam-store",
  "raunch",
+ "regex",
  "rmcp",
  "schemars",
  "serde",
