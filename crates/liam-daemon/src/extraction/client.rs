@@ -243,6 +243,9 @@ fn completion_body(req: &ExtractRequest) -> Vec<u8> {
         // The server reuses cached prompt state by default, which can change
         // the logits and break repeatable answers.
         "cache_prompt": false,
+        // A thinking model would otherwise spend the token budget reasoning
+        // before it writes the JSON.
+        "chat_template_kwargs": { "enable_thinking": false },
     });
     body.to_string().into_bytes()
 }
@@ -413,6 +416,7 @@ mod tests {
         assert_eq!(body["response_format"]["schema"], request().schema);
         assert_eq!(body["max_tokens"], MAX_TOKENS);
         assert_eq!(body["cache_prompt"], false);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(body["seed"], SEED);
         assert_eq!(body["temperature"], 0.0);
         assert_eq!(
