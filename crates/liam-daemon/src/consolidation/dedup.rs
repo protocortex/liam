@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use liam_store::relation::NEAR_DUPLICATE_OF;
 use liam_store::{ContentEmbedder, DefaultGraph, Millis, NodeId, Query, BEGINNING};
+use serde::{Deserialize, Serialize};
 
 /// Most nodes one pass scans. The comparison is quadratic and each node costs
 /// an embedder call, so the rest wait for the next pass.
@@ -50,7 +51,7 @@ impl From<liam_store::Error> for DedupError {
 
 /// Where a scan stopped. A later pass passes it back to continue after it, and
 /// the row id breaks ties between nodes that share a `tx_from`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanPosition {
     pub tx_from: Millis,
     pub rowid: i64,

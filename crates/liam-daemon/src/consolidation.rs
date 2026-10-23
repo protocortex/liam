@@ -4,9 +4,11 @@
 //! the event log's unrelated WAL-to-Parquet compactor.
 
 pub mod dedup;
+pub mod dedup_cursor;
 pub mod determinism;
 pub mod hooks;
 pub mod manifest;
 pub mod probe_set;
 pub mod probes;
 pub mod run;
+pub mod shared_store;

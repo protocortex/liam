@@ -8,6 +8,7 @@ use liam_log::wal::{write_atomically, OsFileOps};
 use liam_store::{Millis, RUN_SOURCE_PREFIX};
 use serde::{Deserialize, Serialize};
 
+use super::dedup::ScanPosition;
 use crate::embedder_fingerprint::EmbedderFingerprint;
 
 /// Appended to the database path to name the manifest file.
@@ -17,7 +18,7 @@ const MANIFEST_SUFFIX: &str = ".consolidation.json";
 /// other version is refused rather than guessed at. Any new manifest field must
 /// bump it: `flatten` rules out `deny_unknown_fields`, so an older build would
 /// silently drop the field and rewrite the file without it.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// How a finished run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +39,11 @@ pub struct RunManifest {
     pub snapshot_log_offset: Option<u64>,
     /// The snapshot's metadata file, which a rollback restores from.
     pub snapshot_meta_path: Option<PathBuf>,
+    /// The snapshot's database copy, which is removed with the run.
+    pub snapshot_database_path: Option<PathBuf>,
+    /// Where the run's near-duplicate pass stopped, saved as the next pass's
+    /// start once the run commits.
+    pub dedup_resume_from: Option<ScanPosition>,
     pub completed_steps: Vec<String>,
     pub outcome: Option<RunOutcome>,
 }
@@ -113,6 +119,8 @@ impl RunManifest {
             created_at,
             snapshot_log_offset: None,
             snapshot_meta_path: None,
+            snapshot_database_path: None,
+            dedup_resume_from: None,
             completed_steps: Vec::new(),
             outcome: None,
         }
@@ -208,7 +216,7 @@ impl RunManifest {
     }
 
     /// Whether `step` has been recorded as finished.
-    pub fn is_complete(&self, step: &str) -> bool {
+    pub(crate) fn is_complete(&self, step: &str) -> bool {
         self.completed_steps.iter().any(|done| done == step)
     }
 }
@@ -246,6 +254,11 @@ mod tests {
         let mut original = manifest();
         original.snapshot_log_offset = Some(7);
         original.snapshot_meta_path = Some(dir.path().join("snapshot.json"));
+        original.snapshot_database_path = Some(dir.path().join("snapshot.db"));
+        original.dedup_resume_from = Some(ScanPosition {
+            tx_from: Millis(5),
+            rowid: 9,
+        });
         original.completed_steps = vec!["snapshot".into()];
         original.outcome = Some(RunOutcome::RolledBack);
 
@@ -267,6 +280,8 @@ mod tests {
         assert_eq!(fresh.outcome, None);
         assert_eq!(fresh.snapshot_log_offset, None);
         assert_eq!(fresh.snapshot_meta_path, None);
+        assert_eq!(fresh.snapshot_database_path, None);
+        assert_eq!(fresh.dedup_resume_from, None);
     }
 
     #[test]
@@ -315,7 +330,7 @@ mod tests {
         let path = manifest_path_for(&dir.path().join("liam.db"));
         manifest().save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, text.replace("\"version\": 2", "\"version\": 99")).unwrap();
+        std::fs::write(&path, text.replace("\"version\": 3", "\"version\": 99")).unwrap();
 
         // Act
         let result = RunManifest::load(&path);
