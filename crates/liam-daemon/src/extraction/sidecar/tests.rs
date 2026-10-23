@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
+mod stale_tests;
+
 use super::*;
 use crate::extraction::client::{
     ExtractError, ExtractRequest, JsonExtractor, ModelIdentity, SidecarClient,
@@ -55,10 +57,18 @@ fn config(timeout_secs: u64) -> ExtractionConfig {
 }
 
 fn deps(ports: Vec<u16>) -> Deps {
+    thread_local! {
+        // Each test runs on its own thread, so the directory lives exactly as
+        // long as the test.
+        static PIDFILE_DIR: TempDir = TempDir::new().unwrap();
+    }
     let mut ports = ports.into_iter();
     Deps {
         free_ram: Box::new(FixedRam(ENOUGH_RAM_MB)),
         next_port: Box::new(move || Ok(ports.next().expect("a port was scripted"))),
+        processes: Box::new(SystemProcesses),
+        pidfile: PIDFILE_DIR.with(|dir| dir.path().join("sidecar.pid")),
+        server_exe: std::env::current_exe().unwrap(),
     }
 }
 

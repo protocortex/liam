@@ -24,6 +24,9 @@ use tracing::{debug, info, warn};
 
 use super::http::{self, Limits, Request};
 use crate::config::ExtractionConfig;
+use stale::{Pidfile, ProcessTable, SweepOutcome, SystemProcesses};
+
+pub mod stale;
 
 const API_KEY_ENV: &str = "LLAMA_API_KEY";
 const ALIAS_ENV: &str = "LLAMA_ARG_ALIAS";
@@ -105,16 +108,25 @@ impl FreeRam for SystemRam {
     }
 }
 
-/// What a start needs from the outside world, so tests can set RAM and ports.
+/// What a start needs from the outside world, so tests can set RAM and ports
+/// and script the process table.
 pub struct Deps {
     pub free_ram: Box<dyn FreeRam>,
     pub next_port: Box<dyn FnMut() -> io::Result<u16> + Send>,
+    pub processes: Box<dyn ProcessTable>,
+    /// Records the running child so a later daemon can clear it.
+    pub pidfile: PathBuf,
+    /// The executable a stale pidfile must name before its process is killed.
+    pub server_exe: PathBuf,
 }
 
 impl Deps {
-    pub fn system(config: &ExtractionConfig) -> Self {
+    pub fn system(config: &ExtractionConfig, pidfile: &Path, server_exe: &Path) -> Self {
         let (host, fixed_port) = (config.host.clone(), config.port);
         Self {
+            processes: Box::new(SystemProcesses),
+            pidfile: pidfile.to_path_buf(),
+            server_exe: server_exe.to_path_buf(),
             free_ram: Box::new(SystemRam),
             next_port: Box::new(move || match fixed_port {
                 0 => free_loopback_port(&host),
@@ -217,6 +229,12 @@ fn server_command(config: &ExtractionConfig, paths: &Paths, launch: &LaunchParam
     command
 }
 
+/// Where a started child is recorded and how its start time is read.
+struct Recorder<'a> {
+    pidfile: &'a Path,
+    processes: &'a dyn ProcessTable,
+}
+
 /// The secret the client authenticates with; never printed.
 struct Secret(String);
 
@@ -289,6 +307,7 @@ pub struct SidecarGuard {
     probe_key: Secret,
     alias: Secret,
     stderr: Arc<Mutex<StderrTail>>,
+    pidfile: PathBuf,
 }
 
 impl fmt::Debug for AliveHandle {
@@ -299,14 +318,24 @@ impl fmt::Debug for AliveHandle {
 
 impl SidecarGuard {
     /// Starts the configured `llama-server` and returns once it is ready.
-    pub async fn start(config: &ExtractionConfig) -> Result<Self, SidecarError> {
+    /// `pidfile` is where the running child is recorded.
+    pub async fn start(config: &ExtractionConfig, pidfile: &Path) -> Result<Self, SidecarError> {
         let paths = Paths::resolve(config)?;
         Self::start_with(
             config,
             |launch| server_command(config, &paths, launch),
-            Deps::system(config),
+            Deps::system(config, pidfile, &paths.server),
         )
         .await
+    }
+
+    /// Clears a sidecar an earlier daemon left behind. Run once at daemon
+    /// startup, because a killed daemon cannot run `Drop`.
+    pub fn sweep_stale(config: &ExtractionConfig, pidfile: &Path) -> SweepOutcome {
+        match &config.llama_server_path {
+            Some(server) => stale::sweep(pidfile, Path::new(server), &SystemProcesses),
+            None => SweepOutcome::NoPidfile,
+        }
     }
 
     /// `start` with the command and the outside world injected.
@@ -315,6 +344,9 @@ impl SidecarGuard {
         command_for: impl Fn(&LaunchParams) -> Command,
         mut deps: Deps,
     ) -> Result<Self, SidecarError> {
+        // Before the RAM gate: a stale server holds the memory the gate reads.
+        let swept = stale::sweep(&deps.pidfile, &deps.server_exe, deps.processes.as_ref());
+        debug!(?swept, "swept the previous sidecar");
         let free_mb = deps.free_ram.free_mb();
         if free_mb < config.ram_budget_mb {
             return Err(SidecarError::RamGate {
@@ -341,7 +373,11 @@ impl SidecarGuard {
                 probe_key: &probe_key,
                 key: &key,
             };
-            match Self::launch(command_for(&launch), &launch, deadline).await {
+            let recorder = Recorder {
+                pidfile: &deps.pidfile,
+                processes: deps.processes.as_ref(),
+            };
+            match Self::launch(command_for(&launch), &launch, deadline, recorder).await {
                 Err(SidecarError::Exited(code)) if attempt < MAX_START_ATTEMPTS => {
                     warn!(attempt, ?code, "sidecar exited at start, trying a new port");
                 }
@@ -355,6 +391,7 @@ impl SidecarGuard {
         mut command: Command,
         launch: &LaunchParams<'_>,
         deadline: Instant,
+        recorder: Recorder<'_>,
     ) -> Result<Self, SidecarError> {
         command
             .stdin(Stdio::null())
@@ -366,6 +403,7 @@ impl SidecarGuard {
             capture_stderr(pipe, Arc::clone(&stderr));
         }
         // Built before the wait so every early return reaps the child.
+        stale::claim(child.id());
         let guard = Self {
             pid: child.id(),
             child: Arc::new(Mutex::new(child)),
@@ -374,7 +412,25 @@ impl SidecarGuard {
             probe_key: Secret(launch.probe_key.to_string()),
             alias: Secret(launch.alias.to_string()),
             stderr,
+            pidfile: recorder.pidfile.to_path_buf(),
         };
+        // Written before the wait: a daemon killed mid-start still leaves a
+        // record the next one can clear. A failure drops the guard, which
+        // kills the child, since an unrecorded sidecar could never be swept.
+        // Without a start time the record could never match, so it is refused.
+        let start_time = recorder
+            .processes
+            .inspect(guard.pid)
+            .ok_or(SidecarError::Setup(io::ErrorKind::NotFound))?
+            .start_time;
+        let record = Pidfile {
+            pid: guard.pid,
+            start_time,
+            port: launch.addr.port(),
+        };
+        record
+            .write(recorder.pidfile)
+            .map_err(|e| SidecarError::Setup(e.kind()))?;
         match guard.wait_ready(deadline).await {
             Ok(()) => {
                 info!(pid = guard.pid, port = guard.addr.port(), "sidecar ready");
@@ -500,6 +556,11 @@ impl Drop for SidecarGuard {
         // Errors mean the child is already gone, which is the goal.
         let _ = child.kill();
         let _ = child.wait();
+        stale::release(self.pid);
+        // Another guard may have recorded its own child here; leave that.
+        if Pidfile::recorded_pid(&self.pidfile) == Some(self.pid) {
+            let _ = std::fs::remove_file(&self.pidfile);
+        }
     }
 }
 
