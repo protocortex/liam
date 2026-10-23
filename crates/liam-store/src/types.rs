@@ -583,6 +583,35 @@ pub enum EndOutcome {
     Rejected,
 }
 
+/// A statement that a fact has stopped being true. It closes a matching live
+/// fact and never inserts a live one. `scope` is `None` for none.
+#[derive(Clone, Debug)]
+pub struct EndFact {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub scope: Option<String>,
+    pub valid_until: Millis,
+    /// The latest `min(observed_at, ingested_at)` among the cited events.
+    pub evidence_at: Millis,
+    pub trust_score: f64,
+    /// Log event ids the statement came from. One with none is refused.
+    pub source_event_ids: Vec<String>,
+}
+
+/// What `retract_fact` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetractOutcome {
+    /// The lineage is no longer asserted. `restored` lists the live versions
+    /// brought back for the facts it had replaced.
+    Retracted { restored: Vec<FactId> },
+    /// The lineage has no current version.
+    NotFound,
+    /// Restoring was asked for, but another live fact holds the key; nothing
+    /// changed.
+    RestoreBlocked,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

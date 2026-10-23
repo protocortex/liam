@@ -11,7 +11,8 @@ use std::collections::BTreeSet;
 use crate::error::{Error, Result};
 use crate::ids::{FactId, Millis, FOREVER};
 use crate::types::{
-    ArbitrationCaps, ArbitrationOutcome, Cardinality, Fact, MatchMode, NewFact, PredicateSpec,
+    ArbitrationCaps, ArbitrationOutcome, Cardinality, EndFact, EndOutcome, Fact, MatchMode,
+    NewFact, PredicateSpec, RetractOutcome,
 };
 
 /// Mints the id of each version a decision inserts.
@@ -70,6 +71,14 @@ pub(super) struct Claim {
     pub object_key: String,
 }
 
+/// An end statement that passed validation.
+#[derive(Clone, Debug)]
+pub(super) struct EndClaim {
+    pub end: EndFact,
+    pub scope: String,
+    pub object_key: String,
+}
+
 pub(super) fn object_key(object: &str) -> String {
     object
         .split_whitespace()
@@ -124,6 +133,19 @@ impl Claim {
         let object_key = object_key(&fact.object);
         Ok(Self {
             fact,
+            scope,
+            object_key,
+        })
+    }
+}
+
+impl EndClaim {
+    pub(super) fn new(end: EndFact, scope: String) -> Result<Self> {
+        check_sources(&end.source_event_ids)?;
+        check_trust(end.trust_score)?;
+        let object_key = object_key(&end.object);
+        Ok(Self {
+            end,
             scope,
             object_key,
         })
@@ -529,6 +551,91 @@ fn compete(
     ));
     plan.link(&id, claim.fact.source_event_ids.clone());
     decision(plan, ArbitrationOutcome::Competing { id })
+}
+
+pub(super) fn decide_end(
+    state: &KeyState,
+    claim: &EndClaim,
+    rules: &Rules,
+    mint: Mint<'_>,
+) -> Decision<EndOutcome> {
+    let end = &claim.end;
+    let no_change = || decision(Plan::default(), EndOutcome::NoMatch);
+    let already_recorded = state.versions.iter().any(|version| {
+        version.object_key == claim.object_key
+            && (version.valid_until == end.valid_until || version.valid_until == version.valid_from)
+            && unlinked(&end.source_event_ids, version).is_empty()
+    });
+    let live = state.live(end.evidence_at);
+    let Some(target) = live_match(&live, &claim.object_key, rules.mode()) else {
+        return no_change();
+    };
+    if already_recorded || end.valid_until >= target.valid_until {
+        return no_change();
+    }
+    if end.valid_until <= target.valid_from {
+        return decision(Plan::default(), EndOutcome::Rejected);
+    }
+    if end.trust_score < target.trust_score {
+        return decision(Plan::default(), EndOutcome::Outranked);
+    }
+    let mut plan = Plan::default();
+    if end.evidence_at < target.evidence_at {
+        let id = mint();
+        let mut past = successor(target, id.clone(), rules.at);
+        past.lineage_id = id.clone();
+        // Empty interval: reads do not dedupe per object, so a copy spanning
+        // the live fact's range would list the same object twice.
+        past.valid_until = past.valid_from;
+        past.evidence_at = end.evidence_at;
+        past.trust_score = end.trust_score;
+        past.closed_by = None;
+        past.source_event_ids = end.source_event_ids.clone();
+        plan.insert.push(past);
+        plan.link(&id, end.source_event_ids.clone());
+        return decision(plan, EndOutcome::Ended { closed: vec![] });
+    }
+    let closed = plan.end_version(target, end.valid_until, end.evidence_at, None, rules, mint);
+    plan.link(&target.lineage_id, unlinked(&end.source_event_ids, target));
+    decision(
+        plan,
+        EndOutcome::Ended {
+            closed: vec![closed],
+        },
+    )
+}
+
+/// What a retraction needs to know about the key, beyond the version it closes.
+pub(super) struct RetractInput<'a> {
+    pub target: &'a Fact,
+    /// Valid-time closed versions the target replaced, each with the version
+    /// it had before it was closed.
+    pub restorable: &'a [(Fact, Fact)],
+    /// Whether another live fact holds the key.
+    pub key_taken: bool,
+    pub restore_previous: bool,
+}
+
+pub(super) fn decide_retract(
+    input: &RetractInput<'_>,
+    at: Millis,
+    mint: Mint<'_>,
+) -> Decision<RetractOutcome> {
+    if input.restore_previous && input.key_taken {
+        return decision(Plan::default(), RetractOutcome::RestoreBlocked);
+    }
+    let mut plan = Plan::default();
+    plan.retire(input.target, at);
+    let mut restored = Vec::new();
+    if input.restore_previous {
+        for (closed, before) in input.restorable {
+            plan.close.push(closed.id.clone());
+            let reopened = successor(before, mint(), at);
+            restored.push(reopened.id.clone());
+            plan.insert.push(reopened);
+        }
+    }
+    decision(plan, RetractOutcome::Retracted { restored })
 }
 
 #[cfg(test)]
