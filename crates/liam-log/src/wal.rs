@@ -121,14 +121,14 @@ pub struct WalConfig {
 }
 
 /// The disk operations a writer performs, so tests can inject failures.
-pub(crate) trait FileOps: Send {
+pub trait FileOps: Send {
     fn write_all(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()>;
     fn sync_file(&mut self, file: &File) -> io::Result<()>;
     fn truncate(&mut self, file: &File, len: u64) -> io::Result<()>;
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()>;
 }
 
-pub(crate) struct OsFileOps;
+pub struct OsFileOps;
 
 impl FileOps for OsFileOps {
     fn write_all(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
@@ -155,7 +155,7 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
 
 /// Writes `bytes` to a temp file beside `path` and renames it into place, so a
 /// crash leaves the old file or the new one, never a partial write.
-pub(crate) fn write_atomically(path: &Path, bytes: &[u8], ops: &mut dyn FileOps) -> io::Result<()> {
+pub fn write_atomically(path: &Path, bytes: &[u8], ops: &mut dyn FileOps) -> io::Result<()> {
     let mut staged = path.as_os_str().to_owned();
     staged.push(".tmp");
     let staged = PathBuf::from(staged);

@@ -87,6 +87,15 @@ pub trait Backend: Send + Sync + Sized {
     /// do it inside a transaction of its own. `None` for a backend whose vectors
     /// go with their nodes.
     fn vector_clear_sql(&self) -> Option<&'static str>;
+    /// The statements that empty the vector storage and leave it sized for
+    /// `dims`, for a rebuild that must also follow a change of embedding
+    /// width. Clearing is enough for a backend whose vectors carry no width.
+    fn vector_reset_statements(&self, _dims: usize) -> Vec<String> {
+        self.vector_clear_sql()
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    }
 
     /// Read. Nearest node ids to `query`, restricted to the live set at
     /// `as_of` and, when given, to `kind` and `scope`. Each backend applies

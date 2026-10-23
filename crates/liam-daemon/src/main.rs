@@ -48,7 +48,7 @@ use config::Config;
 use liam_daemon::models::{
     build_llm, build_models, export_fastembed_cache_dir, resolve_config_path, resolve_log_dir,
 };
-use liam_daemon::{storelock, telemetry};
+use liam_daemon::{embedder_fingerprint, storelock, telemetry};
 use liam_model::{Embedder, Llm, Reranker};
 use log_startup::StartedStore;
 use mcp::MemoryServer;
@@ -134,6 +134,13 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
          shuttles to it and opens no store",
     )?;
 
+    // Verified before the store opens, which creates `node_vectors` at the
+    // configured width, and recorded only once it has opened.
+    let fingerprint = embedder_fingerprint::verify(
+        &database_path,
+        &embedder_fingerprint::EmbedderFingerprint::from_config(&config),
+    )?;
+
     let (embedder, reranker) = build_models(&config)?;
     let StartedStore { store, compactor } = log_startup::open_store_with_log(
         &config,
@@ -143,6 +150,9 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         &shutdown,
     )
     .await?;
+    if let Some(fingerprint) = fingerprint {
+        fingerprint.commit()?;
+    }
     let store = Arc::new(store);
 
     let llm = build_llm(&config)?;
@@ -619,6 +629,59 @@ mod tests {
             8192,
             1,
         )
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_or_corrupt_fingerprint_stops_startup_before_the_store_opens() {
+        for contents in [
+            r#"{"version":1,"provider":"mock","model":"other-model","dims":768,"prompt_scheme":0}"#,
+            "{not json",
+        ] {
+            // Arrange
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("liam.db");
+            let config = Config {
+                database_path: database.to_string_lossy().into_owned(),
+                ..Config::default()
+            };
+            std::fs::write(
+                liam_daemon::embedder_fingerprint::fingerprint_path_for(&database),
+                contents,
+            )
+            .unwrap();
+
+            // Act
+            let result = serve_until(cli::Mode::Stdio, config, Shutdown::default()).await;
+
+            // Assert
+            let error = result.expect_err("startup must fail").to_string();
+            assert!(
+                error.contains("embedder fingerprint"),
+                "wrong error for {contents}: {error}"
+            );
+            assert!(!database.exists(), "the store was opened for {contents}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_that_fails_to_open_the_store_records_no_fingerprint() {
+        // Arrange: a log directory that is a file, which the store open refuses
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        let not_a_log = dir.path().join("not-a-log");
+        std::fs::write(&not_a_log, b"data").unwrap();
+        let mut config = Config {
+            database_path: database.to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        config.log.dir = Some(not_a_log.to_string_lossy().into_owned());
+
+        // Act
+        let result = serve_until(cli::Mode::Stdio, config, Shutdown::default()).await;
+
+        // Assert
+        assert!(result.is_err());
+        assert!(!liam_daemon::embedder_fingerprint::fingerprint_path_for(&database).exists());
     }
 
     #[tokio::test]
