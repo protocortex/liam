@@ -182,8 +182,6 @@ CREATE TABLE IF NOT EXISTS log_quarantine (
 ///
 /// `facts`, `fact_sources` and `fact_suppressions` are derived from the log and
 /// `extraction_cursor` follows them; `extraction_attempts` is operator state.
-/// None is in `DERIVED_TABLES` yet because no log event writes them, and the
-/// replay that does must add them there.
 fn fact_tables() -> String {
     let forever = FOREVER.0;
     format!(
@@ -262,7 +260,13 @@ pub(crate) enum Clear {
 /// the assignments, otherwise its fingerprint would vouch for communities that
 /// are no longer there. The backend's vector table goes before all of them, as
 /// `Backend::vector_clear_sql` returns it.
-pub(crate) const DERIVED_TABLES: [(&str, Clear); 8] = [
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 13] = [
+    // No foreign keys link the fact tables, so their order among themselves is free.
+    ("fact_sources", Clear::Always),
+    ("fact_suppressions", Clear::Always),
+    ("facts", Clear::Always),
+    // Extraction restarts from the first event, which the fact rules treat as a replay.
+    ("extraction_cursor", Clear::Always),
     ("node_community", Clear::Always),
     ("cluster_state", Clear::Always),
     ("edges", Clear::Always),
@@ -273,6 +277,8 @@ pub(crate) const DERIVED_TABLES: [(&str, Clear); 8] = [
     // The operator's refusal reasons, which the log cannot recreate.
     ("log_quarantine", Clear::OnAdoption),
     ("entity_mention_state", Clear::OnAdoption),
+    // Failure counts for batches of the old log's events, which the new log lacks.
+    ("extraction_attempts", Clear::OnAdoption),
 ];
 
 #[cfg(all(test, feature = "backend-libsql"))]
@@ -490,12 +496,6 @@ mod tests {
         assert!(table_exists(&backend, "facts").await);
     }
 
-    /// Fact tables no log event writes yet. The segment that writes one must
-    /// move it into `DERIVED_TABLES`, with the clearing and seeding that
-    /// entails, and delete it from this list; until then a rebuild would keep
-    /// its stale rows.
-    const PENDING_DERIVED_TABLES: [&str; 5] = FACT_TABLES;
-
     /// Tables that hold state the log cannot recreate, so a rebuild keeps them.
     const KEPT_TABLES: [&str; 2] = ["log_cursor", "log_backfill_state"];
 
@@ -658,7 +658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_table_is_derived_kept_or_pending_and_never_two_of_them() {
+    async fn every_table_is_derived_or_kept_and_never_both() {
         // Arrange
         let (_dir, backend) = file_backend_at("classified.db").await;
         backend
@@ -686,13 +686,11 @@ mod tests {
             let lists = [
                 derived.contains(&table.as_str()),
                 KEPT_TABLES.contains(&table.as_str()),
-                PENDING_DERIVED_TABLES.contains(&table.as_str()),
             ];
             let count = lists.iter().filter(|listed| **listed).count();
             assert_eq!(
                 count, 1,
-                "{table} must be in exactly one of DERIVED_TABLES, KEPT_TABLES, \
-                 PENDING_DERIVED_TABLES"
+                "{table} must be in exactly one of DERIVED_TABLES, KEPT_TABLES"
             );
         }
     }

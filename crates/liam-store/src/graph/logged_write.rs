@@ -203,16 +203,32 @@ impl<B: Backend> Graph<B> {
     {
         let mut tx = self.backend.begin().await?;
         let now = self.clock.now();
-        let applied = async {
+        let planned = async {
             let plan = prepare(&mut *tx, now).await?;
-            if let Some(refusal) = plan.dedup.and_then(|dedup| dedup.refusal_if_absent) {
-                return Err(refusal);
+            match plan.dedup.and_then(|dedup| dedup.refusal_if_absent) {
+                Some(refusal) => Err(refusal),
+                None => Ok(plan.steps),
             }
-            apply_steps(&mut *tx, &plan.steps, self.backend.vector_delete_sql()).await
         }
         .await;
-        commit_or_abandon(tx, applied).await?;
+        match planned {
+            Ok(steps) => self.apply_and_commit(tx, &steps).await?,
+            Err(error) => {
+                abandon(tx).await;
+                return Err(error);
+            }
+        }
         Ok(WriteOutcome::Written)
+    }
+
+    /// Projects `steps` and commits, with no log involved.
+    pub(super) async fn apply_and_commit(
+        &self,
+        mut tx: Box<dyn BackendTx + '_>,
+        steps: &[Step],
+    ) -> Result<()> {
+        let applied = apply_steps(&mut *tx, steps, self.backend.vector_delete_sql()).await;
+        commit_or_abandon(tx, applied).await
     }
 
     /// The logged path: poison check, log lock, `begin`, then plan, deduplicate,

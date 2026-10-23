@@ -2,6 +2,7 @@
 //! Bitemporal fact reads against a file store, over one scripted timeline in
 //! which facts change, compete and are corrected late.
 
+use super::support::FACT_WRITER;
 use super::*;
 use crate::graph::fact_read::{CURRENT_FILTER, MAX_FACT_ROWS, MAX_SOURCES_PER_FACT};
 use crate::types::{
@@ -75,14 +76,19 @@ impl Store {
     async fn assert_at(&self, tx: i64, fact: NewFact) -> ArbitrationOutcome {
         self.clock.set(Millis(tx));
         self.graph
-            .assert_fact(fact, &single(), ArbitrationCaps::default())
+            .assert_fact(fact, &single(), FACT_WRITER, ArbitrationCaps::default())
             .await
             .unwrap()
     }
 
     async fn assert_many(&self, fact: NewFact) -> ArbitrationOutcome {
         self.graph
-            .assert_fact(fact, &PredicateSpec::default(), ArbitrationCaps::default())
+            .assert_fact(
+                fact,
+                &PredicateSpec::default(),
+                FACT_WRITER,
+                ArbitrationCaps::default(),
+            )
             .await
             .unwrap()
     }
@@ -501,7 +507,7 @@ async fn an_end_on_older_evidence_leaves_one_visible_version() {
         trust_score: HIGH_TRUST,
         source_event_ids: vec!["stale-end".into()],
     };
-    let ended = s.graph.end_fact(end, &single()).await.unwrap();
+    let ended = s.graph.end_fact(end, &single(), FACT_WRITER).await.unwrap();
 
     // Act
     let facts = s.valid_at(T2 + 500).await;

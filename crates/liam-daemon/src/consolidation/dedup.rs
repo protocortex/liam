@@ -383,6 +383,15 @@ mod tests {
 
     const DIMS: usize = 2;
     const START: Millis = Millis(1000);
+
+    #[test]
+    fn the_dedup_source_is_a_consolidation_run_source_the_store_can_roll_back() {
+        // Act
+        let rest = DEDUP_SOURCE.strip_prefix(liam_store::RUN_SOURCE_PREFIX);
+
+        // Assert
+        assert_eq!(rest, Some("dedup"));
+    }
     /// Just before the end of time, so every live row is visible.
     const AS_OF: Millis = Millis(FOREVER.0 - 1);
     const WAL: WalConfig = WalConfig {

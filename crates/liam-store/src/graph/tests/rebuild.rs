@@ -744,7 +744,7 @@ async fn rebuild_without_an_embedder_reports_the_nodes_pending_instead_of_failin
 
 /// Puts a row in every table a rebuild empties but `nodes`, `edges` and
 /// `log_hash_index`, which `populate` fills, and names the tables it did.
-async fn seed_derived_tables(live: &Opened) -> [&'static str; 5] {
+async fn seed_derived_tables(live: &Opened) -> [&'static str; 10] {
     let g = &live.graph;
     let node_id = g
         .backend
@@ -768,6 +768,18 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 5] {
          VALUES ('s', '', 1, 1, 1)",
         "INSERT INTO log_quarantine (event_id, segment, seg_index, reason, at)
          VALUES ('event-x', 0, 0, 'refused', 1)",
+        "INSERT INTO facts
+         (id, lineage_id, subject, predicate, object, object_key, evidence_at, valid_from,
+          tx_from, trust_score, extractor_id, extractor_version)
+         VALUES ('f', 'l', 's', 'p', 'o', 'o', 1, 1, 1, 0.5, 'rules', 'v1')",
+        "INSERT INTO fact_sources (lineage_id, event_id) VALUES ('l', 'event-x')",
+        "INSERT INTO fact_suppressions
+         (subject, predicate, scope, object_key, trust_score, retracted_at)
+         VALUES ('s', 'p', '', 'o', 0.5, 1)",
+        "INSERT INTO extraction_cursor (name, last_segment, last_index, updated_at)
+         VALUES ('rules', 0, 0, 1)",
+        "INSERT INTO extraction_attempts (batch_key, event_ids, failures, last_error, updated_at)
+         VALUES ('b', 'event-x', 1, 'timeout', 1)",
     ] {
         g.backend.execute(sql, &[]).await.unwrap();
     }
@@ -777,6 +789,11 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 5] {
         "provenance_repair_state",
         "entity_mention_state",
         "log_quarantine",
+        "facts",
+        "fact_sources",
+        "fact_suppressions",
+        "extraction_cursor",
+        "extraction_attempts",
     ]
 }
 

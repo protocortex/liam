@@ -48,7 +48,7 @@ impl RecordingLog {
         (log, appended)
     }
 
-    fn over(inner: FailingLogWriter) -> (Self, Appended) {
+    pub(super) fn over(inner: FailingLogWriter) -> (Self, Appended) {
         let appended = Appended::default();
         let log = Self {
             inner,

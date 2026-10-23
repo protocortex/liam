@@ -143,9 +143,11 @@ pub fn content_hashes(event: &LogEvent) -> Vec<([u8; 32], String)> {
                 RowEffect::Edge(row) => (edge_row_hash(row), row.id.clone()),
             })
             .collect(),
-        LogPayload::Tombstone(_) | LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. } => {
-            Vec::new()
-        }
+        LogPayload::Tombstone(_)
+        | LogPayload::DuplicateOf { .. }
+        | LogPayload::Voided { .. }
+        | LogPayload::FactWrite { .. }
+        | LogPayload::RunRolledBack { .. } => Vec::new(),
     }
 }
 
