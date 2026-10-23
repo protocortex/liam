@@ -3,6 +3,7 @@
 //! gate that commits or rolls back. Named "consolidation" to stay apart from
 //! the event log's unrelated WAL-to-Parquet compactor.
 
+pub mod dedup;
 pub mod hooks;
 pub mod manifest;
 pub mod probes;
