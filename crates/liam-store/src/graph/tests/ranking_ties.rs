@@ -405,21 +405,21 @@ async fn mentions_with_equal_tx_from_follow_edge_id_descending() {
 }
 
 #[tokio::test]
-async fn stale_entities_never_synthesized_come_back_in_id_order() {
+async fn stale_entities_never_synthesized_come_back_in_insertion_order() {
     // Arrange: six entities that all tie at last_synthesized_at = 0.
+    const NAMES: [&str; 6] = ["Ada", "Bob", "Cyd", "Dee", "Eve", "Fay"];
     for _ in 0..FRESH_STORES {
         let g = fresh_graph().await;
-        for name in ["Ada", "Bob", "Cyd", "Dee", "Eve", "Fay"] {
-            g.insert(NewNode::entity("person", name)).await.unwrap();
+        let mut inserted = Vec::new();
+        for name in NAMES {
+            inserted.push(g.insert(NewNode::entity("person", name)).await.unwrap());
         }
 
         // Act
         let stale = g.stale_entities(10, Millis(2000)).await.unwrap();
 
-        // Assert
-        let got: Vec<&str> = stale.iter().map(|(id, _, _)| id.as_str()).collect();
-        let mut sorted = got.clone();
-        sorted.sort_unstable();
-        assert_eq!(got, sorted);
+        // Assert: oldest insert first, whatever the random ids sort like
+        let got: Vec<&NodeId> = stale.iter().map(|(id, _, _)| id).collect();
+        assert_eq!(got, inserted.iter().collect::<Vec<_>>());
     }
 }

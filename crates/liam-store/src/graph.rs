@@ -1407,6 +1407,7 @@ impl<B: Backend> Graph<B> {
             subject: String,
             scope: Option<String>,
             last_synthesized_at: Millis,
+            rowid: i64,
         }
 
         let mut candidates = Vec::new();
@@ -1445,11 +1446,23 @@ impl<B: Backend> Graph<B> {
             if live_fingerprint.edge_count != stored_count
                 || live_fingerprint.max_tx_from != stored_max_tx_from
             {
+                let rowid = self
+                    .backend
+                    .query(
+                        "SELECT rowid FROM nodes WHERE id = ?1",
+                        &[id.as_str().into()],
+                    )
+                    .await?
+                    .first()
+                    .map(|r| r.get_i64(0))
+                    .transpose()?
+                    .unwrap_or(i64::MAX);
                 candidates.push(Candidate {
                     id,
                     subject,
                     scope,
                     last_synthesized_at,
+                    rowid,
                 });
             }
         }
@@ -1459,7 +1472,7 @@ impl<B: Backend> Graph<B> {
             .backend
             .query(
                 &format!(
-                    "SELECT n.id, n.subject, n.scope
+                    "SELECT n.id, n.subject, n.scope, n.rowid
                      FROM nodes n
                      LEFT JOIN entity_mention_state s
                        ON s.subject = n.subject AND s.scope = COALESCE(n.scope, '')
@@ -1474,13 +1487,14 @@ impl<B: Backend> Graph<B> {
                 subject: row.get_string(1)?,
                 scope: opt_string(row, 2)?,
                 last_synthesized_at: Millis(0),
+                rowid: row.get_i64(3)?,
             });
         }
 
         candidates.sort_by(|a, b| {
             a.last_synthesized_at
                 .cmp(&b.last_synthesized_at)
-                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+                .then_with(|| a.rowid.cmp(&b.rowid))
         });
         Ok(candidates
             .into_iter()
