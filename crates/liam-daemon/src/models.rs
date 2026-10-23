@@ -136,12 +136,26 @@ pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<d
     Ok((embedder, reranker))
 }
 
+/// Whether `model` names BGE-M3, which loads through its own embedder. Every
+/// other model id goes to the Qwen3 loader. Hugging Face ids are
+/// case-insensitive, so the match is too.
+#[cfg(any(test, feature = "local"))]
+fn is_bge_m3(model: &str) -> bool {
+    model.eq_ignore_ascii_case(liam_model::BGE_M3_MODEL_ID)
+}
+
 #[cfg(feature = "local")]
 fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
-    use liam_model::FastEmbedEmbedder;
+    use liam_model::{BgeM3Embedder, FastEmbedEmbedder};
     let home = std::env::var("HOME").unwrap_or_default();
     let cache_dir =
         resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
+    if is_bge_m3(&config.embedder.model) {
+        return Ok(Arc::new(BgeM3Embedder::load(
+            config.embedding_dims,
+            &cache_dir,
+        )?));
+    }
     Ok(Arc::new(FastEmbedEmbedder::load(
         &config.embedder.model,
         config.embedding_dims,
@@ -314,6 +328,15 @@ mod tests {
             resolve_path_with_home("llm.cache_dir", "~/.liam/models", "/home/alice").unwrap(),
             "/home/alice/.liam/models"
         );
+    }
+
+    #[test]
+    fn only_the_bge_m3_model_id_selects_the_bge_m3_embedder() {
+        // Arrange / Act / Assert
+        assert!(is_bge_m3("BAAI/bge-m3"));
+        assert!(is_bge_m3("baai/BGE-M3"));
+        assert!(!is_bge_m3("Qwen/Qwen3-Embedding-0.6B"));
+        assert!(!is_bge_m3("BAAI/bge-m3-unsupervised"));
     }
 
     /// An absolute cache dir is already correct and must be passed through

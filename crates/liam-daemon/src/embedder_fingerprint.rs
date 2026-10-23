@@ -508,6 +508,34 @@ mod tests {
     }
 
     #[test]
+    fn switching_from_qwen3_to_bge_m3_is_refused_by_the_model_alone() {
+        // Arrange: both models are 1024 wide, so only the model id differs.
+        let local_config = |model: &str| {
+            let mut config = Config::default();
+            config.embedder.provider = "local".to_string();
+            config.embedder.model = model.to_string();
+            config.embedding_dims = 1024;
+            EmbedderFingerprint::from_config(&config)
+        };
+        let qwen3 = local_config("Qwen/Qwen3-Embedding-0.6B");
+        let bge_m3 = local_config(liam_model::BGE_M3_MODEL_ID);
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        start(&database, &qwen3).unwrap();
+        std::fs::write(&database, b"existing vectors").unwrap();
+
+        // Act
+        let error = verify(&database, &bge_m3)
+            .expect_err("a different model must not start")
+            .to_string();
+
+        // Assert
+        assert_eq!(qwen3.dims, bge_m3.dims);
+        assert!(error.contains(liam_model::BGE_M3_MODEL_ID), "{error}");
+        assert!(error.contains("Qwen/Qwen3-Embedding-0.6B"), "{error}");
+    }
+
+    #[test]
     fn the_fingerprint_comes_from_the_configured_embedder() {
         // Arrange
         let mut config = Config::default();

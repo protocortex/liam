@@ -77,7 +77,7 @@ fn qwen3_input(text: &str, kind: TextKind) -> String {
 /// so it bounds worst-case latency without silently cutting off normal
 /// content.
 #[cfg(feature = "local")]
-const EMBED_MAX_INPUT_TOKENS: usize = 8192;
+pub(crate) const EMBED_MAX_INPUT_TOKENS: usize = 8192;
 
 /// Shrink an already-normalized embedding to its first `dims` entries and
 /// re-normalize to a unit vector.
