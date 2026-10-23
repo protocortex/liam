@@ -497,7 +497,7 @@ impl ExtractorName {
     }
 
     /// The extractor stored under `stored`, or `None` for a value no write produces.
-    pub fn from_stored(stored: &str) -> Option<Self> {
+    pub(crate) fn from_stored(stored: &str) -> Option<Self> {
         [Self::Rules, Self::Llm]
             .into_iter()
             .find(|name| name.as_str() == stored)

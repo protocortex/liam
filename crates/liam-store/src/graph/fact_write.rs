@@ -12,8 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::arbitration::{
-    decide_assert, decide_end, decide_retract, Claim, EndClaim, KeyState, Plan, RetractInput,
-    Rules, Suppression,
+    decide_assert, decide_end, decide_retract, Claim, Decision, EndClaim, KeyState, Plan,
+    RetractInput, Rules, Suppression,
 };
 use super::logged_write::commit_or_abandon;
 use super::{validate_scope, Graph};
@@ -43,13 +43,19 @@ const CLOSE_VERSION_SQL: &str = "UPDATE facts SET tx_to = ?1 WHERE id = ?2 AND t
 const LINK_SOURCE_SQL: &str =
     "INSERT OR IGNORE INTO fact_sources (lineage_id, event_id) VALUES (?1, ?2)";
 
-// A key retracted twice keeps the stronger trust and the later time.
+// A key retracted twice keeps the later retraction whole: its trust belongs to
+// its time, so the two are never mixed. On a tie the higher trust stays.
 const SUPPRESS_SQL: &str = "INSERT INTO fact_suppressions
        (subject, predicate, scope, object_key, trust_score, retracted_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
      ON CONFLICT(subject, predicate, scope, object_key) DO UPDATE SET
-       trust_score = MAX(trust_score, excluded.trust_score),
+       trust_score = CASE
+         WHEN excluded.retracted_at > retracted_at
+           OR (excluded.retracted_at = retracted_at AND excluded.trust_score > trust_score)
+         THEN excluded.trust_score ELSE trust_score END,
        retracted_at = MAX(retracted_at, excluded.retracted_at)";
+
+const CLOSED_ROWS: u64 = 1;
 
 const LATEST_TX_SQL: &str =
     "SELECT MAX(tx_from) FROM facts WHERE subject = ?1 AND predicate = ?2 AND scope = ?3";
@@ -66,12 +72,20 @@ struct Key {
 }
 
 impl Key {
-    fn of(version: &Fact) -> Self {
+    fn new(subject: &str, predicate: &str, scope: &str) -> Self {
         Self {
-            subject: version.subject.clone(),
-            predicate: version.predicate.clone(),
-            scope: version.scope.clone().unwrap_or_default(),
+            subject: subject.to_owned(),
+            predicate: predicate.to_owned(),
+            scope: scope.to_owned(),
         }
+    }
+
+    fn of(version: &Fact) -> Self {
+        Self::new(
+            &version.subject,
+            &version.predicate,
+            version.scope.as_deref().unwrap_or_default(),
+        )
     }
 
     fn params(&self) -> [Value; 3] {
@@ -204,13 +218,28 @@ async fn read_state(tx: &mut dyn BackendTx, key: &Key) -> Result<KeyState> {
     })
 }
 
+/// A close must hit the one current row it names, or the plan was decided on
+/// state that is no longer there.
+fn check_closed(id: &FactId, updated: u64) -> Result<()> {
+    if updated == CLOSED_ROWS {
+        Ok(())
+    } else {
+        Err(corrupt(
+            id.as_str(),
+            &format!("closed {updated} current rows instead of {CLOSED_ROWS}"),
+        ))
+    }
+}
+
 async fn apply(tx: &mut dyn BackendTx, plan: &Plan, at: Millis) -> Result<()> {
     for id in &plan.close {
-        tx.execute(
-            CLOSE_VERSION_SQL,
-            &[at.into(), id.as_str().into(), FOREVER.into()],
-        )
-        .await?;
+        let updated = tx
+            .execute(
+                CLOSE_VERSION_SQL,
+                &[at.into(), id.as_str().into(), FOREVER.into()],
+            )
+            .await?;
+        check_closed(id, updated)?;
     }
     for version in &plan.insert {
         tx.execute(INSERT_VERSION_SQL, &version_params(version))
@@ -255,26 +284,12 @@ impl<B: Backend> Graph<B> {
     ) -> Result<ArbitrationOutcome> {
         let scope = validate_scope(&fact.scope)?.unwrap_or_default();
         let claim = Claim::new(fact, scope)?;
-        let key = Key {
-            subject: claim.fact.subject.clone(),
-            predicate: claim.fact.predicate.clone(),
-            scope: claim.scope.clone(),
-        };
-        let mut tx = self.backend.begin().await?;
-        let decided = async {
-            let state = read_state(&mut *tx, &key).await?;
-            let at = self.transaction_time(&mut *tx, &key).await?;
-            let rules = Rules {
-                spec: *spec,
-                caps,
-                at,
-            };
-            let decision = decide_assert(&state, &claim, &rules, &mut FactId::new)?;
-            apply(&mut *tx, &decision.plan, at).await?;
-            Ok(decision.outcome)
-        }
-        .await;
-        let outcome = commit_or_abandon(tx, decided).await?;
+        let key = Key::new(&claim.fact.subject, &claim.fact.predicate, &claim.scope);
+        let outcome = self
+            .write_key(&key, spec, caps, |state, rules| {
+                decide_assert(state, &claim, rules, &mut FactId::new)
+            })
+            .await?;
         tracing::debug!(?outcome, "fact asserted");
         Ok(outcome)
     }
@@ -284,26 +299,12 @@ impl<B: Backend> Graph<B> {
     pub async fn end_fact(&self, end: EndFact, spec: &PredicateSpec) -> Result<EndOutcome> {
         let scope = validate_scope(&end.scope)?.unwrap_or_default();
         let claim = EndClaim::new(end, scope)?;
-        let key = Key {
-            subject: claim.end.subject.clone(),
-            predicate: claim.end.predicate.clone(),
-            scope: claim.scope.clone(),
-        };
-        let mut tx = self.backend.begin().await?;
-        let decided = async {
-            let state = read_state(&mut *tx, &key).await?;
-            let at = self.transaction_time(&mut *tx, &key).await?;
-            let rules = Rules {
-                spec: *spec,
-                caps: ArbitrationCaps::default(),
-                at,
-            };
-            let decision = decide_end(&state, &claim, &rules, &mut FactId::new);
-            apply(&mut *tx, &decision.plan, at).await?;
-            Ok(decision.outcome)
-        }
-        .await;
-        let outcome = commit_or_abandon(tx, decided).await?;
+        let key = Key::new(&claim.end.subject, &claim.end.predicate, &claim.scope);
+        let outcome = self
+            .write_key(&key, spec, ArbitrationCaps::default(), |state, rules| {
+                Ok(decide_end(state, &claim, rules, &mut FactId::new))
+            })
+            .await?;
         tracing::debug!(?outcome, "fact ended");
         Ok(outcome)
     }
@@ -345,6 +346,32 @@ impl<B: Backend> Graph<B> {
         Ok(outcome)
     }
 
+    /// Reads the key, lets `decide` plan against it, applies the plan and
+    /// commits, all in one transaction.
+    async fn write_key<T>(
+        &self,
+        key: &Key,
+        spec: &PredicateSpec,
+        caps: ArbitrationCaps,
+        decide: impl FnOnce(&KeyState, &Rules) -> Result<Decision<T>>,
+    ) -> Result<T> {
+        let mut tx = self.backend.begin().await?;
+        let decided = async {
+            let state = read_state(&mut *tx, key).await?;
+            let at = self.transaction_time(&mut *tx, key).await?;
+            let rules = Rules {
+                spec: *spec,
+                caps,
+                at,
+            };
+            let decision = decide(&state, &rules)?;
+            apply(&mut *tx, &decision.plan, at).await?;
+            Ok(decision.outcome)
+        }
+        .await;
+        commit_or_abandon(tx, decided).await
+    }
+
     /// Fact versions whose lineage has no source event, which no write of this
     /// store produces. Empty on a healthy store.
     pub async fn facts_without_sources(&self) -> Result<Vec<FactId>> {
@@ -380,15 +407,22 @@ async fn lineage_head(tx: &mut dyn BackendTx, lineage_id: &FactId) -> Result<Opt
 /// The valid-time closed versions the target replaced, paired with the version
 /// each had before the replacement closed it.
 async fn restorable_versions(tx: &mut dyn BackendTx, target: &Fact) -> Result<Vec<(Fact, Fact)>> {
+    let [subject, predicate, scope] = Key::of(target).params();
     let closed = tx
         .query(
             &format!(
                 "SELECT {FACT_COLUMNS} FROM facts
-                 WHERE tx_to = ?1
-                   AND closed_by IN (SELECT id FROM facts WHERE lineage_id = ?2)
+                 WHERE {KEY_FILTER} AND tx_to = ?4
+                   AND closed_by IN (SELECT id FROM facts WHERE lineage_id = ?5)
                  ORDER BY rowid"
             ),
-            &[FOREVER.into(), target.lineage_id.as_str().into()],
+            &[
+                subject,
+                predicate,
+                scope,
+                FOREVER.into(),
+                target.lineage_id.as_str().into(),
+            ],
         )
         .await?;
     let mut pairs = Vec::new();
@@ -433,4 +467,35 @@ async fn key_is_taken(
             && !reopened.contains(version.lineage_id.as_str())
             && version.valid_until > target.evidence_at
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_close_that_updates_other_than_one_row_is_corrupt_state() {
+        for updated in [0, 2] {
+            // Arrange
+            let id = FactId::from_raw("a");
+
+            // Act
+            let result = check_closed(&id, updated);
+
+            // Assert
+            assert!(
+                matches!(result, Err(Error::CorruptFactState(_))),
+                "{updated} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn a_close_that_updates_one_row_is_accepted() {
+        // Act
+        let result = check_closed(&FactId::from_raw("a"), CLOSED_ROWS);
+
+        // Assert
+        assert!(result.is_ok());
+    }
 }

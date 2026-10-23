@@ -14,9 +14,14 @@ use crate::types::{
 const DIMS: usize = 8;
 const START: Millis = Millis(1000);
 const LATER: Millis = Millis(2000);
+const MIDDLE: Millis = Millis(3000);
+const SMALL_CAP: usize = 2;
+const WEAK_TRUST: f64 = 0.3;
 const RACE_ROUNDS: usize = 50;
 const LOW_TRUST: f64 = 0.5;
 const HIGH_TRUST: f64 = 0.9;
+
+type ErrorCheck = fn(&Error) -> bool;
 
 fn one() -> PredicateSpec {
     PredicateSpec {
@@ -145,16 +150,23 @@ async fn a_fact_without_a_source_event_is_refused_and_leaves_no_row() {
 
 #[tokio::test]
 async fn an_invalid_assertion_is_refused_before_the_store_is_touched() {
-    let cases = [
-        ("nan trust", fact("Sydney", f64::NAN, "e1", 100)),
-        ("negative trust", fact("Sydney", -0.1, "e1", 100)),
-        ("trust above one", fact("Sydney", 1.5, "e1", 100)),
+    let cases: [(&str, NewFact, ErrorCheck); 5] = [
+        ("nan trust", fact("Sydney", f64::NAN, "e1", 100), |e| {
+            matches!(e, Error::InvalidFactTrust(_))
+        }),
+        ("negative trust", fact("Sydney", -0.1, "e1", 100), |e| {
+            matches!(e, Error::InvalidFactTrust(_))
+        }),
+        ("trust above one", fact("Sydney", 1.5, "e1", 100), |e| {
+            matches!(e, Error::InvalidFactTrust(_))
+        }),
         (
             "empty interval",
             NewFact {
                 valid_until: Millis(100),
                 ..fact("Sydney", LOW_TRUST, "e1", 100)
             },
+            |e| matches!(e, Error::InvalidFactInterval { .. }),
         ),
         (
             "bad scope",
@@ -162,9 +174,10 @@ async fn an_invalid_assertion_is_refused_before_the_store_is_touched() {
                 scope: Some("has space".into()),
                 ..fact("Sydney", LOW_TRUST, "e1", 100)
             },
+            |e| matches!(e, Error::InvalidScope(_)),
         ),
     ];
-    for (label, invalid) in cases {
+    for (label, invalid, is_expected) in cases {
         // Arrange
         let (g, _) = store_at(START).await;
 
@@ -174,7 +187,7 @@ async fn an_invalid_assertion_is_refused_before_the_store_is_touched() {
             .await;
 
         // Assert
-        assert!(result.is_err(), "{label}");
+        assert!(is_expected(&result.unwrap_err()), "{label}");
         assert_eq!(count_of(&g, "facts").await, 0, "{label}");
         assert_eq!(count_of(&g, "fact_sources").await, 0, "{label}");
     }
@@ -325,7 +338,10 @@ async fn a_clock_stepped_backwards_never_overlaps_history() {
         .unwrap();
     let closed_at = rows(
         &g,
-        "SELECT tx_to FROM facts WHERE closed_by = '' AND tx_to < 4102444800000",
+        &format!(
+            "SELECT tx_to FROM facts WHERE closed_by = '' AND tx_to < {}",
+            FOREVER.0
+        ),
     )
     .await[0]
         .get_i64(0)
@@ -358,18 +374,23 @@ async fn ending_a_fact_closes_it_and_never_inserts_a_live_one() {
         .end_fact(end("sydney", 500, LOW_TRUST, "e2", 200), &one())
         .await
         .unwrap();
-    let again = g
+    let replayed = g
         .end_fact(end("sydney", 500, LOW_TRUST, "e2", 200), &one())
+        .await
+        .unwrap();
+    let from_new_event = g
+        .end_fact(end("sydney", 500, LOW_TRUST, "e3", 300), &one())
         .await
         .unwrap();
 
     // Assert
     assert!(matches!(ended, EndOutcome::Ended { .. }));
-    assert_eq!(again, EndOutcome::NoMatch);
+    assert_eq!(replayed, EndOutcome::NoMatch);
+    assert_eq!(from_new_event, EndOutcome::NoMatch);
     assert!(live_objects(&g).await.is_empty());
     let open = rows(
         &g,
-        "SELECT valid_until FROM facts WHERE tx_to = 4102444800000",
+        &format!("SELECT valid_until FROM facts WHERE tx_to = {}", FOREVER.0),
     )
     .await;
     assert_eq!(open[0].get_i64(0).unwrap(), 500);
@@ -462,6 +483,107 @@ async fn a_retraction_blocks_old_evidence_but_not_newer_or_stronger_evidence() {
     assert_eq!(stale, ArbitrationOutcome::Suppressed);
     assert!(matches!(stronger, ArbitrationOutcome::Inserted { .. }));
     assert!(matches!(newer, ArbitrationOutcome::Inserted { .. }));
+}
+
+async fn suppression_rows<B: Backend>(g: &Graph<B>) -> Vec<(String, f64, i64)> {
+    rows(
+        g,
+        "SELECT object_key, trust_score, retracted_at FROM fact_suppressions ORDER BY object_key",
+    )
+    .await
+    .iter()
+    .map(|row| {
+        (
+            row.get_string(0).unwrap(),
+            row.get_f64(1).unwrap(),
+            row.get_i64(2).unwrap(),
+        )
+    })
+    .collect()
+}
+
+/// Asserts and retracts Sydney, so the retraction is stamped with the clock.
+async fn retract_sydney(
+    g: &DefaultGraph,
+    clock: &FixedClock,
+    at: Millis,
+    trust: f64,
+    event: &str,
+    evidence: i64,
+) {
+    clock.set(at);
+    let lineage = lineage_of(&assert_one(g, fact("Sydney", trust, event, evidence)).await);
+    g.retract_fact(&lineage, false).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_later_retraction_replaces_the_earlier_one_whole() {
+    // Arrange
+    let (g, clock) = store_at(START).await;
+    retract_sydney(&g, &clock, LATER, HIGH_TRUST, "e1", 100).await;
+    retract_sydney(&g, &clock, MIDDLE, WEAK_TRUST, "e2", 2500).await;
+
+    // Act
+    let between = assert_one(&g, fact("Sydney", 0.8, "e3", 2800)).await;
+
+    // Assert
+    assert_eq!(
+        suppression_rows(&g).await,
+        vec![("sydney".to_string(), WEAK_TRUST, MIDDLE.0)]
+    );
+    assert!(matches!(between, ArbitrationOutcome::Inserted { .. }));
+}
+
+#[tokio::test]
+async fn retractions_at_the_same_time_keep_the_higher_trust() {
+    // Arrange
+    let (g, clock) = store_at(START).await;
+    retract_sydney(&g, &clock, MIDDLE, WEAK_TRUST, "e1", 100).await;
+
+    // Act
+    retract_sydney(&g, &clock, MIDDLE, LOW_TRUST, "e2", 2800).await;
+
+    // Assert
+    assert_eq!(
+        suppression_rows(&g).await,
+        vec![("sydney".to_string(), LOW_TRUST, MIDDLE.0)]
+    );
+}
+
+#[tokio::test]
+async fn past_the_cap_the_weakest_competing_lineage_is_closed_and_suppressed() {
+    // Arrange
+    let (g, _) = store_at(START).await;
+    let caps = ArbitrationCaps {
+        max_competing_per_key: SMALL_CAP,
+    };
+    let claims = [
+        ("Sydney", HIGH_TRUST, "e1", 100),
+        ("Melbourne", LOW_TRUST, "e2", 200),
+        ("Perth", 0.4, "e3", 300),
+    ];
+    for (object, trust, event, evidence) in claims {
+        g.assert_fact(fact(object, trust, event, evidence), &one(), caps)
+            .await
+            .unwrap();
+    }
+
+    // Act
+    let outcome = g
+        .assert_fact(fact("Hobart", 0.45, "e4", 400), &one(), caps)
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(matches!(outcome, ArbitrationOutcome::Competing { .. }));
+    assert_eq!(
+        live_objects(&g).await,
+        vec!["Hobart", "Melbourne", "Sydney"]
+    );
+    assert_eq!(
+        suppression_rows(&g).await,
+        vec![("perth".to_string(), 0.4, START.0)]
+    );
 }
 
 #[tokio::test]
