@@ -16,7 +16,7 @@ pub mod reranker;
 #[cfg(feature = "llama")]
 pub mod llama;
 
-pub use bge::BGE_M3_MODEL_ID;
+pub use bge::{BGE_M3_DIMS, BGE_M3_MODEL_ID};
 pub use embedder::{Embedder, MockEmbedder, TextKind, QWEN3_EMBEDDING_MODEL_ID};
 pub use error::{ModelError, Result};
 pub use llm::{Llm, MockLlm};

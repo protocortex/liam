@@ -95,6 +95,9 @@ impl ContentEmbedder for StoreEmbedder {
     }
 }
 
+/// The `embedder.provider` value that selects the in-process models.
+pub const LOCAL_PROVIDER: &str = "local";
+
 /// Points fastembed's cache at the configured directory when the embedder is
 /// local, and returns that directory.
 ///
@@ -105,7 +108,7 @@ impl ContentEmbedder for StoreEmbedder {
 /// into a directory named `~`. It sets the reranker's cache; the embedder
 /// reaches the same directory through its own explicit parameter.
 pub fn export_fastembed_cache_dir(config: &Config) -> anyhow::Result<Option<PathBuf>> {
-    if config.embedder.provider != "local" {
+    if config.embedder.provider != LOCAL_PROVIDER {
         return Ok(None);
     }
     let cache_dir = resolve_config_path("embedder.cache_dir", &config.embedder.cache_dir)?;
@@ -118,7 +121,7 @@ pub fn export_fastembed_cache_dir(config: &Config) -> anyhow::Result<Option<Path
 ///
 /// Callers must run `export_fastembed_cache_dir` first.
 pub fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
-    if config.embedder.provider == "local" {
+    if config.embedder.provider == LOCAL_PROVIDER {
         return build_local_embedder(config);
     }
     Ok(Arc::new(MockEmbedder::new(config.embedding_dims)))
@@ -128,7 +131,7 @@ pub fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
 /// identity for the mock provider, fastembed's for `local`.
 pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
     let embedder = build_embedder(config)?;
-    let reranker: Arc<dyn Reranker> = if config.embedder.provider == "local" {
+    let reranker: Arc<dyn Reranker> = if config.embedder.provider == LOCAL_PROVIDER {
         build_local_reranker()?
     } else {
         Arc::new(IdentityReranker)

@@ -135,6 +135,7 @@
 //! can outrank the expected one), not a regression to chase.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use liam_model::{Embedder, TextKind};
@@ -142,10 +143,15 @@ use liam_store::{DefaultGraph, ExplainedHit, Millis, NewEdge, NodeId, Query, Res
 
 use serde::Serialize;
 
+use crate::config::Config;
 #[cfg(feature = "local")]
-use crate::{config::Config, models};
+use crate::models;
+#[cfg(any(test, feature = "local"))]
+use crate::models::LOCAL_PROVIDER;
 
 mod golden_set;
+#[cfg(test)]
+mod scale_probe;
 use golden_set::{CORPUS, QUESTIONS};
 
 /// The unique ids among the first `k` entries of `retrieved`. WHY a shared
@@ -730,42 +736,88 @@ impl EvalReport {
 /// initialisation does not inflate the first timed call.
 const WARM_UP_TEXT: &str = "warm-up";
 
-/// Loads `model_id` and runs the benchmark with it. This is the entry point
-/// for callers that only have a model name.
+/// The embedding models the harness can load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalModel {
+    Qwen3,
+    BgeM3,
+}
+
+impl EvalModel {
+    pub const ALL: [EvalModel; 2] = [EvalModel::Qwen3, EvalModel::BgeM3];
+
+    /// The Hugging Face id the model loads under.
+    pub fn id(self) -> &'static str {
+        match self {
+            EvalModel::Qwen3 => liam_model::QWEN3_EMBEDDING_MODEL_ID,
+            EvalModel::BgeM3 => liam_model::BGE_M3_MODEL_ID,
+        }
+    }
+
+    /// The embedding width to run at. BGE-M3 has one fixed width; Qwen3 runs
+    /// at the configured one (Matryoshka truncation).
+    pub fn dims(self, configured: usize) -> usize {
+        match self {
+            EvalModel::Qwen3 => configured,
+            EvalModel::BgeM3 => liam_model::BGE_M3_DIMS,
+        }
+    }
+}
+
+impl std::str::FromStr for EvalModel {
+    type Err = String;
+
+    /// Hugging Face ids are case-insensitive, so the match is too.
+    fn from_str(id: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|model| model.id().eq_ignore_ascii_case(id))
+            .ok_or_else(|| {
+                let supported: Vec<&str> = Self::ALL.iter().map(|m| m.id()).collect();
+                format!(
+                    "unknown embedding model {id:?}; supported models: {}",
+                    supported.join(", ")
+                )
+            })
+    }
+}
+
+/// Loads `model` and runs the benchmark with it. This is the entry point for
+/// callers that only have a model choice.
 ///
-/// Reads the dimensions and cache directory from the daemon's shipped
-/// defaults, so the harness measures what the daemon would run.
+/// Reads the Qwen3 width and the cache directory from `config`, so the
+/// harness measures what the daemon with that config would run.
 ///
 /// # Errors
 ///
 /// Fails when the model cannot be loaded, including in a build without the
 /// `local` feature, which has no real embedder to load.
-pub async fn run_retrieval_eval(model_id: &str) -> anyhow::Result<EvalReport> {
-    let embedder = load_embedder(model_id)?;
-    evaluate_embedder(embedder.as_ref(), model_id).await
+pub async fn run_retrieval_eval(model: EvalModel, config: &Config) -> anyhow::Result<EvalReport> {
+    let embedder = load_embedder(model, config)?;
+    evaluate_embedder(embedder.as_ref(), model.id()).await
 }
 
 #[cfg(feature = "local")]
-fn load_embedder(model_id: &str) -> anyhow::Result<Box<dyn Embedder>> {
-    use anyhow::Context as _;
+fn load_embedder(model: EvalModel, config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
+    models::build_embedder(&eval_config(model, config))
+}
 
-    let defaults = Config::default();
-    let cache_dir = models::resolve_path_with_home(
-        "embedder.cache_dir",
-        &defaults.embedder.cache_dir,
-        &std::env::var("HOME").unwrap_or_default(),
-    )?;
-    let embedder =
-        liam_model::FastEmbedEmbedder::load(model_id, defaults.embedding_dims, &cache_dir)
-            .with_context(|| format!("loading embedder {model_id}"))?;
-    Ok(Box::new(embedder))
+/// `config` rewritten to load `model` in-process at the width it runs at.
+#[cfg(any(test, feature = "local"))]
+fn eval_config(model: EvalModel, config: &Config) -> Config {
+    let mut config = config.clone();
+    config.embedder.provider = LOCAL_PROVIDER.to_string();
+    config.embedder.model = model.id().to_string();
+    config.embedding_dims = model.dims(config.embedding_dims);
+    config
 }
 
 #[cfg(not(feature = "local"))]
-fn load_embedder(model_id: &str) -> anyhow::Result<Box<dyn Embedder>> {
+fn load_embedder(model: EvalModel, _config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
     anyhow::bail!(
-        "cannot load embedder {model_id}: this build has no local models. \
-         Rebuild with `--features local`."
+        "cannot load embedder {}: this build has no local models. \
+         Rebuild with `--features local`.",
+        model.id()
     )
 }
 
@@ -839,7 +891,6 @@ pub async fn evaluate_embedder(
     embedder: &dyn Embedder,
     model_id: &str,
 ) -> anyhow::Result<EvalReport> {
-    use std::sync::Arc;
     use std::time::Instant;
 
     use anyhow::Context as _;
@@ -2128,12 +2179,117 @@ mod tests {
     #[tokio::test]
     async fn run_retrieval_eval_without_the_local_feature_explains_how_to_fix_it() {
         // Act
-        let err = run_retrieval_eval("any/model")
+        let err = run_retrieval_eval(EvalModel::Qwen3, &Config::default())
             .await
             .expect_err("no real embedder in this build");
 
         // Assert
         assert!(err.to_string().contains("--features local"), "{err}");
+    }
+
+    #[test]
+    fn eval_model_parses_each_supported_id_case_insensitively() {
+        // Arrange
+        let cases = [
+            (liam_model::QWEN3_EMBEDDING_MODEL_ID, EvalModel::Qwen3),
+            ("qwen/qwen3-embedding-0.6b", EvalModel::Qwen3),
+            (liam_model::BGE_M3_MODEL_ID, EvalModel::BgeM3),
+            ("baai/BGE-M3", EvalModel::BgeM3),
+        ];
+
+        for (id, expected) in cases {
+            // Act
+            let parsed: EvalModel = id.parse().expect("a supported id parses");
+
+            // Assert
+            assert_eq!(parsed, expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn eval_model_round_trips_through_its_canonical_id() {
+        for model in EvalModel::ALL {
+            // Act
+            let parsed: EvalModel = model.id().parse().expect("a canonical id parses");
+
+            // Assert
+            assert_eq!(parsed, model);
+        }
+    }
+
+    #[test]
+    fn an_unknown_model_id_is_refused_naming_it_and_the_supported_ids() {
+        // Act
+        let err = "BAAI/bge-m3-unsupervised"
+            .parse::<EvalModel>()
+            .expect_err("an unknown id must not parse");
+
+        // Assert
+        assert!(err.contains("BAAI/bge-m3-unsupervised"), "{err}");
+        assert!(err.contains(liam_model::QWEN3_EMBEDDING_MODEL_ID), "{err}");
+        assert!(err.contains(liam_model::BGE_M3_MODEL_ID), "{err}");
+    }
+
+    #[test]
+    fn bge_m3_runs_at_its_native_width_and_qwen3_at_the_configured_one() {
+        // Arrange
+        let configured = 768;
+
+        // Act / Assert
+        assert_eq!(EvalModel::Qwen3.dims(configured), configured);
+        assert_eq!(EvalModel::BgeM3.dims(configured), liam_model::BGE_M3_DIMS);
+    }
+
+    #[test]
+    fn eval_config_selects_the_local_provider_model_and_width_for_each_model() {
+        // Arrange
+        let mut base = Config::default();
+        base.embedder.provider = "mock".to_string();
+        base.embedder.model = "other".to_string();
+        base.embedding_dims = 768;
+
+        for model in EvalModel::ALL {
+            // Act
+            let config = eval_config(model, &base);
+
+            // Assert
+            assert_eq!(config.embedder.provider, LOCAL_PROVIDER);
+            assert_eq!(config.embedder.model, model.id());
+            assert_eq!(config.embedding_dims, model.dims(base.embedding_dims));
+        }
+        assert_eq!(
+            eval_config(EvalModel::BgeM3, &base).embedding_dims,
+            liam_model::BGE_M3_DIMS
+        );
+        assert_eq!(eval_config(EvalModel::Qwen3, &base).embedding_dims, 768);
+    }
+
+    /// The report fields that depend on wall-clock time: every key of
+    /// `timings` except the call and item counts.
+    const TIMING_FIELDS: [&str; 3] = ["total_ms", "mean_latency_ms", "throughput_per_sec"];
+
+    fn json_without_timing(report: &EvalReport) -> String {
+        let mut value = serde_json::to_value(report).expect("report serializes");
+        let timings = value["timings"]
+            .as_object_mut()
+            .expect("the mock run embeds the corpus");
+        for field in TIMING_FIELDS {
+            timings.remove(field);
+        }
+        serde_json::to_string(&value).expect("value serializes")
+    }
+
+    #[tokio::test]
+    async fn two_mock_runs_produce_byte_identical_json_apart_from_timing() {
+        // Arrange
+        let embedder = liam_model::MockEmbedder::new(DIMS);
+
+        // Act
+        let first = evaluate_embedder(&embedder, "mock").await.expect("run 1");
+        let second = evaluate_embedder(&embedder, "mock").await.expect("run 2");
+
+        // Assert
+        assert_eq!(json_without_timing(&first), json_without_timing(&second));
     }
 
     /// Given the seeded `CORPUS`/`QUESTIONS` fixtures, when every
@@ -2292,9 +2448,11 @@ mod real_embedder_run {
 
     /// `LIAM_RETRIEVAL_EVAL_MODEL` overrides the model for a local A/B run,
     /// mirroring `eval.rs`'s `LIAM_EVAL_MODEL`.
-    fn model_id() -> String {
+    fn model() -> EvalModel {
         std::env::var("LIAM_RETRIEVAL_EVAL_MODEL")
             .unwrap_or_else(|_| Config::default().embedder.model)
+            .parse()
+            .expect("LIAM_RETRIEVAL_EVAL_MODEL names a supported model")
     }
 
     /// Given the seeded fixtures and a real local embedder, when every
@@ -2305,7 +2463,7 @@ mod real_embedder_run {
     #[ignore = "downloads embedder weights; see module doc for the run command"]
     async fn real_embedder_tier_scores_every_category_including_vector_semantic() {
         // Act
-        let report = run_retrieval_eval(&model_id())
+        let report = run_retrieval_eval(model(), &Config::default())
             .await
             .expect("real embedder run");
         let text = report.render();
@@ -2337,5 +2495,39 @@ mod real_embedder_run {
             .count();
         let timings = report.timings.expect("the real tier embeds every fact");
         assert_eq!(timings.calls, CORPUS.len() + vector_questions);
+    }
+
+    /// Given the same real model and corpus, when the harness runs twice,
+    /// then the ranking-derived metrics match to within `EPSILON`. Not exact
+    /// equality: multi-threaded matrix kernels may reduce in a different
+    /// order across runs, and `EPSILON` only tolerates the resulting float
+    /// noise, not a changed ranking.
+    #[tokio::test]
+    #[ignore = "downloads embedder weights; see module doc for the run command"]
+    async fn two_real_runs_agree_on_every_ranking_metric() {
+        // Arrange
+        const EPSILON: f64 = 1e-9;
+        let config = Config::default();
+
+        // Act
+        let first = run_retrieval_eval(model(), &config).await.expect("run 1");
+        let second = run_retrieval_eval(model(), &config).await.expect("run 2");
+
+        // Assert
+        let (a, b) = (
+            first.overall.expect("scored"),
+            second.overall.expect("scored"),
+        );
+        for (x, y) in [
+            (a.recall_at_10, b.recall_at_10),
+            (a.ndcg_at_10, b.ndcg_at_10),
+            (a.mrr, b.mrr),
+            (a.precision_at_4, b.precision_at_4),
+            (a.precision_at_8, b.precision_at_8),
+            (a.recall_at_4, b.recall_at_4),
+            (a.recall_at_8, b.recall_at_8),
+        ] {
+            assert!((x - y).abs() < EPSILON, "{x} vs {y}");
+        }
     }
 }
