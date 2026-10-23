@@ -434,7 +434,11 @@ fn decay_factor(valid_from: Millis, now: Millis, half_life: Option<Millis>) -> f
 
 /// A raw node row as stored: unlike `Hit`/`ExplainedHit`, carries no
 /// retrieval score, so it fits a direct by-id lookup as well as scoring.
+#[non_exhaustive]
 pub struct Candidate {
+    /// Insertion order of the row, the stable tie-break between equal scores.
+    /// Ids carry a random ULID suffix, so they order differently per store.
+    pub(crate) rowid: i64,
     pub id: NodeId,
     pub kind: String,
     pub label: String,
@@ -443,6 +447,38 @@ pub struct Candidate {
     pub attributes: serde_json::Value,
     pub confidence: f64,
     pub valid_from: Millis,
+}
+
+impl Candidate {
+    /// A row with the given identity and text, no scope or attributes, full
+    /// confidence, valid from the epoch; set the public fields to refine it.
+    pub fn new(
+        id: NodeId,
+        kind: impl Into<String>,
+        label: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            rowid: 0,
+            id,
+            kind: kind.into(),
+            label: label.into(),
+            content: content.into(),
+            scope: None,
+            attributes: serde_json::Value::Null,
+            confidence: 1.0,
+            valid_from: Millis(0),
+        }
+    }
+}
+
+/// The one ranking order: score descending (a total order, so a NaN score
+/// cannot make the sort inconsistent), then insertion order. Ranking ties
+/// follow the rowid, so a store rebuilt from a natively written log (replayed
+/// in write order) ranks ties as the original did; one rebuilt from a
+/// backfill gets rowids in id order, so its ties can order differently.
+fn rank_order(a_score: f64, a_rowid: i64, b_score: f64, b_rowid: i64) -> std::cmp::Ordering {
+    b_score.total_cmp(&a_score).then(a_rowid.cmp(&b_rowid))
 }
 
 /// Turns lexical and vector search rank lists into one fused RRF score per
@@ -459,6 +495,17 @@ fn rrf_fuse(lexical: &[NodeId], vector: &[NodeId], rrf_k: f64) -> HashMap<String
         *rrf.entry(id.as_str().to_string()).or_insert(0.0) += 1.0 / (rrf_k + rank as f64 + 1.0);
     }
     rrf
+}
+
+/// The ids that seed graph expansion: the top `k` by fused score, ties broken
+/// by `rowid` as in the final ranking. An id with no rowid (its row vanished
+/// since the search) sorts last among its ties.
+fn rank_seeds(rrf: &HashMap<String, f64>, rowids: &HashMap<String, i64>, k: usize) -> Vec<String> {
+    let rowid = |id: &str| rowids.get(id).copied().unwrap_or(i64::MAX);
+    let mut seeds: Vec<(&str, f64)> = rrf.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+    seeds.sort_by(|a, b| rank_order(a.1, rowid(a.0), b.1, rowid(b.0)));
+    seeds.truncate(k);
+    seeds.into_iter().map(|(id, _)| id.to_string()).collect()
 }
 
 /// Scores hydrated candidate rows by RRF base score, confidence, time decay,
@@ -486,32 +533,32 @@ fn score_and_rank(
         let decay = decay_factor(c.valid_from, now, half_life);
         let weight = if is_expanded { expansion_weight } else { 1.0 };
         let score = base * c.confidence * decay * weight;
-        out.push(ExplainedHit {
-            hit: Hit {
-                id: c.id.clone(),
-                kind: c.kind,
-                label: c.label,
-                content: c.content,
-                attributes: c.attributes,
-                score,
+        out.push((
+            c.rowid,
+            ExplainedHit {
+                hit: Hit {
+                    id: c.id.clone(),
+                    kind: c.kind,
+                    label: c.label,
+                    content: c.content,
+                    attributes: c.attributes,
+                    score,
+                },
+                lexical_rank: lex_rank.get(c.id.as_str()).copied(),
+                vector_rank: vec_rank.get(c.id.as_str()).copied(),
+                rrf: base,
+                confidence: c.confidence,
+                decay,
+                valid_from: c.valid_from,
+                expanded: is_expanded,
             },
-            lexical_rank: lex_rank.get(c.id.as_str()).copied(),
-            vector_rank: vec_rank.get(c.id.as_str()).copied(),
-            rrf: base,
-            confidence: c.confidence,
-            decay,
-            valid_from: c.valid_from,
-            expanded: is_expanded,
-        });
+        ));
     }
-    out.sort_by(|a, b| {
-        b.hit
-            .score
-            .partial_cmp(&a.hit.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+    out.sort_by(|(a_rowid, a), (b_rowid, b)| {
+        rank_order(a.hit.score, *a_rowid, b.hit.score, *b_rowid)
     });
     out.truncate(k);
-    out
+    out.into_iter().map(|(_, hit)| hit).collect()
 }
 
 pub struct Graph<B: Backend> {
@@ -861,7 +908,7 @@ impl<B: Backend> Graph<B> {
             .query(
                 "SELECT dst FROM edges WHERE src = ?1 AND type = ?2
                  AND tx_from <= ?3 AND tx_to > ?3
-                 ORDER BY tx_from DESC LIMIT ?4",
+                 ORDER BY tx_from DESC, id DESC LIMIT ?4",
                 &[
                     entity_id.as_str().into(),
                     crate::types::relation::MENTIONS.into(),
@@ -913,9 +960,8 @@ impl<B: Backend> Graph<B> {
         let rrf = rrf_fuse(&lexical, &vector, self.rrf_k);
 
         // Seeds: top of the fused list. Expand their neighbours, down-weighted.
-        let mut seeds: Vec<(String, f64)> = rrf.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        seeds.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        seeds.truncate(q.k);
+        let rowids = self.rowids_of(rrf.keys().map(String::as_str)).await?;
+        let seeds = rank_seeds(&rrf, &rowids, q.k);
 
         let floor = 1.0 / (self.rrf_k + pool as f64 + 1.0);
         let mut candidates: HashMap<String, (f64, bool)> = HashMap::new();
@@ -925,7 +971,7 @@ impl<B: Backend> Graph<B> {
         let mut expanded: HashSet<String> = HashSet::new();
         let seed_ids: Vec<NodeId> = seeds
             .iter()
-            .map(|(id, _)| NodeId::from_raw(id.clone()))
+            .map(|id| NodeId::from_raw(id.clone()))
             .collect();
         for seed_id in &seed_ids {
             for n in self.neighbors(seed_id, now).await? {
@@ -1065,17 +1111,47 @@ impl<B: Backend> Graph<B> {
             "SELECT n.id FROM nodes_fts
              JOIN nodes n ON n.rowid = nodes_fts.rowid
              WHERE nodes_fts MATCH ?1 AND {live}{filters}
-             ORDER BY bm25(nodes_fts) LIMIT ?3",
+             ORDER BY bm25(nodes_fts), n.rowid LIMIT ?3",
             live = live_at("n", 2),
         );
         let rows = self.backend.query(&sql, &params).await?;
         ids_from(&rows)
     }
 
+    /// Insertion order of each id's row, in one query per chunk. An id with no
+    /// row is absent from the result.
+    async fn rowids_of<'a>(
+        &self,
+        ids: impl Iterator<Item = &'a str>,
+    ) -> Result<HashMap<String, i64>> {
+        const CHUNK: usize = 500;
+        let ids: Vec<&str> = ids.collect();
+        let mut out = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let params: Vec<Value> = chunk.iter().map(|id| (*id).into()).collect();
+            let rows = self
+                .backend
+                .query(
+                    &format!("SELECT id, rowid FROM nodes WHERE id IN ({placeholders})"),
+                    &params,
+                )
+                .await?;
+            for row in &rows {
+                out.insert(row.get_string(0)?, row.get_i64(1)?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Fetch the live rows for a set of candidate ids in one query per chunk
     /// (missing or expired ids simply don't come back). Chunked to stay under
-    /// SQLite's 999 bound-parameter limit; order is not meaningful, callers
-    /// look candidates up by id.
+    /// SQLite's 999 bound-parameter limit. Each chunk is in insertion order;
+    /// across chunks the order follows `ids`, so callers needing a total order
+    /// sort on `Candidate::rowid`.
     async fn fetch_candidates(
         &self,
         ids: &[NodeId],
@@ -1113,13 +1189,15 @@ impl<B: Backend> Graph<B> {
                 filters.push_str(&format!(" AND kind = ?{}", params.len()));
             }
             let sql = format!(
-                "SELECT id, kind, label, content, scope, attributes, confidence, valid_from
-                 FROM nodes WHERE id IN ({placeholders}) AND {live}{filters}",
+                "SELECT id, kind, label, content, scope, attributes, confidence, valid_from, rowid
+                 FROM nodes WHERE id IN ({placeholders}) AND {live}{filters}
+                 ORDER BY rowid",
                 live = live_at("nodes", 1),
             );
             let rows = self.backend.query(&sql, &params).await?;
             for row in &rows {
                 out.push(Candidate {
+                    rowid: row.get_i64(8)?,
                     id: NodeId::from_raw(row.get_string(0)?),
                     kind: row.get_string(1)?,
                     label: row.get_string(2)?,
@@ -1329,6 +1407,7 @@ impl<B: Backend> Graph<B> {
             subject: String,
             scope: Option<String>,
             last_synthesized_at: Millis,
+            rowid: i64,
         }
 
         let mut candidates = Vec::new();
@@ -1367,11 +1446,23 @@ impl<B: Backend> Graph<B> {
             if live_fingerprint.edge_count != stored_count
                 || live_fingerprint.max_tx_from != stored_max_tx_from
             {
+                let rowid = self
+                    .backend
+                    .query(
+                        "SELECT rowid FROM nodes WHERE id = ?1",
+                        &[id.as_str().into()],
+                    )
+                    .await?
+                    .first()
+                    .map(|r| r.get_i64(0))
+                    .transpose()?
+                    .unwrap_or(i64::MAX);
                 candidates.push(Candidate {
                     id,
                     subject,
                     scope,
                     last_synthesized_at,
+                    rowid,
                 });
             }
         }
@@ -1381,7 +1472,7 @@ impl<B: Backend> Graph<B> {
             .backend
             .query(
                 &format!(
-                    "SELECT n.id, n.subject, n.scope
+                    "SELECT n.id, n.subject, n.scope, n.rowid
                      FROM nodes n
                      LEFT JOIN entity_mention_state s
                        ON s.subject = n.subject AND s.scope = COALESCE(n.scope, '')
@@ -1396,10 +1487,15 @@ impl<B: Backend> Graph<B> {
                 subject: row.get_string(1)?,
                 scope: opt_string(row, 2)?,
                 last_synthesized_at: Millis(0),
+                rowid: row.get_i64(3)?,
             });
         }
 
-        candidates.sort_by_key(|c| c.last_synthesized_at);
+        candidates.sort_by(|a, b| {
+            a.last_synthesized_at
+                .cmp(&b.last_synthesized_at)
+                .then_with(|| a.rowid.cmp(&b.rowid))
+        });
         Ok(candidates
             .into_iter()
             .take(limit)
@@ -2120,6 +2216,7 @@ mod tests {
     mod log_open;
     mod log_write;
     mod log_write_faults;
+    mod ranking_ties;
     mod rebuild;
     mod reembed;
     mod soak;
@@ -3119,16 +3216,7 @@ mod tests {
         let a = NodeId::from_raw("a");
         let b = NodeId::from_raw("b");
         let c = NodeId::from_raw("c");
-        let candidate = |id: &NodeId| Candidate {
-            id: id.clone(),
-            kind: "fact".to_string(),
-            label: String::new(),
-            content: String::new(),
-            scope: None,
-            attributes: serde_json::Value::Null,
-            confidence: 1.0,
-            valid_from: Millis(0),
-        };
+        let candidate = |id: &NodeId| Candidate::new(id.clone(), "fact", "", "");
         let scrambled = vec![candidate(&c), candidate(&a), candidate(&b)];
         let ordered_ids = vec![a.clone(), b.clone(), c.clone()];
 
@@ -3141,16 +3229,10 @@ mod tests {
     }
 
     fn scoring_candidate(id: &str, confidence: f64, valid_from: Millis) -> Candidate {
-        Candidate {
-            id: NodeId::from_raw(id),
-            kind: "fact".to_string(),
-            label: String::new(),
-            content: String::new(),
-            scope: None,
-            attributes: serde_json::Value::Null,
-            confidence,
-            valid_from,
-        }
+        let mut c = Candidate::new(NodeId::from_raw(id), "fact", "", "");
+        c.confidence = confidence;
+        c.valid_from = valid_from;
+        c
     }
 
     #[test]

@@ -54,8 +54,12 @@ impl GraphConfig {
             read_pool_size: 4,
         }
     }
+    /// Sets the RRF constant. A negative value is clamped to zero and a
+    /// non-finite one is ignored, so fused scores stay finite and comparable.
     pub fn with_rrf_k(mut self, k: f64) -> Self {
-        self.rrf_k = k;
+        if k.is_finite() {
+            self.rrf_k = k.max(0.0);
+        }
         self
     }
     pub fn with_expansion_weight(mut self, w: f64) -> Self {
