@@ -187,6 +187,18 @@ pub enum Error {
     #[error("batch {batch_key} has no room left to count another failure")]
     ExtractionCounterOverflow { batch_key: String },
 
+    /// A fact or the end of one named no log event it came from.
+    #[error("a fact needs at least one source event")]
+    FactWithoutSource,
+
+    /// A trust score outside `[0.0, 1.0]`, or not a number.
+    #[error("trust score {0} is not a number between 0.0 and 1.0")]
+    InvalidFactTrust(f64),
+
+    /// A fact whose validity would not start before it ends.
+    #[error("a fact cannot be valid from {valid_from} until {valid_until}")]
+    InvalidFactInterval { valid_from: i64, valid_until: i64 },
+
     /// The store holds rows the log does not record yet, so a logged write
     /// would sit ahead of them and a replay could not apply it.
     #[error("the store has rows the log does not hold yet: run the backfill first")]

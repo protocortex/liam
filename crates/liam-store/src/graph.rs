@@ -32,6 +32,7 @@ use crate::types::{
 };
 use crate::value::{Row, Value};
 
+mod arbitration;
 mod backfill;
 mod facts;
 mod gc;
