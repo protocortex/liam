@@ -30,6 +30,9 @@ const ALIAS_ENV: &str = "LLAMA_ARG_ALIAS";
 const HEALTH_PATH: &str = "/health";
 const MODELS_PATH: &str = "/v1/models";
 const HTTP_OK: u16 = 200;
+const HTTP_UNAUTHORIZED: u16 = 401;
+/// Not on the server's public list, so it answers 401 without the key.
+const PROTECTED_PATH: &str = "/props";
 const URANDOM: &str = "/dev/urandom";
 const KEY_BYTES: usize = 32;
 const ALIAS_BYTES: usize = 16;
@@ -319,7 +322,9 @@ impl SidecarGuard {
             .host
             .parse()
             .map_err(|_| SidecarError::Setup(io::ErrorKind::InvalidInput))?;
-        let deadline = Instant::now() + Duration::from_secs(config.start_timeout_secs);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(config.start_timeout_secs))
+            .ok_or(SidecarError::Setup(io::ErrorKind::InvalidInput))?;
         let (key, alias) = (random_hex(KEY_BYTES)?, random_hex(ALIAS_BYTES)?);
         for attempt in 1..=MAX_START_ATTEMPTS {
             let port = (deps.next_port)().map_err(|e| SidecarError::Setup(e.kind()))?;
@@ -388,18 +393,28 @@ impl SidecarGuard {
         }
     }
 
-    /// Both probes are unauthenticated: the key must not reach a listener
-    /// that has not proven it is the child we started.
+    /// Every probe is unauthenticated: the key must not reach a listener that
+    /// has not proven it is the child we started. The last probe also proves
+    /// the child enforces the key, so a server that ignored the key variable
+    /// never counts as ready.
     async fn answers_with_alias(&self) -> bool {
         let Some(models) = self.probe(MODELS_PATH).await else {
             return false;
         };
-        let listed = serde_json::from_slice::<ModelList>(&models)
-            .is_ok_and(|list| list.data.iter().any(|model| model.id == self.alias.0));
-        listed && self.probe(HEALTH_PATH).await.is_some()
+        let listed = models.status == HTTP_OK
+            && serde_json::from_slice::<ModelList>(&models.body)
+                .is_ok_and(|list| list.data.iter().any(|model| model.id == self.alias.0));
+        if !listed || self.probe(HEALTH_PATH).await.map(|r| r.status) != Some(HTTP_OK) {
+            return false;
+        }
+        let guarded = self.probe(PROTECTED_PATH).await.map(|r| r.status) == Some(HTTP_UNAUTHORIZED);
+        if !guarded {
+            warn!("sidecar does not reject an unauthenticated request, so it is not trusted");
+        }
+        guarded
     }
 
-    async fn probe(&self, path: &str) -> Option<Vec<u8>> {
+    async fn probe(&self, path: &str) -> Option<http::Response> {
         let request = Request {
             method: "GET",
             path,
@@ -410,13 +425,10 @@ impl SidecarGuard {
             timeout: PROBE_TIMEOUT,
             max_body_bytes: PROBE_MAX_BYTES,
         };
-        match http::send(self.addr, &request, limits).await {
-            Ok(response) if response.status == HTTP_OK => Some(response.body),
-            other => {
-                debug!(path, ok = other.is_ok(), "sidecar probe not ready");
-                None
-            }
-        }
+        http::send(self.addr, &request, limits)
+            .await
+            .map_err(|error| debug!(path, %error, "sidecar probe failed"))
+            .ok()
     }
 
     fn exit_status(&self) -> Option<ExitStatus> {
@@ -451,9 +463,16 @@ impl SidecarGuard {
     /// Asks the server to quit and waits up to a grace period; `Drop` then
     /// kills whatever is left.
     pub async fn stop(self) {
-        // SAFETY: `kill` only sends a signal; the pid is our own live or
-        // not-yet-reaped child, so it cannot name another process.
-        unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGTERM) };
+        {
+            let mut child = lock(&self.child);
+            // An unreaped child still owns its pid, so the signal cannot
+            // reach a process that reused it.
+            if matches!(child.try_wait(), Ok(None)) {
+                // SAFETY: `kill` only sends a signal, and the child lock is
+                // held so the pid cannot be reaped and recycled meanwhile.
+                unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGTERM) };
+            }
+        }
         let give_up = Instant::now() + STOP_GRACE;
         while self.is_alive() && Instant::now() < give_up {
             tokio::time::sleep(STOP_POLL_INTERVAL).await;

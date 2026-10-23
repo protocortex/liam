@@ -17,6 +17,9 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_CTX_TOKENS: usize = 4096;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_START_TIMEOUT_SECS: u64 = 120;
+/// An hour is far past any model load; a larger value is a typo that would
+/// also overflow the deadline arithmetic.
+const MAX_START_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_RUN_DEADLINE_SECS: u64 = 600;
 const DEFAULT_RAM_BUDGET_MB: u64 = 4096;
 const DEFAULT_MAX_EVENTS_PER_RUN: usize = 200;
@@ -132,6 +135,10 @@ impl ExtractionConfig {
         ] {
             anyhow::ensure!(value > 0, "extraction.{key} must be at least 1");
         }
+        anyhow::ensure!(
+            self.start_timeout_secs <= MAX_START_TIMEOUT_SECS,
+            "extraction.start_timeout_secs must be at most {MAX_START_TIMEOUT_SECS}"
+        );
         anyhow::ensure!(
             self.max_event_chars != Some(0),
             "extraction.max_event_chars must be at least 1"
@@ -284,6 +291,24 @@ mod tests {
 
     fn error_of(toml: &str) -> String {
         format!("{:#}", load(toml).expect_err("config must be rejected"))
+    }
+
+    #[test]
+    fn a_start_timeout_over_the_cap_is_rejected_and_the_cap_itself_is_allowed() {
+        // Arrange
+        let over = format!(
+            "[extraction]\nstart_timeout_secs = {}\n",
+            MAX_START_TIMEOUT_SECS + 1
+        );
+        let at = format!("[extraction]\nstart_timeout_secs = {MAX_START_TIMEOUT_SECS}\n");
+
+        // Act
+        let message = error_of(&over);
+        let allowed = loaded_extraction(&at);
+
+        // Assert
+        assert!(message.contains("start_timeout_secs"), "{message}");
+        assert_eq!(allowed.start_timeout_secs, MAX_START_TIMEOUT_SECS);
     }
 
     #[test]

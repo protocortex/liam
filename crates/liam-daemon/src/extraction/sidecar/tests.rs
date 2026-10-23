@@ -20,6 +20,9 @@ const FAKE_PID_FILE: &str = "FAKE_PID_FILE";
 const MODE_EXIT: &str = "exit";
 const MODE_LOADING: &str = "loading";
 const MODE_IGNORE_TERM: &str = "ignore_term";
+const MODE_UNHEALTHY: &str = "unhealthy";
+/// Serves every path without checking the key.
+const MODE_OPEN: &str = "open";
 const START_TIMEOUT_SECS: u64 = 10;
 const SHORT_TIMEOUT_SECS: u64 = 1;
 const TIMEOUT_SLACK_FACTOR: u64 = 5;
@@ -188,9 +191,10 @@ fn serve(stream: TcpStream, mode: &str, key: &str, alias: &str) {
     let path = request_line.split_whitespace().nth(1).unwrap_or_default();
     let (status, body) = match path {
         _ if mode == MODE_LOADING => ("503 Service Unavailable", String::new()),
+        HEALTH_PATH if mode == MODE_UNHEALTHY => ("503 Service Unavailable", String::new()),
         HEALTH_PATH => ("200 OK", r#"{"status":"ok"}"#.into()),
         MODELS_PATH => ("200 OK", format!(r#"{{"data":[{{"id":"{alias}"}}]}}"#)),
-        _ if authorized => ("200 OK", CHAT_BODY.into()),
+        _ if authorized || mode == MODE_OPEN => ("200 OK", CHAT_BODY.into()),
         _ => ("401 Unauthorized", String::new()),
     };
     let reply = format!(
@@ -336,6 +340,123 @@ async fn a_hostile_listener_gets_no_key_and_no_body() {
     assert!(seen
         .iter()
         .all(|r| r.starts_with("GET ") && !r.to_ascii_lowercase().contains("authorization")));
+}
+
+/// A listener that answers every request with 200, naming `alias` in the model
+/// list, and records the raw requests it gets.
+async fn echoing_listener(alias: Arc<Mutex<String>>) -> (u16, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((LOOPBACK, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut raw = vec![0u8; 4096];
+            let read = stream.read(&mut raw).await.unwrap_or(0);
+            log.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&raw[..read]).into_owned());
+            let body = format!(r#"{{"data":[{{"id":"{}"}}]}}"#, alias.lock().unwrap());
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+        }
+    });
+    (port, seen)
+}
+
+#[tokio::test]
+async fn a_listener_that_echoes_the_alias_still_gets_no_key_and_no_body() {
+    // Arrange
+    let alias = Arc::new(Mutex::new(String::new()));
+    let (hostile_port, seen) = echoing_listener(Arc::clone(&alias)).await;
+    let (inner, spawns) = fake("", None);
+    let factory = {
+        let alias = Arc::clone(&alias);
+        move |launch: &LaunchParams| {
+            *alias.lock().unwrap() = launch.alias.to_string();
+            inner(launch)
+        }
+    };
+    let ports = vec![hostile_port, free_port()];
+
+    // Act
+    let guard = SidecarGuard::start_with(&config(START_TIMEOUT_SECS), factory, deps(ports)).await;
+
+    // Assert
+    assert!(guard.is_ok());
+    assert_eq!(spawns.load(Ordering::SeqCst), 2);
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|request| {
+        let lower = request.to_ascii_lowercase();
+        request.starts_with("GET ")
+            && !lower.contains("authorization")
+            && !lower.contains("content-length")
+    }));
+}
+
+#[tokio::test]
+async fn a_server_that_lists_the_alias_but_reports_unhealthy_is_not_ready() {
+    // Arrange
+    let (factory, _) = fake(MODE_UNHEALTHY, None);
+
+    // Act
+    let result = SidecarGuard::start_with(
+        &config(SHORT_TIMEOUT_SECS),
+        factory,
+        deps(vec![free_port()]),
+    )
+    .await;
+
+    // Assert
+    assert_eq!(result.err(), Some(SidecarError::StartTimeout));
+}
+
+#[tokio::test]
+async fn a_server_that_ignores_the_key_is_never_trusted() {
+    // Arrange
+    let (factory, _) = fake(MODE_OPEN, None);
+
+    // Act
+    let result = SidecarGuard::start_with(
+        &config(SHORT_TIMEOUT_SECS),
+        factory,
+        deps(vec![free_port()]),
+    )
+    .await;
+
+    // Assert
+    assert_eq!(result.err(), Some(SidecarError::StartTimeout));
+}
+
+#[tokio::test]
+async fn free_ram_equal_to_the_budget_is_enough() {
+    // Arrange
+    let (factory, _) = fake("", None);
+    let config = ExtractionConfig {
+        ram_budget_mb: 4096,
+        ..config(START_TIMEOUT_SECS)
+    };
+    let exact = Deps {
+        free_ram: Box::new(FixedRam(4096)),
+        ..deps(vec![free_port()])
+    };
+
+    // Act
+    let guard = SidecarGuard::start_with(&config, factory, exact).await;
+
+    // Assert
+    assert!(guard.is_ok());
+}
+
+#[test]
+fn the_start_budget_is_three_attempts() {
+    assert_eq!(MAX_START_ATTEMPTS, 3);
 }
 
 #[tokio::test]
