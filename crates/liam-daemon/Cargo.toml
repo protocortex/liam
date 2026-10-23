@@ -67,6 +67,9 @@ clap = { version = "4", features = ["derive"] }
 # tracker can only WAIT for tasks, and the drain has to abort the ones still
 # running when the deadline passes.
 tokio-util = { version = "0.7", default-features = false }
+# SIGTERM for the sidecar's graceful stop; std can only send SIGKILL. Already
+# in the tree through tokio and others, so this is a new direct edge only.
+libc = "0.2"
 
 # Cold-start concurrency tuning (WU-8) reads available system RAM to bound how
 # many concurrent generations it is even worth benchmarking. MIT/Apache-2.0,
