@@ -3,6 +3,7 @@ use tempfile::TempDir;
 use super::*;
 
 const LOOPBACK: &str = "127.0.0.1";
+const LEAK_PROBE: &str = "LIAM_TEST_SIDECAR_LEAK";
 
 #[test]
 fn the_production_command_keeps_the_secrets_off_argv() {
@@ -92,14 +93,44 @@ fn stderr_keeps_only_the_tail_and_never_the_secrets() {
 fn a_secret_cut_by_the_cap_leaves_no_fragment() {
     // Arrange
     let mut tail = StderrTail::default();
-    let filler = "y".repeat(STDERR_CAP_BYTES - 4);
+    let filler = "y".repeat(STDERR_CAP_BYTES - 5);
 
     // Act
-    tail.push(format!("key=ABCDEFGH\n{filler}").as_bytes());
+    tail.push(format!("ABCDEFGH{filler}").as_bytes());
     let text = tail.redacted(&["ABCDEFGH"]);
 
     // Assert
-    assert!(!text.contains("EFGH"));
+    assert!(!text.contains("DEFGH"), "a fragment of the secret survived");
+}
+
+#[test]
+fn the_child_inherits_only_the_allowlist_and_its_own_secrets() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let script = dir.path().join("print-env");
+    std::fs::write(&script, "#!/bin/sh\nenv\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let paths = Paths {
+        server: script,
+        model: "/models/m.gguf".into(),
+    };
+    let launch = LaunchParams {
+        addr: "127.0.0.1:9".parse().unwrap(),
+        alias: "the-alias",
+        key: "the-key",
+    };
+    std::env::set_var(LEAK_PROBE, "leaked");
+
+    // Act
+    let output = server_command(&ExtractionConfig::default(), &paths, &launch)
+        .output()
+        .unwrap();
+
+    // Assert
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(printed.contains("LLAMA_API_KEY=the-key"), "{printed}");
+    assert!(printed.contains("PATH="), "{printed}");
+    assert!(!printed.contains(LEAK_PROBE), "{printed}");
 }
 
 #[test]

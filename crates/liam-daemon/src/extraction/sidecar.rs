@@ -122,10 +122,30 @@ fn required(value: &Option<String>, key: &'static str) -> Result<PathBuf, Sideca
     }
 }
 
+/// The only variables the child inherits: the daemon's own environment may
+/// hold credentials that a model server has no use for.
+const INHERITED_ENV: [&str; 9] = [
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "XDG_CACHE_HOME",
+    "LD_LIBRARY_PATH",
+    "CUDA_VISIBLE_DEVICES",
+];
+
 /// The real `llama-server` command line. No shell is involved, and the
 /// secrets travel in the environment only.
 fn server_command(config: &ExtractionConfig, paths: &Paths, launch: &LaunchParams) -> Command {
     let mut command = Command::new(&paths.server);
+    command.env_clear();
+    for name in INHERITED_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     command
         .arg("--host")
         .arg(launch.addr.ip().to_string())
@@ -167,14 +187,20 @@ impl StderrTail {
         }
     }
 
-    /// Secrets removed. After a cut the first line is dropped: it may hold
-    /// only the tail of a secret, which no exact match could find.
+    /// Secrets removed. After a cut the front may hold only the tail of a
+    /// secret, which no exact match could find: the first line is dropped, or
+    /// with no line break the longest tail a secret could leave.
     fn redacted(&self, secrets: &[&str]) -> String {
-        let text = String::from_utf8_lossy(&self.bytes);
-        let mut text = match (self.dropped, text.split_once('\n')) {
-            (true, Some((_, rest))) => rest.to_string(),
-            _ => text.into_owned(),
+        let start = if self.dropped {
+            let longest = secrets.iter().map(|s| s.len()).max().unwrap_or(0);
+            match self.bytes.iter().position(|&b| b == b'\n') {
+                Some(line_end) => line_end + 1,
+                None => longest.saturating_sub(1).min(self.bytes.len()),
+            }
+        } else {
+            0
         };
+        let mut text = String::from_utf8_lossy(&self.bytes[start..]).into_owned();
         for secret in secrets {
             text = text.replace(secret, REDACTED);
         }
