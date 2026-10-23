@@ -39,7 +39,7 @@ rmcp = { version = "3", features = ["server", "macros", "transport-io"] }
 schemars = "1"
 # `remember`'s `attributes` argument is a caller-supplied JSON object, passed
 # straight through to `liam_store::NewNode::with_attributes`.
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 time = "0.3"
 # Mode dispatch. Declared directly even though leiden-rs pulls clap in through
 # liam-store anyway, and always will now that ADR-0002 made clustering

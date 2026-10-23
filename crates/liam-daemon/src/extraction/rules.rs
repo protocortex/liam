@@ -178,7 +178,7 @@ fn is_whole_date_token(scan: &Scan, start: usize, end: usize) -> bool {
 }
 
 /// `candidate` is `YYYY-MM-DD` by construction of the pattern.
-fn is_calendar_date(candidate: &str) -> bool {
+pub(super) fn is_calendar_date(candidate: &str) -> bool {
     let field = |range: std::ops::Range<usize>| candidate[range].parse::<u32>().ok();
     let (Some(year), Some(month), Some(day)) =
         (field(YEAR_FIELD), field(MONTH_FIELD), field(DAY_FIELD))

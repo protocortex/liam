@@ -189,6 +189,15 @@ impl ExtractionConfig {
 /// one source of cardinality, match mode, and grounding for every extraction
 /// step.
 pub fn resolve_vocabulary(config: &ExtractionConfig) -> Vocabulary {
+    Vocabulary::new(merged_specs(config))
+}
+
+/// Every predicate name the model may use, built-ins and configured, sorted.
+pub fn declared_predicates(config: &ExtractionConfig) -> Vec<String> {
+    merged_specs(config).into_keys().collect()
+}
+
+fn merged_specs(config: &ExtractionConfig) -> BTreeMap<String, PredicateSpec> {
     let mut specs: BTreeMap<String, PredicateSpec> = BUILT_IN_PREDICATES
         .iter()
         .map(|(name, spec)| ((*name).to_string(), *spec))
@@ -204,7 +213,7 @@ pub fn resolve_vocabulary(config: &ExtractionConfig) -> Vocabulary {
             },
         );
     }
-    Vocabulary::new(specs)
+    specs
 }
 
 /// A number must be a real score in `[0.0, 1.0]`; NaN fails the range check.
@@ -581,5 +590,19 @@ mod tests {
         // Assert
         assert_eq!(spec.cardinality, Cardinality::Many);
         assert_eq!(spec.match_mode, MatchMode::Exact);
+    }
+
+    #[test]
+    fn declared_predicates_are_the_built_ins_plus_configured_names_sorted() {
+        // Arrange
+        let config = loaded_extraction("[extraction.predicates.speaks]\ncardinality = \"many\"\n");
+
+        // Act
+        let names = declared_predicates(&config);
+
+        // Assert
+        assert_eq!(names.len(), BUILT_IN_PREDICATES.len() + 1);
+        assert!(names.contains(&"speaks".to_string()) && names.contains(&"works_at".to_string()));
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }
