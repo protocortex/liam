@@ -26,7 +26,8 @@ use crate::types::{
 };
 use crate::value::{Row, Value};
 
-const FACT_COLUMNS: &str = "id, lineage_id, subject, predicate, object, object_key, scope,
+pub(super) const FACT_COLUMNS: &str =
+    "id, lineage_id, subject, predicate, object, object_key, scope,
        evidence_at, valid_from, valid_until, tx_from, tx_to, closed_by, confidence,
        trust_score, extractor_id, extractor_version";
 
@@ -101,7 +102,7 @@ fn corrupt(id: &str, detail: &str) -> Error {
     Error::CorruptFactState(format!("fact version {id} {detail}"))
 }
 
-fn version_from_row(row: &Row) -> Result<Fact> {
+pub(super) fn version_from_row(row: &Row) -> Result<Fact> {
     let id = row.get_string(0)?;
     let extractor = row.get_string(15)?;
     let extractor_id = ExtractorName::from_stored(&extractor)
