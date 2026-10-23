@@ -344,6 +344,9 @@ impl SidecarGuard {
         command_for: impl Fn(&LaunchParams) -> Command,
         mut deps: Deps,
     ) -> Result<Self, SidecarError> {
+        // Before the RAM gate: a stale server holds the memory the gate reads.
+        let swept = stale::sweep(&deps.pidfile, &deps.server_exe, deps.processes.as_ref());
+        debug!(?swept, "swept the previous sidecar");
         let free_mb = deps.free_ram.free_mb();
         if free_mb < config.ram_budget_mb {
             return Err(SidecarError::RamGate {
@@ -351,8 +354,6 @@ impl SidecarGuard {
                 budget_mb: config.ram_budget_mb,
             });
         }
-        let swept = stale::sweep(&deps.pidfile, &deps.server_exe, deps.processes.as_ref());
-        debug!(?swept, "swept the previous sidecar");
         let ip: IpAddr = config
             .host
             .parse()
@@ -402,6 +403,7 @@ impl SidecarGuard {
             capture_stderr(pipe, Arc::clone(&stderr));
         }
         // Built before the wait so every early return reaps the child.
+        stale::claim(child.id());
         let guard = Self {
             pid: child.id(),
             child: Arc::new(Mutex::new(child)),
@@ -415,12 +417,15 @@ impl SidecarGuard {
         // Written before the wait: a daemon killed mid-start still leaves a
         // record the next one can clear. A failure drops the guard, which
         // kills the child, since an unrecorded sidecar could never be swept.
+        // Without a start time the record could never match, so it is refused.
+        let start_time = recorder
+            .processes
+            .inspect(guard.pid)
+            .ok_or(SidecarError::Setup(io::ErrorKind::NotFound))?
+            .start_time;
         let record = Pidfile {
             pid: guard.pid,
-            start_time: recorder
-                .processes
-                .inspect(guard.pid)
-                .map_or(0, |p| p.start_time),
+            start_time,
             port: launch.addr.port(),
         };
         record
@@ -551,8 +556,11 @@ impl Drop for SidecarGuard {
         // Errors mean the child is already gone, which is the goal.
         let _ = child.kill();
         let _ = child.wait();
-        // Already gone is fine.
-        let _ = std::fs::remove_file(&self.pidfile);
+        stale::release(self.pid);
+        // Another guard may have recorded its own child here; leave that.
+        if Pidfile::recorded_pid(&self.pidfile) == Some(self.pid) {
+            let _ = std::fs::remove_file(&self.pidfile);
+        }
     }
 }
 

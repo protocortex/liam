@@ -57,18 +57,17 @@ fn config(timeout_secs: u64) -> ExtractionConfig {
 }
 
 fn deps(ports: Vec<u16>) -> Deps {
-    static NEXT_PIDFILE: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        // Each test runs on its own thread, so the directory lives exactly as
+        // long as the test.
+        static PIDFILE_DIR: TempDir = TempDir::new().unwrap();
+    }
     let mut ports = ports.into_iter();
-    let unique = NEXT_PIDFILE.fetch_add(1, Ordering::SeqCst);
     Deps {
         free_ram: Box::new(FixedRam(ENOUGH_RAM_MB)),
         next_port: Box::new(move || Ok(ports.next().expect("a port was scripted"))),
         processes: Box::new(SystemProcesses),
-        // The guard removes it on drop, including after a failed start.
-        pidfile: std::env::temp_dir().join(format!(
-            "liam-sidecar-test-{}-{unique}.pid",
-            std::process::id()
-        )),
+        pidfile: PIDFILE_DIR.with(|dir| dir.path().join("sidecar.pid")),
         server_exe: std::env::current_exe().unwrap(),
     }
 }
