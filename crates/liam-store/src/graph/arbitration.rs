@@ -3,8 +3,6 @@
 //! versions of a key and an incoming claim decide, with no SQL. The effects
 //! are a `Plan` of rows to close, insert and link, so the write path can log a
 //! decision before it applies it and a test can read every rule off a table.
-// The SQL effects that call these arrive in the change after this one.
-#![allow(dead_code)]
 
 use std::collections::BTreeSet;
 

@@ -495,6 +495,13 @@ impl ExtractorName {
             Self::Llm => "llm",
         }
     }
+
+    /// The extractor stored under `stored`, or `None` for a value no write produces.
+    pub(crate) fn from_stored(stored: &str) -> Option<Self> {
+        [Self::Rules, Self::Llm]
+            .into_iter()
+            .find(|name| name.as_str() == stored)
+    }
 }
 
 /// A fact to assert. `scope` is `None` for none; it is stored as ''.
