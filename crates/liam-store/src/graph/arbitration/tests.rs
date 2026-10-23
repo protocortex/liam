@@ -317,6 +317,23 @@ fn a_higher_trust_corroboration_closes_a_lower_trust_contradiction() {
 }
 
 #[test]
+fn a_higher_trust_corroboration_closes_a_contradiction_on_equal_evidence() {
+    // Arrange
+    let mut contradiction = version("b", "Melbourne");
+    contradiction.trust_score = 0.3;
+    contradiction.evidence_at = Millis(200);
+    let live = state(vec![version("a", "Sydney"), contradiction]);
+    let mut claim = claim("Sydney");
+    claim.fact.trust_score = 0.9;
+
+    // Act
+    let decision = assert_with(&live, &claim, &single());
+
+    // Assert
+    assert_eq!(decision.plan.close, ids(&["a", "b"]));
+}
+
+#[test]
 fn a_higher_trust_corroboration_leaves_a_contradiction_on_newer_evidence() {
     // Arrange
     let mut contradiction = version("b", "Melbourne");
@@ -695,6 +712,96 @@ fn restating_a_replaced_value_from_a_new_event_corroborates_the_closed_version()
 }
 
 #[test]
+fn restating_a_replaced_value_on_equal_evidence_revives_it() {
+    // Arrange
+    let mut closed = version("a", "Sydney");
+    closed.valid_until = Millis(150);
+    closed.evidence_at = Millis(200);
+    let mut melbourne = version("b", "Melbourne");
+    melbourne.valid_from = Millis(150);
+    melbourne.evidence_at = Millis(200);
+    let mut claim = claim("Sydney");
+    claim.fact.valid_from = Millis(700);
+
+    // Act
+    let decision = assert_with(&state(vec![closed, melbourne]), &claim, &single());
+
+    // Assert
+    assert_eq!(
+        decision.outcome,
+        ArbitrationOutcome::Replaced {
+            closed: ids(&["b"]),
+            inserted: FactId::from_raw("m1")
+        }
+    );
+}
+
+#[test]
+fn replaying_a_live_version_with_higher_trust_changes_nothing() {
+    // Arrange
+    let mut claim = claim("Sydney");
+    claim.fact.source_event_ids = vec!["e-a".into()];
+    claim.fact.trust_score = 0.9;
+
+    // Act
+    let decision = assert_with(&state(vec![version("a", "Sydney")]), &claim, &single());
+
+    // Assert
+    assert_eq!(decision.plan, Plan::default());
+}
+
+#[test]
+fn replaying_a_replaced_version_with_a_new_valid_from_changes_nothing() {
+    // Arrange
+    let mut closed = version("a", "Sydney");
+    closed.valid_until = Millis(150);
+    closed.evidence_at = Millis(200);
+    let mut melbourne = version("b", "Melbourne");
+    melbourne.valid_from = Millis(150);
+    melbourne.evidence_at = Millis(200);
+    let mut claim = claim("Sydney");
+    claim.fact.source_event_ids = vec!["e-a".into()];
+    claim.fact.evidence_at = Millis(300);
+    claim.fact.valid_from = Millis(700);
+
+    // Act
+    let decision = assert_with(&state(vec![closed, melbourne]), &claim, &single());
+
+    // Assert
+    assert_eq!(decision.plan, Plan::default());
+}
+
+#[test]
+fn a_version_is_live_only_while_it_ends_after_the_evidence() {
+    for (valid_until, live) in [
+        (Millis(199), false),
+        (Millis(200), false),
+        (Millis(201), true),
+    ] {
+        // Arrange
+        let mut stored = version("a", "Sydney");
+        stored.valid_until = valid_until;
+
+        // Act
+        let decision = assert_with(&state(vec![stored]), &claim("Melbourne"), &single());
+
+        // Assert
+        let label = format!("valid_until {}", valid_until.0);
+        if live {
+            assert!(
+                matches!(decision.outcome, ArbitrationOutcome::Replaced { .. }),
+                "{label}"
+            );
+        } else {
+            assert!(
+                matches!(decision.outcome, ArbitrationOutcome::Inserted { .. }),
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
 fn replaying_the_events_of_a_replaced_value_changes_nothing() {
     // Arrange
     let mut closed = version("a", "Sydney");
@@ -854,6 +961,23 @@ fn an_assertion_with_only_an_end_may_start_at_the_beginning() {
 
     // Assert
     assert!(result.is_ok());
+}
+
+#[test]
+fn the_trust_bounds_are_accepted() {
+    for trust in [0.0, 1.0] {
+        // Arrange
+        let fact = NewFact {
+            trust_score: trust,
+            ..new_fact("x")
+        };
+
+        // Act
+        let result = Claim::new(fact, String::new());
+
+        // Assert
+        assert!(result.is_ok(), "trust {trust}");
+    }
 }
 
 #[test]

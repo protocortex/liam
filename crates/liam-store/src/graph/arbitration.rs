@@ -308,8 +308,9 @@ pub(super) fn decide_assert(
         .filter(|version| !live.iter().any(|held| held.id == version.id))
         .max_by_key(|version| (version.evidence_at, version.valid_from))
     {
+        // Equal evidence revives too: ties break toward the newer claim, as in `differing`.
         let revives =
-            claim.fact.evidence_at > past.evidence_at && claim.fact.valid_from != past.valid_from;
+            claim.fact.evidence_at >= past.evidence_at && claim.fact.valid_from != past.valid_from;
         if !revives {
             let mut plan = Plan::default();
             plan.link(
