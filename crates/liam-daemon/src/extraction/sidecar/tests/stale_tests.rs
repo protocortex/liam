@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use std::os::unix::fs::symlink;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::AtomicBool;
