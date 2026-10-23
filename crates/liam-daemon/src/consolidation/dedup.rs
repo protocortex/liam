@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Near-duplicate merge: nodes whose content embeds almost the same are linked
 //! by a `near_duplicate_of` edge. Both rows stay live, so the merge only adds
-//! edges. Each edge goes through the logged `relate_from` path, stamped with a
-//! `consolidation:` source: a rebuild from the log replays it, and a rollback's
+//! edges. Each edge goes through the logged `relate_from` path, stamped with the
+//! run's source: a rebuild from the log replays it, and a rollback's
 //! replay-forward skips it along with the rest of the run's own writes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use liam_store::relation::NEAR_DUPLICATE_OF;
 use liam_store::{ContentEmbedder, DefaultGraph, Millis, NodeId, Query, BEGINNING};
-
-/// The log source of every edge this pass writes.
-pub const DEDUP_SOURCE: &str = "consolidation:dedup";
 
 /// Most nodes one pass scans. The comparison is quadratic and each node costs
 /// an embedder call, so the rest wait for the next pass.
@@ -273,7 +270,8 @@ async fn older_match(
 
 /// Links near-duplicates among the live nodes written after `after`, and
 /// between those and older nodes of the same scope and producer. `as_of` must
-/// be an instant at which every live row is visible.
+/// be an instant at which every live row is visible. `source` stamps each edge's
+/// log record.
 ///
 /// # Errors
 ///
@@ -285,6 +283,7 @@ pub async fn merge_near_duplicates(
     after: Option<ScanPosition>,
     as_of: Millis,
     threshold: f32,
+    source: &str,
 ) -> Result<MergeReport, DedupError> {
     check_threshold(threshold)?;
     let scan = scan(store, embedder, after, as_of).await?;
@@ -337,12 +336,7 @@ pub async fn merge_near_duplicates(
     pairs.truncate(MAX_MERGES_PER_PASS);
     for pair in &pairs {
         let written = store
-            .relate_from(
-                &pair.duplicate,
-                &pair.canonical,
-                NEAR_DUPLICATE_OF,
-                DEDUP_SOURCE,
-            )
+            .relate_from(&pair.duplicate, &pair.canonical, NEAR_DUPLICATE_OF, source)
             .await;
         match written {
             Ok(_) => report.linked += 1,
@@ -370,6 +364,8 @@ mod tests {
     use super::*;
     use crate::event_log;
     use async_trait::async_trait;
+
+    const SOURCE: &str = "consolidation:test-run";
     use futures_util::StreamExt;
     use liam_log::dedup::BloomConfig;
     use liam_log::event::LogPayload;
@@ -383,15 +379,6 @@ mod tests {
 
     const DIMS: usize = 2;
     const START: Millis = Millis(1000);
-
-    #[test]
-    fn the_dedup_source_is_a_consolidation_run_source_the_store_can_roll_back() {
-        // Act
-        let rest = DEDUP_SOURCE.strip_prefix(liam_store::RUN_SOURCE_PREFIX);
-
-        // Assert
-        assert_eq!(rest, Some("dedup"));
-    }
     /// Just before the end of time, so every live row is visible.
     const AS_OF: Millis = Millis(FOREVER.0 - 1);
     const WAL: WalConfig = WalConfig {
@@ -477,7 +464,7 @@ mod tests {
     }
 
     async fn run(store: &DefaultGraph, embed: &Embed, threshold: f32) -> MergeReport {
-        merge_near_duplicates(store, embed, None, AS_OF, threshold)
+        merge_near_duplicates(store, embed, None, AS_OF, threshold, SOURCE)
             .await
             .unwrap()
     }
@@ -729,9 +716,10 @@ mod tests {
         let new = store.insert(fact("new").with_scope("s")).await.unwrap();
 
         // Act
-        let second = merge_near_duplicates(&store, &embed, first.resume_from, AS_OF, THRESHOLD)
-            .await
-            .unwrap();
+        let second =
+            merge_near_duplicates(&store, &embed, first.resume_from, AS_OF, THRESHOLD, SOURCE)
+                .await
+                .unwrap();
 
         // Assert
         assert_eq!((second.scanned, second.linked), (1, 1));
@@ -757,9 +745,10 @@ mod tests {
         store.insert(fact("new").with_scope("s")).await.unwrap();
 
         // Act
-        let second = merge_near_duplicates(&store, &embed, first.resume_from, AS_OF, THRESHOLD)
-            .await
-            .unwrap();
+        let second =
+            merge_near_duplicates(&store, &embed, first.resume_from, AS_OF, THRESHOLD, SOURCE)
+                .await
+                .unwrap();
 
         // Assert
         assert_eq!((second.scanned, second.linked), (1, 0));
@@ -780,7 +769,7 @@ mod tests {
         let mut after = None;
         let mut scanned = Vec::new();
         loop {
-            let report = merge_near_duplicates(&store, &embed, after, AS_OF, EXACT)
+            let report = merge_near_duplicates(&store, &embed, after, AS_OF, EXACT, SOURCE)
                 .await
                 .unwrap();
             if report.scanned == 0 {
@@ -815,7 +804,7 @@ mod tests {
 
         // Act
         let first = run(&store, &embed, EXACT).await;
-        let second = merge_near_duplicates(&store, &embed, first.resume_from, AS_OF, EXACT)
+        let second = merge_near_duplicates(&store, &embed, first.resume_from, AS_OF, EXACT, SOURCE)
             .await
             .unwrap();
 
@@ -840,7 +829,7 @@ mod tests {
 
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.5, 1.5] {
             // Act
-            let result = merge_near_duplicates(&store, &embed, None, AS_OF, bad).await;
+            let result = merge_near_duplicates(&store, &embed, None, AS_OF, bad, SOURCE).await;
 
             // Assert
             assert!(
@@ -857,7 +846,7 @@ mod tests {
         let (store, _) = open(&dir).await;
 
         // Act
-        let result = merge_near_duplicates(&store, &constant(ONE), None, AS_OF, 1.0).await;
+        let result = merge_near_duplicates(&store, &constant(ONE), None, AS_OF, 1.0, SOURCE).await;
 
         // Assert
         assert!(result.is_ok());
@@ -970,7 +959,7 @@ mod tests {
                 sources.push(event.source);
             }
         }
-        assert_eq!(sources, vec![DEDUP_SOURCE.to_string()]);
+        assert_eq!(sources, vec![SOURCE.to_string()]);
     }
 
     #[tokio::test]

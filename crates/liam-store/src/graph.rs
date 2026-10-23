@@ -49,6 +49,7 @@ mod rebuild;
 mod reembed;
 mod replay;
 mod rolled_back;
+mod run_marker;
 mod snapshot;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
@@ -2255,6 +2256,7 @@ mod tests {
     mod ranking_ties;
     mod rebuild;
     mod reembed;
+    mod run_marker;
     mod snapshot;
     mod soak;
     mod support;

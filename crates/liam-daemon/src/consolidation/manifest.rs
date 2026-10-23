@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use liam_log::wal::{write_atomically, OsFileOps};
-use liam_store::Millis;
+use liam_store::{Millis, RUN_SOURCE_PREFIX};
 use serde::{Deserialize, Serialize};
 
 use crate::embedder_fingerprint::EmbedderFingerprint;
@@ -17,7 +17,7 @@ const MANIFEST_SUFFIX: &str = ".consolidation.json";
 /// other version is refused rather than guessed at. Any new manifest field must
 /// bump it: `flatten` rules out `deny_unknown_fields`, so an older build would
 /// silently drop the field and rewrite the file without it.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// How a finished run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +36,8 @@ pub struct RunManifest {
     pub llm_model_fingerprint: String,
     pub created_at: Millis,
     pub snapshot_log_offset: Option<u64>,
+    /// The snapshot's metadata file, which a rollback restores from.
+    pub snapshot_meta_path: Option<PathBuf>,
     pub completed_steps: Vec<String>,
     pub outcome: Option<RunOutcome>,
 }
@@ -110,9 +112,15 @@ impl RunManifest {
             llm_model_fingerprint,
             created_at,
             snapshot_log_offset: None,
+            snapshot_meta_path: None,
             completed_steps: Vec::new(),
             outcome: None,
         }
+    }
+
+    /// The log source this run stamps on its own writes.
+    pub fn write_source(&self) -> String {
+        format!("{RUN_SOURCE_PREFIX}{}", self.run_id)
     }
 
     /// Writes the manifest to `path`, replacing any earlier one.
@@ -236,6 +244,7 @@ mod tests {
         let path = manifest_path_for(&dir.path().join("liam.db"));
         let mut original = manifest();
         original.snapshot_log_offset = Some(7);
+        original.snapshot_meta_path = Some(dir.path().join("snapshot.json"));
         original.completed_steps = vec!["snapshot".into()];
         original.outcome = Some(RunOutcome::RolledBack);
 
@@ -256,6 +265,19 @@ mod tests {
         assert!(fresh.completed_steps.is_empty());
         assert_eq!(fresh.outcome, None);
         assert_eq!(fresh.snapshot_log_offset, None);
+        assert_eq!(fresh.snapshot_meta_path, None);
+    }
+
+    #[test]
+    fn a_run_stamps_its_writes_with_its_own_source() {
+        // Arrange
+        let run = manifest();
+
+        // Act
+        let source = run.write_source();
+
+        // Assert
+        assert_eq!(source.strip_prefix(RUN_SOURCE_PREFIX), Some("run-1"));
     }
 
     #[test]
@@ -292,7 +314,7 @@ mod tests {
         let path = manifest_path_for(&dir.path().join("liam.db"));
         manifest().save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, text.replace("\"version\": 1", "\"version\": 99")).unwrap();
+        std::fs::write(&path, text.replace("\"version\": 2", "\"version\": 99")).unwrap();
 
         // Act
         let result = RunManifest::load(&path);
@@ -362,13 +384,13 @@ mod tests {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
         let path = manifest_path_for(&dir.path().join("liam.db"));
-        std::fs::write(&path, r#"{"version": 2, "renamed_run": "x"}"#).unwrap();
+        std::fs::write(&path, r#"{"version": 99, "renamed_run": "x"}"#).unwrap();
 
         // Act
         let error = RunManifest::load(&path).unwrap_err().to_string();
 
         // Assert
-        assert!(error.contains("version 2"), "{error}");
+        assert!(error.contains("version 99"), "{error}");
     }
 
     #[test]
