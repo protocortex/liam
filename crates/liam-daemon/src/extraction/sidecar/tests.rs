@@ -21,6 +21,8 @@ const MODE_EXIT: &str = "exit";
 const MODE_LOADING: &str = "loading";
 const MODE_IGNORE_TERM: &str = "ignore_term";
 const MODE_UNHEALTHY: &str = "unhealthy";
+/// Rejects the probe key, so the alias can never be read.
+const MODE_REAL_ONLY: &str = "real_only";
 /// Serves every path without checking the key.
 const MODE_OPEN: &str = "open";
 const START_TIMEOUT_SECS: u64 = 10;
@@ -78,7 +80,7 @@ fn fake(
             .args(["--exact", ENTRY_TEST, "--nocapture", "--test-threads=1"])
             .env(FAKE_PORT, launch.addr.port().to_string())
             .env(FAKE_MODE, mode)
-            .env(API_KEY_ENV, launch.key)
+            .env(API_KEY_ENV, format!("{},{}", launch.probe_key, launch.key))
             .env(ALIAS_ENV, launch.alias);
         if let Some(path) = &pid_file {
             command.env(FAKE_PID_FILE, path);
@@ -167,7 +169,8 @@ fn fake_server_entry() {
     }
 }
 
-fn serve(stream: TcpStream, mode: &str, key: &str, alias: &str) {
+fn serve(stream: TcpStream, mode: &str, keys: &str, alias: &str) {
+    let real = keys.rsplit(',').next().unwrap_or_default();
     stream.set_nonblocking(false).unwrap();
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
@@ -177,9 +180,14 @@ fn serve(stream: TcpStream, mode: &str, key: &str, alias: &str) {
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
-        authorized |= line
-            .trim()
-            .eq_ignore_ascii_case(&format!("authorization: bearer {key}"));
+        if let Some(token) = line.trim().strip_prefix("Authorization: Bearer ") {
+            // Like the real server, any listed key is accepted; a test mode
+            // can narrow that to the real key alone.
+            let accepted = keys
+                .split(',')
+                .filter(|k| mode != MODE_REAL_ONLY || *k == real);
+            authorized |= accepted.into_iter().any(|k| k == token);
+        }
         if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
             length = value.trim().parse().unwrap();
         }
@@ -193,9 +201,10 @@ fn serve(stream: TcpStream, mode: &str, key: &str, alias: &str) {
         _ if mode == MODE_LOADING => ("503 Service Unavailable", String::new()),
         HEALTH_PATH if mode == MODE_UNHEALTHY => ("503 Service Unavailable", String::new()),
         HEALTH_PATH => ("200 OK", r#"{"status":"ok"}"#.into()),
+        // Like llama.cpp master, only `/health` answers without a key.
+        _ if !authorized && mode != MODE_OPEN => ("401 Unauthorized", String::new()),
         MODELS_PATH => ("200 OK", format!(r#"{{"data":[{{"id":"{alias}"}}]}}"#)),
-        _ if authorized || mode == MODE_OPEN => ("200 OK", CHAT_BODY.into()),
-        _ => ("401 Unauthorized", String::new()),
+        _ => ("200 OK", CHAT_BODY.into()),
     };
     let reply = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -323,10 +332,18 @@ async fn a_taken_port_is_retried_on_a_new_one() {
 }
 
 #[tokio::test]
-async fn a_hostile_listener_gets_no_key_and_no_body() {
+async fn a_listener_with_the_wrong_alias_gets_no_real_key_and_no_body() {
     // Arrange
     let hostile = spawn_double(vec![ok(r#"{"data":[{"id":"wrong"}]}"#)]).await;
-    let (factory, spawns) = fake("", None);
+    let (inner, spawns) = fake("", None);
+    let real = Arc::new(Mutex::new(String::new()));
+    let factory = {
+        let real = Arc::clone(&real);
+        move |launch: &LaunchParams| {
+            *real.lock().unwrap() = launch.key.to_string();
+            inner(launch)
+        }
+    };
     let ports = vec![hostile.addr.port(), free_port()];
 
     // Act
@@ -335,11 +352,11 @@ async fn a_hostile_listener_gets_no_key_and_no_body() {
     // Assert
     assert!(guard.is_ok());
     assert_eq!(spawns.load(Ordering::SeqCst), 2);
-    let seen = hostile.requests();
+    let (seen, real) = (hostile.requests(), real.lock().unwrap().clone());
     assert!(!seen.is_empty());
     assert!(seen
         .iter()
-        .all(|r| r.starts_with("GET ") && !r.to_ascii_lowercase().contains("authorization")));
+        .all(|r| r.starts_with("GET ") && !r.contains(&real)));
 }
 
 /// A listener that answers every request with 200, naming `alias` in the model
@@ -370,15 +387,19 @@ async fn echoing_listener(alias: Arc<Mutex<String>>) -> (u16, Arc<Mutex<Vec<Stri
 }
 
 #[tokio::test]
-async fn a_listener_that_echoes_the_alias_still_gets_no_key_and_no_body() {
+async fn a_listener_that_echoes_the_alias_never_receives_the_real_key() {
     // Arrange
     let alias = Arc::new(Mutex::new(String::new()));
     let (hostile_port, seen) = echoing_listener(Arc::clone(&alias)).await;
     let (inner, spawns) = fake("", None);
+    let keys = Arc::new(Mutex::new(Vec::new()));
     let factory = {
-        let alias = Arc::clone(&alias);
+        let (alias, keys) = (Arc::clone(&alias), Arc::clone(&keys));
         move |launch: &LaunchParams| {
             *alias.lock().unwrap() = launch.alias.to_string();
+            keys.lock()
+                .unwrap()
+                .push((launch.probe_key.to_string(), launch.key.to_string()));
             inner(launch)
         }
     };
@@ -390,14 +411,102 @@ async fn a_listener_that_echoes_the_alias_still_gets_no_key_and_no_body() {
     // Assert
     assert!(guard.is_ok());
     assert_eq!(spawns.load(Ordering::SeqCst), 2);
+    let (first_probe, real) = keys.lock().unwrap()[0].clone();
     let seen = seen.lock().unwrap();
     assert!(!seen.is_empty());
     assert!(seen.iter().all(|request| {
         let lower = request.to_ascii_lowercase();
-        request.starts_with("GET ")
-            && !lower.contains("authorization")
-            && !lower.contains("content-length")
+        request.starts_with("GET ") && !request.contains(&real) && !lower.contains("content-length")
     }));
+    assert!(seen.iter().any(|request| request.contains(&first_probe)));
+}
+
+#[tokio::test]
+async fn the_probe_key_is_new_for_every_attempt_and_every_start() {
+    // Arrange
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let collect = |inner: Box<dyn Fn(&LaunchParams) -> Command>| {
+        let keys = Arc::clone(&keys);
+        move |launch: &LaunchParams| {
+            keys.lock()
+                .unwrap()
+                .push((launch.probe_key.to_string(), launch.key.to_string()));
+            inner(launch)
+        }
+    };
+    let (failing, _) = fake(MODE_EXIT, None);
+    let (healthy, _) = fake("", None);
+    let ports = (0..MAX_START_ATTEMPTS).map(|_| free_port()).collect();
+
+    // Act
+    let _ = SidecarGuard::start_with(
+        &config(START_TIMEOUT_SECS),
+        collect(Box::new(failing)),
+        deps(ports),
+    )
+    .await;
+    let guard = SidecarGuard::start_with(
+        &config(START_TIMEOUT_SECS),
+        collect(Box::new(healthy)),
+        deps(vec![free_port()]),
+    )
+    .await
+    .unwrap();
+
+    // Assert
+    let keys = keys.lock().unwrap();
+    let probes: std::collections::HashSet<_> = keys.iter().map(|(probe, _)| probe).collect();
+    assert_eq!(keys.len(), MAX_START_ATTEMPTS as usize + 1);
+    assert_eq!(probes.len(), keys.len(), "a probe key was reused");
+    assert!(keys.iter().all(|(probe, real)| probe != real));
+    assert_eq!(guard.api_key(), keys.last().unwrap().1);
+}
+
+#[tokio::test]
+async fn the_alias_cannot_be_read_without_the_probe_key() {
+    // Arrange
+    let (factory, _) = fake(MODE_REAL_ONLY, None);
+    let config = config(SHORT_TIMEOUT_SECS);
+
+    // Act
+    let result = SidecarGuard::start_with(&config, factory, deps(vec![free_port()])).await;
+
+    // Assert
+    assert_eq!(result.err(), Some(SidecarError::StartTimeout));
+}
+
+#[tokio::test]
+async fn models_and_props_need_a_key_but_health_does_not() {
+    // Arrange
+    let (factory, _) = fake("", None);
+    let guard = started(factory).await;
+    let addr = guard.addr();
+    let get = |path: &'static str| async move {
+        let request = Request {
+            method: "GET",
+            path,
+            bearer: None,
+            body: &[],
+        };
+        let limits = Limits {
+            timeout: PROBE_TIMEOUT,
+            max_body_bytes: PROBE_MAX_BYTES,
+        };
+        http::send(addr, &request, limits).await.unwrap().status
+    };
+
+    // Act
+    let (health, models, props) = (
+        get(HEALTH_PATH).await,
+        get(MODELS_PATH).await,
+        get(PROTECTED_PATH).await,
+    );
+
+    // Assert
+    assert_eq!(
+        (health, models, props),
+        (HTTP_OK, HTTP_UNAUTHORIZED, HTTP_UNAUTHORIZED)
+    );
 }
 
 #[tokio::test]
@@ -545,6 +654,7 @@ fn the_production_command_keeps_the_secrets_off_argv() {
     let launch = LaunchParams {
         addr: "127.0.0.1:9".parse().unwrap(),
         alias: "the-alias",
+        probe_key: "the-probe",
         key: "the-key",
     };
 
@@ -558,11 +668,11 @@ fn the_production_command_keeps_the_secrets_off_argv() {
         .collect();
     assert!(args
         .iter()
-        .all(|a| !a.contains("the-key") && !a.contains("the-alias")));
+        .all(|a| !a.contains("the-key") && !a.contains("the-probe") && !a.contains("the-alias")));
     assert!(args.windows(2).any(|w| w == ["--host", LOOPBACK]));
     assert!(args.windows(2).any(|w| w == ["--threads", "2"]));
     let envs: Vec<_> = command.get_envs().collect();
-    assert!(envs.contains(&(API_KEY_ENV.as_ref(), Some("the-key".as_ref()))));
+    assert!(envs.contains(&(API_KEY_ENV.as_ref(), Some("the-probe,the-key".as_ref()))));
     assert!(envs.contains(&(ALIAS_ENV.as_ref(), Some("the-alias".as_ref()))));
 }
 
@@ -643,6 +753,7 @@ fn the_child_inherits_only_the_allowlist_and_its_own_secrets() {
     let launch = LaunchParams {
         addr: "127.0.0.1:9".parse().unwrap(),
         alias: "the-alias",
+        probe_key: "the-probe",
         key: "the-key",
     };
     std::env::set_var(LEAK_PROBE, "leaked");
@@ -654,7 +765,10 @@ fn the_child_inherits_only_the_allowlist_and_its_own_secrets() {
 
     // Assert
     let printed = String::from_utf8_lossy(&output.stdout);
-    assert!(printed.contains("LLAMA_API_KEY=the-key"), "{printed}");
+    assert!(
+        printed.contains("LLAMA_API_KEY=the-probe,the-key"),
+        "{printed}"
+    );
     assert!(printed.contains("PATH="), "{printed}");
     assert!(!printed.contains(LEAK_PROBE), "{printed}");
 }

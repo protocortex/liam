@@ -137,6 +137,9 @@ fn free_loopback_port(host: &str) -> io::Result<u16> {
 pub struct LaunchParams<'a> {
     pub addr: SocketAddr,
     pub alias: &'a str,
+    /// Accepted by the server beside `key` and good for nothing else: it is
+    /// the only secret a listener of unproven identity ever sees.
+    pub probe_key: &'a str,
     pub key: &'a str,
 }
 
@@ -209,7 +212,7 @@ fn server_command(config: &ExtractionConfig, paths: &Paths, launch: &LaunchParam
         .arg("--ctx-size")
         .arg(config.ctx_tokens.to_string())
         .args(&config.extra_args)
-        .env(API_KEY_ENV, launch.key)
+        .env(API_KEY_ENV, format!("{},{}", launch.probe_key, launch.key))
         .env(ALIAS_ENV, launch.alias);
     command
 }
@@ -283,6 +286,7 @@ pub struct SidecarGuard {
     pid: u32,
     addr: SocketAddr,
     key: Secret,
+    probe_key: Secret,
     alias: Secret,
     stderr: Arc<Mutex<StderrTail>>,
 }
@@ -328,9 +332,13 @@ impl SidecarGuard {
         let (key, alias) = (random_hex(KEY_BYTES)?, random_hex(ALIAS_BYTES)?);
         for attempt in 1..=MAX_START_ATTEMPTS {
             let port = (deps.next_port)().map_err(|e| SidecarError::Setup(e.kind()))?;
+            // Fresh per attempt, so a listener that kept one learns nothing
+            // about the next.
+            let probe_key = random_hex(KEY_BYTES)?;
             let launch = LaunchParams {
                 addr: SocketAddr::new(ip, port),
                 alias: &alias,
+                probe_key: &probe_key,
                 key: &key,
             };
             match Self::launch(command_for(&launch), &launch, deadline).await {
@@ -363,6 +371,7 @@ impl SidecarGuard {
             child: Arc::new(Mutex::new(child)),
             addr: launch.addr,
             key: Secret(launch.key.to_string()),
+            probe_key: Secret(launch.probe_key.to_string()),
             alias: Secret(launch.alias.to_string()),
             stderr,
         };
@@ -393,32 +402,37 @@ impl SidecarGuard {
         }
     }
 
-    /// Every probe is unauthenticated: the key must not reach a listener that
-    /// has not proven it is the child we started. The last probe also proves
-    /// the child enforces the key, so a server that ignored the key variable
-    /// never counts as ready.
+    /// Identity comes before trust. `/health` and the 401 check are
+    /// anonymous. The alias is read with the probe key alone, so a listener
+    /// that is not our child never sees the real key and cannot echo an alias
+    /// it never received. A server that ignored the key variable fails the
+    /// 401 check and is not trusted either.
     async fn answers_with_alias(&self) -> bool {
-        let Some(models) = self.probe(MODELS_PATH).await else {
+        if self.probe(HEALTH_PATH, None).await.map(|r| r.status) != Some(HTTP_OK) {
+            return false;
+        }
+        let Some(models) = self.probe(MODELS_PATH, Some(&self.probe_key.0)).await else {
             return false;
         };
         let listed = models.status == HTTP_OK
             && serde_json::from_slice::<ModelList>(&models.body)
                 .is_ok_and(|list| list.data.iter().any(|model| model.id == self.alias.0));
-        if !listed || self.probe(HEALTH_PATH).await.map(|r| r.status) != Some(HTTP_OK) {
+        if !listed {
             return false;
         }
-        let guarded = self.probe(PROTECTED_PATH).await.map(|r| r.status) == Some(HTTP_UNAUTHORIZED);
+        let guarded =
+            self.probe(PROTECTED_PATH, None).await.map(|r| r.status) == Some(HTTP_UNAUTHORIZED);
         if !guarded {
             warn!("sidecar does not reject an unauthenticated request, so it is not trusted");
         }
         guarded
     }
 
-    async fn probe(&self, path: &str) -> Option<http::Response> {
+    async fn probe(&self, path: &str, bearer: Option<&str>) -> Option<http::Response> {
         let request = Request {
             method: "GET",
             path,
-            bearer: None,
+            bearer,
             body: &[],
         };
         let limits = Limits {
@@ -457,7 +471,7 @@ impl SidecarGuard {
 
     /// What the child wrote to stderr last, with the key and alias removed.
     pub fn stderr_tail(&self) -> String {
-        lock(&self.stderr).redacted(&[&self.key.0, &self.alias.0])
+        lock(&self.stderr).redacted(&[&self.key.0, &self.probe_key.0, &self.alias.0])
     }
 
     /// Asks the server to quit and waits up to a grace period; `Drop` then
