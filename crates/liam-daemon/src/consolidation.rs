@@ -4,3 +4,4 @@
 //! the event log's unrelated WAL-to-Parquet compactor.
 
 pub mod manifest;
+pub mod probes;
