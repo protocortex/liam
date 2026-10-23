@@ -376,7 +376,7 @@ impl Backend for LibsqlBackend {
              JOIN nodes n ON n.id = v.node_id
              WHERE n.tx_from <= ?2 AND n.tx_to > ?2
                AND n.valid_from <= ?2 AND n.valid_until > ?2{filters}
-             ORDER BY vector_distance_cos(v.embedding, vector(?1)) LIMIT ?3"
+             ORDER BY vector_distance_cos(v.embedding, vector(?1)), n.rowid LIMIT ?3"
         );
         let rows = self
             .reader()
