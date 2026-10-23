@@ -29,6 +29,7 @@ use liam_store::{
 };
 
 use liam_daemon::config::{resolve_config_source, Config};
+use liam_daemon::embedder_fingerprint::{self, EmbedderFingerprint};
 use liam_daemon::event_log;
 use liam_daemon::models::{self, StoreEmbedder};
 use liam_daemon::storelock::StoreLock;
@@ -233,6 +234,9 @@ async fn try_rebuild(
             .first_failure()
             .unwrap_or("reasons are logged above")
     );
+    // Only a complete re-embed vouches for the configured embedder, so the next
+    // daemon start passes the fingerprint check.
+    embedder_fingerprint::record(&database, &EmbedderFingerprint::from_config(config))?;
     Ok(())
 }
 
@@ -1195,6 +1199,94 @@ mod tests {
         assert!(out.is_empty(), "{out}");
         assert_eq!(dump(&database).await, before);
         assert_eq!(nodes_without_vectors(&database).await, 0);
+    }
+
+    fn recorded_fingerprint(database: &Path) -> String {
+        std::fs::read_to_string(embedder_fingerprint::fingerprint_path_for(database)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_successful_rebuild_records_the_fingerprint_of_the_config_it_embedded_with() {
+        // Arrange: a store whose record is for another embedder
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        let mut old = EmbedderFingerprint::from_config(&config());
+        old.model = "previous-model".to_string();
+        embedder_fingerprint::record(&database, &old).unwrap();
+
+        // Act
+        let (code, _out, err) =
+            run_rebuild(dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
+
+        // Assert: the next daemon start finds nothing to refuse or to record
+        assert_eq!(code, 0, "stderr: {err}");
+        let pending =
+            embedder_fingerprint::verify(&database, &EmbedderFingerprint::from_config(&config()))
+                .expect("the rebuilt store must pass the fingerprint check");
+        assert!(pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_with_failed_embeddings_leaves_the_fingerprint_alone() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        let mut old = EmbedderFingerprint::from_config(&config());
+        old.model = "previous-model".to_string();
+        embedder_fingerprint::record(&database, &old).unwrap();
+        let before = recorded_fingerprint(&database);
+
+        // Act
+        let (code, _out, _err) = run_with(
+            &rebuild_of(&database, Some(&log_dir)),
+            &config_file(dir.path()),
+            |_| Ok(Arc::new(FailingEmbedder)),
+        )
+        .await;
+
+        // Assert
+        assert_eq!(code, 1);
+        assert_eq!(recorded_fingerprint(&database), before);
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_to_another_dimension_resizes_the_vector_table() {
+        // Arrange: a store embedded at 8 dimensions, rebuilt for 16
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        let wider = Config {
+            embedding_dims: 2 * DIMS,
+            ..config()
+        };
+
+        // Act
+        let (code, _out, err) =
+            run_with_config(&wider, dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
+
+        // Assert: the table is created at the new width and every node has a vector in it
+        assert_eq!(code, 0, "stderr: {err}");
+        let backend = DefaultBackend::open(database.to_str().unwrap(), 1)
+            .await
+            .unwrap();
+        let ddl = backend
+            .query(
+                "SELECT sql FROM sqlite_master WHERE name = 'node_vectors'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            format!("{ddl:?}").contains("F32_BLOB(16)"),
+            "node_vectors keeps its old width: {ddl:?}"
+        );
+        let stored = backend
+            .query("SELECT count(*) FROM node_vectors", &[])
+            .await
+            .unwrap();
+        assert_eq!(stored[0].get_i64(0).unwrap(), 2);
     }
 
     #[cfg(not(feature = "local"))]

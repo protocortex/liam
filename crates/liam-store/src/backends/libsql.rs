@@ -36,6 +36,10 @@ const VECTOR_DELETE_SQL: &str = "DELETE FROM node_vectors WHERE node_id = ?1";
 
 const VECTOR_CLEAR_SQL: &str = "DELETE FROM node_vectors";
 
+/// libSQL fixes the `F32_BLOB` width when the table is created and accepts a
+/// vector of any width on insert, so a changed width means a new table.
+const VECTOR_DROP_SQL: &str = "DROP TABLE IF EXISTS node_vectors";
+
 /// Whether `path` can safely back a multi-connection read pool: true only
 /// for a plain filesystem path, one that does not start with `file:` and
 /// is not the bare `:memory:` spelling. `database_path` comes from user
@@ -322,6 +326,10 @@ impl Backend for LibsqlBackend {
 
     fn vector_clear_sql(&self) -> Option<&'static str> {
         Some(VECTOR_CLEAR_SQL)
+    }
+
+    fn vector_reset_statements(&self, dims: usize) -> Vec<String> {
+        vec![VECTOR_DROP_SQL.to_owned(), self.vector_ddl(dims)]
     }
 
     async fn vector_delete(&self, node_id: &str) -> Result<()> {

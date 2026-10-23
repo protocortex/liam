@@ -192,11 +192,11 @@ impl<B: Backend> Graph<B> {
     /// says the store takes on another log, which also drops what the old one
     /// left behind.
     pub(super) async fn reset(&self, held: &mut HeldLog, adopting: bool) -> Result<()> {
-        // The vector table has no cascade, so it goes first.
+        // The vector table has no cascade, so it goes first. It is also re-created
+        // at the configured width, which a changed embedder may have moved.
         let statements = self
             .backend
-            .vector_clear_sql()
-            .map(str::to_owned)
+            .vector_reset_statements(self.dims)
             .into_iter()
             .chain(
                 DERIVED_TABLES

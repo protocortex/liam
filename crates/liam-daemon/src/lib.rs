@@ -26,6 +26,7 @@
 //! reaching into it.
 
 pub mod config;
+pub mod embedder_fingerprint;
 pub mod event_log;
 pub mod models;
 pub mod storelock;
