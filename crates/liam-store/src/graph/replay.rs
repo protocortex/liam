@@ -35,7 +35,10 @@ pub struct CatchUpReport {
     pub applied: usize,
     /// Events whose rows the store already held.
     pub already_applied: usize,
-    /// Events a later `Voided` record cancelled.
+    /// Events a later `Voided` record cancelled. A void does not say why it
+    /// was written, so an event a quarantine voided before a snapshot was taken
+    /// is counted here after a restore and its `log_quarantine` row is not
+    /// recreated.
     pub skipped_voided: usize,
     /// Events the projection refused, recorded in `log_quarantine`.
     pub quarantined: usize,
@@ -124,6 +127,10 @@ impl<B: Backend> Graph<B> {
             let event_id = &record.event.event_id;
             let outcome = if ahead.voided.contains(event_id) {
                 log_cursor::advance(&self.backend, held.log_id, record.offset).await?;
+                tracing::info!(
+                    event = %event_id,
+                    "replay: voided event skipped; if a quarantine voided it, its log_quarantine row is not recreated, as the log keeps no reason"
+                );
                 Outcome::Voided
             } else {
                 self.replay_event(held, &record, &ahead.removed, &mut last_void)
