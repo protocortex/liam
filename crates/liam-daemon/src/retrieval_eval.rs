@@ -45,8 +45,10 @@
 //! count, mean call latency, throughput). One untimed warm-up `embed` call
 //! runs first, so model initialisation is excluded from those timings.
 //!
-//! This is a **scored baseline, not a CI gate**: there are no
-//! quality-threshold assertions on the metric values themselves. What IS
+//! This is a **scored baseline, not a CI gate**: the only quality-threshold
+//! assertions are the deterministic text-only tier's per-category recall@10
+//! floors (see "Text-only baseline" below); the real-embedder tier has none
+//! on its metric values. What IS
 //! asserted (in WU-3/WU-4's harness tests) is structural: the harness does
 //! not panic, every metric value lands in `[0, 1]`, every non-excluded
 //! question produces a result, and each category's fixtures are internally
@@ -55,9 +57,43 @@
 //! into a dated table here, the same convention `eval.rs` uses for its own
 //! baselines.
 //!
-//! # Real-embedder baseline (2026-08-30, Apple M1 Pro, macOS 15.7.5,
-//! # Qwen/Qwen3-Embedding-0.6B, 768 dims, `cargo test --release ... --ignored
-//! # --nocapture retrieval`)
+//! # Golden set
+//!
+//! 80 questions, 10 per category, over a synthetic corpus of one fictional
+//! company. LIAM is pre-release and has no real usage or query logs, so this
+//! set substitutes for the "real usage" query set the evaluation brief asks
+//! for: it is a deliberate deviation, to be replaced or extended once actual
+//! users exist. The target stays at 80, well short of the brief's 200 to 500,
+//! because every fixture is hand-written and hand-checked. Each fact is
+//! authored to contain the answer to the question that names it, so a
+//! relevance label is correct by construction rather than judged after the
+//! fact. Question names and corpus labels are stable ids that reports quote:
+//! add new ones, never rename.
+//!
+//! # Text-only baseline (2026-10-23, 80 questions, the always-on tier)
+//!
+//! | category       | n  | precision@4 | precision@8 | recall@4 | recall@8 | recall@10 | nDCG@10 | MRR   |
+//! |----------------|----|-------------|-------------|----------|----------|-----------|---------|-------|
+//! | Lexical        | 10 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//! | GraphExpansion | 10 | 0.375       | 0.225       | 0.750    | 0.900    | 0.900     | 0.851   | 1.000 |
+//! | KindFilter     | 10 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//! | ScopeFilter    | 10 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//! | Decay          | 10 | 0.175       | 0.125       | 0.700    | 1.000    | 1.000     | 0.527   | 0.376 |
+//! | Confidence     | 10 | 0.075       | 0.087       | 0.300    | 0.700    | 0.900     | 0.377   | 0.228 |
+//! | AsOf           | 10 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//!
+//! Unlike the real-embedder tier, the text-only tier is deterministic, so
+//! its recall@10 per category is asserted against the floors recorded in the
+//! earlier 40-question run (see `TEXT_ONLY_RECALL_AT_10_FLOORS`): growing the
+//! set must not regress what that run already measured.
+//!
+//! # Real-embedder baseline (2026-08-30, 40-question set, Apple M1 Pro,
+//! # macOS 15.7.5, Qwen/Qwen3-Embedding-0.6B, 768 dims, `cargo test --release
+//! # ... --ignored --nocapture retrieval`)
+//!
+//! This table predates the 80-question golden set and is NOT recomputed: it
+//! needs a model download and a manual run. Treat it as historical until the
+//! next real-embedder run replaces it.
 //!
 //! | category       | n | precision@4 | precision@8 | recall@4 | recall@8 | recall@10 | nDCG@10 | MRR   |
 //! |----------------|---|-------------|-------------|----------|----------|-----------|---------|-------|
@@ -902,6 +938,523 @@ const CORPUS: &[Fact] = &[
         confidence: Some(0.5),
         ..FACT_DEFAULTS
     },
+    // Expansion block: five more facts (or pairs) per category, appended after
+    // the original corpus so existing labels never move. Every fact's content
+    // is written to contain the answer to the question that names it, which is
+    // what makes its relevance label correct by construction. Like the rest of
+    // the corpus this is synthetic: LIAM is pre-release with no real usage or
+    // query logs, so these questions stand in for the "real usage" set the
+    // evaluation brief asks for, to be replaced once actual users exist.
+    //
+    // Lexical
+    Fact {
+        kind: "fact",
+        label: "Delivery Network Size",
+        content: "Kestrel Robotics operates 120 Falconer drones in its delivery network.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Harrier Survey Drone",
+        content: "The Harrier survey drone maps crop fields using a multispectral camera.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "decision",
+        label: "Charging Dock Standard",
+        content: "Kestrel Robotics adopted the Qi2 inductive standard for every charging dock.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "episode",
+        label: "Aerospace Expo Booth",
+        content: "At the Aerospace Expo in Denver the company booth drew 3000 visitors in two \
+                   days.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "policy",
+        label: "Operator Certificate Policy",
+        content: "Every Falconer operator must hold a Part 107 remote pilot certificate.",
+        ..FACT_DEFAULTS
+    },
+    // VectorSemantic: each fact is the sole real semantic match for its
+    // paraphrase and shares almost no vocabulary with it.
+    Fact {
+        kind: "fact",
+        label: "Night Flight Waiver",
+        content: "Kestrel Robotics received regulatory approval to operate its drones after \
+                   sunset.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "policy",
+        label: "Employee Equity Plan",
+        content: "Kestrel Robotics grants equity options to every full time employee after one \
+                   year.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "episode",
+        label: "Cybersecurity Audit",
+        content: "An external firm tested the drone control software for hacking \
+                   vulnerabilities and found none critical.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "decision",
+        label: "Recycled Packaging",
+        content: "Shipping boxes for Falconer spare parts are now made entirely from recycled \
+                   cardboard.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Wildlife Disturbance Study",
+        content: "A study found the drone flight paths rarely disturbed nesting birds near the \
+                   Boulder test field.",
+        ..FACT_DEFAULTS
+    },
+    // GraphExpansion: five more seed and linked pairs, same shape as above.
+    Fact {
+        kind: "decision",
+        label: "Antenna Upgrade Decision",
+        content: "Engineers replaced the telemetry antenna with a longer range model.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "episode",
+        label: "Ridge Signal Trial",
+        content: "A ridge top trial confirmed the signal stayed solid at twelve kilometers.",
+        edge_target: Some("Antenna Upgrade Decision"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "decision",
+        label: "Gimbal Redesign Decision",
+        content: "The team redesigned the camera gimbal to stop vibration blur in footage.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "episode",
+        label: "Crisp Inspection Images",
+        content: "Customers reported crisp inspection images after the stabilizer update \
+                   shipped.",
+        edge_target: Some("Gimbal Redesign Decision"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "decision",
+        label: "Training Academy Launch",
+        content: "Kestrel Robotics opened a pilot training academy in Austin.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "episode",
+        label: "Academy First Cohort",
+        content: "Twenty four students graduated the inaugural class with perfect safety scores.",
+        edge_target: Some("Training Academy Launch"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "decision",
+        label: "Cloud Telemetry Migration",
+        content: "Flight telemetry storage moved from on premise servers to a managed cloud \
+                   database.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Hosting Cost Savings",
+        content: "Hosting expenses dropped by 35 percent within one quarter.",
+        edge_target: Some("Cloud Telemetry Migration"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "decision",
+        label: "Propeller Order Pause",
+        content: "Kestrel Robotics paused orders from its propeller manufacturer over missed \
+                   delivery dates.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "episode",
+        label: "Backup Blade Vendor",
+        content: "A second manufacturer in Ohio agreed to supply carbon fiber blades within \
+                   six weeks.",
+        edge_target: Some("Propeller Order Pause"),
+        ..FACT_DEFAULTS
+    },
+    // KindFilter: five more pairs sharing topic terms and differing in kind.
+    Fact {
+        kind: "decision",
+        label: "Hangar Lease Decision",
+        content: "Kestrel Robotics decided to lease a second hangar near the Boulder airfield.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "episode",
+        label: "Hangar Lease Walkthrough",
+        content: "Leadership toured the second hangar near the Boulder airfield last week.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "policy",
+        label: "Battery Disposal Policy",
+        content: "Retired batteries must be recycled through a certified hazardous waste handler.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Battery Disposal Incident",
+        content: "A retired battery sent to a standard waste handler overheated in transit.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "episode",
+        label: "Hospital Escalation Episode",
+        content: "A hospital customer escalated a delayed delivery complaint to the executive \
+                   team.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "decision",
+        label: "Hospital Escalation Decision",
+        content: "The executive team decided to assign a dedicated manager to hospital customer \
+                   delivery complaints.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Gust Tolerance Fact",
+        content: "The Falconer safely operates in sustained gusts up to forty kilometers per \
+                   hour.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "policy",
+        label: "Gust Grounding Policy",
+        content: "Operators must ground the Falconer when sustained gusts exceed thirty \
+                   kilometers per hour.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "decision",
+        label: "Open Source Firmware Decision",
+        content: "Kestrel Robotics decided to publish the ground station firmware as open \
+                   source.",
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "episode",
+        label: "Open Source Firmware Announcement",
+        content: "The ground station firmware repository went public at a community meetup, \
+                   open source at last.",
+        ..FACT_DEFAULTS
+    },
+    // ScopeFilter: five more pairs differing only in scope.
+    Fact {
+        kind: "fact",
+        label: "Support Ticket Backlog",
+        content: "Support cleared the ticket backlog after adding two weekend shifts.",
+        scope: Some("support"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Sales Ticket Backlog",
+        content: "Sales reviewed the ticket backlog impact on renewal conversations.",
+        scope: Some("sales"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "HR Hiring Plan",
+        content: "HR opened twelve new roles for the firmware team this year.",
+        scope: Some("hr"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Engineering Hiring Needs",
+        content: "Engineering listed the firmware skills missing from the current team roles.",
+        scope: Some("engineering"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Security Access Audit",
+        content: "Security audited badge access to the drone assembly hall.",
+        scope: Some("security"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Operations Badge Procedure",
+        content: "Operations updated the badge access procedure for assembly hall visitors.",
+        scope: Some("operations"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Sales Pipeline Review",
+        content: "Sales reviewed the enterprise pipeline for delivery drone contracts.",
+        scope: Some("sales"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Marketing Case Studies",
+        content: "Marketing drafted case studies from the enterprise delivery drone contracts.",
+        scope: Some("marketing"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Finance Tax Credit",
+        content: "Finance filed for a research tax credit covering drone development costs.",
+        scope: Some("finance"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Legal Tax Credit Deadline",
+        content: "Legal confirmed the research tax credit filing met the statutory deadline.",
+        scope: Some("legal"),
+        ..FACT_DEFAULTS
+    },
+    // Decay: five more pairs, the newer half restating the older plus a
+    // clause.
+    Fact {
+        kind: "fact",
+        label: "Warranty Term (Old)",
+        content: "Falconer drones carry a one year warranty on all flight components.",
+        valid_from_offset_ms: Some(-450 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Warranty Term (New)",
+        content: "Falconer drones carry a one year warranty on all flight components, now \
+                   extended to cover battery packs.",
+        valid_from_offset_ms: Some(-4 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Charge Time (Old)",
+        content: "A depleted Falconer battery reaches full charge in ninety minutes.",
+        valid_from_offset_ms: Some(-380 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Charge Time (New)",
+        content: "A depleted Falconer battery reaches full charge in ninety minutes, helped by \
+                   the faster charging dock.",
+        valid_from_offset_ms: Some(-3 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Depot Count (Old)",
+        content: "Kestrel Robotics runs three regional depots for drone maintenance.",
+        valid_from_offset_ms: Some(-350 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Depot Count (New)",
+        content: "Kestrel Robotics runs three regional depots for drone maintenance, with \
+                   another site under construction.",
+        valid_from_offset_ms: Some(-2 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "App Rating (Old)",
+        content: "The Kestrel mobile app holds a four point five star store rating.",
+        valid_from_offset_ms: Some(-280 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "App Rating (New)",
+        content: "The Kestrel mobile app holds a four point five star store rating, with over \
+                   ten thousand reviews.",
+        valid_from_offset_ms: Some(-4 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Lead Time (Old)",
+        content: "New Falconer orders ship within six weeks of purchase.",
+        valid_from_offset_ms: Some(-420 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Lead Time (New)",
+        content: "New Falconer orders ship within six weeks of purchase, now tracked in the \
+                   customer portal.",
+        valid_from_offset_ms: Some(-DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    // AsOf: five more pairs, an original fact later superseded.
+    Fact {
+        kind: "fact",
+        label: "Support Channel (Original)",
+        content: "Customers originally reached support only by phone.",
+        valid_from_offset_ms: Some(-600 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Support Channel (Current)",
+        content: "Kestrel Robotics replaced phone only support with a chat portal.",
+        valid_from_offset_ms: Some(-200 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Assembly Site (Original)",
+        content: "The first Falconer assembly line ran from a leased warehouse in Longmont.",
+        valid_from_offset_ms: Some(-700 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Assembly Site (Current)",
+        content: "Assembly moved from the leased Longmont warehouse into the new Boulder \
+                   factory.",
+        valid_from_offset_ms: Some(-250 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Funding Round (Original)",
+        content: "Kestrel Robotics closed a two million dollar seed round.",
+        valid_from_offset_ms: Some(-650 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Funding Round (Current)",
+        content: "Kestrel Robotics followed its seed round with a twenty million dollar \
+                   Series A.",
+        valid_from_offset_ms: Some(-300 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Flight Controller (Original)",
+        content: "Early Falconer prototypes flew on an off the shelf open source autopilot \
+                   board.",
+        valid_from_offset_ms: Some(-550 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Flight Controller (Current)",
+        content: "Kestrel Robotics replaced the open source autopilot board with an in house \
+                   flight controller.",
+        valid_from_offset_ms: Some(-150 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Delivery Radius (Original)",
+        content: "Falconer deliveries were limited to a five kilometer radius around each \
+                   depot.",
+        valid_from_offset_ms: Some(-480 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Delivery Radius (Current)",
+        content: "The delivery radius around each depot grew from five kilometers to eight.",
+        valid_from_offset_ms: Some(-90 * DAY_MS),
+        ..FACT_DEFAULTS
+    },
+    // Confidence: five more pairs; the verified half names the unverified
+    // one it must outrank.
+    Fact {
+        kind: "fact",
+        label: "Charge Cycles (Verified)",
+        content: "Verified lab cycling showed the Falconer battery lasts 800 charge cycles.",
+        confidence: Some(0.92),
+        competes_with: Some("Charge Cycles (Forum Post)"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Charge Cycles (Forum Post)",
+        content: "A forum post claimed the Falconer battery lasts 1500 charge cycles.",
+        confidence: Some(0.35),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Operating Temperature (Verified)",
+        content: "Chamber testing verified Falconer operation from minus ten to forty degrees \
+                   Celsius.",
+        confidence: Some(0.9),
+        competes_with: Some("Operating Temperature (Blog)"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Operating Temperature (Blog)",
+        content: "A blog post said the Falconer works down to minus thirty degrees Celsius.",
+        confidence: Some(0.3),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Open Orders (Verified)",
+        content: "The finance ledger shows 340 open Falconer orders.",
+        confidence: Some(0.88),
+        competes_with: Some("Open Orders (Hallway Rumor)"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Open Orders (Hallway Rumor)",
+        content: "Hallway chatter suggested 900 open Falconer orders.",
+        confidence: Some(0.25),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Crash Rate (Verified)",
+        content: "Flight logs verified a crash rate of one per ten thousand flights.",
+        confidence: Some(0.93),
+        competes_with: Some("Crash Rate (Anecdote)"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Crash Rate (Anecdote)",
+        content: "An anecdote from one customer implied a crash rate of one per thousand \
+                   flights.",
+        confidence: Some(0.4),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Ingress Rating (Verified)",
+        content: "The certification report verified an IP55 ingress protection rating.",
+        confidence: Some(0.95),
+        competes_with: Some("Ingress Rating (Sales Slide)"),
+        ..FACT_DEFAULTS
+    },
+    Fact {
+        kind: "fact",
+        label: "Ingress Rating (Sales Slide)",
+        content: "An old sales slide advertised an IP67 ingress protection rating.",
+        confidence: Some(0.45),
+        ..FACT_DEFAULTS
+    },
 ];
 
 /// The category-specific extra a `Question` layers on top of its text query,
@@ -1240,6 +1793,297 @@ const QUESTIONS: &[Question] = &[
         query_text: "Falconer drone battery life minutes of flight",
         knob: Knob::None,
         expected_relevant: &["Battery Life (Verified)"],
+    },
+    // Expansion block: five more questions per category, each naming the
+    // facts the matching expansion block in CORPUS wrote to answer it.
+    //
+    // Lexical
+    Question {
+        name: "lexical_delivery_network_size",
+        category: Category::Lexical,
+        query_text: "How many drones are in the delivery network?",
+        knob: Knob::None,
+        expected_relevant: &["Delivery Network Size"],
+    },
+    Question {
+        name: "lexical_harrier_survey",
+        category: Category::Lexical,
+        query_text: "Which drone maps crop fields with a multispectral camera?",
+        knob: Knob::None,
+        expected_relevant: &["Harrier Survey Drone"],
+    },
+    Question {
+        name: "lexical_charging_dock_standard",
+        category: Category::Lexical,
+        query_text: "Which inductive standard do the charging docks use?",
+        knob: Knob::None,
+        expected_relevant: &["Charging Dock Standard"],
+    },
+    Question {
+        name: "lexical_expo_visitors",
+        category: Category::Lexical,
+        query_text: "How many visitors came to the company booth at the Aerospace Expo?",
+        knob: Knob::None,
+        expected_relevant: &["Aerospace Expo Booth"],
+    },
+    Question {
+        name: "lexical_operator_certificate",
+        category: Category::Lexical,
+        query_text: "What certificate must a Falconer operator hold?",
+        knob: Knob::None,
+        expected_relevant: &["Operator Certificate Policy"],
+    },
+    // VectorSemantic
+    Question {
+        name: "vector_night_flight",
+        category: Category::VectorSemantic,
+        query_text: "Is the firm allowed to fly its aircraft in the dark?",
+        knob: Knob::None,
+        expected_relevant: &["Night Flight Waiver"],
+    },
+    Question {
+        name: "vector_equity_plan",
+        category: Category::VectorSemantic,
+        query_text: "Do workers get a share of ownership in the business after a while?",
+        knob: Knob::None,
+        expected_relevant: &["Employee Equity Plan"],
+    },
+    Question {
+        name: "vector_security_audit",
+        category: Category::VectorSemantic,
+        query_text: "Did outsiders probe the flight software for ways attackers could break in?",
+        knob: Knob::None,
+        expected_relevant: &["Cybersecurity Audit"],
+    },
+    Question {
+        name: "vector_recycled_packaging",
+        category: Category::VectorSemantic,
+        query_text: "Has the packaging for replacement components become more eco friendly?",
+        knob: Knob::None,
+        expected_relevant: &["Recycled Packaging"],
+    },
+    Question {
+        name: "vector_wildlife_impact",
+        category: Category::VectorSemantic,
+        query_text: "Does flying the machines upset animals that live near the testing site?",
+        knob: Knob::None,
+        expected_relevant: &["Wildlife Disturbance Study"],
+    },
+    // GraphExpansion
+    Question {
+        name: "graph_antenna_upgrade",
+        category: Category::GraphExpansion,
+        query_text: "telemetry antenna replaced",
+        knob: Knob::None,
+        expected_relevant: &["Antenna Upgrade Decision", "Ridge Signal Trial"],
+    },
+    Question {
+        name: "graph_gimbal_redesign",
+        category: Category::GraphExpansion,
+        query_text: "camera gimbal redesigned",
+        knob: Knob::None,
+        expected_relevant: &["Gimbal Redesign Decision", "Crisp Inspection Images"],
+    },
+    Question {
+        name: "graph_training_academy",
+        category: Category::GraphExpansion,
+        query_text: "What came of opening the Austin training academy?",
+        knob: Knob::None,
+        expected_relevant: &["Training Academy Launch", "Academy First Cohort"],
+    },
+    Question {
+        name: "graph_cloud_migration",
+        category: Category::GraphExpansion,
+        query_text: "flight telemetry storage managed cloud database",
+        knob: Knob::None,
+        expected_relevant: &["Cloud Telemetry Migration", "Hosting Cost Savings"],
+    },
+    Question {
+        name: "graph_propeller_pause",
+        category: Category::GraphExpansion,
+        query_text: "Why were propeller orders paused?",
+        knob: Knob::None,
+        expected_relevant: &["Propeller Order Pause", "Backup Blade Vendor"],
+    },
+    // KindFilter
+    Question {
+        name: "kind_hangar_decision",
+        category: Category::KindFilter,
+        query_text: "second hangar Boulder airfield",
+        knob: Knob::Kind("decision"),
+        expected_relevant: &["Hangar Lease Decision"],
+    },
+    Question {
+        name: "kind_battery_disposal_policy",
+        category: Category::KindFilter,
+        query_text: "retired batteries hazardous waste handler",
+        knob: Knob::Kind("policy"),
+        expected_relevant: &["Battery Disposal Policy"],
+    },
+    Question {
+        name: "kind_hospital_escalation_episode",
+        category: Category::KindFilter,
+        query_text: "hospital customer delivery complaint",
+        knob: Knob::Kind("episode"),
+        expected_relevant: &["Hospital Escalation Episode"],
+    },
+    Question {
+        name: "kind_gust_tolerance_fact",
+        category: Category::KindFilter,
+        query_text: "sustained gusts Falconer",
+        knob: Knob::Kind("fact"),
+        expected_relevant: &["Gust Tolerance Fact"],
+    },
+    Question {
+        name: "kind_open_source_episode",
+        category: Category::KindFilter,
+        query_text: "ground station firmware open source",
+        knob: Knob::Kind("episode"),
+        expected_relevant: &["Open Source Firmware Announcement"],
+    },
+    // ScopeFilter
+    Question {
+        name: "scope_support_backlog",
+        category: Category::ScopeFilter,
+        query_text: "ticket backlog",
+        knob: Knob::Scope("support"),
+        expected_relevant: &["Support Ticket Backlog"],
+    },
+    Question {
+        name: "scope_hr_hiring",
+        category: Category::ScopeFilter,
+        query_text: "firmware team roles",
+        knob: Knob::Scope("hr"),
+        expected_relevant: &["HR Hiring Plan"],
+    },
+    Question {
+        name: "scope_security_badge",
+        category: Category::ScopeFilter,
+        query_text: "badge access assembly hall",
+        knob: Knob::Scope("security"),
+        expected_relevant: &["Security Access Audit"],
+    },
+    Question {
+        name: "scope_sales_contracts",
+        category: Category::ScopeFilter,
+        query_text: "enterprise delivery drone contracts",
+        knob: Knob::Scope("sales"),
+        expected_relevant: &["Sales Pipeline Review"],
+    },
+    Question {
+        name: "scope_legal_tax_credit",
+        category: Category::ScopeFilter,
+        query_text: "research tax credit",
+        knob: Knob::Scope("legal"),
+        expected_relevant: &["Legal Tax Credit Deadline"],
+    },
+    // Decay
+    Question {
+        name: "decay_warranty_term",
+        category: Category::Decay,
+        query_text: "Falconer warranty flight components",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["Warranty Term (New)"],
+    },
+    Question {
+        name: "decay_charge_time",
+        category: Category::Decay,
+        query_text: "Falconer battery full charge ninety minutes",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["Charge Time (New)"],
+    },
+    Question {
+        name: "decay_depot_count",
+        category: Category::Decay,
+        query_text: "Kestrel Robotics three regional depots for drone maintenance",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["Depot Count (New)"],
+    },
+    Question {
+        name: "decay_app_rating",
+        category: Category::Decay,
+        query_text: "Kestrel mobile app store rating",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["App Rating (New)"],
+    },
+    Question {
+        name: "decay_lead_time",
+        category: Category::Decay,
+        query_text: "New Falconer orders ship within six weeks of purchase",
+        knob: Knob::HalfLife(30 * DAY_MS),
+        expected_relevant: &["Lead Time (New)"],
+    },
+    // AsOf
+    Question {
+        name: "asof_support_channel",
+        category: Category::AsOf,
+        query_text: "How did customers originally reach support?",
+        knob: Knob::AsOf(-400 * DAY_MS),
+        expected_relevant: &["Support Channel (Original)"],
+    },
+    Question {
+        name: "asof_assembly_site",
+        category: Category::AsOf,
+        query_text: "Where did the first Falconer assembly line run?",
+        knob: Knob::AsOf(-500 * DAY_MS),
+        expected_relevant: &["Assembly Site (Original)"],
+    },
+    Question {
+        name: "asof_funding_round",
+        category: Category::AsOf,
+        query_text: "How large was the seed round Kestrel Robotics closed?",
+        knob: Knob::AsOf(-500 * DAY_MS),
+        expected_relevant: &["Funding Round (Original)"],
+    },
+    Question {
+        name: "asof_flight_controller",
+        category: Category::AsOf,
+        query_text: "Which autopilot board did early Falconer prototypes use?",
+        knob: Knob::AsOf(-350 * DAY_MS),
+        expected_relevant: &["Flight Controller (Original)"],
+    },
+    Question {
+        name: "asof_delivery_radius",
+        category: Category::AsOf,
+        query_text: "What was the delivery radius around each depot originally?",
+        knob: Knob::AsOf(-300 * DAY_MS),
+        expected_relevant: &["Delivery Radius (Original)"],
+    },
+    // Confidence
+    Question {
+        name: "confidence_charge_cycles",
+        category: Category::Confidence,
+        query_text: "Falconer battery charge cycles",
+        knob: Knob::None,
+        expected_relevant: &["Charge Cycles (Verified)"],
+    },
+    Question {
+        name: "confidence_operating_temperature",
+        category: Category::Confidence,
+        query_text: "Falconer operating temperature degrees Celsius",
+        knob: Knob::None,
+        expected_relevant: &["Operating Temperature (Verified)"],
+    },
+    Question {
+        name: "confidence_open_orders",
+        category: Category::Confidence,
+        query_text: "How many open Falconer orders are there?",
+        knob: Knob::None,
+        expected_relevant: &["Open Orders (Verified)"],
+    },
+    Question {
+        name: "confidence_crash_rate",
+        category: Category::Confidence,
+        query_text: "What is the Falconer crash rate per flights?",
+        knob: Knob::None,
+        expected_relevant: &["Crash Rate (Verified)"],
+    },
+    Question {
+        name: "confidence_ingress_rating",
+        category: Category::Confidence,
+        query_text: "Falconer ingress protection rating",
+        knob: Knob::None,
+        expected_relevant: &["Ingress Rating (Verified)"],
     },
 ];
 
@@ -1590,6 +2434,198 @@ mod tests {
                  seed {seed_label:?}",
                 q.name
             );
+        }
+    }
+
+    /// Documented size of the golden set: every category carries the same
+    /// number of questions so no category's average is noisier than another's.
+    const QUESTIONS_PER_CATEGORY: usize = 10;
+    const GOLDEN_SET_SIZE: usize = QUESTIONS_PER_CATEGORY * Category::ALL.len();
+
+    /// Names of the questions that predate the expansion. Reports quote
+    /// questions by name, so renaming or dropping one would silently break
+    /// comparisons against earlier runs.
+    const ORIGINAL_QUESTION_NAMES: [&str; 40] = [
+        "lexical_hq_location",
+        "lexical_founders",
+        "lexical_titanium_frame",
+        "lexical_falconer_battery",
+        "lexical_demo_day_flight",
+        "vector_solar_charging",
+        "vector_remote_work",
+        "vector_drone_swarm",
+        "vector_onboarding_speed",
+        "vector_quieter_rotors",
+        "graph_motor_recall_reason",
+        "graph_weatherproof_casing",
+        "graph_logistics_partnership",
+        "graph_firmware_rollback",
+        "graph_motor_bearing_defect",
+        "kind_warehouse_decision",
+        "kind_data_retention_policy",
+        "kind_battery_supplier_fact",
+        "kind_certification_flight_episode",
+        "kind_insurance_provider_decision",
+        "scope_engineering_sprint",
+        "scope_legal_compliance",
+        "scope_finance_budget",
+        "scope_operations_maintenance",
+        "scope_marketing_launch",
+        "decay_camera_sensor",
+        "decay_flight_range",
+        "decay_support_hours",
+        "decay_pricing_tier",
+        "decay_team_size",
+        "asof_product_name",
+        "asof_headquarters",
+        "asof_ceo",
+        "asof_product_line",
+        "asof_motor_vendor",
+        "confidence_top_speed_terms",
+        "confidence_top_speed_phrase",
+        "confidence_payload_terms",
+        "confidence_payload_phrase",
+        "confidence_battery_life",
+    ];
+
+    /// Per-category recall@10 the text-only tier must keep meeting. Taken
+    /// from the 40-question baseline, so growing the corpus may not regress
+    /// retrieval quality on the categories that baseline already covered.
+    const TEXT_ONLY_RECALL_AT_10_FLOORS: [(Category, f64); 7] = [
+        (Category::Lexical, 1.0),
+        (Category::GraphExpansion, 0.9),
+        (Category::KindFilter, 1.0),
+        (Category::ScopeFilter, 1.0),
+        (Category::Decay, 1.0),
+        (Category::Confidence, 0.8),
+        (Category::AsOf, 1.0),
+    ];
+
+    #[test]
+    fn every_category_carries_the_documented_question_count() {
+        // Given QUESTIONS grouped by category, when each group is counted,
+        // then every category has exactly QUESTIONS_PER_CATEGORY questions.
+        for category in Category::ALL {
+            let count = QUESTIONS.iter().filter(|q| q.category == category).count();
+            assert_eq!(
+                count, QUESTIONS_PER_CATEGORY,
+                "category {category:?} has {count} questions"
+            );
+        }
+    }
+
+    #[test]
+    fn golden_set_has_the_documented_total_size() {
+        // Given QUESTIONS, when counted, then the total matches the
+        // documented golden set size.
+        assert_eq!(QUESTIONS.len(), GOLDEN_SET_SIZE);
+    }
+
+    #[test]
+    fn corpus_labels_are_unique() {
+        // Given CORPUS, when checked for uniqueness by label, then no two
+        // facts share a label (labels are the fixture's stable ids).
+        let mut labels: Vec<&str> = CORPUS.iter().map(|f| f.label).collect();
+        let total = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), total, "duplicate corpus labels");
+    }
+
+    #[test]
+    fn no_question_lists_the_same_relevant_label_twice() {
+        // Given every question, when its expected_relevant labels are
+        // deduplicated, then nothing is lost, so recall's denominator is the
+        // true number of relevant facts.
+        for q in QUESTIONS {
+            let unique: HashSet<&str> = q.expected_relevant.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                q.expected_relevant.len(),
+                "question {} repeats a relevant label",
+                q.name
+            );
+            assert!(
+                !q.expected_relevant.is_empty(),
+                "question {} has no relevant label",
+                q.name
+            );
+        }
+    }
+
+    #[test]
+    fn original_question_names_are_still_present() {
+        // Given the names of the pre-expansion questions, when looked up in
+        // QUESTIONS, then every one is still there.
+        for name in ORIGINAL_QUESTION_NAMES {
+            assert!(
+                QUESTIONS.iter().any(|q| q.name == name),
+                "original question {name:?} was renamed or removed"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_filter_questions_expect_a_fact_of_the_filtered_kind() {
+        // Given each KindFilter question, when its expected fact is read from
+        // CORPUS, then the fact's kind equals the question's kind filter.
+        for q in QUESTIONS
+            .iter()
+            .filter(|q| q.category == Category::KindFilter)
+        {
+            let Knob::Kind(kind) = q.knob else {
+                panic!("question {} has no kind knob", q.name);
+            };
+            for label in q.expected_relevant {
+                let fact = fact_by_label(label).expect("label checked elsewhere");
+                assert_eq!(fact.kind, kind, "question {} expects {label:?}", q.name);
+            }
+        }
+    }
+
+    #[test]
+    fn scope_filter_questions_expect_a_fact_in_the_filtered_scope() {
+        // Given each ScopeFilter question, when its expected fact is read
+        // from CORPUS, then the fact's scope equals the question's scope.
+        for q in QUESTIONS
+            .iter()
+            .filter(|q| q.category == Category::ScopeFilter)
+        {
+            let Knob::Scope(scope) = q.knob else {
+                panic!("question {} has no scope knob", q.name);
+            };
+            for label in q.expected_relevant {
+                let fact = fact_by_label(label).expect("label checked elsewhere");
+                assert_eq!(
+                    fact.scope,
+                    Some(scope),
+                    "question {} expects {label:?}",
+                    q.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn as_of_questions_expect_a_fact_already_valid_at_the_as_of_instant() {
+        // Given each AsOf question, when its expected fact's valid-from
+        // offset is compared with the as-of offset, then the fact is already
+        // valid at that instant.
+        for q in QUESTIONS.iter().filter(|q| q.category == Category::AsOf) {
+            let Knob::AsOf(as_of) = q.knob else {
+                panic!("question {} has no as-of knob", q.name);
+            };
+            for label in q.expected_relevant {
+                let fact = fact_by_label(label).expect("label checked elsewhere");
+                let valid_from = fact
+                    .valid_from_offset_ms
+                    .unwrap_or_else(|| panic!("fact {label:?} has no valid_from offset"));
+                assert!(
+                    valid_from <= as_of,
+                    "question {} expects {label:?}, not yet valid at its as-of instant",
+                    q.name
+                );
+            }
         }
     }
 
@@ -2292,6 +3328,19 @@ mod tests {
                 }
             })
             .collect();
+
+        for (category, floor) in TEXT_ONLY_RECALL_AT_10_FLOORS {
+            let recall = scores
+                .iter()
+                .find(|score| score.category == category)
+                .and_then(|score| score.metrics)
+                .map(|metrics| metrics.recall_at_10)
+                .unwrap_or_else(|| panic!("category {category:?} was not scored"));
+            assert!(
+                recall >= floor,
+                "{category:?} recall@10 {recall:.3} fell below its baseline floor {floor:.3}"
+            );
+        }
 
         let report = format_report(&scores);
         println!("{report}");
