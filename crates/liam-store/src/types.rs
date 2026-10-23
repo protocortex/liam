@@ -3,9 +3,12 @@
 //! `subject` are opaque strings; `attributes` is a JSON bag the library stores
 //! and returns without interpreting.
 
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::ids::{EdgeId, Millis, NodeId};
+use crate::ids::{EdgeId, FactId, Millis, NodeId};
 
 fn empty_attributes() -> Value {
     Value::Object(Map::new())
@@ -389,9 +392,224 @@ pub struct ClusterMember {
     pub label: String,
 }
 
+/// How many objects a predicate may hold for one subject at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Cardinality {
+    /// One live object: a newer or more trusted fact replaces or outranks it.
+    One,
+    /// Any number of live objects, none of which closes another.
+    Many,
+}
+
+/// How two objects of a predicate are judged to be the same value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchMode {
+    /// Equal normalized objects only.
+    Exact,
+    /// Also when one object's tokens contain the other's ("Sydney" and
+    /// "Sydney, Australia").
+    Contains,
+}
+
+/// What a fact's object must be found in, in the text it cites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Grounding {
+    Text,
+    Date,
+}
+
+/// The rules for one predicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PredicateSpec {
+    pub cardinality: Cardinality,
+    pub match_mode: MatchMode,
+    pub grounding: Grounding,
+}
+
+impl Default for PredicateSpec {
+    /// The non-destructive spec an undeclared predicate gets.
+    fn default() -> Self {
+        Self {
+            cardinality: Cardinality::Many,
+            match_mode: MatchMode::Exact,
+            grounding: Grounding::Text,
+        }
+    }
+}
+
+/// The closed set of predicates and their rules.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Vocabulary {
+    specs: BTreeMap<String, PredicateSpec>,
+}
+
+impl Vocabulary {
+    pub fn new(specs: BTreeMap<String, PredicateSpec>) -> Self {
+        Self { specs }
+    }
+
+    /// The spec of `predicate`, or the default for one that was never declared.
+    pub fn spec(&self, predicate: &str) -> PredicateSpec {
+        self.specs.get(predicate).copied().unwrap_or_default()
+    }
+}
+
+/// Bounds on how arbitration treats a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArbitrationCaps {
+    /// Live competing lineages one key may hold before the weakest is retracted.
+    pub max_competing_per_key: usize,
+}
+
+impl ArbitrationCaps {
+    pub const DEFAULT_MAX_COMPETING_PER_KEY: usize = 5;
+}
+
+impl Default for ArbitrationCaps {
+    fn default() -> Self {
+        Self {
+            max_competing_per_key: Self::DEFAULT_MAX_COMPETING_PER_KEY,
+        }
+    }
+}
+
+/// Which extractor produced a fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtractorName {
+    Rules,
+    Llm,
+}
+
+impl ExtractorName {
+    /// The value stored in `extractor_id` and the `extraction_cursor` name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rules => "rules",
+            Self::Llm => "llm",
+        }
+    }
+}
+
+/// A fact to assert. `scope` is `None` for none; it is stored as ''.
+/// `evidence_at` is the latest `min(observed_at, ingested_at)` among the cited
+/// events, which decides recency; it is separate from `valid_from`.
+#[derive(Clone, Debug)]
+pub struct NewFact {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub scope: Option<String>,
+    pub valid_from: Millis,
+    pub valid_until: Millis,
+    pub evidence_at: Millis,
+    pub confidence: f64,
+    pub trust_score: f64,
+    pub extractor: ExtractorName,
+    pub extractor_version: String,
+    /// Log event ids the fact came from. A fact with none is refused.
+    pub source_event_ids: Vec<String>,
+}
+
+/// One stored version of a fact.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fact {
+    pub id: FactId,
+    /// The id of the first version, shared by every version of this fact.
+    pub lineage_id: FactId,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    /// The normalized object every equality check uses.
+    pub object_key: String,
+    pub scope: Option<String>,
+    pub evidence_at: Millis,
+    pub valid_from: Millis,
+    pub valid_until: Millis,
+    pub tx_from: Millis,
+    pub tx_to: Millis,
+    /// The version whose insertion closed this one, when a replacement did.
+    pub closed_by: Option<FactId>,
+    pub confidence: f64,
+    pub trust_score: f64,
+    pub extractor_id: String,
+    pub extractor_version: String,
+    pub source_event_ids: Vec<String>,
+}
+
+/// What `assert_fact` did with a fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArbitrationOutcome {
+    /// A retraction blocks this object for evidence this old.
+    Suppressed,
+    Inserted {
+        id: FactId,
+    },
+    /// A live fact already says this; its sources were linked to it.
+    Corroborated {
+        lineage_id: FactId,
+        changed: bool,
+    },
+    Replaced {
+        closed: Vec<FactId>,
+        inserted: FactId,
+    },
+    /// Stored beside a more trusted live fact, which stays open.
+    Competing {
+        id: FactId,
+    },
+    /// Stored as past history, because it rests on older evidence.
+    Historical {
+        id: FactId,
+    },
+}
+
+/// What `end_fact` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EndOutcome {
+    Ended {
+        closed: Vec<FactId>,
+    },
+    NoMatch,
+    /// The live fact is more trusted than the statement ending it.
+    Outranked,
+    /// The end would not fall after the live fact's start.
+    Rejected,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_undeclared_predicate_is_many_valued_with_exact_matching() {
+        // Arrange
+        let vocabulary = Vocabulary::new(BTreeMap::from([(
+            "works_at".to_string(),
+            PredicateSpec {
+                cardinality: Cardinality::One,
+                ..PredicateSpec::default()
+            },
+        )]));
+
+        // Act
+        let declared = vocabulary.spec("works_at");
+        let undeclared = vocabulary.spec("resides_in");
+
+        // Assert
+        assert_eq!(declared.cardinality, Cardinality::One);
+        assert_eq!(undeclared, PredicateSpec::default());
+        assert_eq!(undeclared.cardinality, Cardinality::Many);
+        assert_eq!(undeclared.match_mode, MatchMode::Exact);
+    }
+
+    #[test]
+    fn extractor_names_are_the_stored_ids() {
+        assert_eq!(ExtractorName::Rules.as_str(), "rules");
+        assert_eq!(ExtractorName::Llm.as_str(), "llm");
+    }
 
     #[test]
     fn entity_page_flag_set_only_by_entity_constructor() {

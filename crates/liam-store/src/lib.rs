@@ -27,10 +27,12 @@ pub use graph::{
     BackfillReport, Candidate, CatchUpReport, ContentEmbedder, EmbedError, EventLog, Graph,
     PoisonHook, RebuildMode, RebuildReport, ReembedReport, SharedLog,
 };
-pub use ids::{EdgeId, Millis, NodeId, FOREVER, HANDLE_LEN};
+pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{
-    relation, Change, ClusterMember, ClusterState, ExplainedHit, Fingerprint, GcReport,
-    GraphConfig, Hit, NewEdge, NewNode, Query, RetentionPolicy, RetentionRule,
+    relation, ArbitrationCaps, ArbitrationOutcome, Cardinality, Change, ClusterMember,
+    ClusterState, EndOutcome, ExplainedHit, ExtractorName, Fact, Fingerprint, GcReport,
+    GraphConfig, Grounding, Hit, MatchMode, NewEdge, NewFact, NewNode, PredicateSpec, Query,
+    RetentionPolicy, RetentionRule, Vocabulary,
 };
 pub use value::{Row, Value};
 

@@ -52,6 +52,39 @@ warmup          = true     # pay Metal's ~10s first-call kernel compile at start
 context_tokens  = 8192     # sizes both the llama.cpp context and ask's evidence trimming
 max_concurrent_generations = 0   # 0 = auto-tune from a one-time benchmark; set a fixed number to disable
 
+# Derives subject/predicate/object facts from the log. Off until enabled.
+[extraction]
+enabled              = false     # false makes the whole hook a no-op
+llm_enabled          = true      # false extracts with the rules only
+# llama_server_path  = "/usr/local/bin/llama-server"
+# model_gguf         = "~/.liam/models/extraction.gguf"
+# extra_args         = ["--threads", "4"]   # --host, --port, --api-key and --alias are set by liam
+host                 = "127.0.0.1"   # loopback addresses only
+port                 = 0         # 0 picks a free port
+ctx_tokens           = 4096
+request_timeout_secs = 120
+start_timeout_secs   = 120
+run_deadline_secs    = 600       # bounds one extraction run
+ram_budget_mb        = 4096
+max_events_per_run   = 200
+batch_events         = 8
+min_event_chars      = 40
+max_batch_failures   = 3
+# max_event_chars    = 2048      # default: half the context window
+# end_cues           = ["no longer"]   # added to the built-in English and Portuguese cues
+max_competing_per_key = 5
+min_confidence       = 0.5
+llm_trust_factor     = 0.8       # share of a source's trust an LLM fact keeps
+default_trust        = 0.5       # for a source not named below
+
+[extraction.trust]
+# source name = trust score in [0.0, 1.0]
+# backfill = 0.3
+
+[extraction.predicates]
+# predicate = { cardinality = "one" | "many", match = "exact" | "contains", grounding = "text" | "date" }
+# works_at = { cardinality = "many" }
+
 [producers]
 unknown_id = "unknown"     # producer id recorded for a client not named in [producers.clients]
 

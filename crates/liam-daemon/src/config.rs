@@ -11,6 +11,13 @@ use liam_log::wal::WalConfig;
 use liam_store::{Millis, RetentionPolicy};
 use serde::Deserialize;
 
+mod extraction;
+
+pub use extraction::{resolve_vocabulary, ExtractionConfig, PredicateOverride};
+
+/// Producer ids starting with this are reserved for consolidation writes.
+const RESERVED_PRODUCER_PREFIX: &str = "consolidation";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -49,6 +56,8 @@ pub struct Config {
     pub producers: ProducersConfig,
     /// The event log every write goes through before it reaches the database.
     pub log: LogConfig,
+    /// Deriving subject/predicate/object facts from the log. Off by default.
+    pub extraction: ExtractionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -161,6 +170,7 @@ impl Default for Config {
             max_connections: 16,
             producers: ProducersConfig::default(),
             log: LogConfig::default(),
+            extraction: ExtractionConfig::default(),
         }
     }
 }
@@ -208,6 +218,22 @@ impl LogConfig {
     pub fn bloom(&self) -> anyhow::Result<BloomConfig> {
         BloomConfig::new(BloomConfig::default().expected_items(), self.bloom_fpr)
             .map_err(|error| anyhow::anyhow!("log.bloom_fpr is invalid: {error}"))
+    }
+}
+
+impl ProducersConfig {
+    /// A producer id may not take the tag consolidation writes under, or a
+    /// client's writes would be mistaken for a rolled-back run's.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let ids = std::iter::once(&self.unknown_id).chain(self.clients.values());
+        for id in ids {
+            anyhow::ensure!(
+                !id.to_lowercase().starts_with(RESERVED_PRODUCER_PREFIX),
+                "producer id {id:?} must not start with {RESERVED_PRODUCER_PREFIX:?}: \
+                 that prefix tags the daemon's own consolidation writes"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -349,6 +375,8 @@ impl Config {
 
         let config: Self = toml::from_str(&text)?;
         config.log.validate()?;
+        config.producers.validate()?;
+        config.extraction.validate()?;
         Ok(config)
     }
 
