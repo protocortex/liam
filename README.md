@@ -264,7 +264,7 @@ file `version`:
 | `provider` | `embedder.provider` |
 | `model` | `embedder.model` |
 | `dims` | `embedding_dims` |
-| `prompt_scheme` | A number built into the binary: the version of the convention that turns text into model input. Scheme 1 puts the `query: ` prefix on search queries only. |
+| `prompt_scheme` | A number built into the binary: the version of the convention that turns text into model input. Scheme 1 puts the `query: ` prefix on Qwen3 search queries only; BGE-M3 and the mock embedder get no prefix. |
 
 Every start of `liamd` and `liamd serve` compares the record with the
 configured values before the store opens. `liamd proxy` opens no store and
@@ -276,7 +276,11 @@ skips the check.
 - **No record, and a database that holds data:** a store from before
   fingerprints. It is taken to hold the configured provider, model and
   dimensions under prompt scheme 0, so it fails the check (the binary is on
-  scheme 1) until you run `liam rebuild`.
+  scheme 1). `liam rebuild` clears this, but it needs an existing event log and
+  refuses without one. A store that predates the log has none, so the
+  fingerprint check currently blocks its start before the log migration can
+  run. This is tracked in
+  [#205](https://github.com/protocortex/liam/issues/205).
 - **Record matches:** the start goes on.
 - **Record differs in any field:** `liamd` exits before opening the store. The
   error names the recorded and the configured values and the rebuild command.
@@ -307,7 +311,7 @@ liam eval retrieval --model <ID> [--json]
 It scores one embedding model on a fixed golden set and measures the embedder's
 speed. Build `liam` with `--features local`; without it the command fails with
 an error saying so. The model is downloaded into `embedder.cache_dir` on first
-use.
+use. BGE-M3 is cached under `HF_HOME` instead when that variable is set.
 
 | Flag | Meaning |
 |---|---|
