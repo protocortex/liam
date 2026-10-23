@@ -264,7 +264,7 @@ impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
             provider: "mock".into(),
-            model: "Qwen/Qwen3-Embedding-0.6B".into(),
+            model: liam_model::QWEN3_EMBEDDING_MODEL_ID.into(),
             cache_dir: "~/.liam/models".into(),
         }
     }

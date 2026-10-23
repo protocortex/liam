@@ -120,6 +120,9 @@ jobs:
           save-if: ${{ env.CACHE_SAVE_IF }}
       - name: Build (local feature)
         run: cargo build -p liam-daemon --features local
+      # Ignored tests download weights and stay ignored, so this never fetches a model.
+      - name: Test (local feature)
+        run: cargo test -p liam-model -p liam-daemon --features local
 
   deny:
     runs-on: ubuntu-latest

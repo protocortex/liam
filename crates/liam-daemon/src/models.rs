@@ -136,12 +136,26 @@ pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<d
     Ok((embedder, reranker))
 }
 
+/// Whether `model` names BGE-M3, which loads through its own embedder. Every
+/// other model id goes to the Qwen3 loader. Hugging Face ids are
+/// case-insensitive, so the match is too.
+#[cfg(any(test, feature = "local"))]
+fn is_bge_m3(model: &str) -> bool {
+    model.eq_ignore_ascii_case(liam_model::BGE_M3_MODEL_ID)
+}
+
 #[cfg(feature = "local")]
 fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
-    use liam_model::FastEmbedEmbedder;
+    use liam_model::{BgeM3Embedder, FastEmbedEmbedder};
     let home = std::env::var("HOME").unwrap_or_default();
     let cache_dir =
         resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
+    if is_bge_m3(&config.embedder.model) {
+        return Ok(Arc::new(BgeM3Embedder::load(
+            config.embedding_dims,
+            &cache_dir,
+        )?));
+    }
     Ok(Arc::new(FastEmbedEmbedder::load(
         &config.embedder.model,
         config.embedding_dims,
@@ -314,6 +328,39 @@ mod tests {
             resolve_path_with_home("llm.cache_dir", "~/.liam/models", "/home/alice").unwrap(),
             "/home/alice/.liam/models"
         );
+    }
+
+    #[test]
+    fn only_the_bge_m3_model_id_selects_the_bge_m3_embedder() {
+        // Arrange / Act / Assert
+        assert!(is_bge_m3("BAAI/bge-m3"));
+        assert!(is_bge_m3("baai/BGE-M3"));
+        assert!(!is_bge_m3(liam_model::QWEN3_EMBEDDING_MODEL_ID));
+        assert!(!is_bge_m3("BAAI/bge-m3-unsupervised"));
+    }
+
+    /// A BGE-M3 id must reach the BGE-M3 loader: its dims check fails before any
+    /// download, whereas the Qwen3 loader would start fetching weights first.
+    #[cfg(feature = "local")]
+    #[test]
+    fn the_bge_m3_model_id_is_routed_to_the_bge_m3_loader() {
+        // Arrange
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.embedder.provider = "local".to_string();
+        config.embedder.model = liam_model::BGE_M3_MODEL_ID.to_string();
+        config.embedder.cache_dir = cache.path().to_string_lossy().into_owned();
+        config.embedding_dims = 512;
+
+        // Act
+        let error = match build_embedder(&config) {
+            Ok(_) => panic!("a 512-wide BGE-M3 config must be refused"),
+            Err(error) => error.to_string(),
+        };
+
+        // Assert
+        assert!(error.contains("fixed output width"), "{error}");
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
     }
 
     /// An absolute cache dir is already correct and must be passed through

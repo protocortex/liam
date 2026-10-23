@@ -4,7 +4,12 @@
 
 use async_trait::async_trait;
 
+#[cfg(feature = "local")]
+use crate::blocking::with_model_blocking;
 use crate::error::Result;
+
+/// The default Qwen3 embedding model id.
+pub const QWEN3_EMBEDDING_MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
 
 /// The role a text plays in retrieval. Asymmetric models embed a search query
 /// differently from the content it is matched against.
@@ -75,9 +80,9 @@ fn qwen3_input(text: &str, kind: TextKind) -> String {
 /// `mrl_truncate`). 8192 comfortably holds any realistic remembered fact or
 /// episode item, well under Qwen3-Embedding's 32,768-token native context,
 /// so it bounds worst-case latency without silently cutting off normal
-/// content.
+/// content. It is also BGE-M3's maximum input length.
 #[cfg(feature = "local")]
-const EMBED_MAX_INPUT_TOKENS: usize = 8192;
+pub(crate) const EMBED_MAX_INPUT_TOKENS: usize = 8192;
 
 /// Shrink an already-normalized embedding to its first `dims` entries and
 /// re-normalize to a unit vector.
@@ -145,7 +150,9 @@ fn parse_qwen3_config(model_id: &str, bytes: &[u8]) -> Result<fastembed::Qwen3Co
     serde_json::from_slice(bytes).map_err(|e| {
         crate::error::ModelError::Embed(format!(
             "{model_id}'s config.json does not parse as a Qwen3 embedding config ({e}); \
-             sharded and Qwen3-VL checkpoints are not supported by this loader"
+             sharded and Qwen3-VL checkpoints are not supported by this loader, and the \
+             only non-Qwen3 model id supported is {}",
+            crate::BGE_M3_MODEL_ID
         ))
     })
 }
@@ -258,10 +265,7 @@ impl Embedder for FastEmbedEmbedder {
         let model = self.model.clone();
         let input = qwen3_input(text, kind);
         let dims = self.dims;
-        let out = tokio::task::spawn_blocking(move || {
-            let m = model
-                .lock()
-                .map_err(|_| crate::error::ModelError::Embed("model lock poisoned".into()))?;
+        with_model_blocking(model, crate::error::ModelError::Embed, move |m| {
             let vecs = m
                 .embed(&[input.as_str()])
                 .map_err(|e| crate::error::ModelError::Embed(e.to_string()))?;
@@ -272,8 +276,6 @@ impl Embedder for FastEmbedEmbedder {
             Ok(mrl_truncate(&full, dims))
         })
         .await
-        .map_err(|e| crate::error::ModelError::Embed(e.to_string()))??;
-        Ok(out)
     }
 }
 
