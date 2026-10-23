@@ -34,6 +34,7 @@ use crate::value::{Row, Value};
 
 mod arbitration;
 mod backfill;
+mod fact_write;
 mod facts;
 mod gc;
 mod log_cursor;
@@ -2220,6 +2221,7 @@ mod tests {
     mod backfill;
     mod backwards_clock;
     mod catch_up;
+    mod fact_arbitration;
     mod gc_log;
     mod log_open;
     mod log_write;
@@ -7788,7 +7790,9 @@ mod tests {
             self.inner.execute(sql, params).await
         }
         async fn query(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-            self.inner.query(sql, params).await
+            let rows = self.inner.query(sql, params).await;
+            self.probe.after_query().await;
+            rows
         }
         async fn commit(self: Box<Self>) -> Result<()> {
             self.probe.before_commit().await;
@@ -7824,9 +7828,49 @@ mod tests {
         /// Every statement a transaction was asked to execute, the one that
         /// was made to fail included.
         executed: std::sync::Mutex<Vec<String>>,
+        /// Holds the first transaction that reads, right after its first read.
+        query_gate: std::sync::Mutex<Option<Arc<QueryGate>>>,
+    }
+
+    /// Stops one transaction between its first read and the statements that
+    /// follow, so a test can start a second writer while the first holds the
+    /// write lock, then let the first go.
+    struct QueryGate {
+        armed: std::sync::atomic::AtomicBool,
+        reached: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl QueryGate {
+        fn new() -> Self {
+            Self {
+                armed: std::sync::atomic::AtomicBool::new(true),
+                reached: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+
+        /// Returns once a transaction is held at the gate.
+        async fn wait_until_held(&self) {
+            self.reached.acquire().await.unwrap().forget();
+        }
+
+        fn let_go(&self) {
+            self.release.add_permits(1);
+        }
     }
 
     impl TxProbe {
+        async fn after_query(&self) {
+            let gate = self.query_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                if gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    gate.reached.add_permits(1);
+                    gate.release.acquire().await.unwrap().forget();
+                }
+            }
+        }
+
         async fn before_begin(&self) {
             use std::sync::atomic::Ordering::SeqCst;
             let nth = self.begins.fetch_add(1, SeqCst);

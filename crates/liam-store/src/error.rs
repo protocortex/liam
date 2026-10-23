@@ -199,6 +199,10 @@ pub enum Error {
     #[error("a fact cannot be valid from {valid_from} until {valid_until}")]
     InvalidFactInterval { valid_from: i64, valid_until: i64 },
 
+    /// A fact row holds a value its column cannot legally have.
+    #[error("the fact state in the store is corrupt: {0}")]
+    CorruptFactState(String),
+
     /// The store holds rows the log does not record yet, so a logged write
     /// would sit ahead of them and a replay could not apply it.
     #[error("the store has rows the log does not hold yet: run the backfill first")]

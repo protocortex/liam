@@ -58,6 +58,12 @@ impl Row {
             _ => Err(Error::Backend(format!("column {i} is not an integer"))),
         }
     }
+    pub fn get_f64(&self, i: usize) -> Result<f64> {
+        match self.0.get(i) {
+            Some(Value::Real(v)) => Ok(*v),
+            _ => Err(Error::Backend(format!("column {i} is not a real"))),
+        }
+    }
     pub fn get_string(&self, i: usize) -> Result<String> {
         match self.0.get(i) {
             Some(Value::Text(v)) => Ok(v.clone()),
