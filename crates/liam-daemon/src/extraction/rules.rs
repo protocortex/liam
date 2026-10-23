@@ -29,12 +29,25 @@ const EVENT_SUBJECT_PREFIX: &str = "event:";
 const MIN_YEAR: u32 = 1000;
 const MAX_YEAR: u32 = 9999;
 const MONTHS_PER_YEAR: u32 = 12;
+/// Byte ranges of the fields in a `YYYY-MM-DD` candidate.
+const YEAR_FIELD: std::ops::Range<usize> = 0..4;
+const MONTH_FIELD: std::ops::Range<usize> = 5..7;
+const DAY_FIELD: std::ops::Range<usize> = 8..10;
 const FEBRUARY: u32 = 2;
 const LEAP_FEBRUARY_DAYS: u32 = 29;
 const DAYS_IN_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 /// Trailing characters that end a sentence or a quotation, not a URL.
 const URL_TRAILING_PUNCTUATION: [char; 7] = ['.', ',', ';', ':', '!', '?', '\''];
+/// Closing quotes, sentence marks and ellipses outside ASCII, which end a
+/// sentence or a quotation rather than a URL.
+const URL_TRAILING_UNICODE_PUNCTUATION: [char; 17] = [
+    '\u{201D}', '\u{2019}', '\u{00BB}', '\u{203A}', '\u{3002}', '\u{3001}', '\u{2026}', '\u{FF0C}',
+    '\u{FF1B}', '\u{FF1A}', '\u{FF01}', '\u{FF1F}', '\u{FF09}', '\u{300D}', '\u{300F}', '\u{3011}',
+    '\u{FF0E}',
+];
+/// Markdown emphasis that wraps a URL, as in `**https://x.y/a**`.
+const URL_TRAILING_EMPHASIS: [char; 3] = ['*', '_', '~'];
 /// Closing brackets are trimmed only when the URL has no opener for them, so
 /// a Wikipedia style `/Rust_(language)` keeps its parenthesis.
 const URL_BRACKET_PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
@@ -67,7 +80,8 @@ pub fn extract_rules(
     known_entities: &[String],
     max_chars: usize,
 ) -> Vec<RuleFact> {
-    let text = truncate_at_char_boundary(text, max_chars);
+    let scan = Scan::new(text, max_chars);
+    let text = scan.window();
     let event_subject = format!("{EVENT_SUBJECT_PREFIX}{event_id}");
     let fact = |subject: &str, predicate: &str, object: &str| RuleFact {
         subject: subject.to_string(),
@@ -78,9 +92,9 @@ pub fn extract_rules(
 
     let mut facts: BTreeSet<RuleFact> = BTreeSet::new();
     for (predicate, objects) in [
-        (PREDICATE_DATE, find_dates(text)),
-        (PREDICATE_URL, find_urls(text)),
-        (PREDICATE_ID, find_ids(text)),
+        (PREDICATE_DATE, find_dates(&scan)),
+        (PREDICATE_URL, find_urls(&scan)),
+        (PREDICATE_ID, find_ids(&scan)),
     ] {
         facts.extend(
             objects
@@ -96,40 +110,80 @@ pub fn extract_rules(
     facts.into_iter().collect()
 }
 
-fn truncate_at_char_boundary(text: &str, max_chars: usize) -> &str {
-    match text.char_indices().nth(max_chars) {
-        Some((byte_index, _)) => &text[..byte_index],
-        None => text,
+/// The text cut to a character bound. Matching runs on the window only, but
+/// boundary checks look at the full text, so the cut never turns a longer
+/// token into a shorter one that looks complete.
+struct Scan<'a> {
+    full: &'a str,
+    cut: usize,
+}
+
+impl<'a> Scan<'a> {
+    fn new(full: &'a str, max_chars: usize) -> Self {
+        let cut = full
+            .char_indices()
+            .nth(max_chars)
+            .map_or(full.len(), |(byte_index, _)| byte_index);
+        Self { full, cut }
+    }
+
+    fn window(&self) -> &'a str {
+        &self.full[..self.cut]
+    }
+
+    fn is_whole_word(&self, start: usize, end: usize) -> bool {
+        is_whole_word(self.full, start, end)
+    }
+
+    /// The token is not part of a hyphenated digit chain such as
+    /// `2026-01-02-03`, `1-2026-01-02` or `CVE-2024-12345`.
+    fn is_hyphen_digit_free(&self, start: usize, end: usize) -> bool {
+        let mut before = self.full[..start].chars().rev();
+        let mut after = self.full[end..].chars();
+        let glued_before =
+            before.next() == Some('-') && before.next().is_some_and(|c| c.is_ascii_digit());
+        let glued_after =
+            after.next() == Some('-') && after.next().is_some_and(|c| c.is_ascii_digit());
+        !glued_before && !glued_after
+    }
+
+    /// A match that reaches the cut might have continued past it.
+    fn ends_at_cut_mid_text(&self, end: usize) -> bool {
+        end == self.cut && self.full[end..].chars().next().is_some_and(continues_url)
     }
 }
 
-fn find_dates(text: &str) -> Vec<String> {
+fn find_dates(scan: &Scan) -> Vec<String> {
     DATE_PATTERN
-        .find_iter(text)
-        .filter(|m| is_whole_date_token(text, m.start(), m.end()))
+        .find_iter(scan.window())
+        .filter(|m| is_whole_date_token(scan, m.start(), m.end()))
         .map(|m| m.as_str())
         .filter(|candidate| is_calendar_date(candidate))
         .map(str::to_string)
         .collect()
 }
 
-/// A date is not part of a longer digit or hyphen chain such as
-/// `2026-01-02-03` or `1-2026-01-02`.
-fn is_whole_date_token(text: &str, start: usize, end: usize) -> bool {
-    let mut before = text[..start].chars().rev();
-    let mut after = text[end..].chars();
-    let (prev, next) = (before.next(), after.next());
-    let glued_before = prev.is_some_and(char::is_alphanumeric)
-        || (prev == Some('-') && before.next().is_some_and(|c| c.is_ascii_digit()));
-    let glued_after = next.is_some_and(char::is_alphanumeric)
-        || (next == Some('-') && after.next().is_some_and(|c| c.is_ascii_digit()));
-    !glued_before && !glued_after
+/// A date stands alone, or is followed by an ISO time (`T10:00:00Z`).
+fn is_whole_date_token(scan: &Scan, start: usize, end: usize) -> bool {
+    if !scan.is_hyphen_digit_free(start, end) {
+        return false;
+    }
+    let mut after = scan.full[end..].chars();
+    let time_follows =
+        matches!(after.next(), Some('T' | 't')) && after.next().is_some_and(|c| c.is_ascii_digit());
+    let word_before = scan.full[..start]
+        .chars()
+        .next_back()
+        .is_some_and(is_word_char);
+    !word_before && (time_follows || scan.is_whole_word(start, end))
 }
 
 /// `candidate` is `YYYY-MM-DD` by construction of the pattern.
 fn is_calendar_date(candidate: &str) -> bool {
     let field = |range: std::ops::Range<usize>| candidate[range].parse::<u32>().ok();
-    let (Some(year), Some(month), Some(day)) = (field(0..4), field(5..7), field(8..10)) else {
+    let (Some(year), Some(month), Some(day)) =
+        (field(YEAR_FIELD), field(MONTH_FIELD), field(DAY_FIELD))
+    else {
         return false;
     };
     if !(MIN_YEAR..=MAX_YEAR).contains(&year) || !(1..=MONTHS_PER_YEAR).contains(&month) {
@@ -146,9 +200,10 @@ fn is_leap_year(year: u32) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
-fn find_urls(text: &str) -> Vec<String> {
+fn find_urls(scan: &Scan) -> Vec<String> {
     URL_PATTERN
-        .find_iter(text)
+        .find_iter(scan.window())
+        .filter(|m| !scan.ends_at_cut_mid_text(m.end()))
         .filter_map(|m| trim_url(m.as_str()))
         .map(str::to_string)
         .collect()
@@ -169,7 +224,7 @@ fn trim_url(raw: &str) -> Option<&str> {
             .filter(|&pair| balance[pair] > 0);
         if let Some(pair) = unmatched_closer {
             balance[pair] -= 1;
-        } else if !URL_TRAILING_PUNCTUATION.contains(&last) {
+        } else if !is_trailing_url_noise(last) {
             break;
         }
         url = &url[..url.len() - last.len_utf8()];
@@ -178,10 +233,24 @@ fn trim_url(raw: &str) -> Option<&str> {
     (!rest.is_empty()).then_some(url)
 }
 
-fn find_ids(text: &str) -> Vec<String> {
+/// Whether `c` could be part of a URL match, mirroring `URL_PATTERN`.
+fn continues_url(c: char) -> bool {
+    !(c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '"' | '`'))
+}
+
+fn is_trailing_url_noise(c: char) -> bool {
+    URL_TRAILING_PUNCTUATION.contains(&c)
+        || URL_TRAILING_UNICODE_PUNCTUATION.contains(&c)
+        || URL_TRAILING_EMPHASIS.contains(&c)
+}
+
+/// `UTF-8`, `SHA-256` and `ISO-8601` match the id shape and are emitted: the
+/// extractor cannot tell them from a ticket without a vocabulary.
+fn find_ids(scan: &Scan) -> Vec<String> {
     ID_PATTERN
-        .find_iter(text)
-        .filter(|m| is_whole_word(text, m.start(), m.end()))
+        .find_iter(scan.window())
+        .filter(|m| scan.is_whole_word(m.start(), m.end()))
+        .filter(|m| scan.is_hyphen_digit_free(m.start(), m.end()))
         .map(|m| m.as_str().to_string())
         .collect()
 }
@@ -209,9 +278,12 @@ fn find_entities(text: &str, known_entities: &[String]) -> BTreeSet<String> {
 /// The characters on both sides of `start..end`, if any, are not word
 /// characters.
 fn is_whole_word(text: &str, start: usize, end: usize) -> bool {
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    !text[..start].chars().next_back().is_some_and(is_word)
-        && !text[end..].chars().next().is_some_and(is_word)
+    !text[..start].chars().next_back().is_some_and(is_word_char)
+        && !text[end..].chars().next().is_some_and(is_word_char)
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 #[cfg(test)]
@@ -324,6 +396,7 @@ mod tests {
             ("2026-02-30", false),
             ("0000-00-00", false),
             ("2026-00-10", false),
+            ("2026-01-00", false),
             ("2026-04-31", false),
             ("2023-02-29", false),
             ("1900-02-29", false),
@@ -352,7 +425,42 @@ mod tests {
             "1-2026-01-02",
             "x2026-01-02",
             "2026-01-02y",
+            "2026-01-02_",
+            "_2026-01-02",
+            "2026-03-04x",
         ] {
+            // Act
+            let facts = run(text);
+
+            // Assert
+            assert!(objects(&facts, "references_date").is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_date_followed_by_a_time_keeps_its_date() {
+        for text in [
+            "deploy at 2026-03-04T10:00:00Z",
+            "2026-03-04T10:00:00+02:00",
+            "2026-03-04t10:00:00",
+            "2026-03-04T10",
+            "2026-03-04T10:00:00.123-0300",
+        ] {
+            // Act
+            let facts = run(text);
+
+            // Assert
+            assert_eq!(
+                objects(&facts, "references_date"),
+                vec!["2026-03-04"],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_t_not_followed_by_a_digit_still_glues_a_date() {
+        for text in ["2026-03-04T", "2026-03-04Tx", "2026-03-04today"] {
             // Act
             let facts = run(text);
 
@@ -366,6 +474,21 @@ mod tests {
         for (text, expected) in [
             ("https://x.y/a).", "https://x.y/a"),
             ("https://x.y/a,", "https://x.y/a"),
+            ("https://x.y/a;", "https://x.y/a"),
+            ("https://x.y/a:", "https://x.y/a"),
+            ("https://x.y/a!", "https://x.y/a"),
+            ("https://x.y/a?", "https://x.y/a"),
+            ("https://x.y/a'", "https://x.y/a"),
+            ("\u{201C}https://x.y/a\u{201D}", "https://x.y/a"),
+            ("https://x.y/a\u{3002}", "https://x.y/a"),
+            ("https://x.y/a\u{2026}", "https://x.y/a"),
+            ("https://x.y/a\u{2019}", "https://x.y/a"),
+            ("https://x.y/a\u{00BB}", "https://x.y/a"),
+            ("**https://x.y/a**", "https://x.y/a"),
+            ("_https://x.y/a_", "https://x.y/a"),
+            ("~~https://x.y/a~~", "https://x.y/a"),
+            ("https://x.y/a**b/c", "https://x.y/a**b/c"),
+            ("https://x.y/a\u{2026}b", "https://x.y/a\u{2026}b"),
             ("<https://x.y/a>", "https://x.y/a"),
             ("(see https://x.y/a)", "https://x.y/a"),
             ("[https://x.y/a]", "https://x.y/a"),
@@ -400,7 +523,7 @@ mod tests {
         // Act
         let long = run("XABC-1234");
         let short = run("ABC-123");
-        let glued = run("xABC-123 ABC-123x ABC-123_");
+        let glued = run("xABC-123 ABC-123x ABC-123_ _ABC-123");
         let embedded = run("a ABC-123.");
 
         // Assert
@@ -408,6 +531,34 @@ mod tests {
         assert_eq!(objects(&short, "references_id"), vec!["ABC-123"]);
         assert!(objects(&glued, "references_id").is_empty());
         assert_eq!(objects(&embedded, "references_id"), vec!["ABC-123"]);
+    }
+
+    #[test]
+    fn an_id_inside_a_hyphen_chain_is_not_a_partial_id() {
+        for text in ["CVE-2024-12345", "ABC-123-4", "1-ABC-123", "ABC-123-"] {
+            // Act
+            let facts = run(text);
+
+            // Assert
+            let found = objects(&facts, "references_id");
+            if text == "ABC-123-" {
+                assert_eq!(found, vec!["ABC-123"], "{text}");
+            } else {
+                assert!(found.is_empty(), "{text} gave {found:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn standard_names_with_the_id_shape_are_emitted_as_ids() {
+        // Act
+        let facts = run("encode as UTF-8 and hash with SHA-256 per ISO-8601");
+
+        // Assert
+        assert_eq!(
+            objects(&facts, "references_id"),
+            vec!["ISO-8601", "SHA-256", "UTF-8"]
+        );
     }
 
     #[test]
@@ -500,17 +651,62 @@ mod tests {
 
         // Act
         let exactly = at(date);
-        let one_over = at(&format!("{date}x"));
+        let one_over_space = at(&format!("{date} x"));
         let one_under = at(&date[..cap - 1]);
         let split_char = at(&format!("{}é", &date[..cap - 1]));
         let wide = at(&"é".repeat(cap + 1));
 
         // Assert
         assert_eq!(exactly.len(), 1);
-        assert_eq!(one_over.len(), 1, "the 11th character is cut away");
+        assert_eq!(one_over_space.len(), 1, "the 11th character is cut away");
         assert!(one_under.is_empty());
         assert!(split_char.is_empty());
         assert!(wide.is_empty());
+    }
+
+    #[test]
+    fn a_cut_never_creates_a_fact_the_full_text_lacks() {
+        for (text, cap) in [
+            ("2026-03-04x", 10),
+            ("2026-03-04-05", 10),
+            ("2026-03-0412", 10),
+            ("https://x.y/abc", 14),
+            ("https://x.y/abc def", 14),
+            ("ABC-12345", 6),
+            ("ABC-123-4", 7),
+            ("ABCDEF-123", 9),
+        ] {
+            // Act
+            let facts = extract_rules(EVENT, text, &[], cap);
+
+            // Assert
+            assert!(facts.is_empty(), "{text} cut at {cap} gave {facts:?}");
+        }
+    }
+
+    #[test]
+    fn a_cut_at_a_real_token_end_keeps_the_fact() {
+        for (text, cap, predicate, object) in [
+            ("2026-03-04 x", 10, "references_date", "2026-03-04"),
+            ("2026-03-04T10:00", 10, "references_date", "2026-03-04"),
+            (
+                "https://x.y/abc def",
+                17,
+                "references_url",
+                "https://x.y/abc",
+            ),
+            ("ABC-123 x", 7, "references_id", "ABC-123"),
+        ] {
+            // Act
+            let facts = extract_rules(EVENT, text, &[], cap);
+
+            // Assert
+            assert_eq!(facts.len(), 1, "{text} gave {facts:?}");
+            assert_eq!(
+                (&*facts[0].predicate, &*facts[0].object),
+                (predicate, object)
+            );
+        }
     }
 
     #[test]
@@ -525,7 +721,7 @@ mod tests {
     #[test]
     fn text_past_the_cap_is_ignored() {
         // Arrange
-        let adversarial = format!("{}ABC-123", "a".repeat(CAP));
+        let adversarial = format!("{}ABC-123", "a ".repeat(CAP / 2));
         let prefix: String = adversarial.chars().take(CAP).collect();
 
         // Act
@@ -535,10 +731,11 @@ mod tests {
         // Assert
         assert_eq!(full, truncated);
         assert!(full.is_empty());
+        assert!(!extract_rules(EVENT, &adversarial, &[], CAP + 7).is_empty());
     }
 
     #[test]
-    fn pathological_input_finishes_within_the_backstop_and_is_bounded() {
+    fn pathological_input_finishes_within_the_backstop_and_matches_its_prefix() {
         // Arrange
         let cap = 100_000;
         let shapes = [
@@ -552,11 +749,21 @@ mod tests {
         let started = std::time::Instant::now();
 
         for text in &shapes {
+            let prefix: String = text.chars().take(cap).collect();
+
             // Act
             let facts = extract_rules(EVENT, text, &["a".into()], cap);
+            let prefix_facts = extract_rules(EVENT, &prefix, &["a".into()], cap);
 
             // Assert
             assert!(facts.len() <= cap, "output is bounded by the input");
+            let only_in_prefix = prefix_facts.iter().filter(|f| !facts.contains(f));
+            assert!(
+                only_in_prefix.clone().all(|f| f.predicate == PREDICATE_URL),
+                "only a URL running into the cut may differ: {:?}",
+                only_in_prefix.collect::<Vec<_>>()
+            );
+            assert!(facts.iter().all(|f| prefix_facts.contains(f)));
         }
         assert!(started.elapsed().as_secs() < BACKSTOP_SECS);
     }
