@@ -2375,7 +2375,10 @@ mod real_embedder_run {
 
         // Untimed warm-up so one-off model initialisation does not inflate
         // the first timed call.
-        embedder.embed("warm-up").await.expect("warm-up embed");
+        embedder
+            .embed("warm-up", TextKind::Document)
+            .await
+            .expect("warm-up embed");
 
         // Same bitemporal-clock pattern as the text-only tier's test above
         // (see its comment for why `DefaultGraph::open`'s real clock would

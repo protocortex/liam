@@ -373,6 +373,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_store_embedder_embeds_as_a_document() {
+        // Arrange
+        struct KindRecorder(std::sync::Mutex<Vec<TextKind>>);
+
+        #[async_trait]
+        impl Embedder for KindRecorder {
+            fn dims(&self) -> usize {
+                8
+            }
+
+            async fn embed(
+                &self,
+                _text: &str,
+                kind: TextKind,
+            ) -> liam_model::error::Result<Vec<f32>> {
+                self.0.lock().unwrap().push(kind);
+                Ok(vec![0.0; 8])
+            }
+        }
+        let recorder = Arc::new(KindRecorder(std::sync::Mutex::new(Vec::new())));
+
+        // Act
+        StoreEmbedder(recorder.clone())
+            .embed("alpha")
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(*recorder.0.lock().unwrap(), vec![TextKind::Document]);
+    }
+
+    #[tokio::test]
     async fn the_store_embedder_passes_an_embed_failure_on_as_an_error() {
         // Act
         let error = StoreEmbedder(Arc::new(FailingEmbedder))
