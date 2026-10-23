@@ -269,7 +269,7 @@ async fn column_exists<B: Backend>(backend: &B, table: &str, column: &str) -> Re
     }
     // `PRAGMA table_info` returns one row per column, shaped
     // (cid, name, type, notnull, dflt_value, pk). Confirmed against the
-    // pinned libsql 0.9.30 by querying it back rather than assumed, the same
+    // pinned libsql by querying it back rather than assumed, the same
     // way S1 confirmed `journal_mode` by reading it back: see
     // `pragma_table_info_reports_the_column_name_at_index_1` below.
     for row in &rows {
@@ -457,7 +457,7 @@ mod tests {
     }
 
     /// Pins the literal wording the string match in `add_column_if_missing`
-    /// depends on: confirmed empirically against libsql 0.9.30 (not assumed
+    /// depends on: confirmed empirically against the pinned libsql (not assumed
     /// generic SQLite wording) by running the same `ALTER TABLE ADD COLUMN`
     /// twice outside the helper and reading the second error back. Observed:
     /// `` backend: SQLite failure: `duplicate column name: producer` ``. If

@@ -174,7 +174,6 @@ async fn ingest_and_rebuild(rows: usize) {
         all_before.len()
     );
     assert_eq!(report.live_nodes + report.live_edges, live_before.len());
-    drop(rebuilt);
 }
 
 async fn sweep(source: &DefaultGraph, retention: &RetentionPolicy, total: &mut GcReport) {

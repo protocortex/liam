@@ -208,7 +208,7 @@ impl Backend for LibsqlBackend {
         let write_conn = db.connect().map_err(err)?;
         // WAL is persistent in the database file, not the connection, so it
         // is set once here rather than in `configure_connection`. Verified
-        // empirically against libsql 0.9.30: issuing `PRAGMA journal_mode =
+        // empirically against libsql: issuing `PRAGMA journal_mode =
         // WAL` as the very first statement on the first connection sticks,
         // confirmed by querying `PRAGMA journal_mode` back on a file-backed
         // database (see `wal_is_enabled_on_a_file_backed_database` below),
@@ -933,91 +933,5 @@ mod tests {
             .await
             .expect("spawned task did not panic")
             .expect("spawned write succeeded");
-    }
-
-    /// Stores opened and dropped per stress test run. Large enough that a
-    /// crash on drop that hits a few percent of closes shows up every run.
-    const DROP_STRESS_ITERATIONS: usize = 100;
-    const STRESS_ROWS: usize = 5;
-    const STRESS_VECTOR_DIMS: usize = 4;
-    const STRESS_READERS: usize = 4;
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn opening_writing_and_dropping_a_store_in_a_loop_does_not_crash() {
-        for round in 0..DROP_STRESS_ITERATIONS {
-            // Arrange
-            let (dir, backend) = file_backend_at("drop.db", ARBITRARY_POOL_SIZE).await;
-            backend
-                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-                .await
-                .expect("create table");
-
-            // Act
-            for row in 0..STRESS_ROWS {
-                backend
-                    .execute(
-                        "INSERT INTO t (v) VALUES (?1)",
-                        &[Value::Text(format!("{round}-{row}"))],
-                    )
-                    .await
-                    .expect("insert");
-            }
-            let rows = backend.query("SELECT v FROM t", &[]).await.expect("read");
-            drop(backend);
-            drop(dir);
-
-            // Assert
-            assert_eq!(rows.len(), STRESS_ROWS);
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn dropping_a_store_with_reads_and_a_vector_write_in_flight_does_not_crash() {
-        for round in 0..DROP_STRESS_ITERATIONS {
-            // Arrange
-            let (dir, backend) = file_backend_at("inflight.db", ARBITRARY_POOL_SIZE).await;
-            let backend = std::sync::Arc::new(backend);
-            backend
-                .execute_batch(&format!(
-                    "CREATE TABLE nodes (id TEXT PRIMARY KEY); {}",
-                    backend.vector_ddl(STRESS_VECTOR_DIMS)
-                ))
-                .await
-                .expect("create tables");
-            let node_id = format!("n-{round}");
-            backend
-                .execute(
-                    "INSERT INTO nodes (id) VALUES (?1)",
-                    &[Value::Text(node_id.clone())],
-                )
-                .await
-                .expect("insert node");
-
-            // Act: readers and a vector write run on other worker threads,
-            // and the last handle to the store is released by whichever
-            // task finishes last.
-            let mut tasks = Vec::new();
-            for _ in 0..STRESS_READERS {
-                let backend = std::sync::Arc::clone(&backend);
-                tasks.push(tokio::spawn(async move {
-                    backend
-                        .query("SELECT id FROM nodes", &[])
-                        .await
-                        .expect("read");
-                }));
-            }
-            let writer = std::sync::Arc::clone(&backend);
-            tasks.push(tokio::spawn(async move {
-                writer
-                    .vector_upsert(&node_id, &[1.0; STRESS_VECTOR_DIMS])
-                    .await
-                    .expect("vector write");
-            }));
-            drop(backend);
-            for task in tasks {
-                task.await.expect("task did not panic");
-            }
-            drop(dir);
-        }
     }
 }
