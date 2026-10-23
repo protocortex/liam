@@ -34,6 +34,7 @@ use crate::value::{Row, Value};
 
 mod arbitration;
 mod backfill;
+mod fact_read;
 mod fact_write;
 mod facts;
 mod gc;
@@ -2222,6 +2223,7 @@ mod tests {
     mod backwards_clock;
     mod catch_up;
     mod fact_arbitration;
+    mod fact_read;
     mod gc_log;
     mod log_open;
     mod log_write;
