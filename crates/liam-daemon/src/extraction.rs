@@ -13,5 +13,6 @@ mod iso_date;
 pub mod prompt;
 pub mod response;
 pub mod rules;
+pub mod sidecar;
 #[cfg(test)]
 mod test_double;
