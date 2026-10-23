@@ -13,6 +13,7 @@ use std::sync::Arc;
 use liam_log::event::NodeRow;
 
 pub use self::backfill::BackfillReport;
+pub use self::facts::batch_key;
 use self::logged_plan::{refuse_supersedes, Collision};
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, PoisonHook, SharedLog};
@@ -31,6 +32,7 @@ use crate::types::{
 use crate::value::{Row, Value};
 
 mod backfill;
+mod facts;
 mod gc;
 mod log_cursor;
 mod log_open;
