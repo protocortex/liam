@@ -534,7 +534,7 @@ pub struct Fact {
     pub closed_by: Option<FactId>,
     pub confidence: f64,
     pub trust_score: f64,
-    pub extractor_id: String,
+    pub extractor_id: ExtractorName,
     pub extractor_version: String,
     pub source_event_ids: Vec<String>,
 }

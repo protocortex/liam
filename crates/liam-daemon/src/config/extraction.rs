@@ -128,9 +128,14 @@ impl ExtractionConfig {
             ("max_events_per_run", self.max_events_per_run as u64),
             ("batch_events", self.batch_events as u64),
             ("max_competing_per_key", self.max_competing_per_key as u64),
+            ("max_batch_failures", u64::from(self.max_batch_failures)),
         ] {
             anyhow::ensure!(value > 0, "extraction.{key} must be at least 1");
         }
+        anyhow::ensure!(
+            self.max_event_chars != Some(0),
+            "extraction.max_event_chars must be at least 1"
+        );
         for (key, value) in [
             ("min_confidence", self.min_confidence),
             ("llm_trust_factor", self.llm_trust_factor),
@@ -174,8 +179,9 @@ impl ExtractionConfig {
     /// The longest event text sent to the model: the configured bound, else
     /// half the context window.
     pub fn max_event_chars(&self) -> usize {
-        self.max_event_chars
-            .unwrap_or(self.ctx_tokens * CHARS_PER_TOKEN / EVENT_CONTEXT_SHARE_DIVISOR)
+        self.max_event_chars.unwrap_or(
+            self.ctx_tokens.saturating_mul(CHARS_PER_TOKEN) / EVENT_CONTEXT_SHARE_DIVISOR,
+        )
     }
 }
 
@@ -292,11 +298,25 @@ mod tests {
         assert_eq!(config, ExtractionConfig::default());
         assert!(!config.enabled);
         assert!(config.llm_enabled);
+        assert_eq!(config.llama_server_path, None);
+        assert!(config.extra_args.is_empty());
+        assert_eq!(config.model_gguf, None);
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 0);
-        assert_eq!(config.run_deadline_secs, 600);
+        assert_eq!(config.ctx_tokens, 4096);
         assert_eq!(config.request_timeout_secs, 120);
+        assert_eq!(config.start_timeout_secs, 120);
+        assert_eq!(config.run_deadline_secs, 600);
+        assert_eq!(config.ram_budget_mb, 4096);
+        assert_eq!(config.max_events_per_run, 200);
+        assert_eq!(config.batch_events, 8);
+        assert_eq!(config.min_event_chars, 40);
         assert_eq!(config.max_batch_failures, 3);
+        assert_eq!(config.max_event_chars, None);
+        assert_eq!(config.max_event_chars(), 8192);
+        assert!(config.end_cues.is_empty());
+        assert!(config.trust.is_empty());
+        assert!(config.predicates.is_empty());
         assert_eq!(config.max_competing_per_key, 5);
         assert_eq!(config.min_confidence, 0.5);
         assert_eq!(config.llm_trust_factor, 0.8);
@@ -325,6 +345,17 @@ mod tests {
             ("start_timeout_secs = 0", false),
             ("run_deadline_secs = 0", false),
             ("max_competing_per_key = 0", false),
+            ("max_batch_failures = 0", false),
+            ("max_event_chars = 0", false),
+            ("max_events_per_run = 1", true),
+            ("batch_events = 1", true),
+            ("ctx_tokens = 1", true),
+            ("request_timeout_secs = 1", true),
+            ("start_timeout_secs = 1", true),
+            ("run_deadline_secs = 1", true),
+            ("max_competing_per_key = 1", true),
+            ("max_batch_failures = 1", true),
+            ("max_event_chars = 1", true),
             ("port = 65536", false),
             ("port = 65535", true),
             ("min_confidence = -0.1", false),
@@ -454,6 +485,30 @@ mod tests {
 
         // Assert
         assert!(message.contains("several"), "{message}");
+    }
+
+    #[test]
+    fn a_misspelled_key_inside_a_predicate_override_fails() {
+        // Arrange
+        let toml = "[extraction.predicates]\nworks_at = { cardnality = \"one\" }\n";
+
+        // Act
+        let message = error_of(toml);
+
+        // Assert
+        assert!(message.contains("cardnality"), "{message}");
+    }
+
+    #[test]
+    fn a_huge_context_saturates_the_derived_event_bound() {
+        // Arrange
+        let config = loaded_extraction("[extraction]\nctx_tokens = 9223372036854775807\n");
+
+        // Act
+        let bound = config.max_event_chars();
+
+        // Assert
+        assert_eq!(bound, usize::MAX / 2);
     }
 
     #[test]
