@@ -45,30 +45,80 @@
 //! count, mean call latency, throughput). One untimed warm-up `embed` call
 //! runs first, so model initialisation is excluded from those timings.
 //!
-//! This is a **scored baseline, not a CI gate**: there are no
-//! quality-threshold assertions on the metric values themselves. What IS
-//! asserted (in WU-3/WU-4's harness tests) is structural: the harness does
-//! not panic, every metric value lands in `[0, 1]`, every non-excluded
-//! question produces a result, and each category's fixtures are internally
-//! consistent. The numbers themselves are printed via `format_report` for a
+//! The text-only tier IS a CI gate on quality: its per-category recall@10
+//! floors (see "Text-only baseline" below) fail the build if retrieval
+//! regresses, which is safe because that tier is deterministic. The
+//! real-embedder tier is a scored baseline only, with no assertions on its
+//! metric values. Both tiers also assert structure: the harness does not
+//! panic, every metric value lands in `[0, 1]`, every non-excluded question
+//! produces a result, and each category's fixtures are internally consistent
+//! (labels exist, every answer appears in its fact, Decay and AsOf pairs are
+//! ordered in time). The numbers are printed via `format_report` for a
 //! maintainer to read and, when they change meaningfully, hand-transcribe
 //! into a dated table here, the same convention `eval.rs` uses for its own
 //! baselines.
 //!
-//! # Real-embedder baseline (2026-08-30, Apple M1 Pro, macOS 15.7.5,
-//! # Qwen/Qwen3-Embedding-0.6B, 768 dims, `cargo test --release ... --ignored
-//! # --nocapture retrieval`)
+//! # Golden set
+//!
+//! 80 questions, 10 per category, over a synthetic corpus of one fictional
+//! company, kept in the `golden_set` submodule. LIAM is pre-release and has
+//! no real usage or query logs, so this set is a synthetic stand-in for real
+//! usage, to be replaced or extended once actual users exist. It stays small
+//! because every fixture is hand-written and hand-checked. Each question
+//! carries an `answer` phrase that a test asserts appears in its expected
+//! fact, so a relevance label is checked against the text. Question names
+//! and corpus labels are stable ids that reports quote: add new ones, never
+//! rename.
+//!
+//! # Text-only baseline (2026-10-23, 70 questions, the always-on tier)
+//!
+//! | category       | n  | precision@4 | precision@8 | recall@4 | recall@8 | recall@10 | nDCG@10 | MRR   |
+//! |----------------|----|-------------|-------------|----------|----------|-----------|---------|-------|
+//! | Lexical        | 10 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//! | GraphExpansion | 10 | 0.350       | 0.212       | 0.700    | 0.850    | 0.900     | 0.831   | 1.000 |
+//! | KindFilter     | 10 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//! | ScopeFilter    | 10 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//! | Decay          | 10 | 0.175       | 0.125       | 0.700    | 1.000    | 1.000     | 0.527   | 0.376 |
+//! | Confidence     | 10 | 0.075       | 0.087       | 0.300    | 0.700    | 0.900     | 0.377   | 0.228 |
+//! | AsOf           | 10 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//!
+//! The same tier on the pre-expansion 40-question set (2026-10-23, 35
+//! questions scored, re-run against the earlier corpus):
 //!
 //! | category       | n | precision@4 | precision@8 | recall@4 | recall@8 | recall@10 | nDCG@10 | MRR   |
 //! |----------------|---|-------------|-------------|----------|----------|-----------|---------|-------|
-//! | Lexical        | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
-//! | VectorSemantic | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
-//! | GraphExpansion | 5 | 0.450       | 0.225       | 0.900    | 0.900    || 1.000    | -         | -       | 1.000 |
-//! | KindFilter     | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
-//! | ScopeFilter    | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
-//! | Decay          | 5 | 0.100       | 0.125       | 0.400    | 1.000    || 0.302    | -         | -       | 0.302 |
-//! | Confidence     | 5 | 0.050       | 0.050       | 0.200    | 0.400    || 0.150    | -         | -       | 0.150 |
-//! | AsOf           | 5 | 0.250       | 0.125       | 1.000    | 1.000    || 1.000    | -         | -       | 1.000 |
+//! | Lexical        | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//! | GraphExpansion | 5 | 0.450       | 0.225       | 0.900    | 0.900    | 0.900     | 0.882   | 1.000 |
+//! | KindFilter     | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//! | ScopeFilter    | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//! | Decay          | 5 | 0.100       | 0.125       | 0.400    | 1.000    | 1.000     | 0.468   | 0.302 |
+//! | Confidence     | 5 | 0.050       | 0.050       | 0.200    | 0.400    | 0.800     | 0.289   | 0.150 |
+//! | AsOf           | 5 | 0.250       | 0.125       | 1.000    | 1.000    | 1.000     | 1.000   | 1.000 |
+//!
+//! The text-only tier is deterministic, so its recall@10 per category is
+//! asserted against floors (`TEXT_ONLY_RECALL_AT_10_FLOORS`) set to the
+//! measured values of the 80-question run above; every floor except
+//! `Confidence` also equals the 40-question value, and `Confidence` rose from
+//! 0.8 to 0.9 as the set grew. A drop in any category fails the build.
+//!
+//! # Real-embedder baseline (2026-08-30, 40-question set, Apple M1 Pro,
+//! # macOS 15.7.5, Qwen/Qwen3-Embedding-0.6B, 768 dims, `cargo test --release
+//! # ... --ignored --nocapture retrieval`)
+//!
+//! This table predates the 80-question golden set and is NOT recomputed: it
+//! needs a model download and a manual run. Treat it as historical until the
+//! next real-embedder run replaces it.
+//!
+//! | category       | n | precision@4 | precision@8 | recall@4 | recall@8 | recall@10 | nDCG@10 | MRR   |
+//! |----------------|---|-------------|-------------|----------|----------|-----------|---------|-------|
+//! | Lexical        | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
+//! | VectorSemantic | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
+//! | GraphExpansion | 5 | 0.450       | 0.225       | 0.900    | 0.900    | -         | -       | 1.000 |
+//! | KindFilter     | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
+//! | ScopeFilter    | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
+//! | Decay          | 5 | 0.100       | 0.125       | 0.400    | 1.000    | -         | -       | 0.302 |
+//! | Confidence     | 5 | 0.050       | 0.050       | 0.200    | 0.400    | -         | -       | 0.150 |
+//! | AsOf           | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
 //!
 //! The recall@10 and nDCG@10 columns were added after this baseline was
 //! taken, so they read `-` until the next real-embedder run fills them in.
@@ -87,6 +137,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use liam_store::{DefaultGraph, ExplainedHit, Millis, NewEdge, NodeId, Query, Result};
+
+mod golden_set;
+use golden_set::{CORPUS, QUESTIONS};
 
 /// The unique ids among the first `k` entries of `retrieved`. WHY a shared
 /// helper: both `precision_at_k` and `recall_at_k` need this exact
@@ -392,518 +445,6 @@ struct Fact {
     competes_with: Option<&'static str>,
 }
 
-const FACT_DEFAULTS: Fact = Fact {
-    kind: "fact",
-    label: "",
-    content: "",
-    scope: None,
-    confidence: None,
-    valid_from_offset_ms: None,
-    edge_target: None,
-    competes_with: None,
-};
-
-/// Fictional domain: Kestrel Robotics, a drone company, and its flagship
-/// Falconer drone. Consistent across every entry so a reviewer can follow the
-/// story; nothing here refers to a real person or company. Grouped under a
-/// heading naming the category each block primarily serves; a handful of
-/// facts (the `GraphExpansion` seeds) are also referenced by more than one
-/// `Question`.
-const CORPUS: &[Fact] = &[
-    // Lexical: exact/near-term-matching facts with no other knob involved.
-    Fact {
-        kind: "fact",
-        label: "Kestrel HQ",
-        content: "Kestrel Robotics headquarters is located in Boulder, Colorado.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Kestrel Founding",
-        content: "Kestrel Robotics was founded in 2019 by Priya Anand and Tomas Reyes.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Titanium Frame Decision",
-        content: "The engineering team chose a titanium frame for the Falconer drone to cut \
-                   weight by 20 percent.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Falconer Battery",
-        content: "The Falconer drone uses a 6400 mAh lithium battery pack.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "episode",
-        label: "Falconer Demo Day",
-        content: "On demo day the Falconer drone completed a 45 minute autonomous flight \
-                   without a single course correction.",
-        ..FACT_DEFAULTS
-    },
-    // VectorSemantic: real-embedder tier only (WU-4); this WU just authors
-    // the fact and its paraphrase-target `Question.query_text`.
-    Fact {
-        kind: "fact",
-        label: "Solar Charging Pilot",
-        content: "Kestrel Robotics is piloting solar panel charging docks for its warehouse \
-                   drones.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Remote Work Policy",
-        content: "Kestrel Robotics allows engineers to work from home three days a week.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Drone Swarm Research",
-        content: "Kestrel Robotics researchers are studying how small drone swarms coordinate \
-                   obstacle avoidance.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "episode",
-        label: "Customer Onboarding Redesign",
-        content: "The customer success team redesigned onboarding to cut new customer setup \
-                   time in half.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Noise Reduction Rotor",
-        content: "The newest Falconer rotor blades reduce audible flight noise by 12 decibels.",
-        ..FACT_DEFAULTS
-    },
-    // GraphExpansion: each seed is matched lexically by its Question; each
-    // linked fact carries edge_target naming its seed, so the harness can
-    // Graph::link them and prove expansion, not just lexical match, found it.
-    Fact {
-        kind: "decision",
-        label: "Falconer Motor Recall",
-        content: "Kestrel Robotics issued a recall for the Falconer's left motor after bearing \
-                   wear was reported.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "episode",
-        label: "Motor Vendor Notice",
-        content: "The motor vendor notified Kestrel Robotics about a batch of bearings that \
-                   wear faster than spec.",
-        edge_target: Some("Falconer Motor Recall"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Weatherproof Casing",
-        content: "The engineering team weatherproofed the Falconer casing to withstand heavy \
-                   rain.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "episode",
-        label: "Field Test Storm Report",
-        content: "A field test flew the Falconer through a thunderstorm and the weatherproof \
-                   casing kept all electronics dry.",
-        edge_target: Some("Weatherproof Casing"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Logistics Partnership Signed",
-        content: "Kestrel Robotics signed a last mile delivery partnership with SwiftHaul.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "SwiftHaul Pilot Results",
-        content: "The SwiftHaul delivery pilot completed 500 drone deliveries with a 98 \
-                   percent on time rate.",
-        edge_target: Some("Logistics Partnership Signed"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Software Update Rollback",
-        content: "Kestrel Robotics rolled back the v3.2 flight control firmware update after \
-                   reports of mid flight instability.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "episode",
-        label: "Firmware Bug Report",
-        content: "A pilot reported the Falconer drifting sideways during hover after \
-                   installing firmware v3.2.",
-        edge_target: Some("Software Update Rollback"),
-        ..FACT_DEFAULTS
-    },
-    // KindFilter: each pair shares the same topic terms and differs only in
-    // kind, so a wrong kind filter would let the distractor rank instead.
-    Fact {
-        kind: "decision",
-        label: "Warehouse Automation Decision",
-        content: "Kestrel Robotics decided to move forward with warehouse automation using \
-                   robotic picking arms.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "episode",
-        label: "Warehouse Automation Kickoff",
-        content: "The warehouse automation project kicked off with a training session for \
-                   warehouse staff.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "policy",
-        label: "Data Retention Policy",
-        content: "Kestrel Robotics retains flight log data for two years before deletion.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Data Retention Incident",
-        content: "An audit found flight log data retention exceeded two years before the \
-                   policy was enforced.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Battery Supplier Fact",
-        content: "Kestrel Robotics sources lithium battery cells from a supplier based in \
-                   Nevada.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Battery Supplier Switch Decision",
-        content: "Kestrel Robotics decided to switch lithium battery cell suppliers to one \
-                   based in Nevada.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "episode",
-        label: "Certification Flight Episode",
-        content: "The certification flight for the Falconer drone passed all FAA test points \
-                   on the first attempt.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Certification Flight Scheduling",
-        content: "Kestrel Robotics scheduled the certification flight for the Falconer drone \
-                   after final firmware review.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Insurance Provider Decision",
-        content: "Kestrel Robotics chose a new insurance provider for its commercial drone \
-                   fleet.",
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Insurance Provider Coverage",
-        content: "The new insurance provider covers up to two million dollars per drone \
-                   incident for the commercial fleet.",
-        ..FACT_DEFAULTS
-    },
-    // ScopeFilter: same pattern, scope is the only thing that differs
-    // between each pair.
-    Fact {
-        kind: "fact",
-        label: "Engineering Sprint Cadence",
-        content: "The engineering team runs two week sprint cycles for the Falconer firmware \
-                   roadmap.",
-        scope: Some("engineering"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Marketing Sprint Cadence",
-        content: "The marketing team also runs two week sprint cycles for campaign planning.",
-        scope: Some("marketing"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Legal Compliance Review",
-        content: "Legal completed a compliance review of the Falconer's export control \
-                   classification.",
-        scope: Some("legal"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Operations Compliance Review",
-        content: "Operations completed a separate compliance review of warehouse safety \
-                   procedures.",
-        scope: Some("operations"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Finance Budget Approval",
-        content: "Finance approved the annual budget for the Falconer production line.",
-        scope: Some("finance"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Engineering Budget Request",
-        content: "Engineering submitted a budget request for the Falconer production line \
-                   expansion.",
-        scope: Some("engineering"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "decision",
-        label: "Operations Fleet Maintenance",
-        content: "Operations scheduled fleet wide maintenance for all active Falconer drones.",
-        scope: Some("operations"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Engineering Maintenance Design",
-        content: "Engineering redesigned the maintenance access panel on the Falconer drone.",
-        scope: Some("engineering"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "episode",
-        label: "Marketing Launch Campaign",
-        content: "Marketing launched a campaign announcing the Falconer drone to retail \
-                   customers.",
-        scope: Some("marketing"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Legal Launch Review",
-        content: "Legal reviewed the marketing materials before the Falconer drone launch \
-                   campaign.",
-        scope: Some("legal"),
-        ..FACT_DEFAULTS
-    },
-    // Decay: each pair states the same fact, with the newer half restating
-    // it plus one clause, so decay (not a lexical difference) is what should
-    // separate them.
-    Fact {
-        kind: "fact",
-        label: "Camera Sensor Spec (2024)",
-        content: "The Falconer drone camera sensor captures 12 megapixel stills at 30 frames \
-                   per second.",
-        valid_from_offset_ms: Some(-500 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Camera Sensor Spec (2026)",
-        content: "The Falconer drone camera sensor captures 12 megapixel stills at 30 frames \
-                   per second, now with improved low light performance.",
-        valid_from_offset_ms: Some(-2 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Range Spec (Early)",
-        content: "The Falconer drone has a maximum flight range of 8 kilometers on a single \
-                   charge.",
-        valid_from_offset_ms: Some(-400 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Range Spec (Current)",
-        content: "The Falconer drone has a maximum flight range of 8 kilometers on a single \
-                   charge, extended by the new battery pack.",
-        valid_from_offset_ms: Some(-3 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Support Hours (Old)",
-        content: "Kestrel Robotics customer support operates from 9 AM to 5 PM Mountain Time.",
-        valid_from_offset_ms: Some(-300 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Support Hours (New)",
-        content: "Kestrel Robotics customer support operates from 9 AM to 5 PM Mountain Time, \
-                   now with weekend coverage added.",
-        valid_from_offset_ms: Some(-5 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Pricing Tier (Old)",
-        content: "The Falconer drone starter package is priced at four thousand dollars.",
-        valid_from_offset_ms: Some(-200 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Pricing Tier (New)",
-        content: "The Falconer drone starter package is priced at four thousand dollars, \
-                   unchanged from last year.",
-        valid_from_offset_ms: Some(-DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Team Size (Old)",
-        content: "The Kestrel Robotics engineering team has thirty employees.",
-        valid_from_offset_ms: Some(-600 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Team Size (New)",
-        content: "The Kestrel Robotics engineering team has thirty employees, following a \
-                   recent hiring freeze.",
-        valid_from_offset_ms: Some(-4 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    // AsOf: each pair is an original fact later superseded by a changed one;
-    // the Question's Knob::AsOf offset sits between the two, so only the
-    // original should be visible at that instant.
-    Fact {
-        kind: "fact",
-        label: "Product Name (Original)",
-        content: "The Falconer drone was originally named the SkyHawk before its public \
-                   release.",
-        valid_from_offset_ms: Some(-500 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Product Name (Renamed)",
-        content: "The drone formerly called SkyHawk was renamed Falconer ahead of its public \
-                   release.",
-        valid_from_offset_ms: Some(-490 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Headquarters (Original)",
-        content: "Kestrel Robotics' original headquarters was a shared workspace in Denver.",
-        valid_from_offset_ms: Some(-800 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Headquarters (Current)",
-        content: "Kestrel Robotics moved its headquarters from the shared Denver workspace to \
-                   a dedicated site in Boulder.",
-        valid_from_offset_ms: Some(-700 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "CEO (Original)",
-        content: "Priya Anand served as Kestrel Robotics' first CEO.",
-        valid_from_offset_ms: Some(-900 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "CEO (Current)",
-        content: "Tomas Reyes became Kestrel Robotics' CEO after Priya Anand stepped down.",
-        valid_from_offset_ms: Some(-100 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Product Line (Original)",
-        content: "Kestrel Robotics originally built only agricultural survey drones.",
-        valid_from_offset_ms: Some(-1000 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Product Line (Current)",
-        content: "Kestrel Robotics expanded from agricultural survey drones into the Falconer \
-                   commercial delivery line.",
-        valid_from_offset_ms: Some(-300 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Falconer Motor Vendor (Original)",
-        content: "The Falconer's motor was originally sourced from a supplier called Torque \
-                   Dynamics.",
-        valid_from_offset_ms: Some(-450 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Falconer Motor Vendor (Current)",
-        content: "Kestrel Robotics switched the Falconer's motor supplier from Torque Dynamics \
-                   to a new vendor after the bearing recall.",
-        valid_from_offset_ms: Some(-50 * DAY_MS),
-        ..FACT_DEFAULTS
-    },
-    // Confidence: each pair states the same fact from a verified and an
-    // unverified source; competes_with on the higher-confidence half names
-    // the one it must outrank.
-    Fact {
-        kind: "fact",
-        label: "Falconer Top Speed (Verified)",
-        content: "Verified wind tunnel testing measured the Falconer drone's top speed at 65 \
-                   kilometers per hour.",
-        confidence: Some(0.95),
-        competes_with: Some("Falconer Top Speed (Field Report)"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Falconer Top Speed (Field Report)",
-        content: "An early field report estimated the Falconer drone's top speed at around 60 \
-                   kilometers per hour.",
-        confidence: Some(0.4),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Payload Capacity (Verified)",
-        content: "Verified payload testing confirmed the Falconer drone carries up to 3 \
-                   kilograms.",
-        confidence: Some(0.9),
-        competes_with: Some("Payload Capacity (Rumor)"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Payload Capacity (Rumor)",
-        content: "An unconfirmed rumor claimed the Falconer drone could carry up to 5 \
-                   kilograms.",
-        confidence: Some(0.3),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Battery Life (Verified)",
-        content: "Verified bench testing measured the Falconer drone's battery life at 40 \
-                   minutes of flight.",
-        confidence: Some(0.85),
-        competes_with: Some("Battery Life (Marketing Estimate)"),
-        ..FACT_DEFAULTS
-    },
-    Fact {
-        kind: "fact",
-        label: "Battery Life (Marketing Estimate)",
-        content: "An early marketing estimate claimed the Falconer drone's battery life was 50 \
-                   minutes of flight.",
-        confidence: Some(0.5),
-        ..FACT_DEFAULTS
-    },
-];
-
 /// The category-specific extra a `Question` layers on top of its text query,
 /// per the module doc's text-plus-knob rule. `Lexical`/`GraphExpansion`/
 /// `Confidence` need nothing beyond `query_text` itself, since their "knob"
@@ -934,314 +475,12 @@ struct Question {
     query_text: &'static str,
     knob: Knob,
     expected_relevant: &'static [&'static str],
+    /// A phrase the answering fact's `content` must contain, so a relevance
+    /// label is checked against the text rather than trusted. For a
+    /// `GraphExpansion` question the answer lives in the linked fact, not the
+    /// seed.
+    answer: &'static str,
 }
-
-const QUESTIONS: &[Question] = &[
-    // Lexical
-    Question {
-        name: "lexical_hq_location",
-        category: Category::Lexical,
-        query_text: "Where is Kestrel Robotics headquarters located?",
-        knob: Knob::None,
-        expected_relevant: &["Kestrel HQ"],
-    },
-    Question {
-        name: "lexical_founders",
-        category: Category::Lexical,
-        query_text: "Who founded Kestrel Robotics?",
-        knob: Knob::None,
-        expected_relevant: &["Kestrel Founding"],
-    },
-    Question {
-        name: "lexical_titanium_frame",
-        category: Category::Lexical,
-        query_text: "What frame material did the engineering team choose for the Falconer \
-                      drone?",
-        knob: Knob::None,
-        expected_relevant: &["Titanium Frame Decision"],
-    },
-    Question {
-        name: "lexical_falconer_battery",
-        category: Category::Lexical,
-        query_text: "What battery does the Falconer drone use?",
-        knob: Knob::None,
-        expected_relevant: &["Falconer Battery"],
-    },
-    Question {
-        name: "lexical_demo_day_flight",
-        category: Category::Lexical,
-        query_text: "How long did the Falconer drone fly autonomously on demo day?",
-        knob: Knob::None,
-        expected_relevant: &["Falconer Demo Day"],
-    },
-    // VectorSemantic (real-embedder tier only, WU-4): each query_text is a
-    // paraphrase with weak lexical overlap against its expected fact.
-    Question {
-        name: "vector_solar_charging",
-        category: Category::VectorSemantic,
-        query_text: "Is the company experimenting with any renewable energy for recharging \
-                      its fleet?",
-        knob: Knob::None,
-        expected_relevant: &["Solar Charging Pilot"],
-    },
-    Question {
-        name: "vector_remote_work",
-        category: Category::VectorSemantic,
-        query_text: "Can staff do their jobs from a home office part of the week?",
-        knob: Knob::None,
-        expected_relevant: &["Remote Work Policy"],
-    },
-    Question {
-        name: "vector_drone_swarm",
-        category: Category::VectorSemantic,
-        query_text: "What is being studied about groups of small flying robots avoiding \
-                      obstacles together?",
-        knob: Knob::None,
-        expected_relevant: &["Drone Swarm Research"],
-    },
-    Question {
-        name: "vector_onboarding_speed",
-        category: Category::VectorSemantic,
-        query_text: "Did the company make it quicker for new clients to get started?",
-        knob: Knob::None,
-        expected_relevant: &["Customer Onboarding Redesign"],
-    },
-    Question {
-        name: "vector_quieter_rotors",
-        category: Category::VectorSemantic,
-        query_text: "Are the blades on the newest aircraft quieter than before?",
-        knob: Knob::None,
-        expected_relevant: &["Noise Reduction Rotor"],
-    },
-    // GraphExpansion: query_text surfaces the seed via lexical match;
-    // expected_relevant names both the seed and its linked fact.
-    Question {
-        name: "graph_motor_recall_reason",
-        category: Category::GraphExpansion,
-        // Deliberately avoids "Kestrel Robotics": that phrase appears in
-        // most of CORPUS (company-history/org facts), and at HARNESS_K's
-        // widened k, fts5_query's stopword-OR would then lexically match
-        // the entire corpus for this query, leaving nothing for
-        // GraphExpansion to discover that wasn't already found lexically
-        // (see the strengthened per-question assertion below, which
-        // caught exactly this before this comment was added).
-        query_text: "Why was the Falconer's motor recalled?",
-        knob: Knob::None,
-        expected_relevant: &["Falconer Motor Recall", "Motor Vendor Notice"],
-    },
-    Question {
-        name: "graph_weatherproof_casing",
-        category: Category::GraphExpansion,
-        query_text: "How did the engineering team weatherproof the Falconer casing?",
-        knob: Knob::None,
-        expected_relevant: &["Weatherproof Casing", "Field Test Storm Report"],
-    },
-    Question {
-        name: "graph_logistics_partnership",
-        category: Category::GraphExpansion,
-        query_text: "What logistics partnership did Kestrel Robotics sign?",
-        knob: Knob::None,
-        expected_relevant: &["Logistics Partnership Signed", "SwiftHaul Pilot Results"],
-    },
-    Question {
-        name: "graph_firmware_rollback",
-        category: Category::GraphExpansion,
-        query_text: "Why was the v3.2 firmware update rolled back?",
-        knob: Knob::None,
-        expected_relevant: &["Software Update Rollback", "Firmware Bug Report"],
-    },
-    Question {
-        name: "graph_motor_bearing_defect",
-        category: Category::GraphExpansion,
-        query_text: "What bearing defect caused the Falconer motor recall?",
-        knob: Knob::None,
-        expected_relevant: &["Falconer Motor Recall", "Motor Vendor Notice"],
-    },
-    // KindFilter
-    Question {
-        name: "kind_warehouse_decision",
-        category: Category::KindFilter,
-        query_text: "warehouse automation",
-        knob: Knob::Kind("decision"),
-        expected_relevant: &["Warehouse Automation Decision"],
-    },
-    Question {
-        name: "kind_data_retention_policy",
-        category: Category::KindFilter,
-        query_text: "flight log data retention",
-        knob: Knob::Kind("policy"),
-        expected_relevant: &["Data Retention Policy"],
-    },
-    Question {
-        name: "kind_battery_supplier_fact",
-        category: Category::KindFilter,
-        query_text: "lithium battery cell supplier Nevada",
-        knob: Knob::Kind("fact"),
-        expected_relevant: &["Battery Supplier Fact"],
-    },
-    Question {
-        name: "kind_certification_flight_episode",
-        category: Category::KindFilter,
-        query_text: "certification flight Falconer drone",
-        knob: Knob::Kind("episode"),
-        expected_relevant: &["Certification Flight Episode"],
-    },
-    Question {
-        name: "kind_insurance_provider_decision",
-        category: Category::KindFilter,
-        query_text: "insurance provider commercial drone fleet",
-        knob: Knob::Kind("decision"),
-        expected_relevant: &["Insurance Provider Decision"],
-    },
-    // ScopeFilter
-    Question {
-        name: "scope_engineering_sprint",
-        category: Category::ScopeFilter,
-        query_text: "two week sprint cycles",
-        knob: Knob::Scope("engineering"),
-        expected_relevant: &["Engineering Sprint Cadence"],
-    },
-    Question {
-        name: "scope_legal_compliance",
-        category: Category::ScopeFilter,
-        query_text: "compliance review",
-        knob: Knob::Scope("legal"),
-        expected_relevant: &["Legal Compliance Review"],
-    },
-    Question {
-        name: "scope_finance_budget",
-        category: Category::ScopeFilter,
-        query_text: "Falconer production line budget",
-        knob: Knob::Scope("finance"),
-        expected_relevant: &["Finance Budget Approval"],
-    },
-    Question {
-        name: "scope_operations_maintenance",
-        category: Category::ScopeFilter,
-        query_text: "Falconer maintenance",
-        knob: Knob::Scope("operations"),
-        expected_relevant: &["Operations Fleet Maintenance"],
-    },
-    Question {
-        name: "scope_marketing_launch",
-        category: Category::ScopeFilter,
-        query_text: "Falconer drone launch campaign",
-        knob: Knob::Scope("marketing"),
-        expected_relevant: &["Marketing Launch Campaign"],
-    },
-    // Decay
-    Question {
-        name: "decay_camera_sensor",
-        category: Category::Decay,
-        query_text: "Falconer drone camera sensor megapixel stills frames per second",
-        knob: Knob::HalfLife(30 * DAY_MS),
-        expected_relevant: &["Camera Sensor Spec (2026)"],
-    },
-    Question {
-        name: "decay_flight_range",
-        category: Category::Decay,
-        query_text: "Falconer drone maximum flight range single charge",
-        knob: Knob::HalfLife(30 * DAY_MS),
-        expected_relevant: &["Range Spec (Current)"],
-    },
-    Question {
-        name: "decay_support_hours",
-        category: Category::Decay,
-        query_text: "Kestrel Robotics customer support operating hours Mountain Time",
-        knob: Knob::HalfLife(30 * DAY_MS),
-        expected_relevant: &["Support Hours (New)"],
-    },
-    Question {
-        name: "decay_pricing_tier",
-        category: Category::Decay,
-        query_text: "Falconer drone starter package price",
-        knob: Knob::HalfLife(30 * DAY_MS),
-        expected_relevant: &["Pricing Tier (New)"],
-    },
-    Question {
-        name: "decay_team_size",
-        category: Category::Decay,
-        query_text: "Kestrel Robotics engineering team employees",
-        knob: Knob::HalfLife(30 * DAY_MS),
-        expected_relevant: &["Team Size (New)"],
-    },
-    // AsOf
-    Question {
-        name: "asof_product_name",
-        category: Category::AsOf,
-        query_text: "What was the Falconer drone originally called before its public \
-                      release?",
-        knob: Knob::AsOf(-495 * DAY_MS),
-        expected_relevant: &["Product Name (Original)"],
-    },
-    Question {
-        name: "asof_headquarters",
-        category: Category::AsOf,
-        query_text: "Where was Kestrel Robotics' original headquarters before the move to \
-                      Boulder?",
-        knob: Knob::AsOf(-750 * DAY_MS),
-        expected_relevant: &["Headquarters (Original)"],
-    },
-    Question {
-        name: "asof_ceo",
-        category: Category::AsOf,
-        query_text: "Who was Kestrel Robotics' first CEO?",
-        knob: Knob::AsOf(-500 * DAY_MS),
-        expected_relevant: &["CEO (Original)"],
-    },
-    Question {
-        name: "asof_product_line",
-        category: Category::AsOf,
-        query_text: "What kind of drones did Kestrel Robotics originally build?",
-        knob: Knob::AsOf(-600 * DAY_MS),
-        expected_relevant: &["Product Line (Original)"],
-    },
-    Question {
-        name: "asof_motor_vendor",
-        category: Category::AsOf,
-        query_text: "Which vendor originally supplied the Falconer's motor?",
-        knob: Knob::AsOf(-250 * DAY_MS),
-        expected_relevant: &["Falconer Motor Vendor (Original)"],
-    },
-    // Confidence: query_text matches both halves of a pair; expected_relevant
-    // names the higher-confidence half, whose competes_with names the loser
-    // (checked below).
-    Question {
-        name: "confidence_top_speed_terms",
-        category: Category::Confidence,
-        query_text: "Falconer drone top speed kilometers per hour",
-        knob: Knob::None,
-        expected_relevant: &["Falconer Top Speed (Verified)"],
-    },
-    Question {
-        name: "confidence_top_speed_phrase",
-        category: Category::Confidence,
-        query_text: "How fast can the Falconer drone fly?",
-        knob: Knob::None,
-        expected_relevant: &["Falconer Top Speed (Verified)"],
-    },
-    Question {
-        name: "confidence_payload_terms",
-        category: Category::Confidence,
-        query_text: "Falconer drone payload capacity kilograms",
-        knob: Knob::None,
-        expected_relevant: &["Payload Capacity (Verified)"],
-    },
-    Question {
-        name: "confidence_payload_phrase",
-        category: Category::Confidence,
-        query_text: "How much weight can the Falconer drone carry?",
-        knob: Knob::None,
-        expected_relevant: &["Payload Capacity (Verified)"],
-    },
-    Question {
-        name: "confidence_battery_life",
-        category: Category::Confidence,
-        query_text: "Falconer drone battery life minutes of flight",
-        knob: Knob::None,
-        expected_relevant: &["Battery Life (Verified)"],
-    },
-];
 
 /// Build the `Query` a `Question` describes: text plus its knob layered on
 /// top, using `base` as the shared time origin for `Knob::AsOf` (the module
@@ -1590,6 +829,277 @@ mod tests {
                  seed {seed_label:?}",
                 q.name
             );
+        }
+    }
+
+    /// Documented size of the golden set: every category carries the same
+    /// number of questions so no category's average is noisier than another's.
+    const QUESTIONS_PER_CATEGORY: usize = 10;
+    const GOLDEN_SET_SIZE: usize = QUESTIONS_PER_CATEGORY * Category::ALL.len();
+
+    /// Names of the questions that predate the expansion. Reports quote
+    /// questions by name, so renaming or dropping one would silently break
+    /// comparisons against earlier runs.
+    const ORIGINAL_QUESTION_NAMES: [&str; 40] = [
+        "lexical_hq_location",
+        "lexical_founders",
+        "lexical_titanium_frame",
+        "lexical_falconer_battery",
+        "lexical_demo_day_flight",
+        "vector_solar_charging",
+        "vector_remote_work",
+        "vector_drone_swarm",
+        "vector_onboarding_speed",
+        "vector_quieter_rotors",
+        "graph_motor_recall_reason",
+        "graph_weatherproof_casing",
+        "graph_logistics_partnership",
+        "graph_firmware_rollback",
+        "graph_motor_bearing_defect",
+        "kind_warehouse_decision",
+        "kind_data_retention_policy",
+        "kind_battery_supplier_fact",
+        "kind_certification_flight_episode",
+        "kind_insurance_provider_decision",
+        "scope_engineering_sprint",
+        "scope_legal_compliance",
+        "scope_finance_budget",
+        "scope_operations_maintenance",
+        "scope_marketing_launch",
+        "decay_camera_sensor",
+        "decay_flight_range",
+        "decay_support_hours",
+        "decay_pricing_tier",
+        "decay_team_size",
+        "asof_product_name",
+        "asof_headquarters",
+        "asof_ceo",
+        "asof_product_line",
+        "asof_motor_vendor",
+        "confidence_top_speed_terms",
+        "confidence_top_speed_phrase",
+        "confidence_payload_terms",
+        "confidence_payload_phrase",
+        "confidence_battery_life",
+    ];
+
+    /// Per-category recall@10 the text-only tier must keep meeting. Each
+    /// equals the value measured on the 80-question set. Exact equality is
+    /// safe because this tier is deterministic: no embedder, an in-memory
+    /// store, and a fixed clock.
+    const TEXT_ONLY_RECALL_AT_10_FLOORS: [(Category, f64); 7] = [
+        (Category::Lexical, 1.0),
+        (Category::GraphExpansion, 0.9),
+        (Category::KindFilter, 1.0),
+        (Category::ScopeFilter, 1.0),
+        (Category::Decay, 1.0),
+        (Category::Confidence, 0.9),
+        (Category::AsOf, 1.0),
+    ];
+
+    #[test]
+    fn every_category_carries_the_documented_question_count() {
+        // Given QUESTIONS grouped by category, when each group is counted,
+        // then every category has exactly QUESTIONS_PER_CATEGORY questions.
+        for category in Category::ALL {
+            let count = QUESTIONS.iter().filter(|q| q.category == category).count();
+            assert_eq!(
+                count, QUESTIONS_PER_CATEGORY,
+                "category {category:?} has {count} questions"
+            );
+        }
+    }
+
+    #[test]
+    fn golden_set_has_the_documented_total_size() {
+        // Given QUESTIONS, when counted, then the total matches the
+        // documented golden set size.
+        assert_eq!(QUESTIONS.len(), GOLDEN_SET_SIZE);
+    }
+
+    #[test]
+    fn corpus_labels_are_unique() {
+        // Given CORPUS, when checked for uniqueness by label, then no two
+        // facts share a label (labels are the fixture's stable ids).
+        let mut labels: Vec<&str> = CORPUS.iter().map(|f| f.label).collect();
+        let total = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), total, "duplicate corpus labels");
+    }
+
+    #[test]
+    fn no_question_lists_the_same_relevant_label_twice() {
+        // Given every question, when its expected_relevant labels are
+        // deduplicated, then nothing is lost, so recall's denominator is the
+        // true number of relevant facts.
+        for q in QUESTIONS {
+            let unique: HashSet<&str> = q.expected_relevant.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                q.expected_relevant.len(),
+                "question {} repeats a relevant label",
+                q.name
+            );
+            assert!(
+                !q.expected_relevant.is_empty(),
+                "question {} has no relevant label",
+                q.name
+            );
+        }
+    }
+
+    #[test]
+    fn original_question_names_are_still_present() {
+        // Given the names of the pre-expansion questions, when looked up in
+        // QUESTIONS, then every one is still there.
+        for name in ORIGINAL_QUESTION_NAMES {
+            assert!(
+                QUESTIONS.iter().any(|q| q.name == name),
+                "original question {name:?} was renamed or removed"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_filter_questions_expect_a_fact_of_the_filtered_kind() {
+        // Given each KindFilter question, when its expected fact is read from
+        // CORPUS, then the fact's kind equals the question's kind filter.
+        for q in QUESTIONS
+            .iter()
+            .filter(|q| q.category == Category::KindFilter)
+        {
+            let Knob::Kind(kind) = q.knob else {
+                panic!("question {} has no kind knob", q.name);
+            };
+            for label in q.expected_relevant {
+                let fact = fact_by_label(label).expect("label checked elsewhere");
+                assert_eq!(fact.kind, kind, "question {} expects {label:?}", q.name);
+            }
+        }
+    }
+
+    #[test]
+    fn scope_filter_questions_expect_a_fact_in_the_filtered_scope() {
+        // Given each ScopeFilter question, when its expected fact is read
+        // from CORPUS, then the fact's scope equals the question's scope.
+        for q in QUESTIONS
+            .iter()
+            .filter(|q| q.category == Category::ScopeFilter)
+        {
+            let Knob::Scope(scope) = q.knob else {
+                panic!("question {} has no scope knob", q.name);
+            };
+            for label in q.expected_relevant {
+                let fact = fact_by_label(label).expect("label checked elsewhere");
+                assert_eq!(
+                    fact.scope,
+                    Some(scope),
+                    "question {} expects {label:?}",
+                    q.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn as_of_questions_expect_a_fact_already_valid_at_the_as_of_instant() {
+        // Given each AsOf question, when its expected fact's valid-from
+        // offset is compared with the as-of offset, then the fact is already
+        // valid at that instant.
+        for q in QUESTIONS.iter().filter(|q| q.category == Category::AsOf) {
+            let Knob::AsOf(as_of) = q.knob else {
+                panic!("question {} has no as-of knob", q.name);
+            };
+            for label in q.expected_relevant {
+                let fact = fact_by_label(label).expect("label checked elsewhere");
+                let valid_from = fact
+                    .valid_from_offset_ms
+                    .unwrap_or_else(|| panic!("fact {label:?} has no valid_from offset"));
+                assert!(
+                    valid_from <= as_of,
+                    "question {} expects {label:?}, not yet valid at its as-of instant",
+                    q.name
+                );
+                // The superseding version must be invalid at that instant,
+                // else the as-of knob would not be what picks the original.
+                let superseding = fact_by_label(&format!("{} (Current)", label_stem(label)))
+                    .or_else(|| fact_by_label(&format!("{} (Renamed)", label_stem(label))))
+                    .unwrap_or_else(|| panic!("fact {label:?} has no superseding version"));
+                let superseding_valid_from =
+                    superseding.valid_from_offset_ms.unwrap_or_else(|| {
+                        panic!("fact {:?} has no valid_from offset", superseding.label)
+                    });
+                assert!(
+                    superseding_valid_from > as_of,
+                    "question {}: superseding fact {:?} is already valid at the as-of instant",
+                    q.name,
+                    superseding.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_question_answer_appears_in_its_expected_fact() {
+        // Given each question's answer phrase, when its expected facts are
+        // read from CORPUS, then the answer is in the answering fact's
+        // content: the last expected label, which for a GraphExpansion
+        // question is the linked fact rather than the lexical seed.
+        for q in QUESTIONS {
+            assert!(!q.answer.is_empty(), "question {} has no answer", q.name);
+            let answering = q
+                .expected_relevant
+                .last()
+                .expect("checked non-empty elsewhere");
+            let fact = fact_by_label(answering).expect("label checked elsewhere");
+            assert!(
+                fact.content.contains(q.answer),
+                "question {}: fact {answering:?} does not contain answer {:?}",
+                q.name,
+                q.answer
+            );
+        }
+    }
+
+    /// The label with its trailing parenthesised version tag removed, so
+    /// `Support Hours (Old)` and `Support Hours (New)` share a stem.
+    fn label_stem(label: &str) -> &str {
+        label.rsplit_once(" (").map_or(label, |(stem, _)| stem)
+    }
+
+    #[test]
+    fn decay_questions_expect_the_newest_version_of_their_fact() {
+        // Given each Decay question, when its expected fact is compared with
+        // the other facts sharing its label stem, then it was valid later
+        // than every one of them, so decay favours it.
+        for q in QUESTIONS.iter().filter(|q| q.category == Category::Decay) {
+            for label in q.expected_relevant {
+                let fact = fact_by_label(label).expect("label checked elsewhere");
+                let valid_from = fact
+                    .valid_from_offset_ms
+                    .unwrap_or_else(|| panic!("fact {label:?} has no valid_from offset"));
+                let older_versions: Vec<&Fact> = CORPUS
+                    .iter()
+                    .filter(|f| f.label != *label && label_stem(f.label) == label_stem(label))
+                    .collect();
+                assert!(
+                    !older_versions.is_empty(),
+                    "question {} expects {label:?}, which has no other version to decay",
+                    q.name
+                );
+                for other in older_versions {
+                    let other_valid_from = other.valid_from_offset_ms.unwrap_or_else(|| {
+                        panic!("fact {:?} has no valid_from offset", other.label)
+                    });
+                    assert!(
+                        valid_from > other_valid_from,
+                        "question {} expects {label:?}, which is not newer than {:?}",
+                        q.name,
+                        other.label
+                    );
+                }
+            }
         }
     }
 
@@ -2255,10 +1765,9 @@ mod tests {
         assert_metrics_in_unit_range(&per_category);
 
         // Assert: EVERY GraphExpansion question individually observed
-        // expanded == true, not just any one of them (two of the five
-        // target the same corpus pair, so at most 4 distinct edges are
-        // represented; a single OR'd bool would stay green even if
-        // expansion broke for 4 of the 5 questions).
+        // expanded == true, not just any one of them: questions can share a
+        // corpus pair, and a single OR'd bool would stay green even if
+        // expansion broke for all but one of them.
         let graph_expansion_not_expanded: Vec<&str> = graph_expansion_expanded
             .iter()
             .filter(|(_, expanded)| !expanded)
@@ -2292,6 +1801,19 @@ mod tests {
                 }
             })
             .collect();
+
+        for (category, floor) in TEXT_ONLY_RECALL_AT_10_FLOORS {
+            let recall = scores
+                .iter()
+                .find(|score| score.category == category)
+                .and_then(|score| score.metrics)
+                .map(|metrics| metrics.recall_at_10)
+                .unwrap_or_else(|| panic!("category {category:?} was not scored"));
+            assert!(
+                recall >= floor,
+                "{category:?} recall@10 {recall:.3} fell below its baseline floor {floor:.3}"
+            );
+        }
 
         let report = format_report(&scores);
         println!("{report}");
