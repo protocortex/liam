@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use liam_store::{DefaultGraph, NodeId, Query};
+use serde::{Deserialize, Serialize};
 
 use crate::retrieval_eval::{ndcg_at_10, recall_at_k};
 
@@ -16,7 +17,7 @@ const PROBE_K: usize = 10;
 const MARGIN_EPSILON: f64 = 1e-9;
 
 /// One query and the nodes a correct answer must contain.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Probe {
     pub name: String,
     pub query: String,
@@ -51,14 +52,14 @@ impl From<liam_store::Error> for ProbeError {
 }
 
 /// How one probe scored.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ProbeScore {
     pub recall: f64,
     pub ndcg: f64,
 }
 
 /// Every probe's score, by probe name.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProbeReport {
     pub scores: BTreeMap<String, ProbeScore>,
 }
