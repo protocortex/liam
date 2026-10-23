@@ -14,7 +14,9 @@ use crate::embedder_fingerprint::EmbedderFingerprint;
 const MANIFEST_SUFFIX: &str = ".consolidation.json";
 
 /// Layout version of the manifest file, written as `version`. A file with any
-/// other version is refused rather than guessed at.
+/// other version is refused rather than guessed at. Any new manifest field must
+/// bump it: `flatten` rules out `deny_unknown_fields`, so an older build would
+/// silently drop the field and rewrite the file without it.
 const FORMAT_VERSION: u32 = 1;
 
 /// How a finished run ended.
@@ -37,6 +39,45 @@ pub struct RunManifest {
     pub completed_steps: Vec<String>,
     pub outcome: Option<RunOutcome>,
 }
+
+/// Just the version, read before the rest so a future layout reports its
+/// version instead of a field error.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: u32,
+}
+
+/// Why a saved run cannot be resumed under the current configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeRefused {
+    EmbedderChanged {
+        recorded: Box<EmbedderFingerprint>,
+        current: Box<EmbedderFingerprint>,
+    },
+    LlmChanged {
+        recorded: String,
+        current: String,
+    },
+}
+
+impl std::fmt::Display for ResumeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmbedderChanged { recorded, current } => write!(
+                f,
+                "the interrupted run used embedder {recorded:?} but the configured one is \
+                 {current:?}; finish or discard that run first"
+            ),
+            Self::LlmChanged { recorded, current } => write!(
+                f,
+                "the interrupted run used LLM {recorded} but the configured one is {current}; \
+                 finish or discard that run first"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResumeRefused {}
 
 /// The file's contents: the manifest under a layout version.
 #[derive(Serialize, Deserialize)]
@@ -101,19 +142,21 @@ impl RunManifest {
                 path.display()
             ),
         };
-        let sidecar: Sidecar = serde_json::from_str(&text).map_err(|source| {
+        let unparsable = |source: serde_json::Error| {
             anyhow::anyhow!(
                 "the consolidation manifest {} could not be parsed: {source}",
                 path.display()
             )
-        })?;
+        };
+        let probe: VersionProbe = serde_json::from_str(&text).map_err(unparsable)?;
         anyhow::ensure!(
-            sidecar.version == FORMAT_VERSION,
+            probe.version == FORMAT_VERSION,
             "the consolidation manifest {} has version {}, but this build reads version \
              {FORMAT_VERSION}",
             path.display(),
-            sidecar.version
+            probe.version
         );
+        let sidecar: Sidecar = serde_json::from_str(&text).map_err(unparsable)?;
         Ok(Some(sidecar.manifest))
     }
 
@@ -124,6 +167,28 @@ impl RunManifest {
             self.completed_steps.push(step.to_owned());
         }
         self.save(path)
+    }
+
+    /// Refuses to resume under a different embedder or LLM than the run began
+    /// with, since steps already done would then mix two models' output.
+    pub fn check_resumable(
+        &self,
+        embedder: &EmbedderFingerprint,
+        llm_model_fingerprint: &str,
+    ) -> Result<(), ResumeRefused> {
+        if &self.embedder != embedder {
+            return Err(ResumeRefused::EmbedderChanged {
+                recorded: Box::new(self.embedder.clone()),
+                current: Box::new(embedder.clone()),
+            });
+        }
+        if self.llm_model_fingerprint != llm_model_fingerprint {
+            return Err(ResumeRefused::LlmChanged {
+                recorded: self.llm_model_fingerprint.clone(),
+                current: llm_model_fingerprint.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// The index in `ordered_steps` of the first step not yet completed.
@@ -277,6 +342,83 @@ mod tests {
 
         // Assert
         assert_eq!(point, 2);
+    }
+
+    #[test]
+    fn a_later_step_complete_alone_does_not_move_the_resume_point() {
+        // Arrange
+        let mut run = manifest();
+        run.completed_steps = vec!["dedup".into()];
+
+        // Act
+        let point = run.resume_point(&STEPS);
+
+        // Assert
+        assert_eq!(point, 0);
+    }
+
+    #[test]
+    fn a_future_layout_reports_its_version_not_a_field_error() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let path = manifest_path_for(&dir.path().join("liam.db"));
+        std::fs::write(&path, r#"{"version": 2, "renamed_run": "x"}"#).unwrap();
+
+        // Act
+        let error = RunManifest::load(&path).unwrap_err().to_string();
+
+        // Assert
+        assert!(error.contains("version 2"), "{error}");
+    }
+
+    #[test]
+    fn resuming_with_the_same_models_is_allowed() {
+        // Arrange
+        let run = manifest();
+
+        // Act
+        let result = run.check_resumable(&fingerprint(), "llm/model.gguf");
+
+        // Assert
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn resuming_with_a_changed_embedder_is_refused() {
+        // Arrange
+        let run = manifest();
+        let mut other = fingerprint();
+        other.model = "other-model".into();
+
+        // Act
+        let result = run.check_resumable(&other, "llm/model.gguf");
+
+        // Assert
+        assert_eq!(
+            result,
+            Err(ResumeRefused::EmbedderChanged {
+                recorded: Box::new(fingerprint()),
+                current: Box::new(other),
+            })
+        );
+    }
+
+    #[test]
+    fn resuming_with_a_changed_llm_is_refused() {
+        // Arrange
+        let run = manifest();
+
+        // Act
+        let result = run.check_resumable(&fingerprint(), "llm/other.gguf");
+
+        // Assert
+        assert_eq!(
+            result,
+            Err(ResumeRefused::LlmChanged {
+                recorded: "llm/model.gguf".into(),
+                current: "llm/other.gguf".into(),
+            })
+        );
     }
 
     #[test]
