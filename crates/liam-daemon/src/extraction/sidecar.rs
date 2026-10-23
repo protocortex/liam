@@ -6,17 +6,23 @@
 //! guard therefore gives it a random key and alias through the environment
 //! (argv is readable by other users), and sends the key only after the
 //! unauthenticated model listing echoes that alias.
-// Read by the guard that starts the server.
+// Nothing outside the tests starts the guard until the extraction hook does.
 #![allow(dead_code)]
 
 use std::fmt;
 use std::io::{self, Read};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
+use serde::Deserialize;
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+use tracing::{debug, info, warn};
+
+use super::http::{self, Limits, Request};
 use crate::config::ExtractionConfig;
 
 const API_KEY_ENV: &str = "LLAMA_API_KEY";
@@ -79,6 +85,50 @@ impl fmt::Display for SidecarError {
 }
 
 impl std::error::Error for SidecarError {}
+
+/// Free memory, behind a trait so a test can set it.
+pub trait FreeRam: Send {
+    fn free_mb(&self) -> u64;
+}
+
+pub struct SystemRam;
+
+impl FreeRam for SystemRam {
+    fn free_mb(&self) -> u64 {
+        let system = System::new_with_specifics(
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+        );
+        system.available_memory() / BYTES_PER_MB
+    }
+}
+
+/// What a start needs from the outside world, so tests can set RAM and ports.
+pub struct Deps {
+    pub free_ram: Box<dyn FreeRam>,
+    pub next_port: Box<dyn FnMut() -> io::Result<u16> + Send>,
+}
+
+impl Deps {
+    pub fn system(config: &ExtractionConfig) -> Self {
+        let (host, fixed_port) = (config.host.clone(), config.port);
+        Self {
+            free_ram: Box::new(SystemRam),
+            next_port: Box::new(move || match fixed_port {
+                0 => free_loopback_port(&host),
+                port => Ok(port),
+            }),
+        }
+    }
+}
+
+fn free_loopback_port(host: &str) -> io::Result<u16> {
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // The port is released before the child binds it; a lost race shows as an
+    // early exit and is retried.
+    Ok(TcpListener::bind((ip, 0))?.local_addr()?.port())
+}
 
 /// Where one start attempt listens and the secrets the child is given.
 pub struct LaunchParams<'a> {
@@ -206,6 +256,241 @@ impl StderrTail {
         }
         text
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A cheap view of whether the child still runs, for code that does not own
+/// the guard.
+#[derive(Clone)]
+pub struct AliveHandle(Arc<Mutex<Child>>);
+
+impl AliveHandle {
+    pub fn is_alive(&self) -> bool {
+        matches!(lock(&self.0).try_wait(), Ok(None))
+    }
+}
+
+/// Owns a running, ready sidecar. Dropping it kills and reaps the child.
+#[derive(Debug)]
+pub struct SidecarGuard {
+    child: Arc<Mutex<Child>>,
+    pid: u32,
+    addr: SocketAddr,
+    key: Secret,
+    alias: Secret,
+    stderr: Arc<Mutex<StderrTail>>,
+}
+
+impl fmt::Debug for AliveHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AliveHandle")
+    }
+}
+
+impl SidecarGuard {
+    /// Starts the configured `llama-server` and returns once it is ready.
+    pub async fn start(config: &ExtractionConfig) -> Result<Self, SidecarError> {
+        let paths = Paths::resolve(config)?;
+        Self::start_with(
+            config,
+            |launch| server_command(config, &paths, launch),
+            Deps::system(config),
+        )
+        .await
+    }
+
+    /// `start` with the command and the outside world injected.
+    pub async fn start_with(
+        config: &ExtractionConfig,
+        command_for: impl Fn(&LaunchParams) -> Command,
+        mut deps: Deps,
+    ) -> Result<Self, SidecarError> {
+        let free_mb = deps.free_ram.free_mb();
+        if free_mb < config.ram_budget_mb {
+            return Err(SidecarError::RamGate {
+                free_mb,
+                budget_mb: config.ram_budget_mb,
+            });
+        }
+        let ip: IpAddr = config
+            .host
+            .parse()
+            .map_err(|_| SidecarError::Setup(io::ErrorKind::InvalidInput))?;
+        let deadline = Instant::now() + Duration::from_secs(config.start_timeout_secs);
+        let (key, alias) = (random_hex(KEY_BYTES)?, random_hex(ALIAS_BYTES)?);
+        for attempt in 1..=MAX_START_ATTEMPTS {
+            let port = (deps.next_port)().map_err(|e| SidecarError::Setup(e.kind()))?;
+            let launch = LaunchParams {
+                addr: SocketAddr::new(ip, port),
+                alias: &alias,
+                key: &key,
+            };
+            match Self::launch(command_for(&launch), &launch, deadline).await {
+                Err(SidecarError::Exited(code)) if attempt < MAX_START_ATTEMPTS => {
+                    warn!(attempt, ?code, "sidecar exited at start, trying a new port");
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the last attempt always returns")
+    }
+
+    async fn launch(
+        mut command: Command,
+        launch: &LaunchParams<'_>,
+        deadline: Instant,
+    ) -> Result<Self, SidecarError> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(|e| SidecarError::Spawn(e.kind()))?;
+        let stderr = Arc::new(Mutex::new(StderrTail::default()));
+        if let Some(pipe) = child.stderr.take() {
+            capture_stderr(pipe, Arc::clone(&stderr));
+        }
+        // Built before the wait so every early return reaps the child.
+        let guard = Self {
+            pid: child.id(),
+            child: Arc::new(Mutex::new(child)),
+            addr: launch.addr,
+            key: Secret(launch.key.to_string()),
+            alias: Secret(launch.alias.to_string()),
+            stderr,
+        };
+        match guard.wait_ready(deadline).await {
+            Ok(()) => {
+                info!(pid = guard.pid, port = guard.addr.port(), "sidecar ready");
+                Ok(guard)
+            }
+            Err(error) => {
+                warn!(%error, stderr = %guard.stderr_tail(), "sidecar did not become ready");
+                Err(error)
+            }
+        }
+    }
+
+    async fn wait_ready(&self, deadline: Instant) -> Result<(), SidecarError> {
+        loop {
+            if let Some(status) = self.exit_status() {
+                return Err(SidecarError::Exited(status.code()));
+            }
+            if self.answers_with_alias().await {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(SidecarError::StartTimeout);
+            }
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Both probes are unauthenticated: the key must not reach a listener
+    /// that has not proven it is the child we started.
+    async fn answers_with_alias(&self) -> bool {
+        let Some(models) = self.probe(MODELS_PATH).await else {
+            return false;
+        };
+        let listed = serde_json::from_slice::<ModelList>(&models)
+            .is_ok_and(|list| list.data.iter().any(|model| model.id == self.alias.0));
+        listed && self.probe(HEALTH_PATH).await.is_some()
+    }
+
+    async fn probe(&self, path: &str) -> Option<Vec<u8>> {
+        let request = Request {
+            method: "GET",
+            path,
+            bearer: None,
+            body: &[],
+        };
+        let limits = Limits {
+            timeout: PROBE_TIMEOUT,
+            max_body_bytes: PROBE_MAX_BYTES,
+        };
+        match http::send(self.addr, &request, limits).await {
+            Ok(response) if response.status == HTTP_OK => Some(response.body),
+            other => {
+                debug!(path, ok = other.is_ok(), "sidecar probe not ready");
+                None
+            }
+        }
+    }
+
+    fn exit_status(&self) -> Option<ExitStatus> {
+        lock(&self.child).try_wait().ok().flatten()
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.key.0
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive_handle().is_alive()
+    }
+
+    pub fn alive_handle(&self) -> AliveHandle {
+        AliveHandle(Arc::clone(&self.child))
+    }
+
+    /// What the child wrote to stderr last, with the key and alias removed.
+    pub fn stderr_tail(&self) -> String {
+        lock(&self.stderr).redacted(&[&self.key.0, &self.alias.0])
+    }
+
+    /// Asks the server to quit and waits up to a grace period; `Drop` then
+    /// kills whatever is left.
+    pub async fn stop(self) {
+        // SAFETY: `kill` only sends a signal; the pid is our own live or
+        // not-yet-reaped child, so it cannot name another process.
+        unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGTERM) };
+        let give_up = Instant::now() + STOP_GRACE;
+        while self.is_alive() && Instant::now() < give_up {
+            tokio::time::sleep(STOP_POLL_INTERVAL).await;
+        }
+    }
+}
+
+impl Drop for SidecarGuard {
+    fn drop(&mut self) {
+        let mut child = lock(&self.child);
+        // Errors mean the child is already gone, which is the goal.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[derive(Deserialize)]
+struct ModelList {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+/// Drains the pipe so the child never blocks on a full stderr.
+fn capture_stderr(mut pipe: impl Read + Send + 'static, tail: Arc<Mutex<StderrTail>>) {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; STDERR_READ_CHUNK];
+        while let Ok(read) = pipe.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            lock(&tail).push(&chunk[..read]);
+        }
+    });
 }
 
 fn random_hex(len: usize) -> Result<String, SidecarError> {
