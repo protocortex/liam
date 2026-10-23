@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The run's source of randomness. Every random choice in a consolidation run
+//! The run's source of randomness. Every random choice the job itself makes
 //! draws from one generator seeded by the manifest, so a rerun from the same
-//! manifest makes the same choices. `thread_rng` is never used.
+//! manifest makes the same choices. Ids the store mints for nodes, edges and
+//! snapshots stay random, so runs match by content, not by id.
 
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -21,6 +22,18 @@ mod tests {
     use rand_chacha::rand_core::RngCore;
 
     const DRAWS: usize = 8;
+    /// Pinned so a changed algorithm, seeding rule or crate release fails here
+    /// instead of silently changing every run's choices.
+    const PINNED_SEED_42: [u64; DRAWS] = [
+        12_578_764_544_318_200_737,
+        17_529_487_244_874_322_312,
+        7_886_285_670_807_131_020,
+        11_572_758_976_476_374_866,
+        5_323_617_429_756_461_744,
+        2_766_252_901_828_231_838,
+        5_682_345_367_224_914_708,
+        14_828_835_203_913_492_612,
+    ];
 
     fn manifest_with(seed: u64) -> RunManifest {
         let embedder = EmbedderFingerprint {
@@ -49,6 +62,18 @@ mod tests {
 
         // Assert
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn seed_42_gives_the_pinned_first_draws() {
+        // Arrange
+        let manifest = manifest_with(42);
+
+        // Act
+        let first = draws(&manifest);
+
+        // Assert
+        assert_eq!(first, PINNED_SEED_42);
     }
 
     #[test]

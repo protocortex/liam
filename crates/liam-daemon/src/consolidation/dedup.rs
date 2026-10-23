@@ -854,18 +854,22 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Each node's content with the contents it is linked to, sorted, so two
-    /// stores with different ids compare by what they hold.
-    async fn links_by_content(store: &DefaultGraph, ids: &[NodeId]) -> Vec<(String, Vec<String>)> {
-        let mut out = Vec::new();
+    /// The (duplicate content, canonical content) of every edge written to the
+    /// log, sorted, so two stores with different ids compare by what they hold.
+    async fn decisions(store: DefaultGraph, dir: &Path, ids: &[NodeId]) -> Vec<(String, String)> {
+        let mut content_of = HashMap::new();
         for id in ids {
-            let content = store.get(id, AS_OF).await.unwrap().unwrap().content;
-            let mut linked = Vec::new();
-            for other in store.neighbors(id, AS_OF).await.unwrap() {
-                linked.push(store.get(&other, AS_OF).await.unwrap().unwrap().content);
+            let node = store.get(id, AS_OF).await.unwrap().unwrap();
+            content_of.insert(id.as_str().to_string(), node.content);
+        }
+        drop(store);
+        let reader = SequentialScanReader::local(&dir.join("events")).unwrap();
+        let mut stream = reader.scan(None);
+        let mut out = Vec::new();
+        while let Some(record) = stream.next().await {
+            if let LogPayload::EdgeWrite(edge) = record.unwrap().event.payload {
+                out.push((content_of[&edge.src].clone(), content_of[&edge.dst].clone()));
             }
-            linked.sort();
-            out.push((content, linked));
         }
         out.sort();
         out
@@ -893,31 +897,45 @@ mod tests {
         run(&second, &embed, 0.5).await;
 
         // Assert
-        let decisions = links_by_content(&first, &first_ids).await;
-        assert_eq!(decisions, links_by_content(&second, &second_ids).await);
-        assert!(decisions.contains(&("c".to_string(), vec!["a".to_string()])));
+        let decided = decisions(first, first_dir.path(), &first_ids).await;
+        assert_eq!(
+            decided,
+            decisions(second, second_dir.path(), &second_ids).await
+        );
+        assert_eq!(decided, vec![("c".to_string(), "a".to_string())]);
     }
 
     #[test]
-    fn plan_merges_gives_the_same_pairs_however_the_groups_interleave() {
-        // Arrange: two producers whose items arrive in different interleavings
-        let (a1, a2) = (
-            in_scope("a1", None, "a", ONE),
-            in_scope("a2", None, "a", ONE),
-        );
-        let (b1, b2) = (
-            in_scope("b1", None, "b", ONE),
-            in_scope("b2", None, "b", ONE),
-        );
-        let grouped = [a1.clone(), a2.clone(), b1.clone(), b2.clone()];
-        let woven = [b1, a1, b2, a2];
+    fn plan_merges_gives_the_same_ordered_pairs_however_the_groups_interleave() {
+        // Arrange: four producers, each with an original then a repeat
+        let grouped: Vec<Embedded> = ["a", "b", "c", "d"]
+            .iter()
+            .flat_map(|p| {
+                [
+                    in_scope(&format!("{p}1"), None, p, ONE),
+                    in_scope(&format!("{p}2"), None, p, ONE),
+                ]
+            })
+            .collect();
+        // Each producer's own order is kept; only the interleaving changes
+        let woven: Vec<Embedded> = [6, 0, 4, 2, 1, 7, 5, 3]
+            .iter()
+            .map(|&i| grouped[i].clone())
+            .collect();
 
         // Act
         let from_grouped = plan_merges(&grouped, THRESHOLD);
         let from_woven = plan_merges(&woven, THRESHOLD);
 
-        // Assert
-        assert_eq!(from_grouped.len(), 2);
+        // Assert: producers come out in key order, each repeat pointing at its original
+        let pairs: Vec<(&str, &str)> = from_grouped
+            .iter()
+            .map(|p| (p.duplicate.as_str(), p.canonical.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("a2", "a1"), ("b2", "b1"), ("c2", "c1"), ("d2", "d1")]
+        );
         assert_eq!(from_grouped, from_woven);
     }
 
