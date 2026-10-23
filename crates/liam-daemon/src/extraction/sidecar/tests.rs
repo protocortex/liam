@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
+mod stale_tests;
+
 use super::*;
 use crate::extraction::client::{
     ExtractError, ExtractRequest, JsonExtractor, ModelIdentity, SidecarClient,
@@ -55,10 +57,19 @@ fn config(timeout_secs: u64) -> ExtractionConfig {
 }
 
 fn deps(ports: Vec<u16>) -> Deps {
+    static NEXT_PIDFILE: AtomicUsize = AtomicUsize::new(0);
     let mut ports = ports.into_iter();
+    let unique = NEXT_PIDFILE.fetch_add(1, Ordering::SeqCst);
     Deps {
         free_ram: Box::new(FixedRam(ENOUGH_RAM_MB)),
         next_port: Box::new(move || Ok(ports.next().expect("a port was scripted"))),
+        processes: Box::new(SystemProcesses),
+        // The guard removes it on drop, including after a failed start.
+        pidfile: std::env::temp_dir().join(format!(
+            "liam-sidecar-test-{}-{unique}.pid",
+            std::process::id()
+        )),
+        server_exe: std::env::current_exe().unwrap(),
     }
 }
 
