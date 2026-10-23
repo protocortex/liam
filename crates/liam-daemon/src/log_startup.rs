@@ -907,7 +907,11 @@ mod tests {
             DIMS
         }
 
-        async fn embed(&self, _text: &str) -> liam_model::Result<Vec<f32>> {
+        async fn embed(
+            &self,
+            _text: &str,
+            _kind: liam_model::TextKind,
+        ) -> liam_model::Result<Vec<f32>> {
             Err(liam_model::ModelError::Embed("injected failure".into()))
         }
     }

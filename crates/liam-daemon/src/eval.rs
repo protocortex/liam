@@ -324,7 +324,7 @@ mod run {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use liam_model::{Embedder, Llm};
+    use liam_model::{Embedder, Llm, TextKind};
     use liam_store::{DefaultGraph, GraphConfig, NewNode};
 
     use super::{failures, CASES, CORPUS, REQUIRED_CASES};
@@ -430,7 +430,10 @@ mod run {
         );
         let embedder = Arc::new(liam_model::MockEmbedder::new(DIMS));
         for (kind, label, content) in CORPUS {
-            let embedding = embedder.embed(content).await.expect("embed corpus item");
+            let embedding = embedder
+                .embed(content, TextKind::Document)
+                .await
+                .expect("embed corpus item");
             store
                 .insert(NewNode::now(*kind, *label, *content).with_embedding(embedding))
                 .await

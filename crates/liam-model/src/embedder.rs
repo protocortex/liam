@@ -6,15 +6,23 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
+/// The role a text plays in retrieval. Asymmetric models embed a search query
+/// differently from the content it is matched against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextKind {
+    Query,
+    Document,
+}
+
 #[async_trait]
 pub trait Embedder: Send + Sync {
     fn dims(&self) -> usize;
-    async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    async fn embed(&self, text: &str, kind: TextKind) -> Result<Vec<f32>>;
     /// Batch by default calls `embed`; adapters may override for efficiency.
-    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    async fn embed_batch(&self, texts: &[String], kind: TextKind) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for t in texts {
-            out.push(self.embed(t).await?);
+            out.push(self.embed(t, kind).await?);
         }
         Ok(out)
     }
@@ -36,12 +44,26 @@ impl Embedder for MockEmbedder {
     fn dims(&self) -> usize {
         self.dims
     }
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    async fn embed(&self, text: &str, _kind: TextKind) -> Result<Vec<f32>> {
         let mut v = vec![0.0f32; self.dims];
         for (i, b) in text.bytes().enumerate() {
             v[i % self.dims] += (b as f32) / 255.0;
         }
         Ok(v)
+    }
+}
+
+/// Instruction marker Qwen3-Embedding expects on search queries; documents are
+/// embedded as plain text.
+#[cfg(any(test, feature = "local"))]
+const QUERY_PREFIX: &str = "query: ";
+
+/// The exact string handed to the model for `text` in its `kind` role.
+#[cfg(any(test, feature = "local"))]
+fn embed_input(text: &str, kind: TextKind) -> std::borrow::Cow<'_, str> {
+    match kind {
+        TextKind::Query => std::borrow::Cow::Owned(format!("{QUERY_PREFIX}{text}")),
+        TextKind::Document => std::borrow::Cow::Borrowed(text),
     }
 }
 
@@ -230,16 +252,16 @@ impl Embedder for FastEmbedEmbedder {
     fn dims(&self) -> usize {
         self.dims
     }
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    async fn embed(&self, text: &str, kind: TextKind) -> Result<Vec<f32>> {
         let model = self.model.clone();
-        let query = format!("query: {text}");
+        let input = embed_input(text, kind).into_owned();
         let dims = self.dims;
         let out = tokio::task::spawn_blocking(move || {
             let m = model
                 .lock()
                 .map_err(|_| crate::error::ModelError::Embed("model lock poisoned".into()))?;
             let vecs = m
-                .embed(&[query.as_str()])
+                .embed(&[input.as_str()])
                 .map_err(|e| crate::error::ModelError::Embed(e.to_string()))?;
             let full = vecs
                 .into_iter()
@@ -255,7 +277,7 @@ impl Embedder for FastEmbedEmbedder {
 
 #[cfg(test)]
 mod tests {
-    use super::{mrl_truncate, validate_dims};
+    use super::{embed_input, mrl_truncate, validate_dims, Embedder, MockEmbedder, TextKind};
     #[cfg(feature = "local")]
     use super::{parse_qwen3_config, weight_fetch_error};
 
@@ -430,6 +452,64 @@ mod tests {
         assert!(err.contains("sharded"), "message: {err}");
     }
 
+    #[test]
+    fn embed_input_prefixes_a_query_with_the_query_marker() {
+        // Arrange
+        let text = "where do I live";
+
+        // Act
+        let input = embed_input(text, TextKind::Query);
+
+        // Assert
+        assert_eq!(input, "query: where do I live");
+    }
+
+    #[test]
+    fn embed_input_leaves_a_document_unprefixed() {
+        // Arrange
+        let text = "I live in Lisbon";
+
+        // Act
+        let input = embed_input(text, TextKind::Document);
+
+        // Assert
+        assert_eq!(input, text);
+    }
+
+    #[tokio::test]
+    async fn mock_embedder_ignores_the_text_kind() {
+        // Arrange
+        let embedder = MockEmbedder::new(8);
+        let text = "same text, two roles";
+
+        // Act
+        let as_query = embedder.embed(text, TextKind::Query).await.unwrap();
+        let as_document = embedder.embed(text, TextKind::Document).await.unwrap();
+
+        // Assert
+        assert_eq!(as_query, as_document);
+    }
+
+    #[tokio::test]
+    async fn default_embed_batch_passes_the_kind_to_every_item() {
+        // Arrange
+        let embedder = MockEmbedder::new(8);
+        let texts = vec!["alpha".to_string(), "beta".to_string()];
+
+        // Act
+        let batch = embedder
+            .embed_batch(&texts, TextKind::Document)
+            .await
+            .unwrap();
+
+        // Assert
+        let expected = vec![
+            embedder.embed("alpha", TextKind::Document).await.unwrap(),
+            embedder.embed("beta", TextKind::Document).await.unwrap(),
+        ];
+        assert_eq!(batch, expected);
+    }
+
     /// Real-tier regression pin for issue #112: a fresh temp dir per run
     /// means this can only pass if `with_cache_dir` genuinely took effect,
     /// since the old bare `from_hf` call would leave it empty. Gated and
@@ -439,7 +519,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "downloads embedder weights; see module doc for the run command"]
     async fn load_downloads_weights_into_the_configured_cache_dir() {
-        use crate::Embedder;
+        use crate::{Embedder, TextKind};
 
         // Arrange: removed on drop, even on an early panic below.
         struct CleanupOnDrop(std::path::PathBuf);
@@ -473,7 +553,7 @@ mod tests {
             );
         }
         let vector = embedder
-            .embed("hello world")
+            .embed("hello world", TextKind::Query)
             .await
             .expect("embed after load");
         assert_eq!(vector.len(), native_dims);

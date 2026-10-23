@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use liam_model::{Embedder, Llm, Reranker};
+use liam_model::{Embedder, Llm, Reranker, TextKind};
 use liam_store::types::{EpisodeEdge, EpisodeRef};
 use liam_store::{relation, DefaultGraph, NewNode, Query};
 use rmcp::handler::server::wrapper::Parameters;
@@ -773,7 +773,7 @@ impl MemoryServer {
         }
 
         let Some(episode) = args.episode else {
-            let embedding = match self.embedder.embed(&args.content).await {
+            let embedding = match self.embedder.embed(&args.content, TextKind::Document).await {
                 Ok(v) => v,
                 Err(e) => return format!("embed failed: {e}"),
             };
@@ -838,7 +838,7 @@ impl MemoryServer {
         // build the combined node list in order: index 0 is the top-level
         // fact, 1..=fact_count is episode.facts, and
         // 1+fact_count..1+fact_count+entity_count is episode.entities.
-        let embedding = match self.embedder.embed(&args.content).await {
+        let embedding = match self.embedder.embed(&args.content, TextKind::Document).await {
             Ok(v) => v,
             Err(e) => return format!("embed failed: {e}"),
         };
@@ -863,7 +863,7 @@ impl MemoryServer {
         nodes.push(top);
 
         for fact in episode.facts {
-            let embedding = match self.embedder.embed(&fact.content).await {
+            let embedding = match self.embedder.embed(&fact.content, TextKind::Document).await {
                 Ok(v) => v,
                 Err(e) => return format!("embed failed: {e}"),
             };
@@ -1032,7 +1032,7 @@ impl MemoryServer {
             Ok(content) => content,
             Err(e) => return Err(format!("{label}: {e}")),
         };
-        let embedding = match self.embedder.embed(&new_content).await {
+        let embedding = match self.embedder.embed(&new_content, TextKind::Document).await {
             Ok(v) => v,
             Err(e) => return Err(format!("{label}: {e}")),
         };
@@ -1054,7 +1054,7 @@ impl MemoryServer {
     // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Retrieve relevant long-term memory, reranked for precision.")]
     pub(crate) async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
-        let embedding = self.embedder.embed(&args.query).await.ok();
+        let embedding = self.embedder.embed(&args.query, TextKind::Query).await.ok();
         let q = build_query(
             &args.query,
             args.k,
@@ -1332,7 +1332,11 @@ impl MemoryServer {
     // path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
-        let embedding = self.embedder.embed(&args.question).await.ok();
+        let embedding = self
+            .embedder
+            .embed(&args.question, TextKind::Query)
+            .await
+            .ok();
         let k = clamp_ask_k(args.k);
         let q = build_query(
             &args.question,
@@ -1484,9 +1488,9 @@ mod tests {
         fn dims(&self) -> usize {
             self.inner.dims()
         }
-        async fn embed(&self, text: &str) -> liam_model::Result<Vec<f32>> {
+        async fn embed(&self, text: &str, kind: TextKind) -> liam_model::Result<Vec<f32>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.embed(text).await
+            self.inner.embed(text, kind).await
         }
     }
 

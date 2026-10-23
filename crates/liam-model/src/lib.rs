@@ -13,7 +13,7 @@ pub mod reranker;
 #[cfg(feature = "llama")]
 pub mod llama;
 
-pub use embedder::{Embedder, MockEmbedder};
+pub use embedder::{Embedder, MockEmbedder, TextKind};
 pub use error::{ModelError, Result};
 pub use llm::{Llm, MockLlm};
 pub use reranker::{IdentityReranker, Reranker};
