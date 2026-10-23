@@ -126,6 +126,11 @@ pub trait FileOps: Send {
     fn sync_file(&mut self, file: &File) -> io::Result<()>;
     fn truncate(&mut self, file: &File, len: u64) -> io::Result<()>;
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()>;
+
+    /// Moves `from` over `to`. Defaults to the real rename.
+    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
 }
 
 pub struct OsFileOps;
@@ -162,13 +167,13 @@ pub fn write_atomically(path: &Path, bytes: &[u8], ops: &mut dyn FileOps) -> io:
     let mut file = File::create(&staged)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(&staged, path)?;
+    ops.rename(&staged, path)?;
     ops.sync_dir(sync_dir_for(path))
 }
 
 /// The directory whose entry for `path` must reach disk. A bare file name has
 /// an empty parent, which means the current directory.
-pub(crate) fn sync_dir_for(path: &Path) -> &Path {
+pub fn sync_dir_for(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),

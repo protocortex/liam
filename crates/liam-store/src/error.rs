@@ -191,6 +191,58 @@ pub enum Error {
     /// would sit ahead of them and a replay could not apply it.
     #[error("the store has rows the log does not hold yet: run the backfill first")]
     BackfillRequired,
+
+    /// A snapshot could not be written, read, or used as asked.
+    #[error("snapshot: {0}")]
+    Snapshot(String),
+
+    /// A snapshot's metadata is unreadable or not in a format this build knows,
+    /// so it is not restored.
+    #[error("the snapshot is corrupt: {0}")]
+    SnapshotCorrupt(String),
+
+    /// A snapshot's database file is not the file whose size and checksum were
+    /// recorded when it was taken.
+    #[error(
+        "snapshot {snapshot_id} does not match its recorded size and checksum, \
+         so the file was damaged or replaced after it was taken; restore another snapshot"
+    )]
+    SnapshotChecksumMismatch { snapshot_id: String },
+
+    /// The snapshot was taken against another log than the store's.
+    #[error(
+        "snapshot was taken against log {snapshot}, but this store's log is {store}; \
+         restore a snapshot taken from this store"
+    )]
+    SnapshotLogMismatch {
+        snapshot: uuid::Uuid,
+        store: uuid::Uuid,
+    },
+
+    /// The snapshot covers more of the log than the log now holds.
+    #[error(
+        "the snapshot covers the log up to {cursor}, but the log ends at {end}; \
+         the log lost records the snapshot holds, so the snapshot is not restored",
+        end = log_end(.head)
+    )]
+    SnapshotAheadOfLog {
+        cursor: liam_log::LogOffset,
+        head: Option<liam_log::LogOffset>,
+    },
+
+    /// A snapshot of a store without a log cannot be placed against the log of
+    /// a store that has one.
+    #[error(
+        "snapshot {snapshot_id} was taken without an event log, so its position in \
+         the log is unknown; restore a snapshot taken with the log attached"
+    )]
+    SnapshotWithoutLog { snapshot_id: String },
+
+    /// A restore could not put the snapshot in place, or finish an earlier
+    /// interrupted one. The live database and its `-wal` are as they were
+    /// unless the message says the swap itself completed.
+    #[error("restore failed: {0}")]
+    RestoreFailed(String),
 }
 
 /// What the log's live rows were compared with when they did not match.

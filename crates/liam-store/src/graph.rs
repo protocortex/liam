@@ -20,6 +20,7 @@ pub use self::logged_write::{EventLog, PoisonHook, SharedLog};
 pub use self::rebuild::{RebuildMode, RebuildReport};
 pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
 pub use self::replay::CatchUpReport;
+pub use self::snapshot::{recover_interrupted_restore, Snapshot, SnapshotLog, SnapshotMeta};
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};
@@ -42,6 +43,7 @@ mod projection;
 mod rebuild;
 mod reembed;
 mod replay;
+mod snapshot;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
 /// one-character handle answers with something a caller can act on instead of
@@ -583,6 +585,9 @@ impl<B: Backend> Graph<B> {
         config: GraphConfig,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
+        // A crash during a restore leaves the database without its WAL; put
+        // it back before the file is opened.
+        snapshot::recover_interrupted_restore(std::path::Path::new(path))?;
         let backend = B::open(path, config.read_pool_size).await?;
         let mut ddl = schema(&config);
         ddl.push_str(&backend.vector_ddl(config.embedding_dims));
@@ -2221,6 +2226,7 @@ mod tests {
     mod ranking_ties;
     mod rebuild;
     mod reembed;
+    mod snapshot;
     mod soak;
     mod support;
 
