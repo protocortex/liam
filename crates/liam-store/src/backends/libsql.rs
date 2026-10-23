@@ -208,7 +208,7 @@ impl Backend for LibsqlBackend {
         let write_conn = db.connect().map_err(err)?;
         // WAL is persistent in the database file, not the connection, so it
         // is set once here rather than in `configure_connection`. Verified
-        // empirically against libsql 0.9.30: issuing `PRAGMA journal_mode =
+        // empirically against libsql: issuing `PRAGMA journal_mode =
         // WAL` as the very first statement on the first connection sticks,
         // confirmed by querying `PRAGMA journal_mode` back on a file-backed
         // database (see `wal_is_enabled_on_a_file_backed_database` below),
