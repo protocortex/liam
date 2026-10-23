@@ -24,7 +24,8 @@ use crate::config::Config;
 /// Version of the convention that turns text into model input (prefixes and
 /// the like). Bump it whenever that convention changes for a model, since the
 /// model and dimensions stay the same while old and new vectors diverge.
-pub const PROMPT_SCHEME: u32 = 0;
+/// Scheme 1: only queries get the model's query prefix, stored text does not.
+pub const PROMPT_SCHEME: u32 = 1;
 
 /// The scheme every store written before fingerprints existed was embedded
 /// under. It stays 0 however far `PROMPT_SCHEME` moves.
@@ -337,6 +338,21 @@ mod tests {
         assert!(error.contains("prompt scheme 1"), "{error}");
         assert!(error.contains(&sidecar.display().to_string()), "{error}");
         assert!(!sidecar.exists(), "a refusal must write nothing");
+    }
+
+    #[test]
+    fn a_build_with_the_current_scheme_refuses_a_store_embedded_before_fingerprints() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let database = existing_database(dir.path());
+
+        // Act
+        let error = verify(&database, &fingerprint("model-a", 768, PROMPT_SCHEME))
+            .expect_err("the current scheme must not be taken for the legacy one")
+            .to_string();
+
+        // Assert
+        assert!(error.contains("prompt scheme 0"), "{error}");
     }
 
     #[test]
