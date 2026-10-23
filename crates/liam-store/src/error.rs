@@ -191,6 +191,20 @@ pub enum Error {
     /// would sit ahead of them and a replay could not apply it.
     #[error("the store has rows the log does not hold yet: run the backfill first")]
     BackfillRequired,
+
+    /// A snapshot could not be written, read, or used as asked.
+    #[error("snapshot: {0}")]
+    Snapshot(String),
+
+    /// A snapshot's metadata or database file is not what was recorded when it
+    /// was taken, so it is not restored.
+    #[error("the snapshot is corrupt: {0}")]
+    SnapshotCorrupt(String),
+
+    /// A restore could not put the snapshot in place. The live database file
+    /// may be missing its `-wal`, but is otherwise as it was.
+    #[error("restore failed: {0}")]
+    RestoreFailed(String),
 }
 
 /// What the log's live rows were compared with when they did not match.

@@ -42,6 +42,7 @@ mod projection;
 mod rebuild;
 mod reembed;
 mod replay;
+pub mod snapshot;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
 /// one-character handle answers with something a caller can act on instead of
@@ -2221,6 +2222,7 @@ mod tests {
     mod ranking_ties;
     mod rebuild;
     mod reembed;
+    mod snapshot;
     mod soak;
     mod support;
 
