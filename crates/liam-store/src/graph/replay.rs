@@ -173,7 +173,9 @@ impl<B: Backend> Graph<B> {
             }
             Err(error) if is_refusal(&error) => {
                 tracing::warn!(event = %event.event_id, %error, "replay: event refused, quarantining");
-                let void = self.quarantine(held, record, &error.to_string()).await?;
+                let void = self
+                    .quarantine_record(held, record, &error.to_string())
+                    .await?;
                 *last_void = Some(void);
                 Ok(Outcome::Quarantined)
             }
@@ -184,7 +186,7 @@ impl<B: Backend> Graph<B> {
     /// Appends a `Voided` for the refused event, so a rebuild from the log
     /// skips it as this store does, then records the refusal and moves the
     /// cursor onto the event in one transaction. Returns the void's offset.
-    async fn quarantine(
+    async fn quarantine_record(
         &self,
         held: &mut HeldLog,
         record: &LogRecord,

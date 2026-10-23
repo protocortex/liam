@@ -160,6 +160,33 @@ pub enum Error {
     #[error("the log state in the store is corrupt: {0}")]
     CorruptLogState(String),
 
+    /// A row of extraction state holds a value its column cannot legally have.
+    #[error("the extraction state in the store is corrupt: {0}")]
+    CorruptExtractionState(String),
+
+    /// A batch was quarantined before any failure was recorded for it.
+    #[error("batch {batch_key} has no recorded failure, so it cannot be quarantined")]
+    ExtractionBatchUnknown { batch_key: String },
+
+    /// An extraction cursor was asked to move behind where it already is, which
+    /// would make the extractor read records it has done again.
+    #[error(
+        "the {extractor} extraction cursor is at {stored}, so it cannot move back to {attempted}"
+    )]
+    ExtractionCursorRegressed {
+        extractor: &'static str,
+        stored: liam_log::LogOffset,
+        attempted: liam_log::LogOffset,
+    },
+
+    /// A log offset has a part above `i64::MAX`, which the database cannot hold.
+    #[error("the log offset {0} does not fit the extraction cursor columns")]
+    ExtractionOffsetOutOfRange(liam_log::LogOffset),
+
+    /// A batch has failed `u32::MAX` times already, so counting one more would wrap.
+    #[error("batch {batch_key} has no room left to count another failure")]
+    ExtractionCounterOverflow { batch_key: String },
+
     /// The store holds rows the log does not record yet, so a logged write
     /// would sit ahead of them and a replay could not apply it.
     #[error("the store has rows the log does not hold yet: run the backfill first")]

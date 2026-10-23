@@ -13,6 +13,8 @@ serde_json = "1"
 thiserror = "2"
 ulid = "2"
 tracing = "0.1"
+# The extraction batch key is a SHA-256, as in liam-log.
+sha2 = { version = "0.11.0", default-features = false }
 liam-log = { path = "../liam-log" }
 # Replay pulls the log reader's record stream.
 futures-util = { version = "0.3", default-features = false }

@@ -98,36 +98,45 @@ fn advance_params(log_id: Uuid, offset: LogOffset) -> Result<[Value; 3]> {
     Ok([log_id.to_string().into(), segment, index])
 }
 
-/// The column values for an offset. SQLite integers are signed, so an offset
-/// above `i64::MAX` cannot be stored.
+/// The column values for an offset, or `None` when a part is above
+/// `i64::MAX`: SQLite integers are signed, so it cannot be stored.
+pub(super) fn offset_to_columns(offset: LogOffset) -> Option<(i64, i64)> {
+    Some((
+        i64::try_from(offset.segment).ok()?,
+        i64::try_from(offset.index).ok()?,
+    ))
+}
+
+/// The offset held by two column values, or `None` when either is negative.
+pub(super) fn offset_from_columns(segment: i64, index: i64) -> Option<LogOffset> {
+    Some(LogOffset {
+        segment: u64::try_from(segment).ok()?,
+        index: u64::try_from(index).ok()?,
+    })
+}
+
 pub(super) fn offset_to_values(offset: LogOffset) -> Result<(Value, Value)> {
-    let column = |part: u64| {
-        i64::try_from(part).map(Value::Int).map_err(|_| {
-            Error::CorruptLogState(format!(
-                "log offset {offset} does not fit the log_cursor columns"
-            ))
-        })
-    };
-    Ok((column(offset.segment)?, column(offset.index)?))
+    let (segment, index) = offset_to_columns(offset).ok_or_else(|| {
+        Error::CorruptLogState(format!(
+            "log offset {offset} does not fit the log_cursor columns"
+        ))
+    })?;
+    Ok((Value::Int(segment), Value::Int(index)))
 }
 
 /// The offset held by two column values; both NULL means no offset yet.
 pub(super) fn offset_from_values(segment: &Value, index: &Value) -> Result<Option<LogOffset>> {
     match (segment, index) {
         (Value::Null, Value::Null) => Ok(None),
-        (Value::Int(segment), Value::Int(index)) => Ok(Some(LogOffset {
-            segment: column_to_u64(*segment)?,
-            index: column_to_u64(*index)?,
-        })),
+        (Value::Int(segment), Value::Int(index)) => offset_from_columns(*segment, *index)
+            .map(Some)
+            .ok_or_else(|| {
+                Error::CorruptLogState(format!("log_cursor holds the offset {segment}, {index}"))
+            }),
         _ => Err(Error::CorruptLogState(
             "log_cursor holds a segment without an index, or an index without a segment".into(),
         )),
     }
-}
-
-fn column_to_u64(value: i64) -> Result<u64> {
-    u64::try_from(value)
-        .map_err(|_| Error::CorruptLogState(format!("log_cursor holds the offset {value}")))
 }
 
 #[cfg(test)]
