@@ -181,7 +181,7 @@ unknown key fails loudly.
 |---|---|---|
 | `database_path` | `liam.db` | The libSQL file. |
 | `log_filter` | `info,liam=debug` | tracing filter. `RUST_LOG` overrides it. |
-| `embedding_dims` | `768` | Vector width. Fixed when the DB is created. |
+| `embedding_dims` | `768` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see The embedder fingerprint). |
 | `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. |
 | `gc.interval_hours` | `6` | Sweep interval. |
 | `gc.reclaim` | `true` | Run incremental vacuum after a sweep. |
@@ -189,8 +189,8 @@ unknown key fails loudly.
 | `gc.max_resynth_per_tick` | `5` | Ceiling on entities re-synthesized per maintenance tick. |
 | `gc.full_synthesis_mention_threshold` | `8` | Live-mention count at or above which the next resynthesis uses the full-tier token budget. |
 | `gc.full_synthesis_max_new_tokens` | `512` | Output token budget for a full-tier resynthesis. |
-| `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. |
-| `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`. |
+| `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. Part of the embedder fingerprint. |
+| `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`. Part of the embedder fingerprint. |
 | `embedder.cache_dir` | `~/.liam/models` | Files for both the reranker and the embedder, each under its own `models--Org--Name` subdirectory. |
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
 | `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
@@ -251,6 +251,89 @@ Vectors stored before documents and queries were embedded separately carry the
 `query: ` prefix on documents too. After upgrading, run `liam rebuild --database
 PATH` once: it clears the stored vectors and re-embeds every live node as a
 document, which makes the store consistent.
+
+### The embedder fingerprint
+
+A store's vectors only make sense next to others from the same embedder. Beside
+the database, `liamd` keeps a record of what wrote them: `<database>.embedder.json`
+(for `liam.db`, that is `liam.db.embedder.json`). It holds four fields and a
+file `version`:
+
+| Field | Source |
+|---|---|
+| `provider` | `embedder.provider` |
+| `model` | `embedder.model` |
+| `dims` | `embedding_dims` |
+| `prompt_scheme` | A number built into the binary: the version of the convention that turns text into model input. Scheme 1 puts the `query: ` prefix on search queries only. |
+
+Every start of `liamd` and `liamd serve` compares the record with the
+configured values before the store opens. `liamd proxy` opens no store and
+skips the check.
+
+- **No record, and no database or an empty one:** a fresh install. The record
+  is written after the store opens, so a start that fails leaves nothing
+  behind.
+- **No record, and a database that holds data:** a store from before
+  fingerprints. It is taken to hold the configured provider, model and
+  dimensions under prompt scheme 0, so it fails the check (the binary is on
+  scheme 1) until you run `liam rebuild`.
+- **Record matches:** the start goes on.
+- **Record differs in any field:** `liamd` exits before opening the store. The
+  error names the recorded and the configured values and the rebuild command.
+- **Record cannot be read, parsed, or has another `version`:** `liamd` exits
+  with a message distinct from the mismatch one. The file is never overwritten,
+  because that could hide a change of embedder.
+
+To change `embedder.provider`, `embedder.model` or `embedding_dims`, stop
+`liamd`, edit `liam.toml`, and run:
+
+```sh
+liam rebuild --database PATH
+```
+
+It re-embeds every live node with the configured embedder, resizes the vector
+table, and records the new fingerprint, but only when no embedding failed. Do
+not delete the `.embedder.json` file to get past the error: the old vectors
+would stay in `node_vectors`, mixed with the new ones. Deleting the file is
+safe only after the vectors are cleared or re-embedded. The other way out is to
+restore the previous `liam.toml` settings.
+
+### Evaluating retrieval
+
+```sh
+liam eval retrieval --model <ID> [--json]
+```
+
+It scores one embedding model on a fixed golden set and measures the embedder's
+speed. Build `liam` with `--features local`; without it the command fails with
+an error saying so. The model is downloaded into `embedder.cache_dir` on first
+use.
+
+| Flag | Meaning |
+|---|---|
+| `--model <ID>` | Required. `Qwen/Qwen3-Embedding-0.6B` or `BAAI/bge-m3`. The match ignores case. Any other id is refused with the list of supported ones. |
+| `--json` | Print the report as JSON instead of text. Latencies are in milliseconds. |
+| `--config <PATH>` | The config to read, as for the other `liam` commands (`LIAM_CONFIG` also works). |
+
+The run uses the in-process `local` embedder whatever `embedder.provider` says.
+Qwen3 runs at `embedding_dims`; BGE-M3 always runs at its fixed 1024.
+
+The golden set is 80 hand-written questions, ten in each of eight categories
+(`Lexical`, `VectorSemantic`, `GraphExpansion`, `KindFilter`, `ScopeFilter`,
+`Decay`, `Confidence`, `AsOf`), over a synthetic corpus about one fictional
+company. LIAM has no real usage logs yet, so the set stands in for them. It is
+small, and most categories are decided by full-text search, so only
+`VectorSemantic` separates embedders. Treat differences of a few thousandths as
+noise.
+
+The text report has a header line (model, dimensions, facts, questions), a
+per-category table (precision and recall at 4 and 8, recall@10, nDCG@10, MRR),
+an `overall` line, and an `embedder:` line with the call count, item count, mean
+latency and throughput in items per second. The JSON report carries the same
+figures plus a row per question. The ranking metrics are deterministic: two
+runs of the same model give the same values. Only the timings vary with the
+machine. The measured comparison of the two models is in
+[`docs/specs/2026-10-23-m-l2-d42-embedder-evaluation.md`](docs/specs/2026-10-23-m-l2-d42-embedder-evaluation.md).
 
 ### Upgrading a database that predates the log
 
