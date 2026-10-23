@@ -1110,19 +1110,40 @@ fn ending_at_or_before_the_start_is_rejected() {
 
 #[test]
 fn ending_never_extends_a_fact_that_already_ends_sooner() {
-    // Arrange
-    let mut ending = version("a", "Sydney");
-    ending.valid_until = Millis(1000);
+    for existing_end in [Millis(1000), Millis(900)] {
+        // Arrange
+        let mut ending = version("a", "Sydney");
+        ending.valid_until = existing_end;
 
-    // Act
-    let decision = end_with(&state(vec![ending]), &end_claim("Sydney"), &single());
+        // Act
+        let decision = end_with(&state(vec![ending]), &end_claim("Sydney"), &single());
 
-    // Assert
-    assert_eq!(decision.outcome, EndOutcome::NoMatch);
+        // Assert
+        assert_eq!(decision.outcome, EndOutcome::NoMatch, "{existing_end:?}");
+        assert_eq!(decision.plan, Plan::default(), "{existing_end:?}");
+    }
 }
 
 #[test]
-fn an_end_on_older_evidence_is_recorded_as_history_and_leaves_the_live_fact() {
+fn an_end_on_equal_evidence_closes_the_live_fact() {
+    // Arrange
+    let mut live = version("a", "Sydney");
+    live.evidence_at = Millis(200);
+
+    // Act
+    let decision = end_with(&state(vec![live]), &end_claim("Sydney"), &single());
+
+    // Assert
+    assert_eq!(
+        decision.outcome,
+        EndOutcome::Ended {
+            closed: ids(&["a"])
+        }
+    );
+}
+
+#[test]
+fn an_end_on_older_evidence_is_recorded_as_an_invisible_copy_and_leaves_the_live_fact() {
     // Arrange
     let mut live = version("a", "Sydney");
     live.valid_from = Millis(500);
@@ -1140,7 +1161,7 @@ fn an_end_on_older_evidence_is_recorded_as_history_and_leaves_the_live_fact() {
     assert_eq!(history.lineage_id, FactId::from_raw("m1"));
     assert_eq!(
         (history.valid_from, history.valid_until),
-        (Millis(500), Millis(1000))
+        (Millis(500), Millis(500))
     );
 }
 
@@ -1152,7 +1173,7 @@ fn replaying_an_end_recorded_as_history_changes_nothing() {
     live.evidence_at = Millis(900);
     let mut recorded = version("h", "Sydney");
     recorded.valid_from = Millis(500);
-    recorded.valid_until = Millis(1000);
+    recorded.valid_until = Millis(500);
     recorded.source_event_ids = vec![NEW_EVENT.into()];
     let mut claim = end_claim("Sydney");
     claim.end.evidence_at = Millis(300);

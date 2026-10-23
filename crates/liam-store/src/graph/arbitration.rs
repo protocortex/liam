@@ -563,7 +563,7 @@ pub(super) fn decide_end(
     let no_change = || decision(Plan::default(), EndOutcome::NoMatch);
     let already_recorded = state.versions.iter().any(|version| {
         version.object_key == claim.object_key
-            && version.valid_until == end.valid_until
+            && (version.valid_until == end.valid_until || version.valid_until == version.valid_from)
             && unlinked(&end.source_event_ids, version).is_empty()
     });
     let live = state.live(end.evidence_at);
@@ -584,7 +584,9 @@ pub(super) fn decide_end(
         let id = mint();
         let mut past = successor(target, id.clone(), rules.at);
         past.lineage_id = id.clone();
-        past.valid_until = end.valid_until;
+        // Empty interval: reads do not dedupe per object, so a copy spanning
+        // the live fact's range would list the same object twice.
+        past.valid_until = past.valid_from;
         past.evidence_at = end.evidence_at;
         past.trust_score = end.trust_score;
         past.closed_by = None;
