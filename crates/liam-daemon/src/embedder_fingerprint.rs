@@ -517,7 +517,7 @@ mod tests {
             config.embedding_dims = 1024;
             EmbedderFingerprint::from_config(&config)
         };
-        let qwen3 = local_config("Qwen/Qwen3-Embedding-0.6B");
+        let qwen3 = local_config(liam_model::QWEN3_EMBEDDING_MODEL_ID);
         let bge_m3 = local_config(liam_model::BGE_M3_MODEL_ID);
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("liam.db");
@@ -532,7 +532,10 @@ mod tests {
         // Assert
         assert_eq!(qwen3.dims, bge_m3.dims);
         assert!(error.contains(liam_model::BGE_M3_MODEL_ID), "{error}");
-        assert!(error.contains("Qwen/Qwen3-Embedding-0.6B"), "{error}");
+        assert!(
+            error.contains(liam_model::QWEN3_EMBEDDING_MODEL_ID),
+            "{error}"
+        );
     }
 
     #[test]

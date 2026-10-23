@@ -335,8 +335,32 @@ mod tests {
         // Arrange / Act / Assert
         assert!(is_bge_m3("BAAI/bge-m3"));
         assert!(is_bge_m3("baai/BGE-M3"));
-        assert!(!is_bge_m3("Qwen/Qwen3-Embedding-0.6B"));
+        assert!(!is_bge_m3(liam_model::QWEN3_EMBEDDING_MODEL_ID));
         assert!(!is_bge_m3("BAAI/bge-m3-unsupervised"));
+    }
+
+    /// A BGE-M3 id must reach the BGE-M3 loader: its dims check fails before any
+    /// download, whereas the Qwen3 loader would start fetching weights first.
+    #[cfg(feature = "local")]
+    #[test]
+    fn the_bge_m3_model_id_is_routed_to_the_bge_m3_loader() {
+        // Arrange
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.embedder.provider = "local".to_string();
+        config.embedder.model = liam_model::BGE_M3_MODEL_ID.to_string();
+        config.embedder.cache_dir = cache.path().to_string_lossy().into_owned();
+        config.embedding_dims = 512;
+
+        // Act
+        let error = match build_embedder(&config) {
+            Ok(_) => panic!("a 512-wide BGE-M3 config must be refused"),
+            Err(error) => error.to_string(),
+        };
+
+        // Assert
+        assert!(error.contains("fixed output width"), "{error}");
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
     }
 
     /// An absolute cache dir is already correct and must be passed through

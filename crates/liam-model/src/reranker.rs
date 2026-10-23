@@ -5,6 +5,8 @@
 
 use async_trait::async_trait;
 
+#[cfg(feature = "local")]
+use crate::blocking::with_model_blocking;
 use crate::error::Result;
 
 #[async_trait]
@@ -67,16 +69,12 @@ impl Reranker for FastEmbedReranker {
         let query = query.to_string();
         let docs = docs.to_vec();
         let n = docs.len();
-        let results = tokio::task::spawn_blocking(move || {
-            let mut m = model
-                .lock()
-                .map_err(|_| crate::error::ModelError::Rerank("model lock poisoned".into()))?;
+        let results = with_model_blocking(model, crate::error::ModelError::Rerank, move |m| {
             let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
             m.rerank(query.as_str(), refs, false, None)
                 .map_err(|e| crate::error::ModelError::Rerank(e.to_string()))
         })
-        .await
-        .map_err(|e| crate::error::ModelError::Rerank(e.to_string()))??;
+        .await?;
 
         let mut scores = vec![0.0f32; n];
         for r in results {

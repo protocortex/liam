@@ -6,6 +6,8 @@
 //! rerank after retrieving without the store ever depending on a model runtime.
 
 mod bge;
+#[cfg(feature = "local")]
+mod blocking;
 pub mod embedder;
 pub mod error;
 pub mod llm;
@@ -15,7 +17,7 @@ pub mod reranker;
 pub mod llama;
 
 pub use bge::BGE_M3_MODEL_ID;
-pub use embedder::{Embedder, MockEmbedder, TextKind};
+pub use embedder::{Embedder, MockEmbedder, TextKind, QWEN3_EMBEDDING_MODEL_ID};
 pub use error::{ModelError, Result};
 pub use llm::{Llm, MockLlm};
 pub use reranker::{IdentityReranker, Reranker};

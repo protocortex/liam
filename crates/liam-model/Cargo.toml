@@ -27,6 +27,7 @@ serde_json = { version = "1", optional = true }
 # "rt" for spawn_blocking: the embedder, reranker, and llama.cpp provider all
 # run blocking model calls on it instead of the async runtime.
 tokio = { version = "1", features = ["rt", "sync"], optional = true }
+tracing = { workspace = true, optional = true }
 
 # hf-hub downloads GGUF weights for the llama.cpp provider (feature `llama`).
 # anyhow keeps that loader's error handling simple; the `Llm` impl converts to
@@ -56,7 +57,7 @@ default = []
 # opt-in because it needs the CUDA toolkit and nvcc at BUILD time, which no
 # default build may assume.
 cuda = ["candle-core/cuda"]
-local = ["dep:fastembed", "dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:serde_json", "dep:hf-hub", "dep:tokio"]
+local = ["dep:fastembed", "dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:serde_json", "dep:hf-hub", "dep:tokio", "dep:tracing"]
 llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:anyhow", "dep:tokio", "dep:hf-hub"]
 
 [dev-dependencies]
