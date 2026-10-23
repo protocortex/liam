@@ -901,8 +901,14 @@ mod tests {
     #[test]
     fn plan_merges_gives_the_same_pairs_however_the_groups_interleave() {
         // Arrange: two producers whose items arrive in different interleavings
-        let (a1, a2) = (in_scope("a1", None, "a", ONE), in_scope("a2", None, "a", ONE));
-        let (b1, b2) = (in_scope("b1", None, "b", ONE), in_scope("b2", None, "b", ONE));
+        let (a1, a2) = (
+            in_scope("a1", None, "a", ONE),
+            in_scope("a2", None, "a", ONE),
+        );
+        let (b1, b2) = (
+            in_scope("b1", None, "b", ONE),
+            in_scope("b2", None, "b", ONE),
+        );
         let grouped = [a1.clone(), a2.clone(), b1.clone(), b2.clone()];
         let woven = [b1, a1, b2, a2];
 

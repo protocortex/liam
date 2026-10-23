@@ -9,8 +9,8 @@ use rand_chacha::ChaCha8Rng;
 use super::manifest::RunManifest;
 
 /// The generator for a run, seeded from its manifest.
-pub fn rng_for(_manifest: &RunManifest) -> ChaCha8Rng {
-    ChaCha8Rng::seed_from_u64(0)
+pub fn rng_for(manifest: &RunManifest) -> ChaCha8Rng {
+    ChaCha8Rng::seed_from_u64(manifest.seed)
 }
 
 #[cfg(test)]
