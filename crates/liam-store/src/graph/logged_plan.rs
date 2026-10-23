@@ -195,8 +195,12 @@ fn effect_hash(effect: &RowEffect) -> [u8; 32] {
 }
 
 /// A record that removes `targets`. It covers no content, so its hash is empty.
-pub(super) fn tombstone_event(targets: Vec<TombstoneTarget>, now: Millis) -> LogEvent {
-    let stamp = (STORE_SOURCE, STORE_TRUST);
+pub(super) fn tombstone_event(
+    targets: Vec<TombstoneTarget>,
+    now: Millis,
+    source: &str,
+) -> LogEvent {
+    let stamp = (source, STORE_TRUST);
     event([0; 32], stamp, now.0, now, LogPayload::Tombstone(targets))
 }
 

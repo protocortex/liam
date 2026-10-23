@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use liam_log::event::{TombstoneTable, TombstoneTarget};
 
-use super::logged_plan::{edges_of_node, tombstone_event};
+use super::logged_plan::{edges_of_node, tombstone_event, STORE_SOURCE};
 use super::logged_write::{abandon, commit_or_abandon, HeldLog};
 use super::projection::{apply_steps, steps_for};
 use super::Graph;
@@ -39,7 +39,22 @@ impl<B: Backend> Graph<B> {
         self.sweep(policy, GC_CHUNK_TARGETS).await
     }
 
+    /// `gc` with the log records stamped by `source`, so a rollback of the
+    /// consolidation run named in it cancels the sweep too.
+    pub async fn gc_from(&self, policy: &RetentionPolicy, source: &str) -> Result<GcReport> {
+        self.sweep_from(policy, GC_CHUNK_TARGETS, source).await
+    }
+
     pub(super) async fn sweep(&self, policy: &RetentionPolicy, chunk: usize) -> Result<GcReport> {
+        self.sweep_from(policy, chunk, STORE_SOURCE).await
+    }
+
+    async fn sweep_from(
+        &self,
+        policy: &RetentionPolicy,
+        chunk: usize,
+        source: &str,
+    ) -> Result<GcReport> {
         let mut held = match &self.log {
             Some(log) => Some(HeldLog::acquire_for_write(log).await?),
             None => None,
@@ -51,11 +66,15 @@ impl<B: Backend> Graph<B> {
             tracing::debug!(kind = %rule.kind, doomed = doomed.len(), "gc selected nodes");
             for ids in doomed.chunks(chunk) {
                 let nodes = TombstoneTable::Nodes;
-                report.edges_removed += self.sweep_chunk(held.as_mut(), nodes, ids, now).await?;
+                report.edges_removed += self
+                    .sweep_chunk(held.as_mut(), nodes, ids, (now, source))
+                    .await?;
                 report.nodes_removed += ids.len() as u64;
             }
         }
-        report.edges_removed += self.sweep_orphan_edges(held.as_mut(), chunk, now).await?;
+        report.edges_removed += self
+            .sweep_orphan_edges(held.as_mut(), chunk, (now, source))
+            .await?;
         // The rest is not a log write, so writers need not wait for it.
         drop(held);
         self.backend.vector_sweep_orphans().await?;
@@ -83,7 +102,7 @@ impl<B: Backend> Graph<B> {
         &self,
         held: Option<&mut HeldLog>,
         chunk: usize,
-        now: Millis,
+        stamp: (Millis, &str),
     ) -> Result<u64> {
         let Some(held) = held else {
             let delete = format!("DELETE FROM edges WHERE {ORPHAN_EDGES}");
@@ -98,7 +117,9 @@ impl<B: Backend> Graph<B> {
         let mut removed = 0;
         for ids in orphans.chunks(chunk) {
             let edges = TombstoneTable::Edges;
-            removed += self.sweep_chunk(Some(&mut *held), edges, ids, now).await?;
+            removed += self
+                .sweep_chunk(Some(&mut *held), edges, ids, stamp)
+                .await?;
         }
         Ok(removed)
     }
@@ -111,7 +132,7 @@ impl<B: Backend> Graph<B> {
         held: Option<&mut HeldLog>,
         table: TombstoneTable,
         ids: &[String],
-        now: Millis,
+        (now, source): (Millis, &str),
     ) -> Result<u64> {
         let targets = ids
             .iter()
@@ -120,7 +141,7 @@ impl<B: Backend> Graph<B> {
                 id: id.clone(),
             })
             .collect();
-        let event = tombstone_event(targets, now);
+        let event = tombstone_event(targets, now, source);
         let steps = steps_for(&event.payload);
         let mut tx = self.backend.begin().await?;
         let edges = match table {

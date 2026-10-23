@@ -21,7 +21,9 @@ pub use self::rebuild::{RebuildMode, RebuildReport};
 pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
 pub use self::replay::CatchUpReport;
 pub use self::rolled_back::RUN_SOURCE_PREFIX;
-pub use self::snapshot::{recover_interrupted_restore, Snapshot, SnapshotLog, SnapshotMeta};
+pub use self::snapshot::{
+    recover_interrupted_restore, verify_snapshot, Snapshot, SnapshotLog, SnapshotMeta,
+};
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};

@@ -3,7 +3,7 @@
 //! run whatever its payload, and leaves other runs and client writes alone. Each
 //! test uses a real WAL and database file in its own temp directory.
 
-use super::support::{count, fact, Env};
+use super::support::{count, fact, fact_at, Env};
 use super::*;
 use crate::DefaultBackend;
 
@@ -93,4 +93,25 @@ async fn marking_without_an_event_log_is_refused() {
 
     // Assert
     assert!(matches!(result, Err(Error::NoEventLog)));
+}
+
+#[tokio::test]
+async fn a_sweep_stamped_with_a_run_is_cancelled_by_its_marker() {
+    // Arrange
+    let env = Env::new();
+    {
+        let (live, _log) = env.open::<DefaultBackend>("live.db", clock()).await;
+        live.insert(fact_at("old note")).await.unwrap();
+        let policy = RetentionPolicy::keep("fact", Millis(1)).without_reclaim();
+        let report = live.gc_from(&policy, RUN_SOURCE).await.unwrap();
+        assert_eq!(report.nodes_removed, 1);
+        live.mark_run_rolled_back(RUN).await.unwrap();
+    }
+    let (replayed, _log) = env.open::<DefaultBackend>("replayed.db", clock()).await;
+
+    // Act
+    replayed.catch_up().await.unwrap();
+
+    // Assert
+    assert_eq!(contents(&replayed).await, ["old note"]);
 }
