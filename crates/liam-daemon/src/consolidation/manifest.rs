@@ -207,7 +207,8 @@ impl RunManifest {
             .unwrap_or(ordered_steps.len())
     }
 
-    fn is_complete(&self, step: &str) -> bool {
+    /// Whether `step` has been recorded as finished.
+    pub fn is_complete(&self, step: &str) -> bool {
         self.completed_steps.iter().any(|done| done == step)
     }
 }
