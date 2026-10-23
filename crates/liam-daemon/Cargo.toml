@@ -28,6 +28,9 @@ async-trait = "0.1"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 toml = "1"
+# The rules extractor's URL, date and id patterns. Already in the tree through
+# other crates; its matcher runs in linear time, so no input can stall it.
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
