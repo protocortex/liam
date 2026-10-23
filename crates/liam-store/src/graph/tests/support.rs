@@ -775,3 +775,6 @@ pub(super) async fn gc_leaves_an_edge_whose_endpoints_both_survive<B: Backend>(
     );
     Vec::new()
 }
+
+/// The write source fact tests stamp their log events with.
+pub(super) const FACT_WRITER: &str = "extraction:test";

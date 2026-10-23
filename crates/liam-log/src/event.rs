@@ -8,8 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Schema version this build writes and the newest it can read.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// Schema version this build writes and the newest it can read. Version 2 adds
+/// the fact payloads, which an older build cannot replay.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Why an encoded event could not be turned back into a [`LogEvent`].
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -62,6 +63,40 @@ pub struct EdgeRow {
     pub tx_to: i64,
 }
 
+/// A `facts` row with every value already resolved. `scope` and `closed_by`
+/// are empty strings for none, as the table stores them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FactRowEffect {
+    pub id: String,
+    pub lineage_id: String,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub object_key: String,
+    pub scope: String,
+    pub evidence_at: i64,
+    pub valid_from: i64,
+    pub valid_until: i64,
+    pub tx_from: i64,
+    pub tx_to: i64,
+    pub closed_by: String,
+    pub confidence: f64,
+    pub trust_score: f64,
+    pub extractor_id: String,
+    pub extractor_version: String,
+}
+
+/// A `fact_suppressions` row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SuppressionEffect {
+    pub subject: String,
+    pub predicate: String,
+    pub scope: String,
+    pub object_key: String,
+    pub trust_score: f64,
+    pub retracted_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RowEffect {
     Node(NodeRow),
@@ -80,6 +115,20 @@ pub enum LogPayload {
     },
     Voided {
         target_event_id: String,
+    },
+    /// What one fact write decided, resolved, so a replay applies it without
+    /// arbitrating again. The versions in `closed_version_ids` get `tx_to = at`.
+    FactWrite {
+        at: i64,
+        closed_version_ids: Vec<String>,
+        inserted: Vec<FactRowEffect>,
+        /// `(lineage_id, event_id)` pairs.
+        source_links: Vec<(String, String)>,
+        suppressions: Vec<SuppressionEffect>,
+    },
+    /// Cancels the fact writes whose source is the consolidation run `run_id`.
+    RunRolledBack {
+        run_id: String,
     },
 }
 
@@ -305,6 +354,63 @@ mod tests {
         // Arrange
         let event = event_with(LogPayload::Voided {
             target_event_id: "event-0".into(),
+        });
+
+        // Act and Assert
+        assert_round_trips(event);
+    }
+
+    fn fact_write() -> LogPayload {
+        let version = FactRowEffect {
+            id: "fact-1".into(),
+            lineage_id: "lineage-1".into(),
+            subject: "alice".into(),
+            predicate: "lives_in".into(),
+            object: "Sydney".into(),
+            object_key: "sydney".into(),
+            scope: String::new(),
+            evidence_at: 1_000,
+            valid_from: 1_000,
+            valid_until: 4_102_444_800_000,
+            tx_from: 2_000,
+            tx_to: 4_102_444_800_000,
+            closed_by: String::new(),
+            confidence: 1.0,
+            trust_score: 0.75,
+            extractor_id: "rules".into(),
+            extractor_version: "v1".into(),
+        };
+        let suppression = SuppressionEffect {
+            subject: "alice".into(),
+            predicate: "lives_in".into(),
+            scope: String::new(),
+            object_key: "perth".into(),
+            trust_score: 0.5,
+            retracted_at: 3_000,
+        };
+        LogPayload::FactWrite {
+            at: 2_000,
+            closed_version_ids: vec!["fact-0".into()],
+            inserted: vec![version],
+            source_links: vec![("lineage-1".into(), "event-9".into())],
+            suppressions: vec![suppression],
+        }
+    }
+
+    #[test]
+    fn fact_write_round_trips() {
+        // Arrange
+        let event = event_with(fact_write());
+
+        // Act and Assert
+        assert_round_trips(event);
+    }
+
+    #[test]
+    fn run_rolled_back_round_trips() {
+        // Arrange
+        let event = event_with(LogPayload::RunRolledBack {
+            run_id: "run-1".into(),
         });
 
         // Act and Assert
@@ -599,7 +705,7 @@ mod tests {
 
     #[test]
     fn v1_wire_format_is_pinned() {
-        // Arrange: one fixed event per payload variant, in declaration order.
+        // Arrange: one fixed event per version 1 payload variant, in declaration order.
         let golden = [
             (LogPayload::NodeWrite(node_row()), "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f0000066e6f64652d310466616374056c6162656c07636f6e74656e74076167656e742d61027b7d010670726f6a2f6100000000000000e83fd00f0180e09ecce5ee01a01f80e09ecce5ee01"),
             (LogPayload::EdgeWrite(edge_row()), "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f000106656467652d31066e6f64652d31066e6f64652d320a72656c617465735f746f027b7da01f80e09ecce5ee01"),
@@ -625,6 +731,34 @@ mod tests {
                     target_event_id: "event-0".into(),
                 },
                 "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f0005076576656e742d30",
+            ),
+        ];
+
+        for (payload, hex) in golden {
+            let mut event = event_with(payload);
+            event.schema_version = 1;
+            let expected_bytes = from_hex(hex);
+
+            // Act
+            let encoded = event.encode().expect("encode event");
+            let decoded = LogEvent::decode(&expected_bytes);
+
+            // Assert
+            assert_eq!(encoded, expected_bytes, "encoding drifted for {event:?}");
+            assert_eq!(decoded, Ok(event));
+        }
+    }
+
+    #[test]
+    fn v2_fact_payloads_wire_format_is_pinned() {
+        // Arrange
+        let golden = [
+            (fact_write(), "02076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f0006a01f0106666163742d300106666163742d31096c696e656167652d3105616c696365086c697665735f696e065379646e6579067379646e657900d00fd00f80e09ecce5ee01a01f80e09ecce5ee0100000000000000f03f000000000000e83f0572756c657302763101096c696e656167652d31076576656e742d390105616c696365086c697665735f696e00057065727468000000000000e03ff02e"),
+            (
+                LogPayload::RunRolledBack {
+                    run_id: "run-1".into(),
+                },
+                "02076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f00070572756e2d31",
             ),
         ];
 

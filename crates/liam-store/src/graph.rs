@@ -2243,6 +2243,7 @@ mod tests {
     mod backwards_clock;
     mod catch_up;
     mod fact_arbitration;
+    mod fact_log;
     mod fact_read;
     mod gc_log;
     mod log_open;

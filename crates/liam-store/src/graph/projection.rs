@@ -5,6 +5,7 @@
 
 use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTarget};
 
+use super::fact_write::{apply_fact_step, fact_steps, FactStep};
 use super::logged_plan::Table;
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
@@ -29,6 +30,7 @@ pub(super) enum Step {
     /// Deletes a row and what depends on it. Removing a row that is already
     /// gone changes nothing, so a replay can run it again.
     Remove(TombstoneTarget),
+    Fact(FactStep),
 }
 
 /// The statements that project a logged payload. A `supersedes` edge closes its
@@ -45,7 +47,10 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
             })
             .collect(),
         LogPayload::Tombstone(targets) => targets.iter().cloned().map(Step::Remove).collect(),
-        LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. } => Vec::new(),
+        LogPayload::FactWrite { .. } => fact_steps(payload),
+        LogPayload::DuplicateOf { .. }
+        | LogPayload::Voided { .. }
+        | LogPayload::RunRolledBack { .. } => Vec::new(),
     }
 }
 
@@ -95,6 +100,7 @@ pub(super) async fn apply_steps(
             }
             Step::GuardedEdge(row) => insert_guarded_edge(tx, row).await?,
             Step::Remove(target) => remove_row(tx, target, vector_delete).await?,
+            Step::Fact(step) => apply_fact_step(tx, step).await?,
         }
     }
     Ok(())

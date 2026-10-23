@@ -6,16 +6,21 @@
 //! reads the first's rows. It touches the rows of one key only, never a
 //! caller-sized batch, and never spans a model call.
 //!
-//! These writes go straight to the projection tables and are not in the event
-//! log, so a rebuild from the log does not reproduce them.
+//! On a logged store the decision is appended to the log as one `FactWrite`
+//! before it is applied, so a replay reproduces the rows without arbitrating
+//! again. A decision that changes nothing appends nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use liam_log::event::{FactRowEffect, LogEvent, LogPayload, SuppressionEffect};
 
 use super::arbitration::{
     decide_assert, decide_end, decide_retract, Claim, Decision, EndClaim, KeyState, Plan,
     RetractInput, Rules, Suppression,
 };
-use super::logged_write::commit_or_abandon;
+use super::logged_plan::{event, STORE_TRUST};
+use super::logged_write::{abandon, commit_or_abandon, HeldLog};
+use super::projection::{apply_steps, steps_for, Step};
 use super::{validate_scope, Graph};
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
@@ -131,7 +136,32 @@ pub(super) fn version_from_row(row: &Row) -> Result<Fact> {
     })
 }
 
-fn version_params(version: &Fact) -> Vec<Value> {
+fn version_effect(version: &Fact) -> FactRowEffect {
+    FactRowEffect {
+        id: version.id.as_str().to_owned(),
+        lineage_id: version.lineage_id.as_str().to_owned(),
+        subject: version.subject.clone(),
+        predicate: version.predicate.clone(),
+        object: version.object.clone(),
+        object_key: version.object_key.clone(),
+        scope: version.scope.clone().unwrap_or_default(),
+        evidence_at: version.evidence_at.0,
+        valid_from: version.valid_from.0,
+        valid_until: version.valid_until.0,
+        tx_from: version.tx_from.0,
+        tx_to: version.tx_to.0,
+        closed_by: version
+            .closed_by
+            .as_ref()
+            .map_or_else(String::new, |id| id.as_str().to_owned()),
+        confidence: version.confidence,
+        trust_score: version.trust_score,
+        extractor_id: version.extractor_id.as_str().to_owned(),
+        extractor_version: version.extractor_version.clone(),
+    }
+}
+
+fn version_params(version: &FactRowEffect) -> Vec<Value> {
     vec![
         version.id.as_str().into(),
         version.lineage_id.as_str().into(),
@@ -139,13 +169,13 @@ fn version_params(version: &Fact) -> Vec<Value> {
         version.predicate.as_str().into(),
         version.object.as_str().into(),
         version.object_key.as_str().into(),
-        version.scope.as_deref().unwrap_or_default().into(),
+        version.scope.as_str().into(),
         version.evidence_at.into(),
         version.valid_from.into(),
         version.valid_until.into(),
         version.tx_from.into(),
         version.tx_to.into(),
-        version.closed_by.as_ref().map_or("", FactId::as_str).into(),
+        version.closed_by.as_str().into(),
         version.confidence.into(),
         version.trust_score.into(),
         version.extractor_id.as_str().into(),
@@ -232,62 +262,188 @@ fn check_closed(id: &FactId, updated: u64) -> Result<()> {
     }
 }
 
-async fn apply(tx: &mut dyn BackendTx, plan: &Plan, at: Millis) -> Result<()> {
-    for id in &plan.close {
-        let updated = tx
-            .execute(
-                CLOSE_VERSION_SQL,
-                &[at.into(), id.as_str().into(), FOREVER.into()],
-            )
-            .await?;
-        check_closed(id, updated)?;
-    }
-    for version in &plan.insert {
-        tx.execute(INSERT_VERSION_SQL, &version_params(version))
-            .await?;
-    }
-    for (lineage, events) in &plan.link {
-        for event in events {
-            tx.execute(
-                LINK_SOURCE_SQL,
-                &[lineage.as_str().into(), event.as_str().into()],
-            )
-            .await?;
+/// A fact write between its open and its finish: the log lock and the transaction.
+struct OpenWrite<'a> {
+    held: Option<HeldLog>,
+    tx: Box<dyn BackendTx + 'a>,
+}
+
+/// One statement of a fact write's projection.
+pub(super) enum FactStep {
+    Close {
+        id: String,
+        tx_to: i64,
+    },
+    Insert(FactRowEffect),
+    Link {
+        lineage_id: String,
+        event_id: String,
+    },
+    Suppress(SuppressionEffect),
+}
+
+/// The statements a `FactWrite` projects, which a live write and a replay share.
+pub(super) fn fact_steps(payload: &LogPayload) -> Vec<Step> {
+    let LogPayload::FactWrite {
+        at,
+        closed_version_ids,
+        inserted,
+        source_links,
+        suppressions,
+    } = payload
+    else {
+        return Vec::new();
+    };
+    let closes = closed_version_ids.iter().map(|id| FactStep::Close {
+        id: id.clone(),
+        tx_to: *at,
+    });
+    let inserts = inserted.iter().cloned().map(FactStep::Insert);
+    let links = source_links.iter().map(|(lineage, event)| FactStep::Link {
+        lineage_id: lineage.clone(),
+        event_id: event.clone(),
+    });
+    let blocks = suppressions.iter().cloned().map(FactStep::Suppress);
+    closes
+        .chain(inserts)
+        .chain(links)
+        .chain(blocks)
+        .map(Step::Fact)
+        .collect()
+}
+
+pub(super) async fn apply_fact_step(tx: &mut dyn BackendTx, step: &FactStep) -> Result<()> {
+    match step {
+        FactStep::Close { id, tx_to } => close_version(tx, id, *tx_to).await,
+        FactStep::Insert(version) => {
+            tx.execute(INSERT_VERSION_SQL, &version_params(version))
+                .await?;
+            Ok(())
         }
-    }
-    for blocked in &plan.suppress {
-        tx.execute(
-            SUPPRESS_SQL,
-            &[
+        FactStep::Link {
+            lineage_id,
+            event_id,
+        } => {
+            let params = [lineage_id.as_str().into(), event_id.as_str().into()];
+            tx.execute(LINK_SOURCE_SQL, &params).await?;
+            Ok(())
+        }
+        FactStep::Suppress(blocked) => {
+            let params = [
                 blocked.subject.as_str().into(),
                 blocked.predicate.as_str().into(),
                 blocked.scope.as_str().into(),
                 blocked.object_key.as_str().into(),
                 blocked.trust_score.into(),
                 blocked.retracted_at.into(),
-            ],
+            ];
+            tx.execute(SUPPRESS_SQL, &params).await?;
+            Ok(())
+        }
+    }
+}
+
+/// Closes a current version. One already closed at `tx_to` is a replay of this
+/// close and is left as it is.
+async fn close_version(tx: &mut dyn BackendTx, id: &str, tx_to: i64) -> Result<()> {
+    let updated = tx
+        .execute(
+            CLOSE_VERSION_SQL,
+            &[tx_to.into(), id.into(), FOREVER.into()],
         )
         .await?;
+    if updated == 0 && closed_at(tx, id, tx_to).await? {
+        return Ok(());
     }
-    Ok(())
+    check_closed(&FactId::from_raw(id), updated)
+}
+
+async fn closed_at(tx: &mut dyn BackendTx, id: &str, tx_to: i64) -> Result<bool> {
+    let rows = tx
+        .query(
+            "SELECT 1 FROM facts WHERE id = ?1 AND tx_to = ?2",
+            &[id.into(), tx_to.into()],
+        )
+        .await?;
+    Ok(!rows.is_empty())
+}
+
+/// The log event for a decision, or `None` when it changes nothing. It is
+/// stamped by the strongest fact it inserts.
+fn fact_event(plan: &Plan, at: Millis, write_source: &str) -> Option<LogEvent> {
+    let inserted: Vec<FactRowEffect> = plan.insert.iter().map(version_effect).collect();
+    let source_links: Vec<(String, String)> = plan
+        .link
+        .iter()
+        .flat_map(|(lineage, events)| {
+            events
+                .iter()
+                .map(|event| (lineage.as_str().to_owned(), event.clone()))
+        })
+        .collect();
+    let suppressions: Vec<SuppressionEffect> = plan
+        .suppress
+        .iter()
+        .map(|blocked| SuppressionEffect {
+            subject: blocked.subject.clone(),
+            predicate: blocked.predicate.clone(),
+            scope: blocked.scope.clone(),
+            object_key: blocked.object_key.clone(),
+            trust_score: blocked.trust_score,
+            retracted_at: blocked.retracted_at.0,
+        })
+        .collect();
+    if plan.close.is_empty()
+        && inserted.is_empty()
+        && source_links.is_empty()
+        && suppressions.is_empty()
+    {
+        return None;
+    }
+    let trust = inserted
+        .iter()
+        .map(|version| version.trust_score)
+        .reduce(f64::max)
+        .unwrap_or(STORE_TRUST);
+    let observed_at = inserted
+        .iter()
+        .map(|version| version.evidence_at)
+        .max()
+        .unwrap_or(at.0);
+    let payload = LogPayload::FactWrite {
+        at: at.0,
+        closed_version_ids: plan.close.iter().map(|id| id.as_str().to_owned()).collect(),
+        inserted,
+        source_links,
+        suppressions,
+    };
+    Some(event(
+        [0; 32],
+        (write_source, trust),
+        observed_at,
+        at,
+        payload,
+    ))
 }
 
 impl<B: Backend> Graph<B> {
     /// Asserts a fact, arbitrating it against the live facts of its key by
     /// trust and recency (ADR-0007). A fact with no source event, a trust
     /// outside `[0.0, 1.0]`, or a validity that does not start before it ends is
-    /// refused with a typed error before the store is touched.
+    /// refused with a typed error before the store is touched. `write_source`
+    /// stamps the log event, so a rolled-back run's writes can be told apart.
     pub async fn assert_fact(
         &self,
         fact: NewFact,
         spec: &PredicateSpec,
+        write_source: &str,
         caps: ArbitrationCaps,
     ) -> Result<ArbitrationOutcome> {
         let scope = validate_scope(&fact.scope)?.unwrap_or_default();
         let claim = Claim::new(fact, scope)?;
         let key = Key::new(&claim.fact.subject, &claim.fact.predicate, &claim.scope);
         let outcome = self
-            .write_key(&key, spec, caps, |state, rules| {
+            .write_key(&key, spec, caps, write_source, |state, rules| {
                 decide_assert(state, &claim, rules, &mut FactId::new)
             })
             .await?;
@@ -297,14 +453,23 @@ impl<B: Backend> Graph<B> {
 
     /// Ends the live fact an `end` statement matches, when its trust is not
     /// below the fact's. It never inserts a live fact.
-    pub async fn end_fact(&self, end: EndFact, spec: &PredicateSpec) -> Result<EndOutcome> {
+    pub async fn end_fact(
+        &self,
+        end: EndFact,
+        spec: &PredicateSpec,
+        write_source: &str,
+    ) -> Result<EndOutcome> {
         let scope = validate_scope(&end.scope)?.unwrap_or_default();
         let claim = EndClaim::new(end, scope)?;
         let key = Key::new(&claim.end.subject, &claim.end.predicate, &claim.scope);
         let outcome = self
-            .write_key(&key, spec, ArbitrationCaps::default(), |state, rules| {
-                Ok(decide_end(state, &claim, rules, &mut FactId::new))
-            })
+            .write_key(
+                &key,
+                spec,
+                ArbitrationCaps::default(),
+                write_source,
+                |state, rules| Ok(decide_end(state, &claim, rules, &mut FactId::new)),
+            )
             .await?;
         tracing::debug!(?outcome, "fact ended");
         Ok(outcome)
@@ -320,57 +485,106 @@ impl<B: Backend> Graph<B> {
         &self,
         lineage_id: &FactId,
         restore_previous: bool,
+        write_source: &str,
     ) -> Result<RetractOutcome> {
-        let mut tx = self.backend.begin().await?;
+        let mut write = self.open_write().await?;
+        let tx = &mut *write.tx;
         let decided = async {
-            let Some(target) = lineage_head(&mut *tx, lineage_id).await? else {
-                return Ok(RetractOutcome::NotFound);
+            let Some(target) = lineage_head(tx, lineage_id).await? else {
+                let unchanged = Decision {
+                    plan: Plan::default(),
+                    outcome: RetractOutcome::NotFound,
+                };
+                return Ok((unchanged, self.clock.now()));
             };
             let key = Key::of(&target);
-            let at = self.transaction_time(&mut *tx, &key).await?;
-            let restorable = restorable_versions(&mut *tx, &target).await?;
+            let at = self.transaction_time(tx, &key).await?;
+            let restorable = restorable_versions(tx, &target).await?;
             let key_taken =
-                restore_previous && key_is_taken(&mut *tx, &key, &target, &restorable).await?;
+                restore_previous && key_is_taken(tx, &key, &target, &restorable).await?;
             let input = RetractInput {
                 target: &target,
                 restorable: &restorable,
                 key_taken,
                 restore_previous,
             };
-            let decision = decide_retract(&input, at, &mut FactId::new);
-            apply(&mut *tx, &decision.plan, at).await?;
-            Ok(decision.outcome)
+            Ok((decide_retract(&input, at, &mut FactId::new), at))
         }
         .await;
-        let outcome = commit_or_abandon(tx, decided).await?;
+        let outcome = self.finish_write(write, decided, write_source).await?;
         tracing::debug!(?outcome, "fact retracted");
         Ok(outcome)
     }
 
-    /// Reads the key, lets `decide` plan against it, applies the plan and
-    /// commits, all in one transaction.
+    /// Reads the key and lets `decide` plan against it, then logs and applies
+    /// the plan, all in one transaction.
     async fn write_key<T>(
         &self,
         key: &Key,
         spec: &PredicateSpec,
         caps: ArbitrationCaps,
+        write_source: &str,
         decide: impl FnOnce(&KeyState, &Rules) -> Result<Decision<T>>,
     ) -> Result<T> {
-        let mut tx = self.backend.begin().await?;
+        let mut write = self.open_write().await?;
+        let tx = &mut *write.tx;
         let decided = async {
-            let state = read_state(&mut *tx, key).await?;
-            let at = self.transaction_time(&mut *tx, key).await?;
+            let state = read_state(tx, key).await?;
+            let at = self.transaction_time(tx, key).await?;
             let rules = Rules {
                 spec: *spec,
                 caps,
                 at,
             };
-            let decision = decide(&state, &rules)?;
-            apply(&mut *tx, &decision.plan, at).await?;
-            Ok(decision.outcome)
+            Ok((decide(&state, &rules)?, at))
         }
         .await;
-        commit_or_abandon(tx, decided).await
+        self.finish_write(write, decided, write_source).await
+    }
+
+    /// Takes the log lock, when there is a log, and opens the transaction. The
+    /// lock is held until `finish_write`, so the reads a decision makes cannot
+    /// go stale before it is appended.
+    async fn open_write(&self) -> Result<OpenWrite<'_>> {
+        let held = match &self.log {
+            Some(log) => Some(HeldLog::acquire_for_write(log).await?),
+            None => None,
+        };
+        let tx = self.backend.begin().await?;
+        Ok(OpenWrite { held, tx })
+    }
+
+    /// Appends the decided plan to the log and applies it, or abandons the
+    /// transaction when the decision failed or changes nothing. A plan that
+    /// changes nothing appends nothing.
+    async fn finish_write<T>(
+        &self,
+        write: OpenWrite<'_>,
+        decided: Result<(Decision<T>, Millis)>,
+        write_source: &str,
+    ) -> Result<T> {
+        let OpenWrite { held, mut tx } = write;
+        let (decision, at) = match decided {
+            Ok(decided) => decided,
+            Err(error) => {
+                abandon(tx).await;
+                return Err(error);
+            }
+        };
+        let Some(event) = fact_event(&decision.plan, at, write_source) else {
+            abandon(tx).await;
+            return Ok(decision.outcome);
+        };
+        let steps = steps_for(&event.payload);
+        match held {
+            Some(mut held) => self.append_and_commit(tx, &mut held, event, &steps).await?,
+            None => {
+                let vector_delete = self.backend.vector_delete_sql();
+                let applied = apply_steps(&mut *tx, &steps, vector_delete).await;
+                commit_or_abandon(tx, applied).await?;
+            }
+        }
+        Ok(decision.outcome)
     }
 
     /// Fact versions whose lineage has no source event, which no write of this

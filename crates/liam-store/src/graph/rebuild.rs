@@ -223,7 +223,8 @@ impl<B: Backend> Graph<B> {
 pub(super) async fn holds_rows<B: Backend>(backend: &B) -> Result<bool> {
     let rows = backend
         .query(
-            "SELECT EXISTS(SELECT 1 FROM nodes) OR EXISTS(SELECT 1 FROM edges)",
+            "SELECT EXISTS(SELECT 1 FROM nodes) OR EXISTS(SELECT 1 FROM edges)
+                 OR EXISTS(SELECT 1 FROM facts)",
             &[],
         )
         .await?;

@@ -4,6 +4,7 @@
 
 use tokio::sync::Barrier;
 
+use super::support::FACT_WRITER;
 use super::*;
 use crate::ids::FactId;
 use crate::types::{
@@ -12,29 +13,35 @@ use crate::types::{
 };
 
 const DIMS: usize = 8;
-const START: Millis = Millis(1000);
-const LATER: Millis = Millis(2000);
+pub(super) const START: Millis = Millis(1000);
+pub(super) const LATER: Millis = Millis(2000);
 const MIDDLE: Millis = Millis(3000);
-const SMALL_CAP: usize = 2;
+pub(super) const SMALL_CAP: usize = 2;
 const WEAK_TRUST: f64 = 0.3;
 const RACE_ROUNDS: usize = 50;
-const LOW_TRUST: f64 = 0.5;
-const HIGH_TRUST: f64 = 0.9;
+pub(super) const LOW_TRUST: f64 = 0.5;
+pub(super) const HIGH_TRUST: f64 = 0.9;
 
 type ErrorCheck = fn(&Error) -> bool;
 
-fn one() -> PredicateSpec {
+pub(super) fn one() -> PredicateSpec {
     PredicateSpec {
         cardinality: Cardinality::One,
         ..PredicateSpec::default()
     }
 }
 
-fn many() -> PredicateSpec {
+pub(super) fn many() -> PredicateSpec {
     PredicateSpec::default()
 }
 
-fn fact_for(predicate: &str, object: &str, trust: f64, event: &str, evidence: i64) -> NewFact {
+pub(super) fn fact_for(
+    predicate: &str,
+    object: &str,
+    trust: f64,
+    event: &str,
+    evidence: i64,
+) -> NewFact {
     NewFact {
         subject: "alice".into(),
         predicate: predicate.into(),
@@ -51,7 +58,7 @@ fn fact_for(predicate: &str, object: &str, trust: f64, event: &str, evidence: i6
     }
 }
 
-fn fact(object: &str, trust: f64, event: &str, evidence: i64) -> NewFact {
+pub(super) fn fact(object: &str, trust: f64, event: &str, evidence: i64) -> NewFact {
     fact_for("lives_in", object, trust, event, evidence)
 }
 
@@ -64,7 +71,7 @@ async fn store_at(t: Millis) -> (DefaultGraph, Arc<FixedClock>) {
 }
 
 async fn assert_one(g: &DefaultGraph, fact: NewFact) -> ArbitrationOutcome {
-    g.assert_fact(fact, &one(), ArbitrationCaps::default())
+    g.assert_fact(fact, &one(), FACT_WRITER, ArbitrationCaps::default())
         .await
         .unwrap()
 }
@@ -139,7 +146,7 @@ async fn a_fact_without_a_source_event_is_refused_and_leaves_no_row() {
 
     // Act
     let error = g
-        .assert_fact(unsourced, &one(), ArbitrationCaps::default())
+        .assert_fact(unsourced, &one(), FACT_WRITER, ArbitrationCaps::default())
         .await
         .unwrap_err();
 
@@ -183,7 +190,7 @@ async fn an_invalid_assertion_is_refused_before_the_store_is_touched() {
 
         // Act
         let result = g
-            .assert_fact(invalid, &one(), ArbitrationCaps::default())
+            .assert_fact(invalid, &one(), FACT_WRITER, ArbitrationCaps::default())
             .await;
 
         // Assert
@@ -201,7 +208,7 @@ async fn a_many_valued_predicate_keeps_every_object_and_counts_each_source() {
     // Act
     for (object, event) in [("Bob", "e1"), ("Carol", "e2"), ("Dan", "e3"), ("Bob", "e4")] {
         let known = fact_for("knows", object, LOW_TRUST, event, 100);
-        g.assert_fact(known, &many(), ArbitrationCaps::default())
+        g.assert_fact(known, &many(), FACT_WRITER, ArbitrationCaps::default())
             .await
             .unwrap();
     }
@@ -350,7 +357,13 @@ async fn a_clock_stepped_backwards_never_overlaps_history() {
     assert_eq!(closed_at, LATER.0);
 }
 
-fn end(object: &str, valid_until: i64, trust: f64, event: &str, evidence: i64) -> EndFact {
+pub(super) fn end(
+    object: &str,
+    valid_until: i64,
+    trust: f64,
+    event: &str,
+    evidence: i64,
+) -> EndFact {
     EndFact {
         subject: "alice".into(),
         predicate: "lives_in".into(),
@@ -371,15 +384,27 @@ async fn ending_a_fact_closes_it_and_never_inserts_a_live_one() {
 
     // Act
     let ended = g
-        .end_fact(end("sydney", 500, LOW_TRUST, "e2", 200), &one())
+        .end_fact(
+            end("sydney", 500, LOW_TRUST, "e2", 200),
+            &one(),
+            FACT_WRITER,
+        )
         .await
         .unwrap();
     let replayed = g
-        .end_fact(end("sydney", 500, LOW_TRUST, "e2", 200), &one())
+        .end_fact(
+            end("sydney", 500, LOW_TRUST, "e2", 200),
+            &one(),
+            FACT_WRITER,
+        )
         .await
         .unwrap();
     let from_new_event = g
-        .end_fact(end("sydney", 500, LOW_TRUST, "e3", 300), &one())
+        .end_fact(
+            end("sydney", 500, LOW_TRUST, "e3", 300),
+            &one(),
+            FACT_WRITER,
+        )
         .await
         .unwrap();
 
@@ -417,7 +442,7 @@ async fn an_end_with_no_match_a_stronger_fact_or_a_bad_interval_changes_nothing(
 
     for (statement, expected) in cases {
         // Act
-        let outcome = g.end_fact(statement, &one()).await.unwrap();
+        let outcome = g.end_fact(statement, &one(), FACT_WRITER).await.unwrap();
 
         // Assert
         assert_eq!(outcome, expected);
@@ -425,7 +450,7 @@ async fn an_end_with_no_match_a_stronger_fact_or_a_bad_interval_changes_nothing(
     }
 }
 
-fn lineage_of(outcome: &ArbitrationOutcome) -> FactId {
+pub(super) fn lineage_of(outcome: &ArbitrationOutcome) -> FactId {
     match outcome {
         ArbitrationOutcome::Inserted { id } | ArbitrationOutcome::Competing { id } => id.clone(),
         ArbitrationOutcome::Replaced { inserted, .. } => inserted.clone(),
@@ -441,7 +466,7 @@ async fn a_retracted_fact_leaves_current_belief_but_stays_in_the_history() {
     clock.set(LATER);
 
     // Act
-    let outcome = g.retract_fact(&lineage, false).await.unwrap();
+    let outcome = g.retract_fact(&lineage, false, FACT_WRITER).await.unwrap();
 
     // Assert
     assert_eq!(outcome, RetractOutcome::Retracted { restored: vec![] });
@@ -459,7 +484,10 @@ async fn retracting_an_unknown_lineage_finds_nothing() {
     let (g, _) = store_at(START).await;
 
     // Act
-    let outcome = g.retract_fact(&FactId::new(), false).await.unwrap();
+    let outcome = g
+        .retract_fact(&FactId::new(), false, FACT_WRITER)
+        .await
+        .unwrap();
 
     // Assert
     assert_eq!(outcome, RetractOutcome::NotFound);
@@ -471,12 +499,14 @@ async fn a_retraction_blocks_old_evidence_but_not_newer_or_stronger_evidence() {
     let (g, clock) = store_at(START).await;
     let lineage = lineage_of(&assert_one(&g, fact("Sydney", LOW_TRUST, "e1", 100)).await);
     clock.set(LATER);
-    g.retract_fact(&lineage, false).await.unwrap();
+    g.retract_fact(&lineage, false, FACT_WRITER).await.unwrap();
 
     // Act
     let stale = assert_one(&g, fact("Sydney", LOW_TRUST, "e2", 1500)).await;
     let stronger = assert_one(&g, fact("Sydney", HIGH_TRUST, "e3", 1500)).await;
-    g.retract_fact(&lineage_of(&stronger), false).await.unwrap();
+    g.retract_fact(&lineage_of(&stronger), false, FACT_WRITER)
+        .await
+        .unwrap();
     let newer = assert_one(&g, fact("Sydney", LOW_TRUST, "e4", 2500)).await;
 
     // Assert
@@ -513,7 +543,7 @@ async fn retract_sydney(
 ) {
     clock.set(at);
     let lineage = lineage_of(&assert_one(g, fact("Sydney", trust, event, evidence)).await);
-    g.retract_fact(&lineage, false).await.unwrap();
+    g.retract_fact(&lineage, false, FACT_WRITER).await.unwrap();
 }
 
 #[tokio::test]
@@ -563,14 +593,19 @@ async fn past_the_cap_the_weakest_competing_lineage_is_closed_and_suppressed() {
         ("Perth", 0.4, "e3", 300),
     ];
     for (object, trust, event, evidence) in claims {
-        g.assert_fact(fact(object, trust, event, evidence), &one(), caps)
-            .await
-            .unwrap();
+        g.assert_fact(
+            fact(object, trust, event, evidence),
+            &one(),
+            FACT_WRITER,
+            caps,
+        )
+        .await
+        .unwrap();
     }
 
     // Act
     let outcome = g
-        .assert_fact(fact("Hobart", 0.45, "e4", 400), &one(), caps)
+        .assert_fact(fact("Hobart", 0.45, "e4", 400), &one(), FACT_WRITER, caps)
         .await
         .unwrap();
 
@@ -594,6 +629,7 @@ async fn retracting_with_restore_brings_back_only_what_that_lineage_replaced() {
     g.assert_fact(
         fact_for("works_at", "Acme", LOW_TRUST, "e2", 100),
         &one(),
+        FACT_WRITER,
         ArbitrationCaps::default(),
     )
     .await
@@ -603,6 +639,7 @@ async fn retracting_with_restore_brings_back_only_what_that_lineage_replaced() {
     g.assert_fact(
         fact_for("works_at", "Initech", HIGH_TRUST, "e4", 200),
         &one(),
+        FACT_WRITER,
         ArbitrationCaps::default(),
     )
     .await
@@ -610,7 +647,7 @@ async fn retracting_with_restore_brings_back_only_what_that_lineage_replaced() {
 
     // Act
     let outcome = g
-        .retract_fact(&lineage_of(&replacing_city), true)
+        .retract_fact(&lineage_of(&replacing_city), true, FACT_WRITER)
         .await
         .unwrap();
 
@@ -632,7 +669,7 @@ async fn restoring_is_refused_while_another_fact_holds_the_key() {
     let before = content(&g).await;
 
     // Act
-    let outcome = g.retract_fact(&weaker, true).await.unwrap();
+    let outcome = g.retract_fact(&weaker, true, FACT_WRITER).await.unwrap();
 
     // Assert
     assert_eq!(outcome, RetractOutcome::RestoreBlocked);
@@ -654,6 +691,7 @@ async fn a_failure_part_way_through_a_replacement_leaves_the_store_as_it_was() {
     g.assert_fact(
         fact("Sydney", LOW_TRUST, "e1", 100),
         &one(),
+        FACT_WRITER,
         ArbitrationCaps::default(),
     )
     .await
@@ -667,6 +705,7 @@ async fn a_failure_part_way_through_a_replacement_leaves_the_store_as_it_was() {
         .assert_fact(
             fact("Melbourne", HIGH_TRUST, "e2", 200),
             &one(),
+            FACT_WRITER,
             ArbitrationCaps::default(),
         )
         .await;
@@ -688,7 +727,7 @@ async fn serial_content(first: NewFact, second: NewFact) -> Vec<(String, String,
     .await
     .unwrap();
     for fact in [first, second] {
-        g.assert_fact(fact, &one(), ArbitrationCaps::default())
+        g.assert_fact(fact, &one(), FACT_WRITER, ArbitrationCaps::default())
             .await
             .unwrap();
     }
@@ -718,7 +757,7 @@ async fn a_second_writer_waits_for_the_first_and_decides_on_what_it_wrote() {
     let first = tokio::spawn({
         let (g, weak) = (g.clone(), weak.clone());
         async move {
-            g.assert_fact(weak, &one(), ArbitrationCaps::default())
+            g.assert_fact(weak, &one(), FACT_WRITER, ArbitrationCaps::default())
                 .await
         }
     });
@@ -726,7 +765,7 @@ async fn a_second_writer_waits_for_the_first_and_decides_on_what_it_wrote() {
     let mut second = tokio::spawn({
         let (g, strong) = (g.clone(), strong.clone());
         async move {
-            g.assert_fact(strong, &one(), ArbitrationCaps::default())
+            g.assert_fact(strong, &one(), FACT_WRITER, ArbitrationCaps::default())
                 .await
         }
     });
@@ -773,7 +812,7 @@ async fn racing_asserts_end_in_the_state_of_one_serial_order() {
             let (g, start) = (g.clone(), start.clone());
             tokio::spawn(async move {
                 start.wait().await;
-                g.assert_fact(fact, &one(), ArbitrationCaps::default())
+                g.assert_fact(fact, &one(), FACT_WRITER, ArbitrationCaps::default())
                     .await
                     .unwrap()
             })

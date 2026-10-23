@@ -6,12 +6,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use liam_log::event::{EdgeRow, LogPayload, RowEffect, TombstoneTable, TombstoneTarget};
+use liam_log::event::{EdgeRow, LogEvent, LogPayload, RowEffect, TombstoneTable, TombstoneTarget};
 use liam_log::hash::content_hashes;
 use liam_log::reader::{LogReader, LogRecord, LogStream};
 use liam_log::LogOffset;
 use uuid::Uuid;
 
+use super::fact_write::FactStep;
 use super::log_cursor;
 use super::logged_plan::Table;
 use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog};
@@ -21,6 +22,9 @@ use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::value::Value;
+
+/// The source prefix of the writes a consolidation run makes.
+const RUN_SOURCE_PREFIX: &str = "consolidation:";
 
 const QUARANTINE_SQL: &str = "INSERT INTO log_quarantine (event_id, segment, seg_index, reason, at)
      VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(event_id) DO NOTHING";
@@ -125,11 +129,12 @@ impl<B: Backend> Graph<B> {
         while let Some(record) = records.next().await {
             let record = record?;
             let event_id = &record.event.event_id;
-            let outcome = if ahead.voided.contains(event_id) {
+            let outcome = if ahead.voided.contains(event_id) || ahead.is_rolled_back(&record.event)
+            {
                 log_cursor::advance(&self.backend, held.log_id, record.offset).await?;
                 tracing::info!(
                     event = %event_id,
-                    "replay: voided event skipped; if a quarantine voided it, its log_quarantine row is not recreated, as the log keeps no reason"
+                    "replay: voided or rolled-back event skipped; if a quarantine voided it, its log_quarantine row is not recreated, as the log keeps no reason"
                 );
                 Outcome::Voided
             } else {
@@ -278,9 +283,21 @@ pub(super) struct Ahead {
     voided: HashSet<String>,
     /// The rows named by the tombstones that ran, so a voided one is left out.
     removed: Removed,
+    /// The ids of the consolidation runs a `RunRolledBack` record cancels.
+    rolled_back: HashSet<String>,
 }
 
 impl Ahead {
+    /// Whether the event is a fact write of a rolled-back run. The source must
+    /// match the whole run id, so rolling back run 1 leaves run 12 alone.
+    fn is_rolled_back(&self, event: &LogEvent) -> bool {
+        matches!(event.payload, LogPayload::FactWrite { .. })
+            && event
+                .source
+                .strip_prefix(RUN_SOURCE_PREFIX)
+                .is_some_and(|run_id| self.rolled_back.contains(run_id))
+    }
+
     pub(super) fn into_voided(self) -> HashSet<String> {
         self.voided
     }
@@ -314,6 +331,7 @@ impl Removed {
                     || self.nodes.contains(&edge.src)
                     || self.nodes.contains(&edge.dst)
             }
+            WrittenRow::Fact(_) => false,
         }
     }
 }
@@ -321,6 +339,7 @@ impl Removed {
 pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
     let mut voided = HashSet::new();
     let mut tombstones = Vec::new();
+    let mut markers = Vec::new();
     while let Some(record) = records.next().await {
         let event = record?.event;
         match event.payload {
@@ -328,6 +347,7 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
                 voided.insert(target_event_id);
             }
             LogPayload::Tombstone(targets) => tombstones.push((event.event_id, targets)),
+            LogPayload::RunRolledBack { run_id } => markers.push((event.event_id, run_id)),
             _ => {}
         }
     }
@@ -337,7 +357,16 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
         .filter(|(event_id, _)| !voided.contains(event_id))
         .flat_map(|(_, targets)| targets)
         .for_each(|target| removed.add(target));
-    Ok(Ahead { voided, removed })
+    let rolled_back = markers
+        .into_iter()
+        .filter(|(event_id, _)| !voided.contains(event_id))
+        .map(|(_, run_id)| run_id)
+        .collect();
+    Ok(Ahead {
+        voided,
+        removed,
+        rolled_back,
+    })
 }
 
 /// Hands `visit` the payload of every record up to `head` that no `Voided`
@@ -370,9 +399,11 @@ pub(super) fn row_effects(payload: LogPayload) -> Vec<RowEffect> {
         LogPayload::NodeWrite(row) => vec![RowEffect::Node(row)],
         LogPayload::EdgeWrite(row) => vec![RowEffect::Edge(row)],
         LogPayload::EpisodeBatch(effects) => effects,
-        LogPayload::Tombstone(_) | LogPayload::DuplicateOf { .. } | LogPayload::Voided { .. } => {
-            Vec::new()
-        }
+        LogPayload::Tombstone(_)
+        | LogPayload::DuplicateOf { .. }
+        | LogPayload::Voided { .. }
+        | LogPayload::FactWrite { .. }
+        | LogPayload::RunRolledBack { .. } => Vec::new(),
     }
 }
 
@@ -380,13 +411,15 @@ pub(super) fn row_effects(payload: LogPayload) -> Vec<RowEffect> {
 enum WrittenRow<'a> {
     Node(&'a str),
     Edge(&'a EdgeRow),
+    Fact(&'a str),
 }
 
 impl WrittenRow<'_> {
-    fn table_and_id(&self) -> (Table, &str) {
+    fn exists_query_and_id(&self) -> (&'static str, &str) {
         match self {
-            WrittenRow::Node(id) => (Table::Nodes, id),
-            WrittenRow::Edge(edge) => (Table::Edges, &edge.id),
+            WrittenRow::Node(id) => (Table::Nodes.exists_query(), id),
+            WrittenRow::Edge(edge) => (Table::Edges.exists_query(), &edge.id),
+            WrittenRow::Fact(id) => ("SELECT 1 FROM facts WHERE id = ?1", id),
         }
     }
 }
@@ -399,7 +432,8 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
         .filter_map(|step| match step {
             Step::Node(row) => Some(WrittenRow::Node(&row.id)),
             Step::Edge(row) | Step::GuardedEdge(row) => Some(WrittenRow::Edge(row)),
-            Step::Close { .. } | Step::Remove(_) => None,
+            Step::Fact(FactStep::Insert(row)) => Some(WrittenRow::Fact(&row.id)),
+            Step::Close { .. } | Step::Remove(_) | Step::Fact(_) => None,
         })
         .collect()
 }
@@ -408,12 +442,8 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
 async fn rows_held(tx: &mut dyn BackendTx, rows: &[WrittenRow<'_>]) -> Result<usize> {
     let mut held = 0;
     for row in rows {
-        let (table, id) = row.table_and_id();
-        if !tx
-            .query(table.exists_query(), &[Value::from(id)])
-            .await?
-            .is_empty()
-        {
+        let (sql, id) = row.exists_query_and_id();
+        if !tx.query(sql, &[Value::from(id)]).await?.is_empty() {
             held += 1;
         }
     }
@@ -429,6 +459,7 @@ fn is_refusal(error: &Error) -> bool {
             | Error::NodeNotFound(_)
             | Error::Constraint(_)
             | Error::PartlyApplied(_)
+            | Error::CorruptFactState(_)
     )
 }
 
