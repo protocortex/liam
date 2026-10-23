@@ -6,6 +6,8 @@
 //! that is never reached still fails the lint afterwards.
 #![cfg_attr(not(test), allow(dead_code))]
 
+pub mod grounding;
 mod iso_date;
+pub mod prompt;
 pub mod response;
 pub mod rules;

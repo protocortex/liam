@@ -32,6 +32,11 @@ toml = "1"
 # other crates; its matcher runs in linear time, so no input can stall it.
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+# The prompt fingerprint that ties a prompt change to a version bump.
+sha2 = { version = "0.11.0", default-features = false }
+# NFC composition so an accent typed as a combining mark still grounds.
+# MIT OR Apache-2.0, maintained under the unicode-rs organization.
+unicode-normalization = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
