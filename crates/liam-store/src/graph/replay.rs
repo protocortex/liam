@@ -6,25 +6,23 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use liam_log::event::{EdgeRow, LogEvent, LogPayload, RowEffect, TombstoneTable, TombstoneTarget};
+use liam_log::event::{EdgeRow, LogPayload, RowEffect, TombstoneTable, TombstoneTarget};
 use liam_log::hash::content_hashes;
 use liam_log::reader::{LogReader, LogRecord, LogStream};
 use liam_log::LogOffset;
 use uuid::Uuid;
 
-use super::fact_write::FactStep;
+use super::fact_projection::FactStep;
 use super::log_cursor;
 use super::logged_plan::Table;
 use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog};
 use super::projection::{steps_for, Step};
 use super::reembed::ReembedReport;
+use super::rolled_back::{RolledBack, SeenFactWrite};
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::value::Value;
-
-/// The source prefix of the writes a consolidation run makes.
-const RUN_SOURCE_PREFIX: &str = "consolidation:";
 
 const QUARANTINE_SQL: &str = "INSERT INTO log_quarantine (event_id, segment, seg_index, reason, at)
      VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(event_id) DO NOTHING";
@@ -115,7 +113,7 @@ impl<B: Backend> Graph<B> {
         let reader = held.reader()?;
         // A `Voided` record follows its target, so the targets are all known
         // before the first record is applied.
-        let ahead = scan_ahead(reader.scan_through(cursor, head)).await?;
+        let mut ahead = scan_ahead(reader.scan_through(cursor, head)).await?;
         tracing::debug!(
             voided = ahead.voided.len(),
             "replay: void and tombstone records collected"
@@ -129,7 +127,8 @@ impl<B: Backend> Graph<B> {
         while let Some(record) = records.next().await {
             let record = record?;
             let event_id = &record.event.event_id;
-            let outcome = if ahead.voided.contains(event_id) || ahead.is_rolled_back(&record.event)
+            let outcome = if ahead.voided.contains(event_id)
+                || ahead.rolled_back.skips(&record.event)
             {
                 log_cursor::advance(&self.backend, held.log_id, record.offset).await?;
                 tracing::info!(
@@ -138,7 +137,12 @@ impl<B: Backend> Graph<B> {
                 );
                 Outcome::Voided
             } else {
-                self.replay_event(held, &record, &ahead.removed, &mut last_void)
+                let Ahead {
+                    removed,
+                    rolled_back,
+                    ..
+                } = &mut ahead;
+                self.replay_event(held, &record, removed, rolled_back, &mut last_void)
                     .await?
             };
             tracing::debug!(event = %event_id, offset = %record.offset, "replay: record accounted for");
@@ -157,10 +161,11 @@ impl<B: Backend> Graph<B> {
         held: &mut HeldLog,
         record: &LogRecord,
         removed: &Removed,
+        rolled_back: &mut RolledBack,
         last_void: &mut Option<LogOffset>,
     ) -> Result<Outcome> {
         let LogRecord { offset, event, .. } = record;
-        let steps = steps_for(&event.payload);
+        let steps = steps_for(&rolled_back.reconcile(event.payload.clone()));
         if steps.is_empty() {
             log_cursor::advance(&self.backend, held.log_id, *offset).await?;
             return Ok(Outcome::Passed);
@@ -283,24 +288,8 @@ pub(super) struct Ahead {
     voided: HashSet<String>,
     /// The rows named by the tombstones that ran, so a voided one is left out.
     removed: Removed,
-    /// The ids of the consolidation runs a `RunRolledBack` record cancels.
-    rolled_back: HashSet<String>,
-}
-
-impl Ahead {
-    /// Whether the event is a fact write of a rolled-back run. The source must
-    /// match the whole run id, so rolling back run 1 leaves run 12 alone.
-    fn is_rolled_back(&self, event: &LogEvent) -> bool {
-        matches!(event.payload, LogPayload::FactWrite { .. })
-            && event
-                .source
-                .strip_prefix(RUN_SOURCE_PREFIX)
-                .is_some_and(|run_id| self.rolled_back.contains(run_id))
-    }
-
-    pub(super) fn into_voided(self) -> HashSet<String> {
-        self.voided
-    }
+    /// The runs a `RunRolledBack` record cancels.
+    rolled_back: RolledBack,
 }
 
 /// Rows named by a tombstone. Ids are never reused, so once the tombstone has
@@ -340,8 +329,10 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
     let mut voided = HashSet::new();
     let mut tombstones = Vec::new();
     let mut markers = Vec::new();
+    let mut fact_writes = Vec::new();
     while let Some(record) = records.next().await {
         let event = record?.event;
+        fact_writes.extend(SeenFactWrite::of(&event));
         match event.payload {
             LogPayload::Voided { target_event_id } => {
                 voided.insert(target_event_id);
@@ -357,11 +348,12 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
         .filter(|(event_id, _)| !voided.contains(event_id))
         .flat_map(|(_, targets)| targets)
         .for_each(|target| removed.add(target));
-    let rolled_back = markers
+    let runs = markers
         .into_iter()
         .filter(|(event_id, _)| !voided.contains(event_id))
         .map(|(_, run_id)| run_id)
         .collect();
+    let rolled_back = RolledBack::new(runs, &fact_writes, &voided);
     Ok(Ahead {
         voided,
         removed,
@@ -375,19 +367,41 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
 pub(super) async fn for_each_unvoided(
     reader: Arc<dyn LogReader>,
     head: Option<LogOffset>,
+    visit: impl FnMut(LogPayload),
+) -> Result<()> {
+    for_each_logged(reader, head, false, visit).await
+}
+
+/// Like `for_each_unvoided`, but hands over what a replay applies: writes of
+/// rolled-back runs are left out and later fact writes are reconciled with that.
+pub(super) async fn for_each_replayed(
+    reader: Arc<dyn LogReader>,
+    head: Option<LogOffset>,
+    visit: impl FnMut(LogPayload),
+) -> Result<()> {
+    for_each_logged(reader, head, true, visit).await
+}
+
+async fn for_each_logged(
+    reader: Arc<dyn LogReader>,
+    head: Option<LogOffset>,
+    replayed: bool,
     mut visit: impl FnMut(LogPayload),
 ) -> Result<()> {
     let Some(head) = head else {
         return Ok(());
     };
-    let voided = scan_ahead(reader.scan_through(None, head))
-        .await?
-        .into_voided();
+    let mut ahead = scan_ahead(reader.scan_through(None, head)).await?;
     let mut records = reader.scan_through(None, head);
     while let Some(record) = records.next().await {
         let event = record?.event;
-        if !voided.contains(&event.event_id) {
+        if ahead.voided.contains(&event.event_id) {
+            continue;
+        }
+        if !replayed {
             visit(event.payload);
+        } else if !ahead.rolled_back.skips(&event) {
+            visit(ahead.rolled_back.reconcile(event.payload));
         }
     }
     Ok(())

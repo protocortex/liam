@@ -2,7 +2,7 @@
 //! Rebuilding the projection from the event log alone, and checking the result
 //! row by row against what the log says should be live.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTable};
 use liam_log::hash::{edge_row_hash, node_row_hash};
@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::log_cursor;
 use super::logged_write::{commit_or_abandon, HeldLog, SharedLog};
-use super::replay::{for_each_unvoided, row_effects, CatchUpReport};
+use super::replay::{for_each_replayed, row_effects, CatchUpReport};
 use super::{opt_string, row_f64, Graph};
 use crate::backend::Backend;
 use crate::error::{Error, MismatchSource, Result};
@@ -47,11 +47,19 @@ pub struct RebuildReport {
     pub live_edges: usize,
 }
 
-/// The sorted hashes of the live rows, with how many are nodes and edges.
+/// The sorted hashes of the live rows, with how many are nodes and edges, and
+/// the id of every fact version, which the log also names.
 struct LiveRows {
     hashes: Vec<[u8; 32]>,
+    facts: BTreeSet<String>,
     nodes: usize,
     edges: usize,
+}
+
+/// What the log alone says the projection holds: the same two views.
+struct LoggedState {
+    hashes: Vec<[u8; 32]>,
+    facts: BTreeSet<String>,
 }
 
 /// The columns `stored_node` and `stored_edge` read, in their order.
@@ -107,10 +115,10 @@ impl<B: Backend> Graph<B> {
         tracing::info!(?replayed, "rebuild: log replayed");
 
         let rebuilt = self.live_rows().await?;
-        let expected = log_expected_multiset(&held).await?;
-        verify(MismatchSource::Log, &expected, &rebuilt.hashes)?;
+        let expected = log_expected_state(&held).await?;
+        verify(MismatchSource::Log, &expected, &rebuilt)?;
         tracing::info!(
-            rows = rebuilt.hashes.len(),
+            rows = rebuilt.hashes.len() + rebuilt.facts.len(),
             "rebuild: rebuilt rows verified"
         );
         drop(held);
@@ -137,9 +145,9 @@ impl<B: Backend> Graph<B> {
             }
             RebuildMode::RequireEmpty => Ok(()),
             RebuildMode::ResetChecked => {
-                let expected = log_expected_multiset(held).await?;
+                let expected = log_expected_state(held).await?;
                 let stored = self.live_rows().await?;
-                verify(MismatchSource::PriorProjection, &expected, &stored.hashes)
+                verify(MismatchSource::PriorProjection, &expected, &stored)
             }
             RebuildMode::Replace if !holds_rows(&self.backend).await? => Ok(()),
             RebuildMode::Replace => {
@@ -161,9 +169,10 @@ impl<B: Backend> Graph<B> {
     }
 
     async fn unknown_rows(&self, held: &HeldLog) -> Result<usize> {
-        let known = log_expected_multiset(held).await?;
+        let known = log_expected_state(held).await?;
         let stored = self.live_rows().await?;
-        Ok(multiset_difference(&stored.hashes, &known).0)
+        let unknown_facts = stored.facts.difference(&known.facts).count();
+        Ok(multiset_difference(&stored.hashes, &known.hashes).0 + unknown_facts)
     }
 
     async fn live_rows(&self) -> Result<LiveRows> {
@@ -180,8 +189,13 @@ impl<B: Backend> Graph<B> {
         }
         let edges = hashes.len() - nodes;
         hashes.sort_unstable();
+        let mut facts = BTreeSet::new();
+        for row in self.backend.query("SELECT id FROM facts", &[]).await? {
+            facts.insert(row.get_string(0)?);
+        }
         Ok(LiveRows {
             hashes,
+            facts,
             nodes,
             edges,
         })
@@ -267,15 +281,17 @@ pub(super) fn stored_edge(row: &Row) -> Result<EdgeRow> {
 
 /// Fails when `found` is not the multiset `expected`, naming how far apart they
 /// are even when the counts agree.
-fn verify(against: MismatchSource, expected: &[[u8; 32]], found: &[[u8; 32]]) -> Result<()> {
-    let (missing, unexpected) = multiset_difference(expected, found);
+fn verify(against: MismatchSource, expected: &LoggedState, found: &LiveRows) -> Result<()> {
+    let (missing_rows, unexpected_rows) = multiset_difference(&expected.hashes, &found.hashes);
+    let missing = missing_rows + expected.facts.difference(&found.facts).count();
+    let unexpected = unexpected_rows + found.facts.difference(&expected.facts).count();
     if missing + unexpected == 0 {
         return Ok(());
     }
     Err(Error::RebuildMismatch {
         against,
-        expected: expected.len(),
-        found: found.len(),
+        expected: expected.hashes.len() + expected.facts.len(),
+        found: found.hashes.len() + found.facts.len(),
         missing,
         unexpected,
     })
@@ -308,10 +324,10 @@ fn multiset_difference(left: &[[u8; 32]], right: &[[u8; 32]]) -> (usize, usize) 
 /// The sorted multiset of live rows the log alone describes: every event that
 /// was not voided, applied in order. It is read from the log's own rows instead
 /// of the projection, so it can catch a replay that dropped or invented one.
-async fn log_expected_multiset(held: &HeldLog) -> Result<Vec<[u8; 32]>> {
+async fn log_expected_state(held: &HeldLog) -> Result<LoggedState> {
     let mut rows = LoggedRows::default();
-    for_each_unvoided(held.reader()?, held.head()?, |payload| rows.apply(payload)).await?;
-    Ok(rows.live_hashes())
+    for_each_replayed(held.reader()?, held.head()?, |payload| rows.apply(payload)).await?;
+    Ok(rows.into_state())
 }
 
 /// The rows the log has produced so far, kept as little as the verdict needs:
@@ -325,6 +341,7 @@ struct LoggedRows {
     /// them without a scan. An edge removed through its other end or on its own
     /// stays listed, and removing it again changes nothing.
     edges_of: HashMap<String, Vec<String>>,
+    facts: BTreeSet<String>,
 }
 
 impl LoggedRows {
@@ -334,6 +351,9 @@ impl LoggedRows {
                 for target in targets {
                     self.remove(target.table, &target.id);
                 }
+            }
+            LogPayload::FactWrite { inserted, .. } => {
+                self.facts.extend(inserted.into_iter().map(|row| row.id));
             }
             written => {
                 for effect in row_effects(written) {
@@ -383,7 +403,7 @@ impl LoggedRows {
         }
     }
 
-    fn live_hashes(self) -> Vec<[u8; 32]> {
+    fn into_state(self) -> LoggedState {
         let mut hashes: Vec<_> = self
             .nodes
             .into_values()
@@ -391,6 +411,9 @@ impl LoggedRows {
             .flatten()
             .collect();
         hashes.sort_unstable();
-        hashes
+        LoggedState {
+            hashes,
+            facts: self.facts,
+        }
     }
 }

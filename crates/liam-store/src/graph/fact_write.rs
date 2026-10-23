@@ -19,8 +19,8 @@ use super::arbitration::{
     RetractInput, Rules, Suppression,
 };
 use super::logged_plan::{event, STORE_TRUST};
-use super::logged_write::{abandon, commit_or_abandon, HeldLog};
-use super::projection::{apply_steps, steps_for, Step};
+use super::logged_write::{abandon, HeldLog};
+use super::projection::steps_for;
 use super::{validate_scope, Graph};
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
@@ -37,31 +37,6 @@ pub(super) const FACT_COLUMNS: &str =
        trust_score, extractor_id, extractor_version";
 
 const KEY_FILTER: &str = "subject = ?1 AND predicate = ?2 AND scope = ?3";
-
-const INSERT_VERSION_SQL: &str = "INSERT INTO facts
-       (id, lineage_id, subject, predicate, object, object_key, scope, evidence_at,
-        valid_from, valid_until, tx_from, tx_to, closed_by, confidence, trust_score,
-        extractor_id, extractor_version)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)";
-
-const CLOSE_VERSION_SQL: &str = "UPDATE facts SET tx_to = ?1 WHERE id = ?2 AND tx_to = ?3";
-
-const LINK_SOURCE_SQL: &str =
-    "INSERT OR IGNORE INTO fact_sources (lineage_id, event_id) VALUES (?1, ?2)";
-
-// A key retracted twice keeps the later retraction whole: its trust belongs to
-// its time, so the two are never mixed. On a tie the higher trust stays.
-const SUPPRESS_SQL: &str = "INSERT INTO fact_suppressions
-       (subject, predicate, scope, object_key, trust_score, retracted_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-     ON CONFLICT(subject, predicate, scope, object_key) DO UPDATE SET
-       trust_score = CASE
-         WHEN excluded.retracted_at > retracted_at
-           OR (excluded.retracted_at = retracted_at AND excluded.trust_score > trust_score)
-         THEN excluded.trust_score ELSE trust_score END,
-       retracted_at = MAX(retracted_at, excluded.retracted_at)";
-
-const CLOSED_ROWS: u64 = 1;
 
 const LATEST_TX_SQL: &str =
     "SELECT MAX(tx_from) FROM facts WHERE subject = ?1 AND predicate = ?2 AND scope = ?3";
@@ -103,7 +78,7 @@ impl Key {
     }
 }
 
-fn corrupt(id: &str, detail: &str) -> Error {
+pub(super) fn corrupt(id: &str, detail: &str) -> Error {
     Error::CorruptFactState(format!("fact version {id} {detail}"))
 }
 
@@ -159,28 +134,6 @@ fn version_effect(version: &Fact) -> FactRowEffect {
         extractor_id: version.extractor_id.as_str().to_owned(),
         extractor_version: version.extractor_version.clone(),
     }
-}
-
-fn version_params(version: &FactRowEffect) -> Vec<Value> {
-    vec![
-        version.id.as_str().into(),
-        version.lineage_id.as_str().into(),
-        version.subject.as_str().into(),
-        version.predicate.as_str().into(),
-        version.object.as_str().into(),
-        version.object_key.as_str().into(),
-        version.scope.as_str().into(),
-        version.evidence_at.into(),
-        version.valid_from.into(),
-        version.valid_until.into(),
-        version.tx_from.into(),
-        version.tx_to.into(),
-        version.closed_by.as_str().into(),
-        version.confidence.into(),
-        version.trust_score.into(),
-        version.extractor_id.as_str().into(),
-        version.extractor_version.as_str().into(),
-    ]
 }
 
 async fn current_versions(tx: &mut dyn BackendTx, key: &Key) -> Result<Vec<Fact>> {
@@ -249,123 +202,10 @@ async fn read_state(tx: &mut dyn BackendTx, key: &Key) -> Result<KeyState> {
     })
 }
 
-/// A close must hit the one current row it names, or the plan was decided on
-/// state that is no longer there.
-fn check_closed(id: &FactId, updated: u64) -> Result<()> {
-    if updated == CLOSED_ROWS {
-        Ok(())
-    } else {
-        Err(corrupt(
-            id.as_str(),
-            &format!("closed {updated} current rows instead of {CLOSED_ROWS}"),
-        ))
-    }
-}
-
 /// A fact write between its open and its finish: the log lock and the transaction.
 struct OpenWrite<'a> {
     held: Option<HeldLog>,
     tx: Box<dyn BackendTx + 'a>,
-}
-
-/// One statement of a fact write's projection.
-pub(super) enum FactStep {
-    Close {
-        id: String,
-        tx_to: i64,
-    },
-    Insert(FactRowEffect),
-    Link {
-        lineage_id: String,
-        event_id: String,
-    },
-    Suppress(SuppressionEffect),
-}
-
-/// The statements a `FactWrite` projects, which a live write and a replay share.
-pub(super) fn fact_steps(payload: &LogPayload) -> Vec<Step> {
-    let LogPayload::FactWrite {
-        at,
-        closed_version_ids,
-        inserted,
-        source_links,
-        suppressions,
-    } = payload
-    else {
-        return Vec::new();
-    };
-    let closes = closed_version_ids.iter().map(|id| FactStep::Close {
-        id: id.clone(),
-        tx_to: *at,
-    });
-    let inserts = inserted.iter().cloned().map(FactStep::Insert);
-    let links = source_links.iter().map(|(lineage, event)| FactStep::Link {
-        lineage_id: lineage.clone(),
-        event_id: event.clone(),
-    });
-    let blocks = suppressions.iter().cloned().map(FactStep::Suppress);
-    closes
-        .chain(inserts)
-        .chain(links)
-        .chain(blocks)
-        .map(Step::Fact)
-        .collect()
-}
-
-pub(super) async fn apply_fact_step(tx: &mut dyn BackendTx, step: &FactStep) -> Result<()> {
-    match step {
-        FactStep::Close { id, tx_to } => close_version(tx, id, *tx_to).await,
-        FactStep::Insert(version) => {
-            tx.execute(INSERT_VERSION_SQL, &version_params(version))
-                .await?;
-            Ok(())
-        }
-        FactStep::Link {
-            lineage_id,
-            event_id,
-        } => {
-            let params = [lineage_id.as_str().into(), event_id.as_str().into()];
-            tx.execute(LINK_SOURCE_SQL, &params).await?;
-            Ok(())
-        }
-        FactStep::Suppress(blocked) => {
-            let params = [
-                blocked.subject.as_str().into(),
-                blocked.predicate.as_str().into(),
-                blocked.scope.as_str().into(),
-                blocked.object_key.as_str().into(),
-                blocked.trust_score.into(),
-                blocked.retracted_at.into(),
-            ];
-            tx.execute(SUPPRESS_SQL, &params).await?;
-            Ok(())
-        }
-    }
-}
-
-/// Closes a current version. One already closed at `tx_to` is a replay of this
-/// close and is left as it is.
-async fn close_version(tx: &mut dyn BackendTx, id: &str, tx_to: i64) -> Result<()> {
-    let updated = tx
-        .execute(
-            CLOSE_VERSION_SQL,
-            &[tx_to.into(), id.into(), FOREVER.into()],
-        )
-        .await?;
-    if updated == 0 && closed_at(tx, id, tx_to).await? {
-        return Ok(());
-    }
-    check_closed(&FactId::from_raw(id), updated)
-}
-
-async fn closed_at(tx: &mut dyn BackendTx, id: &str, tx_to: i64) -> Result<bool> {
-    let rows = tx
-        .query(
-            "SELECT 1 FROM facts WHERE id = ?1 AND tx_to = ?2",
-            &[id.into(), tx_to.into()],
-        )
-        .await?;
-    Ok(!rows.is_empty())
 }
 
 /// The log event for a decision, or `None` when it changes nothing. It is
@@ -563,7 +403,7 @@ impl<B: Backend> Graph<B> {
         decided: Result<(Decision<T>, Millis)>,
         write_source: &str,
     ) -> Result<T> {
-        let OpenWrite { held, mut tx } = write;
+        let OpenWrite { held, tx } = write;
         let (decision, at) = match decided {
             Ok(decided) => decided,
             Err(error) => {
@@ -578,11 +418,7 @@ impl<B: Backend> Graph<B> {
         let steps = steps_for(&event.payload);
         match held {
             Some(mut held) => self.append_and_commit(tx, &mut held, event, &steps).await?,
-            None => {
-                let vector_delete = self.backend.vector_delete_sql();
-                let applied = apply_steps(&mut *tx, &steps, vector_delete).await;
-                commit_or_abandon(tx, applied).await?;
-            }
+            None => self.apply_and_commit(tx, &steps).await?,
         }
         Ok(decision.outcome)
     }
@@ -682,35 +518,4 @@ async fn key_is_taken(
             && !reopened.contains(version.lineage_id.as_str())
             && version.valid_until > target.evidence_at
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_close_that_updates_other_than_one_row_is_corrupt_state() {
-        for updated in [0, 2] {
-            // Arrange
-            let id = FactId::from_raw("a");
-
-            // Act
-            let result = check_closed(&id, updated);
-
-            // Assert
-            assert!(
-                matches!(result, Err(Error::CorruptFactState(_))),
-                "{updated} rows"
-            );
-        }
-    }
-
-    #[test]
-    fn a_close_that_updates_one_row_is_accepted() {
-        // Act
-        let result = check_closed(&FactId::from_raw("a"), CLOSED_ROWS);
-
-        // Assert
-        assert!(result.is_ok());
-    }
 }

@@ -7,17 +7,20 @@
 use liam_log::event::{LogPayload, CURRENT_SCHEMA_VERSION};
 
 use super::fact_arbitration::{
-    end, fact, fact_for, lineage_of, many, one, HIGH_TRUST, LATER, LOW_TRUST, SMALL_CAP, START,
+    end, fact, fact_for, lineage_of, many, one, HIGH_TRUST, LATER, LOW_TRUST, MIDDLE, SMALL_CAP,
+    START,
 };
 use super::log_write::{events, RecordingLog};
 use super::support::{
-    controlled_log, count, event, share, snapshot, Env, FACT_WRITER, ONE_SEGMENT,
+    controlled_log, count, event, node_write, share, snapshot, Env, FACT_WRITER, ONE_SEGMENT,
 };
 use super::*;
-use crate::types::{ArbitrationCaps, ArbitrationOutcome, EndOutcome};
+use crate::error::MismatchSource;
+use crate::types::{ArbitrationCaps, ArbitrationOutcome, EndOutcome, RetractOutcome};
 use crate::DefaultBackend;
 
-const MIDDLE: Millis = Millis(3000);
+/// The writes of `script` that change something: one log event each.
+const SCRIPT_FACT_WRITES: usize = 12;
 const OTHER_CLIENT: &str = "client:mcp";
 /// The fact tables with the columns that order their rows.
 const FACT_TABLES: [(&str, &str); 3] = [
@@ -43,7 +46,8 @@ async fn fact_state<B: Backend>(g: &Graph<B>) -> Vec<String> {
 }
 
 /// Every outcome class that writes: insert, corroborate, replace, historical,
-/// competing, a many-valued insert, an end and a retraction.
+/// competing, a many-valued insert, an end on newer and on older evidence, and
+/// retractions with and without restoring what the lineage replaced.
 async fn script(g: &DefaultGraph, clock: &FixedClock, source: &str) {
     let caps = ArbitrationCaps::default();
     let spec = one();
@@ -62,6 +66,14 @@ async fn script(g: &DefaultGraph, clock: &FixedClock, source: &str) {
     assert!(matches!(replaced, ArbitrationOutcome::Replaced { .. }));
     let historical = assert(fact("Perth", LOW_TRUST, "e4", 50)).await.unwrap();
     assert!(matches!(historical, ArbitrationOutcome::Historical { .. }));
+    let older_end = g
+        .end_fact(end("Melbourne", 250, HIGH_TRUST, "e10", 150), &spec, source)
+        .await
+        .unwrap();
+    assert!(
+        matches!(older_end, EndOutcome::Ended { .. }),
+        "{older_end:?}"
+    );
     assert(fact_for("works_at", "Acme", HIGH_TRUST, "e5", 100))
         .await
         .unwrap();
@@ -85,6 +97,14 @@ async fn script(g: &DefaultGraph, clock: &FixedClock, source: &str) {
     g.retract_fact(&lineage_of(&competing), false, source)
         .await
         .unwrap();
+    let restored = g
+        .retract_fact(&lineage_of(&replaced), true, source)
+        .await
+        .unwrap();
+    assert!(
+        matches!(restored, RetractOutcome::Retracted { ref restored } if !restored.is_empty()),
+        "{restored:?}"
+    );
 }
 
 /// A live store that ran `script`, over the log in `env`.
@@ -114,7 +134,7 @@ async fn fact_writes(env: &Env) -> Vec<liam_log::event::LogEvent> {
 }
 
 #[tokio::test]
-async fn a_fact_write_is_logged_with_its_source_and_schema_version_before_it_is_applied() {
+async fn every_fact_write_of_the_script_is_logged_with_the_callers_source_and_the_current_schema() {
     // Arrange
     let env = Env::new();
     let (g, _log) = scripted(&env, "live.db", OTHER_CLIENT).await;
@@ -123,7 +143,7 @@ async fn a_fact_write_is_logged_with_its_source_and_schema_version_before_it_is_
     let logged = fact_writes(&env).await;
 
     // Assert
-    assert!(logged.len() >= 8, "{} fact writes", logged.len());
+    assert_eq!(logged.len(), SCRIPT_FACT_WRITES);
     for event in &logged {
         assert_eq!(event.source, OTHER_CLIENT);
         assert_eq!(event.schema_version, CURRENT_SCHEMA_VERSION);
@@ -470,4 +490,189 @@ async fn evicting_at_the_competing_cap_replays_with_its_suppression() {
 
     // Assert
     assert_eq!(fact_state(&replica).await, fact_state(&live).await);
+}
+
+/// The objects of the stored versions with whether each is still current, in a
+/// stable order.
+async fn versions<B: Backend>(g: &Graph<B>) -> Vec<(String, bool)> {
+    let sql = format!(
+        "SELECT object, tx_to = {} FROM facts ORDER BY object, tx_from",
+        FOREVER.0
+    );
+    g.backend
+        .query(&sql, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get_string(0).unwrap(), row.get_i64(1).unwrap() == 1))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_client_replace_built_on_a_rolled_back_replace_applies_without_the_missing_rows() {
+    // Arrange: a client's Sydney, then run 7 replaces it with Melbourne, then the
+    // client replaces Melbourne with Perth, then run 7 is rolled back.
+    let env = Env::new();
+    let clock = Arc::new(FixedClock::new(START));
+    {
+        let (g, _log) = env
+            .open::<DefaultBackend>("live.db", Arc::clone(&clock))
+            .await;
+        let caps = ArbitrationCaps::default();
+        let steps = [
+            (OTHER_CLIENT, "Sydney", LOW_TRUST, "e1", 100),
+            ("consolidation:7", "Melbourne", HIGH_TRUST, "e2", 200),
+            (OTHER_CLIENT, "Perth", HIGH_TRUST, "e3", 300),
+        ];
+        for (source, object, trust, event, evidence) in steps {
+            clock.set(Millis(evidence * 10));
+            g.assert_fact(fact(object, trust, event, evidence), &one(), source, caps)
+                .await
+                .unwrap();
+        }
+    }
+    env.append(&[event(
+        "rollback-7",
+        [0; 32],
+        LogPayload::RunRolledBack { run_id: "7".into() },
+    )]);
+    let log = env.log(ONE_SEGMENT);
+    let rebuilt = replica(&env, &log, "rebuilt.db").await;
+    let expected = [("Perth".to_string(), true), ("Sydney".to_string(), false)];
+
+    // Act
+    rebuilt.catch_up().await.unwrap();
+
+    // Assert: Melbourne never existed; Sydney, which the run had closed, is
+    // closed by the client's replace; Perth is the one current belief.
+    assert_eq!(versions(&rebuilt).await, expected);
+    assert!(rebuilt.facts_without_sources().await.unwrap().is_empty());
+    assert_eq!(count(&rebuilt, "fact_sources").await, 2);
+    let (again, _) = rebuilt
+        .rebuild_from_log(log, RebuildMode::Replace)
+        .await
+        .unwrap();
+    assert_eq!(versions(&again).await, expected);
+}
+
+#[tokio::test]
+async fn a_reset_checked_rebuild_is_refused_when_stored_facts_differ_from_the_log() {
+    // Arrange
+    let env = Env::new();
+    let (live, log) = scripted(&env, "live.db", FACT_WRITER).await;
+    live.backend
+        .execute(
+            "INSERT INTO facts
+             (id, lineage_id, subject, predicate, object, object_key, evidence_at, valid_from,
+              tx_from, trust_score, extractor_id, extractor_version)
+             VALUES ('stray', 'stray', 's', 'p', 'o', 'o', 1, 1, 1, 0.5, 'rules', 'v1')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // Act
+    let result = live.rebuild_from_log(log, RebuildMode::ResetChecked).await;
+
+    // Assert
+    assert!(
+        matches!(
+            result,
+            Err(Error::RebuildMismatch {
+                against: MismatchSource::PriorProjection,
+                unexpected: 1,
+                ..
+            })
+        ),
+        "{:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
+async fn a_reset_checked_rebuild_goes_ahead_when_stored_facts_match_the_log() {
+    // Arrange
+    let env = Env::new();
+    let (live, log) = scripted(&env, "live.db", FACT_WRITER).await;
+    let expected = fact_state(&live).await;
+
+    // Act
+    let (rebuilt, _) = live
+        .rebuild_from_log(log, RebuildMode::ResetChecked)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(fact_state(&rebuilt).await, expected);
+}
+
+#[tokio::test]
+async fn a_rolled_back_runs_node_writes_are_skipped_and_the_rebuild_still_verifies() {
+    // Arrange
+    let env = Env::new();
+    let mut run_node = node_write("node-run", "written by the run");
+    run_node.source = format!("{RUN_SOURCE_PREFIX}7");
+    env.append(&[
+        node_write("node-client", "written by a client"),
+        run_node,
+        event(
+            "rollback-7",
+            [0; 32],
+            LogPayload::RunRolledBack { run_id: "7".into() },
+        ),
+    ]);
+    let log = env.log(ONE_SEGMENT);
+    let store = replica(&env, &log, "rebuilt.db").await;
+
+    // Act
+    let (rebuilt, _) = store
+        .rebuild_from_log(log, RebuildMode::RequireEmpty)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(count(&rebuilt, "nodes").await, 1);
+}
+
+#[tokio::test]
+async fn facts_written_before_a_snapshot_survive_a_restore_and_catch_up() {
+    // Arrange
+    let env = Env::new();
+    let dir = tempfile::TempDir::new().unwrap();
+    let clock = Arc::new(FixedClock::new(START));
+    let (g, log) = env
+        .open::<DefaultBackend>("live.db", Arc::clone(&clock))
+        .await;
+    g.assert_fact(
+        fact("Sydney", LOW_TRUST, "e1", 100),
+        &one(),
+        FACT_WRITER,
+        ArbitrationCaps::default(),
+    )
+    .await
+    .unwrap();
+    let taken = g.snapshot(dir.path()).await.unwrap();
+    clock.set(LATER);
+    g.assert_fact(
+        fact("Melbourne", HIGH_TRUST, "e2", 200),
+        &one(),
+        FACT_WRITER,
+        ArbitrationCaps::default(),
+    )
+    .await
+    .unwrap();
+    let expected = fact_state(&g).await;
+    g.restore_snapshot(std::path::Path::new(&env.db("live.db")), &taken.meta_path)
+        .await
+        .unwrap();
+    drop(log);
+
+    // Act
+    let restored = replica(&env, &env.log(ONE_SEGMENT), "live.db").await;
+    let at_restore = count(&restored, "facts").await;
+    restored.catch_up().await.unwrap();
+
+    // Assert
+    assert_eq!(at_restore, 1, "the restore reverts the later write");
+    assert_eq!(fact_state(&restored).await, expected);
 }

@@ -15,7 +15,7 @@ use crate::types::{
 const DIMS: usize = 8;
 pub(super) const START: Millis = Millis(1000);
 pub(super) const LATER: Millis = Millis(2000);
-const MIDDLE: Millis = Millis(3000);
+pub(super) const MIDDLE: Millis = Millis(3000);
 pub(super) const SMALL_CAP: usize = 2;
 const WEAK_TRUST: f64 = 0.3;
 const RACE_ROUNDS: usize = 50;

@@ -5,7 +5,7 @@
 
 use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTarget};
 
-use super::fact_write::{apply_fact_step, fact_steps, FactStep};
+use super::fact_projection::{apply_fact_step, fact_steps, FactStep};
 use super::logged_plan::Table;
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
@@ -47,7 +47,7 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
             })
             .collect(),
         LogPayload::Tombstone(targets) => targets.iter().cloned().map(Step::Remove).collect(),
-        LogPayload::FactWrite { .. } => fact_steps(payload),
+        LogPayload::FactWrite { .. } => fact_steps(payload).into_iter().map(Step::Fact).collect(),
         LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
         | LogPayload::RunRolledBack { .. } => Vec::new(),
