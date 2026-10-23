@@ -5,6 +5,7 @@
 
 use super::support::{count, fact, fact_at, Env};
 use super::*;
+use crate::types::relation;
 use crate::DefaultBackend;
 
 const RUN: &str = "7";
@@ -114,4 +115,72 @@ async fn a_sweep_stamped_with_a_run_is_cancelled_by_its_marker() {
 
     // Assert
     assert_eq!(contents(&replayed).await, ["old note"]);
+}
+
+#[tokio::test]
+async fn a_supersession_by_a_marked_run_is_cancelled_with_its_closing_edge() {
+    // Arrange
+    let env = Env::new();
+    {
+        let (live, _log) = env.open::<DefaultBackend>("live.db", clock()).await;
+        live.upsert_by(NewNode::entity("person", "Kim").with_producer("client"))
+            .await
+            .unwrap();
+        let mut renewed = NewNode::entity("person", "Kim").with_producer(RUN_SOURCE);
+        renewed.content = "written by the run".to_owned();
+        live.upsert_by(renewed).await.unwrap();
+        live.mark_run_rolled_back(RUN).await.unwrap();
+    }
+    let (replayed, _log) = env.open::<DefaultBackend>("replayed.db", clock()).await;
+
+    // Act
+    replayed.catch_up().await.unwrap();
+
+    // Assert: the original entity is open again and nothing of the run is left.
+    let live: Vec<(String, i64)> = replayed
+        .backend
+        .query("SELECT content, tx_to FROM nodes", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get_string(0).unwrap(), row.get_i64(1).unwrap()))
+        .collect();
+    assert_eq!(live, [(String::new(), FOREVER.0)]);
+    assert_eq!(count(&replayed, "edges").await, 0);
+}
+
+#[tokio::test]
+async fn a_repair_stamped_with_a_run_is_cancelled_by_its_marker() {
+    // Arrange: a client supersedes an entity that a fact mentions.
+    let env = Env::new();
+    let before = {
+        let (live, _log) = env.open::<DefaultBackend>("live.db", clock()).await;
+        let entity = live
+            .upsert_by(NewNode::entity("person", "Kim").with_producer("client"))
+            .await
+            .unwrap();
+        let note = live.insert(fact("Kim likes tea")).await.unwrap();
+        live.relate(&note, &entity, relation::MENTIONS)
+            .await
+            .unwrap();
+        let mut renewed = NewNode::entity("person", "Kim").with_producer("client");
+        renewed.content = "renewed".to_owned();
+        live.upsert_by(renewed).await.unwrap();
+        let before = count(&live, "edges").await;
+        let repaired = live
+            .repair_superseded_mentions_from(RUN_SOURCE)
+            .await
+            .unwrap();
+        assert_eq!(repaired, 1);
+        assert_eq!(count(&live, "edges").await, before + 1);
+        live.mark_run_rolled_back(RUN).await.unwrap();
+        before
+    };
+    let (replayed, _log) = env.open::<DefaultBackend>("replayed.db", clock()).await;
+
+    // Act
+    replayed.catch_up().await.unwrap();
+
+    // Assert
+    assert_eq!(count(&replayed, "edges").await, before);
 }

@@ -14,7 +14,7 @@ use liam_log::event::NodeRow;
 
 pub use self::backfill::BackfillReport;
 pub use self::facts::batch_key;
-use self::logged_plan::{refuse_supersedes, Collision};
+use self::logged_plan::{refuse_supersedes, Collision, STORE_SOURCE};
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, PoisonHook, SharedLog};
 pub use self::rebuild::{RebuildMode, RebuildReport};
@@ -1556,6 +1556,12 @@ impl<B: Backend> Graph<B> {
     /// sibling repair on the same edge succeeded, so a later run revisits
     /// exactly what this one could not finish.
     pub async fn repair_superseded_mentions(&self) -> Result<usize> {
+        self.repair_superseded_mentions_from(STORE_SOURCE).await
+    }
+
+    /// `repair_superseded_mentions` with the log records stamped by `source`, so
+    /// a rollback of the consolidation run named in it cancels the repair.
+    pub async fn repair_superseded_mentions_from(&self, source: &str) -> Result<usize> {
         let watermark = self.repair_watermark().await?;
         let supersede_rows = self
             .backend
@@ -1591,11 +1597,12 @@ impl<B: Backend> Graph<B> {
             for mention_row in &mention_rows {
                 let mentioning = NodeId::from_raw(mention_row.get_string(0)?);
                 let result = self
-                    .project_edge(
+                    .project_edge_from(
                         &mentioning,
                         &terminal,
                         crate::types::relation::MENTIONS,
                         EMPTY_ATTRIBUTES,
+                        source,
                     )
                     .await;
                 fold_repair_outcome(
@@ -1627,11 +1634,12 @@ impl<B: Backend> Graph<B> {
             for mention_row in &own_mention_rows {
                 let mentioned = NodeId::from_raw(mention_row.get_string(0)?);
                 let result = self
-                    .project_edge(
+                    .project_edge_from(
                         &terminal,
                         &mentioned,
                         crate::types::relation::MENTIONS,
                         EMPTY_ATTRIBUTES,
+                        source,
                     )
                     .await;
                 fold_repair_outcome(
