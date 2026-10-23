@@ -75,6 +75,7 @@
 //! can outrank the expected one), not a regression to chase.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use liam_store::{DefaultGraph, ExplainedHit, Millis, NewEdge, NodeId, Query, Result};
 
@@ -112,6 +113,42 @@ pub fn recall_at_k(retrieved: &[String], relevant: &HashSet<&str>, k: usize) -> 
     let top = top_k_unique(retrieved, k);
     let hits = relevant.iter().filter(|id| top.contains(*id)).count();
     hits as f64 / relevant.len() as f64
+}
+
+/// The cutoff for the `recall_at_10` and `ndcg_at_10` headline metrics.
+const HEADLINE_K: usize = 10;
+
+/// `recall_at_k` at the headline cutoff of 10.
+pub fn recall_at_10(retrieved: &[String], relevant: &HashSet<&str>) -> f64 {
+    recall_at_k(retrieved, relevant, HEADLINE_K)
+}
+
+/// Rank discount for a 0-indexed position: `1 / log2(rank + 1)` with rank
+/// 1-indexed.
+fn rank_discount(index: usize) -> f64 {
+    1.0 / ((index + 2) as f64).log2()
+}
+
+/// Normalised discounted cumulative gain over the top 10, with binary
+/// relevance. A repeated id earns its gain once, at its first position, but
+/// still occupies a rank, matching how the sibling metrics dedupe. The ideal
+/// ranking puts every relevant id (up to 10) first; an empty `relevant` set
+/// has no ideal ranking, so it returns `0.0` instead of dividing by zero.
+pub fn ndcg_at_10(retrieved: &[String], relevant: &HashSet<&str>) -> f64 {
+    let ideal_hits = relevant.len().min(HEADLINE_K);
+    if ideal_hits == 0 {
+        return 0.0;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let dcg: f64 = retrieved
+        .iter()
+        .take(HEADLINE_K)
+        .enumerate()
+        .filter(|(_, id)| relevant.contains(id.as_str()) && seen.insert(id.as_str()))
+        .map(|(index, _)| rank_discount(index))
+        .sum();
+    let ideal_dcg: f64 = (0..ideal_hits).map(rank_discount).sum();
+    dcg / ideal_dcg
 }
 
 /// `1 / rank` of the first relevant id in `retrieved` (1-indexed), or `0.0`
@@ -178,6 +215,8 @@ pub struct CategoryMetrics {
     pub precision_at_8: f64,
     pub recall_at_4: f64,
     pub recall_at_8: f64,
+    pub recall_at_10: f64,
+    pub ndcg_at_10: f64,
     pub mrr: f64,
 }
 
@@ -204,21 +243,31 @@ pub fn format_report(scores: &[CategoryScore]) -> String {
     // `Result` that is never actually an error here.
     let _ = writeln!(
         out,
-        "{:<16}{:>4}  {:>11}{:>13}{:>10}{:>10}{:>7}",
-        "category", "n", "precision@4", "precision@8", "recall@4", "recall@8", "MRR"
+        "{:<16}{:>4}  {:>11}{:>13}{:>10}{:>10}{:>11}{:>10}{:>7}",
+        "category",
+        "n",
+        "precision@4",
+        "precision@8",
+        "recall@4",
+        "recall@8",
+        "recall@10",
+        "nDCG@10",
+        "MRR"
     );
     for score in scores {
         match score.metrics {
             Some(m) => {
                 let _ = writeln!(
                     out,
-                    "{:<16}{:>4}  {:>11.3}{:>13.3}{:>10.3}{:>10.3}{:>7.3}",
+                    "{:<16}{:>4}  {:>11.3}{:>13.3}{:>10.3}{:>10.3}{:>11.3}{:>10.3}{:>7.3}",
                     score.category.name(),
                     score.scored,
                     m.precision_at_4,
                     m.precision_at_8,
                     m.recall_at_4,
                     m.recall_at_8,
+                    m.recall_at_10,
+                    m.ndcg_at_10,
                     m.mrr,
                 );
             }
@@ -234,6 +283,70 @@ pub fn format_report(scores: &[CategoryScore]) -> String {
     }
     out
 }
+
+/// Wall-clock cost of embedder calls, one entry per `embed`/`embed_batch`
+/// call. Durations are passed in rather than measured here so the arithmetic
+/// is testable without depending on real elapsed time.
+#[derive(Debug, Default)]
+pub struct EmbedTimings {
+    calls: Vec<EmbedCall>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EmbedCall {
+    items: usize,
+    elapsed: Duration,
+}
+
+/// Aggregate latency and throughput over every recorded embedder call.
+#[derive(Debug, Clone, Copy)]
+pub struct TimingSummary {
+    pub calls: usize,
+    pub items: usize,
+    pub total: Duration,
+    pub mean_latency: Duration,
+    pub throughput_per_sec: f64,
+}
+
+impl EmbedTimings {
+    pub fn record(&mut self, items: usize, elapsed: Duration) {
+        self.calls.push(EmbedCall { items, elapsed });
+    }
+
+    /// `None` when nothing was recorded. Throughput is `0.0` when the total
+    /// elapsed time is zero, since a rate over no time is undefined.
+    pub fn summary(&self) -> Option<TimingSummary> {
+        let calls = u32::try_from(self.calls.len()).ok().filter(|&n| n > 0)?;
+        let items: usize = self.calls.iter().map(|c| c.items).sum();
+        let total: Duration = self.calls.iter().map(|c| c.elapsed).sum();
+        let throughput_per_sec = if total.is_zero() {
+            0.0
+        } else {
+            items as f64 / total.as_secs_f64()
+        };
+        Some(TimingSummary {
+            calls: calls as usize,
+            items,
+            total,
+            mean_latency: total / calls,
+            throughput_per_sec,
+        })
+    }
+}
+
+/// One-line rendering of a `TimingSummary` for the report.
+pub fn format_timing(summary: &TimingSummary) -> String {
+    format!(
+        "embedder: {} calls, {} items, mean latency {:.1} ms, throughput {:.1} items/s\n",
+        summary.calls,
+        summary.items,
+        summary.mean_latency.as_secs_f64() * MS_PER_SEC,
+        summary.throughput_per_sec,
+    )
+}
+
+/// Milliseconds per second, for rendering latencies.
+const MS_PER_SEC: f64 = 1_000.0;
 
 /// One day in milliseconds, so `CORPUS`/`QUESTIONS` express ages, half-lives,
 /// and as-of windows in days rather than raw millisecond counts. Convention
@@ -1160,6 +1273,8 @@ fn score_question(retrieved: &[String], relevant: &HashSet<&str>) -> CategoryMet
         precision_at_8: precision_at_k(retrieved, relevant, 8),
         recall_at_4: recall_at_k(retrieved, relevant, 4),
         recall_at_8: recall_at_k(retrieved, relevant, 8),
+        recall_at_10: recall_at_10(retrieved, relevant),
+        ndcg_at_10: ndcg_at_10(retrieved, relevant),
         mrr: reciprocal_rank(retrieved, relevant),
     }
 }
@@ -1178,6 +1293,8 @@ fn average_category_metrics(per_question: &[CategoryMetrics]) -> Option<Category
         precision_at_8: 0.0,
         recall_at_4: 0.0,
         recall_at_8: 0.0,
+        recall_at_10: 0.0,
+        ndcg_at_10: 0.0,
         mrr: 0.0,
     };
     for m in per_question {
@@ -1185,6 +1302,8 @@ fn average_category_metrics(per_question: &[CategoryMetrics]) -> Option<Category
         sum.precision_at_8 += m.precision_at_8;
         sum.recall_at_4 += m.recall_at_4;
         sum.recall_at_8 += m.recall_at_8;
+        sum.recall_at_10 += m.recall_at_10;
+        sum.ndcg_at_10 += m.ndcg_at_10;
         sum.mrr += m.mrr;
     }
     Some(CategoryMetrics {
@@ -1192,6 +1311,8 @@ fn average_category_metrics(per_question: &[CategoryMetrics]) -> Option<Category
         precision_at_8: sum.precision_at_8 / n,
         recall_at_4: sum.recall_at_4 / n,
         recall_at_8: sum.recall_at_8 / n,
+        recall_at_10: sum.recall_at_10 / n,
+        ndcg_at_10: sum.ndcg_at_10 / n,
         mrr: sum.mrr / n,
     })
 }
@@ -1282,6 +1403,8 @@ fn assert_metrics_in_unit_range(per_category: &HashMap<Category, Vec<CategoryMet
             metrics.precision_at_8,
             metrics.recall_at_4,
             metrics.recall_at_8,
+            metrics.recall_at_10,
+            metrics.ndcg_at_10,
             metrics.mrr,
         ] {
             assert!(
@@ -1294,6 +1417,8 @@ fn assert_metrics_in_unit_range(per_category: &HashMap<Category, Vec<CategoryMet
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn fact_by_label(label: &str) -> Option<&'static Fact> {
@@ -1639,6 +1764,8 @@ mod tests {
             precision_at_8: 0.5,
             recall_at_4: 0.0,
             recall_at_8: 1.0,
+            recall_at_10: 1.0,
+            ndcg_at_10: 0.5,
             mrr: 0.5,
         };
         let b = CategoryMetrics {
@@ -1646,6 +1773,8 @@ mod tests {
             precision_at_8: 1.0,
             recall_at_4: 1.0,
             recall_at_8: 0.0,
+            recall_at_10: 0.0,
+            ndcg_at_10: 1.0,
             mrr: 1.0,
         };
         let c = CategoryMetrics {
@@ -1653,6 +1782,8 @@ mod tests {
             precision_at_8: 0.0,
             recall_at_4: 0.5,
             recall_at_8: 0.5,
+            recall_at_10: 0.5,
+            ndcg_at_10: 0.0,
             mrr: 0.0,
         };
 
@@ -1665,6 +1796,8 @@ mod tests {
         assert_eq!(average.precision_at_8, 0.5);
         assert_eq!(average.recall_at_4, 0.5);
         assert_eq!(average.recall_at_8, 0.5);
+        assert_eq!(average.recall_at_10, 0.5);
+        assert_eq!(average.ndcg_at_10, 0.5);
         assert_eq!(average.mrr, 0.5);
     }
 
@@ -1673,6 +1806,236 @@ mod tests {
         // Given an empty slice, when averaged, then None, not a
         // divide-by-zero NaN or a misleading 0.0.
         assert!(average_category_metrics(&[]).is_none());
+    }
+
+    /// Tolerance for comparing logarithm-based scores against hand-computed
+    /// decimals.
+    const SCORE_EPSILON: f64 = 1e-9;
+
+    fn ids(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn recall_at_10_counts_hits_inside_the_first_ten_only() {
+        // Arrange: relevant ids sit at ranks 2, 10 and 11 of 12 results.
+        let retrieved = ids(&[
+            "x1", "r1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "r2", "r3", "x9",
+        ]);
+        let relevant = set(&["r1", "r2", "r3"]);
+
+        // Act
+        let recall = recall_at_10(&retrieved, &relevant);
+
+        // Assert: rank 10 is inside the window, rank 11 is not, so 2 of 3.
+        assert_eq!(recall, 2.0 / 3.0);
+    }
+
+    #[test]
+    fn recall_at_10_with_a_list_shorter_than_ten_uses_the_whole_list() {
+        // Arrange
+        let retrieved = ids(&["a", "x", "b"]);
+        let relevant = set(&["a", "b"]);
+
+        // Act
+        let recall = recall_at_10(&retrieved, &relevant);
+
+        // Assert
+        assert_eq!(recall, 1.0);
+    }
+
+    #[test]
+    fn recall_at_10_is_zero_for_an_empty_relevant_set() {
+        // Arrange
+        let retrieved = ids(&["a", "b"]);
+        let relevant = set(&[]);
+
+        // Act
+        let recall = recall_at_10(&retrieved, &relevant);
+
+        // Assert
+        assert_eq!(recall, 0.0);
+    }
+
+    #[test]
+    fn ndcg_at_10_matches_a_hand_computed_worked_example() {
+        // Arrange: relevant a, b, c; a is ranked 1 and b is ranked 3.
+        // DCG  = 1/log2(2) + 1/log2(4)               = 1 + 0.5          = 1.5
+        // IDCG = 1/log2(2) + 1/log2(3) + 1/log2(4)   = 2.1309297535714573
+        let retrieved = ids(&["a", "x", "b", "y"]);
+        let relevant = set(&["a", "b", "c"]);
+
+        // Act
+        let ndcg = ndcg_at_10(&retrieved, &relevant);
+
+        // Assert
+        assert!((ndcg - 0.7039180890341347).abs() < SCORE_EPSILON, "{ndcg}");
+    }
+
+    #[test]
+    fn ndcg_at_10_is_zero_for_an_empty_relevant_set() {
+        // Arrange
+        let retrieved = ids(&["a", "b"]);
+        let relevant = set(&[]);
+
+        // Act
+        let ndcg = ndcg_at_10(&retrieved, &relevant);
+
+        // Assert: an empty ideal ranking must not divide by zero.
+        assert_eq!(ndcg, 0.0);
+    }
+
+    #[test]
+    fn ndcg_at_10_is_zero_for_an_empty_retrieved_list() {
+        // Arrange
+        let retrieved: Vec<String> = vec![];
+        let relevant = set(&["a"]);
+
+        // Act
+        let ndcg = ndcg_at_10(&retrieved, &relevant);
+
+        // Assert
+        assert_eq!(ndcg, 0.0);
+    }
+
+    #[test]
+    fn ndcg_at_10_is_one_for_a_single_relevant_item_at_rank_one() {
+        // Arrange
+        let retrieved = ids(&["a", "x", "y"]);
+        let relevant = set(&["a"]);
+
+        // Act
+        let ndcg = ndcg_at_10(&retrieved, &relevant);
+
+        // Assert
+        assert!((ndcg - 1.0).abs() < SCORE_EPSILON, "{ndcg}");
+    }
+
+    #[test]
+    fn ndcg_at_10_is_one_when_every_retrieved_item_is_relevant() {
+        // Arrange
+        let retrieved = ids(&["a", "b", "c"]);
+        let relevant = set(&["a", "b", "c"]);
+
+        // Act
+        let ndcg = ndcg_at_10(&retrieved, &relevant);
+
+        // Assert
+        assert!((ndcg - 1.0).abs() < SCORE_EPSILON, "{ndcg}");
+    }
+
+    #[test]
+    fn ndcg_at_10_with_a_list_shorter_than_ten_penalises_the_missing_item() {
+        // Arrange: only a is returned; the ideal ranking also has b at rank 2.
+        // DCG = 1, IDCG = 1 + 1/log2(3) = 1.6309297535714573
+        let retrieved = ids(&["a"]);
+        let relevant = set(&["a", "b"]);
+
+        // Act
+        let ndcg = ndcg_at_10(&retrieved, &relevant);
+
+        // Assert
+        assert!((ndcg - 0.6131471927654584).abs() < SCORE_EPSILON, "{ndcg}");
+    }
+
+    #[test]
+    fn ndcg_at_10_ignores_a_relevant_item_ranked_eleventh() {
+        // Arrange
+        let retrieved = ids(&[
+            "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "a",
+        ]);
+        let relevant = set(&["a"]);
+
+        // Act
+        let ndcg = ndcg_at_10(&retrieved, &relevant);
+
+        // Assert
+        assert_eq!(ndcg, 0.0);
+    }
+
+    #[test]
+    fn ndcg_at_10_counts_a_repeated_id_once_but_it_still_occupies_a_rank() {
+        // Arrange: a appears at ranks 1 and 2, b at rank 3.
+        // DCG  = 1/log2(2) + 1/log2(4)   = 1.5 (the second a earns nothing)
+        // IDCG = 1/log2(2) + 1/log2(3)   = 1.6309297535714573
+        let retrieved = ids(&["a", "a", "b"]);
+        let relevant = set(&["a", "b"]);
+
+        // Act
+        let ndcg = ndcg_at_10(&retrieved, &relevant);
+
+        // Assert
+        assert!((ndcg - 0.9197207891481876).abs() < SCORE_EPSILON, "{ndcg}");
+    }
+
+    #[test]
+    fn score_question_fills_recall_at_10_and_ndcg_at_10() {
+        // Arrange
+        let retrieved = ids(&["a", "x"]);
+        let relevant = set(&["a"]);
+
+        // Act
+        let metrics = score_question(&retrieved, &relevant);
+
+        // Assert
+        assert_eq!(metrics.recall_at_10, 1.0);
+        assert!((metrics.ndcg_at_10 - 1.0).abs() < SCORE_EPSILON);
+    }
+
+    #[test]
+    fn embed_timings_summarise_latency_and_throughput_from_recorded_durations() {
+        // Arrange: 1 item in 100ms, then 3 items in 300ms.
+        let mut timings = EmbedTimings::default();
+        timings.record(1, Duration::from_millis(100));
+        timings.record(3, Duration::from_millis(300));
+
+        // Act
+        let summary = timings.summary().expect("two calls were recorded");
+
+        // Assert: 4 items over 0.4s is 10 items/s; mean call latency is 200ms.
+        assert_eq!(summary.calls, 2);
+        assert_eq!(summary.items, 4);
+        assert_eq!(summary.total, Duration::from_millis(400));
+        assert_eq!(summary.mean_latency, Duration::from_millis(200));
+        assert!((summary.throughput_per_sec - 10.0).abs() < SCORE_EPSILON);
+    }
+
+    #[test]
+    fn embed_timings_with_no_calls_have_no_summary() {
+        // Arrange
+        let timings = EmbedTimings::default();
+
+        // Act / Assert
+        assert!(timings.summary().is_none());
+    }
+
+    #[test]
+    fn embed_timings_with_zero_elapsed_report_zero_throughput_not_infinity() {
+        // Arrange
+        let mut timings = EmbedTimings::default();
+        timings.record(5, Duration::ZERO);
+
+        // Act
+        let summary = timings.summary().expect("one call was recorded");
+
+        // Assert
+        assert_eq!(summary.throughput_per_sec, 0.0);
+    }
+
+    #[test]
+    fn format_timing_reports_calls_latency_and_throughput() {
+        // Arrange
+        let mut timings = EmbedTimings::default();
+        timings.record(4, Duration::from_millis(400));
+        let summary = timings.summary().expect("one call was recorded");
+
+        // Act
+        let text = format_timing(&summary);
+
+        // Assert
+        assert!(text.contains("latency"), "{text}");
+        assert!(text.contains("throughput"), "{text}");
+        assert!(text.contains("10.0"), "{text}");
     }
 
     fn all_category_scores() -> Vec<CategoryScore> {
@@ -1686,6 +2049,8 @@ mod tests {
                     precision_at_8: 0.75,
                     recall_at_4: 0.9,
                     recall_at_8: 0.95,
+                    recall_at_10: 0.97,
+                    ndcg_at_10: 0.88,
                     mrr: 0.833,
                 }),
             })
@@ -1708,7 +2073,8 @@ mod tests {
             );
         }
         assert!(report.contains("precision"), "{report}");
-        assert!(report.contains("recall"), "{report}");
+        assert!(report.contains("recall@10"), "{report}");
+        assert!(report.contains("nDCG@10"), "{report}");
         assert!(report.contains("MRR"), "{report}");
     }
 
@@ -1913,6 +2279,8 @@ mod tests {
 /// by tier.
 #[cfg(feature = "local")]
 mod real_embedder_run {
+    use std::time::Instant;
+
     use super::*;
 
     /// Read an env override, falling back to `default` when unset. Same
@@ -1972,16 +2340,19 @@ mod real_embedder_run {
         // Seed every fact with a real embedding this time, in addition to
         // everything the text-only tier already seeds.
         let mut ids: HashMap<&str, NodeId> = HashMap::new();
+        let mut timings = EmbedTimings::default();
         for fact in CORPUS {
             let valid_from = fact
                 .valid_from_offset_ms
                 .map(|offset| Millis(base.0 + offset));
             clock.set(valid_from.unwrap_or(base));
 
+            let started = Instant::now();
             let embedding = embedder
                 .embed(fact.content)
                 .await
                 .expect("embed corpus fact");
+            timings.record(1, started.elapsed());
             let mut node =
                 NewNode::now(fact.kind, fact.label, fact.content).with_embedding(embedding);
             if let Some(scope) = fact.scope {
@@ -2015,12 +2386,13 @@ mod real_embedder_run {
 
         for question in QUESTIONS {
             let embedding = if question.category == Category::VectorSemantic {
-                Some(
-                    embedder
-                        .embed(question.query_text)
-                        .await
-                        .expect("embed VectorSemantic query"),
-                )
+                let started = Instant::now();
+                let embedding = embedder
+                    .embed(question.query_text)
+                    .await
+                    .expect("embed VectorSemantic query");
+                timings.record(1, started.elapsed());
+                Some(embedding)
             } else {
                 None
             };
@@ -2080,6 +2452,16 @@ mod real_embedder_run {
 
         let report = format_report(&scores);
         println!("{report}");
+
+        let summary = timings
+            .summary()
+            .expect("the real tier embeds every corpus fact");
+        println!("{}", format_timing(&summary));
+        let vector_semantic_questions = QUESTIONS
+            .iter()
+            .filter(|q| q.category == Category::VectorSemantic)
+            .count();
+        assert_eq!(summary.calls, CORPUS.len() + vector_semantic_questions);
 
         for category in Category::ALL {
             assert!(
