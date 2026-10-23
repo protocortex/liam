@@ -1000,3 +1000,279 @@ fn the_error_names_what_was_wrong_with_the_assertion() {
     assert!(matches!(missing, Error::FactWithoutSource));
     assert!(matches!(trust, Error::InvalidFactTrust(t) if t == 1.5));
 }
+
+fn end_claim(object: &str) -> EndClaim {
+    EndClaim::new(
+        EndFact {
+            subject: "alice".into(),
+            predicate: "lives_in".into(),
+            object: object.into(),
+            scope: None,
+            valid_until: Millis(1000),
+            evidence_at: Millis(200),
+            trust_score: 0.5,
+            source_event_ids: vec![NEW_EVENT.into()],
+        },
+        String::new(),
+    )
+    .unwrap()
+}
+
+fn end_with(state: &KeyState, claim: &EndClaim, rules: &Rules) -> Decision<EndOutcome> {
+    decide_end(state, claim, rules, &mut mint())
+}
+
+#[test]
+fn ending_a_live_fact_closes_it_at_the_given_time() {
+    // Arrange
+    let live = state(vec![version("a", "Sydney")]);
+
+    // Act
+    let decision = end_with(&live, &end_claim("sydney"), &single());
+
+    // Assert
+    assert_eq!(
+        decision.outcome,
+        EndOutcome::Ended {
+            closed: ids(&["a"])
+        }
+    );
+    assert_eq!(decision.plan.close, ids(&["a"]));
+    let clone = inserted(&decision.plan, "m1");
+    assert_eq!(clone.lineage_id, FactId::from_raw("a"));
+    assert_eq!(clone.valid_until, Millis(1000));
+    assert_eq!(clone.evidence_at, Millis(200));
+    assert_eq!(decision.plan.link, linked("a"));
+}
+
+#[test]
+fn ending_follows_the_predicates_match_mode() {
+    // Arrange
+    let live = state(vec![version("a", "Sydney, Australia")]);
+
+    // Act
+    let contains = end_with(
+        &live,
+        &end_claim("Sydney"),
+        &rules(Cardinality::One, MatchMode::Contains),
+    );
+    let exact = end_with(&live, &end_claim("Sydney"), &single());
+
+    // Assert
+    assert!(matches!(contains.outcome, EndOutcome::Ended { .. }));
+    assert_eq!(exact.outcome, EndOutcome::NoMatch);
+}
+
+#[test]
+fn ending_with_no_matching_live_fact_writes_nothing() {
+    // Arrange
+    let live = state(vec![version("a", "Melbourne")]);
+
+    // Act
+    let decision = end_with(&live, &end_claim("Sydney"), &single());
+
+    // Assert
+    assert_eq!(decision.outcome, EndOutcome::NoMatch);
+    assert_eq!(decision.plan, Plan::default());
+}
+
+#[test]
+fn ending_cannot_outrank_a_more_trusted_fact() {
+    // Arrange
+    let mut trusted = version("a", "Sydney");
+    trusted.trust_score = 0.9;
+
+    // Act
+    let decision = end_with(&state(vec![trusted]), &end_claim("Sydney"), &single());
+
+    // Assert
+    assert_eq!(decision.outcome, EndOutcome::Outranked);
+    assert_eq!(decision.plan, Plan::default());
+}
+
+#[test]
+fn ending_at_or_before_the_start_is_rejected() {
+    for valid_until in [Millis(100), Millis(50)] {
+        // Arrange
+        let mut live = version("a", "Sydney");
+        live.valid_from = Millis(100);
+        let mut claim = end_claim("Sydney");
+        claim.end.valid_until = valid_until;
+
+        // Act
+        let decision = end_with(&state(vec![live]), &claim, &single());
+
+        // Assert
+        assert_eq!(decision.outcome, EndOutcome::Rejected, "{valid_until:?}");
+        assert_eq!(decision.plan, Plan::default());
+    }
+}
+
+#[test]
+fn ending_never_extends_a_fact_that_already_ends_sooner() {
+    // Arrange
+    let mut ending = version("a", "Sydney");
+    ending.valid_until = Millis(1000);
+
+    // Act
+    let decision = end_with(&state(vec![ending]), &end_claim("Sydney"), &single());
+
+    // Assert
+    assert_eq!(decision.outcome, EndOutcome::NoMatch);
+}
+
+#[test]
+fn an_end_on_older_evidence_is_recorded_as_history_and_leaves_the_live_fact() {
+    // Arrange
+    let mut live = version("a", "Sydney");
+    live.valid_from = Millis(500);
+    live.evidence_at = Millis(900);
+    let mut claim = end_claim("Sydney");
+    claim.end.evidence_at = Millis(300);
+
+    // Act
+    let decision = end_with(&state(vec![live]), &claim, &single());
+
+    // Assert
+    assert_eq!(decision.outcome, EndOutcome::Ended { closed: vec![] });
+    assert!(decision.plan.close.is_empty());
+    let history = inserted(&decision.plan, "m1");
+    assert_eq!(history.lineage_id, FactId::from_raw("m1"));
+    assert_eq!(
+        (history.valid_from, history.valid_until),
+        (Millis(500), Millis(1000))
+    );
+}
+
+#[test]
+fn replaying_an_end_recorded_as_history_changes_nothing() {
+    // Arrange
+    let mut live = version("a", "Sydney");
+    live.valid_from = Millis(500);
+    live.evidence_at = Millis(900);
+    let mut recorded = version("h", "Sydney");
+    recorded.valid_from = Millis(500);
+    recorded.valid_until = Millis(1000);
+    recorded.source_event_ids = vec![NEW_EVENT.into()];
+    let mut claim = end_claim("Sydney");
+    claim.end.evidence_at = Millis(300);
+
+    // Act
+    let decision = end_with(&state(vec![live, recorded]), &claim, &single());
+
+    // Assert
+    assert_eq!(decision.outcome, EndOutcome::NoMatch);
+    assert_eq!(decision.plan, Plan::default());
+}
+
+#[test]
+fn an_end_is_validated_like_an_assertion() {
+    // Arrange
+    let end = |trust_score, source_event_ids: Vec<String>| EndFact {
+        subject: "alice".into(),
+        predicate: "lives_in".into(),
+        object: "x".into(),
+        scope: None,
+        valid_until: Millis(1),
+        evidence_at: Millis(1),
+        trust_score,
+        source_event_ids,
+    };
+
+    // Act
+    let no_source = EndClaim::new(end(0.5, vec![]), String::new());
+    let bad_trust = EndClaim::new(end(f64::NAN, vec!["e".into()]), String::new());
+
+    // Assert
+    assert!(matches!(no_source, Err(Error::FactWithoutSource)));
+    assert!(matches!(bad_trust, Err(Error::InvalidFactTrust(_))));
+}
+
+#[test]
+fn retracting_closes_the_version_and_records_a_suppression() {
+    // Arrange
+    let target = version("y", "Melbourne");
+    let input = RetractInput {
+        target: &target,
+        restorable: &[],
+        key_taken: false,
+        restore_previous: false,
+    };
+
+    // Act
+    let decision = decide_retract(&input, AT, &mut mint());
+
+    // Assert
+    assert_eq!(
+        decision.outcome,
+        RetractOutcome::Retracted { restored: vec![] }
+    );
+    assert_eq!(decision.plan.close, ids(&["y"]));
+    assert_eq!(
+        decision.plan.suppress,
+        vec![Suppression {
+            retracted_at: AT,
+            ..suppression("Melbourne", 0.5)
+        }]
+    );
+}
+
+#[test]
+fn restoring_reopens_only_the_versions_the_target_closed() {
+    // Arrange
+    let target = version("y", "Melbourne");
+    let mut closed = version("x2", "Sydney");
+    closed.lineage_id = FactId::from_raw("x");
+    closed.valid_until = Millis(500);
+    closed.closed_by = Some(FactId::from_raw("y"));
+    let mut before = version("x1", "Sydney");
+    before.lineage_id = FactId::from_raw("x");
+    let pairs = [(closed, before)];
+    let input = RetractInput {
+        target: &target,
+        restorable: &pairs,
+        key_taken: false,
+        restore_previous: true,
+    };
+
+    // Act
+    let decision = decide_retract(&input, AT, &mut mint());
+
+    // Assert
+    assert_eq!(
+        decision.outcome,
+        RetractOutcome::Retracted {
+            restored: ids(&["m1"])
+        }
+    );
+    assert_eq!(decision.plan.close, ids(&["y", "x2"]));
+    let reopened = inserted(&decision.plan, "m1");
+    assert_eq!(reopened.valid_until, FOREVER);
+    assert_eq!(reopened.lineage_id, FactId::from_raw("x"));
+    assert_eq!((reopened.tx_from, reopened.tx_to), (AT, FOREVER));
+    assert_eq!(reopened.closed_by, None);
+}
+
+#[test]
+fn restoring_is_refused_while_another_live_fact_holds_the_key() {
+    // Arrange
+    let target = version("y", "Melbourne");
+    let input = |restore_previous| RetractInput {
+        target: &target,
+        restorable: &[],
+        key_taken: true,
+        restore_previous,
+    };
+
+    // Act
+    let refused = decide_retract(&input(true), AT, &mut mint());
+    let plain = decide_retract(&input(false), AT, &mut mint());
+
+    // Assert
+    assert_eq!(refused.outcome, RetractOutcome::RestoreBlocked);
+    assert_eq!(refused.plan, Plan::default());
+    assert_eq!(
+        plain.outcome,
+        RetractOutcome::Retracted { restored: vec![] }
+    );
+}
