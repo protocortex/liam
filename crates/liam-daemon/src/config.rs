@@ -13,7 +13,9 @@ use serde::Deserialize;
 
 mod extraction;
 
-pub use extraction::{resolve_vocabulary, ExtractionConfig, PredicateOverride};
+pub use extraction::{
+    declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
+};
 
 /// Producer ids starting with this are reserved for consolidation writes.
 const RESERVED_PRODUCER_PREFIX: &str = "consolidation";
