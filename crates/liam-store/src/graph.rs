@@ -454,6 +454,7 @@ pub struct Candidate {
     pub attributes: serde_json::Value,
     pub confidence: f64,
     pub valid_from: Millis,
+    pub producer: String,
 }
 
 impl Candidate {
@@ -475,6 +476,7 @@ impl Candidate {
             attributes: serde_json::Value::Null,
             confidence: 1.0,
             valid_from: Millis(0),
+            producer: "unknown".to_string(),
         }
     }
 }
@@ -742,6 +744,21 @@ impl<B: Backend> Graph<B> {
     /// it changes the guarantee rather than tightening it.
     pub async fn relate(&self, src: &NodeId, dst: &NodeId, kind: &str) -> Result<EdgeId> {
         Ok(self.project_edge(src, dst, kind, EMPTY_ATTRIBUTES).await?.0)
+    }
+
+    /// `relate`, with the log record stamped by `source` instead of the store,
+    /// so a replay can tell who wrote the edge.
+    pub async fn relate_from(
+        &self,
+        src: &NodeId,
+        dst: &NodeId,
+        kind: &str,
+        source: &str,
+    ) -> Result<EdgeId> {
+        let written = self
+            .project_edge_from(src, dst, kind, EMPTY_ATTRIBUTES, source)
+            .await?;
+        Ok(written.0)
     }
 
     /// Write a batch of nodes and the edges between them as one atomic unit:
@@ -1199,7 +1216,8 @@ impl<B: Backend> Graph<B> {
                 filters.push_str(&format!(" AND kind = ?{}", params.len()));
             }
             let sql = format!(
-                "SELECT id, kind, label, content, scope, attributes, confidence, valid_from, rowid
+                "SELECT id, kind, label, content, scope, attributes, confidence, valid_from, rowid,
+                        producer
                  FROM nodes WHERE id IN ({placeholders}) AND {live}{filters}
                  ORDER BY rowid",
                 live = live_at("nodes", 1),
@@ -1216,6 +1234,7 @@ impl<B: Backend> Graph<B> {
                     attributes: serde_json::from_str(&row.get_string(5)?)?,
                     confidence: row_f64(row, 6),
                     valid_from: Millis(row.get_i64(7)?),
+                    producer: row.get_string(9)?,
                 });
             }
         }
@@ -1259,9 +1278,9 @@ impl<B: Backend> Graph<B> {
         let rows = self
             .backend
             .query(
-                "SELECT id, tx_from, tx_to FROM nodes
+                "SELECT id, tx_from, tx_to, rowid FROM nodes
                  WHERE tx_from > ?1 OR (tx_to > ?1 AND tx_to < ?2)
-                 ORDER BY tx_from",
+                 ORDER BY tx_from, rowid",
                 &[cursor.into(), FOREVER.into()],
             )
             .await?;
@@ -1271,6 +1290,7 @@ impl<B: Backend> Graph<B> {
             out.push(Change {
                 id: NodeId::from_raw(row.get_string(0)?),
                 tx_from: Millis(row.get_i64(1)?),
+                rowid: row.get_i64(3)?,
                 closed: tx_to != FOREVER.0 && tx_to > cursor.0,
             });
         }
