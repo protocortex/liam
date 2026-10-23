@@ -3,6 +3,7 @@
 //! storage is backend-owned and appended via `Backend::vector_ddl`. Open
 //! intervals use the FOREVER sentinel so every currency check is positive.
 
+use crate::ids::FOREVER;
 use crate::types::GraphConfig;
 
 pub fn schema(_config: &GraphConfig) -> String {
@@ -168,8 +169,83 @@ CREATE TABLE IF NOT EXISTS log_quarantine (
 );
 ",
     );
+    sql.push_str(&fact_tables());
 
     sql
+}
+
+/// Bitemporal facts and the state extraction keeps about them. Every row of
+/// `facts` is an immutable version: only `tx_to` and `closed_by` are set later,
+/// once, when a newer version replaces it. `lineage_id` is shared by the
+/// versions of one fact, so it cannot be a foreign key. `scope` uses '' for
+/// none, as `entity_mention_state` does, so keys compare with plain equality.
+///
+/// `facts`, `fact_sources` and `fact_suppressions` are derived from the log and
+/// `extraction_cursor` follows them; `extraction_attempts` is operator state.
+/// None is in `DERIVED_TABLES` yet because no log event writes them, and the
+/// replay that does must add them there.
+fn fact_tables() -> String {
+    let forever = FOREVER.0;
+    format!(
+        "
+CREATE TABLE IF NOT EXISTS facts (
+  id                TEXT    PRIMARY KEY,
+  lineage_id        TEXT    NOT NULL,
+  subject           TEXT    NOT NULL,
+  predicate         TEXT    NOT NULL,
+  object            TEXT    NOT NULL,
+  object_key        TEXT    NOT NULL,
+  evidence_at       INTEGER NOT NULL,
+  scope             TEXT    NOT NULL DEFAULT '',
+  valid_from        INTEGER NOT NULL,
+  valid_until       INTEGER NOT NULL DEFAULT {forever},
+  tx_from           INTEGER NOT NULL,
+  tx_to             INTEGER NOT NULL DEFAULT {forever},
+  closed_by         TEXT    NOT NULL DEFAULT '',
+  confidence        REAL    NOT NULL DEFAULT 1.0,
+  trust_score       REAL    NOT NULL,
+  extractor_id      TEXT    NOT NULL,
+  extractor_version TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS facts_current ON facts (subject, predicate, scope, tx_to);
+CREATE INDEX IF NOT EXISTS facts_lineage ON facts (lineage_id);
+
+CREATE TABLE IF NOT EXISTS fact_sources (
+  lineage_id TEXT NOT NULL,
+  event_id   TEXT NOT NULL,
+  PRIMARY KEY (lineage_id, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS fact_suppressions (
+  subject      TEXT    NOT NULL,
+  predicate    TEXT    NOT NULL,
+  scope        TEXT    NOT NULL DEFAULT '',
+  object_key   TEXT    NOT NULL,
+  trust_score  REAL    NOT NULL,
+  retracted_at INTEGER NOT NULL,
+  PRIMARY KEY (subject, predicate, scope, object_key)
+);
+
+-- One row per extractor, so a stalled model never holds back the rules. The
+-- position is a log offset, stored as its segment and index like log_cursor.
+CREATE TABLE IF NOT EXISTS extraction_cursor (
+  name         TEXT    PRIMARY KEY CHECK (name IN ('rules', 'llm')),
+  last_segment INTEGER NOT NULL,
+  last_index   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS extraction_attempts (
+  batch_key   TEXT    PRIMARY KEY,
+  event_ids   TEXT    NOT NULL,
+  failures    INTEGER NOT NULL,
+  quarantined INTEGER NOT NULL DEFAULT 0,
+  last_error  TEXT    NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+"
+    )
 }
 
 /// When a rebuild empties a derived table.
@@ -203,6 +279,7 @@ pub(crate) const DERIVED_TABLES: [(&str, Clear); 8] = [
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use crate::value::Value;
     use crate::DefaultBackend;
     use tempfile::TempDir;
 
@@ -318,5 +395,305 @@ mod tests {
             .await
             .expect("query sqlite_master");
         assert_eq!(repair_exists[0].get_i64(0).unwrap(), 1);
+    }
+
+    const FACT_TABLES: [&str; 5] = [
+        "facts",
+        "fact_sources",
+        "fact_suppressions",
+        "extraction_cursor",
+        "extraction_attempts",
+    ];
+
+    async fn table_exists(backend: &DefaultBackend, table: &str) -> bool {
+        let rows = backend
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                &[Value::Text(table.to_string())],
+            )
+            .await
+            .expect("query sqlite_master");
+        rows[0].get_i64(0).unwrap() == 1
+    }
+
+    async fn catalogue(backend: &DefaultBackend) -> Vec<(String, String)> {
+        backend
+            .query(
+                "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
+                &[],
+            )
+            .await
+            .expect("read the catalogue")
+            .iter()
+            .map(|row| (row.get_string(0).unwrap(), row.get_string(1).unwrap()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_database_without_fact_tables_gains_them_and_keeps_its_rows() {
+        // Arrange: a database that predates the fact tables, holding a node
+        let (_dir, backend) = file_backend_at("predates.db").await;
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("apply schema");
+        backend
+            .execute(
+                "INSERT INTO nodes (id, kind, label, content, valid_from, tx_from)
+                 VALUES ('n1', 'fact', 'label', 'content', 1, 1)",
+                &[],
+            )
+            .await
+            .expect("insert node");
+        for table in FACT_TABLES {
+            backend
+                .execute(&format!("DROP TABLE {table}"), &[])
+                .await
+                .expect("drop fact table");
+        }
+
+        // Act
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("reapply schema");
+
+        // Assert
+        for table in FACT_TABLES {
+            assert!(table_exists(&backend, table).await, "{table} missing");
+        }
+        let nodes = backend
+            .query("SELECT id FROM nodes", &[])
+            .await
+            .expect("read nodes");
+        assert_eq!(nodes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn applying_the_schema_twice_changes_nothing() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("twice.db").await;
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("apply schema");
+        let first = catalogue(&backend).await;
+
+        // Act
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("reapply schema");
+
+        // Assert
+        assert_eq!(catalogue(&backend).await, first);
+        assert!(table_exists(&backend, "facts").await);
+    }
+
+    /// Fact tables no log event writes yet. The segment that writes one must
+    /// move it into `DERIVED_TABLES`, with the clearing and seeding that
+    /// entails, and delete it from this list; until then a rebuild would keep
+    /// its stale rows.
+    const PENDING_DERIVED_TABLES: [&str; 5] = FACT_TABLES;
+
+    /// Tables that hold state the log cannot recreate, so a rebuild keeps them.
+    const KEPT_TABLES: [&str; 2] = ["log_cursor", "log_backfill_state"];
+
+    async fn shape(backend: &DefaultBackend, table: &str) -> Vec<String> {
+        backend
+            .query(
+                "SELECT name, type, \"notnull\", COALESCE(dflt_value, ''), pk
+                 FROM pragma_table_info(?1) ORDER BY cid",
+                &[Value::Text(table.to_string())],
+            )
+            .await
+            .expect("read table_info")
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {} notnull={} default={:?} pk={}",
+                    r.get_string(0).unwrap(),
+                    r.get_string(1).unwrap(),
+                    r.get_i64(2).unwrap(),
+                    r.get_string(3).unwrap(),
+                    r.get_i64(4).unwrap()
+                )
+            })
+            .collect()
+    }
+
+    async fn indexes_of(backend: &DefaultBackend, table: &str) -> Vec<String> {
+        backend
+            .query(
+                "SELECT name FROM sqlite_master
+                 WHERE type='index' AND tbl_name=?1 AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+                &[Value::Text(table.to_string())],
+            )
+            .await
+            .expect("read indexes")
+            .iter()
+            .map(|r| r.get_string(0).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_fact_tables_have_the_documented_columns_keys_and_indexes() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("shape.db").await;
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("apply schema");
+        let forever = FOREVER.0;
+        let facts = [
+            "id TEXT notnull=0 default=\"\" pk=1".to_string(),
+            "lineage_id TEXT notnull=1 default=\"\" pk=0".to_string(),
+            "subject TEXT notnull=1 default=\"\" pk=0".to_string(),
+            "predicate TEXT notnull=1 default=\"\" pk=0".to_string(),
+            "object TEXT notnull=1 default=\"\" pk=0".to_string(),
+            "object_key TEXT notnull=1 default=\"\" pk=0".to_string(),
+            "evidence_at INTEGER notnull=1 default=\"\" pk=0".to_string(),
+            "scope TEXT notnull=1 default=\"''\" pk=0".to_string(),
+            "valid_from INTEGER notnull=1 default=\"\" pk=0".to_string(),
+            format!("valid_until INTEGER notnull=1 default=\"{forever}\" pk=0"),
+            "tx_from INTEGER notnull=1 default=\"\" pk=0".to_string(),
+            format!("tx_to INTEGER notnull=1 default=\"{forever}\" pk=0"),
+            "closed_by TEXT notnull=1 default=\"''\" pk=0".to_string(),
+            "confidence REAL notnull=1 default=\"1.0\" pk=0".to_string(),
+            "trust_score REAL notnull=1 default=\"\" pk=0".to_string(),
+            "extractor_id TEXT notnull=1 default=\"\" pk=0".to_string(),
+            "extractor_version TEXT notnull=1 default=\"\" pk=0".to_string(),
+        ];
+        let expected: [(&str, Vec<String>, Vec<&str>); 5] = [
+            (
+                "facts",
+                facts.to_vec(),
+                vec!["facts_current", "facts_lineage"],
+            ),
+            (
+                "fact_sources",
+                vec![
+                    "lineage_id TEXT notnull=1 default=\"\" pk=1".into(),
+                    "event_id TEXT notnull=1 default=\"\" pk=2".into(),
+                ],
+                vec![],
+            ),
+            (
+                "fact_suppressions",
+                vec![
+                    "subject TEXT notnull=1 default=\"\" pk=1".into(),
+                    "predicate TEXT notnull=1 default=\"\" pk=2".into(),
+                    "scope TEXT notnull=1 default=\"''\" pk=3".into(),
+                    "object_key TEXT notnull=1 default=\"\" pk=4".into(),
+                    "trust_score REAL notnull=1 default=\"\" pk=0".into(),
+                    "retracted_at INTEGER notnull=1 default=\"\" pk=0".into(),
+                ],
+                vec![],
+            ),
+            (
+                "extraction_cursor",
+                vec![
+                    "name TEXT notnull=0 default=\"\" pk=1".into(),
+                    "last_segment INTEGER notnull=1 default=\"\" pk=0".into(),
+                    "last_index INTEGER notnull=1 default=\"\" pk=0".into(),
+                    "updated_at INTEGER notnull=1 default=\"\" pk=0".into(),
+                ],
+                vec![],
+            ),
+            (
+                "extraction_attempts",
+                vec![
+                    "batch_key TEXT notnull=0 default=\"\" pk=1".into(),
+                    "event_ids TEXT notnull=1 default=\"\" pk=0".into(),
+                    "failures INTEGER notnull=1 default=\"\" pk=0".into(),
+                    "quarantined INTEGER notnull=1 default=\"0\" pk=0".into(),
+                    "last_error TEXT notnull=1 default=\"\" pk=0".into(),
+                    "updated_at INTEGER notnull=1 default=\"\" pk=0".into(),
+                ],
+                vec![],
+            ),
+        ];
+
+        for (table, columns, indexes) in expected {
+            // Act
+            let actual_columns = shape(&backend, table).await;
+            let actual_indexes = indexes_of(&backend, table).await;
+
+            // Assert
+            assert_eq!(actual_columns, columns, "{table} columns");
+            assert_eq!(actual_indexes, indexes, "{table} indexes");
+        }
+        let current = backend
+            .query(
+                "SELECT name FROM pragma_index_info('facts_current') ORDER BY seqno",
+                &[],
+            )
+            .await
+            .expect("read index columns");
+        let current: Vec<_> = current.iter().map(|r| r.get_string(0).unwrap()).collect();
+        assert_eq!(current, ["subject", "predicate", "scope", "tx_to"]);
+    }
+
+    #[tokio::test]
+    async fn an_extraction_cursor_name_must_be_a_known_extractor() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("cursor.db").await;
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("apply schema");
+
+        // Act
+        let result = backend
+            .execute(
+                "INSERT INTO extraction_cursor (name, last_segment, last_index, updated_at)
+                 VALUES ('other', 0, 0, 0)",
+                &[],
+            )
+            .await;
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn every_table_is_derived_kept_or_pending_and_never_two_of_them() {
+        // Arrange
+        let (_dir, backend) = file_backend_at("classified.db").await;
+        backend
+            .execute_batch(&schema(&GraphConfig::new(8)))
+            .await
+            .expect("apply schema");
+        let derived: Vec<&str> = DERIVED_TABLES.iter().map(|(name, _)| *name).collect();
+
+        // Act: the full-text index and its shadow tables follow `nodes`
+        let tables: Vec<String> = backend
+            .query(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                   AND name NOT LIKE 'nodes_fts%' ORDER BY name",
+                &[],
+            )
+            .await
+            .expect("list tables")
+            .iter()
+            .map(|r| r.get_string(0).unwrap())
+            .collect();
+
+        // Assert
+        for table in &tables {
+            let lists = [
+                derived.contains(&table.as_str()),
+                KEPT_TABLES.contains(&table.as_str()),
+                PENDING_DERIVED_TABLES.contains(&table.as_str()),
+            ];
+            let count = lists.iter().filter(|listed| **listed).count();
+            assert_eq!(
+                count, 1,
+                "{table} must be in exactly one of DERIVED_TABLES, KEPT_TABLES, \
+                 PENDING_DERIVED_TABLES"
+            );
+        }
     }
 }

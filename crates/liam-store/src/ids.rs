@@ -10,6 +10,10 @@ pub struct Millis(pub i64);
 /// Sentinel end of an open interval (2100-01-01 UTC).
 pub const FOREVER: Millis = Millis(4_102_444_800_000);
 
+/// Sentinel start of an interval with no known beginning, for a statement that
+/// gives an end but no start ("lived in Perth until 2020").
+pub const BEGINNING: Millis = Millis(i64::MIN);
+
 impl Millis {
     pub fn now() -> Self {
         let ms = std::time::SystemTime::now()
@@ -52,6 +56,7 @@ macro_rules! branded_id {
 
 branded_id!(NodeId);
 branded_id!(EdgeId);
+branded_id!(FactId);
 
 /// Characters of a node id that `recall` renders and `relate` resolves back.
 ///
