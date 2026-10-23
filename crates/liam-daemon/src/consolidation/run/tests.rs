@@ -4,11 +4,13 @@
 //! resume by running again over the same files.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use liam_log::dedup::BloomConfig;
-use liam_log::wal::WalConfig;
+use liam_log::event::{LogEvent, LogPayload};
+use liam_log::wal::{SystemClock, WalConfig, WalError, WalWriter};
+use liam_log::{LogOffset, LogWriter};
 use liam_store::{EmbedError, GraphConfig, NewNode, SharedLog, BEGINNING};
 
 use super::*;
@@ -151,16 +153,64 @@ impl ExtractionHook for RecordingExtraction {
     }
 }
 
+/// A writer that refuses to append the rollback marker while `marker_fails` is
+/// set, and reports itself poisoned on any append while `poisoned` is set.
+struct FlakyWriter {
+    inner: WalWriter<SystemClock>,
+    marker_fails: Arc<AtomicBool>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl LogWriter for FlakyWriter {
+    fn append(&mut self, event: &LogEvent) -> Result<LogOffset, WalError> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(WalError::Poisoned);
+        }
+        let marker = matches!(event.payload, LogPayload::RunRolledBack { .. });
+        if marker && self.marker_fails.load(Ordering::SeqCst) {
+            return Err(WalError::Io(std::io::Error::other(
+                "injected append failure",
+            )));
+        }
+        self.inner.append(event)
+    }
+
+    fn log_id(&self) -> uuid::Uuid {
+        self.inner.log_id()
+    }
+
+    fn head(&self) -> Option<LogOffset> {
+        self.inner.head()
+    }
+}
+
+/// Reopens the store, failing first, or poisoning the log afterwards, when told to.
 pub(super) struct Reopen {
     database_path: PathBuf,
     pub(super) log: SharedLog,
     embedder: Arc<dyn ContentEmbedder>,
+    reopen_fails: Arc<AtomicBool>,
+    poison_on_reopen: Arc<AtomicBool>,
+    writer_poisoned: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl StoreReopener for Reopen {
     async fn reopen(&self) -> anyhow::Result<DefaultGraph> {
-        open_on(&self.database_path, &self.log, &self.embedder).await
+        anyhow::ensure!(
+            !self.reopen_fails.load(Ordering::SeqCst),
+            "injected reopen failure"
+        );
+        let store = open_on(&self.database_path, &self.log, &self.embedder).await?;
+        if self.poison_on_reopen.load(Ordering::SeqCst) {
+            self.writer_poisoned.store(true, Ordering::SeqCst);
+            // The failed append leaves the log poisoned, which a replay refuses.
+            store
+                .insert(note("written to poison the log"))
+                .await
+                .unwrap_err();
+        }
+        Ok(store)
     }
 }
 
@@ -184,6 +234,10 @@ pub(super) struct Env {
     pub(super) dir: tempfile::TempDir,
     pub(super) log: SharedLog,
     pub(super) embedder: Arc<dyn ContentEmbedder>,
+    pub(super) marker_fails: Arc<AtomicBool>,
+    pub(super) reopen_fails: Arc<AtomicBool>,
+    pub(super) poison_on_reopen: Arc<AtomicBool>,
+    writer_poisoned: Arc<AtomicBool>,
 }
 
 impl Env {
@@ -194,9 +248,23 @@ impl Env {
     pub(super) fn with_embedder(embedder: Arc<dyn ContentEmbedder>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("events");
-        let writer = event_log::open_writer(&log_dir, WAL).unwrap();
+        let marker_fails = Arc::new(AtomicBool::new(false));
+        let writer_poisoned = Arc::new(AtomicBool::new(false));
+        let writer = FlakyWriter {
+            inner: event_log::open_writer(&log_dir, WAL).unwrap(),
+            marker_fails: marker_fails.clone(),
+            poisoned: writer_poisoned.clone(),
+        };
         let log = event_log::shared_log(writer, &log_dir, BloomConfig::default(), None).unwrap();
-        Self { dir, log, embedder }
+        Self {
+            dir,
+            log,
+            embedder,
+            marker_fails,
+            reopen_fails: Default::default(),
+            poison_on_reopen: Default::default(),
+            writer_poisoned,
+        }
     }
 
     pub(super) fn database_path(&self) -> PathBuf {
@@ -263,6 +331,9 @@ impl Env {
                 database_path: self.database_path(),
                 log: self.log.clone(),
                 embedder: self.embedder.clone(),
+                reopen_fails: self.reopen_fails.clone(),
+                poison_on_reopen: self.poison_on_reopen.clone(),
+                writer_poisoned: self.writer_poisoned.clone(),
             }),
             probes,
         };
@@ -324,7 +395,9 @@ pub(super) async fn state(shared: &SharedStore) -> (BTreeSet<String>, Links) {
         };
         contents.insert(node.content.clone());
         for other in store.neighbors(&change.id, ALL_LIVE).await.unwrap() {
-            let other = store.get(&other, ALL_LIVE).await.unwrap().unwrap();
+            let Some(other) = store.get(&other, ALL_LIVE).await.unwrap() else {
+                continue;
+            };
             links.insert((node.content.clone(), other.content));
         }
     }

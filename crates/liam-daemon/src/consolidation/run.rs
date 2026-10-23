@@ -179,15 +179,16 @@ impl Consolidator {
             "probe_count is zero, so the run would have no probes to gate it"
         );
         let (mut manifest, refused) = self.begin()?;
-        let verdict = match refused {
-            Some(refused) => Verdict::Rollback(refused.to_string()),
-            None => self.forward(shared, &mut manifest).await?,
+        let verdict = if let Some(refused) = refused {
+            Verdict::Rollback(refused.to_string())
+        } else if manifest.is_complete(rollback::ROLLBACK_PENDING) {
+            Verdict::Rollback("finishing an interrupted rollback".to_owned())
+        } else {
+            self.forward(shared, &mut manifest).await?
         };
         match verdict {
             Verdict::Commit => self.commit(manifest),
-            Verdict::Rollback(reason) => {
-                anyhow::bail!("the run cannot be committed and cannot yet be rolled back: {reason}")
-            }
+            Verdict::Rollback(reason) => self.roll_back(shared, manifest, &reason).await,
         }
     }
 
@@ -450,5 +451,8 @@ fn remove_dir_if_present(path: &Path) {
     }
 }
 
+mod rollback;
+#[cfg(test)]
+mod rollback_tests;
 #[cfg(test)]
 mod tests;

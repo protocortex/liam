@@ -10,7 +10,7 @@
 //! it works. Only the rollback's restore and replay pause them.
 
 use liam_store::DefaultGraph;
-use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct SharedStore {
     slot: RwLock<Option<DefaultGraph>>,
@@ -33,5 +33,10 @@ impl SharedStore {
         RwLockReadGuard::try_map(self.slot.read().await, Option::as_ref).map_err(|_| {
             anyhow::anyhow!("the store is unavailable: a rollback could not reopen it")
         })
+    }
+
+    /// Exclusive access to the slot, for a restore that replaces the store.
+    pub(super) async fn exclusive(&self) -> RwLockWriteGuard<'_, Option<DefaultGraph>> {
+        self.slot.write().await
     }
 }
