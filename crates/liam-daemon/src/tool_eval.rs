@@ -297,9 +297,11 @@ mod real_tier {
         // Assert
         let decoy = HashSet::from([DECOY_LABEL]);
         let target = HashSet::from([TARGET_LABEL]);
-        let baseline_decoy_rr = crate::retrieval_eval::reciprocal_rank(&baseline_labels, &decoy);
-        let baseline_target_rr = crate::retrieval_eval::reciprocal_rank(&baseline_labels, &target);
-        let real_target_rr = crate::retrieval_eval::reciprocal_rank(&real_labels, &target);
+        let baseline_decoy_rr =
+            liam_daemon::retrieval_eval::reciprocal_rank(&baseline_labels, &decoy);
+        let baseline_target_rr =
+            liam_daemon::retrieval_eval::reciprocal_rank(&baseline_labels, &target);
+        let real_target_rr = liam_daemon::retrieval_eval::reciprocal_rank(&real_labels, &target);
         println!(
             "reciprocal rank: baseline decoy={baseline_decoy_rr}, baseline \
              target={baseline_target_rr}, real target={real_target_rr}"
@@ -378,7 +380,7 @@ mod real_tier {
         println!("labels: {labels:?}");
 
         // Assert
-        let rr = crate::retrieval_eval::reciprocal_rank(
+        let rr = liam_daemon::retrieval_eval::reciprocal_rank(
             &labels,
             &HashSet::from([PARAPHRASE_FACT_LABEL]),
         );

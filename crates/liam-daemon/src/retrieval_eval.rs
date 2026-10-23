@@ -15,10 +15,12 @@
 //!   vector arm to rank without one). This is a non-`#[ignore]`d
 //!   `#[tokio::test]`, so it runs under plain `cargo test -p liam-daemon` and
 //!   the existing CI `test` job, with no model download. Added in WU-3.
-//! - **Real-embedder, gated + `#[ignore]`d:** loads the actual local embedder
-//!   behind `#[cfg(feature = "local")]` and scores `VectorSemantic` too.
-//!   Downloads model weights on first run and is slow, like `eval.rs`'s own
-//!   gated tier, so it is `#[ignore]`d rather than part of plain
+//! - **Real-embedder, `#[ignore]`d:** `run_retrieval_eval` loads the actual
+//!   local embedder (needs `--features local`; other builds return an error)
+//!   and scores `VectorSemantic` too. `evaluate_embedder` is the same run
+//!   over any `Embedder`, which the mock-embedder test uses. Downloads model
+//!   weights on first run and is slow, like `eval.rs`'s own gated tier, so
+//!   its test is `#[ignore]`d rather than part of plain
 //!   `cargo test -p liam-daemon`:
 //!
 //!   ```text
@@ -27,8 +29,7 @@
 //!
 //!   Env override: `LIAM_RETRIEVAL_EVAL_MODEL`, mirroring `eval.rs`'s
 //!   `LIAM_EVAL_MODEL` for local A/B runs against a different embedding
-//!   model. Added in WU-4; see `mod real_embedder_run` below for the harness
-//!   itself.
+//!   model.
 //!
 //! # Metrics
 //!
@@ -136,7 +137,13 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use liam_model::{Embedder, TextKind};
 use liam_store::{DefaultGraph, ExplainedHit, Millis, NewEdge, NodeId, Query, Result};
+
+use serde::Serialize;
+
+#[cfg(feature = "local")]
+use crate::{config::Config, models};
 
 mod golden_set;
 use golden_set::{CORPUS, QUESTIONS};
@@ -221,7 +228,7 @@ pub fn reciprocal_rank(retrieved: &[String], relevant: &HashSet<&str>) -> f64 {
 /// The eight query features the retrieval benchmark scores. WU-2 extends this
 /// module with `Fact`/`Question`/`CORPUS`/`QUESTIONS`, which reference this
 /// enum; this WU only needs the enum itself and a stable iteration order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Category {
     Lexical,
     VectorSemantic,
@@ -266,7 +273,7 @@ impl Category {
 
 /// Precision/recall/MRR for one category, once at least one question in it
 /// was actually scored.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct CategoryMetrics {
     pub precision_at_4: f64,
     pub precision_at_8: f64,
@@ -281,7 +288,7 @@ pub struct CategoryMetrics {
 /// the text-only tier never runs `VectorSemantic`, and printing `0.0` for a
 /// metric that never ran would read as "the pipeline scored zero" instead of
 /// "this category was not exercised this run", which is a different fact.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct CategoryScore {
     pub category: Category,
     pub scored: usize,
@@ -356,7 +363,7 @@ struct EmbedCall {
 }
 
 /// Aggregate latency and throughput over every recorded embedder call.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct TimingSummary {
     pub calls: usize,
     pub items: usize,
@@ -442,6 +449,7 @@ struct Fact {
     /// Another fact's `label` this fact's confidence is meant to be compared
     /// against; set only on the higher-confidence ("expected") half of a
     /// `Confidence` pair, read back by the fixture-consistency check below.
+    #[cfg_attr(not(test), allow(dead_code))]
     competes_with: Option<&'static str>,
 }
 
@@ -479,6 +487,7 @@ struct Question {
     /// label is checked against the text rather than trusted. For a
     /// `GraphExpansion` question the answer lives in the linked fact, not the
     /// seed.
+    #[cfg_attr(not(test), allow(dead_code))]
     answer: &'static str,
 }
 
@@ -639,6 +648,7 @@ fn retrieved_and_relevant<'a>(
 /// Assert every scored metric across every category is a valid, finite
 /// fraction in `[0.0, 1.0]`. Shared with WU-4 for the same reason as
 /// `build_query` above.
+#[cfg(test)]
 fn assert_metrics_in_unit_range(per_category: &HashMap<Category, Vec<CategoryMetrics>>) {
     for metrics in per_category.values().flatten() {
         for value in [
@@ -656,6 +666,238 @@ fn assert_metrics_in_unit_range(per_category: &HashMap<Category, Vec<CategoryMet
             );
         }
     }
+}
+
+/// The result of one embedder-backed run over `CORPUS`/`QUESTIONS`.
+///
+/// `per_category` always holds one row per `Category`, in `Category::ALL`
+/// order, so two reports line up row by row and serialize identically for
+/// identical metrics.
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalReport {
+    pub model_id: String,
+    pub dims: usize,
+    pub corpus_facts: usize,
+    pub questions: usize,
+    pub per_category: Vec<CategoryScore>,
+    /// Mean over every scored question, not over the category means, so a
+    /// category with more questions weighs more.
+    pub overall: Option<CategoryMetrics>,
+    /// `None` only if nothing was embedded.
+    pub timings: Option<TimingSummary>,
+    /// Names of `GraphExpansion` questions whose hits showed no expansion.
+    /// Non-empty means an edge was not seeded or not consulted.
+    pub graph_expansion_unexpanded: Vec<String>,
+}
+
+impl EvalReport {
+    /// The report as printable text: a header, the per-category table, the
+    /// overall row, and the embed timing line.
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        // `write!` into a `String` never fails.
+        let _ = writeln!(
+            out,
+            "model: {} ({} dims), {} facts, {} questions",
+            self.model_id, self.dims, self.corpus_facts, self.questions
+        );
+        out.push_str(&format_report(&self.per_category));
+        if let Some(m) = self.overall {
+            let _ = writeln!(
+                out,
+                "overall: recall@10 {:.3}, nDCG@10 {:.3}, MRR {:.3}",
+                m.recall_at_10, m.ndcg_at_10, m.mrr
+            );
+        }
+        if let Some(summary) = &self.timings {
+            out.push_str(&format_timing(summary));
+        }
+        out
+    }
+}
+
+/// Text embedded once, untimed, before the corpus so one-off model
+/// initialisation does not inflate the first timed call.
+const WARM_UP_TEXT: &str = "warm-up";
+
+/// Loads `model_id` and runs the benchmark with it. This is the entry point
+/// for callers that only have a model name.
+///
+/// Reads the dimensions and cache directory from the daemon's shipped
+/// defaults, so the harness measures what the daemon would run.
+///
+/// # Errors
+///
+/// Fails when the model cannot be loaded, including in a build without the
+/// `local` feature, which has no real embedder to load.
+pub async fn run_retrieval_eval(model_id: &str) -> anyhow::Result<EvalReport> {
+    let embedder = load_embedder(model_id)?;
+    evaluate_embedder(embedder.as_ref(), model_id).await
+}
+
+#[cfg(feature = "local")]
+fn load_embedder(model_id: &str) -> anyhow::Result<Box<dyn Embedder>> {
+    use anyhow::Context as _;
+
+    let defaults = Config::default();
+    let cache_dir = models::resolve_path_with_home(
+        "embedder.cache_dir",
+        &defaults.embedder.cache_dir,
+        &std::env::var("HOME").unwrap_or_default(),
+    )?;
+    let embedder =
+        liam_model::FastEmbedEmbedder::load(model_id, defaults.embedding_dims, &cache_dir)
+            .with_context(|| format!("loading embedder {model_id}"))?;
+    Ok(Box::new(embedder))
+}
+
+#[cfg(not(feature = "local"))]
+fn load_embedder(model_id: &str) -> anyhow::Result<Box<dyn Embedder>> {
+    anyhow::bail!(
+        "cannot load embedder {model_id}: this build has no local models. \
+         Rebuild with `--features local`."
+    )
+}
+
+/// Seeds `CORPUS` into a fresh in-memory store with embeddings from
+/// `embedder`, runs every question (embedding the `VectorSemantic` query
+/// text too), and scores the results.
+///
+/// Takes the embedder as a parameter so tests can run the whole pipeline with
+/// the mock. Metric values are only meaningful for a real model.
+///
+/// # Errors
+///
+/// Fails on an embedder or store error. An empty result for a question is a
+/// valid zero score, not an error.
+pub async fn evaluate_embedder(
+    embedder: &dyn Embedder,
+    model_id: &str,
+) -> anyhow::Result<EvalReport> {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use anyhow::Context as _;
+    use liam_store::{FixedClock, GraphConfig, NewNode};
+
+    let dims = embedder.dims();
+    embedder
+        .embed(WARM_UP_TEXT, TextKind::Document)
+        .await
+        .context("warm-up embed")?;
+
+    // `Knob::AsOf` needs each row's transaction time to match its backdated
+    // `valid_from`; the store's real clock would stamp every row "now" and
+    // hide all of them from an as-of query in the past. So the clock is
+    // driven by the harness.
+    let base = Millis::now();
+    let clock = Arc::new(FixedClock::new(base));
+    let store = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(dims), clock.clone())
+        .await
+        .context("opening in-memory store")?;
+
+    let mut ids: HashMap<&str, NodeId> = HashMap::new();
+    let mut timings = EmbedTimings::default();
+    for fact in CORPUS {
+        let valid_from = fact
+            .valid_from_offset_ms
+            .map(|offset| Millis(base.0 + offset));
+        clock.set(valid_from.unwrap_or(base));
+
+        let started = Instant::now();
+        let embedding = embedder
+            .embed(fact.content, TextKind::Document)
+            .await
+            .with_context(|| format!("embedding corpus fact {}", fact.label))?;
+        timings.record(1, started.elapsed());
+
+        let mut node = NewNode::now(fact.kind, fact.label, fact.content).with_embedding(embedding);
+        if let Some(scope) = fact.scope {
+            node = node.with_scope(scope);
+        }
+        if let Some(confidence) = fact.confidence {
+            node = node.with_confidence(confidence);
+        }
+        if let Some(valid_from) = valid_from {
+            node = node.with_valid_from(valid_from);
+        }
+        let id = store
+            .insert(node)
+            .await
+            .with_context(|| format!("seeding corpus fact {}", fact.label))?;
+        ids.insert(fact.label, id);
+    }
+
+    // Edges and every query resolve "now" to `base`, not to the last
+    // backdated instant the loop above left the clock at.
+    clock.set(base);
+    seed_graph_expansion_edges(&store, &ids)
+        .await
+        .context("linking GraphExpansion pairs")?;
+
+    let mut per_category: HashMap<Category, Vec<CategoryMetrics>> = HashMap::new();
+    let mut graph_expansion_unexpanded: Vec<String> = Vec::new();
+    for question in QUESTIONS {
+        let embedding = if question.category == Category::VectorSemantic {
+            let started = Instant::now();
+            let embedding = embedder
+                .embed(question.query_text, TextKind::Query)
+                .await
+                .with_context(|| format!("embedding query for {}", question.name))?;
+            timings.record(1, started.elapsed());
+            Some(embedding)
+        } else {
+            None
+        };
+        let query = build_query(question, base, HARNESS_K, embedding);
+        let hits = store
+            .query_explained(&query)
+            .await
+            .with_context(|| format!("running question {}", question.name))?;
+
+        if question.category == Category::GraphExpansion && !hits.iter().any(|h| h.expanded) {
+            graph_expansion_unexpanded.push(question.name.to_string());
+        }
+
+        let (retrieved, relevant) = retrieved_and_relevant(&hits, question, &ids);
+        per_category
+            .entry(question.category)
+            .or_default()
+            .push(score_question(&retrieved, &relevant));
+    }
+
+    let per_category_scores: Vec<CategoryScore> = Category::ALL
+        .iter()
+        .map(|&category| {
+            let results = per_category.get(&category).map_or(&[][..], Vec::as_slice);
+            CategoryScore {
+                category,
+                scored: results.len(),
+                metrics: average_category_metrics(results),
+            }
+        })
+        .collect();
+    // Fixed order: float addition is not associative, so summing in HashMap
+    // order would make the overall mean differ in its last digits per run.
+    let all_questions: Vec<CategoryMetrics> = Category::ALL
+        .iter()
+        .filter_map(|category| per_category.get(category))
+        .flatten()
+        .copied()
+        .collect();
+
+    Ok(EvalReport {
+        model_id: model_id.to_string(),
+        dims,
+        corpus_facts: CORPUS.len(),
+        questions: QUESTIONS.len(),
+        per_category: per_category_scores,
+        overall: average_category_metrics(&all_questions),
+        timings: timings.summary(),
+        graph_expansion_unexpanded,
+    })
 }
 
 #[cfg(test)]
@@ -1655,6 +1897,128 @@ mod tests {
         assert!(!report.contains("0.000"), "{report}");
     }
 
+    /// Mock embedding width for the whole-pipeline runs below.
+    const MOCK_DIMS: usize = 8;
+
+    fn hand_built_report() -> EvalReport {
+        let metrics = CategoryMetrics {
+            precision_at_4: 0.25,
+            precision_at_8: 0.125,
+            recall_at_4: 0.5,
+            recall_at_8: 0.75,
+            recall_at_10: 0.9,
+            ndcg_at_10: 0.8,
+            mrr: 0.7,
+        };
+        EvalReport {
+            model_id: "test/model".to_string(),
+            dims: 4,
+            corpus_facts: 3,
+            questions: 2,
+            per_category: vec![
+                CategoryScore {
+                    category: Category::Lexical,
+                    scored: 2,
+                    metrics: Some(metrics),
+                },
+                CategoryScore {
+                    category: Category::VectorSemantic,
+                    scored: 0,
+                    metrics: None,
+                },
+            ],
+            overall: Some(metrics),
+            timings: Some(TimingSummary {
+                calls: 2,
+                items: 2,
+                total: Duration::from_millis(20),
+                mean_latency: Duration::from_millis(10),
+                throughput_per_sec: 100.0,
+            }),
+            graph_expansion_unexpanded: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn render_lists_header_table_overall_and_timing_in_order() {
+        // Arrange
+        let report = hand_built_report();
+
+        // Act
+        let text = report.render();
+
+        // Assert
+        let positions: Vec<usize> = [
+            "model: test/model (4 dims), 3 facts, 2 questions",
+            "Lexical",
+            "VectorSemantic",
+            "overall: recall@10 0.900, nDCG@10 0.800, MRR 0.700",
+            "embedder: 2 calls",
+        ]
+        .iter()
+        .map(|needle| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in: {text}"))
+        })
+        .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
+    }
+
+    #[test]
+    fn report_serializes_categories_in_order_with_null_for_unscored() {
+        // Arrange
+        let report = hand_built_report();
+
+        // Act
+        let json = serde_json::to_value(&report).expect("serialize report");
+
+        // Assert
+        assert_eq!(json["model_id"], "test/model");
+        assert_eq!(json["per_category"][0]["category"], "Lexical");
+        assert_eq!(json["per_category"][0]["metrics"]["recall_at_10"], 0.9);
+        assert_eq!(json["per_category"][1]["category"], "VectorSemantic");
+        assert!(json["per_category"][1]["metrics"].is_null());
+        assert_eq!(json["timings"]["calls"], 2);
+    }
+
+    #[tokio::test]
+    async fn evaluate_embedder_with_the_mock_scores_every_category() {
+        // Arrange
+        let embedder = liam_model::MockEmbedder::new(MOCK_DIMS);
+
+        // Act
+        let report = evaluate_embedder(&embedder, "mock")
+            .await
+            .expect("mock run succeeds");
+
+        // Assert
+        let categories: Vec<Category> = report.per_category.iter().map(|s| s.category).collect();
+        assert_eq!(categories, Category::ALL);
+        assert!(report.per_category.iter().all(|s| s.metrics.is_some()));
+        assert_eq!(report.dims, MOCK_DIMS);
+        assert_eq!(report.corpus_facts, CORPUS.len());
+        assert_eq!(report.questions, QUESTIONS.len());
+        assert!(report.graph_expansion_unexpanded.is_empty());
+        let vector_questions = QUESTIONS
+            .iter()
+            .filter(|q| q.category == Category::VectorSemantic)
+            .count();
+        let timings = report.timings.expect("the mock run embeds the corpus");
+        assert_eq!(timings.calls, CORPUS.len() + vector_questions);
+    }
+
+    #[cfg(not(feature = "local"))]
+    #[tokio::test]
+    async fn run_retrieval_eval_without_the_local_feature_explains_how_to_fix_it() {
+        // Act
+        let err = run_retrieval_eval("any/model")
+            .await
+            .expect_err("no real embedder in this build");
+
+        // Assert
+        assert!(err.to_string().contains("--features local"), "{err}");
+    }
+
     /// Mock embedding width: irrelevant to this tier, since no fact is ever
     /// seeded with an embedding (see the module doc's "text-only" tier), but
     /// `GraphConfig` still needs a configured vector-table dimension to open.
@@ -1835,216 +2199,56 @@ mod tests {
     }
 }
 
-/// Real-embedder tier: gated behind `feature = "local"` and `#[ignore]`d,
-/// since it downloads model weights on first run and takes real time (see
-/// the module doc's "Two tiers" section for the exact run command). A
-/// sibling of `mod tests`, not nested inside it, specifically so it can
-/// `use super::*;` and reuse `build_query`/`score_question`/
-/// `average_category_metrics`/`HARNESS_K`/`seed_graph_expansion_edges`/
-/// `retrieved_and_relevant`/`assert_metrics_in_unit_range` the same way
-/// `mod tests` does. The corpus-seeding loop itself stays duplicated
-/// between the two tiers below (this one embeds each fact, `mod tests`'s
-/// does not); that is the one piece of the harness that genuinely differs
-/// by tier.
-#[cfg(feature = "local")]
+/// Real-embedder tier: `#[ignore]`d since it downloads model weights on first
+/// run (see the module doc's "Two tiers" section for the run command).
+#[cfg(all(test, feature = "local"))]
 mod real_embedder_run {
-    use std::time::Instant;
-
     use super::*;
 
-    /// Read an env override, falling back to `default` when unset. Same
-    /// small shape as `eval.rs`'s own `env_or`; redefined locally rather
-    /// than shared across modules since it is a two-line function with no
-    /// state to keep in sync.
-    fn env_or(key: &str, default: &str) -> String {
-        std::env::var(key).unwrap_or_else(|_| default.to_string())
+    /// `LIAM_RETRIEVAL_EVAL_MODEL` overrides the model for a local A/B run,
+    /// mirroring `eval.rs`'s `LIAM_EVAL_MODEL`.
+    fn model_id() -> String {
+        std::env::var("LIAM_RETRIEVAL_EVAL_MODEL")
+            .unwrap_or_else(|_| Config::default().embedder.model)
     }
 
-    /// Given the seeded `CORPUS`/`QUESTIONS` fixtures and a real local
-    /// embedder, when every question runs (including `VectorSemantic`, which
-    /// the text-only tier above skips) against a real in-memory store, then
-    /// the harness completes without panicking, every scored metric lands in
-    /// `[0.0, 1.0]`, every `GraphExpansion` question individually shows
-    /// graph expansion at work, and the printed report names all 8
-    /// categories.
+    /// Given the seeded fixtures and a real local embedder, when every
+    /// question runs including `VectorSemantic`, then every metric lands in
+    /// `[0.0, 1.0]`, every `GraphExpansion` question shows expansion, and the
+    /// printed report names all 8 categories.
     #[tokio::test]
     #[ignore = "downloads embedder weights; see module doc for the run command"]
     async fn real_embedder_tier_scores_every_category_including_vector_semantic() {
-        use std::sync::Arc;
-
-        use liam_model::{Embedder, TextKind};
-        use liam_store::{DefaultGraph, FixedClock, GraphConfig, NewNode};
-
-        // Arrange: load the real embedder first, since its output width
-        // sizes the store's vector table below. `model_id`/`dims` read the
-        // daemon's own shipped defaults (`Config::default()`), not a
-        // hardcoded copy, so this harness keeps measuring whatever the
-        // daemon actually ships; `LIAM_RETRIEVAL_EVAL_MODEL` overrides the
-        // model for a local A/B run, mirroring `eval.rs`'s `LIAM_EVAL_MODEL`.
-        let model_id = env_or(
-            "LIAM_RETRIEVAL_EVAL_MODEL",
-            &crate::config::Config::default().embedder.model,
-        );
-        let dims = crate::config::Config::default().embedding_dims;
-        let cache_dir = liam_daemon::models::resolve_path_with_home(
-            "embedder.cache_dir",
-            &crate::config::Config::default().embedder.cache_dir,
-            &std::env::var("HOME").unwrap_or_default(),
-        )
-        .expect("resolve embedder.cache_dir");
-        let embedder = liam_model::FastEmbedEmbedder::load(&model_id, dims, &cache_dir)
-            .expect("load real embedder");
-
-        // Untimed warm-up so one-off model initialisation does not inflate
-        // the first timed call.
-        embedder
-            .embed("warm-up", TextKind::Document)
+        // Act
+        let report = run_retrieval_eval(&model_id())
             .await
-            .expect("warm-up embed");
+            .expect("real embedder run");
+        let text = report.render();
+        println!("{text}");
 
-        // Same bitemporal-clock pattern as the text-only tier's test above
-        // (see its comment for why `DefaultGraph::open`'s real clock would
-        // break `Knob::AsOf`), but this tier's own store instance,
-        // independent of that test's.
-        let base = Millis::now();
-        let clock = Arc::new(FixedClock::new(base));
-        let store =
-            DefaultGraph::open_with_clock(":memory:", GraphConfig::new(dims), clock.clone())
-                .await
-                .expect("open in-memory store");
-
-        // Seed every fact with a real embedding this time, in addition to
-        // everything the text-only tier already seeds.
-        let mut ids: HashMap<&str, NodeId> = HashMap::new();
-        let mut timings = EmbedTimings::default();
-        for fact in CORPUS {
-            let valid_from = fact
-                .valid_from_offset_ms
-                .map(|offset| Millis(base.0 + offset));
-            clock.set(valid_from.unwrap_or(base));
-
-            let started = Instant::now();
-            let embedding = embedder
-                .embed(fact.content, TextKind::Document)
-                .await
-                .expect("embed corpus fact");
-            timings.record(1, started.elapsed());
-            let mut node =
-                NewNode::now(fact.kind, fact.label, fact.content).with_embedding(embedding);
-            if let Some(scope) = fact.scope {
-                node = node.with_scope(scope);
-            }
-            if let Some(confidence) = fact.confidence {
-                node = node.with_confidence(confidence);
-            }
-            if let Some(valid_from) = valid_from {
-                node = node.with_valid_from(valid_from);
-            }
-            let id = store.insert(node).await.expect("seed corpus fact");
-            ids.insert(fact.label, id);
-        }
-
-        // Back to "today" for edges and every query below, same reason as
-        // the text-only tier's test.
-        clock.set(base);
-
-        // Seed GraphExpansion edges, same direction convention as the
-        // text-only tier's test.
-        seed_graph_expansion_edges(&store, &ids)
-            .await
-            .expect("link GraphExpansion pair");
-
-        // Act: run every question, no category filter this time, scoring
-        // each against WU-1's metrics. VectorSemantic questions get their
-        // query text embedded too, then passed through `build_query`.
-        let mut per_category: HashMap<Category, Vec<CategoryMetrics>> = HashMap::new();
-        let mut graph_expansion_expanded: Vec<(&str, bool)> = Vec::new();
-
-        for question in QUESTIONS {
-            let embedding = if question.category == Category::VectorSemantic {
-                let started = Instant::now();
-                let embedding = embedder
-                    .embed(question.query_text, TextKind::Query)
-                    .await
-                    .expect("embed VectorSemantic query");
-                timings.record(1, started.elapsed());
-                Some(embedding)
-            } else {
-                None
-            };
-            let query = build_query(question, base, HARNESS_K, embedding);
-            // An empty result is a valid 0.0-scoring outcome, not a harness
-            // bug; only a genuine store error panics here.
-            let hits = store
-                .query_explained(&query)
-                .await
-                .expect("query_explained should succeed");
-
-            if question.category == Category::GraphExpansion {
-                graph_expansion_expanded.push((question.name, hits.iter().any(|h| h.expanded)));
-            }
-
-            let (retrieved, relevant) = retrieved_and_relevant(&hits, question, &ids);
-
-            per_category
-                .entry(question.category)
-                .or_default()
-                .push(score_question(&retrieved, &relevant));
-        }
-
-        // Assert: every scored metric is a valid, finite fraction.
+        // Assert
+        let per_category: HashMap<Category, Vec<CategoryMetrics>> = report
+            .per_category
+            .iter()
+            .filter_map(|s| s.metrics.map(|m| (s.category, vec![m])))
+            .collect();
         assert_metrics_in_unit_range(&per_category);
-
-        // Assert: EVERY GraphExpansion question individually observed
-        // expanded == true, same strengthened check as the text-only
-        // tier's test above (see its comment for why a single OR'd bool is
-        // too weak here).
-        let graph_expansion_not_expanded: Vec<&str> = graph_expansion_expanded
-            .iter()
-            .filter(|(_, expanded)| !expanded)
-            .map(|(name, _)| *name)
-            .collect();
         assert!(
-            graph_expansion_not_expanded.is_empty(),
-            "expected every GraphExpansion question to have expanded == true, proving its edge \
-             was seeded and consulted, but {graph_expansion_not_expanded:?} did not \
-             (saw: {graph_expansion_expanded:?})"
+            report.graph_expansion_unexpanded.is_empty(),
+            "GraphExpansion questions without expansion: {:?}",
+            report.graph_expansion_unexpanded
         );
-
-        // Aggregate per-category into the report; every category is scored
-        // this tier, including VectorSemantic (no not-run special case).
-        let scores: Vec<CategoryScore> = Category::ALL
-            .iter()
-            .map(|&category| {
-                let empty = Vec::new();
-                let results = per_category.get(&category).unwrap_or(&empty);
-                CategoryScore {
-                    category,
-                    scored: results.len(),
-                    metrics: average_category_metrics(results),
-                }
-            })
-            .collect();
-
-        let report = format_report(&scores);
-        println!("{report}");
-
-        let summary = timings
-            .summary()
-            .expect("the real tier embeds every corpus fact");
-        println!("{}", format_timing(&summary));
-        println!("(timings exclude the untimed warm-up embed call)");
-        let vector_semantic_questions = QUESTIONS
+        for category in Category::ALL {
+            assert!(
+                text.contains(category.name()),
+                "report missing category {category:?}: {text}"
+            );
+        }
+        let vector_questions = QUESTIONS
             .iter()
             .filter(|q| q.category == Category::VectorSemantic)
             .count();
-        assert_eq!(summary.calls, CORPUS.len() + vector_semantic_questions);
-
-        for category in Category::ALL {
-            assert!(
-                report.contains(category.name()),
-                "report missing category {category:?}: {report}"
-            );
-        }
+        let timings = report.timings.expect("the real tier embeds every fact");
+        assert_eq!(timings.calls, CORPUS.len() + vector_questions);
     }
 }

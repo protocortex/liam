@@ -21,6 +21,10 @@
 //! the same log. The stderr logging setup is shared so `liam` reports failures
 //! the way the daemon does.
 //!
+//! The retrieval eval harness is shared for the same reason: `liam` runs it
+//! from the command line and the tests run it with a mock embedder. Nothing in
+//! `liamd` calls it, so the daemon does not link or initialise it.
+//!
 //! Everything else the daemon owns (the MCP surface, the socket transport)
 //! stays private to the `liamd` binary, because the CLI has no business
 //! reaching into it.
@@ -29,5 +33,6 @@ pub mod config;
 pub mod embedder_fingerprint;
 pub mod event_log;
 pub mod models;
+pub mod retrieval_eval;
 pub mod storelock;
 pub mod telemetry;
