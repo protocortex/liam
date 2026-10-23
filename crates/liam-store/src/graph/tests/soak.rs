@@ -103,15 +103,6 @@ async fn write_round(source: &DefaultGraph, round: usize) -> Written {
     written
 }
 
-/// Drops a store without closing its connections, which still releases its
-/// hold on the log. libsql intermittently crashes in `sqlite3Close` when a
-/// release build closes connections to a database this size, and that would
-/// fail the soak for a reason unrelated to the log. The process ends with the
-/// test, so nothing outlives it. See #181.
-fn leak(graph: DefaultGraph) {
-    std::mem::forget(graph.backend);
-}
-
 /// Ingests at least `rows` rows through the real log-first path, rebuilds the
 /// log into a fresh store, and asserts the sorted multisets of content hashes
 /// are identical for the live rows and for all rows, closed ones included, so
@@ -142,7 +133,7 @@ async fn ingest_and_rebuild(rows: usize) {
     let live_before = oracle_multiset(&source).await;
     let all_before = all_rows_multiset(&source).await;
     let stored = count(&source, "nodes").await + count(&source, "edges").await;
-    leak(source);
+    drop(source);
     drop(log);
 
     let (fresh, fresh_log) = env
@@ -183,7 +174,7 @@ async fn ingest_and_rebuild(rows: usize) {
         all_before.len()
     );
     assert_eq!(report.live_nodes + report.live_edges, live_before.len());
-    leak(rebuilt);
+    drop(rebuilt);
 }
 
 async fn sweep(source: &DefaultGraph, retention: &RetentionPolicy, total: &mut GcReport) {
