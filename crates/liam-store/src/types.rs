@@ -23,6 +23,8 @@ pub mod relation {
     pub const MENTIONS: &str = "mentions";
     /// Links two nodes representing the same real-world entity.
     pub const SAME_AS: &str = "same_as";
+    /// Links a node to the earlier node whose content it nearly repeats.
+    pub const NEAR_DUPLICATE_OF: &str = "near_duplicate_of";
 }
 
 /// Construction parameters. `embedding_dims` sets the dimension the backend's
@@ -312,6 +314,9 @@ pub struct ExplainedHit {
 pub struct Change {
     pub id: NodeId,
     pub tx_from: Millis,
+    /// Insertion order of the row, the tie-break between changes that share
+    /// a `tx_from`.
+    pub rowid: i64,
     /// True when the change is a closure (the node left the live set).
     pub closed: bool,
 }

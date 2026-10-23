@@ -1077,6 +1077,25 @@ async fn log_write_relate_appends_one_edge_write_equal_to_the_stored_row() {
 }
 
 #[tokio::test]
+async fn log_write_relate_from_stamps_the_event_with_the_given_source() {
+    // Arrange
+    let (g, appended, _log_id, _clock) = clocked_graph::<DefaultBackend>(Millis(1000)).await;
+    let src = g.insert(fact_at("src")).await.unwrap();
+    let dst = g.insert(fact_at("dst")).await.unwrap();
+    let since = events(&appended).len();
+
+    // Act
+    g.relate_from(&src, &dst, "mentions", "consolidation:test")
+        .await
+        .unwrap();
+
+    // Assert
+    let logged = events_since(&appended, since);
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(logged[0].source, "consolidation:test");
+}
+
+#[tokio::test]
 async fn log_write_link_appends_one_edge_write_carrying_its_attributes() {
     // Arrange
     let (g, appended, log_id, clock) = clocked_graph::<DefaultBackend>(Millis(1000)).await;

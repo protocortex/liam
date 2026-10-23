@@ -29,7 +29,7 @@ use crate::types::{relation, EpisodeEdge, NewNode};
 use crate::value::Value;
 
 /// Source and trust of a record no producer wrote, such as an edge.
-const STORE_SOURCE: &str = "liam-store";
+pub(super) const STORE_SOURCE: &str = "liam-store";
 pub(super) const STORE_TRUST: f64 = 1.0;
 
 /// A table whose rows a content hash or a tombstone can point at.
@@ -158,8 +158,13 @@ impl Plan {
         Self::new(node_event(&row, now, LogPayload::EpisodeBatch(effects)))
     }
 
-    fn edge_write(row: EdgeRow, now: Millis, refusal_if_absent: Option<Error>) -> Self {
-        let stamp = (STORE_SOURCE, STORE_TRUST);
+    fn edge_write(
+        row: EdgeRow,
+        now: Millis,
+        source: &str,
+        refusal_if_absent: Option<Error>,
+    ) -> Self {
+        let stamp = (source, STORE_TRUST);
         let hash = edge_row_hash(&row);
         let event = event(hash, stamp, now.0, now, LogPayload::EdgeWrite(row));
         Self::new(event).deduplicated(Table::Edges, refusal_if_absent)
@@ -332,7 +337,12 @@ async fn plan_supersede(
 /// since answering it as a duplicate would drop the caller's. Any other live
 /// twin is refused unless the log recorded it, since only an indexed twin can be
 /// answered as a duplicate.
-async fn plan_edge(tx: &mut dyn BackendTx, row: EdgeRow, now: Millis) -> Result<Plan> {
+async fn plan_edge(
+    tx: &mut dyn BackendTx,
+    row: EdgeRow,
+    now: Millis,
+    source: String,
+) -> Result<Plan> {
     let [source_live, target_live, twin_live] =
         edge_guards(tx, &row.src, &row.dst, &row.edge_type).await?;
     let (src, dst) = (NodeId::from_raw(&row.src), NodeId::from_raw(&row.dst));
@@ -358,7 +368,12 @@ async fn plan_edge(tx: &mut dyn BackendTx, row: EdgeRow, now: Millis) -> Result<
             )));
         }
     }
-    Ok(Plan::edge_write(row, now, twin_live.then_some(refusal)))
+    Ok(Plan::edge_write(
+        row,
+        now,
+        &source,
+        twin_live.then_some(refusal),
+    ))
 }
 
 /// The attributes of the live edge that already relates `row`'s endpoints.
@@ -524,6 +539,18 @@ impl<B: Backend> Graph<B> {
         kind: &str,
         attributes: &str,
     ) -> Result<(EdgeId, WriteOutcome)> {
+        self.project_edge_from(src, dst, kind, attributes, STORE_SOURCE)
+            .await
+    }
+
+    pub(super) async fn project_edge_from(
+        &self,
+        src: &NodeId,
+        dst: &NodeId,
+        kind: &str,
+        attributes: &str,
+        source: &str,
+    ) -> Result<(EdgeId, WriteOutcome)> {
         self.refuse_reserved([kind])?;
         let id = EdgeId::new();
         let outcome = self
@@ -537,7 +564,8 @@ impl<B: Backend> Graph<B> {
                     tx_from: now.0,
                     tx_to: FOREVER.0,
                 };
-                Box::pin(plan_edge(tx, row, now))
+                let source = source.to_string();
+                Box::pin(plan_edge(tx, row, now, source))
             })
             .await?;
         Ok((outcome.edge_id(&id), outcome))
