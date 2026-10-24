@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The extraction part of a consolidation run. It reads the log from the
-//! model pass's own cursor, up to what the store has applied, and hands the
-//! window to the model loop, which writes the facts under the run's source so a
-//! rollback of the run takes them away again.
+//! The extraction part of a consolidation run. Two passes, each with its own
+//! log cursor: the rules pass, which needs no model, and the model pass. Each
+//! reads the log up to what the store has applied and writes its facts under
+//! the run's source, so a rollback of the run takes them away again.
 //!
-//! The cursor moves only after the facts are written, and every write is
+//! A cursor moves only after its facts are written, and every write is
 //! idempotent, so a run that stops anywhere is finished by the next one.
 
 use std::sync::Arc;
@@ -13,6 +13,8 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use liam_daemon::consolidation::hooks::{ExtractCtx, ExtractionHook, ExtractionReport};
+use liam_log::event::LogEvent;
 use liam_log::reader::LogReader;
 use liam_log::LogOffset;
 use liam_store::ExtractorName;
@@ -21,14 +23,18 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::apply::{apply_rules, ApplyContext};
 use super::cache::CacheStore;
 use super::client::ModelIdentity;
 use super::extractor::ExtractionReport as ModelRun;
 use super::extractor::{extract_events, ExtractionDeps, ExtractorProvider};
 use super::inputs::events_to_inputs;
 use super::sidecar::FreeRam;
-use crate::config::{ExtractionConfig, MAX_RUN_DEADLINE_SECS};
-use liam_daemon::consolidation::hooks::{ExtractCtx, ExtractionHook, ExtractionReport};
+use crate::config::{resolve_vocabulary, ExtractionConfig, MAX_RUN_DEADLINE_SECS};
+
+/// Entity pages the rules look for in each event. The cap bounds the memory
+/// and scan time of a store with a very large number of them.
+const MAX_KNOWN_ENTITIES: usize = 10_000;
 
 /// What the extraction part is built from.
 pub struct ExtractionHooks {
@@ -45,35 +51,85 @@ pub struct ExtractionHooks {
     pub stopping: CancellationToken,
 }
 
+/// The oldest events a pass has not read, in log order.
+struct Window {
+    events: Vec<(LogOffset, LogEvent)>,
+    end: LogOffset,
+}
+
 #[async_trait]
 impl ExtractionHook for ExtractionHooks {
     async fn extract(&self, ctx: &ExtractCtx<'_>) -> anyhow::Result<ExtractionReport> {
-        if !self.config.enabled || !self.config.llm_enabled {
+        if !self.config.enabled {
             return Ok(ExtractionReport::default());
         }
-        self.model_pass(ctx).await
+        // The passes do not depend on each other: a model that cannot start
+        // must not stall the rules, and a rules failure must not stall the model.
+        let rules = self.rules_pass(ctx).await.map(|()| false);
+        let model = if self.config.llm_enabled {
+            self.model_pass(ctx).await
+        } else {
+            Ok(false)
+        };
+        let mut partial = false;
+        for (pass, outcome) in [("rules", rules), ("model", model)] {
+            match outcome {
+                Ok(left_work) => partial |= left_work,
+                Err(error) => {
+                    warn!(pass, error = %format!("{error:#}"), "extraction: a pass failed");
+                    partial = true;
+                }
+            }
+        }
+        Ok(ExtractionReport { partial })
     }
 }
 
 impl ExtractionHooks {
-    async fn model_pass(&self, ctx: &ExtractCtx<'_>) -> anyhow::Result<ExtractionReport> {
-        let Some(applied) = ctx.store.last_applied_offset().await? else {
-            return Ok(ExtractionReport::default());
+    async fn rules_pass(&self, ctx: &ExtractCtx<'_>) -> anyhow::Result<()> {
+        let Some(window) = self.window(ctx, ExtractorName::Rules).await? else {
+            return Ok(());
         };
-        let from = ctx.store.extraction_cursor(ExtractorName::Llm).await?;
-        let events = self.read_window(from, applied).await?;
-        let Some(&(window_end, _)) = events.last() else {
-            return Ok(ExtractionReport::default());
+        let inputs = events_to_inputs(&window.events, self.config.min_event_chars);
+        if !inputs.is_empty() {
+            let known = ctx.store.live_entity_subjects(MAX_KNOWN_ENTITIES).await?;
+            if known.len() >= MAX_KNOWN_ENTITIES {
+                warn!(
+                    limit = MAX_KNOWN_ENTITIES,
+                    "extraction: more entity pages than the rules look for, the rest are not matched"
+                );
+            }
+            let vocabulary = resolve_vocabulary(&self.config);
+            let apply = ApplyContext {
+                store: ctx.store,
+                config: &self.config,
+                vocabulary: &vocabulary,
+                write_source: &ctx.source,
+            };
+            let counts = apply_rules(&apply, &inputs, &known).await?;
+            info!(
+                ?counts,
+                inputs = inputs.len(),
+                "extraction: rules pass done"
+            );
+        }
+        advance(ctx, ExtractorName::Rules, window.end).await
+    }
+
+    /// True when work was left for a later run.
+    async fn model_pass(&self, ctx: &ExtractCtx<'_>) -> anyhow::Result<bool> {
+        let Some(window) = self.window(ctx, ExtractorName::Llm).await? else {
+            return Ok(false);
         };
-        let inputs = events_to_inputs(&events, self.config.min_event_chars);
+        let inputs = events_to_inputs(&window.events, self.config.min_event_chars);
         info!(
-            events = events.len(),
+            events = window.events.len(),
             inputs = inputs.len(),
             "extraction: model pass starting"
         );
         if inputs.is_empty() {
-            advance(ctx, window_end).await?;
-            return Ok(ExtractionReport::default());
+            advance(ctx, ExtractorName::Llm, window.end).await?;
+            return Ok(false);
         }
         // Validation caps the setting; the cap here keeps a hand built config
         // from overflowing the deadline.
@@ -89,7 +145,7 @@ impl ExtractionHooks {
             write_source: &ctx.source,
             deadline: Instant::now() + Duration::from_secs(deadline_secs),
             stopping: &self.stopping,
-            window_end,
+            window_end: window.end,
         };
         // The loop stops between batches when the daemon is stopping; dropping
         // it mid write would leave the event log poisoned.
@@ -98,37 +154,45 @@ impl ExtractionHooks {
             warn!("extraction: the daemon is stopping, the rest of the window is left for the next run");
         }
         if let Some(done) = run.completed_offset {
-            advance(ctx, done).await?;
+            advance(ctx, ExtractorName::Llm, done).await?;
         }
-        Ok(ExtractionReport {
-            partial: is_partial(&run),
-        })
+        Ok(is_partial(&run))
     }
 
-    /// The oldest `max_events_per_run` events after `from`, up to `through`.
-    async fn read_window(
+    /// The oldest `max_events_per_run` events after the cursor of `name`, up
+    /// to what the store has applied, or `None` when there are none.
+    async fn window(
         &self,
-        from: Option<LogOffset>,
-        through: LogOffset,
-    ) -> anyhow::Result<Vec<(LogOffset, liam_log::event::LogEvent)>> {
-        let mut records = self.reader.scan_through(from, through);
+        ctx: &ExtractCtx<'_>,
+        name: ExtractorName,
+    ) -> anyhow::Result<Option<Window>> {
+        let Some(applied) = ctx.store.last_applied_offset().await? else {
+            return Ok(None);
+        };
+        let from = ctx.store.extraction_cursor(name).await?;
+        let mut records = self.reader.scan_through(from, applied);
         let mut events = Vec::new();
         while events.len() < self.config.max_events_per_run {
-            match records.next().await {
-                Some(record) => {
-                    let record = record.context("could not read the event log")?;
-                    events.push((record.offset, record.event));
-                }
-                None => break,
-            }
+            let Some(record) = records.next().await else {
+                break;
+            };
+            let record = record.context("could not read the event log")?;
+            events.push((record.offset, record.event));
         }
-        Ok(events)
+        Ok(events
+            .last()
+            .map(|&(end, _)| end)
+            .map(|end| Window { events, end }))
     }
 }
 
-async fn advance(ctx: &ExtractCtx<'_>, offset: LogOffset) -> anyhow::Result<()> {
+async fn advance(
+    ctx: &ExtractCtx<'_>,
+    name: ExtractorName,
+    offset: LogOffset,
+) -> anyhow::Result<()> {
     ctx.store
-        .advance_extraction_cursor(ExtractorName::Llm, offset)
+        .advance_extraction_cursor(name, offset)
         .await
         .context("could not move the extraction cursor")?;
     Ok(())

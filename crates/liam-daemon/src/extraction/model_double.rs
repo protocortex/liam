@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::bail;
 use async_trait::async_trait;
@@ -40,6 +41,8 @@ pub struct ModelDouble {
     stops_on_call: Option<(usize, CancellationToken)>,
     /// A prompt holding this text gets an answer that is not JSON.
     garbles: Mutex<Option<String>>,
+    /// The call, counted from 1, that answers only after the pause.
+    slow_on_call: Option<(usize, Duration)>,
 }
 
 impl ModelDouble {
@@ -63,6 +66,11 @@ impl JsonExtractor for ModelDouble {
             if *stop_call == call {
                 token.cancel();
                 std::future::pending::<()>().await;
+            }
+        }
+        if let Some((slow_call, pause)) = self.slow_on_call {
+            if slow_call == call {
+                tokio::time::sleep(pause).await;
             }
         }
         let garbled = self.garbles.lock().unwrap();
@@ -94,22 +102,28 @@ pub struct ProviderDouble {
 
 impl ProviderDouble {
     pub fn new() -> Arc<Self> {
-        Self::with(None, None)
+        Self::with(None, None, None)
+    }
+
+    /// The model's `call`-th answer takes `pause`.
+    pub fn slow_on_call(call: usize, pause: Duration) -> Arc<Self> {
+        Self::with(None, None, Some((call, pause)))
     }
 
     /// The model's process is gone after its `call`-th answer.
     pub fn dying_on_call(call: usize) -> Arc<Self> {
-        Self::with(Some(call), None)
+        Self::with(Some(call), None, None)
     }
 
     /// The daemon begins stopping during the model's `call`-th answer.
     pub fn stopping_on_call(call: usize, token: CancellationToken) -> Arc<Self> {
-        Self::with(None, Some((call, token)))
+        Self::with(None, Some((call, token)), None)
     }
 
     fn with(
         dies_on_call: Option<usize>,
         stops_on_call: Option<(usize, CancellationToken)>,
+        slow_on_call: Option<(usize, Duration)>,
     ) -> Arc<Self> {
         Arc::new(Self {
             model: Arc::new(ModelDouble {
@@ -119,6 +133,7 @@ impl ProviderDouble {
                 dies_on_call,
                 stops_on_call,
                 garbles: Mutex::new(None),
+                slow_on_call,
             }),
             opens: AtomicUsize::new(0),
             fail_open: AtomicBool::new(false),
