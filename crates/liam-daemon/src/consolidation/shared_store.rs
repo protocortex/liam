@@ -43,8 +43,30 @@ impl SharedStore {
         })
     }
 
+    /// Checks, under the write guard, that the slot's handle is the only one, so
+    /// a restore can take the store out of it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the slot is empty or another handle holds the store.
+    pub(super) async fn ensure_restorable(&self) -> anyhow::Result<()> {
+        match self.slot.write().await.as_ref() {
+            Some(store) if Arc::strong_count(store) == 1 => Ok(()),
+            Some(_) => anyhow::bail!(
+                "the store is still held outside its slot, so it cannot be closed for the restore"
+            ),
+            None => anyhow::bail!("the store is not in its slot"),
+        }
+    }
+
+    /// True while a restore holds the slot or waits for it, so a new read would
+    /// have to wait too.
+    pub fn is_contended(&self) -> bool {
+        self.slot.try_read().is_err()
+    }
+
     /// Exclusive access to the slot, for a restore that replaces the store.
-    pub(super) async fn exclusive(&self) -> RwLockWriteGuard<'_, Option<Arc<DefaultGraph>>> {
+    pub async fn exclusive(&self) -> RwLockWriteGuard<'_, Option<Arc<DefaultGraph>>> {
         self.slot.write().await
     }
 }

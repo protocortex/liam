@@ -583,10 +583,7 @@ async fn a_rollback_waits_for_a_request_in_flight_and_then_completes() {
         let (run, shared) = (run.clone(), shared.clone());
         tokio::spawn(async move { run.consolidate(&shared).await })
     };
-    while !RunManifest::load(&manifest_path_for(&env.database_path()))
-        .unwrap()
-        .is_some_and(|manifest| manifest.is_complete(ROLLBACK_MARKED))
-    {
+    while !shared.is_contended() {
         tokio::time::sleep(POLL).await;
     }
 

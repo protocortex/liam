@@ -510,7 +510,7 @@ async fn resynthesize_stale(
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(resynthesis.ask_timeout_secs.max(1));
         match server
-            .resynthesize_entity_as(node_id, deadline, max_new_tokens, write_source)
+            .resynthesize_entity_as(store, node_id, deadline, max_new_tokens, write_source)
             .await
         {
             Ok(()) => {

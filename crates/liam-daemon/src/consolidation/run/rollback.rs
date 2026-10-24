@@ -44,6 +44,9 @@ impl Consolidator {
                 return self.end(manifest, RunOutcome::RestoreFailed);
             }
             if !manifest.is_complete(ROLLBACK_PENDING) {
+                // Once pending is recorded the run never goes forward, so a
+                // restore that could not happen must be found out first.
+                shared.ensure_restorable().await?;
                 self.finish_step(&mut manifest, ROLLBACK_PENDING)?;
             }
             shared
@@ -74,7 +77,9 @@ impl Consolidator {
             Ok(store) => store,
             Err(held) => {
                 *slot = Some(held);
-                anyhow::bail!("the store is still held outside its slot, so it cannot be closed for the restore");
+                anyhow::bail!(
+                    "the store is still held outside its slot, so it cannot be closed for the restore"
+                );
             }
         };
         let restored = store.restore_snapshot(&self.database_path, snapshot).await;

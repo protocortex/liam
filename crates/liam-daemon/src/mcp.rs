@@ -673,10 +673,16 @@ impl MemoryServer {
         self.granted_capacity.clone()
     }
 
+    /// Shares this server's store slot with the consolidation job, whose
+    /// rollback swaps the store in it.
+    #[cfg(test)]
+    pub(crate) fn shared_store(&self) -> Arc<SharedStore> {
+        self.store.clone()
+    }
+
     /// The store for one call. The guard holds back a rollback's restore, so
-    /// it is not kept across another `store()` outside the consolidation job's
-    /// own maintenance step: a restore waiting in between would block the
-    /// second read behind it. Only that job restores, and not during its step.
+    /// it is never kept across another `store()`: a restore queued in between
+    /// would block the second read behind it, and neither would proceed.
     ///
     /// # Errors
     ///
@@ -1020,22 +1026,30 @@ impl MemoryServer {
         deadline: tokio::time::Instant,
         max_new_tokens: usize,
     ) -> Result<(), String> {
-        self.resynthesize_entity_as(entity_id, deadline, max_new_tokens, None)
+        // Held through the model call: a rollback waits for it, as for an `ask`.
+        let store = self
+            .store()
+            .await
+            .map_err(|e| format!("{}: {e}", entity_id.as_str()))?;
+        self.resynthesize_entity_as(&store, entity_id, deadline, max_new_tokens, None)
             .await
     }
 
     /// `resynthesize_entity` with the new page written under `write_source`
     /// instead of the server's producer, so a consolidation run's rollback
-    /// cancels the write and the supersession that comes with it.
+    /// cancels the write and the supersession that comes with it. Works on the
+    /// caller's `store`, never locking the slot again: a second read behind a
+    /// queued restore would deadlock.
     pub(crate) async fn resynthesize_entity_as(
         &self,
+        store: &DefaultGraph,
         entity_id: liam_store::NodeId,
         deadline: tokio::time::Instant,
         max_new_tokens: usize,
         write_source: Option<&str>,
     ) -> Result<(), String> {
         let now = liam_store::Millis::now();
-        let candidate = match on_store!(self, |store| store.get(&entity_id, now)) {
+        let candidate = match store.get(&entity_id, now).await {
             Ok(Some(c)) => c,
             Ok(None) => {
                 return Err(format!(
@@ -1046,14 +1060,11 @@ impl MemoryServer {
             Err(e) => return Err(format!("{}: {e}", entity_id.as_str())),
         };
         let label = candidate.label.clone();
-        let mentions: Vec<ask::Evidence> = match on_store!(self, |store| store.mentions(
-            &entity_id,
-            now,
-            MENTIONS_FETCH_LIMIT
-        )) {
-            Ok(rows) => rows.iter().map(ask::Evidence::from_candidate).collect(),
-            Err(e) => return Err(format!("{label}: {e}")),
-        };
+        let mentions: Vec<ask::Evidence> =
+            match store.mentions(&entity_id, now, MENTIONS_FETCH_LIMIT).await {
+                Ok(rows) => rows.iter().map(ask::Evidence::from_candidate).collect(),
+                Err(e) => return Err(format!("{label}: {e}")),
+            };
         let new_content = match synthesis::synthesize_entity(
             &*self.llm,
             &self.aimd_handles(),
@@ -1082,7 +1093,7 @@ impl MemoryServer {
             node = node.with_scope(scope);
         }
         node.content = new_content;
-        match on_store!(self, |store| store.upsert_by(node)) {
+        match store.upsert_by(node).await {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("{label}: {e}")),
         }
@@ -3617,6 +3628,7 @@ mod tests {
         // Act
         server
             .resynthesize_entity_as(
+                &server.store().await.unwrap(),
                 entity_id.clone(),
                 deadline,
                 ENTITY_SYNTHESIS_MAX_NEW_TOKENS,
@@ -7192,5 +7204,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Yields until the shared slot is held or awaited by a writer.
+    async fn until_contended(shared: &SharedStore) {
+        for _ in 0..YIELDS {
+            if shared.is_contended() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("no writer ever queued");
+    }
+
+    /// Yields enough times for a spawned task to run to its first wait.
+    async fn settle() {
+        for _ in 0..YIELDS {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    const YIELDS: usize = 200;
+    const BOUND: Duration = Duration::from_secs(10);
+
+    fn recall_args() -> RecallArgs {
+        RecallArgs {
+            query: "anything".to_string(),
+            kind: None,
+            scope: None,
+            k: None,
+            as_of: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resynthesis_on_the_callers_store_finishes_while_a_restore_is_queued() {
+        // Arrange: the caller holds a read guard and a writer queues behind it
+        let (server, _embedder) =
+            server_with_recording_embedder_and_llm(Arc::new(CountingLlm::new())).await;
+        let shared = server.shared_store();
+        let guard = server.store().await.unwrap();
+        let entity_id = guard
+            .upsert_by(NewNode::entity("person", "Kim"))
+            .await
+            .unwrap();
+        let queued = {
+            let shared = shared.clone();
+            tokio::spawn(async move { drop(shared.exclusive().await) })
+        };
+        until_contended(&shared).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act: a second read behind the queued writer would never return
+        let resynthesized = tokio::time::timeout(
+            BOUND,
+            server.resynthesize_entity_as(&guard, entity_id, deadline, 64, None),
+        )
+        .await;
+        drop(guard);
+
+        // Assert
+        assert!(matches!(resynthesized, Ok(Ok(()))), "{resynthesized:?}");
+        tokio::time::timeout(BOUND, queued).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_request_during_a_swap_waits_and_is_then_served() {
+        // Arrange: a restore holds the slot
+        let (server, _embedder) = server_with_recording_embedder().await;
+        let shared = server.shared_store();
+        let swap = shared.exclusive().await;
+        let request = {
+            let server = server.clone();
+            tokio::spawn(async move { server.recall(Parameters(recall_args())).await })
+        };
+
+        // Act
+        settle().await;
+        let waiting = !request.is_finished();
+        drop(swap);
+        let answer = tokio::time::timeout(BOUND, request).await.unwrap().unwrap();
+
+        // Assert
+        assert!(waiting, "the request must wait for the swap");
+        assert!(!answer.contains("failed"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_request_after_a_swap_that_lost_the_store_gets_a_clean_error() {
+        // Arrange: the restore could not reopen the store
+        let (server, _embedder) = server_with_recording_embedder().await;
+        let shared = server.shared_store();
+        let mut swap = shared.exclusive().await;
+        *swap = None;
+        let request = {
+            let server = server.clone();
+            tokio::spawn(async move { server.recall(Parameters(recall_args())).await })
+        };
+        settle().await;
+
+        // Act
+        drop(swap);
+        let answer = tokio::time::timeout(BOUND, request).await.unwrap().unwrap();
+
+        // Assert
+        assert!(answer.starts_with("recall failed"), "{answer}");
+        assert!(answer.contains("store is unavailable"), "{answer}");
     }
 }
