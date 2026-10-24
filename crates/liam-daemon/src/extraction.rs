@@ -15,6 +15,8 @@ mod iso_date;
 pub(crate) mod model_double;
 pub mod prompt;
 pub mod provider;
+#[cfg(test)]
+mod r10;
 pub mod response;
 pub mod rules;
 pub mod setup;
