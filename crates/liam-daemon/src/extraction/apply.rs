@@ -5,7 +5,7 @@
 
 use liam_store::{
     ArbitrationCaps, ArbitrationOutcome, DefaultGraph, EndFact, EndOutcome, Error, ExtractorName,
-    Millis, NewFact, Vocabulary, BEGINNING, FOREVER,
+    Millis, NewFact, PredicateSpec, Vocabulary, BEGINNING, FOREVER, MAX_FACTS_PER_BATCH,
 };
 
 use super::grounding::supporting_events;
@@ -57,6 +57,7 @@ impl std::error::Error for ApplyError {}
 impl From<Error> for ApplyError {
     fn from(error: Error) -> Self {
         match error {
+            Error::FactInBatch { source, .. } => Self::from(*source),
             Error::InvalidFactInterval { .. }
             | Error::InvalidFactTrust(_)
             | Error::FactWithoutSource
@@ -89,7 +90,8 @@ impl Grounded {
     }
 }
 
-/// Writes the facts of `parsed`, whose event numbers index `batch`.
+/// Writes the facts of `parsed`, whose event numbers index `batch`. A run of
+/// asserted facts is one atomic store write; an ended fact is its own write.
 pub async fn apply_answer(
     ctx: &ApplyContext<'_>,
     batch: &[&ExtractionInput],
@@ -101,16 +103,53 @@ pub async fn apply_answer(
     };
     let mut grounded = ground(ctx, batch, parsed.facts, &mut counts);
     grounded.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+
+    let mut asserted: Vec<(NewFact, PredicateSpec)> = Vec::new();
     for item in &grounded {
-        match write(ctx, batch, item).await? {
-            Written::Changed => counts.written += 1,
-            Written::Unchanged => {}
-            Written::Dropped => counts.dropped += 1,
-            Written::EndedNoMatch => counts.ended_no_match += 1,
-            Written::EndedOutranked => counts.ended_outranked += 1,
+        match prepare(ctx, batch, item) {
+            None => counts.dropped += 1,
+            Some(Prepared::Assert(fact, spec)) => asserted.push((fact, spec)),
+            Some(Prepared::End(end, spec)) => {
+                flush_asserted(ctx, &mut asserted, &mut counts).await?;
+                let outcome = ctx.store.end_fact(end, &spec, ctx.write_source).await?;
+                match outcome {
+                    EndOutcome::Ended { .. } => counts.written += 1,
+                    EndOutcome::NoMatch => counts.ended_no_match += 1,
+                    EndOutcome::Outranked => counts.ended_outranked += 1,
+                    EndOutcome::Rejected => counts.dropped += 1,
+                }
+            }
         }
     }
+    flush_asserted(ctx, &mut asserted, &mut counts).await?;
     Ok(counts)
+}
+
+async fn flush_asserted(
+    ctx: &ApplyContext<'_>,
+    asserted: &mut Vec<(NewFact, PredicateSpec)>,
+    counts: &mut ApplyCounts,
+) -> Result<(), ApplyError> {
+    let caps = ArbitrationCaps {
+        max_competing_per_key: ctx.config.max_competing_per_key,
+    };
+    for chunk in std::mem::take(asserted)
+        .chunks(MAX_FACTS_PER_BATCH)
+        .map(<[_]>::to_vec)
+    {
+        for outcome in ctx
+            .store
+            .assert_facts(chunk, ctx.write_source, caps)
+            .await?
+        {
+            match outcome {
+                ArbitrationOutcome::Suppressed => counts.dropped += 1,
+                ArbitrationOutcome::Corroborated { changed: false, .. } => {}
+                _ => counts.written += 1,
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ground(
@@ -138,25 +177,22 @@ fn ground(
         .collect()
 }
 
-enum Written {
-    Changed,
-    Unchanged,
-    Dropped,
-    EndedNoMatch,
-    EndedOutranked,
+enum Prepared {
+    Assert(NewFact, PredicateSpec),
+    End(EndFact, PredicateSpec),
 }
 
-async fn write(
+/// The store call a grounded fact becomes, or `None` when its dates cannot
+/// make a valid fact and it is dropped.
+fn prepare(
     ctx: &ApplyContext<'_>,
     batch: &[&ExtractionInput],
     item: &Grounded,
-) -> Result<Written, ApplyError> {
+) -> Option<Prepared> {
     let sources: Vec<&ExtractionInput> = item.supporting.iter().map(|&i| batch[i]).collect();
     let fact = &item.fact;
     let spec = ctx.vocabulary.spec(&fact.predicate);
-    let Some(dates) = Dates::of(fact, &sources) else {
-        return Ok(Written::Dropped);
-    };
+    let dates = Dates::of(fact, &sources)?;
     let trust = trust_of(ctx.config, &sources);
     let evidence_at = sources
         .iter()
@@ -178,16 +214,8 @@ async fn write(
             trust_score: trust,
             source_event_ids,
         };
-        return Ok(
-            match ctx.store.end_fact(end, &spec, ctx.write_source).await? {
-                EndOutcome::Ended { .. } => Written::Changed,
-                EndOutcome::NoMatch => Written::EndedNoMatch,
-                EndOutcome::Outranked => Written::EndedOutranked,
-                EndOutcome::Rejected => Written::Dropped,
-            },
-        );
+        return Some(Prepared::End(end, spec));
     }
-
     let new = NewFact {
         subject: fact.subject.clone(),
         predicate: fact.predicate.clone(),
@@ -202,18 +230,7 @@ async fn write(
         extractor_version: PROMPT_VERSION.to_string(),
         source_event_ids,
     };
-    let caps = ArbitrationCaps {
-        max_competing_per_key: ctx.config.max_competing_per_key,
-    };
-    let outcome = ctx
-        .store
-        .assert_fact(new, &spec, ctx.write_source, caps)
-        .await?;
-    Ok(match outcome {
-        ArbitrationOutcome::Suppressed => Written::Dropped,
-        ArbitrationOutcome::Corroborated { changed: false, .. } => Written::Unchanged,
-        _ => Written::Changed,
-    })
+    Some(Prepared::Assert(new, spec))
 }
 
 /// The strongest source trust, scaled down because a model can misread.
@@ -251,6 +268,11 @@ impl Dates {
             None if until.is_some() => BEGINNING,
             None => earliest_observed,
         };
+        // An empty or backwards span is a fact the model got wrong, not a
+        // batch the store should refuse.
+        if fact.polarity == Polarity::Asserted && from >= until.unwrap_or(FOREVER) {
+            return None;
+        }
         Some(Self {
             from,
             until,
