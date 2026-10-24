@@ -18,7 +18,7 @@ const MANIFEST_SUFFIX: &str = ".consolidation.json";
 /// other version is refused rather than guessed at. Any new manifest field must
 /// bump it: `flatten` rules out `deny_unknown_fields`, so an older build would
 /// silently drop the field and rewrite the file without it.
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 /// How a finished run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +26,14 @@ pub enum RunOutcome {
     Committed,
     RolledBack,
     RestoreFailed,
+}
+
+/// The extraction model a run's facts came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionModel {
+    pub model_id: String,
+    pub model_sha256: String,
+    pub prompt_version: String,
 }
 
 /// Everything needed to reproduce and resume a run.
@@ -44,6 +52,9 @@ pub struct RunManifest {
     /// Where the run's near-duplicate pass stopped, saved as the next pass's
     /// start once the run commits.
     pub dedup_resume_from: Option<ScanPosition>,
+    /// Set when the extraction step ran a model.
+    #[serde(default)]
+    pub extraction_model: Option<ExtractionModel>,
     pub completed_steps: Vec<String>,
     pub outcome: Option<RunOutcome>,
 }
@@ -121,6 +132,7 @@ impl RunManifest {
             snapshot_meta_path: None,
             snapshot_database_path: None,
             dedup_resume_from: None,
+            extraction_model: None,
             completed_steps: Vec::new(),
             outcome: None,
         }
@@ -330,7 +342,8 @@ mod tests {
         let path = manifest_path_for(&dir.path().join("liam.db"));
         manifest().save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, text.replace("\"version\": 3", "\"version\": 99")).unwrap();
+        let current = format!("\"version\": {FORMAT_VERSION}");
+        std::fs::write(&path, text.replace(&current, "\"version\": 99")).unwrap();
 
         // Act
         let result = RunManifest::load(&path);

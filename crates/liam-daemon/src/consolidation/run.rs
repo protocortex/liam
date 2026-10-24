@@ -309,8 +309,11 @@ impl Consolidator {
             EXTRACT => {
                 let configured = self.parts.hooks.extraction.is_some();
                 let ctx = ExtractCtx { store, source };
-                let result = self.parts.hooks.extract(&ctx).await;
-                self.note_hook(step, configured, result.map(|r| r.partial), manifest)?;
+                let result = self.parts.hooks.extract(&ctx).await.map(|report| {
+                    manifest.extraction_model = report.model.or(manifest.extraction_model.take());
+                    report.partial
+                });
+                self.note_hook(step, configured, result, manifest)?;
             }
             SUMMARIZE => {
                 let configured = self.parts.hooks.summary.is_some();

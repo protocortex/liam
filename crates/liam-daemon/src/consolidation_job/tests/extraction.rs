@@ -17,7 +17,8 @@ use super::*;
 use crate::config::ExtractionConfig;
 use crate::extraction::cache::{cache_path, CacheStore};
 use crate::extraction::hooks::ExtractionHooks;
-use crate::extraction::model_double::{employment, ProviderDouble};
+use crate::extraction::model_double::{employment, ProviderDouble, MODEL_ID, MODEL_SHA};
+use crate::extraction::prompt::PROMPT_VERSION;
 use crate::extraction::sidecar::FreeRam;
 
 const CLIENT: &str = "claude-code";
@@ -87,7 +88,7 @@ fn extraction_part(
         },
         reader: Arc::new(SequentialScanReader::local(&log_dir).unwrap()),
         provider: provider.clone(),
-        identity: crate::extraction::model_double::identity(),
+        identity: Some(crate::extraction::model_double::identity()),
         cache: Arc::new(CacheStore::open(cache_path(&database_in(&harness.root))).unwrap()),
         permits: Arc::new(Semaphore::new(1)),
         free_ram: Arc::new(PlentyOfRam),
@@ -217,6 +218,32 @@ async fn a_run_with_extraction_writes_the_facts_and_moves_the_cursor_to_the_last
         .unwrap();
     assert!(done(&manifest, "extract"));
     assert!(!done(&manifest, "extract:partial"));
+    let model = manifest.extraction_model.expect("the model was recorded");
+    assert_eq!(model.model_id, MODEL_ID);
+    assert_eq!(model.model_sha256, MODEL_SHA);
+    assert_eq!(model.prompt_version, PROMPT_VERSION);
+}
+
+#[tokio::test]
+async fn a_model_pass_without_a_model_identity_fails_the_step_partial_and_starts_nothing() {
+    // Arrange
+    let harness = Harness::new();
+    let server = seeded(&harness, PEOPLE.len()).await;
+    let provider = ProviderDouble::new();
+    let mut part = extraction_part(&harness, &provider, config());
+    part.identity = None;
+    let job = harness.job_with_hooks(&server, honest(), None, hooks_of(part));
+
+    // Act
+    let outcome = job.tick().await;
+
+    // Assert
+    assert_eq!(outcome, Some(RunOutcome::Committed));
+    let manifest = RunManifest::load(&harness.manifest_path())
+        .unwrap()
+        .unwrap();
+    assert!(done(&manifest, "extract:partial"));
+    assert_eq!(provider.opens(), 0);
 }
 
 #[tokio::test]

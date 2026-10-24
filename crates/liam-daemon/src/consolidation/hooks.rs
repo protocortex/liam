@@ -8,6 +8,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use liam_store::DefaultGraph;
 
+use super::manifest::ExtractionModel;
+
 /// Input to the extraction part.
 pub struct ExtractCtx<'a> {
     /// The store the run guards, which the part reads and writes through.
@@ -23,6 +25,8 @@ pub struct ExtractionReport {
     /// Some of the work was left undone, such as batches the model could not
     /// answer. The run records the step as partial and goes on.
     pub partial: bool,
+    /// The model that answered, to be recorded in the run's manifest.
+    pub model: Option<ExtractionModel>,
 }
 
 /// Input to the summary part.

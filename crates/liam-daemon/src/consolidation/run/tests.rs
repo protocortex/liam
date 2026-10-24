@@ -149,7 +149,32 @@ impl ExtractionHook for PartialExtraction {
         &self,
         _ctx: &ExtractCtx<'_>,
     ) -> anyhow::Result<crate::consolidation::hooks::ExtractionReport> {
-        Ok(crate::consolidation::hooks::ExtractionReport { partial: true })
+        Ok(crate::consolidation::hooks::ExtractionReport {
+            partial: true,
+            ..Default::default()
+        })
+    }
+}
+
+const REPORTED_MODEL: &str = "reported-model";
+
+/// Reports the model it ran.
+struct ModelExtraction;
+
+#[async_trait]
+impl ExtractionHook for ModelExtraction {
+    async fn extract(
+        &self,
+        _ctx: &ExtractCtx<'_>,
+    ) -> anyhow::Result<crate::consolidation::hooks::ExtractionReport> {
+        Ok(crate::consolidation::hooks::ExtractionReport {
+            partial: false,
+            model: Some(crate::consolidation::manifest::ExtractionModel {
+                model_id: REPORTED_MODEL.into(),
+                model_sha256: "abc123".into(),
+                prompt_version: "1".into(),
+            }),
+        })
     }
 }
 
@@ -582,6 +607,29 @@ async fn an_extraction_part_that_reports_partial_work_is_recorded_as_partial() {
     assert_eq!(manifest.outcome, Some(RunOutcome::Committed));
     assert!(manifest.is_complete("extract:partial"));
     assert!(!manifest.is_complete("extract:skipped"));
+}
+
+#[tokio::test]
+async fn the_model_an_extraction_part_reports_is_recorded_in_the_saved_manifest() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let hooks = ConsolidationHookSet {
+        extraction: Some(Arc::new(ModelExtraction)),
+        ..Default::default()
+    };
+    let run = env.consolidator_with(maintenance(), honest(), hooks);
+
+    // Act
+    run.consolidate(&shared).await.unwrap();
+
+    // Assert
+    let recorded = env
+        .manifest()
+        .extraction_model
+        .expect("a model was recorded");
+    assert_eq!(recorded.model_id, REPORTED_MODEL);
+    assert_eq!(recorded.model_sha256, "abc123");
 }
 
 #[tokio::test]
