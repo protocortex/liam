@@ -93,6 +93,12 @@ impl ExtractionHooks {
         let inputs = events_to_inputs(&window.events, self.config.min_event_chars);
         if !inputs.is_empty() {
             let known = ctx.store.live_entity_subjects(MAX_KNOWN_ENTITIES).await?;
+            if known.len() >= MAX_KNOWN_ENTITIES {
+                warn!(
+                    limit = MAX_KNOWN_ENTITIES,
+                    "extraction: more entity pages than the rules look for, the rest are not matched"
+                );
+            }
             let vocabulary = resolve_vocabulary(&self.config);
             let apply = ApplyContext {
                 store: ctx.store,

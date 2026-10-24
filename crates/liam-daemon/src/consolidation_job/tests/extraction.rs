@@ -550,16 +550,20 @@ async fn a_run_deadline_far_past_any_clock_still_runs() {
     assert_eq!(facts_of(&store).await.len(), 2);
 }
 
-/// Reads the log as usual, after moving the model cursor ahead of anything the
-/// run will finish, as another writer of the cursor would.
+/// Reads the log as usual, except that on one scan it first moves a cursor
+/// ahead of anything the run will finish, as another writer of the cursor would.
 struct CursorBumpingReader {
     inner: SequentialScanReader,
     store: Arc<DefaultGraph>,
+    cursor: ExtractorName,
     to: LogOffset,
+    /// Which scan of the run bumps, counted from 0.
+    on_scan: usize,
     scans: AtomicUsize,
 }
 
 /// The rules pass scans first and the model pass second.
+const RULES_PASS_SCAN: usize = 0;
 const MODEL_PASS_SCAN: usize = 1;
 
 impl LogReader for CursorBumpingReader {
@@ -573,13 +577,11 @@ impl LogReader for CursorBumpingReader {
         through: LogOffset,
     ) -> liam_log::reader::LogStream {
         let (store, to, inner) = (self.store.clone(), self.to, self.inner.clone());
-        let bumps = self.scans.fetch_add(1, Ordering::SeqCst) == MODEL_PASS_SCAN;
+        let cursor = self.cursor;
+        let bumps = self.scans.fetch_add(1, Ordering::SeqCst) == self.on_scan;
         let bump_then_read = async move {
             if bumps {
-                store
-                    .advance_extraction_cursor(ExtractorName::Llm, to)
-                    .await
-                    .unwrap();
+                store.advance_extraction_cursor(cursor, to).await.unwrap();
             }
             inner.scan_through(from, through)
         };
@@ -603,7 +605,9 @@ async fn a_cursor_moved_by_another_writer_makes_the_step_partial_and_the_next_ru
     part.reader = Arc::new(CursorBumpingReader {
         inner: SequentialScanReader::local(&log_dir_in(&harness.root)).unwrap(),
         store: store.clone(),
+        cursor: ExtractorName::Llm,
         to: ahead,
+        on_scan: MODEL_PASS_SCAN,
         scans: AtomicUsize::new(0),
     });
     let job = harness.job_with_hooks(&server, honest(), None, hooks_of(part));
