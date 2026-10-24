@@ -9,6 +9,7 @@
 mod ask;
 mod cli;
 mod clusters;
+mod consolidation_job;
 /// Grounding eval for `ask`; test-only, see the module docs to run it.
 #[cfg(test)]
 mod eval;
@@ -42,6 +43,7 @@ use liam_store::DefaultGraph;
 pub use liam_daemon::config;
 
 use config::Config;
+use consolidation_job::{ConsolidationJob, JobSetup};
 use liam_daemon::models::{
     build_llm, build_models, export_fastembed_cache_dir, resolve_config_path, resolve_log_dir,
 };
@@ -139,7 +141,11 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     )?;
 
     let (embedder, reranker) = build_models(&config)?;
-    let StartedStore { store, compactor } = log_startup::open_store_with_log(
+    let StartedStore {
+        store,
+        compactor,
+        log,
+    } = log_startup::open_store_with_log(
         &config,
         &database_path,
         &log_dir,
@@ -163,6 +169,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         }
     }
 
+    let job_embedder = embedder.clone();
     let server = if config.llm.max_concurrent_generations == 0 {
         let cache_dir = resolve_config_path("llm.cache_dir", &config.llm.cache_dir)?
             .to_string_lossy()
@@ -195,7 +202,18 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     };
 
     let server = server.with_shutdown(shutdown.token());
-    let maintenance = spawn_gc(&config, server.clone());
+    let job = Arc::new(ConsolidationJob::new(JobSetup {
+        config: &config,
+        database_path: &database_path,
+        log_dir: &log_dir,
+        log,
+        embedder: job_embedder,
+        server: &server,
+    })?);
+    job.finish_pending_rollback()
+        .await
+        .context("could not finish the consolidation rollback a crash interrupted")?;
+    let maintenance = spawn_gc(&config, job);
 
     let served = match mode {
         cli::Mode::Serve => serve_socket(&config, server, shutdown.token()).await,
@@ -347,38 +365,20 @@ async fn serve_socket(
     .await
 }
 
-/// GC and the cluster refresh, on the SAME `Graph` every request handler
-/// uses, not a second connection: a second connection only traded an
+/// The consolidation job on its schedule, on the SAME `Graph` every request
+/// handler uses, not a second connection: a second connection only traded an
 /// in-process wait for an opaque SQLite lock timeout. See ADR-0002
-/// Amendment 4. Takes a `MemoryServer` clone, not just its store, so the tick
-/// can also reach the LLM and entity-resynthesis path a later change adds.
-fn spawn_gc(config: &Config, server: MemoryServer) -> JoinHandle<()> {
-    let policy = config.gc_policy();
+/// Amendment 4. The job's maintenance step keeps the tick's own steps, so GC,
+/// the cluster refresh and resynthesis now run inside its snapshot and probe
+/// gate. A run left unfinished by a crash resumes at once instead of waiting
+/// out an interval.
+fn spawn_gc(config: &Config, job: Arc<ConsolidationJob>) -> JoinHandle<()> {
     let interval = config.gc_interval();
     let run_on_start = config.gc.run_on_start;
-    let max_resynth_per_tick = config.gc.max_resynth_per_tick;
-    let full_synthesis_mention_threshold = config.gc.full_synthesis_mention_threshold;
-    let full_synthesis_max_new_tokens = config.gc.full_synthesis_max_new_tokens;
-    let ask_timeout_secs = config.ask_timeout_secs;
-    // An autotuned server (`max_concurrent_generations == 0`) is still
-    // calibrating its generation-permit capacity when the run-on-start tick
-    // fires, so that one tick alone skips resynthesis to avoid competing with
-    // the calibration benchmark for the same permits. Every later tick,
-    // periodic or otherwise, resynthesizes normally.
-    let skip_first_resynth = run_on_start && config.llm.max_concurrent_generations == 0;
-    let stopping = server.shutdown_token();
+    let stopping = job.stopping();
     tokio::spawn(async move {
-        if run_on_start {
-            maintenance_tick(
-                &server,
-                &policy,
-                max_resynth_per_tick,
-                ask_timeout_secs,
-                skip_first_resynth,
-                full_synthesis_mention_threshold,
-                full_synthesis_max_new_tokens,
-            )
-            .await;
+        if run_on_start || job.has_unfinished_run() {
+            job.tick().await;
         }
         let mut tick = tokio::time::interval(interval);
         tick.tick().await; // drop the immediate first tick
@@ -387,26 +387,19 @@ fn spawn_gc(config: &Config, server: MemoryServer) -> JoinHandle<()> {
                 _ = stopping.cancelled() => return,
                 _ = tick.tick() => {}
             }
-            maintenance_tick(
-                &server,
-                &policy,
-                max_resynth_per_tick,
-                ask_timeout_secs,
-                false,
-                full_synthesis_mention_threshold,
-                full_synthesis_max_new_tokens,
-            )
-            .await;
+            job.tick().await;
         }
     })
 }
 
-/// Replay the log, sweep, repair, refresh clusters, then resynthesize stale
+/// The tick's steps without the consolidation envelope, for tests of a single
+/// step. Replay the log, sweep, repair, refresh clusters, then resynthesize stale
 /// entities unless `skip_resynthesis` is set (the run-on-start tick of an
 /// autotuning server, which cannot yet spare generation permits for it). The
 /// tick stops after any step that left the daemon stopping, as a poisoned log
 /// does: the later steps would only be refused, and resynthesis would spend a
 /// model call on a write that cannot land.
+#[cfg(test)]
 async fn maintenance_tick(
     server: &MemoryServer,
     policy: &liam_store::RetentionPolicy,
@@ -429,11 +422,23 @@ async fn maintenance_tick(
 }
 
 /// How much resynthesis a tick does.
-struct Resynthesis {
+#[derive(Clone, Copy)]
+pub(crate) struct Resynthesis {
     max_per_tick: usize,
     ask_timeout_secs: u64,
     full_mention_threshold: usize,
     full_max_new_tokens: usize,
+}
+
+impl Resynthesis {
+    pub(crate) fn from_config(config: &Config) -> Self {
+        Self {
+            max_per_tick: config.gc.max_resynth_per_tick,
+            ask_timeout_secs: config.ask_timeout_secs,
+            full_mention_threshold: config.gc.full_synthesis_mention_threshold,
+            full_max_new_tokens: config.gc.full_synthesis_max_new_tokens,
+        }
+    }
 }
 
 /// The tick's steps. With a `write_source`, every log write they make is
@@ -441,7 +446,7 @@ struct Resynthesis {
 /// writes cancelled by a rollback; without one they keep their own sources.
 /// Cluster assignments are derived rows kept out of the log, which a restore
 /// puts back with the rest of the database.
-async fn maintenance_steps(
+pub(crate) async fn maintenance_steps(
     server: &MemoryServer,
     store: &DefaultGraph,
     policy: &liam_store::RetentionPolicy,

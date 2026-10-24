@@ -3,8 +3,9 @@
 
 use std::path::Path;
 
-use super::run::RunSettings;
+use super::run::{Identity, RunSettings};
 use crate::config::Config;
+use crate::embedder_fingerprint::EmbedderFingerprint;
 use crate::models::resolve_snapshot_dir;
 
 /// The settings of a run over the database at `database`.
@@ -22,9 +23,33 @@ pub fn run_settings(config: &Config, database: &Path) -> anyhow::Result<RunSetti
     })
 }
 
+/// The models a run is made under, as `liam.toml` configures them.
+pub fn identity(config: &Config) -> Identity {
+    Identity {
+        embedder: EmbedderFingerprint::from_config(config),
+        llm_model: format!("{}/{}", config.llm.model, config.llm.gguf_file),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_identity_names_the_configured_embedder_and_llm() {
+        // Arrange
+        let config = Config::default();
+
+        // Act
+        let identity = identity(&config);
+
+        // Assert
+        assert_eq!(identity.embedder, EmbedderFingerprint::from_config(&config));
+        assert_eq!(
+            identity.llm_model,
+            format!("{}/{}", config.llm.model, config.llm.gguf_file)
+        );
+    }
 
     #[test]
     fn the_settings_carry_the_configured_values_and_the_default_directory() {

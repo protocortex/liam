@@ -675,7 +675,6 @@ impl MemoryServer {
 
     /// Shares this server's store slot with the consolidation job, whose
     /// rollback swaps the store in it.
-    #[cfg(test)]
     pub(crate) fn shared_store(&self) -> Arc<SharedStore> {
         self.store.clone()
     }
