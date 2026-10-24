@@ -9,15 +9,23 @@
 //! A run holds no guard between its steps, so clients are never stopped while
 //! it works. Only the rollback's restore and replay pause them.
 
+use std::sync::Arc;
+
 use liam_store::DefaultGraph;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct SharedStore {
-    slot: RwLock<Option<DefaultGraph>>,
+    slot: RwLock<Option<Arc<DefaultGraph>>>,
 }
 
 impl SharedStore {
     pub fn new(store: DefaultGraph) -> Self {
+        Self::from_arc(Arc::new(store))
+    }
+
+    /// A slot over a store that its caller also holds. A restore needs the
+    /// slot's handle to be the last one, so a rollback over such a slot fails.
+    pub fn from_arc(store: Arc<DefaultGraph>) -> Self {
         Self {
             slot: RwLock::new(Some(store)),
         }
@@ -30,13 +38,35 @@ impl SharedStore {
     ///
     /// Fails when a rollback could not reopen the store, so the slot is empty.
     pub async fn get(&self) -> anyhow::Result<RwLockReadGuard<'_, DefaultGraph>> {
-        RwLockReadGuard::try_map(self.slot.read().await, Option::as_ref).map_err(|_| {
+        RwLockReadGuard::try_map(self.slot.read().await, Option::as_deref).map_err(|_| {
             anyhow::anyhow!("the store is unavailable: a rollback could not reopen it")
         })
     }
 
+    /// Checks, under the write guard, that the slot's handle is the only one, so
+    /// a restore can take the store out of it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the slot is empty or another handle holds the store.
+    pub(super) async fn ensure_restorable(&self) -> anyhow::Result<()> {
+        match self.slot.write().await.as_ref() {
+            Some(store) if Arc::strong_count(store) == 1 => Ok(()),
+            Some(_) => anyhow::bail!(
+                "the store is still held outside its slot, so it cannot be closed for the restore"
+            ),
+            None => anyhow::bail!("the store is not in its slot"),
+        }
+    }
+
+    /// True while a restore holds the slot or waits for it, so a new read would
+    /// have to wait too.
+    pub fn is_contended(&self) -> bool {
+        self.slot.try_read().is_err()
+    }
+
     /// Exclusive access to the slot, for a restore that replaces the store.
-    pub(super) async fn exclusive(&self) -> RwLockWriteGuard<'_, Option<DefaultGraph>> {
+    pub async fn exclusive(&self) -> RwLockWriteGuard<'_, Option<Arc<DefaultGraph>>> {
         self.slot.write().await
     }
 }
