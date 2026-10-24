@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use liam_store::{
-    ArbitrationCaps, DefaultGraph, ExtractorName, FixedClock, GraphConfig, Millis, NewFact, FOREVER,
+    ArbitrationCaps, DefaultGraph, ExtractorName, FixedClock, GraphConfig, Millis, NewFact,
+    FOREVER, MAX_SOURCES_PER_FACT,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
@@ -24,8 +25,6 @@ const HIGH_TRUST: f64 = 0.9;
 const LOW_TRUST: f64 = 0.3;
 const SETTLE_YIELDS: usize = 200;
 const BOUND: Duration = Duration::from_secs(10);
-/// One more than the most a fact lists, so its source list is cut.
-const OVER_SOURCE_CAP: usize = 101;
 
 struct Env {
     _dir: TempDir,
@@ -101,7 +100,6 @@ fn query(subject: &str) -> FactsArgs {
         scope: None,
         as_of: None,
         believed_at: None,
-        lineage: None,
         limit: None,
     }
 }
@@ -244,21 +242,6 @@ async fn invalid_input_is_refused_with_a_clear_error() {
         ),
         (query("   "), "subject must not be empty"),
         (query(&long_subject), "subject exceeds"),
-        (
-            FactsArgs {
-                lineage: Some("not an id".into()),
-                ..query("alice")
-            },
-            "lineage",
-        ),
-        (
-            FactsArgs {
-                lineage: Some("01HZX3ABCDEFGHJKMNPQRSTVWX".into()),
-                as_of: Some(T1),
-                ..query("alice")
-            },
-            "lineage cannot be combined",
-        ),
     ];
 
     for (args, expected) in cases {
@@ -341,7 +324,9 @@ async fn a_fact_with_two_sources_shows_the_count_and_both_ids() {
 async fn a_fact_with_more_sources_than_the_store_lists_says_so() {
     // Arrange
     let env = Env::new().await;
-    let events: Vec<String> = (0..OVER_SOURCE_CAP).map(|n| format!("e{n:03}")).collect();
+    let events: Vec<String> = (0..=MAX_SOURCES_PER_FACT)
+        .map(|n| format!("e{n:03}"))
+        .collect();
     let refs: Vec<&str> = events.iter().map(String::as_str).collect();
     env.record_at(T1, fact("works_at", "Acme", HIGH_TRUST, &refs, T1))
         .await;
@@ -351,7 +336,10 @@ async fn a_fact_with_more_sources_than_the_store_lists_says_so() {
 
     // Assert
     assert!(answer.contains(MORE_SOURCES_NOTE), "{answer}");
-    assert!(answer.contains(" more)"), "{answer}");
+    assert!(
+        answer.contains(&format!("sources: {MAX_SOURCES_PER_FACT}+ (")),
+        "{answer}"
+    );
 }
 
 #[tokio::test]
@@ -426,66 +414,6 @@ async fn a_scope_narrows_to_itself_and_its_descendants() {
 }
 
 #[tokio::test]
-async fn a_lineage_lists_its_own_versions_and_not_the_one_that_replaced_it() {
-    // Arrange
-    let env = Env::new().await;
-    moved_city(&env).await;
-    let current = env.ask(query("alice")).await;
-    let sydney = env
-        .ask(FactsArgs {
-            believed_at: Some(T2),
-            ..query("alice")
-        })
-        .await;
-    let lineage = lineage_of(&sydney);
-    assert_ne!(lineage, lineage_of(&current));
-
-    // Act
-    let history = env
-        .ask(FactsArgs {
-            lineage: Some(lineage),
-            ..query("alice")
-        })
-        .await;
-
-    // Assert
-    assert_eq!(rows_of(&history, "alice lives_in Sydney"), 2, "{history}");
-    assert!(
-        history.contains("recorded: 1700000000000 to 1702592000000"),
-        "{history}"
-    );
-    assert!(!history.contains("Melbourne"), "{history}");
-    assert!(!history.contains("competing"), "{history}");
-}
-
-#[tokio::test]
-async fn a_lineage_of_another_subject_lists_nothing() {
-    // Arrange
-    let env = Env::new().await;
-    moved_city(&env).await;
-    let lineage = lineage_of(&env.ask(query("alice")).await);
-
-    // Act
-    let answer = env
-        .ask(FactsArgs {
-            lineage: Some(lineage),
-            ..query("bob")
-        })
-        .await;
-
-    // Assert
-    assert_eq!(answer, "no matching facts");
-}
-
-fn lineage_of(answer: &str) -> String {
-    answer
-        .lines()
-        .find_map(|line| line.strip_prefix("lineage: "))
-        .unwrap_or_else(|| panic!("no lineage line in {answer}"))
-        .to_owned()
-}
-
-#[tokio::test]
 async fn a_multi_line_object_is_rendered_on_one_line() {
     // Arrange
     let env = Env::new().await;
@@ -527,14 +455,7 @@ async fn the_tool_is_registered_with_the_argument_names_clients_send() {
 
     // Assert
     let schema = serde_json::to_string(&tool.input_schema).unwrap();
-    for field in [
-        "subject",
-        "scope",
-        "as_of",
-        "believed_at",
-        "lineage",
-        "limit",
-    ] {
+    for field in ["subject", "scope", "as_of", "believed_at", "limit"] {
         assert!(
             schema.contains(&format!("\"{field}\"")),
             "{field} missing: {schema}"
@@ -585,4 +506,82 @@ async fn a_request_after_a_swap_that_lost_the_store_gets_a_clean_error() {
     // Assert
     assert!(answer.starts_with("facts failed"), "{answer}");
     assert!(answer.contains("store is unavailable"), "{answer}");
+}
+
+#[tokio::test]
+async fn limit_zero_with_a_bad_scope_is_still_an_error() {
+    // Arrange
+    let env = Env::new().await;
+    let args = FactsArgs {
+        scope: Some("bad scope!".into()),
+        limit: Some(0),
+        ..query("alice")
+    };
+
+    // Act
+    let answer = env.ask(args).await;
+
+    // Assert
+    assert!(answer.starts_with("facts failed:"), "{answer}");
+    assert!(answer.contains("scope"), "{answer}");
+}
+
+#[tokio::test]
+async fn the_store_is_free_for_a_swap_as_soon_as_a_call_returns() {
+    // Arrange
+    let env = Env::new().await;
+    moved_city(&env).await;
+    let shared = env.server.shared_store();
+
+    // Act: several calls, then a restore asking for the slot
+    for _ in 0..3 {
+        env.ask(query("alice")).await;
+    }
+    let swap = tokio::time::timeout(BOUND, shared.exclusive()).await;
+
+    // Assert: a guard kept past the read would leave the writer waiting
+    assert!(swap.is_ok(), "a finished call must not hold the store");
+}
+
+#[tokio::test]
+async fn store_errors_name_no_sql_or_file_paths() {
+    // Arrange
+    let env = Env::new().await;
+    let shared = env.server.shared_store();
+    let lost = {
+        let mut swap = shared.exclusive().await;
+        *swap = None;
+        drop(swap);
+        env.ask(query("alice")).await
+    };
+    let bad_scope = Env::new()
+        .await
+        .ask(FactsArgs {
+            scope: Some("bad scope!".into()),
+            ..query("alice")
+        })
+        .await;
+
+    for answer in [lost, bad_scope] {
+        // Act / Assert
+        assert!(answer.starts_with("facts failed:"), "{answer}");
+        for leak in ["SELECT", "FROM facts", "facts.db", "/tmp", "/var"] {
+            assert!(!answer.contains(leak), "{leak} leaked in {answer}");
+        }
+    }
+}
+
+#[test]
+fn an_unknown_argument_is_ignored_as_it_is_for_the_other_tools() {
+    // Arrange: none of the tool argument structs deny unknown fields, so a
+    // client sending a field this version lacks is not refused.
+    let facts = serde_json::json!({ "subject": "alice", "lineage": "x" });
+    let recall = serde_json::json!({ "query": "alice", "lineage": "x" });
+
+    // Act
+    let facts = serde_json::from_value::<FactsArgs>(facts);
+    let recall = serde_json::from_value::<crate::mcp::RecallArgs>(recall);
+
+    // Assert
+    assert!(facts.is_ok() && recall.is_ok());
 }

@@ -24,10 +24,10 @@ pub use backends::DefaultBackend;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::{Error, MismatchSource, Result};
 pub use graph::{
-    batch_key, recover_interrupted_restore, verify_snapshot, BackfillReport, Candidate,
-    CatchUpReport, ContentEmbedder, EmbedError, EventLog, FactPage, Graph, PoisonHook, RebuildMode,
-    RebuildReport, ReembedReport, SharedLog, Snapshot, SnapshotLog, SnapshotMeta,
-    MAX_FACTS_PER_BATCH, RUN_SOURCE_PREFIX,
+    batch_key, recover_interrupted_restore, validate_scope, verify_snapshot, BackfillReport,
+    Candidate, CatchUpReport, ContentEmbedder, EmbedError, EventLog, FactPage, Graph, PoisonHook,
+    RebuildMode, RebuildReport, ReembedReport, SharedLog, Snapshot, SnapshotLog, SnapshotMeta,
+    MAX_FACTS_PER_BATCH, MAX_SOURCES_PER_FACT, RUN_SOURCE_PREFIX,
 };
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{

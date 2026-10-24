@@ -1310,7 +1310,7 @@ impl MemoryServer {
     #[tool(
         description = "List the facts held about a subject. Default: what is true now. as_of \
                        (epoch ms) asks what was true then; believed_at (epoch ms) asks what the \
-                       store believed then; lineage lists every stored version of one fact."
+                       store believed then."
     )]
     pub(crate) async fn facts(&self, Parameters(args): Parameters<FactsArgs>) -> String {
         facts::read(self, args).await
