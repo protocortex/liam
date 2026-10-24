@@ -10,7 +10,7 @@
 //! the model again only for an answer the cache could not keep.
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +38,9 @@ const EXTRACTION_SEED: u32 = 0;
 const EXTRACTION_TEMPERATURE: f32 = 0.0;
 /// The answer may use this share of the context window; the prompt has the rest.
 const ANSWER_CONTEXT_DIVISOR: usize = 4;
+/// Replies that say the request itself is unacceptable (a prompt over the
+/// context window is a 400 from llama-server), so a retry repeats the failure.
+const CONTENT_REJECTION_STATUSES: [u16; 3] = [400, 413, 422];
 
 /// A running model and what must stay alive to keep it running.
 pub struct ExtractorSession {
@@ -97,6 +100,8 @@ pub struct ExtractionReport {
 enum Status {
     Pending,
     Done,
+    /// Skipped for good after repeated failures; counts as passed.
+    Quarantined,
     Failed,
 }
 
@@ -115,7 +120,12 @@ enum BatchEnd {
 
 enum Attempt {
     Done,
-    Failed,
+    /// The answer or the facts are bad, which asking again repeats.
+    Content(String),
+    /// The call outlasted its limit while the model was still answering health checks.
+    Timeout,
+    /// The call failed in a way that says nothing about the events.
+    Transport,
     Halted,
 }
 
@@ -140,6 +150,15 @@ struct Run<'a> {
     schema_hash: String,
     session: Option<Opened>,
     report: ExtractionReport,
+    /// Inputs with failures recorded in the store, to clear when they succeed.
+    failing: HashSet<usize>,
+    /// Single events whose call timed out, settled once the run's evidence is in.
+    timeouts: Vec<usize>,
+    /// Inputs a real model call was made for.
+    attempted: HashSet<usize>,
+    /// The model answered a call this run (or a bisection sibling of a timed
+    /// out call was done), so a timeout is about the event, not the limit.
+    model_answered: bool,
 }
 
 /// Batches `inputs` per scope, extracts each batch, and writes the facts.
@@ -150,6 +169,14 @@ pub async fn extract_events(
     let mut run = Run::new(inputs, deps);
     run.execute().await?;
     Ok(run.report)
+}
+
+/// Halves a piece of two or more inputs; a single input cannot be split.
+fn split(piece: &[usize]) -> Option<(Vec<usize>, Vec<usize>)> {
+    (piece.len() > 1).then(|| {
+        let (first, second) = piece.split_at(piece.len() / 2);
+        (first.to_vec(), second.to_vec())
+    })
 }
 
 fn is_parseable(response: &str) -> bool {
@@ -179,11 +206,16 @@ impl<'a> Run<'a> {
             predicates,
             session: None,
             report,
+            failing: HashSet::new(),
+            timeouts: Vec::new(),
+            attempted: HashSet::new(),
+            model_answered: false,
             deps,
         }
     }
 
     async fn execute(&mut self) -> Result<()> {
+        self.skip_quarantined().await?;
         let batches = self.plan_batches();
         info!(
             inputs = self.inputs.len(),
@@ -208,6 +240,7 @@ impl<'a> Run<'a> {
                 BatchEnd::Halted => break,
             }
         }
+        self.settle_timeouts().await?;
         self.report.completed_offset = self.completed_offset();
         info!(
             written = self.report.facts_written,
@@ -223,7 +256,9 @@ impl<'a> Run<'a> {
     fn plan_batches(&self) -> Vec<Batch> {
         let mut by_scope: BTreeMap<&Option<String>, Vec<usize>> = BTreeMap::new();
         for (position, input) in self.inputs.iter().enumerate() {
-            by_scope.entry(&input.scope).or_default().push(position);
+            if self.status[position] != Status::Quarantined {
+                by_scope.entry(&input.scope).or_default().push(position);
+            }
         }
         let mut batches: Vec<Batch> = by_scope
             .into_iter()
@@ -274,18 +309,45 @@ impl<'a> Run<'a> {
         self.deps.deadline.saturating_duration_since(Instant::now())
     }
 
+    /// Runs one batch. A batch the model cannot answer is split in half and
+    /// each half asked again, so one bad event costs only itself.
     async fn run_batch(&mut self, batch: &[usize]) -> Result<BatchEnd> {
-        match self.attempt(batch).await? {
-            Attempt::Done => {
-                self.mark(batch, Status::Done);
-                Ok(BatchEnd::Done)
+        let mut queue: VecDeque<(Vec<usize>, bool)> = VecDeque::from([(batch.to_vec(), false)]);
+        let mut failed = false;
+        while let Some((piece, after_timeout)) = queue.pop_front() {
+            match self.attempt(&piece).await? {
+                Attempt::Done => {
+                    self.mark(&piece, Status::Done);
+                    self.clear_failures(&piece).await?;
+                    self.model_answered |= after_timeout;
+                }
+                Attempt::Halted => return Ok(BatchEnd::Halted),
+                Attempt::Transport => return Ok(BatchEnd::Failed),
+                Attempt::Content(reason) => match split(&piece) {
+                    Some((first, second)) => {
+                        queue.push_front((second, after_timeout));
+                        queue.push_front((first, after_timeout));
+                    }
+                    None => failed |= self.fail_single(piece[0], &reason).await?,
+                },
+                Attempt::Timeout => match split(&piece) {
+                    Some((first, second)) => {
+                        queue.push_front((second, true));
+                        queue.push_front((first, true));
+                    }
+                    None => {
+                        self.timeouts.push(piece[0]);
+                        self.mark(&piece, Status::Failed);
+                        failed = true;
+                    }
+                },
             }
-            Attempt::Failed => {
-                self.mark(batch, Status::Failed);
-                Ok(BatchEnd::Failed)
-            }
-            Attempt::Halted => Ok(BatchEnd::Halted),
         }
+        Ok(if failed {
+            BatchEnd::Failed
+        } else {
+            BatchEnd::Done
+        })
     }
 
     fn mark(&mut self, positions: &[usize], status: Status) {
@@ -308,7 +370,7 @@ impl<'a> Run<'a> {
                 debug!(events = batch.len(), "answered from the response cache");
                 text
             }
-            None => match self.generate(&request).await? {
+            None => match self.generate(&request, piece).await? {
                 Generation::Text(text) => text,
                 Generation::Stop(stop) => return Ok(stop),
             },
@@ -318,7 +380,7 @@ impl<'a> Run<'a> {
             Ok(parsed) => parsed,
             Err(error) => {
                 warn!(%error, events = batch.len(), "the model's answer could not be read");
-                return Ok(Attempt::Failed);
+                return Ok(Attempt::Content(error.to_string()));
             }
         };
         let ctx = ApplyContext {
@@ -343,7 +405,7 @@ impl<'a> Run<'a> {
             }
             Err(ApplyError::Rejected(why)) => {
                 warn!(%why, events = batch.len(), "the store refused the batch's facts");
-                Ok(Attempt::Failed)
+                Ok(Attempt::Content(why))
             }
             Err(ApplyError::Store(error)) => Err(error.into()),
         }
@@ -369,7 +431,7 @@ impl<'a> Run<'a> {
     }
 
     /// Asks the model, starting it first if this is the run's first miss.
-    async fn generate(&mut self, request: &ExtractRequest) -> Result<Generation> {
+    async fn generate(&mut self, request: &ExtractRequest, piece: &[usize]) -> Result<Generation> {
         if self.expired() {
             self.report.deadline_hit = true;
             return Ok(Generation::Stop(Attempt::Halted));
@@ -405,20 +467,39 @@ impl<'a> Run<'a> {
         let limit = self
             .remaining()
             .min(Duration::from_secs(self.deps.config.request_timeout_secs));
+        self.attempted.extend(piece);
         match tokio::time::timeout(limit, cached.extract_json(request)).await {
-            Ok(Ok(text)) => Ok(Generation::Text(text)),
+            Ok(Ok(text)) => {
+                self.model_answered = true;
+                Ok(Generation::Text(text))
+            }
             // The deadline cut the call short, which is the run ending, not a failure.
             Err(_) | Ok(Err(ExtractError::Timeout)) if self.expired() => {
                 self.report.deadline_hit = true;
                 Ok(Generation::Stop(Attempt::Halted))
             }
-            Err(_) => {
-                warn!("the model call timed out");
-                Ok(Generation::Stop(Attempt::Failed))
+            Err(_) | Ok(Err(ExtractError::Timeout)) => {
+                // A model that is gone also times out; it must not be blamed on the events.
+                if cached.health().await {
+                    warn!("the model call timed out");
+                    Ok(Generation::Stop(Attempt::Timeout))
+                } else {
+                    warn!("the model call timed out and the model does not answer");
+                    self.report.sidecar_lost = true;
+                    Ok(Generation::Stop(Attempt::Halted))
+                }
+            }
+            Ok(Err(ExtractError::Status(status)))
+                if CONTENT_REJECTION_STATUSES.contains(&status) =>
+            {
+                warn!(status, "the model rejected the request");
+                Ok(Generation::Stop(Attempt::Content(format!(
+                    "the model rejected the request with HTTP {status}"
+                ))))
             }
             Ok(Err(error)) => {
                 warn!(%error, "the model call failed");
-                Ok(Generation::Stop(Attempt::Failed))
+                Ok(Generation::Stop(Attempt::Transport))
             }
         }
     }
@@ -467,7 +548,7 @@ impl<'a> Run<'a> {
         for positions in by_scope.values() {
             let Some(unfinished) = positions
                 .iter()
-                .position(|&p| self.status[p] != Status::Done)
+                .position(|&p| !matches!(self.status[p], Status::Done | Status::Quarantined))
             else {
                 continue;
             };
@@ -477,6 +558,8 @@ impl<'a> Run<'a> {
         Some(lowest)
     }
 }
+
+mod failures;
 
 #[cfg(test)]
 mod tests;

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::bail;
-use liam_store::{GraphConfig, Millis};
+use liam_store::{batch_key, GraphConfig, Millis};
 use serde_json::json;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -20,6 +20,12 @@ const CLIENT: &str = "claude-code";
 const MODEL_SHA: &str = "abc123";
 const EMBEDDING_DIMS: usize = 8;
 const READ_LIMIT: usize = 10;
+const POISON: &str = "POISON";
+/// A source whose configured trust the store refuses.
+const BAD_SOURCE: &str = "bad-source";
+const UNTRUSTWORTHY_SCORE: f64 = 2.0;
+/// Failures that quarantine an event; the config default.
+const RUNS_TO_QUARANTINE: u32 = 3;
 const HOUR: i64 = 3_600_000;
 const OBSERVED: i64 = 1_685_577_600_000;
 const READ_AT: i64 = OBSERVED + 1000 * HOUR;
@@ -49,6 +55,7 @@ struct Script {
     calls: AtomicUsize,
     prompts: Mutex<Vec<String>>,
     requests: Mutex<Vec<ExtractRequest>>,
+    healthy: AtomicBool,
 }
 
 impl Script {
@@ -69,6 +76,18 @@ impl Script {
             calls: AtomicUsize::new(0),
             prompts: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
+            healthy: AtomicBool::new(true),
+        })
+    }
+
+    /// Answers like `honest`, except that a prompt naming a POISON event gets `fail`.
+    fn poisoned(fail: fn() -> Reply) -> Arc<Self> {
+        Self::new(move |request, _| {
+            if request.prompt.contains(POISON) {
+                fail()
+            } else {
+                Reply::Text(facts_for(&request.prompt))
+            }
         })
     }
 
@@ -108,7 +127,7 @@ impl JsonExtractor for Script {
     }
 
     async fn health(&self) -> bool {
-        true
+        self.healthy.load(Ordering::SeqCst)
     }
 }
 
@@ -281,6 +300,18 @@ impl Fixture {
             .len()
     }
 
+    fn key(n: u64) -> String {
+        batch_key(PROMPT_VERSION, MODEL_SHA, &[format!("e{n}")])
+    }
+
+    async fn failures(&self, n: u64) -> u32 {
+        self.store.batch_failures(&Self::key(n)).await.unwrap()
+    }
+
+    async fn quarantined(&self, n: u64) -> bool {
+        self.store.is_quarantined(&Self::key(n)).await.unwrap()
+    }
+
     async fn assert_every_fact_has_a_source(&self) {
         let orphans = self.store.facts_without_sources().await.expect("scan");
         assert!(orphans.is_empty(), "facts without a source: {orphans:?}");
@@ -304,6 +335,14 @@ fn input(n: u64, scope: Option<&str>) -> ExtractionInput {
         observed_at: Millis(observed),
         ingested_at: Millis(observed + 1),
         text: format!("Person{n} works at Org{n}."),
+    }
+}
+
+/// An event the model is scripted to choke on.
+fn poison(n: u64) -> ExtractionInput {
+    ExtractionInput {
+        text: format!("Person{n} works at {POISON}."),
+        ..input(n, None)
     }
 }
 
@@ -812,4 +851,242 @@ async fn a_call_is_cut_at_the_request_timeout_even_when_the_deadline_is_far() {
     assert_eq!(report.batches_failed, 1);
     assert!(!report.deadline_hit);
     assert_eq!(fx.facts_about(0).await, 0);
+}
+
+fn garbage() -> Reply {
+    Reply::Text("this is not json".into())
+}
+
+fn context_overflow() -> Reply {
+    Reply::Fail(ExtractError::Status(400))
+}
+
+fn timeout() -> Reply {
+    Reply::Fail(ExtractError::Timeout)
+}
+
+/// Four events, the third one poison, in one batch.
+fn with_poison_third() -> Vec<ExtractionInput> {
+    vec![input(0, None), input(1, None), poison(2), input(3, None)]
+}
+
+#[tokio::test]
+async fn bisection_isolates_the_event_the_model_cannot_read_and_quarantines_it() {
+    for fail in [garbage as fn() -> Reply, context_overflow] {
+        // Arrange
+        let mut fx = Fixture::new().await;
+        fx.config.batch_events = 4;
+        let script = Script::poisoned(fail);
+        let events = with_poison_third();
+
+        // Act
+        let first = fx.run(&Provider::new(&script), &events).await;
+
+        // Assert: the neighbours are written and the cursor stops before the poison.
+        assert_eq!(first.facts_written, 3);
+        assert_eq!(first.batches_failed, 1);
+        assert_eq!(first.completed_offset, Some(offset(1)));
+        assert_eq!(fx.failures(2).await, 1);
+        let written = [
+            fx.facts_about(0).await,
+            fx.facts_about(1).await,
+            fx.facts_about(3).await,
+        ];
+        assert_eq!(written, [1, 1, 1]);
+
+        // Act: the failures add up across runs until the event is quarantined.
+        for _ in 1..RUNS_TO_QUARANTINE {
+            fx.run(&Provider::new(&script), &events).await;
+        }
+        let last = fx.run(&Provider::new(&script), &events).await;
+
+        // Assert: the cursor passes it and it is never asked about again.
+        assert!(fx.quarantined(2).await);
+        assert_eq!(last.completed_offset, Some(WINDOW_END));
+        assert_eq!((last.batches_failed, last.batches_quarantined), (0, 1));
+        let calls_before = script.calls();
+        fx.run(&Provider::new(&script), &events).await;
+        for call in calls_before..script.calls() {
+            assert!(!script.prompt(call).contains(POISON));
+        }
+        fx.assert_every_fact_has_a_source().await;
+    }
+}
+
+#[tokio::test]
+async fn an_event_that_succeeds_again_has_its_failures_cleared() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 4;
+    fx.run(
+        &Provider::new(&Script::poisoned(garbage)),
+        &with_poison_third(),
+    )
+    .await;
+    assert_eq!(fx.failures(2).await, 1);
+
+    // Act
+    let report = fx
+        .run(&Provider::new(&Script::honest()), &with_poison_third())
+        .await;
+
+    // Assert
+    assert_eq!(report.completed_offset, Some(WINDOW_END));
+    assert_eq!(fx.failures(2).await, 0);
+    assert_eq!(fx.facts_about(2).await, 1);
+}
+
+#[tokio::test]
+async fn a_new_model_asks_again_about_a_quarantined_event() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 4;
+    for _ in 0..RUNS_TO_QUARANTINE {
+        fx.run(
+            &Provider::new(&Script::poisoned(garbage)),
+            &with_poison_third(),
+        )
+        .await;
+    }
+    assert!(fx.quarantined(2).await);
+    let upgraded = Script::with_sha("def456", |request, _| {
+        Reply::Text(facts_for(&request.prompt))
+    });
+
+    // Act
+    let report = fx
+        .run(&Provider::new(&upgraded), &with_poison_third())
+        .await;
+
+    // Assert
+    assert_eq!(report.batches_quarantined, 0);
+    assert_eq!(fx.facts_about(2).await, 1);
+}
+
+#[tokio::test]
+async fn the_store_refusing_an_events_facts_takes_the_same_path() {
+    // Arrange: the second event's source has a trust the store refuses.
+    let mut fx = Fixture::new().await;
+    fx.config
+        .trust
+        .insert(BAD_SOURCE.into(), UNTRUSTWORTHY_SCORE);
+    let script = Script::honest();
+    let events = [
+        input(0, None),
+        ExtractionInput {
+            source: BAD_SOURCE.into(),
+            ..input(1, None)
+        },
+    ];
+
+    // Act
+    let report = fx.run(&Provider::new(&script), &events).await;
+
+    // Assert
+    assert_eq!(report.completed_offset, Some(offset(0)));
+    assert_eq!(fx.failures(1).await, 1);
+    assert_eq!((fx.facts_about(0).await, fx.facts_about(1).await), (1, 0));
+}
+
+#[tokio::test]
+async fn a_failed_call_that_says_nothing_about_the_events_is_not_counted() {
+    // Arrange
+    let fx = Fixture::new().await;
+    let script = Script::new(|_, _| Reply::Fail(ExtractError::Status(500)));
+
+    // Act
+    let report = fx.run(&Provider::new(&script), &inputs(2)).await;
+
+    // Assert
+    assert_eq!(report.batches_failed, 1);
+    assert_eq!((fx.failures(0).await, fx.failures(1).await), (0, 0));
+}
+
+#[tokio::test]
+async fn timeouts_while_nothing_answers_quarantine_nothing() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 4;
+    let script = Script::new(|_, _| timeout());
+
+    // Act
+    let mut report = ExtractionReport::default();
+    for _ in 0..=RUNS_TO_QUARANTINE {
+        report = fx.run(&Provider::new(&script), &inputs(4)).await;
+    }
+
+    // Assert
+    assert!(report.batches_failed > 0 && !report.sidecar_lost);
+    for n in 0..4 {
+        assert_eq!((fx.failures(n).await, fx.quarantined(n).await), (0, false));
+    }
+}
+
+#[tokio::test]
+async fn a_dead_model_that_times_out_ends_the_run_and_blames_no_event() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 4;
+    let script = Script::new(|_, _| timeout());
+    script.healthy.store(false, Ordering::SeqCst);
+
+    // Act
+    let report = fx.run(&Provider::new(&script), &inputs(4)).await;
+
+    // Assert
+    assert!(report.sidecar_lost);
+    assert_eq!(script.calls(), 1);
+    assert_eq!(report.completed_offset, None);
+    for n in 0..4 {
+        assert_eq!(fx.failures(n).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn a_poison_event_that_times_out_is_quarantined_once_a_sibling_answers() {
+    // Arrange: the poison event heads the batch, so it times out before any sibling answers.
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 4;
+    let script = Script::poisoned(timeout);
+    let events = vec![poison(0), input(1, None), input(2, None), input(3, None)];
+
+    // Act
+    let first = fx.run(&Provider::new(&script), &events).await;
+    let counted_after_first = fx.failures(0).await;
+    for _ in 1..RUNS_TO_QUARANTINE {
+        fx.run(&Provider::new(&script), &events).await;
+    }
+    let last = fx.run(&Provider::new(&script), &events).await;
+
+    // Assert
+    assert_eq!(first.completed_offset, None);
+    assert_eq!(counted_after_first, 1);
+    assert!(fx.quarantined(0).await);
+    assert_eq!(last.completed_offset, Some(WINDOW_END));
+    assert_eq!(fx.facts_about(3).await, 1);
+}
+
+#[tokio::test]
+async fn a_run_quarantines_at_most_half_of_the_events_it_asked_about_for_timeouts() {
+    // Arrange: three of four events time out every run.
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 4;
+    let script = Script::poisoned(timeout);
+    let events = vec![poison(0), poison(1), poison(2), input(3, None)];
+    for _ in 1..RUNS_TO_QUARANTINE {
+        fx.run(&Provider::new(&script), &events).await;
+    }
+
+    // Act: all three now reach the limit in one run.
+    let report = fx.run(&Provider::new(&script), &events).await;
+
+    // Assert
+    let quarantined = [
+        fx.quarantined(0).await,
+        fx.quarantined(1).await,
+        fx.quarantined(2).await,
+    ];
+    assert_eq!(quarantined, [true, true, false]);
+    assert_eq!(report.batches_quarantined, 2);
+    assert_eq!(report.completed_offset, Some(offset(1)));
 }
