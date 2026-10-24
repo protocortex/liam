@@ -124,6 +124,9 @@ enum Attempt {
     Content(String),
     /// The call outlasted its limit while the model was still answering health checks.
     Timeout,
+    /// The server refused the request with a 4xx status. That can be the
+    /// request, or a server that is set up wrong, so it needs proof like a timeout.
+    Rejected(String),
     /// The call failed in a way that says nothing about the events.
     Transport,
     Halted,
@@ -135,6 +138,8 @@ enum Generation {
 }
 
 struct Opened {
+    /// The model without the cache, for the canary.
+    extractor: Arc<dyn JsonExtractor>,
     cached: Arc<CachedExtractor>,
     alive: Arc<dyn Fn() -> bool + Send + Sync>,
     _keepalive: Option<Box<dyn Any + Send>>,
@@ -152,12 +157,13 @@ struct Run<'a> {
     report: ExtractionReport,
     /// Inputs with failures recorded in the store, to clear when they succeed.
     failing: HashSet<usize>,
-    /// Single events whose call timed out, settled once the run's evidence is in.
-    timeouts: Vec<usize>,
+    /// Single events whose call timed out or was refused, with why, settled
+    /// once the run's evidence is in.
+    suspects: Vec<(usize, String)>,
     /// Inputs a real model call was made for.
     attempted: HashSet<usize>,
-    /// The model answered a call this run (or a bisection sibling of a timed
-    /// out call was done), so a timeout is about the event, not the limit.
+    /// The model itself answered a call this run. A cached answer does not
+    /// count, since it may come from a faster day.
     model_answered: bool,
 }
 
@@ -207,7 +213,7 @@ impl<'a> Run<'a> {
             session: None,
             report,
             failing: HashSet::new(),
-            timeouts: Vec::new(),
+            suspects: Vec::new(),
             attempted: HashSet::new(),
             model_answered: false,
             deps,
@@ -240,7 +246,7 @@ impl<'a> Run<'a> {
                 BatchEnd::Halted => break,
             }
         }
-        self.settle_timeouts().await?;
+        self.settle_suspects().await?;
         self.report.completed_offset = self.completed_offset();
         info!(
             written = self.report.facts_written,
@@ -312,35 +318,32 @@ impl<'a> Run<'a> {
     /// Runs one batch. A batch the model cannot answer is split in half and
     /// each half asked again, so one bad event costs only itself.
     async fn run_batch(&mut self, batch: &[usize]) -> Result<BatchEnd> {
-        let mut queue: VecDeque<(Vec<usize>, bool)> = VecDeque::from([(batch.to_vec(), false)]);
+        let mut queue: VecDeque<Vec<usize>> = VecDeque::from([batch.to_vec()]);
         let mut failed = false;
-        while let Some((piece, after_timeout)) = queue.pop_front() {
-            match self.attempt(&piece).await? {
+        while let Some(piece) = queue.pop_front() {
+            let attempt = self.attempt(&piece).await?;
+            let definite = matches!(attempt, Attempt::Content(_));
+            let reason = match attempt {
                 Attempt::Done => {
                     self.mark(&piece, Status::Done);
                     self.clear_failures(&piece).await?;
-                    self.model_answered |= after_timeout;
+                    continue;
                 }
                 Attempt::Halted => return Ok(BatchEnd::Halted),
                 Attempt::Transport => return Ok(BatchEnd::Failed),
-                Attempt::Content(reason) => match split(&piece) {
-                    Some((first, second)) => {
-                        queue.push_front((second, after_timeout));
-                        queue.push_front((first, after_timeout));
-                    }
-                    None => failed |= self.fail_single(piece[0], &reason).await?,
-                },
-                Attempt::Timeout => match split(&piece) {
-                    Some((first, second)) => {
-                        queue.push_front((second, true));
-                        queue.push_front((first, true));
-                    }
-                    None => {
-                        self.timeouts.push(piece[0]);
-                        self.mark(&piece, Status::Failed);
-                        failed = true;
-                    }
-                },
+                Attempt::Content(reason) => reason,
+                Attempt::Timeout => "the model call timed out".to_string(),
+                Attempt::Rejected(reason) => reason,
+            };
+            if let Some((first, second)) = split(&piece) {
+                queue.push_front(second);
+                queue.push_front(first);
+            } else if definite {
+                failed |= self.fail_single(piece[0], &reason).await?;
+            } else {
+                self.suspects.push((piece[0], reason));
+                self.mark(&piece, Status::Failed);
+                failed = true;
             }
         }
         Ok(if failed {
@@ -493,7 +496,7 @@ impl<'a> Run<'a> {
                 if CONTENT_REJECTION_STATUSES.contains(&status) =>
             {
                 warn!(status, "the model rejected the request");
-                Ok(Generation::Stop(Attempt::Content(format!(
+                Ok(Generation::Stop(Attempt::Rejected(format!(
                     "the model rejected the request with HTTP {status}"
                 ))))
             }
@@ -516,6 +519,7 @@ impl<'a> Run<'a> {
                 false
             }
             Ok(session) => {
+                let extractor = Arc::clone(&session.extractor);
                 let cached = CachedExtractor::new(
                     session.extractor,
                     Arc::clone(&self.deps.cache),
@@ -523,6 +527,7 @@ impl<'a> Run<'a> {
                     is_parseable,
                 );
                 self.session = Some(Opened {
+                    extractor,
                     cached: Arc::new(cached),
                     alive: Arc::from(session.alive),
                     _keepalive: session._keepalive,

@@ -13,6 +13,7 @@ use tempfile::TempDir;
 
 use super::super::cache::{cache_key, cache_path, KeyParts, NewEntry};
 use super::super::client::ExtractError;
+use super::failures::{tracking_id, CANARY_TEXT};
 use super::*;
 use crate::config::ExtractionConfig;
 
@@ -24,8 +25,6 @@ const POISON: &str = "POISON";
 /// A source whose configured trust the store refuses.
 const BAD_SOURCE: &str = "bad-source";
 const UNTRUSTWORTHY_SCORE: f64 = 2.0;
-/// Failures that quarantine an event; the config default.
-const RUNS_TO_QUARANTINE: u32 = 3;
 const HOUR: i64 = 3_600_000;
 const OBSERVED: i64 = 1_685_577_600_000;
 const READ_AT: i64 = OBSERVED + 1000 * HOUR;
@@ -300,16 +299,32 @@ impl Fixture {
             .len()
     }
 
-    fn key(n: u64) -> String {
-        batch_key(PROMPT_VERSION, MODEL_SHA, &[format!("e{n}")])
+    fn key(n: u64, scope: Option<&str>) -> String {
+        batch_key(
+            PROMPT_VERSION,
+            MODEL_SHA,
+            &[tracking_id(scope, &format!("e{n}"))],
+        )
     }
 
     async fn failures(&self, n: u64) -> u32 {
-        self.store.batch_failures(&Self::key(n)).await.unwrap()
+        self.failures_in(n, None).await
+    }
+
+    async fn failures_in(&self, n: u64, scope: Option<&str>) -> u32 {
+        let key = Self::key(n, scope);
+        self.store.batch_failures(&key).await.unwrap()
     }
 
     async fn quarantined(&self, n: u64) -> bool {
-        self.store.is_quarantined(&Self::key(n)).await.unwrap()
+        self.quarantined_in(n, None).await
+    }
+
+    async fn quarantined_in(&self, n: u64, scope: Option<&str>) -> bool {
+        self.store
+            .is_quarantined(&Self::key(n, scope))
+            .await
+            .unwrap()
     }
 
     async fn assert_every_fact_has_a_source(&self) {
@@ -861,6 +876,14 @@ fn context_overflow() -> Reply {
     Reply::Fail(ExtractError::Status(400))
 }
 
+fn payload_too_large() -> Reply {
+    Reply::Fail(ExtractError::Status(413))
+}
+
+fn unprocessable() -> Reply {
+    Reply::Fail(ExtractError::Status(422))
+}
+
 fn timeout() -> Reply {
     Reply::Fail(ExtractError::Timeout)
 }
@@ -872,7 +895,12 @@ fn with_poison_third() -> Vec<ExtractionInput> {
 
 #[tokio::test]
 async fn bisection_isolates_the_event_the_model_cannot_read_and_quarantines_it() {
-    for fail in [garbage as fn() -> Reply, context_overflow] {
+    for fail in [
+        garbage as fn() -> Reply,
+        context_overflow,
+        payload_too_large,
+        unprocessable,
+    ] {
         // Arrange
         let mut fx = Fixture::new().await;
         fx.config.batch_events = 4;
@@ -895,7 +923,7 @@ async fn bisection_isolates_the_event_the_model_cannot_read_and_quarantines_it()
         assert_eq!(written, [1, 1, 1]);
 
         // Act: the failures add up across runs until the event is quarantined.
-        for _ in 1..RUNS_TO_QUARANTINE {
+        for _ in 1..fx.config.max_batch_failures {
             fx.run(&Provider::new(&script), &events).await;
         }
         let last = fx.run(&Provider::new(&script), &events).await;
@@ -941,7 +969,7 @@ async fn a_new_model_asks_again_about_a_quarantined_event() {
     // Arrange
     let mut fx = Fixture::new().await;
     fx.config.batch_events = 4;
-    for _ in 0..RUNS_TO_QUARANTINE {
+    for _ in 0..fx.config.max_batch_failures {
         fx.run(
             &Provider::new(&Script::poisoned(garbage)),
             &with_poison_third(),
@@ -1011,7 +1039,7 @@ async fn timeouts_while_nothing_answers_quarantine_nothing() {
 
     // Act
     let mut report = ExtractionReport::default();
-    for _ in 0..=RUNS_TO_QUARANTINE {
+    for _ in 0..=fx.config.max_batch_failures {
         report = fx.run(&Provider::new(&script), &inputs(4)).await;
     }
 
@@ -1053,7 +1081,7 @@ async fn a_poison_event_that_times_out_is_quarantined_once_a_sibling_answers() {
     // Act
     let first = fx.run(&Provider::new(&script), &events).await;
     let counted_after_first = fx.failures(0).await;
-    for _ in 1..RUNS_TO_QUARANTINE {
+    for _ in 1..fx.config.max_batch_failures {
         fx.run(&Provider::new(&script), &events).await;
     }
     let last = fx.run(&Provider::new(&script), &events).await;
@@ -1073,7 +1101,7 @@ async fn a_run_quarantines_at_most_half_of_the_events_it_asked_about_for_timeout
     fx.config.batch_events = 4;
     let script = Script::poisoned(timeout);
     let events = vec![poison(0), poison(1), poison(2), input(3, None)];
-    for _ in 1..RUNS_TO_QUARANTINE {
+    for _ in 1..fx.config.max_batch_failures {
         fx.run(&Provider::new(&script), &events).await;
     }
 
@@ -1089,4 +1117,163 @@ async fn a_run_quarantines_at_most_half_of_the_events_it_asked_about_for_timeout
     assert_eq!(quarantined, [true, true, false]);
     assert_eq!(report.batches_quarantined, 2);
     assert_eq!(report.completed_offset, Some(offset(1)));
+}
+
+#[tokio::test]
+async fn refusals_while_nothing_answers_count_against_no_event() {
+    // Arrange: the server refuses everything, the canary too.
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 4;
+    let script = Script::new(|_, _| context_overflow());
+
+    // Act
+    for _ in 0..=fx.config.max_batch_failures {
+        fx.run(&Provider::new(&script), &inputs(4)).await;
+    }
+
+    // Assert
+    for n in 0..4 {
+        assert_eq!((fx.failures(n).await, fx.quarantined(n).await), (0, false));
+    }
+}
+
+#[tokio::test]
+async fn an_event_failing_in_one_scope_is_quarantined_there_and_still_works_in_the_other() {
+    // Arrange: one event, two scopes, and text the model only chokes on in "a".
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 1;
+    let events = [
+        ExtractionInput {
+            scope: Some("a".into()),
+            ..poison(0)
+        },
+        input(0, Some("b")),
+    ];
+    let script = Script::poisoned(garbage);
+
+    // Act
+    let first = fx.run(&Provider::new(&script), &events).await;
+    for _ in 1..fx.config.max_batch_failures {
+        fx.run(&Provider::new(&script), &events).await;
+    }
+    let last = fx.run(&Provider::new(&script), &events).await;
+
+    // Assert: the working scope neither clears the failing one's count nor shares its quarantine.
+    assert_eq!(first.completed_offset, None);
+    assert!(fx.quarantined_in(0, Some("a")).await);
+    assert!(!fx.quarantined_in(0, Some("b")).await);
+    assert_eq!(fx.failures_in(0, Some("b")).await, 0);
+    assert_eq!(last.completed_offset, Some(WINDOW_END));
+    assert_eq!(fx.facts_about(0).await, 1);
+}
+
+#[tokio::test]
+async fn a_slow_host_with_cached_siblings_quarantines_nothing() {
+    // Arrange: three events were answered on a fast day, and now nothing answers in time.
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 1;
+    let fast = Script::honest();
+    fx.run(
+        &Provider::new(&fast),
+        &[input(1, None), input(2, None), input(3, None)],
+    )
+    .await;
+    fx.config.batch_events = 2;
+    let slow = Script::new(|_, _| timeout());
+    let events = [poison(0), input(1, None), input(2, None), input(3, None)];
+
+    // Act
+    for _ in 0..=fx.config.max_batch_failures {
+        fx.run(&Provider::new(&slow), &events).await;
+    }
+
+    // Assert
+    assert_eq!((fx.failures(0).await, fx.quarantined(0).await), (0, false));
+}
+
+#[tokio::test]
+async fn a_poison_event_is_quarantined_when_a_canary_proves_the_model_works() {
+    // Arrange: its only sibling is cached, so only the canary can show the model answers.
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 1;
+    fx.run(&Provider::new(&Script::honest()), &[input(1, None)])
+        .await;
+    fx.config.batch_events = 2;
+    let script = Script::poisoned(timeout);
+    let events = [poison(0), input(1, None)];
+
+    // Act
+    for _ in 1..fx.config.max_batch_failures {
+        fx.run(&Provider::new(&script), &events).await;
+    }
+    let last = fx.run(&Provider::new(&script), &events).await;
+
+    // Assert
+    assert!(fx.quarantined(0).await);
+    assert_eq!(last.completed_offset, Some(WINDOW_END));
+    let canaries = (0..script.calls())
+        .filter(|&call| script.prompt(call).contains(CANARY_TEXT))
+        .count();
+    assert_eq!(canaries, fx.config.max_batch_failures as usize);
+}
+
+#[tokio::test]
+async fn a_lost_model_settles_no_failure() {
+    // Arrange: a live answer, a timeout that the model's death follows, then a batch that finds it dead.
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 1;
+    let alive = Arc::new(AtomicBool::new(true));
+    let dies = Arc::clone(&alive);
+    let script = Script::new(move |request, _| {
+        if request.prompt.contains(POISON) {
+            dies.store(false, Ordering::SeqCst);
+            timeout()
+        } else {
+            Reply::Text(facts_for(&request.prompt))
+        }
+    });
+    let mut provider = Provider::new(&script);
+    provider.alive = alive;
+    let events = [
+        input(0, Some("b")),
+        ExtractionInput {
+            scope: Some("a".into()),
+            ..poison(1)
+        },
+        input(2, Some("b")),
+    ];
+
+    // Act
+    let report = fx.run(&provider, &events).await;
+
+    // Assert
+    assert!(report.sidecar_lost);
+    assert_eq!(fx.failures_in(1, Some("a")).await, 0);
+}
+
+#[tokio::test]
+async fn a_live_answer_earlier_in_the_run_is_proof_without_a_canary() {
+    // Arrange: the model answers a real batch, then times out on the poison event and on the canary.
+    let mut fx = Fixture::new().await;
+    fx.config.batch_events = 1;
+    let script = Script::new(|request, _| {
+        if request.prompt.contains(POISON) || request.prompt.contains(CANARY_TEXT) {
+            timeout()
+        } else {
+            Reply::Text(facts_for(&request.prompt))
+        }
+    });
+    let events = [
+        input(0, Some("b")),
+        ExtractionInput {
+            scope: Some("a".into()),
+            ..poison(1)
+        },
+    ];
+
+    // Act
+    fx.run(&Provider::new(&script), &events).await;
+
+    // Assert
+    assert_eq!(fx.failures_in(1, Some("a")).await, 1);
 }
