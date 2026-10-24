@@ -21,7 +21,7 @@ pub use extraction::{
 };
 
 /// Producer ids starting with this are reserved for consolidation writes.
-const RESERVED_PRODUCER_PREFIX: &str = "consolidation";
+pub const RESERVED_PRODUCER_PREFIX: &str = "consolidation";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
