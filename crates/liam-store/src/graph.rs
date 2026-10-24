@@ -13,6 +13,7 @@ use std::sync::Arc;
 use liam_log::event::NodeRow;
 
 pub use self::backfill::BackfillReport;
+pub use self::fact_read::{FactPage, MAX_SOURCES_PER_FACT};
 pub use self::fact_write::MAX_FACTS_PER_BATCH;
 pub use self::facts::batch_key;
 use self::logged_plan::{refuse_supersedes, Collision, STORE_SOURCE};
@@ -358,7 +359,7 @@ const MAX_SCOPE_CHARS: usize = 200;
 /// from `migrate::normalize_scope_column` to flag data written before this
 /// existed, so a malformed value can never mean "matches nothing" on one
 /// side and "a real partition" on the other.
-pub(crate) fn validate_scope(scope: &Option<String>) -> Result<Option<String>> {
+pub fn validate_scope(scope: &Option<String>) -> Result<Option<String>> {
     let Some(raw) = scope else {
         return Ok(None);
     };
