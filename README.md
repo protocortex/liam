@@ -362,6 +362,40 @@ rebuild does not bring swept rows back. The log lock is held for the whole
 sweep, so a very large sweep blocks every writer until it finishes. Chunking
 bounds the size of each event and transaction, not the wait.
 
+### Consolidation
+
+Consolidation is the maintenance job that runs on the `gc.interval_hours`
+schedule, and on demand with `liam consolidate`. It is not the log's compactor,
+which only turns closed WAL segments into Parquet and never removes data.
+
+A run goes through these steps, each recorded in `<database>.consolidation.json`
+as it finishes:
+
+1. Snapshot the database into `consolidation.snapshot_dir`.
+2. Draw up to `consolidation.probe_count` live nodes as probes and score them.
+3. Link near-duplicates, those whose embeddings reach
+   `consolidation.dedup_similarity_threshold`. Both rows stay; the merge adds an edge.
+4. Run the maintenance steps: replay the log, sweep, repair provenance, refresh
+   clusters, and (in the daemon only) resynthesize stale entities.
+5. Score the probes again. A probe whose recall drops by `consolidation.probe_recall_margin`
+   or more fails the run. A probe whose node the sweep removed on purpose is not counted.
+
+A passing run commits. A failing one is rolled back: a marker in the log cancels
+the run's own writes, the snapshot is restored and the log is replayed, so writes
+clients made meanwhile survive. A run that stops for any reason resumes at its
+next step, and a rollback that was cut short is finished when `liamd` starts,
+before it serves.
+
+```
+liam consolidate [--database PATH]          # run, or resume an unfinished run
+liam consolidate status [--database PATH]   # show the last run
+```
+
+`liam consolidate` needs the store to itself, so stop `liamd` first. It exits
+non-zero when the run was rolled back or could not restore the store. It runs no
+model, so resynthesis waits for the daemon's next scheduled run. `status` reads
+one file and works while the daemon runs.
+
 ### Refused at open
 
 The database remembers which log it belongs to. If you delete the log directory

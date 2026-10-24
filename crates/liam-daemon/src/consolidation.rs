@@ -9,6 +9,7 @@ pub mod determinism;
 pub mod hooks;
 pub mod maintenance;
 pub mod manifest;
+pub mod offline;
 pub mod probe_set;
 pub mod probes;
 pub mod run;
