@@ -2,7 +2,7 @@
 //! The daemon's side of the consolidation job: the maintenance steps it runs
 //! inside a snapshot, the reopen after a rollback, and the scheduled tick.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -16,11 +16,11 @@ use liam_daemon::consolidation::run::{
 use liam_daemon::consolidation::settings::{identity, run_settings};
 use liam_daemon::consolidation::shared_store::SharedStore;
 use liam_daemon::models::StoreEmbedder;
+use liam_daemon::store_open::LogReopener;
 use liam_model::Embedder;
 use liam_store::{DefaultGraph, RetentionPolicy, SharedLog};
 use tokio_util::sync::CancellationToken;
 
-use crate::log_startup::{open_database, open_store_on_log};
 use crate::mcp::MemoryServer;
 use crate::shutdown::Shutdown;
 use crate::{maintenance_steps, Resynthesis};
@@ -50,30 +50,6 @@ impl Maintenance for DaemonMaintenance {
             "the daemon is stopping, so the maintenance step did not finish"
         );
         Ok(())
-    }
-}
-
-/// Opens the database again on the log the daemon already writes through.
-struct DaemonReopener {
-    config: Config,
-    database_path: PathBuf,
-    log_dir: PathBuf,
-    log: SharedLog,
-    embedder: Arc<dyn Embedder>,
-}
-
-#[async_trait]
-impl StoreReopener for DaemonReopener {
-    async fn reopen(&self) -> anyhow::Result<DefaultGraph> {
-        let store = open_database(&self.config, &self.database_path).await?;
-        open_store_on_log(
-            store,
-            &self.database_path,
-            &self.log_dir,
-            self.log.clone(),
-            self.embedder.clone(),
-        )
-        .await
     }
 }
 
@@ -130,7 +106,7 @@ impl ConsolidationJob {
             skip_resynthesis_once: skip_resynthesis_once.clone(),
         };
         let reopener = reopener.unwrap_or_else(|| {
-            Arc::new(DaemonReopener {
+            Arc::new(LogReopener {
                 config: config.clone(),
                 database_path: database_path.to_path_buf(),
                 log_dir: log_dir.to_path_buf(),
