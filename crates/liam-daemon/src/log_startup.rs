@@ -23,6 +23,9 @@ use crate::shutdown::Shutdown;
 pub struct StartedStore {
     pub store: DefaultGraph,
     pub compactor: JoinHandle<()>,
+    /// The log the store writes through, kept so a rollback can reopen the
+    /// store on the same writer.
+    pub log: SharedLog,
 }
 
 /// The store at `database_path` over the log in `log_dir`. Every failure is
@@ -63,9 +66,13 @@ pub async fn open_store_with_log(
         config.log.bloom()?,
         Some(shutdown.poison_hook()),
     )?;
-    let store = open_store_on_log(store, database_path, log_dir, log, embedder).await?;
+    let store = open_store_on_log(store, database_path, log_dir, log.clone(), embedder).await?;
     let compactor = compactor_for(log_dir)?.spawn(closed_segments);
-    Ok(StartedStore { store, compactor })
+    Ok(StartedStore {
+        store,
+        compactor,
+        log,
+    })
 }
 
 pub(crate) async fn open_database(

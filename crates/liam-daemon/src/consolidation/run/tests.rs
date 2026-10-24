@@ -86,9 +86,10 @@ pub(super) struct CountingMaintenance {
 
 #[async_trait]
 impl Maintenance for CountingMaintenance {
-    async fn run(&self, _store: &DefaultGraph, source: &str) {
+    async fn run(&self, _store: &DefaultGraph, source: &str) -> anyhow::Result<()> {
         self.runs.fetch_add(1, Ordering::SeqCst);
         self.sources.lock().unwrap().push(source.to_owned());
+        Ok(())
     }
 }
 

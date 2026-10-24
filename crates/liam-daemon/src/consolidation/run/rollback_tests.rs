@@ -26,9 +26,10 @@ struct TaggedWrite;
 
 #[async_trait]
 impl Maintenance for TaggedWrite {
-    async fn run(&self, store: &DefaultGraph, source: &str) {
+    async fn run(&self, store: &DefaultGraph, source: &str) -> anyhow::Result<()> {
         let written = NewNode::now("fact", "note", RUN_NOTE).with_producer(source);
         store.insert(written).await.unwrap();
+        Ok(())
     }
 }
 
@@ -40,7 +41,7 @@ struct CorruptsSnapshot {
 
 #[async_trait]
 impl Maintenance for CorruptsSnapshot {
-    async fn run(&self, _store: &DefaultGraph, _source: &str) {
+    async fn run(&self, _store: &DefaultGraph, _source: &str) -> anyhow::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         for run in std::fs::read_dir(&self.snapshot_dir).unwrap().flatten() {
             for entry in std::fs::read_dir(run.path()).unwrap().flatten() {
@@ -49,6 +50,7 @@ impl Maintenance for CorruptsSnapshot {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -135,7 +137,7 @@ struct TickPath {
 
 #[async_trait]
 impl Maintenance for TickPath {
-    async fn run(&self, store: &DefaultGraph, source: &str) {
+    async fn run(&self, store: &DefaultGraph, source: &str) -> anyhow::Result<()> {
         let worked = match self.path {
             Path::Sweep => {
                 let policy = RetentionPolicy::keep(SCRAP, Millis(0)).without_reclaim();
@@ -151,6 +153,7 @@ impl Maintenance for TickPath {
             Path::Clusters => store.refresh_communities().await.unwrap(),
         };
         self.worked.store(worked, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -671,7 +674,7 @@ struct SweepsKind {
 
 #[async_trait]
 impl Maintenance for SweepsKind {
-    async fn run(&self, store: &DefaultGraph, source: &str) {
+    async fn run(&self, store: &DefaultGraph, source: &str) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(5)).await;
         let policy = RetentionPolicy::keep(self.kind, Millis(0)).without_reclaim();
         if self.anonymous {
@@ -679,6 +682,7 @@ impl Maintenance for SweepsKind {
         } else {
             store.gc_from(&policy, source).await.unwrap();
         }
+        Ok(())
     }
 }
 
@@ -815,4 +819,103 @@ async fn a_store_with_no_run_on_disk_has_no_unfinished_run() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn a_new_run_is_refused_while_the_last_one_ended_restore_failed() {
+    // Arrange: a corrupt snapshot ends a run restore failed and is kept
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let damage = Arc::new(CorruptsSnapshot {
+        snapshot_dir: env.dir.path().join("snapshots"),
+        calls: AtomicUsize::new(0),
+    });
+    let failed = env
+        .consolidator(damage, env.regressing())
+        .consolidate(&shared)
+        .await
+        .unwrap();
+    let kept = env.snapshot_files();
+
+    // Act
+    let refused = env
+        .consolidator(maintenance(), honest())
+        .consolidate(&shared)
+        .await
+        .unwrap_err();
+
+    // Assert
+    assert_eq!(failed.outcome, Some(RunOutcome::RestoreFailed));
+    let message = format!("{refused:#}");
+    assert!(message.contains(&failed.run_id), "{message}");
+    assert!(message.contains("manual inspection"), "{message}");
+    assert!(message.contains("remove"), "{message}");
+    assert_eq!(env.snapshot_files(), kept, "the snapshot is not swept");
+}
+
+#[tokio::test]
+async fn a_run_resumes_after_the_operator_clears_a_failed_restore() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let damage = Arc::new(CorruptsSnapshot {
+        snapshot_dir: env.dir.path().join("snapshots"),
+        calls: AtomicUsize::new(0),
+    });
+    env.consolidator(damage, env.regressing())
+        .consolidate(&shared)
+        .await
+        .unwrap();
+    std::fs::remove_file(manifest_path_for(&env.database_path())).unwrap();
+
+    // Act
+    let manifest = env
+        .consolidator(maintenance(), honest())
+        .consolidate(&shared)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(manifest.outcome, Some(RunOutcome::Committed));
+}
+
+/// Fails the maintenance step the way a stopping daemon does.
+struct Interrupted;
+
+#[async_trait]
+impl Maintenance for Interrupted {
+    async fn run(&self, _store: &DefaultGraph, _source: &str) -> anyhow::Result<()> {
+        anyhow::bail!("the daemon is stopping")
+    }
+}
+
+#[tokio::test]
+async fn a_maintenance_step_that_errors_is_not_recorded_and_the_next_call_resumes_at_it() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+
+    // Act
+    let stopped = env
+        .consolidator(Arc::new(Interrupted), honest())
+        .consolidate(&shared)
+        .await;
+    let recorded = RunManifest::load(&manifest_path_for(&env.database_path()))
+        .unwrap()
+        .unwrap();
+    let ran = maintenance();
+    let resumed = env
+        .consolidator(ran.clone(), honest())
+        .consolidate(&shared)
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(stopped.is_err());
+    assert!(!recorded.is_complete("maintenance"));
+    assert!(recorded.is_complete("dedup"), "earlier steps stay recorded");
+    assert!(recorded.outcome.is_none());
+    assert_eq!(resumed.outcome, Some(RunOutcome::Committed));
+    assert_eq!(resumed.run_id, recorded.run_id, "the same run resumed");
+    assert_eq!(ran.runs.load(Ordering::SeqCst), 1);
 }
