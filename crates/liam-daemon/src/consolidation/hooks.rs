@@ -9,7 +9,11 @@ use async_trait::async_trait;
 
 /// Input to the extraction part.
 #[derive(Debug, Default)]
-pub struct ExtractCtx;
+pub struct ExtractCtx {
+    /// The log source to stamp on every write the part makes, so a rollback of
+    /// the run cancels them.
+    pub source: String,
+}
 
 /// What the extraction part did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -17,7 +21,11 @@ pub struct ExtractionReport;
 
 /// Input to the summary part.
 #[derive(Debug, Default)]
-pub struct SummaryCtx;
+pub struct SummaryCtx {
+    /// The log source to stamp on every write the part makes, so a rollback of
+    /// the run cancels them.
+    pub source: String,
+}
 
 /// What the summary part did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -25,7 +33,11 @@ pub struct SummaryReport;
 
 /// Input to the tiering part.
 #[derive(Debug, Default)]
-pub struct TierCtx;
+pub struct TierCtx {
+    /// The log source to stamp on every write the part makes, so a rollback of
+    /// the run cancels them.
+    pub source: String,
+}
 
 /// What the tiering part did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -126,7 +138,7 @@ mod tests {
         };
 
         // Act
-        let result = hooks.summarize(&SummaryCtx).await;
+        let result = hooks.summarize(&SummaryCtx::default()).await;
 
         // Assert
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -139,9 +151,9 @@ mod tests {
         let hooks = ConsolidationHookSet::default();
 
         // Act
-        let extracted = hooks.extract(&ExtractCtx).await;
-        let summarized = hooks.summarize(&SummaryCtx).await;
-        let tiered = hooks.tier(&TierCtx).await;
+        let extracted = hooks.extract(&ExtractCtx::default()).await;
+        let summarized = hooks.summarize(&SummaryCtx::default()).await;
+        let tiered = hooks.tier(&TierCtx::default()).await;
 
         // Assert
         assert_eq!(extracted.unwrap(), ExtractionReport);
@@ -159,8 +171,8 @@ mod tests {
         };
 
         // Act
-        hooks.extract(&ExtractCtx).await.unwrap();
-        let summarized = hooks.summarize(&SummaryCtx).await;
+        hooks.extract(&ExtractCtx::default()).await.unwrap();
+        let summarized = hooks.summarize(&SummaryCtx::default()).await;
 
         // Assert
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -176,7 +188,7 @@ mod tests {
         };
 
         // Act
-        let result = hooks.tier(&TierCtx).await;
+        let result = hooks.tier(&TierCtx::default()).await;
 
         // Assert
         assert_eq!(result.unwrap_err().to_string(), "tier part failed");

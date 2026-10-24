@@ -416,6 +416,34 @@ async fn maintenance_tick(
     full_synthesis_mention_threshold: usize,
     full_synthesis_max_new_tokens: usize,
 ) {
+    let resynthesis = (!skip_resynthesis).then_some(Resynthesis {
+        max_per_tick: max_resynth_per_tick,
+        ask_timeout_secs,
+        full_mention_threshold: full_synthesis_mention_threshold,
+        full_max_new_tokens: full_synthesis_max_new_tokens,
+    });
+    maintenance_steps(server, policy, resynthesis, None).await;
+}
+
+/// How much resynthesis a tick does.
+struct Resynthesis {
+    max_per_tick: usize,
+    ask_timeout_secs: u64,
+    full_mention_threshold: usize,
+    full_max_new_tokens: usize,
+}
+
+/// The tick's steps. With a `write_source`, every log write they make is
+/// stamped with it, so a consolidation run that calls them can have those
+/// writes cancelled by a rollback; without one they keep their own sources.
+/// Cluster assignments are derived rows kept out of the log, which a restore
+/// puts back with the rest of the database.
+async fn maintenance_steps(
+    server: &MemoryServer,
+    policy: &liam_store::RetentionPolicy,
+    resynthesis: Option<Resynthesis>,
+    write_source: Option<&str>,
+) {
     let store = server.store_handle();
     let stopping = server.shutdown_token();
     // A leftover event applied after the sweep would outlive it.
@@ -423,11 +451,11 @@ async fn maintenance_tick(
     if stopping.is_cancelled() {
         return;
     }
-    sweep(&store, policy).await;
+    sweep(&store, policy, write_source).await;
     if stopping.is_cancelled() {
         return;
     }
-    repair_mentions(&store).await;
+    repair_mentions(&store, write_source).await;
     if stopping.is_cancelled() {
         return;
     }
@@ -435,16 +463,8 @@ async fn maintenance_tick(
     if stopping.is_cancelled() {
         return;
     }
-    if !skip_resynthesis {
-        resynthesize_stale(
-            server,
-            &store,
-            max_resynth_per_tick,
-            ask_timeout_secs,
-            full_synthesis_mention_threshold,
-            full_synthesis_max_new_tokens,
-        )
-        .await;
+    if let Some(resynthesis) = resynthesis {
+        resynthesize_stale(server, &store, &resynthesis, write_source).await;
     }
 }
 
@@ -456,13 +476,11 @@ async fn maintenance_tick(
 async fn resynthesize_stale(
     server: &MemoryServer,
     store: &DefaultGraph,
-    max_resynth_per_tick: usize,
-    ask_timeout_secs: u64,
-    full_synthesis_mention_threshold: usize,
-    full_synthesis_max_new_tokens: usize,
+    resynthesis: &Resynthesis,
+    write_source: Option<&str>,
 ) {
     let now = liam_store::Millis::now();
-    let stale = match store.stale_entities(max_resynth_per_tick, now).await {
+    let stale = match store.stale_entities(resynthesis.max_per_tick, now).await {
         Ok(stale) => stale,
         Err(e) => {
             tracing::warn!(error = %e, "stale entity lookup failed");
@@ -482,14 +500,14 @@ async fn resynthesize_stale(
         }
         let max_new_tokens = resynthesis_budget(
             tier_fingerprint.as_ref().map(|f| *f),
-            full_synthesis_mention_threshold,
-            full_synthesis_max_new_tokens,
+            resynthesis.full_mention_threshold,
+            resynthesis.full_max_new_tokens,
             mcp::ENTITY_SYNTHESIS_MAX_NEW_TOKENS,
         );
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(ask_timeout_secs.max(1));
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(resynthesis.ask_timeout_secs.max(1));
         match server
-            .resynthesize_entity(node_id, deadline, max_new_tokens)
+            .resynthesize_entity_as(node_id, deadline, max_new_tokens, write_source)
             .await
         {
             Ok(()) => {
@@ -551,8 +569,12 @@ fn resynthesis_budget(
 /// entities keep pointing at the current fact. A failure here must not block
 /// the rest of the tick, matching `sweep`'s and `refresh_clusters`'s own
 /// error-doesn't-abort-the-tick pattern.
-async fn repair_mentions(store: &DefaultGraph) {
-    match store.repair_superseded_mentions().await {
+async fn repair_mentions(store: &DefaultGraph, write_source: Option<&str>) {
+    let repaired = match write_source {
+        Some(source) => store.repair_superseded_mentions_from(source).await,
+        None => store.repair_superseded_mentions().await,
+    };
+    match repaired {
         Ok(repaired) => tracing::info!(repaired, "provenance repair completed"),
         Err(e) => tracing::warn!(error = %e, "provenance repair failed"),
     }
@@ -568,8 +590,16 @@ async fn catch_up(store: &DefaultGraph) {
     }
 }
 
-async fn sweep(store: &DefaultGraph, policy: &liam_store::RetentionPolicy) {
-    match store.gc(policy).await {
+async fn sweep(
+    store: &DefaultGraph,
+    policy: &liam_store::RetentionPolicy,
+    write_source: Option<&str>,
+) {
+    let swept = match write_source {
+        Some(source) => store.gc_from(policy, source).await,
+        None => store.gc(policy).await,
+    };
+    match swept {
         Ok(report) => tracing::info!(?report, "gc completed"),
         Err(e) => tracing::warn!(error = %e, "gc failed"),
     }
@@ -1792,6 +1822,65 @@ mod tests {
             assert!(reply.starts_with("remember failed"), "{reply}");
             assert!(shutdown.token().is_cancelled());
             assert!(shutdown.failure().is_some());
+        }
+
+        const RUN_SOURCE: &str = "consolidation:9";
+
+        /// The source of every logged record whose payload `pick` keeps.
+        async fn sources_of(dir: &std::path::Path, pick: fn(&LogPayload) -> bool) -> Vec<String> {
+            logged_events(&log_dir_in(dir))
+                .await
+                .into_iter()
+                .filter(|event| pick(&event.payload))
+                .map(|event| event.source)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_sweep_in_a_run_is_stamped_with_the_runs_source() {
+            // Arrange
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FixedClock::new(Millis(100 * DAY)));
+            let (store, server) = reopen(dir.path(), clock).await;
+            let old = NewNode::now("fact", "label", "old").with_valid_from(Millis(10 * DAY));
+            store.insert(old).await.unwrap();
+
+            // Act
+            maintenance_steps(&server, &sweep_old_facts(), None, Some(RUN_SOURCE)).await;
+
+            // Assert
+            let sources = sources_of(dir.path(), |p| matches!(p, LogPayload::Tombstone(_))).await;
+            assert_eq!(sources, [RUN_SOURCE]);
+        }
+
+        #[tokio::test]
+        async fn a_provenance_repair_in_a_run_is_stamped_with_the_runs_source() {
+            // Arrange: a fact mentions an entity that was then superseded
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(FixedClock::new(Millis(1000)));
+            let (store, server) = reopen(dir.path(), clock).await;
+            let entity = store
+                .upsert_by(NewNode::entity("person", "Kim"))
+                .await
+                .unwrap();
+            let fact = store
+                .insert(NewNode::now("fact", "a", "Kim"))
+                .await
+                .unwrap();
+            store
+                .relate(&fact, &entity, liam_store::relation::MENTIONS)
+                .await
+                .unwrap();
+            let mut renewed = NewNode::entity("person", "Kim");
+            renewed.content = "renewed".to_owned();
+            store.upsert_by(renewed).await.unwrap();
+
+            // Act
+            maintenance_steps(&server, &nothing_to_sweep(), None, Some(RUN_SOURCE)).await;
+
+            // Assert
+            let sources = sources_of(dir.path(), |p| matches!(p, LogPayload::EdgeWrite(_))).await;
+            assert_eq!(sources.iter().filter(|s| *s == RUN_SOURCE).count(), 1);
         }
 
         #[tokio::test]

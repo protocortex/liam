@@ -996,6 +996,20 @@ impl MemoryServer {
         deadline: tokio::time::Instant,
         max_new_tokens: usize,
     ) -> Result<(), String> {
+        self.resynthesize_entity_as(entity_id, deadline, max_new_tokens, None)
+            .await
+    }
+
+    /// `resynthesize_entity` with the new page written under `write_source`
+    /// instead of the server's producer, so a consolidation run's rollback
+    /// cancels the write and the supersession that comes with it.
+    pub(crate) async fn resynthesize_entity_as(
+        &self,
+        entity_id: liam_store::NodeId,
+        deadline: tokio::time::Instant,
+        max_new_tokens: usize,
+        write_source: Option<&str>,
+    ) -> Result<(), String> {
         let now = liam_store::Millis::now();
         let candidate = match self.store.get(&entity_id, now).await {
             Ok(Some(c)) => c,
@@ -1039,7 +1053,7 @@ impl MemoryServer {
         let mut node = NewNode::entity(candidate.kind, candidate.label)
             .with_attributes(candidate.attributes)
             .with_embedding(embedding)
-            .with_producer(self.producer());
+            .with_producer(write_source.map_or_else(|| self.producer(), str::to_owned));
         if let Some(scope) = candidate.scope.clone() {
             node = node.with_scope(scope);
         }
@@ -3482,6 +3496,45 @@ mod tests {
         let calls = embedder.calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].1, TextKind::Document);
+    }
+
+    #[tokio::test]
+    async fn resynthesize_entity_as_writes_the_page_under_the_given_source() {
+        // Arrange
+        let (server, _embedder) =
+            server_with_recording_embedder_and_llm(Arc::new(CountingLlm::new())).await;
+        let entity_id = server
+            .store
+            .upsert_by(NewNode::entity("person", "Kim"))
+            .await
+            .expect("seed entity");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        server
+            .resynthesize_entity_as(
+                entity_id.clone(),
+                deadline,
+                ENTITY_SYNTHESIS_MAX_NEW_TOKENS,
+                Some("consolidation:9"),
+            )
+            .await
+            .expect("resynthesis should succeed");
+
+        // Assert
+        let pages = server
+            .store
+            .changes_since(liam_store::BEGINNING)
+            .await
+            .expect("changes");
+        let newest = pages.iter().rfind(|change| !change.closed).expect("a page");
+        let page = server
+            .store
+            .get(&newest.id, liam_store::Millis(liam_store::FOREVER.0 - 1))
+            .await
+            .expect("get")
+            .expect("live page");
+        assert_eq!(page.producer, "consolidation:9");
     }
 
     #[tokio::test]
