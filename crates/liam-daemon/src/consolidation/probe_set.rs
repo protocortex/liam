@@ -92,20 +92,31 @@ pub async fn pick_probes(
         .collect())
 }
 
+/// What is left of a probe set once the run's own sweep is accounted for.
+#[derive(Debug)]
+pub struct Surviving {
+    pub set: ProbeSet,
+    /// Probes whose nodes vanished and the run's sweep does not explain.
+    pub lost: Vec<String>,
+}
+
 impl ProbeSet {
-    /// The probes that still have a live node to find, with their baseline. A
-    /// node the run's sweep removed on purpose cannot be recalled, so it must
-    /// not count as a regression.
+    /// Splits the set by whether each probe can still be answered. A probe
+    /// with a live node stays. A probe whose nodes are all in `swept`, the ones
+    /// the run's own sweep removed, is dropped with its baseline score. A probe
+    /// that lost a node any other way is reported in `lost`, since nothing the
+    /// run did on purpose explains it.
     ///
     /// # Errors
     ///
     /// Fails when the store cannot read a node.
-    pub async fn retain_live(
+    pub async fn without_swept(
         mut self,
         store: &DefaultGraph,
+        swept: &HashSet<NodeId>,
         as_of: Millis,
-    ) -> liam_store::Result<Self> {
-        let mut kept = Vec::new();
+    ) -> liam_store::Result<Surviving> {
+        let (mut kept, mut lost) = (Vec::new(), Vec::new());
         for probe in self.probes {
             let mut live = false;
             for id in &probe.relevant {
@@ -113,13 +124,15 @@ impl ProbeSet {
             }
             if live {
                 kept.push(probe);
+            } else if probe.relevant.iter().any(|id| !swept.contains(id)) {
+                lost.push(probe.name);
             }
         }
         self.baseline
             .scores
             .retain(|name, _| kept.iter().any(|probe| &probe.name == name));
         self.probes = kept;
-        Ok(self)
+        Ok(Surviving { set: self, lost })
     }
 
     /// Writes the set to `path`, replacing any earlier one.
@@ -328,8 +341,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retain_live_drops_a_probe_whose_node_is_gone_and_its_baseline() {
-        // Arrange
+    async fn only_probes_whose_nodes_the_run_swept_are_dropped_with_their_baseline() {
+        // Arrange: one node kept, one swept by the run, one removed by someone else
         let dir = tempfile::tempdir().unwrap();
         let store = DefaultGraph::open(
             dir.path().join("p.db").to_str().unwrap(),
@@ -337,19 +350,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let kept = store
-            .insert(liam_store::NewNode::now("keep", "a", "alpha"))
-            .await
-            .unwrap();
-        let gone = store
-            .insert(liam_store::NewNode::now("fact", "b", "beta"))
-            .await
-            .unwrap();
+        let insert = |kind: &'static str, text: &'static str| {
+            store.insert(liam_store::NewNode::now(kind, text, text))
+        };
+        let kept = insert("keep", "alpha").await.unwrap();
+        let swept = insert("fact", "beta").await.unwrap();
+        let vanished = insert("other", "gamma").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        store
-            .gc(&liam_store::RetentionPolicy::keep("fact", Millis(0)).without_reclaim())
-            .await
-            .unwrap();
+        let policy = |kind| liam_store::RetentionPolicy::keep(kind, Millis(0)).without_reclaim();
+        store.gc(&policy("fact")).await.unwrap();
+        store.gc(&policy("other")).await.unwrap();
         let probe = |name: &str, id: &NodeId| Probe {
             name: name.into(),
             query: name.into(),
@@ -361,18 +371,31 @@ mod tests {
             ndcg: 1.0,
         };
         let set = ProbeSet {
-            probes: vec![probe("kept", &kept), probe("gone", &gone)],
+            probes: vec![
+                probe("kept", &kept),
+                probe("swept", &swept),
+                probe("vanished", &vanished),
+            ],
             baseline: ProbeReport {
-                scores: [("kept".to_owned(), score), ("gone".to_owned(), score)].into(),
+                scores: ["kept", "swept", "vanished"]
+                    .map(|name| (name.to_owned(), score))
+                    .into(),
             },
         };
 
         // Act
-        let live = set.retain_live(&store, AS_OF).await.unwrap();
+        let result = set
+            .without_swept(&store, &HashSet::from([swept]), AS_OF)
+            .await
+            .unwrap();
 
         // Assert
-        let names: Vec<_> = live.probes.iter().map(|p| p.name.as_str()).collect();
+        let names: Vec<_> = result.set.probes.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["kept"]);
-        assert_eq!(live.baseline.scores.keys().collect::<Vec<_>>(), ["kept"]);
+        assert_eq!(
+            result.set.baseline.scores.keys().collect::<Vec<_>>(),
+            ["kept"]
+        );
+        assert_eq!(result.lost, ["vanished"]);
     }
 }

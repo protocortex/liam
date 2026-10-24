@@ -298,7 +298,7 @@ impl Consolidator {
                 let result = self.parts.hooks.tier(&TierCtx { source }).await;
                 self.note_hook(step, configured, result.map(drop), manifest)?;
             }
-            PROBES => return self.check_probes(store).await,
+            PROBES => return self.check_probes(store, manifest).await,
             other => anyhow::bail!("the consolidation run has no step named {other}"),
         }
         Ok(StepOutcome::Done)
@@ -386,15 +386,32 @@ impl Consolidator {
         manifest.mark_step_complete(&format!("{step}{suffix}"), &self.manifest_path())
     }
 
-    async fn check_probes(&self, store: &DefaultGraph) -> anyhow::Result<StepOutcome> {
-        let set = ProbeSet::load(&self.probe_set_path())?
-            .retain_live(store, ALL_LIVE)
-            .await?;
-        if set.probes.is_empty() {
+    async fn check_probes(
+        &self,
+        store: &DefaultGraph,
+        manifest: &RunManifest,
+    ) -> anyhow::Result<StepOutcome> {
+        let loaded = ProbeSet::load(&self.probe_set_path())?;
+        if loaded.probes.is_empty() {
             tracing::info!(
-                "consolidation: no probed node is live, so there is nothing to gate the run"
+                "consolidation: the store had no live node to probe, the gate is skipped"
             );
             return Ok(StepOutcome::Done);
+        }
+        let swept = store.nodes_swept_by(&manifest.write_source()).await?;
+        let surviving = loaded.without_swept(store, &swept, ALL_LIVE).await?;
+        if !surviving.lost.is_empty() {
+            return Ok(StepOutcome::Failed(format!(
+                "probed nodes vanished that the run's sweep did not remove: {}",
+                surviving.lost.join(", ")
+            )));
+        }
+        let set = surviving.set;
+        if set.probes.is_empty() {
+            return Ok(StepOutcome::Failed(
+                "the run's sweep removed every probed node, so nothing is left to check it against"
+                    .to_owned(),
+            ));
         }
         let current = match self.parts.probes.run(store, &set.probes).await {
             Ok(report) => report,

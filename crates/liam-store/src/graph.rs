@@ -53,6 +53,7 @@ mod replay;
 mod rolled_back;
 mod run_marker;
 mod snapshot;
+mod swept_by;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
 /// one-character handle answers with something a caller can act on instead of
@@ -2270,6 +2271,7 @@ mod tests {
     mod snapshot;
     mod soak;
     mod support;
+    mod swept_by;
 
     /// A graph whose clock starts at 1000, with a handle to move it.
     async fn gc_graph() -> (DefaultGraph, Arc<FixedClock>) {

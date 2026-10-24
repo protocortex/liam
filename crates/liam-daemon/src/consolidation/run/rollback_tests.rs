@@ -662,31 +662,105 @@ async fn a_rollback_over_a_store_held_elsewhere_fails_and_leaves_the_store_in_it
     );
 }
 
-/// Sweeps every fact, as a retention rule would for nodes past their age.
-struct SweepsEverything;
+/// Sweeps one kind of node, as a retention rule would, under the run's source
+/// or, when `anonymous`, as someone else's write.
+struct SweepsKind {
+    kind: &'static str,
+    anonymous: bool,
+}
 
 #[async_trait]
-impl Maintenance for SweepsEverything {
-    async fn run(&self, store: &DefaultGraph, _source: &str) {
+impl Maintenance for SweepsKind {
+    async fn run(&self, store: &DefaultGraph, source: &str) {
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let policy = RetentionPolicy::keep("fact", Millis(0)).without_reclaim();
-        store.gc(&policy).await.unwrap();
+        let policy = RetentionPolicy::keep(self.kind, Millis(0)).without_reclaim();
+        if self.anonymous {
+            store.gc(&policy).await.unwrap();
+        } else {
+            store.gc_from(&policy, source).await.unwrap();
+        }
     }
 }
 
+/// Every node is probed, since the store holds fewer than this.
+const PROBE_ALL: usize = 50;
+
+async fn seeded_with_scrap(env: &Env) -> SharedStore {
+    let shared = env.seeded().await;
+    let store = shared.get().await.unwrap();
+    store
+        .insert(NewNode::now(SCRAP, "scrap note", "scrap note").with_producer(CLIENT))
+        .await
+        .unwrap();
+    drop(store);
+    shared
+}
+
+fn sweeping(env: &Env, kind: &'static str, anonymous: bool) -> Consolidator {
+    env.consolidator_drawing(
+        Arc::new(SweepsKind { kind, anonymous }),
+        honest(),
+        ConsolidationHookSet::default(),
+        PROBE_ALL,
+    )
+}
+
 #[tokio::test]
-async fn a_sweep_of_every_probed_node_is_not_a_regression() {
+async fn a_probed_node_the_runs_own_sweep_removed_does_not_fail_the_run() {
     // Arrange
     let env = Env::new();
-    let shared = env.seeded().await;
-    let run = env.consolidator(Arc::new(SweepsEverything), honest());
+    let shared = seeded_with_scrap(&env).await;
 
     // Act
-    let manifest = run.consolidate(&shared).await.unwrap();
+    let manifest = sweeping(&env, SCRAP, false)
+        .consolidate(&shared)
+        .await
+        .unwrap();
 
     // Assert
     assert_eq!(manifest.outcome, Some(RunOutcome::Committed));
-    assert!(state(&shared).await.0.is_empty(), "the sweep stands");
+    assert!(!state(&shared).await.0.contains("scrap note"));
+}
+
+#[tokio::test]
+async fn a_probed_node_that_vanished_without_the_runs_sweep_fails_the_run() {
+    // Arrange
+    let env = Env::new();
+    let shared = seeded_with_scrap(&env).await;
+    let (mut expected, _) = state(&shared).await;
+    expected.remove("scrap note");
+
+    // Act
+    let manifest = sweeping(&env, SCRAP, true)
+        .consolidate(&shared)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(manifest.outcome, Some(RunOutcome::RolledBack));
+    assert_eq!(
+        state(&shared).await.0,
+        expected,
+        "a write that is not the run's stands after the rollback"
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_that_leaves_no_probe_to_check_fails_the_run() {
+    // Arrange: every node is old enough to be swept
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let (before, _) = state(&shared).await;
+
+    // Act
+    let manifest = sweeping(&env, "fact", false)
+        .consolidate(&shared)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(manifest.outcome, Some(RunOutcome::RolledBack));
+    assert_eq!(state(&shared).await.0, before, "the sweep was undone");
 }
 
 #[tokio::test]
