@@ -319,6 +319,25 @@ fn sidecars(database_path: &Path) -> Vec<(PathBuf, PathBuf)> {
         .collect()
 }
 
+/// Checks the snapshot described by `meta_path` against its recorded size and
+/// checksum, touching nothing. A restore does the same while it stages the
+/// copy; this lets a caller learn the snapshot is unusable before it commits to
+/// a rollback that needs it.
+pub fn verify_snapshot(meta_path: &Path) -> Result<SnapshotMeta> {
+    let meta = read_meta(meta_path)?;
+    let snapshot_file = meta_path.with_extension(DATABASE_EXTENSION);
+    let mut source = File::open(&snapshot_file)
+        .map_err(snapshot_io("open the snapshot file", &snapshot_file))?;
+    let (sha256, bytes) = copy_hashed(&mut source, |_| Ok(()))
+        .map_err(snapshot_io("read the snapshot file", &snapshot_file))?;
+    if bytes != meta.bytes || sha256 != meta.sha256 {
+        return Err(Error::SnapshotChecksumMismatch {
+            snapshot_id: meta.snapshot_id,
+        });
+    }
+    Ok(meta)
+}
+
 pub(crate) fn restore_files(
     ops: &mut impl SnapshotOps,
     database_path: &Path,

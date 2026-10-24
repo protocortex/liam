@@ -24,9 +24,10 @@ pub use backends::DefaultBackend;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::{Error, MismatchSource, Result};
 pub use graph::{
-    batch_key, recover_interrupted_restore, BackfillReport, Candidate, CatchUpReport,
-    ContentEmbedder, EmbedError, EventLog, Graph, PoisonHook, RebuildMode, RebuildReport,
-    ReembedReport, SharedLog, Snapshot, SnapshotLog, SnapshotMeta, RUN_SOURCE_PREFIX,
+    batch_key, recover_interrupted_restore, verify_snapshot, BackfillReport, Candidate,
+    CatchUpReport, ContentEmbedder, EmbedError, EventLog, Graph, PoisonHook, RebuildMode,
+    RebuildReport, ReembedReport, SharedLog, Snapshot, SnapshotLog, SnapshotMeta,
+    RUN_SOURCE_PREFIX,
 };
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{

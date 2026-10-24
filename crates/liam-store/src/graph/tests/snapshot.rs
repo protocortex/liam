@@ -1027,3 +1027,44 @@ async fn recovery_refuses_to_overwrite_a_wal_that_appeared_beside_a_pending_swap
     assert_eq!(bytes(&wal), OLD_WAL);
     assert_eq!(bytes(&aside), b"moved aside");
 }
+
+#[tokio::test]
+async fn verifying_a_snapshot_accepts_an_intact_one_and_touches_nothing() {
+    // Arrange
+    let env = Env::new();
+    let dir = TempDir::new().unwrap();
+    let (graph, _log) = open(&env, "live.db").await;
+    graph.insert(fact("first")).await.unwrap();
+    let taken = graph.snapshot(&snapshot_dir(&dir)).await.unwrap();
+    let before = files_in(&snapshot_dir(&dir));
+
+    // Act
+    let verified = crate::graph::snapshot::verify_snapshot(&taken.meta_path);
+
+    // Assert
+    assert_eq!(verified.unwrap(), taken.meta);
+    assert_eq!(files_in(&snapshot_dir(&dir)), before);
+}
+
+#[tokio::test]
+async fn verifying_a_damaged_or_missing_snapshot_file_fails() {
+    // Arrange
+    let env = Env::new();
+    let dir = TempDir::new().unwrap();
+    let (graph, _log) = open(&env, "live.db").await;
+    graph.insert(fact("first")).await.unwrap();
+    let taken = graph.snapshot(&snapshot_dir(&dir)).await.unwrap();
+    fs::write(&taken.database_path, b"damaged").unwrap();
+
+    // Act
+    let damaged = crate::graph::snapshot::verify_snapshot(&taken.meta_path);
+    fs::remove_file(&taken.database_path).unwrap();
+    let missing = crate::graph::snapshot::verify_snapshot(&taken.meta_path);
+
+    // Assert
+    assert!(matches!(
+        damaged,
+        Err(Error::SnapshotChecksumMismatch { .. })
+    ));
+    assert!(matches!(missing, Err(Error::Snapshot(_))));
+}
