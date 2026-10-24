@@ -11,4 +11,5 @@ pub mod manifest;
 pub mod probe_set;
 pub mod probes;
 pub mod run;
+pub mod settings;
 pub mod shared_store;

@@ -11,8 +11,11 @@ use liam_log::wal::WalConfig;
 use liam_store::{Millis, RetentionPolicy};
 use serde::Deserialize;
 
+mod consolidation;
 mod extraction;
 
+pub(crate) use consolidation::default_snapshot_dir;
+pub use consolidation::ConsolidationConfig;
 pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
 };
@@ -60,6 +63,8 @@ pub struct Config {
     pub log: LogConfig,
     /// Deriving subject/predicate/object facts from the log. Off by default.
     pub extraction: ExtractionConfig,
+    /// The snapshot, merge, probe and commit job that wraps maintenance.
+    pub consolidation: ConsolidationConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -173,6 +178,7 @@ impl Default for Config {
             producers: ProducersConfig::default(),
             log: LogConfig::default(),
             extraction: ExtractionConfig::default(),
+            consolidation: ConsolidationConfig::default(),
         }
     }
 }
@@ -379,6 +385,7 @@ impl Config {
         config.log.validate()?;
         config.producers.validate()?;
         config.extraction.validate()?;
+        config.consolidation.validate()?;
         Ok(config)
     }
 

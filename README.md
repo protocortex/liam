@@ -199,6 +199,10 @@ unknown key fails loudly.
 | `log.wal_segment_max_bytes` | `8388608` | The open WAL segment is closed by the first write after it reaches this size, then compacted to Parquet. Must be at least 1. |
 | `log.wal_rotate_interval_secs` | `300` | The open WAL segment is closed by the first write after it reaches this age, then compacted to Parquet. Must be at least 1. |
 | `log.bloom_fpr` | `0.01` | False positive rate of the dedup filter. At least `1e-9` and below `1`. |
+| `consolidation.probe_recall_margin` | `0.02` | A probe whose recall drops by at least this much fails the run, which is then rolled back. Above `0` and at most `1`. |
+| `consolidation.dedup_similarity_threshold` | `0.95` | Cosine similarity at or above which two nodes are linked as near-duplicates. Above `0` and at most `1`. |
+| `consolidation.probe_count` | `20` | Most probes drawn from the store to gate a run. From `1` to `1000`. |
+| `consolidation.snapshot_dir` | `<database stem>.snapshots` beside the database | Where runs keep their snapshots. `~` is expanded, and a relative path is taken from the database's directory. Must not be empty. |
 | `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
 | `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
 
