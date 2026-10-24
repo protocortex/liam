@@ -73,7 +73,7 @@ const SAFE_DAYS_IN_MONTH: u64 = 28;
 const MAX_TICKET_NUMBER: u64 = 999;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Template {
+pub(crate) enum Template {
     Relocation,
     PastResidence,
     Employment,
@@ -90,7 +90,7 @@ pub(super) enum Template {
 
 /// A fact the model should extract from an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ExpectedFact {
+pub(crate) struct ExpectedFact {
     pub subject: String,
     pub predicate: &'static str,
     pub object: String,
@@ -99,13 +99,13 @@ pub(super) struct ExpectedFact {
 
 /// A date, URL or id the rules extractor should find in an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Reference {
+pub(crate) struct Reference {
     pub predicate: &'static str,
     pub object: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct LabelledEvent {
+pub(crate) struct LabelledEvent {
     pub index: usize,
     pub id: String,
     pub template: Template,
@@ -125,7 +125,8 @@ impl LabelledEvent {
 }
 
 /// The fixed-size corpus for `rng`'s stream, in observation order.
-pub(super) fn generate(rng: &mut ChaCha8Rng) -> Vec<LabelledEvent> {
+// Crate-visible so the trust-and-metrics work can reuse the labelled corpus.
+pub(crate) fn generate(rng: &mut ChaCha8Rng) -> Vec<LabelledEvent> {
     let mut subjects = distinct_people(rng, CYCLES * SUBJECTS_PER_CYCLE).into_iter();
     let mut events = Vec::with_capacity(EVENT_COUNT);
     for _ in 0..CYCLES {

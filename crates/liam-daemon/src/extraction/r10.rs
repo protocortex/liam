@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::response::Polarity;
 
-mod corpus;
+pub(crate) mod corpus;
 #[cfg(test)]
 mod tiers;
 
