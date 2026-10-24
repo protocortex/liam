@@ -192,6 +192,35 @@ impl Consolidator {
         }
     }
 
+    /// Finishes a rollback that a crash interrupted, so the store is right
+    /// before anything serves it. A run that crashed on its forward path is
+    /// left for the next call, which resumes it.
+    ///
+    /// # Errors
+    ///
+    /// Fails like `consolidate` does.
+    pub async fn finish_pending_rollback(
+        &self,
+        shared: &SharedStore,
+    ) -> anyhow::Result<Option<RunManifest>> {
+        let pending = self
+            .unfinished_run()?
+            .is_some_and(|run| run.is_complete(rollback::ROLLBACK_PENDING));
+        if !pending {
+            return Ok(None);
+        }
+        self.consolidate(shared).await.map(Some)
+    }
+
+    /// The run the manifest beside the database records as not yet ended.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the manifest exists and cannot be read.
+    pub fn unfinished_run(&self) -> anyhow::Result<Option<RunManifest>> {
+        Ok(RunManifest::load(&self.manifest_path())?.filter(|run| run.outcome.is_none()))
+    }
+
     fn manifest_path(&self) -> PathBuf {
         manifest_path_for(&self.database_path)
     }
@@ -203,9 +232,7 @@ impl Consolidator {
     /// The unfinished run on disk, or a new one. A run made under other models
     /// comes back with the reason it cannot be resumed.
     fn begin(&self) -> anyhow::Result<(RunManifest, Option<ResumeRefused>)> {
-        if let Some(unfinished) =
-            RunManifest::load(&self.manifest_path())?.filter(|run| run.outcome.is_none())
-        {
+        if let Some(unfinished) = self.unfinished_run()? {
             let refused = unfinished
                 .check_resumable(&self.identity.embedder, &self.identity.llm_model)
                 .err();
@@ -360,10 +387,12 @@ impl Consolidator {
     }
 
     async fn check_probes(&self, store: &DefaultGraph) -> anyhow::Result<StepOutcome> {
-        let set = ProbeSet::load(&self.probe_set_path())?;
+        let set = ProbeSet::load(&self.probe_set_path())?
+            .retain_live(store, ALL_LIVE)
+            .await?;
         if set.probes.is_empty() {
             tracing::info!(
-                "consolidation: the store has no live node to probe, the gate is skipped"
+                "consolidation: no probed node is live, so there is nothing to gate the run"
             );
             return Ok(StepOutcome::Done);
         }

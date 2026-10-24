@@ -93,6 +93,35 @@ pub async fn pick_probes(
 }
 
 impl ProbeSet {
+    /// The probes that still have a live node to find, with their baseline. A
+    /// node the run's sweep removed on purpose cannot be recalled, so it must
+    /// not count as a regression.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store cannot read a node.
+    pub async fn retain_live(
+        mut self,
+        store: &DefaultGraph,
+        as_of: Millis,
+    ) -> liam_store::Result<Self> {
+        let mut kept = Vec::new();
+        for probe in self.probes {
+            let mut live = false;
+            for id in &probe.relevant {
+                live |= store.get(id, as_of).await?.is_some();
+            }
+            if live {
+                kept.push(probe);
+            }
+        }
+        self.baseline
+            .scores
+            .retain(|name, _| kept.iter().any(|probe| &probe.name == name));
+        self.probes = kept;
+        Ok(self)
+    }
+
     /// Writes the set to `path`, replacing any earlier one.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let sidecar = Sidecar {
@@ -296,5 +325,54 @@ mod tests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn retain_live_drops_a_probe_whose_node_is_gone_and_its_baseline() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let store = DefaultGraph::open(
+            dir.path().join("p.db").to_str().unwrap(),
+            liam_store::GraphConfig::new(DIMS),
+        )
+        .await
+        .unwrap();
+        let kept = store
+            .insert(liam_store::NewNode::now("keep", "a", "alpha"))
+            .await
+            .unwrap();
+        let gone = store
+            .insert(liam_store::NewNode::now("fact", "b", "beta"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store
+            .gc(&liam_store::RetentionPolicy::keep("fact", Millis(0)).without_reclaim())
+            .await
+            .unwrap();
+        let probe = |name: &str, id: &NodeId| Probe {
+            name: name.into(),
+            query: name.into(),
+            relevant: vec![id.clone()],
+            embedding: None,
+        };
+        let score = ProbeScore {
+            recall: 1.0,
+            ndcg: 1.0,
+        };
+        let set = ProbeSet {
+            probes: vec![probe("kept", &kept), probe("gone", &gone)],
+            baseline: ProbeReport {
+                scores: [("kept".to_owned(), score), ("gone".to_owned(), score)].into(),
+            },
+        };
+
+        // Act
+        let live = set.retain_live(&store, AS_OF).await.unwrap();
+
+        // Assert
+        let names: Vec<_> = live.probes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["kept"]);
+        assert_eq!(live.baseline.scores.keys().collect::<Vec<_>>(), ["kept"]);
     }
 }

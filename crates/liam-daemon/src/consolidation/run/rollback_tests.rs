@@ -661,3 +661,84 @@ async fn a_rollback_over_a_store_held_elsewhere_fails_and_leaves_the_store_in_it
         "the store stays available to clients"
     );
 }
+
+/// Sweeps every fact, as a retention rule would for nodes past their age.
+struct SweepsEverything;
+
+#[async_trait]
+impl Maintenance for SweepsEverything {
+    async fn run(&self, store: &DefaultGraph, _source: &str) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let policy = RetentionPolicy::keep("fact", Millis(0)).without_reclaim();
+        store.gc(&policy).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_sweep_of_every_probed_node_is_not_a_regression() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let run = env.consolidator(Arc::new(SweepsEverything), honest());
+
+    // Act
+    let manifest = run.consolidate(&shared).await.unwrap();
+
+    // Assert
+    assert_eq!(manifest.outcome, Some(RunOutcome::Committed));
+    assert!(state(&shared).await.0.is_empty(), "the sweep stands");
+}
+
+#[tokio::test]
+async fn a_pending_rollback_is_finished_before_the_store_is_served() {
+    // Arrange: a run that crashed right after committing to its rollback
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let (before, no_links) = state(&shared).await;
+    let mut crashing = env.consolidator(Arc::new(TaggedWrite), env.regressing());
+    crashing.crash_after = Some(ROLLBACK_PENDING);
+    assert!(crashing.consolidate(&shared).await.is_err());
+
+    // Act
+    let manifest = env
+        .consolidator(maintenance(), honest())
+        .finish_pending_rollback(&shared)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(manifest.unwrap().outcome, Some(RunOutcome::RolledBack));
+    assert_eq!(state(&shared).await, (before, no_links));
+}
+
+#[tokio::test]
+async fn a_run_that_crashed_going_forward_is_left_for_the_next_call_to_resume() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let mut crashing = env.consolidator(maintenance(), honest());
+    crashing.crash_after = Some("dedup");
+    assert!(crashing.consolidate(&shared).await.is_err());
+    let run = env.consolidator(maintenance(), honest());
+
+    // Act
+    let reconciled = run.finish_pending_rollback(&shared).await.unwrap();
+
+    // Assert
+    assert!(reconciled.is_none(), "a forward run is not touched");
+    assert!(run.unfinished_run().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_store_with_no_run_on_disk_has_no_unfinished_run() {
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let run = env.consolidator(maintenance(), honest());
+
+    assert!(run.unfinished_run().unwrap().is_none());
+    assert!(run
+        .finish_pending_rollback(&shared)
+        .await
+        .unwrap()
+        .is_none());
+}
