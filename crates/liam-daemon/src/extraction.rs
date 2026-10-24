@@ -15,6 +15,8 @@ mod http;
 pub mod inputs;
 mod iso_date;
 pub mod prompt;
+#[cfg(test)]
+mod r10;
 pub mod response;
 pub mod rules;
 pub mod sidecar;
