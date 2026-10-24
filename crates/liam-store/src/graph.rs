@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use liam_log::event::NodeRow;
+use liam_log::LogOffset;
 
 pub use self::backfill::BackfillReport;
 pub use self::fact_read::{FactPage, MAX_SOURCES_PER_FACT};
@@ -664,6 +665,15 @@ impl<B: Backend> Graph<B> {
         Ok(log_cursor::read(&self.backend)
             .await?
             .map(|cursor| cursor.log_id))
+    }
+
+    /// The last log record the store has accounted for, applied or voided, or
+    /// `None` before the first. A scan up to here sees only records the store
+    /// has settled.
+    pub async fn last_applied_offset(&self) -> Result<Option<LogOffset>> {
+        Ok(log_cursor::read(&self.backend)
+            .await?
+            .and_then(|cursor| cursor.last))
     }
 
     // ---- write ----

@@ -140,6 +140,19 @@ impl TierHook for FailingTier {
     }
 }
 
+/// Reports it did only part of its work.
+struct PartialExtraction;
+
+#[async_trait]
+impl ExtractionHook for PartialExtraction {
+    async fn extract(
+        &self,
+        _ctx: &ExtractCtx<'_>,
+    ) -> anyhow::Result<crate::consolidation::hooks::ExtractionReport> {
+        Ok(crate::consolidation::hooks::ExtractionReport { partial: true })
+    }
+}
+
 /// Keeps the source the run gave it.
 struct RecordingExtraction(Arc<Mutex<Vec<String>>>);
 
@@ -147,7 +160,7 @@ struct RecordingExtraction(Arc<Mutex<Vec<String>>>);
 impl ExtractionHook for RecordingExtraction {
     async fn extract(
         &self,
-        ctx: &ExtractCtx,
+        ctx: &ExtractCtx<'_>,
     ) -> anyhow::Result<crate::consolidation::hooks::ExtractionReport> {
         self.0.lock().unwrap().push(ctx.source.clone());
         Ok(Default::default())
@@ -549,6 +562,26 @@ async fn hook_steps_record_skipped_when_unconfigured_and_partial_when_they_fail(
     assert!(manifest.is_complete("summarize:skipped"));
     assert!(manifest.is_complete("tier:partial"));
     assert!(!manifest.is_complete("tier:skipped"));
+}
+
+#[tokio::test]
+async fn an_extraction_part_that_reports_partial_work_is_recorded_as_partial() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let hooks = ConsolidationHookSet {
+        extraction: Some(Arc::new(PartialExtraction)),
+        ..Default::default()
+    };
+    let run = env.consolidator_with(maintenance(), honest(), hooks);
+
+    // Act
+    let manifest = run.consolidate(&shared).await.unwrap();
+
+    // Assert
+    assert_eq!(manifest.outcome, Some(RunOutcome::Committed));
+    assert!(manifest.is_complete("extract:partial"));
+    assert!(!manifest.is_complete("extract:skipped"));
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ use liam_log::{LogOffset, LogWriter};
 use uuid::Uuid;
 
 use super::log_write::RecordingLog;
-use super::support::{count, cursor, fact_at, share, share_sized};
+use super::support::{count, cursor, cursor_offset, fact_at, share, share_sized};
 use super::*;
 use crate::graph::log_cursor::offset_to_values;
 use crate::DefaultGraph;
@@ -316,6 +316,30 @@ async fn the_stored_log_id_is_none_until_a_log_is_attached_and_then_the_logs_id(
     // Assert
     assert_eq!(before, None);
     assert_eq!(after, Some(log_id));
+}
+
+#[tokio::test]
+async fn the_last_applied_offset_follows_the_log_cursor() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let g = plain(&db_path(&dir)).await;
+    let opened = g.with_log(share(log_with_head(None))).await.unwrap();
+
+    // Act
+    let before = opened.last_applied_offset().await.unwrap();
+    opened.insert(fact_at("one")).await.unwrap();
+    let after = opened.last_applied_offset().await.unwrap();
+
+    // Assert
+    assert_eq!(before, None);
+    let (segment, index) = cursor_offset(&opened).await.unwrap();
+    assert_eq!(
+        after,
+        Some(LogOffset {
+            segment: segment as u64,
+            index: index as u64
+        })
+    );
 }
 
 #[tokio::test]
