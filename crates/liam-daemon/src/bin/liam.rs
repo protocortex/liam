@@ -180,8 +180,15 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Runs `liam consolidate`. Returns the process exit code: zero only for a
-/// committed run, so a script sees a rollback or a failed restore.
+/// Exit code of a run that was rolled back: the store is as it was.
+const EXIT_ROLLED_BACK: i32 = 1;
+/// Exit code of a run whose restore failed: the store needs inspection. Apart
+/// from the plain failure code so a script can page someone for this one.
+const EXIT_RESTORE_FAILED: i32 = 2;
+
+/// Runs `liam consolidate`. Returns the process exit code: zero for a committed
+/// run or a status, `EXIT_ROLLED_BACK` for a rollback, `EXIT_RESTORE_FAILED`
+/// for a failed restore, and 1 for any other failure.
 fn consolidate(args: &ConsolidateArgs, config: &Config, config_path: &Path) -> i32 {
     match try_consolidate(args, config, config_path) {
         Ok(outcome) => consolidate_exit_code(outcome),
@@ -221,7 +228,8 @@ fn try_consolidate(
 fn consolidate_exit_code(outcome: Option<RunOutcome>) -> i32 {
     match outcome {
         None | Some(RunOutcome::Committed) => 0,
-        Some(RunOutcome::RolledBack | RunOutcome::RestoreFailed) => 1,
+        Some(RunOutcome::RolledBack) => EXIT_ROLLED_BACK,
+        Some(RunOutcome::RestoreFailed) => EXIT_RESTORE_FAILED,
     }
 }
 
@@ -835,11 +843,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_committed_run_or_a_status_exits_zero() {
+    fn each_outcome_has_its_own_exit_code() {
         assert_eq!(consolidate_exit_code(None), 0);
         assert_eq!(consolidate_exit_code(Some(RunOutcome::Committed)), 0);
         assert_eq!(consolidate_exit_code(Some(RunOutcome::RolledBack)), 1);
-        assert_eq!(consolidate_exit_code(Some(RunOutcome::RestoreFailed)), 1);
+        assert_eq!(consolidate_exit_code(Some(RunOutcome::RestoreFailed)), 2);
     }
 
     #[test]

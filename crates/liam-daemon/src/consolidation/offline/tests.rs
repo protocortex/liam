@@ -81,7 +81,7 @@ impl Setup {
 }
 
 #[tokio::test]
-async fn a_run_over_a_stopped_stores_commits_and_says_so() {
+async fn a_run_over_a_stopped_store_commits_and_says_so() {
     // Arrange
     let setup = Setup::new().seeded().await;
 
@@ -189,4 +189,29 @@ async fn status_reports_no_run_a_finished_run_and_an_unfinished_one() {
     let unfinished = text(unfinished);
     assert!(unfinished.contains("unfinished"), "{unfinished}");
     assert!(unfinished.contains("liam consolidate"), "{unfinished}");
+}
+
+#[tokio::test]
+async fn a_run_is_refused_while_the_last_one_ended_restore_failed() {
+    // Arrange
+    let setup = Setup::new().seeded().await;
+    let mut failed = RunManifest::new(
+        "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_owned(),
+        3,
+        identity(&setup.config).embedder,
+        identity(&setup.config).llm_model,
+        Millis(1),
+    );
+    failed.outcome = Some(RunOutcome::RestoreFailed);
+    failed.save(&manifest_path_for(&setup.database())).unwrap();
+
+    // Act
+    let error = setup.run().await.unwrap_err();
+
+    // Assert
+    let message = format!("{error:#}");
+    assert!(message.contains("failed restore"), "{message}");
+    assert!(message.contains("remove"), "{message}");
+    let after = RunManifest::load(&manifest_path_for(&setup.database())).unwrap();
+    assert_eq!(after, Some(failed), "no new run replaced the record");
 }
