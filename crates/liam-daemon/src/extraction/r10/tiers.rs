@@ -20,8 +20,9 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use super::corpus::{
-    generate, ExpectedFact, LabelledEvent, Template, CORPUS_SEED, EVENT_COUNT, EVENT_GAP,
-    FIRST_OBSERVED, HAS_TITLE, REFERENCES_DATE, REFERENCES_ID, REFERENCES_URL,
+    generate, ExpectedFact, LabelledEvent, Template, CORPUS_SEED, CYCLE_LEN, EVENT_COUNT,
+    EVENT_GAP, FIRST_OBSERVED, HAS_TITLE, REFERENCES_DATE, REFERENCES_ID, REFERENCES_URL,
+    ROLE_CHANGE_POSITION,
 };
 use super::{normalize_tuple, score, score_by_predicate, Score, Tuple};
 use crate::config::ExtractionConfig;
@@ -375,19 +376,26 @@ impl Plumbing {
     }
 
     /// Rebuilds what the pipeline extracted from what the store holds: a
-    /// fact present when its subject was first mentioned was asserted, and
-    /// one gone by the end was ended.
+    /// fact that starts at an event's time was asserted by it, and one that
+    /// stops there without a replacement was ended by it.
     async fn extracted(&self, events: &[LabelledEvent]) -> Vec<Tuple> {
         let mut tuples = Vec::new();
-        for (subject, mentions) in by_subject(events) {
-            let live = self.valid_at(&subject, self.read_at).await;
-            for fact in self.valid_at(&subject, mentions[0].observed_at).await {
-                let asserted = |polarity| {
+        for event in events {
+            let at = event.observed_at;
+            let just_before = Millis(at.0 - 1);
+            for subject in event.facts.iter().map(|fact| fact.subject.to_lowercase()) {
+                let tuple = |fact: &liam_store::Fact, polarity| {
                     normalize_tuple(&fact.subject, &fact.predicate, &fact.object, polarity)
                 };
-                tuples.push(asserted(Polarity::Asserted));
-                if !live.iter().any(|kept| kept.id == fact.id) {
-                    tuples.push(asserted(Polarity::Ended));
+                for fact in self.valid_at(&subject, at).await {
+                    if fact.valid_from == at {
+                        tuples.push(tuple(&fact, Polarity::Asserted));
+                    }
+                }
+                for fact in self.valid_at(&subject, just_before).await {
+                    if fact.valid_until == at && fact.closed_by.is_none() {
+                        tuples.push(tuple(&fact, Polarity::Ended));
+                    }
                 }
             }
         }
@@ -412,6 +420,15 @@ impl Plumbing {
             if ends {
                 assert!(live.is_empty(), "{subject} should be over");
                 assert_eq!(fact.valid_until, last.observed_at, "{subject}");
+                let linked = [first.id.as_str(), last.id.as_str()];
+                assert_eq!(fact.source_event_ids, linked, "{subject}");
+            } else if mentions.len() > 1 {
+                // A later assertion replaces the earlier one: the old version
+                // is closed at the new event's time and only the new is live.
+                assert_eq!(fact.valid_until, last.observed_at, "{subject}");
+                assert_eq!(live.len(), 1, "{subject}");
+                assert_eq!(live[0].object, last.facts[0].object, "{subject}");
+                assert_eq!(live[0].valid_until, FOREVER, "{subject}");
             } else {
                 assert_eq!(live.len(), 1, "{subject}");
                 assert_eq!(fact.valid_until, FOREVER, "{subject}");
@@ -440,7 +457,7 @@ async fn the_plumbing_tier_stores_exactly_what_the_labels_say() {
 
 /// Index of the role-change event of cycle `cycle`.
 fn role_event(cycle: usize) -> usize {
-    cycle * super::corpus::CYCLE_LEN + 4
+    cycle * CYCLE_LEN + ROLE_CHANGE_POSITION
 }
 
 #[tokio::test]

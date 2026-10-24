@@ -16,6 +16,8 @@ pub(super) const CORPUS_SEED: u64 = 0x10C0_DE10;
 /// Events per template group; the templates repeat in this order.
 pub(super) const CYCLE_LEN: usize = 10;
 pub(super) const CYCLES: usize = EVENT_COUNT / CYCLE_LEN;
+/// Where the role change sits in a cycle.
+pub(super) const ROLE_CHANGE_POSITION: usize = 4;
 /// Gap between consecutive events' observation times.
 pub(super) const EVENT_GAP: Millis = Millis(3_600_000);
 /// 2023-06-01 00:00:00 UTC.
@@ -136,11 +138,12 @@ impl LabelledEvent {
 pub(crate) fn generate(rng: &mut ChaCha8Rng) -> Vec<LabelledEvent> {
     let mut subjects = distinct_people(rng, CYCLES * SUBJECTS_PER_CYCLE).into_iter();
     let mut events = Vec::with_capacity(EVENT_COUNT);
-    for _ in 0..CYCLES {
+    for number in 0..CYCLES {
         let mover = subjects.next().expect("a mover per cycle");
         let worker = subjects.next().expect("a worker per cycle");
         let titled = subjects.next().expect("a title holder per cycle");
-        events.extend(cycle(rng, &mover, &worker, &titled));
+        let moves_again = number == CYCLES - 1;
+        events.extend(cycle(rng, &mover, &worker, &titled, moves_again));
     }
     for (index, event) in events.iter_mut().enumerate() {
         event.index = index;
@@ -152,9 +155,22 @@ pub(crate) fn generate(rng: &mut ChaCha8Rng) -> Vec<LabelledEvent> {
 
 /// One cycle in template order. Relocation and past residence, and employment
 /// and negation, share subject and object, so the second of each pair ends
-/// what the first asserted.
-fn cycle(rng: &mut ChaCha8Rng, mover: &str, worker: &str, titled: &str) -> Vec<LabelledEvent> {
+/// what the first asserted. With `moves_again` the mover instead relocates a
+/// second time, which replaces the first city rather than ending it.
+fn cycle(
+    rng: &mut ChaCha8Rng,
+    mover: &str,
+    worker: &str,
+    titled: &str,
+    moves_again: bool,
+) -> Vec<LabelledEvent> {
     let city = pick(rng, &CITIES);
+    let next_city = CITIES
+        .iter()
+        .cycle()
+        .skip_while(|candidate| **candidate != city)
+        .nth(1)
+        .expect("the pool is not empty");
     let org = pick(rng, &ORGS);
     let title = pick(rng, &TITLES);
     let speaker = person(rng);
@@ -193,12 +209,21 @@ fn cycle(rng: &mut ChaCha8Rng, mover: &str, worker: &str, titled: &str) -> Vec<L
             vec![fact(mover, LIVES_IN, city, asserted)],
             vec![],
         ),
-        event(
-            Template::PastResidence,
-            format!("{mover} used to live in {city}."),
-            vec![fact(mover, LIVES_IN, city, ended)],
-            vec![],
-        ),
+        if moves_again {
+            event(
+                Template::Relocation,
+                format!("{mover} moved to {next_city}."),
+                vec![fact(mover, LIVES_IN, next_city, asserted)],
+                vec![],
+            )
+        } else {
+            event(
+                Template::PastResidence,
+                format!("{mover} used to live in {city}."),
+                vec![fact(mover, LIVES_IN, city, ended)],
+                vec![],
+            )
+        },
         event(
             Template::Employment,
             format!("{worker} works at {org}."),
@@ -368,7 +393,7 @@ mod tests {
         let events = corpus();
 
         // Assert
-        for pair in events.chunks(CYCLE_LEN) {
+        for pair in events.chunks(CYCLE_LEN).take(CYCLES - 1) {
             assert_eq!(pair[1].facts[0].object, pair[0].facts[0].object);
             assert_eq!(pair[1].facts[0].subject, pair[0].facts[0].subject);
             assert_eq!(pair[3].facts[0].object, pair[2].facts[0].object);
@@ -387,5 +412,29 @@ mod tests {
             .flat_map(|event| event.facts.iter().map(|fact| fact.subject.as_str()))
             .collect();
         assert_eq!(subjects.len(), CYCLES * SUBJECTS_PER_CYCLE);
+    }
+
+    #[test]
+    fn the_last_cycle_moves_its_mover_to_a_second_city() {
+        // Act
+        let events = corpus();
+
+        // Assert
+        let last = &events[(CYCLES - 1) * CYCLE_LEN..];
+        assert_eq!(last[1].template, Template::Relocation);
+        assert_eq!(last[1].facts[0].subject, last[0].facts[0].subject);
+        assert_ne!(last[1].facts[0].object, last[0].facts[0].object);
+        assert_eq!(last[1].facts[0].polarity, Polarity::Asserted);
+    }
+
+    #[test]
+    fn the_role_change_sits_at_its_named_position() {
+        // Act
+        let events = corpus();
+
+        // Assert
+        for cycle in events.chunks(CYCLE_LEN) {
+            assert_eq!(cycle[ROLE_CHANGE_POSITION].template, Template::RoleChange);
+        }
     }
 }
