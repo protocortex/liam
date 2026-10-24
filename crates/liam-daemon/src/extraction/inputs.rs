@@ -9,7 +9,7 @@ use liam_log::event::{LogEvent, LogPayload, NodeRow, RowEffect};
 use liam_log::LogOffset;
 use liam_store::Millis;
 
-use liam_daemon::config::RESERVED_PRODUCER_PREFIX;
+use crate::config::RESERVED_PRODUCER_PREFIX;
 
 /// One event's text in one scope, with what the fact rules need to know about
 /// where it came from.
@@ -97,10 +97,12 @@ fn texts_by_scope(payload: &LogPayload) -> BTreeMap<Option<String>, String> {
     by_scope
 }
 
-/// An entity page keys its subject on its own name, and its text is a summary
-/// the daemon wrote, not something a client said.
+/// An entity page keys its subject on its own name and has no content until
+/// the daemon summarizes it. A client fact that merely shares its subject with
+/// its label has content, so it is kept.
 fn is_entity_page(row: &NodeRow) -> bool {
-    row.subject.as_deref() == Some(row.label.trim().to_lowercase().as_str())
+    row.content.is_empty()
+        && row.subject.as_deref() == Some(row.label.trim().to_lowercase().as_str())
 }
 
 #[cfg(test)]
@@ -348,6 +350,22 @@ mod tests {
         // Assert
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].text, "Fact\nAlice works at Acme");
+    }
+
+    #[test]
+    fn a_fact_whose_subject_equals_its_label_but_has_content_is_kept() {
+        // Arrange
+        let row = NodeRow {
+            subject: Some("alice".into()),
+            ..node("Alice", "works at Acme", None)
+        };
+        let events = numbered(vec![event("fact", CLIENT, LogPayload::NodeWrite(row))]);
+
+        // Act
+        let inputs = events_to_inputs(&events, MIN_CHARS);
+
+        // Assert
+        assert_eq!(ids(&inputs), ["fact"]);
     }
 
     #[test]
