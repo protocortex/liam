@@ -422,7 +422,10 @@ async fn maintenance_tick(
         full_mention_threshold: full_synthesis_mention_threshold,
         full_max_new_tokens: full_synthesis_max_new_tokens,
     });
-    maintenance_steps(server, policy, resynthesis, None).await;
+    match server.store().await {
+        Ok(store) => maintenance_steps(server, &store, policy, resynthesis, None).await,
+        Err(error) => tracing::warn!(%error, "the maintenance tick found no store"),
+    }
 }
 
 /// How much resynthesis a tick does.
@@ -440,31 +443,31 @@ struct Resynthesis {
 /// puts back with the rest of the database.
 async fn maintenance_steps(
     server: &MemoryServer,
+    store: &DefaultGraph,
     policy: &liam_store::RetentionPolicy,
     resynthesis: Option<Resynthesis>,
     write_source: Option<&str>,
 ) {
-    let store = server.store_handle();
     let stopping = server.shutdown_token();
     // A leftover event applied after the sweep would outlive it.
-    catch_up(&store).await;
+    catch_up(store).await;
     if stopping.is_cancelled() {
         return;
     }
-    sweep(&store, policy, write_source).await;
+    sweep(store, policy, write_source).await;
     if stopping.is_cancelled() {
         return;
     }
-    repair_mentions(&store, write_source).await;
+    repair_mentions(store, write_source).await;
     if stopping.is_cancelled() {
         return;
     }
-    refresh_clusters(&store).await;
+    refresh_clusters(store).await;
     if stopping.is_cancelled() {
         return;
     }
     if let Some(resynthesis) = resynthesis {
-        resynthesize_stale(server, &store, &resynthesis, write_source).await;
+        resynthesize_stale(server, store, &resynthesis, write_source).await;
     }
 }
 
@@ -1846,7 +1849,7 @@ mod tests {
             store.insert(old).await.unwrap();
 
             // Act
-            maintenance_steps(&server, &sweep_old_facts(), None, Some(RUN_SOURCE)).await;
+            maintenance_steps(&server, &store, &sweep_old_facts(), None, Some(RUN_SOURCE)).await;
 
             // Assert
             let sources = sources_of(dir.path(), |p| matches!(p, LogPayload::Tombstone(_))).await;
@@ -1876,7 +1879,7 @@ mod tests {
             store.upsert_by(renewed).await.unwrap();
 
             // Act
-            maintenance_steps(&server, &nothing_to_sweep(), None, Some(RUN_SOURCE)).await;
+            maintenance_steps(&server, &store, &nothing_to_sweep(), None, Some(RUN_SOURCE)).await;
 
             // Assert
             let sources = sources_of(dir.path(), |p| matches!(p, LogPayload::EdgeWrite(_))).await;

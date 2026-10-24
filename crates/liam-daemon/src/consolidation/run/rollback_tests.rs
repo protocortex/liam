@@ -637,3 +637,30 @@ async fn another_seed_draws_other_probes_and_merges_alike() {
     assert_ne!(first.0, second.0);
     assert_eq!(first.1, second.1);
 }
+
+#[tokio::test]
+async fn a_rollback_over_a_store_held_elsewhere_fails_and_leaves_the_store_in_its_slot() {
+    // Arrange: a slot whose store another handle also holds
+    let env = Env::new();
+    let held = Arc::new(
+        open_on(&env.database_path(), &env.log, &env.embedder)
+            .await
+            .unwrap(),
+    );
+    held.insert(note(CLIENT_NOTE)).await.unwrap();
+    let shared = SharedStore::from_arc(held.clone());
+    let run = env.consolidator(maintenance(), env.regressing());
+
+    // Act
+    let error = run.consolidate(&shared).await.unwrap_err();
+
+    // Assert
+    assert!(
+        error.to_string().contains("held outside its slot"),
+        "{error}"
+    );
+    assert!(
+        shared.get().await.is_ok(),
+        "the store stays available to clients"
+    );
+}

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use liam_daemon::consolidation::shared_store::SharedStore;
 use liam_model::{Embedder, Llm, Reranker, TextKind};
 use liam_store::types::{EpisodeEdge, EpisodeRef};
 use liam_store::{relation, DefaultGraph, NewNode, Query};
@@ -31,6 +32,17 @@ use crate::ask::{
 use crate::clusters::{narrow_groups, render_clusters};
 use crate::synthesis;
 use crate::tuning::{record_and_maybe_evaluate, AimdHandles, RollingWindow};
+
+/// Runs one store call under a read guard that lasts only for that call, and
+/// yields the call's `Result` (or the error of the store being unavailable).
+macro_rules! on_store {
+    ($server:expr, |$store:ident| $call:expr) => {
+        match $server.store().await {
+            Ok($store) => $call.await,
+            Err(error) => Err(error),
+        }
+    };
+}
 
 /// Token budget for the sufficiency pre-pass. Only "YES"/"NO" is wanted, with a
 /// little slack for models that add punctuation or a stray word; anything longer
@@ -454,7 +466,9 @@ pub struct TimelineArgs {
 
 #[derive(Clone)]
 pub struct MemoryServer {
-    store: Arc<DefaultGraph>,
+    /// Shared with the consolidation job, whose rollback swaps the store in the
+    /// slot: reach it through `store()`, never keeping the guard across calls.
+    store: Arc<SharedStore>,
     embedder: Arc<dyn Embedder>,
     reranker: Arc<dyn Reranker>,
     llm: Arc<dyn Llm>,
@@ -588,7 +602,7 @@ impl MemoryServer {
         // matters for a direct explicit-`0` construction that bypasses it.
         let max_concurrent_generations = max_concurrent_generations.max(1);
         Self {
-            store,
+            store: Arc::new(SharedStore::from_arc(store)),
             embedder,
             reranker,
             llm,
@@ -659,11 +673,21 @@ impl MemoryServer {
         self.granted_capacity.clone()
     }
 
-    /// Shares this server's store handle: the same `Graph` every request
-    /// handler uses, so the maintenance tick reads and writes through the
-    /// one connection rather than opening a second.
-    pub(crate) fn store_handle(&self) -> Arc<DefaultGraph> {
-        self.store.clone()
+    /// The store for one call. The guard holds back a rollback's restore, so
+    /// it is not kept across another `store()` outside the consolidation job's
+    /// own maintenance step: a restore waiting in between would block the
+    /// second read behind it. Only that job restores, and not during its step.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a rollback could not reopen the store, so the slot is empty.
+    pub(crate) async fn store(
+        &self,
+    ) -> liam_store::Result<tokio::sync::RwLockReadGuard<'_, DefaultGraph>> {
+        self.store
+            .get()
+            .await
+            .map_err(|error| liam_store::Error::Backend(error.to_string()))
     }
 
     /// Bundles this connection's AIMD state for one evaluation to use.
@@ -715,7 +739,7 @@ impl MemoryServer {
         if let Some(n) = parse_entity_ref(s, entity_count) {
             return Ok(EpisodeRef::New(1 + fact_count + n));
         }
-        self.store.resolve_handle(s).await.map(EpisodeRef::Existing)
+        on_store!(self, |store| store.resolve_handle(s)).map(EpisodeRef::Existing)
     }
 
     /// Resolves every episode edge's `from`/`to` into a real `EpisodeRef`,
@@ -790,9 +814,9 @@ impl MemoryServer {
                 args.subject,
             );
             let write = if has_subject {
-                self.store.upsert_by(node).await
+                on_store!(self, |store| store.upsert_by(node))
             } else {
-                self.store.insert(node).await
+                on_store!(self, |store| store.insert(node))
             };
             return match write {
                 Ok(id) => format!("remembered {}", id.as_str()),
@@ -906,7 +930,7 @@ impl MemoryServer {
             })
             .collect();
 
-        match self.store.ingest_episode(nodes, edges).await {
+        match on_store!(self, |store| store.ingest_episode(nodes, edges)) {
             Ok(result) => {
                 // Only a fresh `entity:N` from THIS episode triggers
                 // resynthesis; a handle-referenced existing entity does not.
@@ -1011,7 +1035,7 @@ impl MemoryServer {
         write_source: Option<&str>,
     ) -> Result<(), String> {
         let now = liam_store::Millis::now();
-        let candidate = match self.store.get(&entity_id, now).await {
+        let candidate = match on_store!(self, |store| store.get(&entity_id, now)) {
             Ok(Some(c)) => c,
             Ok(None) => {
                 return Err(format!(
@@ -1022,11 +1046,11 @@ impl MemoryServer {
             Err(e) => return Err(format!("{}: {e}", entity_id.as_str())),
         };
         let label = candidate.label.clone();
-        let mentions: Vec<ask::Evidence> = match self
-            .store
-            .mentions(&entity_id, now, MENTIONS_FETCH_LIMIT)
-            .await
-        {
+        let mentions: Vec<ask::Evidence> = match on_store!(self, |store| store.mentions(
+            &entity_id,
+            now,
+            MENTIONS_FETCH_LIMIT
+        )) {
             Ok(rows) => rows.iter().map(ask::Evidence::from_candidate).collect(),
             Err(e) => return Err(format!("{label}: {e}")),
         };
@@ -1058,7 +1082,7 @@ impl MemoryServer {
             node = node.with_scope(scope);
         }
         node.content = new_content;
-        match self.store.upsert_by(node).await {
+        match on_store!(self, |store| store.upsert_by(node)) {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("{label}: {e}")),
         }
@@ -1077,7 +1101,7 @@ impl MemoryServer {
             embedding,
             args.as_of,
         );
-        let hits = match self.store.query_explained(&q).await {
+        let hits = match on_store!(self, |store| store.query_explained(&q)) {
             Ok(h) => h,
             Err(e) => return format!("recall failed: {e}"),
         };
@@ -1157,8 +1181,8 @@ impl MemoryServer {
             );
         }
         let (from, to) = match (
-            self.store.resolve_handle(&args.from).await,
-            self.store.resolve_handle(&args.to).await,
+            on_store!(self, |store| store.resolve_handle(&args.from)),
+            on_store!(self, |store| store.resolve_handle(&args.to)),
         ) {
             (Err(e), _) => return format!("relate failed: from: {e}"),
             (_, Err(e)) => return format!("relate failed: to: {e}"),
@@ -1175,7 +1199,7 @@ impl MemoryServer {
         }
         // The edge id is dropped rather than echoed. Nothing takes one as
         // input, and a ULID costs 19 tokens in the reply for no reachable use.
-        match self.store.relate(&from, &to, &kind).await {
+        match on_store!(self, |store| store.relate(&from, &to, &kind)) {
             Ok(_) => format!("related {} -{kind}-> {}", from.handle(), to.handle()),
             Err(e) => format!("relate failed: {e}"),
         }
@@ -1183,7 +1207,7 @@ impl MemoryServer {
 
     #[tool(description = "List memory clusters found by community detection, largest first.")]
     async fn clusters(&self, Parameters(args): Parameters<ClustersArgs>) -> String {
-        let groups = match self.store.community_groups().await {
+        let groups = match on_store!(self, |store| store.community_groups()) {
             Ok(g) => g,
             Err(e) => return format!("clusters failed: {e}"),
         };
@@ -1203,12 +1227,12 @@ impl MemoryServer {
         description = "Show an entity's compiled page and the mentions behind it, most recent first."
     )]
     async fn timeline(&self, Parameters(args): Parameters<TimelineArgs>) -> String {
-        let id = match self.store.resolve_handle(&args.entity).await {
+        let id = match on_store!(self, |store| store.resolve_handle(&args.entity)) {
             Ok(id) => id,
             Err(e) => return format!("timeline failed: {e}"),
         };
         let now = liam_store::Millis::now();
-        let entity = match self.store.get(&id, now).await {
+        let entity = match on_store!(self, |store| store.get(&id, now)) {
             Ok(Some(c)) => c,
             Ok(None) => return format!("timeline failed: {} is not currently live", id.handle()),
             Err(e) => return format!("timeline failed: {e}"),
@@ -1219,7 +1243,7 @@ impl MemoryServer {
         // nothing about `Graph::mentions`'s own internal over-fetch pool
         // (`limit.max(1) * 3`), which exists to survive hydration drops and
         // is unrelated to this trailer.
-        let mut mentions = match self.store.mentions(&id, now, limit + 1).await {
+        let mut mentions = match on_store!(self, |store| store.mentions(&id, now, limit + 1)) {
             Ok(m) => m,
             Err(e) => return format!("timeline failed: {e}"),
         };
@@ -1360,7 +1384,7 @@ impl MemoryServer {
             embedding,
             args.as_of,
         );
-        let hits = match self.store.query_explained(&q).await {
+        let hits = match on_store!(self, |store| store.query_explained(&q)) {
             Ok(h) => h,
             Err(e) => return format!("ask failed: {e}"),
         };
@@ -2115,7 +2139,9 @@ mod tests {
 
         // Then the store holds exactly the attributes sent
         let hits = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("attributes round trip content"))
             .await
             .unwrap();
@@ -2139,7 +2165,9 @@ mod tests {
 
         // Then the store holds that instant, not the store's clock
         let hits = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("valid from backdated content"))
             .await
             .unwrap();
@@ -2163,7 +2191,9 @@ mod tests {
 
         // Then the store holds exactly that confidence
         let hits = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("confidence round trip content"))
             .await
             .unwrap();
@@ -2179,7 +2209,9 @@ mod tests {
 
         for confidence in [-0.1, 1.1, 5.0] {
             let before = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(marker))
                 .await
                 .unwrap()
@@ -2199,7 +2231,9 @@ mod tests {
                 "confidence {confidence}: {out}"
             );
             let after = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(marker))
                 .await
                 .unwrap()
@@ -2234,7 +2268,9 @@ mod tests {
                 "confidence {confidence}: {out}"
             );
             let hits = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(marker))
                 .await
                 .unwrap();
@@ -2291,7 +2327,9 @@ mod tests {
         );
         let marker = "attributes over cap content";
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2311,7 +2349,9 @@ mod tests {
             format!("remember failed: attributes exceeds {MAX_ATTRIBUTES_CHARS} characters")
         );
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2344,7 +2384,9 @@ mod tests {
         );
         assert_eq!(over_cap.chars().count(), MAX_CONTENT_CHARS + 1);
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2359,7 +2401,9 @@ mod tests {
             format!("remember failed: content exceeds {MAX_CONTENT_CHARS} characters")
         );
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2418,7 +2462,9 @@ mod tests {
         // Then attributes/confidence keep their old defaults, and valid_from
         // resolves to "now" within the call's own wall-clock window
         let hits = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("regression pin content"))
             .await
             .unwrap();
@@ -2647,7 +2693,9 @@ mod tests {
         assert!(out.starts_with("remembered "), "{out}");
         assert!(!out.contains('\n'), "unexpected extra line: {out}");
         let hits = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("episode absent regression content"))
             .await
             .unwrap();
@@ -2692,7 +2740,9 @@ mod tests {
         // so a bare length assertion would be pinning that expansion
         // behaviour instead of "both facts exist".
         let top = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("episodetoplevelfactmarker"))
             .await
             .unwrap();
@@ -2702,7 +2752,9 @@ mod tests {
             "{out}"
         );
         let nested = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("episodenestedfactmarker"))
             .await
             .unwrap();
@@ -2735,7 +2787,9 @@ mod tests {
         let server = plain_server().await;
         let marker = "episode supersedes rejection content";
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2756,7 +2810,9 @@ mod tests {
         // Then it is refused, and nothing lands, not even the top-level fact
         assert!(out.contains("reserved"), "{out}");
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2780,7 +2836,9 @@ mod tests {
         .await;
         let marker = "backwards mentions to entity content";
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2803,7 +2861,9 @@ mod tests {
         assert!(out.contains("edge 0"), "{out}");
         assert!(out.contains("backwards"), "{out}");
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2827,7 +2887,9 @@ mod tests {
         .await;
         let marker = "backwards mentions from fact content";
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2850,7 +2912,9 @@ mod tests {
         assert!(out.contains("edge 0"), "{out}");
         assert!(out.contains("backwards"), "{out}");
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2919,7 +2983,9 @@ mod tests {
         let server = plain_server().await;
         let marker = "episode nested confidence rejection content";
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2944,7 +3010,9 @@ mod tests {
         // not just the top-level field's
         assert!(out.contains("confidence"), "{out}");
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2960,7 +3028,9 @@ mod tests {
         let marker = "episode nested content ceiling rejection content";
         let over_cap = "x".repeat(MAX_CONTENT_CHARS + 1);
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -2983,7 +3053,9 @@ mod tests {
         // top-level field's
         assert!(out.contains("fact:1: content exceeds"), "{out}");
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -3029,7 +3101,9 @@ mod tests {
         let server = plain_server().await;
         let marker = "episode out of bounds index rejection content";
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -3054,7 +3128,9 @@ mod tests {
             "{out}"
         );
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -3082,7 +3158,9 @@ mod tests {
             "{boundary_out}"
         );
         let boundary_after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(boundary_marker))
             .await
             .unwrap()
@@ -3100,7 +3178,9 @@ mod tests {
         let server = plain_server().await;
         let marker = "episode unrecognized reference rejection content";
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -3125,7 +3205,9 @@ mod tests {
             "{out}"
         );
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -3188,7 +3270,9 @@ mod tests {
         let server = plain_server().await;
         let marker = "episode over max rejection content";
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -3212,7 +3296,9 @@ mod tests {
         // Then it is refused before any DB call, and nothing lands
         assert!(out.contains("failed"), "{out}");
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -3283,7 +3369,9 @@ mod tests {
         // fact, proving the whole episode rolled back together
         for marker in [top_marker, first_marker, second_marker] {
             let hits = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(marker))
                 .await
                 .unwrap();
@@ -3348,11 +3436,23 @@ mod tests {
             "expected two distinct ids"
         );
         assert!(
-            server.store.resolve_handle(&first_entity_id).await.is_err(),
+            server
+                .store()
+                .await
+                .unwrap()
+                .resolve_handle(&first_entity_id)
+                .await
+                .is_err(),
             "first entity's id is still live; expected the second call to supersede it"
         );
         assert!(
-            server.store.resolve_handle(&second_entity_id).await.is_ok(),
+            server
+                .store()
+                .await
+                .unwrap()
+                .resolve_handle(&second_entity_id)
+                .await
+                .is_ok(),
             "second entity's id should be live"
         );
     }
@@ -3480,7 +3580,9 @@ mod tests {
         let (server, embedder) =
             server_with_recording_embedder_and_llm(Arc::new(CountingLlm::new())).await;
         let entity_id = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .upsert_by(NewNode::entity("person", "Kim"))
             .await
             .expect("seed entity");
@@ -3504,7 +3606,9 @@ mod tests {
         let (server, _embedder) =
             server_with_recording_embedder_and_llm(Arc::new(CountingLlm::new())).await;
         let entity_id = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .upsert_by(NewNode::entity("person", "Kim"))
             .await
             .expect("seed entity");
@@ -3523,13 +3627,17 @@ mod tests {
 
         // Assert
         let pages = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .changes_since(liam_store::BEGINNING)
             .await
             .expect("changes");
         let newest = pages.iter().rfind(|change| !change.closed).expect("a page");
         let page = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .get(&newest.id, liam_store::Millis(liam_store::FOREVER.0 - 1))
             .await
             .expect("get")
@@ -3707,7 +3815,9 @@ mod tests {
         let server = plain_server().await;
         let marker = "episode entities over max rejection content";
         let before = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -3738,7 +3848,9 @@ mod tests {
         // Then it is refused, and nothing lands
         assert!(out.contains("failed"), "{out}");
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(marker))
             .await
             .unwrap()
@@ -3780,7 +3892,9 @@ mod tests {
         // And nothing landed, not even the top-level fact, proving the
         // whole episode rolled back together
         let after = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text(top_marker))
             .await
             .unwrap();
@@ -3863,14 +3977,22 @@ mod tests {
             .to_string();
         for id in [&entity0_id, &entity1_id] {
             assert!(
-                server.store.resolve_handle(id).await.is_err(),
+                server
+                    .store()
+                    .await
+                    .unwrap()
+                    .resolve_handle(id)
+                    .await
+                    .is_err(),
                 "original entity id should have been superseded by its own resynthesis: {out}"
             );
         }
         for label in ["Both One", "Both Two"] {
             let expected_content = format!("person {label}");
             let hits = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(expected_content.as_str()))
                 .await
                 .unwrap();
@@ -3888,7 +4010,9 @@ mod tests {
         let llm = Arc::new(CountingLlm::new());
         let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
         let entity_id = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .upsert_by(
                 NewNode::entity("person", "Kim").with_attributes(json!({"role": "engineer"})),
             )
@@ -3906,14 +4030,18 @@ mod tests {
         // Then the new node's attributes match the old one's, not wiped
         assert!(
             server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .resolve_handle(entity_id.as_str())
                 .await
                 .is_err(),
             "the old version should have been superseded"
         );
         let hits = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("person Kim"))
             .await
             .unwrap();
@@ -3931,7 +4059,9 @@ mod tests {
         let llm = Arc::new(CountingLlm::new());
         let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
         let entity_id = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .upsert_by(NewNode::entity("person", "Priya").with_scope("proj-x"))
             .await
             .expect("seed scoped entity");
@@ -3951,7 +4081,9 @@ mod tests {
         // old id survives
         assert!(
             server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .resolve_handle(entity_id.as_str())
                 .await
                 .is_err(),
@@ -3961,7 +4093,9 @@ mod tests {
         // And the resynthesized node kept the same scope: it is visible
         // to a proj-x-scoped query...
         let scoped = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("person Priya").with_scope("proj-x"))
             .await
             .unwrap();
@@ -3973,7 +4107,9 @@ mod tests {
         // ...but not to a different scope's query, the isolation
         // guarantee a scope-dropping rebuild would silently break
         let other_scope = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("person Priya").with_scope("proj-y"))
             .await
             .unwrap();
@@ -4004,7 +4140,9 @@ mod tests {
             .await
             .expect("hold the sole permit");
         let entity_id = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .upsert_by(NewNode::entity("person", "Deadline Carrier"))
             .await
             .expect("seed entity");
@@ -4050,7 +4188,9 @@ mod tests {
         // committed
         assert!(!out.starts_with("remember failed:"), "{out}");
         let top = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("synthesis failure top content"))
             .await
             .unwrap();
@@ -4066,7 +4206,13 @@ mod tests {
             .trim_start_matches("remembered ")
             .to_string();
         assert!(
-            server.store.resolve_handle(&entity_id).await.is_ok(),
+            server
+                .store()
+                .await
+                .unwrap()
+                .resolve_handle(&entity_id)
+                .await
+                .is_ok(),
             "entity should still be live: {out}"
         );
 
@@ -4159,7 +4305,9 @@ mod tests {
         // "person Mixed One" also surfaces "person Mixed Two" (they share
         // both words), so raw hit count alone would not tell the two apart.
         let mut succeeded: Vec<_> = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("person Mixed One"))
             .await
             .unwrap()
@@ -4168,7 +4316,9 @@ mod tests {
             .collect();
         if succeeded.is_empty() {
             succeeded = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text("person Mixed Two"))
                 .await
                 .unwrap()
@@ -4381,7 +4531,9 @@ mod tests {
             "mixed episode existing handle content",
         ] {
             let hits = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(marker))
                 .await
                 .unwrap();
@@ -4394,11 +4546,19 @@ mod tests {
         // Henry's own id was superseded by its own resynthesis (mentioned
         // via a "mentions" edge); a live, resynthesized Henry still exists
         assert!(
-            server.store.resolve_handle(&henry_id).await.is_err(),
+            server
+                .store()
+                .await
+                .unwrap()
+                .resolve_handle(&henry_id)
+                .await
+                .is_err(),
             "Henry's original id should have been superseded by its own resynthesis"
         );
         let resynthesized_henry = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .query_explained(&Query::text("Henry"))
             .await
             .unwrap();
@@ -4407,11 +4567,23 @@ mod tests {
             "expected a resynthesized, still-live Henry entity: {out}"
         );
         assert!(
-            server.store.resolve_handle(&grace_id).await.is_ok(),
+            server
+                .store()
+                .await
+                .unwrap()
+                .resolve_handle(&grace_id)
+                .await
+                .is_ok(),
             "superseding entity should be live"
         );
         assert!(
-            server.store.resolve_handle(&prior_entity_id).await.is_err(),
+            server
+                .store()
+                .await
+                .unwrap()
+                .resolve_handle(&prior_entity_id)
+                .await
+                .is_err(),
             "prior entity should have been superseded, not left live"
         );
         assert_ne!(prior_entity_id, grace_id, "expected two distinct ids");
@@ -4438,7 +4610,13 @@ mod tests {
         // confirming it round-trips through recall proves it was still
         // written even though nothing points at it.
         assert!(
-            server.store.resolve_handle(&top_id).await.is_ok(),
+            server
+                .store()
+                .await
+                .unwrap()
+                .resolve_handle(&top_id)
+                .await
+                .is_ok(),
             "top-level fact should be live"
         );
     }
@@ -4485,7 +4663,9 @@ mod tests {
         // nested fact
         for marker in [top_marker, fact0_marker, fact1_marker] {
             let hits = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(marker))
                 .await
                 .unwrap();
@@ -4529,7 +4709,9 @@ mod tests {
         assert!(!out.contains("failed"), "{out}");
         for marker in [top_marker, fact_marker, entity_marker] {
             let scoped = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(marker).with_scope("proj-x"))
                 .await
                 .unwrap();
@@ -4548,7 +4730,9 @@ mod tests {
             // QUERY carries a scope, and an unscoped row never equals a
             // scoped filter value.
             let other_scope = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(marker).with_scope("proj-y"))
                 .await
                 .unwrap();
@@ -4589,7 +4773,9 @@ mod tests {
         assert!(!out.contains("failed"), "{out}");
         for marker in [top_marker, fact_marker, entity_marker] {
             let hits = server
-                .store
+                .store()
+                .await
+                .unwrap()
                 .query_explained(&Query::text(marker).with_scope("some-scope"))
                 .await
                 .unwrap();
@@ -6128,7 +6314,13 @@ mod tests {
         // Community detection builds its node set purely from live edges, so a
         // zero count means nothing landed in the table.
         assert_eq!(
-            server.store.recompute_communities().await.unwrap(),
+            server
+                .store()
+                .await
+                .unwrap()
+                .recompute_communities()
+                .await
+                .unwrap(),
             0,
             "a refused relate still wrote an edge"
         );
@@ -6344,26 +6536,40 @@ mod tests {
         let server = server_with_clock(clock.clone()).await;
         let mut entity_node = NewNode::entity("person", "Ada Lovelace");
         entity_node.content = "compiled bio of ada".to_string();
-        let entity_id = server.store.insert(entity_node).await.expect("seed entity");
+        let entity_id = server
+            .store()
+            .await
+            .unwrap()
+            .insert(entity_node)
+            .await
+            .expect("seed entity");
         let fact1 = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::now("fact", "Fact One", "first mention content"))
             .await
             .expect("seed fact one");
         let fact2 = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::now("fact", "Fact Two", "second mention content"))
             .await
             .expect("seed fact two");
         clock.set(Millis(2000));
         server
-            .store
+            .store()
+            .await
+            .unwrap()
             .relate(&entity_id, &fact1, relation::MENTIONS)
             .await
             .expect("link fact one");
         clock.set(Millis(3000));
         server
-            .store
+            .store()
+            .await
+            .unwrap()
             .relate(&entity_id, &fact2, relation::MENTIONS)
             .await
             .expect("link fact two");
@@ -6416,7 +6622,9 @@ mod tests {
         let future_entity = NewNode::entity("person", "Future Person")
             .with_valid_from(Millis(Millis::now().0 + one_day_ms));
         let entity_id = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(future_entity)
             .await
             .expect("seed future entity");
@@ -6445,7 +6653,9 @@ mod tests {
         // Given an entity created directly, with no mentions edges at all
         let server = plain_server().await;
         let entity_id = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::entity("person", "Lonely Entity"))
             .await
             .expect("seed entity");
@@ -6524,12 +6734,16 @@ mod tests {
         let clock = Arc::new(FixedClock::new(Millis(1000)));
         let server = server_with_clock(clock.clone()).await;
         let entity_id = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::entity("person", "Ada Lovelace"))
             .await
             .expect("seed entity");
         let oldest = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::now(
                 "fact",
                 "Fact Oldest",
@@ -6538,7 +6752,9 @@ mod tests {
             .await
             .expect("seed oldest fact");
         let middle = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::now(
                 "fact",
                 "Fact Middle",
@@ -6547,7 +6763,9 @@ mod tests {
             .await
             .expect("seed middle fact");
         let newest = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::now(
                 "fact",
                 "Fact Newest",
@@ -6557,19 +6775,25 @@ mod tests {
             .expect("seed newest fact");
         clock.set(Millis(2000));
         server
-            .store
+            .store()
+            .await
+            .unwrap()
             .relate(&entity_id, &oldest, relation::MENTIONS)
             .await
             .expect("link oldest fact");
         clock.set(Millis(3000));
         server
-            .store
+            .store()
+            .await
+            .unwrap()
             .relate(&entity_id, &middle, relation::MENTIONS)
             .await
             .expect("link middle fact");
         clock.set(Millis(4000));
         server
-            .store
+            .store()
+            .await
+            .unwrap()
             .relate(&entity_id, &newest, relation::MENTIONS)
             .await
             .expect("link newest fact");
@@ -6597,29 +6821,39 @@ mod tests {
         let clock = Arc::new(FixedClock::new(Millis(1000)));
         let server = server_with_clock(clock.clone()).await;
         let entity_id = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::entity("person", "Ada Lovelace"))
             .await
             .expect("seed entity");
         let fact1 = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::now("fact", "Fact One", "first mention content"))
             .await
             .expect("seed fact one");
         let fact2 = server
-            .store
+            .store()
+            .await
+            .unwrap()
             .insert(NewNode::now("fact", "Fact Two", "second mention content"))
             .await
             .expect("seed fact two");
         clock.set(Millis(2000));
         server
-            .store
+            .store()
+            .await
+            .unwrap()
             .relate(&entity_id, &fact1, relation::MENTIONS)
             .await
             .expect("link fact one");
         clock.set(Millis(3000));
         server
-            .store
+            .store()
+            .await
+            .unwrap()
             .relate(&entity_id, &fact2, relation::MENTIONS)
             .await
             .expect("link fact two");

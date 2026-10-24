@@ -9,6 +9,8 @@
 //! the live store disagreeing. `rollback:pending` is the commitment: a run that
 //! has it never resumes forward. `rollback:marked` follows the marker.
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use liam_store::verify_snapshot;
 
@@ -67,7 +69,14 @@ impl Consolidator {
         snapshot: &std::path::Path,
     ) -> anyhow::Result<RunOutcome> {
         let mut slot = shared.exclusive().await;
-        let store = slot.take().context("the store is not in its slot")?;
+        let held = slot.take().context("the store is not in its slot")?;
+        let store = match Arc::try_unwrap(held) {
+            Ok(store) => store,
+            Err(held) => {
+                *slot = Some(held);
+                anyhow::bail!("the store is still held outside its slot, so it cannot be closed for the restore");
+            }
+        };
         let restored = store.restore_snapshot(&self.database_path, snapshot).await;
         let reopened = self.parts.reopener.reopen().await;
         let store = match reopened {
@@ -95,7 +104,7 @@ impl Consolidator {
                 }
             },
         };
-        *slot = Some(store);
+        *slot = Some(Arc::new(store));
         Ok(outcome)
     }
 
