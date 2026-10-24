@@ -308,18 +308,19 @@ impl Consolidator {
             MAINTENANCE => self.parts.maintenance.run(store, &source).await?,
             EXTRACT => {
                 let configured = self.parts.hooks.extraction.is_some();
-                let result = self.parts.hooks.extract(&ExtractCtx { source }).await;
-                self.note_hook(step, configured, result.map(drop), manifest)?;
+                let ctx = ExtractCtx { store, source };
+                let result = self.parts.hooks.extract(&ctx).await;
+                self.note_hook(step, configured, result.map(|r| r.partial), manifest)?;
             }
             SUMMARIZE => {
                 let configured = self.parts.hooks.summary.is_some();
                 let result = self.parts.hooks.summarize(&SummaryCtx { source }).await;
-                self.note_hook(step, configured, result.map(drop), manifest)?;
+                self.note_hook(step, configured, result.map(|_| false), manifest)?;
             }
             TIER => {
                 let configured = self.parts.hooks.tiering.is_some();
                 let result = self.parts.hooks.tier(&TierCtx { source }).await;
-                self.note_hook(step, configured, result.map(drop), manifest)?;
+                self.note_hook(step, configured, result.map(|_| false), manifest)?;
             }
             PROBES => return self.check_probes(store, manifest).await,
             other => anyhow::bail!("the consolidation run has no step named {other}"),
@@ -390,17 +391,19 @@ impl Consolidator {
     }
 
     /// Records how a hook step went. A part that is not configured is skipped;
-    /// one that fails is partial. Neither fails the run.
+    /// one that fails, or reports it did only part of its work (`Ok(true)`), is
+    /// partial. Neither fails the run.
     fn note_hook(
         &self,
         step: &str,
         configured: bool,
-        result: anyhow::Result<()>,
+        result: anyhow::Result<bool>,
         manifest: &mut RunManifest,
     ) -> anyhow::Result<()> {
         let suffix = match (configured, result) {
             (false, _) => SKIPPED_SUFFIX,
-            (true, Ok(())) => return Ok(()),
+            (true, Ok(false)) => return Ok(()),
+            (true, Ok(true)) => PARTIAL_SUFFIX,
             (true, Err(error)) => {
                 tracing::warn!(step, %error, "consolidation: a hook failed, the run goes on");
                 PARTIAL_SUFFIX
