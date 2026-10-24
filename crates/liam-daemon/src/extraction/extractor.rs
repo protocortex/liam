@@ -3,10 +3,11 @@
 //! scope, asks the model (or the response cache) about each batch, and writes
 //! the facts that survive grounding.
 //!
-//! Nothing here holds a store lock across a model call; each fact is its own
-//! short write. A batch is cached before its facts are applied and every write
-//! is idempotent, so a run that dies at any point is finished by the next one
-//! without duplicating a fact or calling the model again.
+//! Nothing here holds a store lock across a model call; a batch's facts are
+//! one short write. An answer is cached before its facts are applied, when the
+//! cache file can be written, and every write is idempotent. A run that dies at
+//! any point is finished by the next one without duplicating a fact; it calls
+//! the model again only for an answer the cache could not keep.
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
@@ -211,17 +212,42 @@ impl<'a> Run<'a> {
         }
         let mut batches: Vec<Batch> = by_scope
             .into_iter()
-            .flat_map(|(scope, positions)| {
-                positions
-                    .chunks(self.deps.config.batch_events)
-                    .map(|chunk| Batch {
-                        scope: scope.clone(),
-                        indices: chunk.to_vec(),
-                    })
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|(scope, positions)| self.chunk(scope, &positions))
             .collect();
         batches.sort_by_key(|batch| batch.indices[0]);
+        batches
+    }
+
+    /// Cuts one scope's inputs into batches of at most `batch_events` events
+    /// and `max_batch_chars` characters, so a batch fits the context window. An
+    /// event alone over the character bound still gets a batch of its own.
+    fn chunk(&self, scope: &Option<String>, positions: &[usize]) -> Vec<Batch> {
+        let (max_events, max_chars) = (
+            self.deps.config.batch_events,
+            self.deps.config.max_batch_chars(),
+        );
+        let mut batches: Vec<Batch> = Vec::new();
+        let mut chars = 0;
+        for &position in positions {
+            let length = self.inputs[position].text.chars().count();
+            let fits = batches.last().is_some_and(|batch| {
+                batch.indices.len() < max_events && chars + length <= max_chars
+            });
+            if fits {
+                batches
+                    .last_mut()
+                    .expect("a batch was open")
+                    .indices
+                    .push(position);
+                chars += length;
+            } else {
+                batches.push(Batch {
+                    scope: scope.clone(),
+                    indices: vec![position],
+                });
+                chars = length;
+            }
+        }
         batches
     }
 
@@ -340,6 +366,11 @@ impl<'a> Run<'a> {
             return true;
         }
         match self.deps.provider.open(self.deps.config).await {
+            Ok(session) if session.extractor.identity() != self.deps.identity => {
+                warn!("the model that started is not the one the run expects");
+                self.report.sidecar_lost = true;
+                false
+            }
             Ok(session) => {
                 let cached = CachedExtractor::new(
                     session.extractor,

@@ -31,6 +31,9 @@ const CHARS_PER_TOKEN: usize = 4;
 /// An event may take up to this share of the context window, the rest being
 /// the prompt and the answer.
 const EVENT_CONTEXT_SHARE_DIVISOR: usize = 2;
+/// One batch of events may take up to this share of the context window, for
+/// the same reason.
+const BATCH_CONTEXT_SHARE_DIVISOR: usize = 2;
 
 /// Server flags the guard sets itself, so `extra_args` may not repeat them.
 /// `-a` is the short form of `--alias`.
@@ -181,6 +184,11 @@ impl ExtractionConfig {
             );
         }
         Ok(())
+    }
+
+    /// The most event text one batch holds: half the context window.
+    pub fn max_batch_chars(&self) -> usize {
+        self.ctx_tokens.saturating_mul(CHARS_PER_TOKEN) / BATCH_CONTEXT_SHARE_DIVISOR
     }
 
     /// The longest event text sent to the model: the configured bound, else
