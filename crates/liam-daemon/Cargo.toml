@@ -25,6 +25,8 @@ liam-model = { path = "../liam-model" }
 liam-log = { path = "../liam-log" }
 
 async-trait = "0.1"
+# The extraction hook reads the event log as a stream of records.
+futures-util = { version = "0.3", default-features = false }
 # Run ids and seeds for consolidation runs; the store mints its ids with it too.
 ulid = "2"
 anyhow = "1"
@@ -88,8 +90,6 @@ raunch = "1.0.1"
 [dev-dependencies]
 # storelock tests need an isolated, disposable directory per test.
 tempfile = "3"
-# Startup tests read the event log back as a stream of records.
-futures-util = { version = "0.3", default-features = false }
 # Test log writers implement `LogWriter`, whose `log_id` returns a `Uuid`.
 uuid = { version = "1", default-features = false }
 # Several tests (synthesis's permit-timeout test, tuning's benchmark tests)

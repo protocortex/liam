@@ -11,9 +11,12 @@ pub mod cache;
 pub mod client;
 pub mod extractor;
 pub mod grounding;
+pub mod hooks;
 mod http;
 pub mod inputs;
 mod iso_date;
+#[cfg(test)]
+pub(crate) mod model_double;
 pub mod prompt;
 pub mod response;
 pub mod rules;

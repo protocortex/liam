@@ -79,15 +79,21 @@ impl ConsolidationJob {
     ///
     /// Fails when the snapshot directory cannot be resolved.
     pub fn new(setup: JobSetup<'_>) -> anyhow::Result<Self> {
-        Self::with_parts(setup, Arc::new(StoreProbes), None)
+        Self::with_parts(
+            setup,
+            Arc::new(StoreProbes),
+            None,
+            ConsolidationHookSet::default(),
+        )
     }
 
-    /// The job over the given probe runner and, when given, reopener, which
-    /// tests use to make a run regress or a reopen fail.
+    /// The job over the given probe runner, hooks and, when given, reopener,
+    /// which tests use to make a run regress or a reopen fail.
     fn with_parts(
         setup: JobSetup<'_>,
         probes: Arc<dyn ProbeRunner>,
         reopener: Option<Arc<dyn StoreReopener>>,
+        hooks: ConsolidationHookSet,
     ) -> anyhow::Result<Self> {
         let JobSetup {
             config,
@@ -116,7 +122,7 @@ impl ConsolidationJob {
         });
         let parts = Parts {
             embedder: Arc::new(StoreEmbedder(embedder.clone())),
-            hooks: ConsolidationHookSet::default(),
+            hooks,
             maintenance: Arc::new(maintenance),
             reopener,
             probes,
