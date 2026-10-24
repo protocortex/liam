@@ -21,6 +21,9 @@ const DEFAULT_START_TIMEOUT_SECS: u64 = 120;
 /// also overflow the deadline arithmetic.
 const MAX_START_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_RUN_DEADLINE_SECS: u64 = 600;
+/// A day is far past any extraction run; a larger value is a typo that would
+/// overflow the deadline arithmetic.
+pub const MAX_RUN_DEADLINE_SECS: u64 = 86_400;
 const DEFAULT_RAM_BUDGET_MB: u64 = 4096;
 const DEFAULT_MAX_EVENTS_PER_RUN: usize = 200;
 const DEFAULT_BATCH_EVENTS: usize = 8;
@@ -138,6 +141,10 @@ impl ExtractionConfig {
         ] {
             anyhow::ensure!(value > 0, "extraction.{key} must be at least 1");
         }
+        anyhow::ensure!(
+            self.run_deadline_secs <= MAX_RUN_DEADLINE_SECS,
+            "extraction.run_deadline_secs must be at most {MAX_RUN_DEADLINE_SECS}"
+        );
         anyhow::ensure!(
             self.start_timeout_secs <= MAX_START_TIMEOUT_SECS,
             "extraction.start_timeout_secs must be at most {MAX_START_TIMEOUT_SECS}"
@@ -395,6 +402,9 @@ mod tests {
             ("request_timeout_secs = 1", true),
             ("start_timeout_secs = 1", true),
             ("run_deadline_secs = 1", true),
+            ("run_deadline_secs = 86400", true),
+            ("run_deadline_secs = 86401", false),
+            ("run_deadline_secs = 18446744073709551615", false),
             ("max_competing_per_key = 1", true),
             ("max_batch_failures = 1", true),
             ("max_event_chars = 1", true),

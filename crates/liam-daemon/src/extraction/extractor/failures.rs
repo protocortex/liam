@@ -21,7 +21,7 @@ pub(super) const CANARY_TEXT: &str = "Alice works at Acme.";
 
 /// Joins a scope and an event id into one id no other pair can produce: scopes
 /// hold no control characters.
-pub(super) fn tracking_id(scope: Option<&str>, event_id: &str) -> String {
+pub(crate) fn tracking_id(scope: Option<&str>, event_id: &str) -> String {
     format!("{}{SCOPE_SEPARATOR}{event_id}", scope.unwrap_or_default())
 }
 

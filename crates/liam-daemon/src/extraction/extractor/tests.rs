@@ -210,6 +210,7 @@ struct Fixture {
     config: ExtractionConfig,
     permits: Semaphore,
     ram: FakeRam,
+    stopping: CancellationToken,
 }
 
 impl Fixture {
@@ -234,6 +235,7 @@ impl Fixture {
             config,
             permits: Semaphore::new(1),
             ram: FakeRam(AtomicU64::new(u64::MAX)),
+            stopping: CancellationToken::new(),
         }
     }
 
@@ -284,6 +286,7 @@ impl Fixture {
             free_ram: &self.ram,
             write_source: WRITE_SOURCE,
             deadline,
+            stopping: &self.stopping,
             window_end: WINDOW_END,
         };
         extract_events(inputs, deps).await.expect("a finished run")
@@ -690,6 +693,27 @@ async fn a_stored_answer_that_cannot_be_read_is_a_miss_and_the_model_is_asked_ag
     assert_eq!(second.calls(), 1);
     assert_eq!(report.completed_offset, Some(WINDOW_END));
     assert_eq!(report.batches_failed, 0);
+}
+
+#[tokio::test]
+async fn a_stopping_daemon_ends_the_run_between_batches_and_keeps_the_batch_it_finished() {
+    // Arrange: the daemon starts stopping while the first batch is answered
+    let fx = Fixture::new().await;
+    let stop = fx.stopping.clone();
+    let script = Script::new(move |request, _| {
+        stop.cancel();
+        Reply::Text(facts_for(&request.prompt))
+    });
+
+    // Act
+    let report = fx.run(&Provider::new(&script), &inputs(4)).await;
+
+    // Assert
+    assert!(report.stopped);
+    assert_eq!(script.calls(), 1);
+    assert_eq!(fx.facts_about(1).await, 1);
+    assert_eq!(fx.facts_about(2).await, 0);
+    assert_eq!(report.completed_offset, Some(offset(1)));
 }
 
 #[tokio::test]

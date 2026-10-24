@@ -27,7 +27,7 @@ use super::extractor::ExtractionReport as ModelRun;
 use super::extractor::{extract_events, ExtractionDeps, ExtractorProvider};
 use super::inputs::events_to_inputs;
 use super::sidecar::FreeRam;
-use crate::config::ExtractionConfig;
+use crate::config::{ExtractionConfig, MAX_RUN_DEADLINE_SECS};
 use liam_daemon::consolidation::hooks::{ExtractCtx, ExtractionHook, ExtractionReport};
 
 /// What the extraction part is built from.
@@ -75,6 +75,9 @@ impl ExtractionHooks {
             advance(ctx, window_end).await?;
             return Ok(ExtractionReport::default());
         }
+        // Validation caps the setting; the cap here keeps a hand built config
+        // from overflowing the deadline.
+        let deadline_secs = self.config.run_deadline_secs.min(MAX_RUN_DEADLINE_SECS);
         let deps = ExtractionDeps {
             provider: self.provider.as_ref(),
             identity: &self.identity,
@@ -84,17 +87,16 @@ impl ExtractionHooks {
             permits: &self.permits,
             free_ram: self.free_ram.as_ref(),
             write_source: &ctx.source,
-            deadline: Instant::now() + Duration::from_secs(self.config.run_deadline_secs),
+            deadline: Instant::now() + Duration::from_secs(deadline_secs),
+            stopping: &self.stopping,
             window_end,
         };
-        // A run dropped at any point is safe to repeat, so stopping is a drop.
-        let run = tokio::select! {
-            run = extract_events(&inputs, deps) => run?,
-            () = self.stopping.cancelled() => {
-                warn!("extraction: the daemon is stopping, the model pass is left for the next run");
-                return Ok(ExtractionReport { partial: true });
-            }
-        };
+        // The loop stops between batches when the daemon is stopping; dropping
+        // it mid write would leave the event log poisoned.
+        let run = extract_events(&inputs, deps).await?;
+        if run.stopped {
+            warn!("extraction: the daemon is stopping, the rest of the window is left for the next run");
+        }
         if let Some(done) = run.completed_offset {
             advance(ctx, done).await?;
         }
@@ -135,5 +137,9 @@ async fn advance(ctx: &ExtractCtx<'_>, offset: LogOffset) -> anyhow::Result<()> 
 /// Work was left for a later run: a batch failed or was quarantined, the model
 /// was lost, or the deadline came first.
 fn is_partial(run: &ModelRun) -> bool {
-    run.batches_failed > 0 || run.batches_quarantined > 0 || run.sidecar_lost || run.deadline_hit
+    run.batches_failed > 0
+        || run.batches_quarantined > 0
+        || run.sidecar_lost
+        || run.deadline_hit
+        || run.stopped
 }

@@ -21,6 +21,7 @@ use liam_store::{DefaultGraph, Vocabulary};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::apply::{apply_answer, ApplyContext, ApplyError};
@@ -72,6 +73,9 @@ pub struct ExtractionDeps<'a> {
     /// The log source the facts are written under.
     pub write_source: &'a str,
     pub deadline: Instant,
+    /// Cancelled when the daemon is stopping. The run ends between batches and
+    /// drops a model call in flight, and never a write.
+    pub stopping: &'a CancellationToken,
     /// The last offset of the scanned window, where a fully done run ends.
     pub window_end: LogOffset,
 }
@@ -92,6 +96,8 @@ pub struct ExtractionReport {
     pub events_truncated: usize,
     pub sidecar_lost: bool,
     pub deadline_hit: bool,
+    /// The daemon began stopping before the run finished.
+    pub stopped: bool,
     /// The model that answered, for the run manifest.
     pub model: Option<ModelIdentity>,
 }
@@ -232,6 +238,10 @@ impl<'a> Run<'a> {
         for batch in &batches {
             if stopped_scopes.contains(&batch.scope) {
                 continue;
+            }
+            if self.deps.stopping.is_cancelled() {
+                self.report.stopped = true;
+                break;
             }
             if self.expired() {
                 self.report.deadline_hit = true;
@@ -435,6 +445,10 @@ impl<'a> Run<'a> {
 
     /// Asks the model, starting it first if this is the run's first miss.
     async fn generate(&mut self, request: &ExtractRequest, piece: &[usize]) -> Result<Generation> {
+        if self.deps.stopping.is_cancelled() {
+            self.report.stopped = true;
+            return Ok(Generation::Stop(Attempt::Halted));
+        }
         if self.expired() {
             self.report.deadline_hit = true;
             return Ok(Generation::Stop(Attempt::Halted));
@@ -453,8 +467,15 @@ impl<'a> Run<'a> {
             self.report.sidecar_lost = true;
             return Ok(Generation::Stop(Attempt::Halted));
         }
-        let Ok(permit) = tokio::time::timeout(self.remaining(), self.deps.permits.acquire()).await
-        else {
+        let waiting = tokio::time::timeout(self.remaining(), self.deps.permits.acquire());
+        let waited = tokio::select! {
+            waited = waiting => waited,
+            () = self.deps.stopping.cancelled() => {
+                self.report.stopped = true;
+                return Ok(Generation::Stop(Attempt::Halted));
+            }
+        };
+        let Ok(permit) = waited else {
             self.report.deadline_hit = true;
             return Ok(Generation::Stop(Attempt::Halted));
         };
@@ -471,7 +492,15 @@ impl<'a> Run<'a> {
             .remaining()
             .min(Duration::from_secs(self.deps.config.request_timeout_secs));
         self.attempted.extend(piece);
-        match tokio::time::timeout(limit, cached.extract_json(request)).await {
+        let call = tokio::time::timeout(limit, cached.extract_json(request));
+        let answered = tokio::select! {
+            answered = call => answered,
+            () = self.deps.stopping.cancelled() => {
+                self.report.stopped = true;
+                return Ok(Generation::Stop(Attempt::Halted));
+            }
+        };
+        match answered {
             Ok(Ok(text)) => {
                 self.model_answered = true;
                 Ok(Generation::Text(text))
@@ -565,6 +594,8 @@ impl<'a> Run<'a> {
 }
 
 mod failures;
+#[cfg(test)]
+pub(crate) use failures::tracking_id;
 
 #[cfg(test)]
 mod tests;

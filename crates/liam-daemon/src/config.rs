@@ -18,6 +18,7 @@ pub(crate) use consolidation::default_snapshot_dir;
 pub use consolidation::ConsolidationConfig;
 pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
+    MAX_RUN_DEADLINE_SECS,
 };
 
 /// Producer ids starting with this are reserved for consolidation writes.

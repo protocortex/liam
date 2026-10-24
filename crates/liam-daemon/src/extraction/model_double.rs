@@ -4,7 +4,7 @@
 //! its process on a chosen call.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::bail;
 use async_trait::async_trait;
@@ -38,9 +38,15 @@ pub struct ModelDouble {
     dies_on_call: Option<usize>,
     /// The call, counted from 1, that cancels the token and never answers.
     stops_on_call: Option<(usize, CancellationToken)>,
+    /// A prompt holding this text gets an answer that is not JSON.
+    garbles: Mutex<Option<String>>,
 }
 
 impl ModelDouble {
+    pub fn garble(&self, text: &str) {
+        *self.garbles.lock().unwrap() = Some(text.to_owned());
+    }
+
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
@@ -58,6 +64,13 @@ impl JsonExtractor for ModelDouble {
                 token.cancel();
                 std::future::pending::<()>().await;
             }
+        }
+        let garbled = self.garbles.lock().unwrap();
+        if garbled
+            .as_deref()
+            .is_some_and(|text| req.prompt.contains(text))
+        {
+            return Ok("not json".to_owned());
         }
         Ok(facts_for(&req.prompt))
     }
@@ -105,6 +118,7 @@ impl ProviderDouble {
                 alive: Arc::new(AtomicBool::new(true)),
                 dies_on_call,
                 stops_on_call,
+                garbles: Mutex::new(None),
             }),
             opens: AtomicUsize::new(0),
             fail_open: AtomicBool::new(false),

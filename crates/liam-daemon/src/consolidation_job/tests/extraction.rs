@@ -11,6 +11,7 @@ use liam_log::reader::{LogReader, SequentialScanReader};
 use liam_log::LogOffset;
 use liam_store::{ExtractorName, Fact, RebuildMode, FOREVER};
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::config::ExtractionConfig;
@@ -156,6 +157,22 @@ fn cache_keys(harness: &Harness) -> BTreeSet<String> {
             entry["key"].as_str().unwrap().to_owned()
         })
         .collect()
+}
+
+/// The offset and event id of the logged node write labelled `label`.
+async fn logged_note(harness: &Harness, label: &str) -> (LogOffset, String) {
+    let reader = SequentialScanReader::local(&log_dir_in(&harness.root)).unwrap();
+    let records: Vec<_> = futures_util::StreamExt::collect(reader.scan(None)).await;
+    records
+        .into_iter()
+        .map(|record| record.unwrap())
+        .find_map(|record| match record.event.payload {
+            LogPayload::NodeWrite(row) if row.label == label => {
+                Some((record.offset, record.event.event_id))
+            }
+            _ => None,
+        })
+        .expect("the note was logged")
 }
 
 async fn logged_payloads(harness: &Harness) -> Vec<LogPayload> {
@@ -409,6 +426,8 @@ async fn a_model_lost_mid_run_keeps_the_batches_it_finished() {
     assert!(done(&manifest, "extract:partial"));
     let store = server.store().await.unwrap();
     assert_eq!(facts_of(&store).await.len(), 2);
+    let (bob, _) = logged_note(&harness, &employment("bob", ORG)).await;
+    assert_eq!(cursor_of(&store).await, Some(bob));
 }
 
 #[tokio::test]
@@ -459,31 +478,71 @@ async fn a_window_is_capped_at_the_events_per_run_and_the_cursor_stops_there() {
 }
 
 #[tokio::test]
-async fn a_daemon_that_begins_stopping_mid_pass_leaves_the_rest_for_the_next_run() {
+async fn a_daemon_that_begins_stopping_mid_pass_keeps_the_log_writable_and_the_next_run_goes_on() {
     // Arrange: the daemon starts stopping during the second answer
     let harness = Harness::new();
     let server = seeded(&harness, 3).await;
-    let provider = ProviderDouble::stopping_on_call(2, harness.shutdown.token());
+    let stop = CancellationToken::new();
+    let provider = ProviderDouble::stopping_on_call(2, stop.clone());
+    let slow = ExtractionConfig {
+        batch_events: 1,
+        ..config()
+    };
+    let mut part = extraction_part(&harness, &provider, slow.clone());
+    part.stopping = stop;
+    let job = harness.job_with_hooks(&server, honest(), None, hooks_of(part));
+
+    // Act
+    job.tick().await;
+
+    // Assert: the first batch is kept, the log still takes writes, and the
+    // next run finishes the window
+    let manifest = RunManifest::load(&harness.manifest_path())
+        .unwrap()
+        .unwrap();
+    assert!(done(&manifest, "extract:partial"));
+    let store = server.store().await.unwrap();
+    let (first, _) = logged_note(&harness, "kept").await;
+    assert_eq!(cursor_of(&store).await, Some(first));
+    store
+        .insert(client_note("written after the stop"))
+        .await
+        .expect("the log is not poisoned");
+    drop(store);
+    let next = harness.job_with_hooks(
+        &server,
+        honest(),
+        None,
+        hooks_of(extraction_part(&harness, &provider, slow)),
+    );
+    assert_eq!(next.tick().await, Some(RunOutcome::Committed));
+    let store = server.store().await.unwrap();
+    assert_eq!(facts_of(&store).await.len(), 3);
+}
+
+#[tokio::test]
+async fn a_run_deadline_far_past_any_clock_still_runs() {
+    // Arrange: a hand built config, which validation would have refused
+    let harness = Harness::new();
+    let server = seeded(&harness, 2).await;
+    let provider = ProviderDouble::new();
     let part = extraction_part(
         &harness,
         &provider,
         ExtractionConfig {
-            batch_events: 1,
+            run_deadline_secs: u64::MAX,
             ..config()
         },
     );
     let job = harness.job_with_hooks(&server, honest(), None, hooks_of(part));
 
     // Act
-    job.tick().await;
+    let outcome = job.tick().await;
 
-    // Assert: the cursor did not move, so the next run starts the window again
-    let manifest = RunManifest::load(&harness.manifest_path())
-        .unwrap()
-        .unwrap();
-    assert!(done(&manifest, "extract:partial"));
+    // Assert
+    assert_eq!(outcome, Some(RunOutcome::Committed));
     let store = server.store().await.unwrap();
-    assert_eq!(cursor_of(&store).await, None);
+    assert_eq!(facts_of(&store).await.len(), 2);
 }
 
 /// Reads the log as usual, after moving the model cursor ahead of anything the
@@ -553,3 +612,5 @@ async fn a_cursor_moved_by_another_writer_makes_the_step_partial_and_the_next_ru
     next.tick().await;
     assert_eq!(provider.model.calls(), calls);
 }
+
+mod restore;
