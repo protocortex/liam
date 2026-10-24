@@ -161,6 +161,46 @@ impl Rules {
 }
 
 impl KeyState {
+    /// The state after `plan` is applied, so a later decision in the same
+    /// transaction sees the rows an earlier one wrote.
+    pub(super) fn apply(&mut self, plan: &Plan) {
+        self.versions
+            .retain(|version| !plan.close.contains(&version.id));
+        self.versions.extend(plan.insert.iter().cloned());
+        for (lineage, events) in &plan.link {
+            for version in self
+                .versions
+                .iter_mut()
+                .filter(|version| version.lineage_id == *lineage)
+            {
+                version.source_event_ids.extend(events.iter().cloned());
+                version.source_event_ids.sort();
+                version.source_event_ids.dedup();
+            }
+        }
+        self.versions
+            .sort_by(|a, b| (a.valid_from, &a.id.as_str()).cmp(&(b.valid_from, &b.id.as_str())));
+        for blocked in &plan.suppress {
+            self.suppress(blocked);
+        }
+    }
+
+    /// Records a suppression the way the table does: one row per object, the
+    /// later retraction kept whole, and on a tie the higher trust.
+    fn suppress(&mut self, blocked: &Suppression) {
+        let same = |known: &Suppression| known.object_key == blocked.object_key;
+        match self.suppressions.iter_mut().find(|known| same(known)) {
+            Some(known) => {
+                let newer = (blocked.retracted_at, blocked.trust_score)
+                    .partial_cmp(&(known.retracted_at, known.trust_score));
+                if newer == Some(std::cmp::Ordering::Greater) {
+                    *known = blocked.clone();
+                }
+            }
+            None => self.suppressions.push(blocked.clone()),
+        }
+    }
+
     /// The versions that still hold against evidence from `evidence_at`: those
     /// ending after it, whether or not something has closed them since.
     fn live(&self, evidence_at: Millis) -> Vec<&Fact> {

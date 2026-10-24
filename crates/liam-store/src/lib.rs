@@ -27,7 +27,7 @@ pub use graph::{
     batch_key, recover_interrupted_restore, verify_snapshot, BackfillReport, Candidate,
     CatchUpReport, ContentEmbedder, EmbedError, EventLog, Graph, PoisonHook, RebuildMode,
     RebuildReport, ReembedReport, SharedLog, Snapshot, SnapshotLog, SnapshotMeta,
-    RUN_SOURCE_PREFIX,
+    MAX_FACTS_PER_BATCH, RUN_SOURCE_PREFIX,
 };
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{

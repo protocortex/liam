@@ -32,7 +32,7 @@ const FACT_TABLES: [(&str, &str); 3] = [
 const REWIND_CURSOR: &str = "UPDATE log_cursor SET last_segment = NULL, last_index = NULL";
 
 /// Every row of the fact tables, ids and stamps included, in a stable order.
-async fn fact_state<B: Backend>(g: &Graph<B>) -> Vec<String> {
+pub(super) async fn fact_state<B: Backend>(g: &Graph<B>) -> Vec<String> {
     let mut state = Vec::new();
     for (table, order) in FACT_TABLES {
         let rows = g
@@ -116,7 +116,7 @@ async fn scripted(env: &Env, db: &str, source: &str) -> (DefaultGraph, SharedLog
 }
 
 /// A second store over the log of `env`, which a first store has written.
-async fn replica(env: &Env, log: &SharedLog, db: &str) -> DefaultGraph {
+pub(super) async fn replica(env: &Env, log: &SharedLog, db: &str) -> DefaultGraph {
     let clock = Arc::new(FixedClock::new(START));
     let (g, _) = env
         .open_over::<DefaultBackend>(Arc::clone(log), db, clock)
@@ -124,7 +124,7 @@ async fn replica(env: &Env, log: &SharedLog, db: &str) -> DefaultGraph {
     g
 }
 
-async fn fact_writes(env: &Env) -> Vec<liam_log::event::LogEvent> {
+pub(super) async fn fact_writes(env: &Env) -> Vec<liam_log::event::LogEvent> {
     env.records()
         .await
         .into_iter()

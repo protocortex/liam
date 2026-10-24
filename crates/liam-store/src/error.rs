@@ -199,6 +199,19 @@ pub enum Error {
     #[error("a fact cannot be valid from {valid_from} until {valid_until}")]
     InvalidFactInterval { valid_from: i64, valid_until: i64 },
 
+    /// A batch of facts is longer than one transaction may hold, so nothing was written.
+    #[error("a batch of {len} facts is over the limit of {max}")]
+    FactBatchTooLarge { len: usize, max: usize },
+
+    /// One fact of a batch was refused, so none of the batch was written.
+    /// `index` is the fact's position in the batch.
+    #[error("fact {index} of the batch was refused: {source}")]
+    FactInBatch {
+        index: usize,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A fact row holds a value its column cannot legally have.
     #[error("the fact state in the store is corrupt: {0}")]
     CorruptFactState(String),

@@ -3,8 +3,10 @@
 //! scope)` key, lets `arbitration` decide, and applies the decision, all in one
 //! `begin()` transaction. The transaction holds the write lock from the read to
 //! the commit, so two racing writers on a key are serialized and the second
-//! reads the first's rows. It touches the rows of one key only, never a
-//! caller-sized batch, and never spans a model call.
+//! reads the first's rows. A single write touches the rows of one key. A batch
+//! (`assert_facts`) touches the keys of its facts in one transaction, capped at
+//! `MAX_FACTS_PER_BATCH` so the lock hold stays bounded. No write spans a model
+//! call.
 //!
 //! On a logged store the decision is appended to the log as one `FactWrite`
 //! before it is applied, so a replay reproduces the rows without arbitrating
@@ -30,6 +32,9 @@ use crate::types::{
     PredicateSpec, RetractOutcome,
 };
 use crate::value::{Row, Value};
+
+mod batch;
+pub use batch::MAX_FACTS_PER_BATCH;
 
 pub(super) const FACT_COLUMNS: &str =
     "id, lineage_id, subject, predicate, object, object_key, scope,

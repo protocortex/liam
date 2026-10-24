@@ -13,6 +13,7 @@ use std::sync::Arc;
 use liam_log::event::NodeRow;
 
 pub use self::backfill::BackfillReport;
+pub use self::fact_write::MAX_FACTS_PER_BATCH;
 pub use self::facts::batch_key;
 use self::logged_plan::{refuse_supersedes, Collision, STORE_SOURCE};
 use self::logged_write::WriteOutcome;
@@ -2258,6 +2259,7 @@ mod tests {
     mod backwards_clock;
     mod catch_up;
     mod fact_arbitration;
+    mod fact_batch;
     mod fact_log;
     mod fact_read;
     mod gc_log;
