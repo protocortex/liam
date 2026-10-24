@@ -105,6 +105,16 @@ impl Harness {
         probes: Arc<dyn ProbeRunner>,
         reopener: Option<Arc<dyn StoreReopener>>,
     ) -> ConsolidationJob {
+        self.job_with_hooks(server, probes, reopener, ConsolidationHookSet::default())
+    }
+
+    fn job_with_hooks(
+        &self,
+        server: &MemoryServer,
+        probes: Arc<dyn ProbeRunner>,
+        reopener: Option<Arc<dyn StoreReopener>>,
+        hooks: ConsolidationHookSet,
+    ) -> ConsolidationJob {
         ConsolidationJob::with_parts(
             JobSetup {
                 config: &self.config,
@@ -117,6 +127,7 @@ impl Harness {
             },
             probes,
             reopener,
+            hooks,
         )
         .unwrap()
     }
@@ -797,3 +808,5 @@ async fn the_maintenance_step_is_done_when_the_daemon_keeps_running() {
 
     assert!(result.is_ok());
 }
+
+mod extraction;
