@@ -44,6 +44,7 @@ pub use liam_daemon::config;
 
 use config::Config;
 use consolidation_job::{ConsolidationJob, JobSetup};
+use liam_daemon::consolidation::maintenance::standard_steps;
 use liam_daemon::models::{
     build_llm, build_models, export_fastembed_cache_dir, resolve_config_path, resolve_log_dir,
 };
@@ -457,21 +458,7 @@ pub(crate) async fn maintenance_steps(
     write_source: Option<&str>,
 ) -> bool {
     let stopping = server.shutdown_token();
-    // A leftover event applied after the sweep would outlive it.
-    catch_up(store).await;
-    if stopping.is_cancelled() {
-        return false;
-    }
-    sweep(store, policy, write_source).await;
-    if stopping.is_cancelled() {
-        return false;
-    }
-    repair_mentions(store, write_source).await;
-    if stopping.is_cancelled() {
-        return false;
-    }
-    refresh_clusters(store).await;
-    if stopping.is_cancelled() {
+    if !standard_steps(store, policy, write_source, &stopping).await {
         return false;
     }
     if let Some(resynthesis) = resynthesis {
@@ -577,68 +564,10 @@ fn resynthesis_budget(
     }
 }
 
-/// Repairs `mentions` edges left dangling by a supersession, so citing
-/// entities keep pointing at the current fact. A failure here must not block
-/// the rest of the tick, matching `sweep`'s and `refresh_clusters`'s own
-/// error-doesn't-abort-the-tick pattern.
-async fn repair_mentions(store: &DefaultGraph, write_source: Option<&str>) {
-    let repaired = match write_source {
-        Some(source) => store.repair_superseded_mentions_from(source).await,
-        None => store.repair_superseded_mentions().await,
-    };
-    match repaired {
-        Ok(repaired) => tracing::info!(repaired, "provenance repair completed"),
-        Err(e) => tracing::warn!(error = %e, "provenance repair failed"),
-    }
-}
-
-async fn catch_up(store: &DefaultGraph) {
-    match store.catch_up().await {
-        Ok(report) if report.applied > 0 || report.quarantined > 0 => {
-            tracing::info!(?report, "event log caught up")
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "event log catch up failed"),
-    }
-}
-
-async fn sweep(
-    store: &DefaultGraph,
-    policy: &liam_store::RetentionPolicy,
-    write_source: Option<&str>,
-) {
-    let swept = match write_source {
-        Some(source) => store.gc_from(policy, source).await,
-        None => store.gc(policy).await,
-    };
-    match swept {
-        Ok(report) => tracing::info!(?report, "gc completed"),
-        Err(e) => tracing::warn!(error = %e, "gc failed"),
-    }
-}
-
-/// Not serving stale: the tick serves no one. A skipped or failed refresh
-/// just means the next read re-runs the check and recomputes then.
-async fn refresh_clusters(store: &DefaultGraph) -> bool {
-    match store.refresh_communities().await {
-        Ok(true) => {
-            tracing::info!("clusters refreshed");
-            true
-        }
-        Ok(false) => {
-            tracing::debug!("clusters already current");
-            false
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "cluster refresh failed");
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use liam_daemon::consolidation::maintenance::refresh_clusters;
     use liam_store::{
         relation, Fingerprint, FixedClock, GraphConfig, Millis, NewEdge, NewNode, RetentionPolicy,
     };

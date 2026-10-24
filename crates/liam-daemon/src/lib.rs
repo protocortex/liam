@@ -35,5 +35,6 @@ pub mod embedder_fingerprint;
 pub mod event_log;
 pub mod models;
 pub mod retrieval_eval;
+pub mod store_open;
 pub mod storelock;
 pub mod telemetry;

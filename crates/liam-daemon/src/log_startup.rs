@@ -9,12 +9,12 @@ use std::sync::Arc;
 use anyhow::Context;
 use liam_log::compactor::{ChannelSink, Compactor};
 use liam_model::Embedder;
-use liam_store::{DefaultGraph, GraphConfig, SharedLog};
+use liam_store::{DefaultGraph, SharedLog};
 use tokio::task::JoinHandle;
 
 use liam_daemon::config::Config;
 use liam_daemon::event_log;
-use liam_daemon::models::StoreEmbedder;
+use liam_daemon::store_open::{open_database, open_store_on_log};
 
 use crate::shutdown::Shutdown;
 
@@ -75,17 +75,6 @@ pub async fn open_store_with_log(
     })
 }
 
-pub(crate) async fn open_database(
-    config: &Config,
-    database_path: &Path,
-) -> anyhow::Result<DefaultGraph> {
-    let path = database_path
-        .to_str()
-        .context("the database path is not UTF-8")?;
-    let graph = GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size);
-    Ok(DefaultGraph::open(path, graph).await?)
-}
-
 /// A database already tied to a log belongs to that log, so a directory with
 /// no log in it is a wrong path, not a place for a new one.
 async fn refuse_a_new_log_for_a_logged_database(
@@ -115,43 +104,6 @@ fn compactor_for(log_dir: &Path) -> anyhow::Result<Compactor> {
     })
 }
 
-/// Attaches `log` to `store`, copies in the rows that predate it and replays
-/// what the store has not applied.
-pub(crate) async fn open_store_on_log(
-    store: DefaultGraph,
-    database_path: &Path,
-    log_dir: &Path,
-    log: SharedLog,
-    embedder: Arc<dyn Embedder>,
-) -> anyhow::Result<DefaultGraph> {
-    // The embedder goes in before the replay so restored nodes get vectors.
-    let store = store
-        .with_log(log)
-        .await
-        .with_context(|| {
-            format!(
-                "the event log in {} cannot be used with the database {}; the cause is below",
-                log_dir.display(),
-                database_path.display()
-            )
-        })?
-        .with_embedder(Arc::new(StoreEmbedder(embedder)));
-
-    if store.needs_backfill().await? {
-        let report = store.backfill_log_from_projection().await.context(
-            "copying the existing rows into the event log failed; fix the cause and \
-                 restart, the copy resumes where it stopped",
-        )?;
-        tracing::info!(?report, "backfill completed");
-    }
-    let report = store
-        .catch_up()
-        .await
-        .context("replaying the event log into the database failed")?;
-    tracing::info!(?report, "event log caught up");
-    Ok(store)
-}
-
 /// Fixtures shared with the maintenance tick tests in `main.rs`.
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -165,7 +117,7 @@ pub(crate) mod test_support {
     use liam_log::reader::{LogReader, LogStream, ReaderError, SequentialScanReader};
     use liam_log::wal::{SystemClock, WalConfig, WalError, WalWriter};
     use liam_log::{LogOffset, LogWriter};
-    use liam_store::{EventLog, PoisonHook, SharedLog, FOREVER};
+    use liam_store::{EventLog, GraphConfig, PoisonHook, SharedLog, FOREVER};
 
     use super::*;
 

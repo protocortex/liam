@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use liam_daemon::config::Config;
+use liam_daemon::consolidation::maintenance::refresh_clusters;
 use liam_daemon::consolidation::manifest::{manifest_path_for, RunManifest, RunOutcome};
 use liam_daemon::consolidation::probes::{run_probes, Probe, ProbeError, ProbeReport};
 use liam_daemon::consolidation::run::{ProbeRunner, StoreReopener};
 use liam_daemon::consolidation::settings::identity;
+use liam_daemon::store_open::{open_database, open_store_on_log};
 use liam_model::Llm;
 use liam_store::{DefaultGraph, FixedClock, GraphConfig, Millis, NewEdge, NewNode};
 
@@ -20,7 +22,6 @@ use super::*;
 use crate::log_startup::test_support::{
     config_in, database_in, embedder, log_dir_in, log_over, standalone_log, ToggledWriter, DIMS,
 };
-use crate::log_startup::{open_database, open_store_on_log};
 
 const POLL: std::time::Duration = std::time::Duration::from_millis(5);
 const WAIT_POLLS: usize = 2_000;
@@ -219,10 +220,7 @@ async fn refresh_clusters_reports_no_work_on_an_idle_store_through_a_consolidati
     let store = Arc::new(store);
     let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
     let job = harness.job(&server, honest());
-    assert!(
-        crate::refresh_clusters(&store).await,
-        "first call always has work"
-    );
+    assert!(refresh_clusters(&store).await, "first call always has work");
     store
         .insert(NewNode::now("fact", "c", "a fact the run must refresh for"))
         .await
@@ -230,7 +228,7 @@ async fn refresh_clusters_reports_no_work_on_an_idle_store_through_a_consolidati
 
     // Act
     let outcome = job.tick().await;
-    let did_work = crate::refresh_clusters(&store).await;
+    let did_work = refresh_clusters(&store).await;
 
     // Assert
     assert_eq!(outcome, Some(RunOutcome::Committed));

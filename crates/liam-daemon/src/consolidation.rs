@@ -7,6 +7,7 @@ pub mod dedup;
 pub mod dedup_cursor;
 pub mod determinism;
 pub mod hooks;
+pub mod maintenance;
 pub mod manifest;
 pub mod probe_set;
 pub mod probes;
