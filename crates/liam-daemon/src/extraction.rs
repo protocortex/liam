@@ -9,6 +9,7 @@
 mod apply;
 pub mod cache;
 pub mod client;
+pub mod extractor;
 pub mod grounding;
 mod http;
 pub mod inputs;
