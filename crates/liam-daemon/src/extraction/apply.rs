@@ -7,15 +7,19 @@ use liam_store::{
     ArbitrationCaps, ArbitrationOutcome, DefaultGraph, EndFact, EndOutcome, Error, ExtractorName,
     Millis, NewFact, PredicateSpec, Vocabulary, BEGINNING, FOREVER, MAX_FACTS_PER_BATCH,
 };
+use tracing::warn;
 
 use super::grounding::supporting_events;
 use super::inputs::ExtractionInput;
 use super::iso_date::parse_iso_date;
 use super::prompt::PROMPT_VERSION;
 use super::response::{ParsedBatch, ParsedFact, Polarity};
+use super::rules::{extract_rules, RuleFact, RULES_EXTRACTOR, RULES_EXTRACTOR_VERSION};
 use crate::config::ExtractionConfig;
 
 const MILLIS_PER_SECOND: i64 = 1000;
+/// The rules match text exactly, so they are as sure as a fact can be.
+const RULE_CONFIDENCE: f64 = 1.0;
 
 /// What the store needs to know to write a batch's facts.
 pub struct ApplyContext<'a> {
@@ -125,6 +129,60 @@ pub async fn apply_answer(
     Ok(counts)
 }
 
+/// Writes the facts the rules find in `inputs`. One input's facts are one
+/// write, so a fact the store refuses costs only that input's facts.
+pub async fn apply_rules(
+    ctx: &ApplyContext<'_>,
+    inputs: &[ExtractionInput],
+    known_entities: &[String],
+) -> Result<ApplyCounts, ApplyError> {
+    let mut counts = ApplyCounts::default();
+    for input in inputs {
+        let mut found: Vec<(NewFact, PredicateSpec)> = extract_rules(
+            &input.event_id,
+            &input.text,
+            known_entities,
+            ctx.config.max_event_chars(),
+        )
+        .into_iter()
+        .map(|fact| rule_fact(ctx, input, fact))
+        .collect();
+        let attempted = found.len();
+        match flush_asserted(ctx, &mut found, &mut counts).await {
+            Ok(()) => {}
+            Err(ApplyError::Rejected(why)) => {
+                warn!(event_id = %input.event_id, %why, "the store refused an event's rule facts");
+                counts.dropped += attempted;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(counts)
+}
+
+fn rule_fact(
+    ctx: &ApplyContext<'_>,
+    input: &ExtractionInput,
+    fact: RuleFact,
+) -> (NewFact, PredicateSpec) {
+    let spec = ctx.vocabulary.spec(&fact.predicate);
+    let new = NewFact {
+        subject: fact.subject,
+        predicate: fact.predicate,
+        object: fact.object,
+        scope: input.scope.clone(),
+        valid_from: input.observed_at,
+        valid_until: FOREVER,
+        evidence_at: evidence_time(input),
+        confidence: RULE_CONFIDENCE,
+        trust_score: source_trust(ctx.config, input),
+        extractor: RULES_EXTRACTOR,
+        extractor_version: RULES_EXTRACTOR_VERSION.to_string(),
+        source_event_ids: vec![fact.source_event_id],
+    };
+    (new, spec)
+}
+
 async fn flush_asserted(
     ctx: &ApplyContext<'_>,
     asserted: &mut Vec<(NewFact, PredicateSpec)>,
@@ -196,7 +254,7 @@ fn prepare(
     let trust = trust_of(ctx.config, &sources);
     let evidence_at = sources
         .iter()
-        .map(|input| input.observed_at.min(input.ingested_at))
+        .map(|input| evidence_time(input))
         .max()
         .expect("a grounded fact has a supporting event");
     let source_event_ids: Vec<String> =
@@ -237,15 +295,24 @@ fn prepare(
 fn trust_of(config: &ExtractionConfig, sources: &[&ExtractionInput]) -> f64 {
     let strongest = sources
         .iter()
-        .map(|input| {
-            config
-                .trust
-                .get(&input.source)
-                .copied()
-                .unwrap_or(config.default_trust)
-        })
+        .map(|input| source_trust(config, input))
         .fold(0.0, f64::max);
     strongest * config.llm_trust_factor
+}
+
+/// What the configuration trusts the event's writer to say.
+fn source_trust(config: &ExtractionConfig, input: &ExtractionInput) -> f64 {
+    config
+        .trust
+        .get(&input.source)
+        .copied()
+        .unwrap_or(config.default_trust)
+}
+
+/// When the event's claim was last known to hold: the earlier of when it was
+/// observed and when it was ingested.
+fn evidence_time(input: &ExtractionInput) -> Millis {
+    input.observed_at.min(input.ingested_at)
 }
 
 struct Dates {

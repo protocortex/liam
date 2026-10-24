@@ -1398,6 +1398,27 @@ impl<B: Backend> Graph<B> {
         })
     }
 
+    /// The subjects of live entity pages, sorted, up to `limit`. An entity page
+    /// is a live node that is the source of a live `mentions` edge.
+    pub async fn live_entity_subjects(&self, limit: usize) -> Result<Vec<String>> {
+        let rows = self
+            .backend
+            .query(
+                "SELECT DISTINCT nodes.subject FROM nodes
+                 JOIN edges ON edges.src = nodes.id
+                 WHERE nodes.tx_to = ?1 AND edges.tx_to = ?1 AND edges.type = ?2
+                   AND nodes.subject IS NOT NULL
+                 ORDER BY nodes.subject LIMIT ?3",
+                &[
+                    FOREVER.into(),
+                    crate::types::relation::MENTIONS.into(),
+                    i64::try_from(limit).unwrap_or(i64::MAX).into(),
+                ],
+            )
+            .await?;
+        rows.iter().map(|row| row.get_string(0)).collect()
+    }
+
     /// Record the mentions fingerprint an entity was just synthesized from,
     /// keyed by `(subject, scope)` so a later `stale_entities` check survives
     /// the entity's `NodeId` changing under a supersede.
@@ -3146,6 +3167,34 @@ mod tests {
 
         // Assert
         assert!(found.is_none());
+    }
+
+    // ---- Graph::live_entity_subjects ----
+
+    #[tokio::test]
+    async fn live_entity_subjects_lists_only_nodes_that_mention_something_sorted_and_capped() {
+        // Arrange: two entity pages that mention a fact, an entity with no
+        // mention, and a fact node with a subject of its own
+        let g = graph_at(Millis(1000)).await;
+        let fact = g
+            .insert(NewNode::now("fact", "note", "a note").with_subject("note-subject"))
+            .await
+            .unwrap();
+        for name in ["Zed", "Ada"] {
+            let entity = g.insert(NewNode::entity("person", name)).await.unwrap();
+            g.link(NewEdge::new(&entity, &fact, relation::MENTIONS))
+                .await
+                .unwrap();
+        }
+        g.insert(NewNode::entity("person", "Lonely")).await.unwrap();
+
+        // Act
+        let all = g.live_entity_subjects(10).await.unwrap();
+        let capped = g.live_entity_subjects(1).await.unwrap();
+
+        // Assert
+        assert_eq!(all, ["ada", "zed"]);
+        assert_eq!(capped, ["ada"]);
     }
 
     // ---- Graph::mentions ----
