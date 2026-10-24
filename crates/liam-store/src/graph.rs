@@ -13,6 +13,7 @@ use std::sync::Arc;
 use liam_log::event::NodeRow;
 
 pub use self::backfill::BackfillReport;
+pub use self::fact_read::FactPage;
 pub use self::fact_write::MAX_FACTS_PER_BATCH;
 pub use self::facts::batch_key;
 use self::logged_plan::{refuse_supersedes, Collision, STORE_SOURCE};

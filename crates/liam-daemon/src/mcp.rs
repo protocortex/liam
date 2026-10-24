@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MCP tool surface: `remember`, `recall`, `relate`, `ask`, `clusters`, and
-//! `timeline`, wiring the store and the model.
+//! MCP tool surface: `remember`, `recall`, `relate`, `ask`, `clusters`,
+//! `timeline`, and `facts`, wiring the store and the model.
 //!
 //! VERSION CHECK: the rmcp macro surface (`#[tool_router]`, `#[tool]`,
 //! `#[tool_handler]`, `Parameters`) moves across releases. Confirmed unchanged
 //! from 2.x through rmcp 3.1.2, the version pinned in `Cargo.toml`; re-confirm
 //! against the rmcp version you pin before bumping again.
 
+pub mod facts;
 pub mod producer;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -16,7 +17,7 @@ use std::time::Duration;
 use liam_daemon::consolidation::shared_store::SharedStore;
 use liam_model::{Embedder, Llm, Reranker, TextKind};
 use liam_store::types::{EpisodeEdge, EpisodeRef};
-use liam_store::{relation, DefaultGraph, NewNode, Query};
+use liam_store::{relation, DefaultGraph, NewNode, Query, Vocabulary};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
@@ -25,11 +26,13 @@ use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use self::facts::FactsArgs;
 use crate::ask::{
     self, build_ask_prompt, clamp_ask_k, estimate_tokens, fallback_answer, fit_evidence_to_budget,
     format_answer,
 };
 use crate::clusters::{narrow_groups, render_clusters};
+use crate::config::{resolve_vocabulary, ExtractionConfig};
 use crate::synthesis;
 use crate::tuning::{record_and_maybe_evaluate, AimdHandles, RollingWindow};
 
@@ -538,6 +541,9 @@ pub struct MemoryServer {
     /// Cancelled when the daemon is stopping, so the maintenance tick stops
     /// at its next step instead of starting work no one will wait for.
     shutdown: CancellationToken,
+    /// Tells `facts` which predicates hold one value, so it can mark competing
+    /// claims. Shared across connections like the other process-wide state.
+    vocabulary: Arc<Vocabulary>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -617,6 +623,7 @@ impl MemoryServer {
             previous_window_average: Arc::new(Mutex::new(None)),
             producer: OnceLock::new(),
             shutdown: CancellationToken::new(),
+            vocabulary: Arc::new(resolve_vocabulary(&ExtractionConfig::default())),
             tool_router: Self::tool_router(),
         }
     }
@@ -624,6 +631,12 @@ impl MemoryServer {
     /// Ties this server to the daemon's shutdown token.
     pub(crate) fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
         self.shutdown = shutdown;
+        self
+    }
+
+    /// Uses the operator's resolved predicate vocabulary for `facts`.
+    pub(crate) fn with_vocabulary(mut self, vocabulary: Vocabulary) -> Self {
+        self.vocabulary = Arc::new(vocabulary);
         self
     }
 
@@ -1292,6 +1305,15 @@ impl MemoryServer {
             ""
         };
         format!("{header}\n\n{mentions_section}{trailer}")
+    }
+
+    #[tool(
+        description = "List the facts held about a subject. Default: what is true now. as_of \
+                       (epoch ms) asks what was true then; believed_at (epoch ms) asks what the \
+                       store believed then; lineage lists every stored version of one fact."
+    )]
+    pub(crate) async fn facts(&self, Parameters(args): Parameters<FactsArgs>) -> String {
+        facts::read(self, args).await
     }
 
     /// Acquires one slot from `generation_permits`, racing the shared request

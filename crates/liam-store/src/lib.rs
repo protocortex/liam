@@ -25,7 +25,7 @@ pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::{Error, MismatchSource, Result};
 pub use graph::{
     batch_key, recover_interrupted_restore, verify_snapshot, BackfillReport, Candidate,
-    CatchUpReport, ContentEmbedder, EmbedError, EventLog, Graph, PoisonHook, RebuildMode,
+    CatchUpReport, ContentEmbedder, EmbedError, EventLog, FactPage, Graph, PoisonHook, RebuildMode,
     RebuildReport, ReembedReport, SharedLog, Snapshot, SnapshotLog, SnapshotMeta,
     MAX_FACTS_PER_BATCH, RUN_SOURCE_PREFIX,
 };
