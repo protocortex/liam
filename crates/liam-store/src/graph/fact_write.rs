@@ -31,6 +31,9 @@ use crate::types::{
 };
 use crate::value::{Row, Value};
 
+mod batch;
+pub use batch::MAX_FACTS_PER_BATCH;
+
 pub(super) const FACT_COLUMNS: &str =
     "id, lineage_id, subject, predicate, object, object_key, scope,
        evidence_at, valid_from, valid_until, tx_from, tx_to, closed_by, confidence,
