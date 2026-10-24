@@ -3,22 +3,24 @@
 //! tests now run through `consolidate()`, a rolled back run is undone while
 //! the server keeps serving, and a crash's leftovers are reconciled.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use liam_daemon::config::Config;
 use liam_daemon::consolidation::manifest::{manifest_path_for, RunManifest, RunOutcome};
 use liam_daemon::consolidation::probes::{run_probes, Probe, ProbeError, ProbeReport};
-use liam_daemon::consolidation::run::ProbeRunner;
+use liam_daemon::consolidation::run::{ProbeRunner, StoreReopener};
 use liam_daemon::consolidation::settings::identity;
 use liam_model::Llm;
 use liam_store::{DefaultGraph, FixedClock, GraphConfig, Millis, NewEdge, NewNode};
 
 use super::*;
 use crate::log_startup::test_support::{
-    config_in, database_in, embedder, log_dir_in, standalone_log, DIMS,
+    config_in, database_in, embedder, log_dir_in, log_over, standalone_log, ToggledWriter, DIMS,
 };
+use crate::log_startup::{open_database, open_store_on_log};
 
 const POLL: std::time::Duration = std::time::Duration::from_millis(5);
 const WAIT_POLLS: usize = 2_000;
@@ -27,24 +29,41 @@ const DAY: i64 = 86_400_000;
 const ROLLBACK_PENDING: &str = "rollback:pending";
 
 struct Harness {
-    dir: tempfile::TempDir,
+    /// Owns the directory when the harness made it.
+    _dir: Option<tempfile::TempDir>,
+    root: PathBuf,
     config: Config,
     log: SharedLog,
+    shutdown: Shutdown,
 }
 
 impl Harness {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let log = standalone_log(&log_dir_in(dir.path()));
-        let mut config = config_in(dir.path());
+        let root = dir.path().to_path_buf();
+        let log = standalone_log(&log_dir_in(&root));
+        let mut harness = Self::over(&root, log);
+        harness._dir = Some(dir);
+        harness
+    }
+
+    /// A harness over files that already exist, with the given log.
+    fn over(root: &Path, log: SharedLog) -> Self {
+        let mut config = config_in(root);
         config.gc.episode_retention_days = 30;
-        Self { dir, config, log }
+        Self {
+            _dir: None,
+            root: root.to_path_buf(),
+            config,
+            log,
+            shutdown: Shutdown::default(),
+        }
     }
 
     async fn store_at(&self, now: Millis) -> (DefaultGraph, Arc<FixedClock>) {
         let clock = Arc::new(FixedClock::new(now));
         let store = DefaultGraph::open_with_clock(
-            database_in(self.dir.path()).to_str().unwrap(),
+            database_in(&self.root).to_str().unwrap(),
             GraphConfig::new(DIMS),
             clock.clone(),
         )
@@ -72,25 +91,37 @@ impl Harness {
             8192,
             1,
         )
+        .with_shutdown(self.shutdown.token())
     }
 
     fn job(&self, server: &MemoryServer, probes: Arc<dyn ProbeRunner>) -> ConsolidationJob {
-        ConsolidationJob::with_probes(
+        self.job_reopening(server, probes, None)
+    }
+
+    fn job_reopening(
+        &self,
+        server: &MemoryServer,
+        probes: Arc<dyn ProbeRunner>,
+        reopener: Option<Arc<dyn StoreReopener>>,
+    ) -> ConsolidationJob {
+        ConsolidationJob::with_parts(
             JobSetup {
                 config: &self.config,
-                database_path: &database_in(self.dir.path()),
-                log_dir: &log_dir_in(self.dir.path()),
+                database_path: &database_in(&self.root),
+                log_dir: &log_dir_in(&self.root),
                 log: self.log.clone(),
                 embedder: embedder(),
                 server,
+                shutdown: &self.shutdown,
             },
             probes,
+            reopener,
         )
         .unwrap()
     }
 
     fn manifest_path(&self) -> std::path::PathBuf {
-        manifest_path_for(&database_in(self.dir.path()))
+        manifest_path_for(&database_in(&self.root))
     }
 }
 
@@ -118,6 +149,14 @@ fn regresses() -> Arc<dyn ProbeRunner> {
     Arc::new(RegressesAfterBaseline {
         calls: AtomicUsize::new(0),
     })
+}
+
+/// A node the retention rule leaves alone, so the run still has a probe.
+async fn keep_one_fact(store: &DefaultGraph) {
+    store
+        .insert(NewNode::now("fact", "kept", "a fact that stays"))
+        .await
+        .unwrap();
 }
 
 async fn linked_pair(store: &DefaultGraph, kind: &str) {
@@ -154,6 +193,7 @@ async fn the_refresh_runs_after_the_sweep_not_before_through_a_consolidation_run
     let harness = Harness::new();
     let (store, clock) = harness.store_at(Millis(10 * DAY)).await;
     linked_pair(&store, "episode").await;
+    keep_one_fact(&store).await;
     clock.set(Millis(100 * DAY));
     let store = Arc::new(store);
     let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
@@ -179,12 +219,21 @@ async fn refresh_clusters_reports_no_work_on_an_idle_store_through_a_consolidati
     let store = Arc::new(store);
     let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
     let job = harness.job(&server, honest());
-    job.tick().await;
+    assert!(
+        crate::refresh_clusters(&store).await,
+        "first call always has work"
+    );
+    store
+        .insert(NewNode::now("fact", "c", "a fact the run must refresh for"))
+        .await
+        .unwrap();
 
     // Act
+    let outcome = job.tick().await;
     let did_work = crate::refresh_clusters(&store).await;
 
     // Assert
+    assert_eq!(outcome, Some(RunOutcome::Committed));
     assert!(!did_work, "the run left the store with nothing to refresh");
 }
 
@@ -249,9 +298,10 @@ async fn resynthesis_processes_entities_one_at_a_time_through_a_consolidation_ru
     release.notify_one();
     until(|| llm.in_flight.load(Ordering::SeqCst) == 1).await;
     release.notify_one();
-    running.await.unwrap();
+    let outcome = running.await.unwrap();
 
     // Assert
+    assert_eq!(outcome, Some(RunOutcome::Committed));
     assert_eq!(llm.peak.load(Ordering::SeqCst), 1);
 }
 
@@ -267,11 +317,9 @@ impl Llm for CountingLlm {
     }
 }
 
-#[tokio::test]
-async fn resynthesis_is_skipped_for_the_first_run_of_an_autotuning_server_only() {
-    // Arrange: run on start with the auto-tune sentinel, and a stale entity
+/// A harness whose server is autotuning, with a stale entity for resynthesis.
+async fn autotuning_harness() -> (Harness, MemoryServer, Arc<CountingLlm>) {
     let mut harness = Harness::new();
-    harness.config.gc.run_on_start = true;
     harness.config.llm.max_concurrent_generations = 0;
     let (store, _clock) = harness.store_at(Millis(1000)).await;
     store
@@ -280,14 +328,23 @@ async fn resynthesis_is_skipped_for_the_first_run_of_an_autotuning_server_only()
         .unwrap();
     let llm = Arc::new(CountingLlm::default());
     let server = harness.server(store, llm.clone());
+    (harness, server, llm)
+}
+
+#[tokio::test]
+async fn resynthesis_is_skipped_for_the_run_made_at_start_of_an_autotuning_server_only() {
+    // Arrange
+    let (harness, server, llm) = autotuning_harness().await;
     let job = harness.job(&server, honest());
 
     // Act
+    let run_now = job.start(true).await.unwrap();
     job.tick().await;
     let during_first = llm.0.load(Ordering::SeqCst);
     job.tick().await;
 
     // Assert
+    assert!(run_now);
     assert_eq!(
         during_first, 0,
         "the first run leaves the permits to calibration"
@@ -295,6 +352,40 @@ async fn resynthesis_is_skipped_for_the_first_run_of_an_autotuning_server_only()
     assert!(
         llm.0.load(Ordering::SeqCst) > 0,
         "the next run resynthesizes"
+    );
+}
+
+#[tokio::test]
+async fn the_run_that_resumes_a_crashed_one_at_start_also_skips_resynthesis_while_autotuning() {
+    // Arrange: nothing asks for a run on start, but a crashed run is waiting
+    let (harness, server, llm) = autotuning_harness().await;
+    let job = harness.job(&server, honest());
+    interrupted_manifest(&harness, &[]);
+
+    // Act
+    let run_now = job.start(false).await.unwrap();
+    job.tick().await;
+
+    // Assert
+    assert!(run_now);
+    assert_eq!(llm.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_start_with_nothing_to_do_runs_nothing_and_leaves_resynthesis_on() {
+    // Arrange
+    let (harness, server, llm) = autotuning_harness().await;
+    let job = harness.job(&server, honest());
+
+    // Act
+    let run_now = job.start(false).await.unwrap();
+    job.tick().await;
+
+    // Assert
+    assert!(!run_now);
+    assert!(
+        llm.0.load(Ordering::SeqCst) > 0,
+        "a later scheduled run resynthesizes"
     );
 }
 
@@ -367,25 +458,91 @@ fn interrupted_manifest(harness: &Harness, steps: &[&str]) {
     }
 }
 
+/// Scores the baseline honestly, then fails the run and makes the log refuse
+/// writes, so the rollback's marker cannot be appended.
+struct FailsThenBreaksTheLog {
+    log_refuses: Arc<AtomicBool>,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ProbeRunner for FailsThenBreaksTheLog {
+    async fn run(&self, store: &DefaultGraph, probes: &[Probe]) -> Result<ProbeReport, ProbeError> {
+        let mut report = run_probes(store, probes).await?;
+        if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+            report.scores.values_mut().for_each(|s| s.recall = 0.0);
+            self.log_refuses.store(true, Ordering::SeqCst);
+        }
+        Ok(report)
+    }
+}
+
 #[tokio::test]
-async fn startup_finishes_a_rollback_a_crash_left_pending() {
-    // Arrange
-    let harness = Harness::new();
-    let (store, _clock) = harness.store_at(Millis(1000)).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
-    let job = harness.job(&server, honest());
-    interrupted_manifest(&harness, &[ROLLBACK_PENDING]);
-    assert!(job.has_unfinished_run());
+async fn startup_finishes_a_rollback_a_real_crash_left_pending() {
+    // Arrange: a run decides to roll back, commits to it, then cannot append
+    // its marker, as a crash at that point would leave it
+    let dir = tempfile::tempdir().unwrap();
+    let log_dir = log_dir_in(dir.path());
+    let edges_before_the_run;
+    {
+        let (writer, refuses) = ToggledWriter::open(&log_dir, false);
+        let reader = Arc::new(liam_log::reader::SequentialScanReader::local(&log_dir).unwrap());
+        let harness = Harness::over(dir.path(), log_over(writer, reader, None));
+        let (store, _clock) = harness.store_at(Millis(1000)).await;
+        linked_pair(&store, "fact").await;
+        edges_before_the_run = store.edge_fingerprint().await.unwrap().edge_count;
+        let server = harness.server(store, Arc::new(liam_model::MockLlm));
+        let probes = Arc::new(FailsThenBreaksTheLog {
+            log_refuses: refuses,
+            calls: AtomicUsize::new(0),
+        });
+        let job = harness.job(&server, probes);
+
+        let outcome = job.tick().await;
+
+        assert_eq!(outcome, None, "the run died before a verdict");
+        let left = RunManifest::load(&harness.manifest_path())
+            .unwrap()
+            .unwrap();
+        assert!(left.completed_steps.iter().any(|s| s == ROLLBACK_PENDING));
+        assert!(left.outcome.is_none());
+        let linked = server.store().await.unwrap();
+        assert!(
+            linked.edge_fingerprint().await.unwrap().edge_count > edges_before_the_run,
+            "the run's merge is still in the store"
+        );
+    }
+    let restarted = Harness::over(dir.path(), standalone_log(&log_dir));
+    let store = open_database(&restarted.config, &database_in(dir.path()))
+        .await
+        .unwrap();
+    let store = open_store_on_log(
+        store,
+        &database_in(dir.path()),
+        &log_dir,
+        restarted.log.clone(),
+        embedder(),
+    )
+    .await
+    .unwrap();
+    let server = restarted.server(store, Arc::new(liam_model::MockLlm));
+    let job = restarted.job(&server, honest());
 
     // Act
-    job.finish_pending_rollback().await.unwrap();
+    let run_now = job.start(false).await.unwrap();
 
     // Assert
-    assert!(!job.has_unfinished_run());
-    let ended = RunManifest::load(&harness.manifest_path())
+    assert!(!run_now, "nothing is left to resume");
+    let ended = RunManifest::load(&restarted.manifest_path())
         .unwrap()
         .unwrap();
     assert_eq!(ended.outcome, Some(RunOutcome::RolledBack));
+    let store = server.store().await.unwrap();
+    assert_eq!(
+        store.edge_fingerprint().await.unwrap().edge_count,
+        edges_before_the_run,
+        "the run's merge was rolled back"
+    );
 }
 
 #[tokio::test]
@@ -402,8 +559,7 @@ async fn startup_leaves_a_forward_run_for_the_first_tick_to_resume() {
     interrupted_manifest(&harness, &[]);
 
     // Act
-    job.finish_pending_rollback().await.unwrap();
-    let resumed = job.has_unfinished_run();
+    let resumed = job.start(false).await.unwrap();
     let outcome = job.tick().await;
 
     // Assert
@@ -432,6 +588,7 @@ async fn a_tick_after_the_daemon_began_stopping_runs_nothing() {
 async fn swept_pair(harness: &Harness) -> (Arc<DefaultGraph>, MemoryServer, ConsolidationJob) {
     let (store, clock) = harness.store_at(Millis(10 * DAY)).await;
     linked_pair(&store, "episode").await;
+    keep_one_fact(&store).await;
     clock.set(Millis(100 * DAY));
     let store = Arc::new(store);
     let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
@@ -452,9 +609,10 @@ async fn a_run_sweeps_a_node_that_still_has_an_edge_pointing_at_it() {
     assert_eq!(outcome, Some(RunOutcome::Committed));
     assert_eq!(store.edge_fingerprint().await.unwrap().edge_count, 0);
     let live = store.changes_since(liam_store::BEGINNING).await.unwrap();
-    assert!(
-        live.iter().all(|change| change.closed),
-        "both nodes are gone"
+    assert_eq!(
+        live.iter().filter(|change| !change.closed).count(),
+        1,
+        "only the kept fact is left"
     );
 }
 
@@ -493,4 +651,151 @@ async fn the_fingerprint_falls_when_a_run_sweeps_an_edge() {
     let after = store.edge_fingerprint().await.unwrap();
     assert_eq!(after.edge_count, 0, "a swept edge must lower the count");
     assert_ne!(before, after, "the fingerprint must notice a deletion");
+}
+
+/// A reopener that cannot open the database, as after a lost file.
+struct BrokenReopener;
+
+#[async_trait]
+impl StoreReopener for BrokenReopener {
+    async fn reopen(&self) -> anyhow::Result<DefaultGraph> {
+        anyhow::bail!("injected reopen failure")
+    }
+}
+
+#[tokio::test]
+async fn a_rollback_that_cannot_reopen_the_store_stops_the_daemon_with_a_failure() {
+    // Arrange
+    let harness = Harness::new();
+    let (store, _clock) = harness.store_at(Millis(1000)).await;
+    store
+        .insert(NewNode::now("fact", "f", "a live fact"))
+        .await
+        .unwrap();
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let job = harness.job_reopening(&server, regresses(), Some(Arc::new(BrokenReopener)));
+
+    // Act
+    let outcome = job.tick().await;
+
+    // Assert
+    assert_eq!(outcome, None);
+    assert!(server.store().await.is_err(), "the slot is empty");
+    assert!(
+        harness.shutdown.token().is_cancelled(),
+        "the supervisor must start the daemon again"
+    );
+    assert!(harness.shutdown.failure().is_some());
+}
+
+#[tokio::test]
+async fn a_run_that_fails_with_the_store_in_place_does_not_stop_the_daemon() {
+    // Arrange: a failure that leaves the slot full, here a refused new run
+    let harness = Harness::new();
+    let (store, _clock) = harness.store_at(Millis(1000)).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let job = harness.job(&server, honest());
+    restore_failed_manifest(&harness);
+
+    // Act
+    let outcome = job.tick().await;
+
+    // Assert
+    assert_eq!(outcome, None);
+    assert!(!harness.shutdown.token().is_cancelled());
+}
+
+fn restore_failed_manifest(harness: &Harness) -> RunManifest {
+    let mut manifest = RunManifest::new(
+        "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_owned(),
+        7,
+        identity(&harness.config).embedder,
+        identity(&harness.config).llm_model,
+        Millis(1),
+    );
+    manifest.outcome = Some(RunOutcome::RestoreFailed);
+    manifest.save(&harness.manifest_path()).unwrap();
+    manifest
+}
+
+#[tokio::test]
+async fn a_new_run_is_refused_while_the_last_one_ended_restore_failed_and_its_snapshot_stays() {
+    // Arrange
+    let harness = Harness::new();
+    let (store, _clock) = harness.store_at(Millis(1000)).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let job = harness.job(&server, honest());
+    let failed = restore_failed_manifest(&harness);
+    let kept = harness
+        .config
+        .consolidation
+        .snapshot_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| liam_daemon_snapshot_dir(&harness))
+        .join(&failed.run_id);
+    std::fs::create_dir_all(&kept).unwrap();
+    std::fs::write(kept.join("snapshot.db"), b"kept for inspection").unwrap();
+
+    // Act
+    let refused = job.consolidator.consolidate(&job.store).await.unwrap_err();
+    let outcome = job.tick().await;
+
+    // Assert
+    let message = format!("{refused:#}");
+    assert!(message.contains("failed restore"), "{message}");
+    assert!(message.contains("manual inspection"), "{message}");
+    assert_eq!(outcome, None);
+    assert!(kept.join("snapshot.db").exists(), "the snapshot is kept");
+    let after = RunManifest::load(&harness.manifest_path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, failed, "no new run replaced the record");
+}
+
+fn liam_daemon_snapshot_dir(harness: &Harness) -> PathBuf {
+    liam_daemon::models::resolve_snapshot_dir(&harness.config, &database_in(&harness.root)).unwrap()
+}
+
+#[tokio::test]
+async fn the_maintenance_step_reports_a_stopping_daemon_so_it_is_not_recorded_done() {
+    // Arrange
+    let harness = Harness::new();
+    let (store, _clock) = harness.store_at(Millis(1000)).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let maintenance = DaemonMaintenance {
+        server: server.clone(),
+        policy: harness.config.gc_policy(),
+        resynthesis: Resynthesis::from_config(&harness.config),
+        skip_resynthesis_once: Arc::new(AtomicBool::new(false)),
+    };
+    harness.shutdown.token().cancel();
+
+    // Act
+    let result = maintenance
+        .run(&server.store().await.unwrap(), "consolidation:test")
+        .await;
+
+    // Assert
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("stopping"), "{error}");
+}
+
+#[tokio::test]
+async fn the_maintenance_step_is_done_when_the_daemon_keeps_running() {
+    let harness = Harness::new();
+    let (store, _clock) = harness.store_at(Millis(1000)).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let maintenance = DaemonMaintenance {
+        server: server.clone(),
+        policy: harness.config.gc_policy(),
+        resynthesis: Resynthesis::from_config(&harness.config),
+        skip_resynthesis_once: Arc::new(AtomicBool::new(false)),
+    };
+
+    let result = maintenance
+        .run(&server.store().await.unwrap(), "consolidation:test")
+        .await;
+
+    assert!(result.is_ok());
 }

@@ -209,11 +209,13 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         log,
         embedder: job_embedder,
         server: &server,
+        shutdown: &shutdown,
     })?);
-    job.finish_pending_rollback()
+    let run_now = job
+        .start(config.gc.run_on_start)
         .await
         .context("could not finish the consolidation rollback a crash interrupted")?;
-    let maintenance = spawn_gc(&config, job);
+    let maintenance = spawn_gc(&config, job, run_now);
 
     let served = match mode {
         cli::Mode::Serve => serve_socket(&config, server, shutdown.token()).await,
@@ -372,12 +374,11 @@ async fn serve_socket(
 /// the cluster refresh and resynthesis now run inside its snapshot and probe
 /// gate. A run left unfinished by a crash resumes at once instead of waiting
 /// out an interval.
-fn spawn_gc(config: &Config, job: Arc<ConsolidationJob>) -> JoinHandle<()> {
+fn spawn_gc(config: &Config, job: Arc<ConsolidationJob>, run_now: bool) -> JoinHandle<()> {
     let interval = config.gc_interval();
-    let run_on_start = config.gc.run_on_start;
     let stopping = job.stopping();
     tokio::spawn(async move {
-        if run_on_start || job.has_unfinished_run() {
+        if run_now {
             job.tick().await;
         }
         let mut tick = tokio::time::interval(interval);
@@ -416,7 +417,9 @@ async fn maintenance_tick(
         full_max_new_tokens: full_synthesis_max_new_tokens,
     });
     match server.store().await {
-        Ok(store) => maintenance_steps(server, &store, policy, resynthesis, None).await,
+        Ok(store) => {
+            maintenance_steps(server, &store, policy, resynthesis, None).await;
+        }
         Err(error) => tracing::warn!(%error, "the maintenance tick found no store"),
     }
 }
@@ -452,28 +455,29 @@ pub(crate) async fn maintenance_steps(
     policy: &liam_store::RetentionPolicy,
     resynthesis: Option<Resynthesis>,
     write_source: Option<&str>,
-) {
+) -> bool {
     let stopping = server.shutdown_token();
     // A leftover event applied after the sweep would outlive it.
     catch_up(store).await;
     if stopping.is_cancelled() {
-        return;
+        return false;
     }
     sweep(store, policy, write_source).await;
     if stopping.is_cancelled() {
-        return;
+        return false;
     }
     repair_mentions(store, write_source).await;
     if stopping.is_cancelled() {
-        return;
+        return false;
     }
     refresh_clusters(store).await;
     if stopping.is_cancelled() {
-        return;
+        return false;
     }
     if let Some(resynthesis) = resynthesis {
         resynthesize_stale(server, store, &resynthesis, write_source).await;
     }
+    !stopping.is_cancelled()
 }
 
 /// Resynthesizes up to `max_resynth_per_tick` stale entities, oldest first.

@@ -10,6 +10,8 @@ use liam_store::PoisonHook;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const POISONED_MESSAGE: &str = "the event log is poisoned; restart liamd to replay it";
+pub(crate) const STORE_LOST_MESSAGE: &str =
+    "a consolidation rollback could not reopen the store; restart liamd to open it again";
 
 /// The token every long running task watches, plus whether the log's poison
 /// is what cancelled it. Clones share both.
@@ -17,6 +19,7 @@ pub(crate) const POISONED_MESSAGE: &str = "the event log is poisoned; restart li
 pub(crate) struct Shutdown {
     token: CancellationToken,
     poisoned: Arc<AtomicBool>,
+    store_lost: Arc<AtomicBool>,
 }
 
 impl Shutdown {
@@ -38,11 +41,25 @@ impl Shutdown {
         self.token.cancel();
     }
 
-    /// The failure the process exits with when the log's poison stopped it.
+    /// For a rollback that left the shared slot without a store: no request
+    /// can be served, so the daemon stops with a failure and its supervisor
+    /// starts it again.
+    pub(crate) fn store_lost(&self) {
+        if !self.store_lost.swap(true, Ordering::SeqCst) {
+            tracing::error!("{STORE_LOST_MESSAGE}");
+        }
+        self.token.cancel();
+    }
+
+    /// The failure the process exits with when the log's poison or a lost
+    /// store stopped it.
     pub(crate) fn failure(&self) -> Option<anyhow::Error> {
-        self.poisoned
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Some(anyhow::anyhow!(POISONED_MESSAGE));
+        }
+        self.store_lost
             .load(Ordering::SeqCst)
-            .then(|| anyhow::anyhow!(POISONED_MESSAGE))
+            .then(|| anyhow::anyhow!(STORE_LOST_MESSAGE))
     }
 }
 
@@ -61,6 +78,20 @@ mod tests {
         // Assert
         assert!(failure.is_none());
         assert!(!shutdown.token().is_cancelled());
+    }
+
+    #[test]
+    fn a_lost_store_cancels_the_token_and_makes_the_exit_a_failure() {
+        // Arrange
+        let shutdown = Shutdown::default();
+
+        // Act
+        shutdown.store_lost();
+
+        // Assert
+        assert!(shutdown.token().is_cancelled());
+        let failure = shutdown.failure().expect("a lost store must fail the exit");
+        assert_eq!(failure.to_string(), STORE_LOST_MESSAGE);
     }
 
     #[test]

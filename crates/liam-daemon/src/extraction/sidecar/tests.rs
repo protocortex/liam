@@ -11,7 +11,7 @@ use super::*;
 use crate::extraction::client::{
     ExtractError, ExtractRequest, JsonExtractor, ModelIdentity, SidecarClient,
 };
-use crate::extraction::test_double::{ok, spawn_double};
+use crate::extraction::test_double::{ok, spawn_double_signalling};
 
 /// The fake server is this test binary run with only the entry test selected;
 /// libtest rejects unknown flags, so its settings travel in the environment.
@@ -34,9 +34,7 @@ const ENOUGH_RAM_MB: u64 = 1 << 20;
 const FAKE_ACCEPT_PAUSE: Duration = Duration::from_millis(20);
 const FAKE_EXIT_CODE: i32 = 3;
 const FAKE_BIND_FAIL_CODE: i32 = 4;
-/// Long enough for the guard's first probes to reach the listener that holds
-/// the port, however busy the machine is, before this child's exit ends them.
-const FAKE_BIND_FAIL_LINGER: Duration = Duration::from_millis(500);
+const FAKE_READY_FILE: &str = "FAKE_READY_FILE";
 const GONE_POLL: Duration = Duration::from_millis(20);
 const GONE_WAIT: Duration = Duration::from_secs(5);
 const CHAT_BODY: &str = r#"{"choices":[{"message":{"content":"{}"}}]}"#;
@@ -103,6 +101,12 @@ fn fake(
     (factory, spawns)
 }
 
+/// Tells a fake child which file to wait for if it loses its port.
+fn with_ready_file(mut command: Command, ready: &std::path::Path) -> Command {
+    command.env(FAKE_READY_FILE, ready);
+    command
+}
+
 async fn started(factory: impl Fn(&LaunchParams) -> Command) -> SidecarGuard {
     let deps = deps(vec![free_port()]);
     SidecarGuard::start_with(&config(START_TIMEOUT_SECS), factory, deps)
@@ -164,7 +168,7 @@ fn fake_server_entry() {
     let alias = std::env::var(ALIAS_ENV).unwrap();
     let Ok(listener) = TcpListener::bind((LOOPBACK, port.parse().unwrap())) else {
         eprintln!("bind failed for key {key} and alias {alias}");
-        std::thread::sleep(FAKE_BIND_FAIL_LINGER);
+        wait_for_ready_file();
         std::process::exit(FAKE_BIND_FAIL_CODE);
     };
     listener.set_nonblocking(true).unwrap();
@@ -180,6 +184,18 @@ fn fake_server_entry() {
             Ok((stream, _)) => serve(stream, &mode, &key, &alias),
             Err(_) => std::thread::sleep(FAKE_ACCEPT_PAUSE),
         }
+    }
+}
+
+/// Holds a child that lost its port until the listener that holds it has seen
+/// a probe, so the guard cannot see the exit first however busy the machine is.
+fn wait_for_ready_file() {
+    let Ok(path) = std::env::var(FAKE_READY_FILE) else {
+        return;
+    };
+    let give_up = Instant::now() + GONE_WAIT;
+    while !std::path::Path::new(&path).exists() && Instant::now() < give_up {
+        std::thread::sleep(GONE_POLL);
     }
 }
 
@@ -348,14 +364,17 @@ async fn a_taken_port_is_retried_on_a_new_one() {
 #[tokio::test]
 async fn a_listener_with_the_wrong_alias_gets_no_real_key_and_no_body() {
     // Arrange
-    let hostile = spawn_double(vec![ok(r#"{"data":[{"id":"wrong"}]}"#)]).await;
+    let handshake = TempDir::new().unwrap();
+    let ready = handshake.path().join("ready");
+    let hostile =
+        spawn_double_signalling(vec![ok(r#"{"data":[{"id":"wrong"}]}"#)], ready.clone()).await;
     let (inner, spawns) = fake("", None);
     let real = Arc::new(Mutex::new(String::new()));
     let factory = {
         let real = Arc::clone(&real);
         move |launch: &LaunchParams| {
             *real.lock().unwrap() = launch.key.to_string();
-            inner(launch)
+            with_ready_file(inner(launch), &ready)
         }
     };
     let ports = vec![hostile.addr.port(), free_port()];
@@ -375,7 +394,10 @@ async fn a_listener_with_the_wrong_alias_gets_no_real_key_and_no_body() {
 
 /// A listener that answers every request with 200, naming `alias` in the model
 /// list, and records the raw requests it gets.
-async fn echoing_listener(alias: Arc<Mutex<String>>) -> (u16, Arc<Mutex<Vec<String>>>) {
+async fn echoing_listener(
+    alias: Arc<Mutex<String>>,
+    ready: std::path::PathBuf,
+) -> (u16, Arc<Mutex<Vec<String>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind((LOOPBACK, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -389,6 +411,7 @@ async fn echoing_listener(alias: Arc<Mutex<String>>) -> (u16, Arc<Mutex<Vec<Stri
             log.lock()
                 .unwrap()
                 .push(String::from_utf8_lossy(&raw[..read]).into_owned());
+            let _ = std::fs::write(&ready, b"seen");
             let body = format!(r#"{{"data":[{{"id":"{}"}}]}}"#, alias.lock().unwrap());
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -404,7 +427,9 @@ async fn echoing_listener(alias: Arc<Mutex<String>>) -> (u16, Arc<Mutex<Vec<Stri
 async fn a_listener_that_echoes_the_alias_never_receives_the_real_key() {
     // Arrange
     let alias = Arc::new(Mutex::new(String::new()));
-    let (hostile_port, seen) = echoing_listener(Arc::clone(&alias)).await;
+    let handshake = TempDir::new().unwrap();
+    let ready = handshake.path().join("ready");
+    let (hostile_port, seen) = echoing_listener(Arc::clone(&alias), ready.clone()).await;
     let (inner, spawns) = fake("", None);
     let keys = Arc::new(Mutex::new(Vec::new()));
     let factory = {
@@ -414,7 +439,7 @@ async fn a_listener_that_echoes_the_alias_never_receives_the_real_key() {
             keys.lock()
                 .unwrap()
                 .push((launch.probe_key.to_string(), launch.key.to_string()));
-            inner(launch)
+            with_ready_file(inner(launch), &ready)
         }
     };
     let ports = vec![hostile_port, free_port()];

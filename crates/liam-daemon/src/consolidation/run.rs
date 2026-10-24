@@ -76,9 +76,12 @@ pub struct Identity {
 /// The existing maintenance steps (sweep, provenance repair, cluster refresh,
 /// resynthesis), run as one step of the job. Every log write they make must be
 /// stamped with `source`, so a rollback of the run cancels them.
+///
+/// An `Err` means the step did not finish, as when the daemon is stopping. The
+/// run stops there without a verdict and resumes at this step.
 #[async_trait]
 pub trait Maintenance: Send + Sync {
-    async fn run(&self, store: &DefaultGraph, source: &str);
+    async fn run(&self, store: &DefaultGraph, source: &str) -> anyhow::Result<()>;
 }
 
 /// Opens the database again, on the same log and embedder, after a restore
@@ -229,9 +232,29 @@ impl Consolidator {
         probe_set_path_for(&self.database_path)
     }
 
+    /// A run that ended in `RestoreFailed` keeps its snapshot for inspection and
+    /// leaves the store possibly mixed. A new run would sweep that snapshot away
+    /// and build on the store, so it waits for an operator to clear the manifest.
+    fn refuse_after_a_failed_restore(&self) -> anyhow::Result<()> {
+        let Some(last) = RunManifest::load(&self.manifest_path())? else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            last.outcome != Some(RunOutcome::RestoreFailed),
+            "consolidation run {} ended with a failed restore, so the store needs manual \
+             inspection and its snapshot is kept in {}; once it is checked, remove {} to allow \
+             new runs",
+            last.run_id,
+            self.snapshot_dir_for(&last).display(),
+            self.manifest_path().display()
+        );
+        Ok(())
+    }
+
     /// The unfinished run on disk, or a new one. A run made under other models
     /// comes back with the reason it cannot be resumed.
     fn begin(&self) -> anyhow::Result<(RunManifest, Option<ResumeRefused>)> {
+        self.refuse_after_a_failed_restore()?;
         if let Some(unfinished) = self.unfinished_run()? {
             let refused = unfinished
                 .check_resumable(&self.identity.embedder, &self.identity.llm_model)
@@ -282,7 +305,7 @@ impl Consolidator {
             SNAPSHOT => self.take_snapshot(store, manifest).await?,
             BASELINE => self.record_baseline(store, manifest).await?,
             DEDUP => return self.merge_duplicates(store, manifest).await,
-            MAINTENANCE => self.parts.maintenance.run(store, &source).await,
+            MAINTENANCE => self.parts.maintenance.run(store, &source).await?,
             EXTRACT => {
                 let configured = self.parts.hooks.extraction.is_some();
                 let result = self.parts.hooks.extract(&ExtractCtx { source }).await;
