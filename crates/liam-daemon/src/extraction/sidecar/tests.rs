@@ -34,6 +34,9 @@ const ENOUGH_RAM_MB: u64 = 1 << 20;
 const FAKE_ACCEPT_PAUSE: Duration = Duration::from_millis(20);
 const FAKE_EXIT_CODE: i32 = 3;
 const FAKE_BIND_FAIL_CODE: i32 = 4;
+/// Long enough for the guard's first probes to reach the listener that holds
+/// the port, however busy the machine is, before this child's exit ends them.
+const FAKE_BIND_FAIL_LINGER: Duration = Duration::from_millis(500);
 const GONE_POLL: Duration = Duration::from_millis(20);
 const GONE_WAIT: Duration = Duration::from_secs(5);
 const CHAT_BODY: &str = r#"{"choices":[{"message":{"content":"{}"}}]}"#;
@@ -161,6 +164,7 @@ fn fake_server_entry() {
     let alias = std::env::var(ALIAS_ENV).unwrap();
     let Ok(listener) = TcpListener::bind((LOOPBACK, port.parse().unwrap())) else {
         eprintln!("bind failed for key {key} and alias {alias}");
+        std::thread::sleep(FAKE_BIND_FAIL_LINGER);
         std::process::exit(FAKE_BIND_FAIL_CODE);
     };
     listener.set_nonblocking(true).unwrap();
