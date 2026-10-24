@@ -192,6 +192,35 @@ impl Consolidator {
         }
     }
 
+    /// Finishes a rollback that a crash interrupted, so the store is right
+    /// before anything serves it. A run that crashed on its forward path is
+    /// left for the next call, which resumes it.
+    ///
+    /// # Errors
+    ///
+    /// Fails like `consolidate` does.
+    pub async fn finish_pending_rollback(
+        &self,
+        shared: &SharedStore,
+    ) -> anyhow::Result<Option<RunManifest>> {
+        let pending = self
+            .unfinished_run()?
+            .is_some_and(|run| run.is_complete(rollback::ROLLBACK_PENDING));
+        if !pending {
+            return Ok(None);
+        }
+        self.consolidate(shared).await.map(Some)
+    }
+
+    /// The run the manifest beside the database records as not yet ended.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the manifest exists and cannot be read.
+    pub fn unfinished_run(&self) -> anyhow::Result<Option<RunManifest>> {
+        Ok(RunManifest::load(&self.manifest_path())?.filter(|run| run.outcome.is_none()))
+    }
+
     fn manifest_path(&self) -> PathBuf {
         manifest_path_for(&self.database_path)
     }
@@ -203,9 +232,7 @@ impl Consolidator {
     /// The unfinished run on disk, or a new one. A run made under other models
     /// comes back with the reason it cannot be resumed.
     fn begin(&self) -> anyhow::Result<(RunManifest, Option<ResumeRefused>)> {
-        if let Some(unfinished) =
-            RunManifest::load(&self.manifest_path())?.filter(|run| run.outcome.is_none())
-        {
+        if let Some(unfinished) = self.unfinished_run()? {
             let refused = unfinished
                 .check_resumable(&self.identity.embedder, &self.identity.llm_model)
                 .err();
@@ -271,7 +298,7 @@ impl Consolidator {
                 let result = self.parts.hooks.tier(&TierCtx { source }).await;
                 self.note_hook(step, configured, result.map(drop), manifest)?;
             }
-            PROBES => return self.check_probes(store).await,
+            PROBES => return self.check_probes(store, manifest).await,
             other => anyhow::bail!("the consolidation run has no step named {other}"),
         }
         Ok(StepOutcome::Done)
@@ -359,13 +386,32 @@ impl Consolidator {
         manifest.mark_step_complete(&format!("{step}{suffix}"), &self.manifest_path())
     }
 
-    async fn check_probes(&self, store: &DefaultGraph) -> anyhow::Result<StepOutcome> {
-        let set = ProbeSet::load(&self.probe_set_path())?;
-        if set.probes.is_empty() {
+    async fn check_probes(
+        &self,
+        store: &DefaultGraph,
+        manifest: &RunManifest,
+    ) -> anyhow::Result<StepOutcome> {
+        let loaded = ProbeSet::load(&self.probe_set_path())?;
+        if loaded.probes.is_empty() {
             tracing::info!(
-                "consolidation: the store has no live node to probe, the gate is skipped"
+                "consolidation: the store had no live node to probe, the gate is skipped"
             );
             return Ok(StepOutcome::Done);
+        }
+        let swept = store.nodes_swept_by(&manifest.write_source()).await?;
+        let surviving = loaded.without_swept(store, &swept, ALL_LIVE).await?;
+        if !surviving.lost.is_empty() {
+            return Ok(StepOutcome::Failed(format!(
+                "probed nodes vanished that the run's sweep did not remove: {}",
+                surviving.lost.join(", ")
+            )));
+        }
+        let set = surviving.set;
+        if set.probes.is_empty() {
+            return Ok(StepOutcome::Failed(
+                "the run's sweep removed every probed node, so nothing is left to check it against"
+                    .to_owned(),
+            ));
         }
         let current = match self.parts.probes.run(store, &set.probes).await {
             Ok(report) => report,

@@ -313,11 +313,22 @@ impl Env {
         probes: Arc<dyn ProbeRunner>,
         hooks: ConsolidationHookSet,
     ) -> Consolidator {
+        self.consolidator_drawing(maintenance, probes, hooks, PROBE_COUNT)
+    }
+
+    /// A consolidator that draws up to `probe_count` probes.
+    pub(super) fn consolidator_drawing(
+        &self,
+        maintenance: Arc<dyn Maintenance>,
+        probes: Arc<dyn ProbeRunner>,
+        hooks: ConsolidationHookSet,
+        probe_count: usize,
+    ) -> Consolidator {
         let settings = RunSettings {
             probe_recall_margin: MARGIN,
             dedup_similarity_threshold: THRESHOLD,
             snapshot_dir: self.dir.path().join("snapshots"),
-            probe_count: PROBE_COUNT,
+            probe_count,
         };
         let identity = Identity {
             embedder: fingerprint(),
