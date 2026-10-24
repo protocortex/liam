@@ -180,7 +180,25 @@ impl KeyState {
         }
         self.versions
             .sort_by(|a, b| (a.valid_from, &a.id.as_str()).cmp(&(b.valid_from, &b.id.as_str())));
-        self.suppressions.extend(plan.suppress.iter().cloned());
+        for blocked in &plan.suppress {
+            self.suppress(blocked);
+        }
+    }
+
+    /// Records a suppression the way the table does: one row per object, the
+    /// later retraction kept whole, and on a tie the higher trust.
+    fn suppress(&mut self, blocked: &Suppression) {
+        let same = |known: &Suppression| known.object_key == blocked.object_key;
+        match self.suppressions.iter_mut().find(|known| same(known)) {
+            Some(known) => {
+                let newer = (blocked.retracted_at, blocked.trust_score)
+                    .partial_cmp(&(known.retracted_at, known.trust_score));
+                if newer == Some(std::cmp::Ordering::Greater) {
+                    *known = blocked.clone();
+                }
+            }
+            None => self.suppressions.push(blocked.clone()),
+        }
     }
 
     /// The versions that still hold against evidence from `evidence_at`: those

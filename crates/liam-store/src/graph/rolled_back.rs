@@ -15,7 +15,14 @@ pub(super) struct SeenFactWrite {
     pub event_id: String,
     pub source: String,
     pub closed: Vec<String>,
-    pub inserted: Vec<(String, String)>,
+    /// `(version id, lineage id, key)` of each version, the key being the
+    /// subject, predicate and scope the version belongs to.
+    pub inserted: Vec<(String, String, String)>,
+}
+
+/// What a version's key is made of; a control character cannot occur in any part.
+fn key_of(row: &FactRowEffect) -> String {
+    format!("{}\u{1f}{}\u{1f}{}", row.subject, row.predicate, row.scope)
 }
 
 impl SeenFactWrite {
@@ -34,7 +41,7 @@ impl SeenFactWrite {
             closed: closed_version_ids.clone(),
             inserted: inserted
                 .iter()
-                .map(|row| (row.id.clone(), row.lineage_id.clone()))
+                .map(|row| (row.id.clone(), row.lineage_id.clone(), key_of(row)))
                 .collect(),
         })
     }
@@ -62,12 +69,30 @@ impl RolledBack {
             runs,
             ..Self::default()
         };
+        let key_of_version: HashMap<&str, &str> = fact_writes
+            .iter()
+            .flat_map(|write| write.inserted.iter())
+            .map(|(id, _, key)| (id.as_str(), key.as_str()))
+            .collect();
         for write in fact_writes {
             if voided.contains(&write.event_id) || !rolled_back.owns(&write.source) {
                 continue;
             }
-            for (id, lineage) in &write.inserted {
-                rolled_back.missing.insert(id.clone(), write.closed.clone());
+            for (id, lineage, key) in &write.inserted {
+                // A batch can write several keys; a version stands in only for
+                // what its own key's versions lost. A close of a version no
+                // write is known to have inserted stays with every insert.
+                let closed = write
+                    .closed
+                    .iter()
+                    .filter(|closed| {
+                        key_of_version
+                            .get(closed.as_str())
+                            .is_none_or(|known| *known == key)
+                    })
+                    .cloned()
+                    .collect();
+                rolled_back.missing.insert(id.clone(), closed);
                 // A version is the first of its lineage when it names itself.
                 if id == lineage {
                     rolled_back.lineages.insert(lineage.clone());
