@@ -396,6 +396,12 @@ impl<'a> Run<'a> {
         let Ok(_permit) = permit else {
             bail!("the generation permits are closed");
         };
+        // The wait for a permit can be long; the model may have died in it.
+        if !alive() {
+            warn!("the model died while the run waited for a generation permit");
+            self.report.sidecar_lost = true;
+            return Ok(Generation::Stop(Attempt::Halted));
+        }
         let limit = self
             .remaining()
             .min(Duration::from_secs(self.deps.config.request_timeout_secs));

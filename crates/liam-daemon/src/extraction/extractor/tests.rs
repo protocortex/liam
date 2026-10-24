@@ -770,3 +770,46 @@ async fn memory_equal_to_the_budget_is_enough() {
     assert_eq!(script.calls(), 1);
     assert!(!report.sidecar_lost);
 }
+
+const SHORT_REQUEST_TIMEOUT_SECS: u64 = 5;
+const SLOW_ANSWER: Duration = Duration::from_secs(100);
+const PERMIT_WAIT: Duration = Duration::from_secs(5);
+
+#[tokio::test(start_paused = true)]
+async fn a_model_that_dies_while_the_run_waits_for_a_permit_is_not_called() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.permits = Semaphore::new(0);
+    let script = Script::honest();
+    let provider = Provider::new(&script);
+
+    // Act
+    let events = inputs(2);
+    let (report, ()) = tokio::join!(fx.run(&provider, &events), async {
+        tokio::time::sleep(PERMIT_WAIT).await;
+        provider.alive.store(false, Ordering::SeqCst);
+        fx.permits.add_permits(1);
+    });
+
+    // Assert
+    assert_eq!(script.calls(), 0);
+    assert!(report.sidecar_lost);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_is_cut_at_the_request_timeout_even_when_the_deadline_is_far() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.config.request_timeout_secs = SHORT_REQUEST_TIMEOUT_SECS;
+    let script = Script::new(|request, _| Reply::After(SLOW_ANSWER, facts_for(&request.prompt)));
+    let started = Instant::now();
+
+    // Act
+    let report = fx.run(&Provider::new(&script), &inputs(2)).await;
+
+    // Assert
+    assert!(started.elapsed() < SLOW_ANSWER);
+    assert_eq!(report.batches_failed, 1);
+    assert!(!report.deadline_hit);
+    assert_eq!(fx.facts_about(0).await, 0);
+}
