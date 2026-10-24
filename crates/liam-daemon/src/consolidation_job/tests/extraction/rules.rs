@@ -11,7 +11,7 @@ const MENTIONED_IN: &str = "mentioned_in";
 const LONGER_THAN_ANY_EVENT: usize = 10_000;
 
 /// The facts the rules wrote about the entity page for Ada.
-async fn mention_facts(store: &DefaultGraph) -> Vec<Fact> {
+pub(super) async fn mention_facts(store: &DefaultGraph) -> Vec<Fact> {
     let page = store
         .facts_valid_at("ada", None, ALL_LIVE, FACT_LIMIT)
         .await
@@ -43,7 +43,7 @@ async fn ada_store(harness: &Harness, mentions: usize) -> DefaultGraph {
     store
 }
 
-async fn with_ada(harness: &Harness, mentions: usize) -> MemoryServer {
+pub(super) async fn with_ada(harness: &Harness, mentions: usize) -> MemoryServer {
     let store = ada_store(harness, mentions).await;
     harness.server(store, Arc::new(liam_model::MockLlm))
 }

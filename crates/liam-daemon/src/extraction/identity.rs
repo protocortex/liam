@@ -11,6 +11,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use anyhow::Context;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -26,6 +28,45 @@ struct StoredHash {
     size: u64,
     modified_millis: u64,
     sha256: String,
+}
+
+/// Names the model a run extracts with. It is asked once per use, so a model
+/// file replaced between runs is noticed.
+#[async_trait]
+pub trait IdentitySource: Send + Sync {
+    async fn identity(&self) -> anyhow::Result<ModelIdentity>;
+}
+
+/// The configured GGUF file. The first read hashes it, which can take seconds,
+/// so that runs off the async threads; later reads are cheap while the file is
+/// unchanged.
+pub struct GgufFile {
+    path: Option<PathBuf>,
+}
+
+impl GgufFile {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self { path }
+    }
+}
+
+#[async_trait]
+impl IdentitySource for GgufFile {
+    async fn identity(&self) -> anyhow::Result<ModelIdentity> {
+        let path = self
+            .path
+            .clone()
+            .context("extraction.model_gguf is not set, so the model pass cannot run")?;
+        tokio::task::spawn_blocking(move || model_identity(&path))
+            .await
+            .context("reading the model file did not finish")?
+            .map_err(|source| {
+                anyhow::anyhow!(
+                    "could not read the model file ({:?}), so the model pass cannot run",
+                    source.kind()
+                )
+            })
+    }
 }
 
 /// The identity of the model in the file at `gguf`: its file name and the
@@ -62,7 +103,7 @@ pub fn model_identity(gguf: &Path) -> io::Result<ModelIdentity> {
     })
 }
 
-fn hash_file_for(gguf: &Path) -> PathBuf {
+pub(crate) fn hash_file_for(gguf: &Path) -> PathBuf {
     let mut name = gguf.as_os_str().to_owned();
     name.push(HASH_FILE_SUFFIX);
     PathBuf::from(name)
@@ -173,6 +214,84 @@ mod tests {
 
         // Assert
         assert_ne!(identity.model_sha256, ABC_SHA256);
+    }
+
+    fn set_modified(path: &Path, millis: u64) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(UNIX_EPOCH + std::time::Duration::from_millis(millis))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_file_with_the_same_size_but_another_time_is_hashed_again() {
+        // Arrange
+        let dir = TempDir::new().unwrap();
+        let path = model_in(&dir, b"abc");
+        set_modified(&path, 1_000);
+        model_identity(&path).unwrap();
+        fs::write(&path, b"xyz").unwrap();
+        set_modified(&path, 2_000);
+
+        // Act
+        let identity = model_identity(&path).unwrap();
+
+        // Assert
+        assert_ne!(identity.model_sha256, ABC_SHA256);
+    }
+
+    #[test]
+    fn the_stored_hash_records_the_size_and_the_modification_time_in_milliseconds() {
+        // Arrange
+        let dir = TempDir::new().unwrap();
+        let path = model_in(&dir, b"abc");
+        set_modified(&path, 1_234_567);
+
+        // Act
+        model_identity(&path).unwrap();
+
+        // Assert
+        let stored: StoredHash =
+            serde_json::from_slice(&fs::read(hash_file_for(&path)).unwrap()).unwrap();
+        assert_eq!(
+            stored,
+            StoredHash {
+                size: 3,
+                modified_millis: 1_234_567,
+                sha256: ABC_SHA256.into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn the_file_source_follows_a_file_replaced_between_reads() {
+        // Arrange
+        let dir = TempDir::new().unwrap();
+        let path = model_in(&dir, b"abc");
+        let source = GgufFile::new(Some(path.clone()));
+        let before = source.identity().await.unwrap();
+        fs::write(&path, b"another model").unwrap();
+
+        // Act
+        let after = source.identity().await.unwrap();
+
+        // Assert
+        assert_eq!(before.model_sha256, ABC_SHA256);
+        assert_ne!(after.model_sha256, before.model_sha256);
+    }
+
+    #[tokio::test]
+    async fn the_file_source_names_what_is_wrong_without_a_path_or_a_file() {
+        // Arrange
+        let dir = TempDir::new().unwrap();
+        let unset = GgufFile::new(None);
+        let absent = GgufFile::new(Some(dir.path().join("absent.gguf")));
+
+        // Act
+        let (unset, absent) = (unset.identity().await, absent.identity().await);
+
+        // Assert
+        assert!(unset.unwrap_err().to_string().contains("model_gguf"));
+        assert!(absent.unwrap_err().to_string().contains("NotFound"));
     }
 
     #[test]

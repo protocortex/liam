@@ -10,8 +10,9 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 
-use super::client::{ModelIdentity, SidecarClient};
+use super::client::SidecarClient;
 use super::extractor::{ExtractorProvider, ExtractorSession};
+use super::identity::IdentitySource;
 use super::sidecar::{SidecarError, SidecarGuard};
 use crate::config::ExtractionConfig;
 
@@ -45,13 +46,13 @@ impl SidecarStarter for SystemStarter {
 
 pub struct SidecarProvider {
     starter: Arc<dyn SidecarStarter>,
-    /// The model the server is started on, which the client reports. `None`
-    /// when the model file could not be read, so no server is started.
-    identity: Option<ModelIdentity>,
+    /// The model the server is started on, which the client reports. When the
+    /// model file cannot be read, no server is started.
+    identity: Arc<dyn IdentitySource>,
 }
 
 impl SidecarProvider {
-    pub fn new(starter: Arc<dyn SidecarStarter>, identity: Option<ModelIdentity>) -> Self {
+    pub fn new(starter: Arc<dyn SidecarStarter>, identity: Arc<dyn IdentitySource>) -> Self {
         Self { starter, identity }
     }
 }
@@ -61,8 +62,9 @@ impl ExtractorProvider for SidecarProvider {
     async fn open(&self, config: &ExtractionConfig) -> anyhow::Result<ExtractorSession> {
         let identity = self
             .identity
-            .clone()
-            .context("the model file could not be read, so the server is not started")?;
+            .identity()
+            .await
+            .context("the server is not started")?;
         let guard = self.starter.start(config).await?;
         let client = SidecarClient::new(
             guard.addr(),

@@ -8,6 +8,8 @@ use async_trait::async_trait;
 
 use super::*;
 use crate::extraction::extractor::ExtractorProvider;
+use crate::extraction::identity::GgufFile;
+use crate::extraction::model_double::FixedIdentity;
 use crate::extraction::provider::{pidfile_path, SidecarProvider, SidecarStarter};
 
 type CommandFactory = Box<dyn Fn(&LaunchParams) -> Command + Send + Sync>;
@@ -41,7 +43,7 @@ impl SidecarStarter for FakeStarter {
 }
 
 fn provider(starter: Arc<FakeStarter>) -> SidecarProvider {
-    SidecarProvider::new(starter, Some(identity()))
+    SidecarProvider::new(starter, Arc::new(FixedIdentity(identity())))
 }
 
 fn read_pid(path: &std::path::Path) -> u32 {
@@ -67,6 +69,26 @@ async fn a_session_answers_through_the_client_and_stops_the_server_when_dropped(
     assert_eq!(answer, "{}");
     assert!(alive_while_open);
     assert!(wait_until_gone(read_pid(&pid_file)));
+}
+
+#[tokio::test]
+async fn a_completion_slower_than_the_request_timeout_fails_at_the_timeout() {
+    // Arrange
+    let (factory, _) = fake(MODE_SLOW_COMPLETION, None);
+    let starter = FakeStarter::with(Box::new(factory), deps(vec![free_port()]));
+    let config = ExtractionConfig {
+        request_timeout_secs: SHORT_TIMEOUT_SECS,
+        ..config(START_TIMEOUT_SECS)
+    };
+    let session = provider(starter).open(&config).await.unwrap();
+    let started = Instant::now();
+
+    // Act
+    let result = session.extractor.extract_json(&request()).await;
+
+    // Assert
+    assert!(result.is_err());
+    assert!(started.elapsed() < FAKE_COMPLETION_PAUSE / 2);
 }
 
 #[tokio::test]
@@ -124,7 +146,7 @@ async fn a_provider_without_a_model_identity_starts_no_server() {
     // Arrange
     let (factory, spawns) = fake("", None);
     let starter = FakeStarter::with(Box::new(factory), deps(vec![free_port()]));
-    let provider = SidecarProvider::new(starter, None);
+    let provider = SidecarProvider::new(starter, Arc::new(GgufFile::new(None)));
 
     // Act
     let result = provider.open(&config(START_TIMEOUT_SECS)).await;

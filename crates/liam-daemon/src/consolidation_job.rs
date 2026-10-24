@@ -67,8 +67,9 @@ pub struct JobSetup<'a> {
 }
 
 /// The hook parts a run calls: extraction when the config turns it on. A model
-/// server an earlier daemon left behind is cleared first, on or off.
-async fn hooks_for(setup: &JobSetup<'_>) -> anyhow::Result<ConsolidationHookSet> {
+/// server an earlier daemon left behind is cleared first, whether extraction is
+/// on or off, when the server's path is configured.
+fn hooks_for(setup: &JobSetup<'_>) -> anyhow::Result<ConsolidationHookSet> {
     let config = &setup.config.extraction;
     sweep_stale_sidecar(config, setup.database_path);
     if !config.enabled {
@@ -80,7 +81,7 @@ async fn hooks_for(setup: &JobSetup<'_>) -> anyhow::Result<ConsolidationHookSet>
         permits: setup.server.generation_permits_handle(),
         stopping: setup.shutdown.token(),
     };
-    let extraction = extraction_setup::build(config, files).await?;
+    let extraction = extraction_setup::build(config, files)?;
     Ok(ConsolidationHookSet {
         extraction: Some(Arc::new(extraction)),
         ..Default::default()
@@ -101,8 +102,8 @@ impl ConsolidationJob {
     ///
     /// Fails when the snapshot directory cannot be resolved, or when extraction
     /// is on and its response cache or the event log cannot be opened.
-    pub async fn new(setup: JobSetup<'_>) -> anyhow::Result<Self> {
-        let hooks = hooks_for(&setup).await?;
+    pub fn new(setup: JobSetup<'_>) -> anyhow::Result<Self> {
+        let hooks = hooks_for(&setup)?;
         Self::with_parts(setup, Arc::new(StoreProbes), None, hooks)
     }
 

@@ -9,14 +9,12 @@ use anyhow::Context;
 use liam_log::reader::SequentialScanReader;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, warn};
 
 use super::cache::{cache_path, CacheStore};
-use super::client::ModelIdentity;
 use super::hooks::ExtractionHooks;
-use super::identity::model_identity;
+use super::identity::{GgufFile, IdentitySource};
 use super::provider::{pidfile_path, SidecarProvider, SystemStarter};
-use super::sidecar::stale::SweepOutcome;
 use super::sidecar::{SidecarGuard, SystemRam};
 use crate::config::ExtractionConfig;
 
@@ -30,32 +28,31 @@ pub struct DaemonFiles<'a> {
 }
 
 /// Clears a model server an earlier daemon left behind. A killed daemon cannot
-/// stop its child, so this runs once at startup, whether or not extraction is on.
+/// stop its child, so this runs once at startup, whether or not extraction is
+/// on. Without `llama_server_path` there is no executable to check a process
+/// against, so a pidfile is left alone.
 pub fn sweep_stale_sidecar(config: &ExtractionConfig, database_path: &Path) {
-    let outcome = SidecarGuard::sweep_stale(config, &pidfile_path(database_path));
-    if outcome != SweepOutcome::NoPidfile {
-        info!(
-            ?outcome,
-            "extraction: swept a model server left by an earlier daemon"
-        );
+    let pidfile = pidfile_path(database_path);
+    if config.llama_server_path.is_none() && pidfile.exists() {
+        warn!("extraction: a model server may be left running, but extraction.llama_server_path is not set to find it");
     }
+    let outcome = SidecarGuard::sweep_stale(config, &pidfile);
+    debug!(
+        ?outcome,
+        "extraction: swept for a model server left by an earlier daemon"
+    );
 }
 
-/// The extraction part for `config`. Reading the model file for its hash can
-/// take seconds the first time, so it runs off the async threads.
+/// The extraction part for `config`. The model file is not read here: the
+/// first model pass hashes it, so a start with extraction on stays quick.
 ///
 /// # Errors
 ///
 /// Fails when the response cache or the event log cannot be opened.
-pub async fn build(
-    config: &ExtractionConfig,
-    files: DaemonFiles<'_>,
-) -> anyhow::Result<ExtractionHooks> {
-    let identity = if config.llm_enabled {
-        read_identity(config).await
-    } else {
-        None
-    };
+pub fn build(config: &ExtractionConfig, files: DaemonFiles<'_>) -> anyhow::Result<ExtractionHooks> {
+    let identity: Arc<dyn IdentitySource> = Arc::new(GgufFile::new(
+        config.model_gguf.as_deref().map(PathBuf::from),
+    ));
     let starter = SystemStarter {
         pidfile: pidfile_path(files.database_path),
     };
@@ -75,40 +72,21 @@ pub async fn build(
     })
 }
 
-/// The identity of the configured model file, or `None` with the reason
-/// logged, which fails the model pass of each run until the file can be read.
-async fn read_identity(config: &ExtractionConfig) -> Option<ModelIdentity> {
-    let Some(gguf) = config.model_gguf.as_deref().map(PathBuf::from) else {
-        error!("extraction: model_gguf is not set, so the model pass cannot run");
-        return None;
-    };
-    match tokio::task::spawn_blocking(move || model_identity(&gguf)).await {
-        Ok(Ok(identity)) => Some(identity),
-        Ok(Err(source)) => {
-            error!(kind = ?source.kind(), "extraction: could not read the model file, so the model pass cannot run");
-            None
-        }
-        Err(source) => {
-            error!(%source, "extraction: reading the model file did not finish");
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::extraction::identity::hash_file_for;
 
-    async fn built(config: &ExtractionConfig, dir: &TempDir) -> ExtractionHooks {
+    fn built(config: &ExtractionConfig, dir: &TempDir) -> ExtractionHooks {
         let files = DaemonFiles {
             database_path: &dir.path().join("liam.db"),
             log_dir: dir.path(),
             permits: Arc::new(Semaphore::new(1)),
             stopping: CancellationToken::new(),
         };
-        build(config, files).await.unwrap()
+        build(config, files).unwrap()
     }
 
     fn config_with_model(path: &Path) -> ExtractionConfig {
@@ -119,48 +97,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_readable_model_gives_the_hooks_its_identity() {
+    async fn the_hooks_name_the_configured_model_file_when_asked() {
         // Arrange
         let dir = TempDir::new().unwrap();
         let model = dir.path().join("model.gguf");
         std::fs::write(&model, b"weights").unwrap();
+        let hooks = built(&config_with_model(&model), &dir);
 
         // Act
-        let hooks = built(&config_with_model(&model), &dir).await;
+        let identity = hooks.identity.identity().await.unwrap();
 
         // Assert
-        let identity = hooks.identity.expect("the model was read");
         assert_eq!(identity.model_id, "model.gguf");
     }
 
     #[tokio::test]
-    async fn an_unreadable_model_leaves_the_identity_unset_and_the_build_succeeds() {
+    async fn an_unreadable_model_fails_when_asked_not_when_built() {
         // Arrange
         let dir = TempDir::new().unwrap();
         let config = config_with_model(&dir.path().join("absent.gguf"));
 
         // Act
-        let hooks = built(&config, &dir).await;
+        let hooks = built(&config, &dir);
 
         // Assert
-        assert_eq!(hooks.identity, None);
+        assert!(hooks.identity.identity().await.is_err());
     }
 
-    #[tokio::test]
-    async fn rules_only_extraction_reads_no_model() {
+    #[test]
+    fn building_the_hooks_does_not_read_the_model() {
         // Arrange
         let dir = TempDir::new().unwrap();
         let model = dir.path().join("model.gguf");
         std::fs::write(&model, b"weights").unwrap();
-        let config = ExtractionConfig {
-            llm_enabled: false,
-            ..config_with_model(&model)
-        };
 
         // Act
-        let hooks = built(&config, &dir).await;
+        built(&config_with_model(&model), &dir);
 
         // Assert
-        assert_eq!(hooks.identity, None);
+        assert!(!hash_file_for(&model).exists());
+    }
+
+    #[test]
+    fn a_leftover_pidfile_is_cleared_only_when_the_server_path_is_known() {
+        // Arrange
+        let dir = TempDir::new().unwrap();
+        let database = dir.path().join("liam.db");
+        let pidfile = pidfile_path(&database);
+        let unset = ExtractionConfig::default();
+        let set = ExtractionConfig {
+            llama_server_path: Some("/nonexistent/llama-server".into()),
+            ..ExtractionConfig::default()
+        };
+        std::fs::write(&pidfile, "not a record").unwrap();
+
+        // Act
+        sweep_stale_sidecar(&unset, &database);
+        let kept = pidfile.exists();
+        sweep_stale_sidecar(&set, &database);
+
+        // Assert
+        assert!(kept);
+        assert!(!pidfile.exists());
     }
 }

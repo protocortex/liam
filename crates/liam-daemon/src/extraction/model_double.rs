@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::{ExtractError, ExtractRequest, JsonExtractor, ModelIdentity};
 use super::extractor::{ExtractorProvider, ExtractorSession};
+use super::identity::IdentitySource;
 use crate::config::ExtractionConfig;
 
 pub const MODEL_ID: &str = "test-model";
@@ -23,6 +24,16 @@ pub fn identity() -> ModelIdentity {
     ModelIdentity {
         model_id: MODEL_ID.into(),
         model_sha256: MODEL_SHA.into(),
+    }
+}
+
+/// Names one model for good, as a file that never changes would.
+pub struct FixedIdentity(pub ModelIdentity);
+
+#[async_trait]
+impl IdentitySource for FixedIdentity {
+    async fn identity(&self) -> anyhow::Result<ModelIdentity> {
+        Ok(self.0.clone())
     }
 }
 
@@ -120,14 +131,28 @@ impl ProviderDouble {
         Self::with(None, Some((call, token)), None)
     }
 
+    /// A model that reports `identity` as its own.
+    pub fn answering_as(identity: ModelIdentity) -> Arc<Self> {
+        Self::build(identity, None, None, None)
+    }
+
     fn with(
+        dies_on_call: Option<usize>,
+        stops_on_call: Option<(usize, CancellationToken)>,
+        slow_on_call: Option<(usize, Duration)>,
+    ) -> Arc<Self> {
+        Self::build(identity(), dies_on_call, stops_on_call, slow_on_call)
+    }
+
+    fn build(
+        identity: ModelIdentity,
         dies_on_call: Option<usize>,
         stops_on_call: Option<(usize, CancellationToken)>,
         slow_on_call: Option<(usize, Duration)>,
     ) -> Arc<Self> {
         Arc::new(Self {
             model: Arc::new(ModelDouble {
-                identity: identity(),
+                identity,
                 calls: AtomicUsize::new(0),
                 alive: Arc::new(AtomicBool::new(true)),
                 dies_on_call,
