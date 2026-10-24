@@ -14,6 +14,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use liam_daemon::consolidation::hooks::{ExtractCtx, ExtractionHook, ExtractionReport};
+use liam_daemon::consolidation::manifest::ExtractionModel;
 use liam_log::event::LogEvent;
 use liam_log::reader::LogReader;
 use liam_log::LogOffset;
@@ -29,6 +30,7 @@ use super::client::ModelIdentity;
 use super::extractor::ExtractionReport as ModelRun;
 use super::extractor::{extract_events, ExtractionDeps, ExtractorProvider};
 use super::inputs::events_to_inputs;
+use super::prompt::PROMPT_VERSION;
 use super::sidecar::FreeRam;
 use crate::config::{resolve_vocabulary, ExtractionConfig, MAX_RUN_DEADLINE_SECS};
 
@@ -42,7 +44,9 @@ pub struct ExtractionHooks {
     pub reader: Arc<dyn LogReader>,
     pub provider: Arc<dyn ExtractorProvider>,
     /// The model the provider is expected to start, known before it starts.
-    pub identity: ModelIdentity,
+    /// `None` when the model file could not be read, which fails the model
+    /// pass on every run until it can.
+    pub identity: Option<ModelIdentity>,
     pub cache: Arc<CacheStore>,
     /// The daemon's generation permits, shared with the other model users.
     pub permits: Arc<Semaphore>,
@@ -65,24 +69,54 @@ impl ExtractionHook for ExtractionHooks {
         }
         // The passes do not depend on each other: a model that cannot start
         // must not stall the rules, and a rules failure must not stall the model.
-        let rules = self.rules_pass(ctx).await.map(|()| false);
+        let rules = self.rules_pass(ctx).await;
         let model = if self.config.llm_enabled {
             self.model_pass(ctx).await
         } else {
-            Ok(false)
+            Ok(ModelEnd::default())
         };
-        let mut partial = false;
-        for (pass, outcome) in [("rules", rules), ("model", model)] {
-            match outcome {
-                Ok(left_work) => partial |= left_work,
-                Err(error) => {
-                    warn!(pass, error = %format!("{error:#}"), "extraction: a pass failed");
-                    partial = true;
-                }
+        let mut report = ExtractionReport::default();
+        if let Err(error) = rules {
+            warn!(error = %format!("{error:#}"), "extraction: the rules pass failed");
+            report.partial = true;
+        }
+        match model {
+            Ok(end) => {
+                report.partial |= end.partial;
+                report.model = end.model.map(extraction_model);
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "extraction: the model pass failed");
+                report.partial = true;
             }
         }
-        Ok(ExtractionReport { partial })
+        Ok(report)
     }
+
+    async fn model(&self) -> Option<ExtractionModel> {
+        let uses_model = self.config.enabled && self.config.llm_enabled;
+        self.identity
+            .clone()
+            .filter(|_| uses_model)
+            .map(extraction_model)
+    }
+}
+
+fn extraction_model(identity: ModelIdentity) -> ExtractionModel {
+    ExtractionModel {
+        model_id: identity.model_id,
+        model_sha256: identity.model_sha256,
+        prompt_version: PROMPT_VERSION.to_owned(),
+    }
+}
+
+/// How the model pass ended.
+#[derive(Default)]
+struct ModelEnd {
+    /// Work was left for a later run.
+    partial: bool,
+    /// The model that answered, when one did.
+    model: Option<ModelIdentity>,
 }
 
 impl ExtractionHooks {
@@ -116,10 +150,9 @@ impl ExtractionHooks {
         advance(ctx, ExtractorName::Rules, window.end).await
     }
 
-    /// True when work was left for a later run.
-    async fn model_pass(&self, ctx: &ExtractCtx<'_>) -> anyhow::Result<bool> {
+    async fn model_pass(&self, ctx: &ExtractCtx<'_>) -> anyhow::Result<ModelEnd> {
         let Some(window) = self.window(ctx, ExtractorName::Llm).await? else {
-            return Ok(false);
+            return Ok(ModelEnd::default());
         };
         let inputs = events_to_inputs(&window.events, self.config.min_event_chars);
         info!(
@@ -129,14 +162,17 @@ impl ExtractionHooks {
         );
         if inputs.is_empty() {
             advance(ctx, ExtractorName::Llm, window.end).await?;
-            return Ok(false);
+            return Ok(ModelEnd::default());
         }
         // Validation caps the setting; the cap here keeps a hand built config
         // from overflowing the deadline.
         let deadline_secs = self.config.run_deadline_secs.min(MAX_RUN_DEADLINE_SECS);
+        let identity = self.identity.as_ref().context(
+            "the model file could not be read, so the model pass cannot tell which model it runs",
+        )?;
         let deps = ExtractionDeps {
             provider: self.provider.as_ref(),
-            identity: &self.identity,
+            identity,
             cache: Arc::clone(&self.cache),
             store: ctx.store,
             config: &self.config,
@@ -156,7 +192,10 @@ impl ExtractionHooks {
         if let Some(done) = run.completed_offset {
             advance(ctx, ExtractorName::Llm, done).await?;
         }
-        Ok(is_partial(&run))
+        Ok(ModelEnd {
+            partial: is_partial(&run),
+            model: run.model,
+        })
     }
 
     /// The oldest `max_events_per_run` events after the cursor of `name`, up

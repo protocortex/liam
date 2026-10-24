@@ -14,11 +14,15 @@ use crate::embedder_fingerprint::EmbedderFingerprint;
 /// Appended to the database path to name the manifest file.
 const MANIFEST_SUFFIX: &str = ".consolidation.json";
 
-/// Layout version of the manifest file, written as `version`. A file with any
-/// other version is refused rather than guessed at. Any new manifest field must
-/// bump it: `flatten` rules out `deny_unknown_fields`, so an older build would
-/// silently drop the field and rewrite the file without it.
-const FORMAT_VERSION: u32 = 3;
+/// Layout version of the manifest file, written as `version`. Any new manifest
+/// field must bump it: `flatten` rules out `deny_unknown_fields`, so an older
+/// build would silently drop the field and rewrite the file without it.
+const FORMAT_VERSION: u32 = 4;
+
+/// Versions this build reads. A file with any other version is refused rather
+/// than guessed at. Version 3 lacks only `extraction_model`, which defaults, so
+/// a run it records stays resumable and never blocks a new one.
+const READABLE_VERSIONS: [u32; 2] = [3, FORMAT_VERSION];
 
 /// How a finished run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +30,14 @@ pub enum RunOutcome {
     Committed,
     RolledBack,
     RestoreFailed,
+}
+
+/// The extraction model a run's facts came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionModel {
+    pub model_id: String,
+    pub model_sha256: String,
+    pub prompt_version: String,
 }
 
 /// Everything needed to reproduce and resume a run.
@@ -44,6 +56,9 @@ pub struct RunManifest {
     /// Where the run's near-duplicate pass stopped, saved as the next pass's
     /// start once the run commits.
     pub dedup_resume_from: Option<ScanPosition>,
+    /// Set when the extraction step ran a model.
+    #[serde(default)]
+    pub extraction_model: Option<ExtractionModel>,
     pub completed_steps: Vec<String>,
     pub outcome: Option<RunOutcome>,
 }
@@ -66,6 +81,10 @@ pub enum ResumeRefused {
         recorded: String,
         current: String,
     },
+    ExtractionModelChanged {
+        recorded: Box<ExtractionModel>,
+        current: Option<Box<ExtractionModel>>,
+    },
 }
 
 impl std::fmt::Display for ResumeRefused {
@@ -80,6 +99,11 @@ impl std::fmt::Display for ResumeRefused {
                 f,
                 "the interrupted run used LLM {recorded} but the configured one is {current}; \
                  finish or discard that run first"
+            ),
+            Self::ExtractionModelChanged { recorded, current } => write!(
+                f,
+                "the interrupted run extracted with {recorded:?} but the configured extraction \
+                 model is {current:?}; finish or discard that run first"
             ),
         }
     }
@@ -121,6 +145,7 @@ impl RunManifest {
             snapshot_meta_path: None,
             snapshot_database_path: None,
             dedup_resume_from: None,
+            extraction_model: None,
             completed_steps: Vec::new(),
             outcome: None,
         }
@@ -166,9 +191,9 @@ impl RunManifest {
         };
         let probe: VersionProbe = serde_json::from_str(&text).map_err(unparsable)?;
         anyhow::ensure!(
-            probe.version == FORMAT_VERSION,
-            "the consolidation manifest {} has version {}, but this build reads version \
-             {FORMAT_VERSION}",
+            READABLE_VERSIONS.contains(&probe.version),
+            "the consolidation manifest {} has version {}, but this build reads versions \
+             {READABLE_VERSIONS:?}",
             path.display(),
             probe.version
         );
@@ -185,12 +210,15 @@ impl RunManifest {
         self.save(path)
     }
 
-    /// Refuses to resume under a different embedder or LLM than the run began
-    /// with, since steps already done would then mix two models' output.
+    /// Refuses to resume under a different embedder, LLM or extraction model
+    /// than the run began with, since steps already done would then mix two
+    /// models' output. A run that has not started extracting has no extraction
+    /// model to keep.
     pub fn check_resumable(
         &self,
         embedder: &EmbedderFingerprint,
         llm_model_fingerprint: &str,
+        extraction_model: Option<&ExtractionModel>,
     ) -> Result<(), ResumeRefused> {
         if &self.embedder != embedder {
             return Err(ResumeRefused::EmbedderChanged {
@@ -203,6 +231,14 @@ impl RunManifest {
                 recorded: self.llm_model_fingerprint.clone(),
                 current: llm_model_fingerprint.to_owned(),
             });
+        }
+        if let Some(recorded) = &self.extraction_model {
+            if Some(recorded) != extraction_model {
+                return Err(ResumeRefused::ExtractionModelChanged {
+                    recorded: Box::new(recorded.clone()),
+                    current: extraction_model.cloned().map(Box::new),
+                });
+            }
         }
         Ok(())
     }
@@ -330,13 +366,98 @@ mod tests {
         let path = manifest_path_for(&dir.path().join("liam.db"));
         manifest().save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, text.replace("\"version\": 3", "\"version\": 99")).unwrap();
+        let current = format!("\"version\": {FORMAT_VERSION}");
+        std::fs::write(&path, text.replace(&current, "\"version\": 99")).unwrap();
 
         // Act
         let result = RunManifest::load(&path);
 
         // Assert
         assert!(result.unwrap_err().to_string().contains("version 99"));
+    }
+
+    #[test]
+    fn a_manifest_in_the_previous_layout_is_read_with_no_extraction_model() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let path = manifest_path_for(&dir.path().join("liam.db"));
+        manifest().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let previous: String = text
+            .lines()
+            .filter(|line| !line.contains("extraction_model"))
+            .map(|line| line.replace("\"version\": 4", "\"version\": 3") + "\n")
+            .collect();
+        assert!(previous.contains("\"version\": 3"));
+        std::fs::write(&path, previous).unwrap();
+
+        // Act
+        let loaded = RunManifest::load(&path).unwrap();
+
+        // Assert
+        assert_eq!(loaded, Some(manifest()));
+    }
+
+    fn extraction(model_id: &str) -> ExtractionModel {
+        ExtractionModel {
+            model_id: model_id.into(),
+            model_sha256: "abc".into(),
+            prompt_version: "1".into(),
+        }
+    }
+
+    #[test]
+    fn resuming_with_another_extraction_model_is_refused() {
+        // Arrange
+        let mut run = manifest();
+        run.extraction_model = Some(extraction("a"));
+
+        // Act
+        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", Some(&extraction("b")));
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(ResumeRefused::ExtractionModelChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn resuming_with_no_extraction_model_after_one_was_recorded_is_refused() {
+        // Arrange
+        let mut run = manifest();
+        run.extraction_model = Some(extraction("a"));
+
+        // Act
+        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", None);
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resuming_a_run_that_recorded_no_extraction_model_accepts_any() {
+        // Arrange
+        let run = manifest();
+
+        // Act
+        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", Some(&extraction("b")));
+
+        // Assert
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn resuming_with_the_same_extraction_model_is_accepted() {
+        // Arrange
+        let mut run = manifest();
+        run.extraction_model = Some(extraction("a"));
+
+        // Act
+        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", Some(&extraction("a")));
+
+        // Assert
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
@@ -415,7 +536,7 @@ mod tests {
         let run = manifest();
 
         // Act
-        let result = run.check_resumable(&fingerprint(), "llm/model.gguf");
+        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", None);
 
         // Assert
         assert_eq!(result, Ok(()));
@@ -429,7 +550,7 @@ mod tests {
         other.model = "other-model".into();
 
         // Act
-        let result = run.check_resumable(&other, "llm/model.gguf");
+        let result = run.check_resumable(&other, "llm/model.gguf", None);
 
         // Assert
         assert_eq!(
@@ -447,7 +568,7 @@ mod tests {
         let run = manifest();
 
         // Act
-        let result = run.check_resumable(&fingerprint(), "llm/other.gguf");
+        let result = run.check_resumable(&fingerprint(), "llm/other.gguf", None);
 
         // Assert
         assert_eq!(

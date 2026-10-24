@@ -149,7 +149,63 @@ impl ExtractionHook for PartialExtraction {
         &self,
         _ctx: &ExtractCtx<'_>,
     ) -> anyhow::Result<crate::consolidation::hooks::ExtractionReport> {
-        Ok(crate::consolidation::hooks::ExtractionReport { partial: true })
+        Ok(crate::consolidation::hooks::ExtractionReport {
+            partial: true,
+            ..Default::default()
+        })
+    }
+}
+
+const REPORTED_MODEL: &str = "reported-model";
+
+fn extraction_model(model_id: &str) -> crate::consolidation::manifest::ExtractionModel {
+    crate::consolidation::manifest::ExtractionModel {
+        model_id: model_id.into(),
+        model_sha256: "abc123".into(),
+        prompt_version: "1".into(),
+    }
+}
+
+/// Reports the model it ran.
+struct ModelExtraction(&'static str);
+
+#[async_trait]
+impl ExtractionHook for ModelExtraction {
+    async fn extract(
+        &self,
+        _ctx: &ExtractCtx<'_>,
+    ) -> anyhow::Result<crate::consolidation::hooks::ExtractionReport> {
+        Ok(crate::consolidation::hooks::ExtractionReport {
+            partial: false,
+            model: Some(extraction_model(self.0)),
+        })
+    }
+
+    async fn model(&self) -> Option<crate::consolidation::manifest::ExtractionModel> {
+        Some(extraction_model(self.0))
+    }
+}
+
+/// Knows its model up front but reports none, and keeps the model the manifest
+/// on disk named when the pass began.
+struct QuietModelExtraction {
+    manifest_path: PathBuf,
+    seen: Mutex<Option<crate::consolidation::manifest::ExtractionModel>>,
+}
+
+#[async_trait]
+impl ExtractionHook for QuietModelExtraction {
+    async fn extract(
+        &self,
+        _ctx: &ExtractCtx<'_>,
+    ) -> anyhow::Result<crate::consolidation::hooks::ExtractionReport> {
+        let on_disk = RunManifest::load(&self.manifest_path).unwrap().unwrap();
+        *self.seen.lock().unwrap() = on_disk.extraction_model;
+        Ok(Default::default())
+    }
+
+    async fn model(&self) -> Option<crate::consolidation::manifest::ExtractionModel> {
+        Some(extraction_model(REPORTED_MODEL))
     }
 }
 
@@ -582,6 +638,140 @@ async fn an_extraction_part_that_reports_partial_work_is_recorded_as_partial() {
     assert_eq!(manifest.outcome, Some(RunOutcome::Committed));
     assert!(manifest.is_complete("extract:partial"));
     assert!(!manifest.is_complete("extract:skipped"));
+}
+
+#[tokio::test]
+async fn the_model_an_extraction_part_reports_is_recorded_in_the_saved_manifest() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let hooks = ConsolidationHookSet {
+        extraction: Some(Arc::new(ModelExtraction(REPORTED_MODEL))),
+        ..Default::default()
+    };
+    let run = env.consolidator_with(maintenance(), honest(), hooks);
+
+    // Act
+    run.consolidate(&shared).await.unwrap();
+
+    // Assert
+    let recorded = env
+        .manifest()
+        .extraction_model
+        .expect("a model was recorded");
+    assert_eq!(recorded.model_id, REPORTED_MODEL);
+    assert_eq!(recorded.model_sha256, "abc123");
+}
+
+#[tokio::test]
+async fn the_model_is_in_the_manifest_before_the_pass_starts_and_stays_when_none_is_reported() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let hook = Arc::new(QuietModelExtraction {
+        manifest_path: manifest_path_for(&env.database_path()),
+        seen: Mutex::new(None),
+    });
+    let hooks = ConsolidationHookSet {
+        extraction: Some(hook.clone()),
+        ..Default::default()
+    };
+    let run = env.consolidator_with(maintenance(), honest(), hooks);
+
+    // Act
+    run.consolidate(&shared).await.unwrap();
+
+    // Assert
+    let expected = Some(extraction_model(REPORTED_MODEL));
+    assert_eq!(*hook.seen.lock().unwrap(), expected);
+    assert_eq!(env.manifest().extraction_model, expected);
+}
+
+async fn crash_after_extracting_with(env: &Env, model_id: &'static str) -> SharedStore {
+    let shared = env.seeded().await;
+    let hooks = ConsolidationHookSet {
+        extraction: Some(Arc::new(ModelExtraction(model_id))),
+        ..Default::default()
+    };
+    let mut crashing = env.consolidator_with(maintenance(), honest(), hooks);
+    crashing.crash_after = Some("extract");
+    assert!(crashing.consolidate(&shared).await.is_err());
+    drop(shared);
+    env.open().await
+}
+
+#[tokio::test]
+async fn a_run_resumes_under_the_extraction_model_it_began_with() {
+    // Arrange
+    let env = Env::new();
+    let reopened = crash_after_extracting_with(&env, REPORTED_MODEL).await;
+    let hooks = ConsolidationHookSet {
+        extraction: Some(Arc::new(ModelExtraction(REPORTED_MODEL))),
+        ..Default::default()
+    };
+
+    // Act
+    let resumed = env
+        .consolidator_with(maintenance(), honest(), hooks)
+        .consolidate(&reopened)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(resumed.outcome, Some(RunOutcome::Committed));
+}
+
+#[tokio::test]
+async fn a_run_is_rolled_back_when_the_extraction_model_changed_since_the_crash() {
+    // Arrange
+    let env = Env::new();
+    let reopened = crash_after_extracting_with(&env, REPORTED_MODEL).await;
+    let hooks = ConsolidationHookSet {
+        extraction: Some(Arc::new(ModelExtraction("another-model"))),
+        ..Default::default()
+    };
+
+    // Act
+    let resumed = env
+        .consolidator_with(maintenance(), honest(), hooks)
+        .consolidate(&reopened)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(resumed.outcome, Some(RunOutcome::RolledBack));
+}
+
+#[tokio::test]
+async fn a_committed_run_saved_in_the_previous_layout_does_not_block_the_next_run() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+    let first = env
+        .consolidator(maintenance(), honest())
+        .consolidate(&shared)
+        .await
+        .unwrap();
+    let path = manifest_path_for(&env.database_path());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let previous_layout: String = text
+        .lines()
+        .filter(|line| !line.contains("extraction_model"))
+        .map(|line| line.replace("\"version\": 4", "\"version\": 3") + "\n")
+        .collect();
+    assert_ne!(previous_layout, text);
+    std::fs::write(&path, previous_layout).unwrap();
+
+    // Act
+    let next = env
+        .consolidator(maintenance(), honest())
+        .consolidate(&shared)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(next.outcome, Some(RunOutcome::Committed));
+    assert_ne!(next.run_id, first.run_id);
 }
 
 #[tokio::test]
