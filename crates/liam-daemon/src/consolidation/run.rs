@@ -181,7 +181,7 @@ impl Consolidator {
             self.settings.probe_count > 0,
             "probe_count is zero, so the run would have no probes to gate it"
         );
-        let (mut manifest, refused) = self.begin()?;
+        let (mut manifest, refused) = self.begin().await?;
         let verdict = if let Some(refused) = refused {
             Verdict::Rollback(refused.to_string())
         } else if manifest.is_complete(rollback::ROLLBACK_PENDING) {
@@ -253,11 +253,16 @@ impl Consolidator {
 
     /// The unfinished run on disk, or a new one. A run made under other models
     /// comes back with the reason it cannot be resumed.
-    fn begin(&self) -> anyhow::Result<(RunManifest, Option<ResumeRefused>)> {
+    async fn begin(&self) -> anyhow::Result<(RunManifest, Option<ResumeRefused>)> {
         self.refuse_after_a_failed_restore()?;
         if let Some(unfinished) = self.unfinished_run()? {
+            let extraction_model = self.parts.hooks.extraction_model().await;
             let refused = unfinished
-                .check_resumable(&self.identity.embedder, &self.identity.llm_model)
+                .check_resumable(
+                    &self.identity.embedder,
+                    &self.identity.llm_model,
+                    extraction_model.as_ref(),
+                )
                 .err();
             tracing::info!(run_id = %unfinished.run_id, done = ?unfinished.completed_steps, refused = refused.is_some(), "consolidation: an unfinished run found");
             return Ok((unfinished, refused));
@@ -308,6 +313,12 @@ impl Consolidator {
             MAINTENANCE => self.parts.maintenance.run(store, &source).await?,
             EXTRACT => {
                 let configured = self.parts.hooks.extraction.is_some();
+                // Recorded before the pass writes anything, so a crash during
+                // it still leaves the run knowing which model it began with.
+                if manifest.extraction_model.is_none() {
+                    manifest.extraction_model = self.parts.hooks.extraction_model().await;
+                    manifest.save(&self.manifest_path())?;
+                }
                 let ctx = ExtractCtx { store, source };
                 let result = self.parts.hooks.extract(&ctx).await.map(|report| {
                     manifest.extraction_model = report.model.or(manifest.extraction_model.take());

@@ -57,6 +57,12 @@ pub struct TierReport;
 #[async_trait]
 pub trait ExtractionHook: Send + Sync {
     async fn extract(&self, ctx: &ExtractCtx<'_>) -> Result<ExtractionReport>;
+
+    /// The model the next `extract` would use, known before it writes anything,
+    /// or `None` when it uses none.
+    async fn model(&self) -> Option<ExtractionModel> {
+        None
+    }
 }
 
 /// An `Err` is recorded as a step status and does not abort the run.
@@ -85,6 +91,13 @@ impl ConsolidationHookSet {
         match &self.extraction {
             Some(hook) => hook.extract(ctx).await,
             None => Ok(ExtractionReport::default()),
+        }
+    }
+
+    pub async fn extraction_model(&self) -> Option<ExtractionModel> {
+        match &self.extraction {
+            Some(hook) => hook.model().await,
+            None => None,
         }
     }
 

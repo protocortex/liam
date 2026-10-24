@@ -553,6 +553,38 @@ async fn a_daemon_that_begins_stopping_mid_pass_keeps_the_log_writable_and_the_n
 }
 
 #[tokio::test]
+async fn a_pass_stopped_after_an_answer_still_reports_the_model_that_answered() {
+    // Arrange
+    let harness = Harness::new();
+    let store = filled(&harness, 3).await;
+    let stop = CancellationToken::new();
+    let provider = ProviderDouble::stopping_on_call(2, stop.clone());
+    let mut part = extraction_part(
+        &harness,
+        &provider,
+        ExtractionConfig {
+            batch_events: 1,
+            ..config()
+        },
+    );
+    part.stopping = stop;
+    let ctx = liam_daemon::consolidation::hooks::ExtractCtx {
+        store: &store,
+        source: "consolidation:r1".into(),
+    };
+
+    // Act
+    let report = liam_daemon::consolidation::hooks::ExtractionHook::extract(&part, &ctx)
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(report.partial);
+    let model = report.model.expect("the first batch was answered");
+    assert_eq!(model.model_id, crate::extraction::model_double::MODEL_ID);
+}
+
+#[tokio::test]
 async fn a_run_deadline_far_past_any_clock_still_runs() {
     // Arrange: a hand built config, which validation would have refused
     let harness = Harness::new();

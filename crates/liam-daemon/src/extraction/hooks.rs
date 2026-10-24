@@ -83,11 +83,7 @@ impl ExtractionHook for ExtractionHooks {
         match model {
             Ok(end) => {
                 report.partial |= end.partial;
-                report.model = end.model.map(|model| ExtractionModel {
-                    model_id: model.model_id,
-                    model_sha256: model.model_sha256,
-                    prompt_version: PROMPT_VERSION.to_owned(),
-                });
+                report.model = end.model.map(extraction_model);
             }
             Err(error) => {
                 warn!(error = %format!("{error:#}"), "extraction: the model pass failed");
@@ -95,6 +91,22 @@ impl ExtractionHook for ExtractionHooks {
             }
         }
         Ok(report)
+    }
+
+    async fn model(&self) -> Option<ExtractionModel> {
+        let uses_model = self.config.enabled && self.config.llm_enabled;
+        self.identity
+            .clone()
+            .filter(|_| uses_model)
+            .map(extraction_model)
+    }
+}
+
+fn extraction_model(identity: ModelIdentity) -> ExtractionModel {
+    ExtractionModel {
+        model_id: identity.model_id,
+        model_sha256: identity.model_sha256,
+        prompt_version: PROMPT_VERSION.to_owned(),
     }
 }
 
