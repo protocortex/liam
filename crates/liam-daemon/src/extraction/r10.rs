@@ -8,6 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::response::Polarity;
 
+mod corpus;
+#[cfg(test)]
+mod tiers;
+
 /// A fact reduced to what the comparison cares about.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Tuple {
