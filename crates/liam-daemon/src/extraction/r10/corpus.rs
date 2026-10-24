@@ -8,6 +8,7 @@ use liam_store::Millis;
 use rand_chacha::rand_core::RngCore;
 use rand_chacha::ChaCha8Rng;
 
+use super::{normalize_tuple, Tuple};
 use crate::extraction::response::Polarity;
 
 pub(super) const EVENT_COUNT: usize = 300;
@@ -95,6 +96,12 @@ pub(crate) struct ExpectedFact {
     pub predicate: &'static str,
     pub object: String,
     pub polarity: Polarity,
+}
+
+impl ExpectedFact {
+    pub(super) fn tuple(&self) -> Tuple {
+        normalize_tuple(&self.subject, self.predicate, &self.object, self.polarity)
+    }
 }
 
 /// A date, URL or id the rules extractor should find in an event.
