@@ -29,6 +29,8 @@ use liam_store::{
 };
 
 use liam_daemon::config::{resolve_config_source, Config};
+use liam_daemon::consolidation::manifest::RunOutcome;
+use liam_daemon::consolidation::offline::{print_status, run_offline};
 use liam_daemon::embedder_fingerprint::{self, EmbedderFingerprint};
 use liam_daemon::event_log;
 use liam_daemon::models::{self, StoreEmbedder};
@@ -66,6 +68,26 @@ enum Command {
     /// Measure how well the local models retrieve, on a fixed synthetic
     /// question set.
     Eval(EvalArgs),
+    /// Run the consolidation job once over a store no daemon holds: snapshot,
+    /// merge near-duplicates, maintain, then commit or roll back. An unfinished
+    /// run is resumed. Resynthesis is left to the daemon's scheduled runs.
+    Consolidate(ConsolidateArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct ConsolidateArgs {
+    /// The database. Defaults to `database_path` from the config.
+    #[arg(long, value_name = "PATH", global = true)]
+    database: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<ConsolidateCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum ConsolidateCommand {
+    /// Show the last run recorded for the database. Works while a daemon runs.
+    Status,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -139,6 +161,13 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Consolidate(args) => {
+            let code = consolidate(&args, &config, &config_path);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Eval(EvalArgs {
             command: EvalCommand::Retrieval(args),
         }) => {
@@ -148,6 +177,59 @@ fn main() -> anyhow::Result<()> {
             print!("{}", render_eval_report(&report, args.json)?);
             Ok(())
         }
+    }
+}
+
+/// Exit code of a run that was rolled back: the store is as it was.
+const EXIT_ROLLED_BACK: i32 = 1;
+/// Exit code of a run whose restore failed: the store needs inspection. Apart
+/// from the plain failure code so a script can page someone for this one.
+const EXIT_RESTORE_FAILED: i32 = 2;
+
+/// Runs `liam consolidate`. Returns the process exit code: zero for a committed
+/// run or a status, `EXIT_ROLLED_BACK` for a rollback, `EXIT_RESTORE_FAILED`
+/// for a failed restore, and 1 for any other failure.
+fn consolidate(args: &ConsolidateArgs, config: &Config, config_path: &Path) -> i32 {
+    match try_consolidate(args, config, config_path) {
+        Ok(outcome) => consolidate_exit_code(outcome),
+        Err(error) => {
+            eprintln!("liam consolidate: {error:#}");
+            1
+        }
+    }
+}
+
+fn try_consolidate(
+    args: &ConsolidateArgs,
+    config: &Config,
+    config_path: &Path,
+) -> anyhow::Result<Option<RunOutcome>> {
+    let database = match &args.database {
+        Some(path) => expand_home("--database", path)?,
+        None => models::resolve_config_path("database_path", &config.database_path)?,
+    };
+    if let Some(ConsolidateCommand::Status) = args.command {
+        print_status(&database, &mut std::io::stdout())?;
+        return Ok(None);
+    }
+    models::export_fastembed_cache_dir(config)?;
+    let embedder = models::build_embedder(config)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let outcome = runtime.block_on(run_offline(
+        config,
+        config_path,
+        &database,
+        embedder,
+        &mut std::io::stdout(),
+    ))?;
+    Ok(Some(outcome))
+}
+
+fn consolidate_exit_code(outcome: Option<RunOutcome>) -> i32 {
+    match outcome {
+        None | Some(RunOutcome::Committed) => 0,
+        Some(RunOutcome::RolledBack) => EXIT_ROLLED_BACK,
+        Some(RunOutcome::RestoreFailed) => EXIT_RESTORE_FAILED,
     }
 }
 
@@ -725,6 +807,80 @@ mod tests {
             resolve_config_source(cli.config.as_deref(), Some("/from-env.toml")),
             PathBuf::from("/explicit.toml")
         );
+    }
+
+    fn consolidate_args(cli: Cli) -> ConsolidateArgs {
+        match cli.command {
+            Command::Consolidate(args) => args,
+            other => panic!("expected the consolidate subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consolidate_runs_the_job_by_default_and_takes_an_optional_database() {
+        // Act
+        let bare = consolidate_args(parse(&["liam", "consolidate"]));
+        let named = consolidate_args(parse(&["liam", "consolidate", "--database", "/d/liam.db"]));
+
+        // Assert
+        assert_eq!(bare.database, None);
+        assert_eq!(bare.command, None);
+        assert_eq!(named.database, Some(PathBuf::from("/d/liam.db")));
+    }
+
+    #[test]
+    fn consolidate_status_is_a_subcommand_that_takes_the_database_flag_after_it() {
+        let status = consolidate_args(parse(&[
+            "liam",
+            "consolidate",
+            "status",
+            "--database",
+            "/d/liam.db",
+        ]));
+
+        assert_eq!(status.command, Some(ConsolidateCommand::Status));
+        assert_eq!(status.database, Some(PathBuf::from("/d/liam.db")));
+    }
+
+    #[test]
+    fn each_outcome_has_its_own_exit_code() {
+        assert_eq!(consolidate_exit_code(None), 0);
+        assert_eq!(consolidate_exit_code(Some(RunOutcome::Committed)), 0);
+        assert_eq!(consolidate_exit_code(Some(RunOutcome::RolledBack)), 1);
+        assert_eq!(consolidate_exit_code(Some(RunOutcome::RestoreFailed)), 2);
+    }
+
+    #[test]
+    fn consolidate_reports_a_missing_log_with_a_failing_exit_code() {
+        // Arrange: a config file that exists, over a database with no log
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("liam.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let args = ConsolidateArgs {
+            database: Some(dir.path().join("liam.db")),
+            command: None,
+        };
+        let mut config = Config::default();
+        config.log.dir = Some(dir.path().join("events").to_str().unwrap().into());
+
+        // Act
+        let code = consolidate(&args, &config, &config_path);
+
+        // Assert
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn consolidate_status_on_a_database_with_no_run_exits_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = ConsolidateArgs {
+            database: Some(dir.path().join("liam.db")),
+            command: Some(ConsolidateCommand::Status),
+        };
+
+        let code = consolidate(&args, &Config::default(), &dir.path().join("liam.toml"));
+
+        assert_eq!(code, 0);
     }
 
     fn rebuild_args(cli: Cli) -> RebuildArgs {
