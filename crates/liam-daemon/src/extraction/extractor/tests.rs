@@ -2,7 +2,7 @@
 //! The batch loop against a real file store, a real cache file and a scripted
 //! model.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::bail;
@@ -29,10 +29,14 @@ const WINDOW_END: LogOffset = LogOffset {
 };
 const WRITE_SOURCE: &str = "consolidation:test-run";
 const ABANDON_AFTER: Duration = Duration::from_secs(60);
+const RUN_BUDGET: Duration = Duration::from_secs(60);
+const FAR_FUTURE: Duration = Duration::from_secs(3600);
 
 enum Reply {
     Text(String),
     Fail(ExtractError),
+    /// Answers after a pause, which moves a paused clock.
+    After(Duration, String),
     Hang,
 }
 
@@ -91,6 +95,10 @@ impl JsonExtractor for Script {
         match (self.handler)(req, call) {
             Reply::Text(text) => Ok(text),
             Reply::Fail(error) => Err(error),
+            Reply::After(pause, text) => {
+                tokio::time::sleep(pause).await;
+                Ok(text)
+            }
             Reply::Hang => std::future::pending().await,
         }
     }
@@ -133,6 +141,7 @@ fn facts_for(prompt: &str) -> String {
 
 struct Provider {
     script: Arc<Script>,
+    alive: Arc<AtomicBool>,
     opens: AtomicUsize,
     cannot_start: bool,
 }
@@ -141,6 +150,7 @@ impl Provider {
     fn new(script: &Arc<Script>) -> Self {
         Self {
             script: Arc::clone(script),
+            alive: Arc::new(AtomicBool::new(true)),
             opens: AtomicUsize::new(0),
             cannot_start: false,
         }
@@ -158,10 +168,20 @@ impl ExtractorProvider for Provider {
         if self.cannot_start {
             bail!("no model to start");
         }
+        let alive = Arc::clone(&self.alive);
         Ok(ExtractorSession {
             extractor: self.script.clone(),
+            alive: Box::new(move || alive.load(Ordering::SeqCst)),
             _keepalive: None,
         })
+    }
+}
+
+struct FakeRam(AtomicU64);
+
+impl FreeRam for FakeRam {
+    fn free_mb(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -170,6 +190,8 @@ struct Fixture {
     store: DefaultGraph,
     cache: Arc<CacheStore>,
     config: ExtractionConfig,
+    permits: Semaphore,
+    ram: FakeRam,
 }
 
 impl Fixture {
@@ -182,6 +204,8 @@ impl Fixture {
                 .expect("open store");
         let cache = Arc::new(CacheStore::open(cache_path(&database)).expect("open cache"));
         let config = ExtractionConfig {
+            // Host memory must never decide a test.
+            ram_budget_mb: 1,
             batch_events: 2,
             ..ExtractionConfig::default()
         };
@@ -190,12 +214,19 @@ impl Fixture {
             store,
             cache,
             config,
+            permits: Semaphore::new(1),
+            ram: FakeRam(AtomicU64::new(u64::MAX)),
         }
     }
 
     async fn run(&self, provider: &Provider, inputs: &[ExtractionInput]) -> ExtractionReport {
-        self.run_expecting(provider, &provider.script.identity, inputs)
-            .await
+        self.run_full(
+            provider,
+            &provider.script.identity,
+            inputs,
+            Instant::now() + FAR_FUTURE,
+        )
+        .await
     }
 
     async fn run_expecting(
@@ -204,13 +235,37 @@ impl Fixture {
         identity: &ModelIdentity,
         inputs: &[ExtractionInput],
     ) -> ExtractionReport {
+        self.run_full(provider, identity, inputs, Instant::now() + FAR_FUTURE)
+            .await
+    }
+
+    async fn run_until(
+        &self,
+        provider: &Provider,
+        inputs: &[ExtractionInput],
+        deadline: Instant,
+    ) -> ExtractionReport {
+        self.run_full(provider, &provider.script.identity, inputs, deadline)
+            .await
+    }
+
+    async fn run_full(
+        &self,
+        provider: &Provider,
+        identity: &ModelIdentity,
+        inputs: &[ExtractionInput],
+        deadline: Instant,
+    ) -> ExtractionReport {
         let deps = ExtractionDeps {
             provider,
             identity,
             cache: Arc::clone(&self.cache),
             store: &self.store,
             config: &self.config,
+            permits: &self.permits,
+            free_ram: &self.ram,
             write_source: WRITE_SOURCE,
+            deadline,
             window_end: WINDOW_END,
         };
         extract_events(inputs, deps).await.expect("a finished run")
@@ -581,4 +636,180 @@ async fn a_stored_answer_that_cannot_be_read_is_a_miss_and_the_model_is_asked_ag
     assert_eq!(second.calls(), 1);
     assert_eq!(report.completed_offset, Some(WINDOW_END));
     assert_eq!(report.batches_failed, 0);
+}
+
+#[tokio::test]
+async fn an_expired_deadline_runs_no_batch() {
+    // Arrange
+    let fx = Fixture::new().await;
+    let script = Script::honest();
+
+    // Act
+    let report = fx
+        .run_until(&Provider::new(&script), &inputs(4), Instant::now())
+        .await;
+
+    // Assert
+    assert_eq!(script.calls(), 0);
+    assert!(report.deadline_hit);
+    assert_eq!(report.completed_offset, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_batch_waiting_for_a_permit_past_the_deadline_is_skipped() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.permits = Semaphore::new(0);
+    let script = Script::honest();
+
+    // Act
+    let report = fx
+        .run_until(
+            &Provider::new(&script),
+            &inputs(2),
+            Instant::now() + RUN_BUDGET,
+        )
+        .await;
+
+    // Assert
+    assert_eq!(script.calls(), 0);
+    assert!(report.deadline_hit);
+    assert!(!report.sidecar_lost);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_cut_by_the_deadline_leaves_the_cursor_before_the_unattempted_batch() {
+    // Arrange: batches in offset order are a[0, 2], b[1, 3], b[5, 7]; the last
+    // answers after the deadline.
+    let fx = Fixture::new().await;
+    let script = Script::new(|request, call| {
+        let text = facts_for(&request.prompt);
+        if call == 2 {
+            Reply::After(FAR_FUTURE, text)
+        } else {
+            Reply::Text(text)
+        }
+    });
+    let events = [
+        input(0, Some("a")),
+        input(1, Some("b")),
+        input(2, Some("a")),
+        input(3, Some("b")),
+        input(5, Some("b")),
+        input(7, Some("b")),
+    ];
+
+    // Act
+    let report = fx
+        .run_until(
+            &Provider::new(&script),
+            &events,
+            Instant::now() + RUN_BUDGET,
+        )
+        .await;
+
+    // Assert
+    assert!(report.deadline_hit);
+    assert_eq!(report.batches_failed, 0);
+    assert_eq!(report.completed_offset, Some(offset(3)));
+    assert_eq!(fx.facts_about(3).await, 1);
+    assert_eq!(fx.facts_about(5).await, 0);
+}
+
+#[tokio::test]
+async fn a_model_that_dies_after_one_batch_ends_the_run_and_keeps_its_facts() {
+    // Arrange
+    let fx = Fixture::new().await;
+    let alive = Arc::new(AtomicBool::new(true));
+    let dies = Arc::clone(&alive);
+    let script = Script::new(move |request, _| {
+        dies.store(false, Ordering::SeqCst);
+        Reply::Text(facts_for(&request.prompt))
+    });
+    let mut provider = Provider::new(&script);
+    provider.alive = alive;
+
+    // Act
+    let report = fx.run(&provider, &inputs(4)).await;
+
+    // Assert
+    assert_eq!(script.calls(), 1);
+    assert!(report.sidecar_lost);
+    assert_eq!(report.completed_offset, Some(offset(1)));
+    assert_eq!((fx.facts_about(1).await, fx.facts_about(2).await), (1, 0));
+}
+
+#[tokio::test]
+async fn memory_below_the_budget_ends_the_run_as_lost_before_any_call() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.config.ram_budget_mb = 4096;
+    fx.ram.0.store(4095, Ordering::SeqCst);
+    let script = Script::honest();
+
+    // Act
+    let report = fx.run(&Provider::new(&script), &inputs(2)).await;
+
+    // Assert
+    assert_eq!(script.calls(), 0);
+    assert!(report.sidecar_lost);
+}
+
+#[tokio::test]
+async fn memory_equal_to_the_budget_is_enough() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.config.ram_budget_mb = 4096;
+    fx.ram.0.store(4096, Ordering::SeqCst);
+    let script = Script::honest();
+
+    // Act
+    let report = fx.run(&Provider::new(&script), &inputs(2)).await;
+
+    // Assert
+    assert_eq!(script.calls(), 1);
+    assert!(!report.sidecar_lost);
+}
+
+const SHORT_REQUEST_TIMEOUT_SECS: u64 = 5;
+const SLOW_ANSWER: Duration = Duration::from_secs(100);
+const PERMIT_WAIT: Duration = Duration::from_secs(5);
+
+#[tokio::test(start_paused = true)]
+async fn a_model_that_dies_while_the_run_waits_for_a_permit_is_not_called() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.permits = Semaphore::new(0);
+    let script = Script::honest();
+    let provider = Provider::new(&script);
+
+    // Act
+    let events = inputs(2);
+    let (report, ()) = tokio::join!(fx.run(&provider, &events), async {
+        tokio::time::sleep(PERMIT_WAIT).await;
+        provider.alive.store(false, Ordering::SeqCst);
+        fx.permits.add_permits(1);
+    });
+
+    // Assert
+    assert_eq!(script.calls(), 0);
+    assert!(report.sidecar_lost);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_is_cut_at_the_request_timeout_even_when_the_deadline_is_far() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.config.request_timeout_secs = SHORT_REQUEST_TIMEOUT_SECS;
+    let script = Script::new(|request, _| Reply::After(SLOW_ANSWER, facts_for(&request.prompt)));
+    let started = Instant::now();
+
+    // Act
+    let report = fx.run(&Provider::new(&script), &inputs(2)).await;
+
+    // Assert
+    assert!(started.elapsed() < SLOW_ANSWER);
+    assert_eq!(report.batches_failed, 1);
+    assert!(!report.deadline_hit);
+    assert_eq!(fx.facts_about(0).await, 0);
 }

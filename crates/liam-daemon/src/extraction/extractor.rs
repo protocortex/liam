@@ -12,21 +12,25 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use liam_log::LogOffset;
 use liam_store::{DefaultGraph, Vocabulary};
 use serde_json::Value;
+use tokio::sync::Semaphore;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::apply::{apply_answer, ApplyContext, ApplyError};
 use super::cache::{cache_key, CacheStore, CachedExtractor, KeyParts};
-use super::client::{ExtractRequest, JsonExtractor, ModelIdentity};
+use super::client::{ExtractError, ExtractRequest, JsonExtractor, ModelIdentity};
 use super::inputs::ExtractionInput;
 use super::prompt::{build_prompt, fact_json_schema, prompt_fingerprint, prompt_template};
 use super::prompt::{PromptEvent, PROMPT_VERSION};
 use super::response::parse_response;
+use super::sidecar::FreeRam;
 use crate::config::{declared_predicates, resolve_vocabulary, ExtractionConfig};
 
 /// Extraction must repeat exactly, so sampling is pinned.
@@ -38,6 +42,8 @@ const ANSWER_CONTEXT_DIVISOR: usize = 4;
 /// A running model and what must stay alive to keep it running.
 pub struct ExtractorSession {
     pub extractor: Arc<dyn JsonExtractor>,
+    /// False once the model process is gone.
+    pub alive: Box<dyn Fn() -> bool + Send + Sync>,
     /// Dropped when the run ends, which stops the model (the sidecar guard in
     /// production, nothing in tests).
     pub _keepalive: Option<Box<dyn Any + Send>>,
@@ -57,8 +63,12 @@ pub struct ExtractionDeps<'a> {
     pub cache: Arc<CacheStore>,
     pub store: &'a DefaultGraph,
     pub config: &'a ExtractionConfig,
+    /// The daemon's shared generation permits.
+    pub permits: &'a Semaphore,
+    pub free_ram: &'a (dyn FreeRam + Sync),
     /// The log source the facts are written under.
     pub write_source: &'a str,
+    pub deadline: Instant,
     /// The last offset of the scanned window, where a fully done run ends.
     pub window_end: LogOffset,
 }
@@ -116,6 +126,7 @@ enum Generation {
 
 struct Opened {
     cached: Arc<CachedExtractor>,
+    alive: Arc<dyn Fn() -> bool + Send + Sync>,
     _keepalive: Option<Box<dyn Any + Send>>,
 }
 
@@ -184,6 +195,10 @@ impl<'a> Run<'a> {
             if stopped_scopes.contains(&batch.scope) {
                 continue;
             }
+            if self.expired() {
+                self.report.deadline_hit = true;
+                break;
+            }
             match self.run_batch(&batch.indices).await? {
                 BatchEnd::Done => {}
                 BatchEnd::Failed => {
@@ -249,6 +264,14 @@ impl<'a> Run<'a> {
             }
         }
         batches
+    }
+
+    fn expired(&self) -> bool {
+        Instant::now() >= self.deps.deadline
+    }
+
+    fn remaining(&self) -> Duration {
+        self.deps.deadline.saturating_duration_since(Instant::now())
     }
 
     async fn run_batch(&mut self, batch: &[usize]) -> Result<BatchEnd> {
@@ -347,13 +370,53 @@ impl<'a> Run<'a> {
 
     /// Asks the model, starting it first if this is the run's first miss.
     async fn generate(&mut self, request: &ExtractRequest) -> Result<Generation> {
+        if self.expired() {
+            self.report.deadline_hit = true;
+            return Ok(Generation::Stop(Attempt::Halted));
+        }
         if !self.ensure_session().await {
             return Ok(Generation::Stop(Attempt::Halted));
         }
-        let cached = Arc::clone(&self.session.as_ref().expect("session was opened").cached);
-        match cached.extract_json(request).await {
-            Ok(text) => Ok(Generation::Text(text)),
-            Err(error) => {
+        let opened = self.session.as_ref().expect("the session was just opened");
+        let (cached, alive) = (Arc::clone(&opened.cached), Arc::clone(&opened.alive));
+        let free_mb = self.deps.free_ram.free_mb();
+        if !alive() || free_mb < self.deps.config.ram_budget_mb {
+            warn!(
+                free_mb,
+                "the model is gone or memory ran out, stopping the run"
+            );
+            self.report.sidecar_lost = true;
+            return Ok(Generation::Stop(Attempt::Halted));
+        }
+        let Ok(permit) = tokio::time::timeout(self.remaining(), self.deps.permits.acquire()).await
+        else {
+            self.report.deadline_hit = true;
+            return Ok(Generation::Stop(Attempt::Halted));
+        };
+        let Ok(_permit) = permit else {
+            bail!("the generation permits are closed");
+        };
+        // The wait for a permit can be long; the model may have died in it.
+        if !alive() {
+            warn!("the model died while the run waited for a generation permit");
+            self.report.sidecar_lost = true;
+            return Ok(Generation::Stop(Attempt::Halted));
+        }
+        let limit = self
+            .remaining()
+            .min(Duration::from_secs(self.deps.config.request_timeout_secs));
+        match tokio::time::timeout(limit, cached.extract_json(request)).await {
+            Ok(Ok(text)) => Ok(Generation::Text(text)),
+            // The deadline cut the call short, which is the run ending, not a failure.
+            Err(_) | Ok(Err(ExtractError::Timeout)) if self.expired() => {
+                self.report.deadline_hit = true;
+                Ok(Generation::Stop(Attempt::Halted))
+            }
+            Err(_) => {
+                warn!("the model call timed out");
+                Ok(Generation::Stop(Attempt::Failed))
+            }
+            Ok(Err(error)) => {
                 warn!(%error, "the model call failed");
                 Ok(Generation::Stop(Attempt::Failed))
             }
@@ -380,6 +443,7 @@ impl<'a> Run<'a> {
                 );
                 self.session = Some(Opened {
                     cached: Arc::new(cached),
+                    alive: Arc::from(session.alive),
                     _keepalive: session._keepalive,
                 });
                 true
