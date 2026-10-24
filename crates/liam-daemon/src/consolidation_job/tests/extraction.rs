@@ -88,7 +88,9 @@ fn extraction_part(
         },
         reader: Arc::new(SequentialScanReader::local(&log_dir).unwrap()),
         provider: provider.clone(),
-        identity: Some(crate::extraction::model_double::identity()),
+        identity: Arc::new(crate::extraction::model_double::FixedIdentity(
+            crate::extraction::model_double::identity(),
+        )),
         cache: Arc::new(CacheStore::open(cache_path(&database_in(&harness.root))).unwrap()),
         permits: Arc::new(Semaphore::new(1)),
         free_ram: Arc::new(PlentyOfRam),
@@ -231,7 +233,7 @@ async fn a_model_pass_without_a_model_identity_fails_the_step_partial_and_starts
     let server = seeded(&harness, PEOPLE.len()).await;
     let provider = ProviderDouble::new();
     let mut part = extraction_part(&harness, &provider, config());
-    part.identity = None;
+    part.identity = Arc::new(crate::extraction::identity::GgufFile::new(None));
     let job = harness.job_with_hooks(&server, honest(), None, hooks_of(part));
 
     // Act
@@ -691,3 +693,4 @@ async fn a_cursor_moved_by_another_writer_makes_the_step_partial_and_the_next_ru
 
 mod restore;
 mod rules;
+mod startup;

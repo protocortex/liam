@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Turning log events into subject/predicate/object facts.
-//!
-//! Nothing calls this module until the extraction hook is wired into
-//! consolidation; the allow below goes away with that wiring, so a fact source
-//! that is never reached still fails the lint afterwards.
-#![cfg_attr(not(test), allow(dead_code))]
 
 mod apply;
 pub mod cache;
@@ -13,13 +8,16 @@ pub mod extractor;
 pub mod grounding;
 pub mod hooks;
 mod http;
+pub mod identity;
 pub mod inputs;
 mod iso_date;
 #[cfg(test)]
 pub(crate) mod model_double;
 pub mod prompt;
+pub mod provider;
 pub mod response;
 pub mod rules;
+pub mod setup;
 pub mod sidecar;
 #[cfg(test)]
 mod test_double;

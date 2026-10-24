@@ -193,6 +193,8 @@ impl CacheStore {
 
     /// Drops every entry that cites one of `event_ids` and returns how many
     /// went.
+    // The lineage deletion that calls this arrives with the trust and deletion work.
+    #[allow(dead_code)]
     pub fn remove_by_event_ids(&self, event_ids: &HashSet<String>) -> io::Result<usize> {
         let mut state = self.lock();
         let before = state.entries.len();

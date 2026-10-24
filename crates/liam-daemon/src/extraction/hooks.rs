@@ -29,6 +29,7 @@ use super::cache::CacheStore;
 use super::client::ModelIdentity;
 use super::extractor::ExtractionReport as ModelRun;
 use super::extractor::{extract_events, ExtractionDeps, ExtractorProvider};
+use super::identity::IdentitySource;
 use super::inputs::events_to_inputs;
 use super::prompt::PROMPT_VERSION;
 use super::sidecar::FreeRam;
@@ -43,10 +44,9 @@ pub struct ExtractionHooks {
     pub config: ExtractionConfig,
     pub reader: Arc<dyn LogReader>,
     pub provider: Arc<dyn ExtractorProvider>,
-    /// The model the provider is expected to start, known before it starts.
-    /// `None` when the model file could not be read, which fails the model
-    /// pass on every run until it can.
-    pub identity: Option<ModelIdentity>,
+    /// The model the provider is expected to start, asked for on every run, so
+    /// a model file replaced between runs is noticed.
+    pub identity: Arc<dyn IdentitySource>,
     pub cache: Arc<CacheStore>,
     /// The daemon's generation permits, shared with the other model users.
     pub permits: Arc<Semaphore>,
@@ -94,11 +94,16 @@ impl ExtractionHook for ExtractionHooks {
     }
 
     async fn model(&self) -> Option<ExtractionModel> {
-        let uses_model = self.config.enabled && self.config.llm_enabled;
-        self.identity
-            .clone()
-            .filter(|_| uses_model)
-            .map(extraction_model)
+        if !(self.config.enabled && self.config.llm_enabled) {
+            return None;
+        }
+        match self.identity.identity().await {
+            Ok(identity) => Some(extraction_model(identity)),
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "extraction: the model is unknown");
+                None
+            }
+        }
     }
 }
 
@@ -167,12 +172,14 @@ impl ExtractionHooks {
         // Validation caps the setting; the cap here keeps a hand built config
         // from overflowing the deadline.
         let deadline_secs = self.config.run_deadline_secs.min(MAX_RUN_DEADLINE_SECS);
-        let identity = self.identity.as_ref().context(
-            "the model file could not be read, so the model pass cannot tell which model it runs",
-        )?;
+        let identity = self
+            .identity
+            .identity()
+            .await
+            .context("the model pass cannot tell which model it runs")?;
         let deps = ExtractionDeps {
             provider: self.provider.as_ref(),
-            identity,
+            identity: &identity,
             cache: Arc::clone(&self.cache),
             store: ctx.store,
             config: &self.config,
