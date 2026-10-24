@@ -35,6 +35,14 @@ wal_segment_max_bytes    = 8388608   # size limit of the open WAL segment
 wal_rotate_interval_secs = 300       # age limit of the open WAL segment
 bloom_fpr                = 0.01      # false positive rate of the dedup filter
 
+# Snapshots the store, merges near-duplicates, runs maintenance and commits only
+# if the probe set still recalls what it did before. Not the log's compactor.
+[consolidation]
+probe_recall_margin        = 0.02   # a probe whose recall drops by this much rolls the run back
+dedup_similarity_threshold = 0.95   # cosine similarity at or above which two nodes are linked
+probe_count                = 20     # most probes drawn from the store to gate a run
+# snapshot_dir             = "~/.liam/liam.snapshots"   # default: <database stem>.snapshots beside the database
+
 [embedder]
 provider  = "mock"                       # "mock" (dev) or "local" (in-process)
 model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"

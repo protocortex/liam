@@ -84,6 +84,38 @@ fn resolve_log_dir_with_home(
     }
 }
 
+/// The directory consolidation runs keep their snapshots in: `[consolidation]
+/// snapshot_dir` when set, else the default beside the database. Resolved like
+/// the log directory, so `liamd` and `liam consolidate` agree.
+pub fn resolve_snapshot_dir(
+    config: &Config,
+    database: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    resolve_snapshot_dir_with_home(config, database, &home)
+}
+
+fn resolve_snapshot_dir_with_home(
+    config: &Config,
+    database: &std::path::Path,
+    home: &str,
+) -> anyhow::Result<PathBuf> {
+    match &config.consolidation.snapshot_dir {
+        Some(dir) => {
+            let dir = PathBuf::from(resolve_path_with_home(
+                "consolidation.snapshot_dir",
+                dir,
+                home,
+            )?);
+            Ok(match database.parent() {
+                Some(parent) if dir.is_relative() => parent.join(dir),
+                _ => dir,
+            })
+        }
+        None => Ok(config::default_snapshot_dir(database)),
+    }
+}
+
 /// Lets the store embed the content of nodes a replay restored, with the same
 /// embedder the daemon serves with.
 pub struct StoreEmbedder(pub Arc<dyn Embedder>);
@@ -596,6 +628,41 @@ mod tests {
         // Assert: only an explicit cpu choice is exempt; an explicit metal
         // request that fell back to cpu must still error.
         assert!(result.is_some());
+    }
+
+    // ---- the snapshot directory ----
+
+    fn config_with_snapshot_dir(dir: Option<&str>) -> Config {
+        let mut config = Config::default();
+        config.consolidation.snapshot_dir = dir.map(str::to_string);
+        config
+    }
+
+    #[test]
+    fn an_unset_snapshot_dir_is_the_default_beside_the_database() {
+        let config = config_with_snapshot_dir(None);
+
+        let dir =
+            resolve_snapshot_dir_with_home(&config, Path::new("/data/work.db"), "/h").unwrap();
+
+        assert_eq!(dir, PathBuf::from("/data/work.snapshots"));
+    }
+
+    #[test]
+    fn a_snapshot_dir_expands_the_tilde_and_resolves_a_relative_path_from_the_database() {
+        for (configured, expected) in [
+            ("~/snaps", "/home/alice/snaps"),
+            ("snaps", "/data/snaps"),
+            ("/var/snaps", "/var/snaps"),
+        ] {
+            let config = config_with_snapshot_dir(Some(configured));
+
+            let dir =
+                resolve_snapshot_dir_with_home(&config, Path::new("/data/work.db"), "/home/alice")
+                    .unwrap();
+
+            assert_eq!(dir, PathBuf::from(expected), "configured {configured}");
+        }
     }
 
     // ---- the log directory ----
