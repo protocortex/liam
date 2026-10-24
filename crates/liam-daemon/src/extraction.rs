@@ -10,6 +10,7 @@ pub mod cache;
 pub mod client;
 pub mod grounding;
 mod http;
+pub mod inputs;
 mod iso_date;
 pub mod prompt;
 pub mod response;
