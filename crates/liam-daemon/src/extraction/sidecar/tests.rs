@@ -825,3 +825,5 @@ fn the_random_values_differ_and_are_hex() {
     assert_eq!(a.len(), KEY_BYTES * 2);
     assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
 }
+
+mod provider_tests;

@@ -205,15 +205,18 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     let server = server
         .with_shutdown(shutdown.token())
         .with_vocabulary(config::resolve_vocabulary(&config.extraction));
-    let job = Arc::new(ConsolidationJob::new(JobSetup {
-        config: &config,
-        database_path: &database_path,
-        log_dir: &log_dir,
-        log,
-        embedder: job_embedder,
-        server: &server,
-        shutdown: &shutdown,
-    })?);
+    let job = Arc::new(
+        ConsolidationJob::new(JobSetup {
+            config: &config,
+            database_path: &database_path,
+            log_dir: &log_dir,
+            log,
+            embedder: job_embedder,
+            server: &server,
+            shutdown: &shutdown,
+        })
+        .await?,
+    );
     let run_now = job
         .start(config.gc.run_on_start)
         .await

@@ -32,7 +32,7 @@ pub struct ProcessInfo {
 }
 
 /// The process table, behind a trait so a test can script it.
-pub trait ProcessTable: Send {
+pub trait ProcessTable: Send + Sync {
     fn inspect(&self, pid: u32) -> Option<ProcessInfo>;
 }
 

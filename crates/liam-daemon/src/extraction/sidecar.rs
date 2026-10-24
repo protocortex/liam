@@ -6,8 +6,6 @@
 //! guard therefore gives it a random key and alias through the environment
 //! (argv is readable by other users), and sends the key only after the
 //! unauthenticated model listing echoes that alias.
-// Nothing outside the tests starts the guard until the extraction hook does.
-#![allow(dead_code)]
 
 use std::fmt;
 use std::io::{self, Read};
@@ -46,7 +44,9 @@ const MAX_START_ATTEMPTS: u32 = 3;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const PROBE_MAX_BYTES: usize = 64 * 1024;
+#[cfg(test)]
 const STOP_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STDERR_CAP_BYTES: usize = 16 * 1024;
 const STDERR_READ_CHUNK: usize = 4096;
@@ -513,10 +513,12 @@ impl SidecarGuard {
         &self.key.0
     }
 
+    #[cfg(test)]
     pub fn pid(&self) -> u32 {
         self.pid
     }
 
+    #[cfg(test)]
     pub fn is_alive(&self) -> bool {
         self.alive_handle().is_alive()
     }
@@ -531,7 +533,8 @@ impl SidecarGuard {
     }
 
     /// Asks the server to quit and waits up to a grace period; `Drop` then
-    /// kills whatever is left.
+    /// kills whatever is left. A run just drops the guard.
+    #[cfg(test)]
     pub async fn stop(self) {
         {
             let mut child = lock(&self.child);

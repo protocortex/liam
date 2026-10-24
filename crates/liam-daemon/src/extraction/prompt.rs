@@ -102,6 +102,7 @@ pub fn prompt_template() -> String {
 }
 
 /// The pinned hash of one prompt version; see `check_prompt_version`.
+#[cfg(test)]
 pub struct GoldenPrompt {
     pub version: &'static str,
     pub sha256: &'static str,
@@ -122,6 +123,7 @@ pub fn prompt_fingerprint(template: &str, schema: &Value) -> String {
 /// True when `version` and the fingerprint of `template` and `schema` both
 /// equal the golden pair. A prompt or schema edit without a version bump, or a
 /// bump without an edit, fails, so the two cannot drift apart.
+#[cfg(test)]
 pub fn check_prompt_version(
     template: &str,
     schema: &Value,
