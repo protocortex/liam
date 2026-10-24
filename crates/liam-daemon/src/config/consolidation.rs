@@ -13,6 +13,9 @@ const DEFAULT_PROBE_RECALL_MARGIN: f64 = 0.02;
 /// since a wrong merge costs a link between unrelated facts.
 const DEFAULT_DEDUP_SIMILARITY_THRESHOLD: f32 = 0.95;
 const DEFAULT_PROBE_COUNT: usize = 20;
+/// Each probe is a retrieval query run twice per run, so a typo like an extra
+/// zero would make every run slow.
+const MAX_PROBE_COUNT: usize = 1_000;
 /// Suffix of the snapshot directory beside the database.
 const SNAPSHOT_DIR_SUFFIX: &str = ".snapshots";
 
@@ -56,8 +59,9 @@ impl ConsolidationConfig {
         );
         // Without probes nothing would gate a run, so it is refused up front.
         anyhow::ensure!(
-            self.probe_count > 0,
-            "consolidation.probe_count must be at least 1"
+            (1..=MAX_PROBE_COUNT).contains(&self.probe_count),
+            "consolidation.probe_count must be between 1 and {MAX_PROBE_COUNT}, got {}",
+            self.probe_count
         );
         anyhow::ensure!(
             self.snapshot_dir
@@ -155,7 +159,12 @@ mod tests {
                 "dedup_similarity_threshold = 1.1",
                 "consolidation.dedup_similarity_threshold",
             ),
+            (
+                "dedup_similarity_threshold = nan",
+                "consolidation.dedup_similarity_threshold",
+            ),
             ("probe_count = 0", "consolidation.probe_count"),
+            ("probe_count = 1001", "consolidation.probe_count"),
             ("snapshot_dir = \"  \"", "consolidation.snapshot_dir"),
         ] {
             // Arrange
@@ -179,6 +188,13 @@ mod tests {
 
         // Assert
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn the_largest_probe_count_is_accepted() {
+        let toml = format!("[consolidation]\nprobe_count = {MAX_PROBE_COUNT}\n");
+
+        assert!(load(&toml).is_ok());
     }
 
     #[test]
