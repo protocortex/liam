@@ -95,6 +95,19 @@ jobs:
           ./target/release/liamd --version
           ./target/release/liam --version
 
+      # `liam fetch-models` downloads the pinned llama-server archive at install
+      # time. If the upstream release were deleted or its bytes changed, the
+      # first user to install would find out, so check the pin here instead.
+      # The model is too large for a release runner; its hash was verified when
+      # it was pinned. `cargo test` exits 0 when a filter matches nothing, so
+      # require that the test ran.
+      - name: Verify the pinned llama-server archive
+        run: |
+          set -euo pipefail
+          cargo test --release -p liam-daemon --lib -- --ignored --exact \
+            fetch::tests::real_server_asset_matches_its_pin 2>&1 | tee pin.log
+          grep -q ' 1 passed' pin.log
+
       # The repo's liam.toml is the DEV config: both providers are "mock" so a
       # default `cargo build` stays light. Shipping it beside a real binary is
       # the failure this workflow used to have, and it is silent: the daemon

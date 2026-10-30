@@ -71,10 +71,14 @@ PLIST="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
 
 # v1 ships one target. Refusing here beats letting the user discover it from
 # a "bad CPU type in executable" three steps later.
-case "$(uname -s)/$(uname -m)" in
+#
+# LIAM_PLATFORM_OVERRIDE (for example "Darwin/arm64") replaces the detected
+# platform. It exists so tests can exercise this script on other hosts.
+PLATFORM="${LIAM_PLATFORM_OVERRIDE:-$(uname -s)/$(uname -m)}"
+case "$PLATFORM" in
     Darwin/arm64) ;;
     *)
-        echo "install.sh: this build is macOS on Apple Silicon only, found $(uname -s)/$(uname -m)" >&2
+        echo "install.sh: this build is macOS on Apple Silicon only, found ${PLATFORM}" >&2
         exit 1
         ;;
 esac
@@ -118,6 +122,7 @@ if [ "$SKIP_MODELS" -eq 1 ]; then
     echo "skipping model download; run '${PREFIX}/liam fetch-models --config ${CONFIG}' before starting the daemon"
 else
     echo "fetching models; the first run downloads several gigabytes and loads each one to verify it"
+    echo "  (with [extraction] enabled it also fetches the pinned llama-server and its model, each sha256 checked)"
     "${PREFIX}/liam" fetch-models --config "$CONFIG"
 fi
 

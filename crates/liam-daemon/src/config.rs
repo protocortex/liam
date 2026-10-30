@@ -359,6 +359,13 @@ pub fn resolve_config_source(flag: Option<&Path>, env_config: Option<&str>) -> P
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        Self::load_with_home(path, &home)
+    }
+
+    /// `load` with the home directory passed in, so `~` expansion is testable
+    /// without mutating the process environment.
+    fn load_with_home(path: &Path, home: &str) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -382,7 +389,8 @@ impl Config {
             );
         }
 
-        let config: Self = toml::from_str(&text)?;
+        let mut config: Self = toml::from_str(&text)?;
+        config.extraction.expand_paths(home)?;
         config.log.validate()?;
         config.producers.validate()?;
         config.extraction.validate()?;
@@ -417,6 +425,49 @@ impl ReclaimExt for RetentionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load_text(text: &str, home: &str) -> anyhow::Result<Config> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("liam.toml");
+        std::fs::write(&path, text).unwrap();
+        Config::load_with_home(&path, home)
+    }
+
+    #[test]
+    fn extraction_file_paths_are_expanded_once_at_load() {
+        // Arrange
+        let text = "[extraction]\nenabled = true\nllama_server_path = \"~/bin/llama-server\"\n\
+                    model_gguf = \"~/models/m.gguf\"\n";
+
+        // Act
+        let config = load_text(text, "/home/alice").unwrap();
+
+        // Assert
+        let extraction = config.extraction;
+        assert_eq!(
+            extraction.llama_server_path.as_deref(),
+            Some("/home/alice/bin/llama-server")
+        );
+        assert_eq!(
+            extraction.model_gguf.as_deref(),
+            Some("/home/alice/models/m.gguf")
+        );
+    }
+
+    #[test]
+    fn a_tilde_extraction_path_without_home_is_an_error_naming_the_key() {
+        // Arrange
+        let text = "[extraction]\nmodel_gguf = \"~/m.gguf\"\n";
+
+        // Act
+        let error = load_text(text, "").unwrap_err();
+
+        // Assert
+        assert!(
+            error.to_string().contains("extraction.model_gguf"),
+            "{error}"
+        );
+    }
 
     /// Writes `contents` to a fresh, uniquely-named temp file so tests exercise
     /// the real `Config::load` file-reading path without touching the repo's
