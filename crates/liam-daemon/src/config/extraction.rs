@@ -128,6 +128,7 @@ impl ExtractionConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_host()?;
         self.validate_extra_args()?;
+        self.validate_model_files()?;
         // A zero here makes extraction a silent no-op or an instant timeout.
         for (key, value) in [
             ("ctx_tokens", self.ctx_tokens as u64),
@@ -162,6 +163,26 @@ impl ExtractionConfig {
         }
         for (source, score) in &self.trust {
             ensure_unit_interval(&format!("extraction.trust.{source}"), *score)?;
+        }
+        Ok(())
+    }
+
+    /// The model pass cannot start without the model and the server that runs
+    /// it, so an incomplete setup fails at load, not on every run.
+    fn validate_model_files(&self) -> anyhow::Result<()> {
+        if !(self.enabled && self.llm_enabled) {
+            return Ok(());
+        }
+        for (key, value) in [
+            ("model_gguf", &self.model_gguf),
+            ("llama_server_path", &self.llama_server_path),
+        ] {
+            anyhow::ensure!(
+                value.is_some(),
+                "extraction.{key} must be set while extraction.enabled and \
+                 extraction.llm_enabled are on; set extraction.llm_enabled = false to run \
+                 the rules alone"
+            );
         }
         Ok(())
     }
@@ -324,6 +345,43 @@ mod tests {
         // Assert
         assert!(message.contains("start_timeout_secs"), "{message}");
         assert_eq!(allowed.start_timeout_secs, MAX_START_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn the_model_pass_needs_the_model_and_its_server() {
+        // Arrange: (toml, whether the load must succeed)
+        let files = "model_gguf = \"m.gguf\"\nllama_server_path = \"/bin/llama-server\"\n";
+        let rows = [
+            ("enabled = true\n".to_owned(), false),
+            (
+                "enabled = true\nmodel_gguf = \"m.gguf\"\n".to_owned(),
+                false,
+            ),
+            (
+                "enabled = true\nllama_server_path = \"/bin/llama-server\"\n".to_owned(),
+                false,
+            ),
+            (format!("enabled = true\n{files}"), true),
+            ("enabled = true\nllm_enabled = false\n".to_owned(), true),
+            ("enabled = false\n".to_owned(), true),
+        ];
+
+        for (body, accepted) in rows {
+            // Act
+            let result = load(&format!("[extraction]\n{body}"));
+
+            // Assert
+            assert_eq!(result.is_ok(), accepted, "{body:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn the_missing_file_setting_is_named() {
+        // Arrange / Act
+        let message = error_of("[extraction]\nenabled = true\n");
+
+        // Assert
+        assert!(message.contains("extraction.model_gguf"), "{message}");
     }
 
     #[test]

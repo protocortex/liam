@@ -27,6 +27,9 @@ const MODE_UNHEALTHY: &str = "unhealthy";
 const MODE_REAL_ONLY: &str = "real_only";
 /// Serves every path without checking the key.
 const MODE_OPEN: &str = "open";
+/// Answers a completion only after `FAKE_COMPLETION_PAUSE`.
+const MODE_SLOW_COMPLETION: &str = "slow_completion";
+const FAKE_COMPLETION_PAUSE: Duration = Duration::from_secs(20);
 const START_TIMEOUT_SECS: u64 = 10;
 const SHORT_TIMEOUT_SECS: u64 = 1;
 const TIMEOUT_SLACK_FACTOR: u64 = 5;
@@ -234,7 +237,12 @@ fn serve(stream: TcpStream, mode: &str, keys: &str, alias: &str) {
         // Like llama.cpp master, only `/health` answers without a key.
         _ if !authorized && mode != MODE_OPEN => ("401 Unauthorized", String::new()),
         MODELS_PATH => ("200 OK", format!(r#"{{"data":[{{"id":"{alias}"}}]}}"#)),
-        _ => ("200 OK", CHAT_BODY.into()),
+        _ => {
+            if mode == MODE_SLOW_COMPLETION {
+                std::thread::sleep(FAKE_COMPLETION_PAUSE);
+            }
+            ("200 OK", CHAT_BODY.into())
+        }
     };
     let reply = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -825,3 +833,5 @@ fn the_random_values_differ_and_are_hex() {
     assert_eq!(a.len(), KEY_BYTES * 2);
     assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
 }
+
+mod provider_tests;

@@ -29,8 +29,6 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Why a model call failed. Carries no request or response text, since both
 /// can hold event content.
-// Most variants are produced by the HTTP client in later changes.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtractError {
     NotLoopback(IpAddr),
@@ -91,8 +89,6 @@ pub struct ModelIdentity {
     pub model_sha256: String,
 }
 
-// Read by the sidecar client and the cache wrapper in later changes.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ExtractRequest {
     pub system: String,
@@ -200,6 +196,7 @@ impl SidecarClient {
         })
     }
 
+    #[cfg(test)]
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self

@@ -21,6 +21,7 @@ use liam_model::Embedder;
 use liam_store::{DefaultGraph, RetentionPolicy, SharedLog};
 use tokio_util::sync::CancellationToken;
 
+use crate::extraction::setup::{self as extraction_setup, sweep_stale_sidecar, DaemonFiles};
 use crate::mcp::MemoryServer;
 use crate::shutdown::Shutdown;
 use crate::{maintenance_steps, Resynthesis};
@@ -65,6 +66,28 @@ pub struct JobSetup<'a> {
     pub shutdown: &'a Shutdown,
 }
 
+/// The hook parts a run calls: extraction when the config turns it on. A model
+/// server an earlier daemon left behind is cleared first, whether extraction is
+/// on or off, when the server's path is configured.
+fn hooks_for(setup: &JobSetup<'_>) -> anyhow::Result<ConsolidationHookSet> {
+    let config = &setup.config.extraction;
+    sweep_stale_sidecar(config, setup.database_path);
+    if !config.enabled {
+        return Ok(ConsolidationHookSet::default());
+    }
+    let files = DaemonFiles {
+        database_path: setup.database_path,
+        log_dir: setup.log_dir,
+        permits: setup.server.generation_permits_handle(),
+        stopping: setup.shutdown.token(),
+    };
+    let extraction = extraction_setup::build(config, files)?;
+    Ok(ConsolidationHookSet {
+        extraction: Some(Arc::new(extraction)),
+        ..Default::default()
+    })
+}
+
 /// The consolidation job as the daemon runs it, on a schedule and at start.
 pub struct ConsolidationJob {
     consolidator: Consolidator,
@@ -77,14 +100,11 @@ pub struct ConsolidationJob {
 impl ConsolidationJob {
     /// # Errors
     ///
-    /// Fails when the snapshot directory cannot be resolved.
+    /// Fails when the snapshot directory cannot be resolved, or when extraction
+    /// is on and its response cache or the event log cannot be opened.
     pub fn new(setup: JobSetup<'_>) -> anyhow::Result<Self> {
-        Self::with_parts(
-            setup,
-            Arc::new(StoreProbes),
-            None,
-            ConsolidationHookSet::default(),
-        )
+        let hooks = hooks_for(&setup)?;
+        Self::with_parts(setup, Arc::new(StoreProbes), None, hooks)
     }
 
     /// The job over the given probe runner, hooks and, when given, reopener,
