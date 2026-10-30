@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use super::corpus::{
     generate, ExpectedFact, LabelledEvent, Template, CORPUS_SEED, CYCLE_LEN, EVENT_COUNT,
@@ -332,6 +333,7 @@ async fn run_plumbing(events: &[LabelledEvent], faults: &BTreeMap<usize, Fault>)
         free_ram: &PlentyOfRam,
         write_source: WRITE_SOURCE,
         deadline: Instant::now() + RUN_BUDGET,
+        stopping: &CancellationToken::new(),
         window_end: LogOffset {
             segment: 0,
             index: EVENT_COUNT as u64,
