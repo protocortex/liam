@@ -76,6 +76,7 @@ fn server_archive(dir: &Path, with_server: bool) -> Vec<u8> {
     let root = dir.join("src").join(STUB_ROOT_DIR);
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("libggml.dylib"), b"lib").unwrap();
+    std::os::unix::fs::symlink("libggml.dylib", root.join("libggml.0.dylib")).unwrap();
     if with_server {
         fs::write(root.join(SERVER_BINARY), STUB_SERVER_SCRIPT).unwrap();
         fs::set_permissions(root.join(SERVER_BINARY), fs::Permissions::from_mode(0o755)).unwrap();
@@ -268,36 +269,117 @@ fn server_archive_without_the_binary_is_rejected_and_leaves_nothing() {
     assert!(files_in(&bin).is_empty());
 }
 
+/// Builds a gzip tarball whose single risky entry is described by `kind`.
+fn unsafe_archive(dir: &Path, kind: &str) -> Vec<u8> {
+    let work = dir.join("work");
+    fs::create_dir_all(work.join("root")).unwrap();
+    fs::write(work.join("x"), b"x").unwrap();
+    let archive = dir.join("evil.tar.gz");
+    let mut tar = Command::new("tar");
+    tar.arg("-czPf").arg(&archive).arg("-C").arg(&work);
+    match kind {
+        "absolute" => tar.arg(work.join("x")),
+        "parent" => tar.arg("root/../x"),
+        "symlink_out" => {
+            std::os::unix::fs::symlink("/etc/passwd", work.join("root/link")).unwrap();
+            tar.arg("root/link")
+        }
+        "symlink_up" => {
+            std::os::unix::fs::symlink("../x", work.join("root/link")).unwrap();
+            tar.arg("root/link")
+        }
+        other => panic!("unknown kind {other}"),
+    };
+    assert!(tar.status().unwrap().success());
+    fs::read(archive).unwrap()
+}
+
 #[test]
-fn server_archive_with_an_absolute_entry_is_rejected() {
+fn server_archive_with_an_unsafe_entry_is_rejected() {
+    for (kind, message) in [
+        ("absolute", "unsafe entry"),
+        ("parent", "unsafe entry"),
+        ("symlink_out", "unsafe link"),
+        ("symlink_up", "unsafe link"),
+    ] {
+        // Arrange
+        let temp = TempDir::new().unwrap();
+        let archive = unsafe_archive(temp.path(), kind);
+        let sha = sha_of(&archive);
+        let fetcher = FakeFetcher::serving(&archive);
+        let bin = temp.path().join("bin");
+
+        // Act
+        let error = install_server(
+            &fetcher,
+            &asset("https://x/s", &sha, &archive),
+            &bin.join("llama-test"),
+        )
+        .unwrap_err();
+
+        // Assert
+        assert!(error.to_string().contains(message), "{kind}: {error}");
+        assert!(files_in(&bin).is_empty(), "{kind}");
+    }
+}
+
+#[test]
+fn concurrent_model_installs_never_publish_unverified_bytes() {
     // Arrange
     let temp = TempDir::new().unwrap();
-    let outside = temp.path().join("outside.txt");
-    fs::write(&outside, b"x").unwrap();
-    let archive_path = temp.path().join("evil.tar.gz");
-    let status = Command::new("tar")
-        .arg("-czPf")
-        .arg(&archive_path)
-        .arg(&outside)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let archive = fs::read(&archive_path).unwrap();
-    let sha = sha_of(&archive);
-    let fetcher = FakeFetcher::serving(&archive);
-    let bin = temp.path().join("bin");
+    let body = b"gguf stub".to_vec();
+    let sha = sha_of(&body);
+    let wrong = sha_of(b"other");
+    let dest = temp.path().join("extraction.gguf");
 
     // Act
-    let error = install_server(
-        &fetcher,
-        &asset("https://x/s", &sha, &archive),
-        &bin.join("llama-test"),
-    )
-    .unwrap_err();
+    let results: Vec<bool> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..6)
+            .map(|n| {
+                let (body, dest) = (&body, &dest);
+                let (sha, wrong) = (&sha, &wrong);
+                scope.spawn(move || {
+                    let fetcher = FakeFetcher::serving(body);
+                    let expected = if n == 5 { wrong } else { sha };
+                    install_model(&fetcher, &asset("https://x/m", expected, body), dest).is_ok()
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
 
     // Assert
-    assert!(error.to_string().contains("unsafe entry"), "{error}");
-    assert!(files_in(&bin).is_empty());
+    assert_eq!(results.iter().filter(|ok| !**ok).count(), 1);
+    assert_eq!(fs::read(&dest).unwrap(), body);
+    assert_eq!(files_in(temp.path()), ["extraction.gguf"]);
+}
+
+#[test]
+fn concurrent_server_installs_leave_one_complete_directory() {
+    // Arrange
+    let temp = TempDir::new().unwrap();
+    let archive = server_archive(temp.path(), true);
+    let sha = sha_of(&archive);
+    let dir = temp.path().join("bin").join("llama-test");
+
+    // Act
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let (archive, sha, dir) = (&archive, &sha, &dir);
+                scope.spawn(move || {
+                    let fetcher = FakeFetcher::serving(archive);
+                    install_server(&fetcher, &asset("https://x/s", sha, archive), dir)
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+
+    // Assert
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    assert!(is_executable_file(&dir.join(SERVER_BINARY)));
+    assert_eq!(files_in(dir.parent().unwrap()), ["llama-test"]);
 }
 
 #[test]
@@ -367,6 +449,37 @@ fn pinned_constants_are_well_formed() {
         assert!(pinned.size_bytes > 0, "{name} size");
     }
     assert!(SERVER_ASSET.url.contains(SERVER_TAG));
+}
+
+#[test]
+fn pinned_assets_name_the_expected_release_and_repository() {
+    // Arrange
+    let server_url = format!(
+        "https://github.com/ggml-org/llama.cpp/releases/download/{SERVER_TAG}/\
+         llama-{SERVER_TAG}-bin-macos-arm64.tar.gz"
+    );
+    let model_prefix = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/";
+    let revision = MODEL_ASSET
+        .url
+        .strip_prefix(model_prefix)
+        .and_then(|rest| rest.strip_suffix("/Qwen3.5-4B-Q4_K_M.gguf"))
+        .expect("model url has an unexpected repository or file name");
+
+    // Act / Assert
+    assert_eq!(SERVER_TAG, "b11860");
+    assert_eq!(SERVER_ASSET.url, server_url);
+    assert_eq!(revision.len(), 40);
+    assert!(revision.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(
+        SERVER_ASSET.sha256,
+        "204fe983df733653d1045d0dfb768f5604c18f8f2859ed804a561a54311a3a9d"
+    );
+    assert_eq!(
+        MODEL_ASSET.sha256,
+        "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+    );
+    assert_eq!(SERVER_ASSET.size_bytes, 16_245_641);
+    assert_eq!(MODEL_ASSET.size_bytes, 2_740_937_888);
 }
 
 #[test]

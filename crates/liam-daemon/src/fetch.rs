@@ -17,6 +17,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
@@ -56,6 +57,7 @@ pub const MODEL_ASSET: Asset<'static> = Asset {
 
 const SERVER_BINARY: &str = "llama-server";
 const PARTIAL_SUFFIX: &str = ".partial";
+const UNPACKED_SUFFIX: &str = ".unpacked";
 const SUPPORTED_OS: &str = "macos";
 const SUPPORTED_ARCH: &str = "aarch64";
 const EXECUTABLE_BITS: u32 = 0o111;
@@ -100,10 +102,12 @@ pub fn install_model(
     if hash_matches(dest, asset) {
         return Ok(Installed::AlreadyPresent);
     }
-    let partial = partial_path(dest);
+    let partial = unique_sibling(dest, PARTIAL_SUFFIX);
     download_verified(fetcher, asset, &partial)?;
-    fs::rename(&partial, dest)
-        .with_context(|| format!("moving the model into {}", dest.display()))?;
+    fs::rename(&partial, dest).map_err(|error| {
+        let _ = fs::remove_file(&partial);
+        anyhow::Error::new(error).context(format!("moving the model into {}", dest.display()))
+    })?;
     debug!(path = %dest.display(), "fetch: model installed");
     Ok(Installed::Downloaded)
 }
@@ -119,22 +123,32 @@ pub fn install_server(
     if is_executable_file(&dir.join(SERVER_BINARY)) {
         return Ok(Installed::AlreadyPresent);
     }
-    let archive = partial_path(dir);
-    let unpacked = unpacked_path(dir);
-    let result = unpack_server(fetcher, asset, &archive, &unpacked).and_then(|()| {
-        if dir.exists() {
-            fs::remove_dir_all(dir).with_context(|| format!("replacing {}", dir.display()))?;
-        }
-        fs::rename(&unpacked, dir)
-            .with_context(|| format!("moving the server into {}", dir.display()))
-    });
+    let archive = unique_sibling(dir, PARTIAL_SUFFIX);
+    let unpacked = unique_sibling(dir, UNPACKED_SUFFIX);
+    let result = unpack_server(fetcher, asset, &archive, &unpacked)
+        .and_then(|()| publish_server(&unpacked, dir));
     let _ = fs::remove_file(&archive);
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&unpacked);
-    }
-    result?;
+    // On success the directory was renamed away; on a lost race it is ours to drop.
+    let _ = fs::remove_dir_all(&unpacked);
+    let outcome = result?;
     debug!(path = %dir.display(), "fetch: server installed");
-    Ok(Installed::Downloaded)
+    Ok(outcome)
+}
+
+/// Moves the unpacked directory into place. A directory that is there without
+/// a server in it is a leftover and is replaced; a complete one, put there by a
+/// concurrent install, wins and is left alone.
+fn publish_server(unpacked: &Path, dir: &Path) -> anyhow::Result<Installed> {
+    if dir.exists() && !is_executable_file(&dir.join(SERVER_BINARY)) {
+        fs::remove_dir_all(dir).with_context(|| format!("replacing {}", dir.display()))?;
+    }
+    match fs::rename(unpacked, dir) {
+        Ok(()) => Ok(Installed::Downloaded),
+        Err(_) if is_executable_file(&dir.join(SERVER_BINARY)) => Ok(Installed::AlreadyPresent),
+        Err(error) => {
+            Err(error).with_context(|| format!("moving the server into {}", dir.display()))
+        }
+    }
 }
 
 fn unpack_server(
@@ -145,9 +159,6 @@ fn unpack_server(
 ) -> anyhow::Result<()> {
     download_verified(fetcher, asset, archive)?;
     reject_unsafe_entries(archive)?;
-    if unpacked.exists() {
-        fs::remove_dir_all(unpacked)?;
-    }
     fs::create_dir_all(unpacked)?;
     let status = Command::new("tar")
         .arg("-xzf")
@@ -169,10 +180,42 @@ fn unpack_server(
 }
 
 /// The archive is hash-pinned, so this is a second line of defence: no entry
-/// may name an absolute path or climb out of the target directory.
+/// may name an absolute path or climb out of the target directory, and no link
+/// may point outside it. The release itself holds relative symlinks between
+/// its libraries, so those stay allowed.
 fn reject_unsafe_entries(archive: &Path) -> anyhow::Result<()> {
+    for name in list_archive(archive, "-tzf")? {
+        ensure!(
+            !escapes(&name),
+            "the server archive has an unsafe entry: {name}"
+        );
+    }
+    for line in list_archive(archive, "-tvzf")? {
+        let hard_link = line.starts_with('h');
+        let symlink_target = line
+            .starts_with('l')
+            .then(|| line.split_once(LINK_ARROW).map(|(_, target)| target));
+        let unsafe_link = hard_link || symlink_target.is_some_and(|t| t.is_none_or(escapes));
+        ensure!(
+            !unsafe_link,
+            "the server archive has an unsafe link: {line}"
+        );
+    }
+    Ok(())
+}
+
+const LINK_ARROW: &str = " -> ";
+
+fn escapes(name: &str) -> bool {
+    Path::new(name).is_absolute()
+        || Path::new(name)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+}
+
+fn list_archive(archive: &Path, flags: &str) -> anyhow::Result<Vec<String>> {
     let listing = Command::new("tar")
-        .arg("-tzf")
+        .arg(flags)
         .arg(archive)
         .output()
         .context("running tar to list the server archive")?;
@@ -180,14 +223,10 @@ fn reject_unsafe_entries(archive: &Path) -> anyhow::Result<()> {
         listing.status.success(),
         "tar could not read the server archive"
     );
-    for name in String::from_utf8_lossy(&listing.stdout).lines() {
-        let escapes = Path::new(name).is_absolute()
-            || Path::new(name)
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir));
-        ensure!(!escapes, "the server archive has an unsafe entry: {name}");
-    }
-    Ok(())
+    Ok(String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Downloads `asset` to `partial`, checks size and hash, and leaves the file
@@ -200,7 +239,6 @@ fn download_verified(
     if let Some(parent) = partial.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let _ = fs::remove_file(partial);
     let result = write_and_check(fetcher, asset, partial);
     if result.is_err() {
         let _ = fs::remove_file(partial);
@@ -255,17 +293,14 @@ fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn partial_path(dest: &Path) -> PathBuf {
-    sibling_with_suffix(dest, PARTIAL_SUFFIX)
-}
+static NEXT_TEMP_SERIAL: AtomicU64 = AtomicU64::new(0);
 
-fn unpacked_path(dest: &Path) -> PathBuf {
-    sibling_with_suffix(dest, ".unpacked")
-}
-
-fn sibling_with_suffix(dest: &Path, suffix: &str) -> PathBuf {
+/// A name beside `dest` no other run can pick, so concurrent installs never
+/// touch each other's unverified bytes.
+fn unique_sibling(dest: &Path, suffix: &str) -> PathBuf {
     let mut name = dest.as_os_str().to_owned();
-    name.push(suffix);
+    let serial = NEXT_TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
+    name.push(format!("{suffix}-{}-{serial}", std::process::id()));
     PathBuf::from(name)
 }
 
