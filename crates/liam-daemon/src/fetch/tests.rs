@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::io::Read;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use tempfile::TempDir;
 
@@ -495,4 +498,198 @@ fn url_shape_check_rejects_typos() {
         assert!(!is_well_formed_https_url(bad), "{bad}");
     }
     assert!(is_well_formed_https_url("https://example.com/a?b=c"));
+}
+
+/// A loopback HTTP server: `/ok`, `/redirect`, `/loop`, `/big` and a 404.
+struct Loopback {
+    port: u16,
+    requests: Arc<AtomicUsize>,
+}
+
+const OK_BODY: &[u8] = b"payload";
+const BIG_BODY_BYTES: usize = 1 << 20;
+
+impl Loopback {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || serve(stream, port));
+            }
+        });
+        Self { port, requests }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+}
+
+fn serve(mut stream: TcpStream, port: u16) {
+    let mut request = Vec::new();
+    let mut byte = [0u8; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        if stream.read(&mut byte).unwrap_or(0) == 0 {
+            return;
+        }
+        request.push(byte[0]);
+    }
+    let path = String::from_utf8_lossy(&request)
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_owned();
+    let (head, body): (String, Vec<u8>) = match path.as_str() {
+        "/ok" => ("200 OK".into(), OK_BODY.to_vec()),
+        "/redirect" => (
+            format!("302 Found\r\nLocation: http://127.0.0.1:{port}/ok"),
+            Vec::new(),
+        ),
+        "/loop" => (
+            format!("302 Found\r\nLocation: http://127.0.0.1:{port}/loop"),
+            Vec::new(),
+        ),
+        "/big" => ("200 OK".into(), vec![0; BIG_BODY_BYTES]),
+        _ => ("404 Not Found".into(), Vec::new()),
+    };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(&body);
+}
+
+fn fetch_bytes(fetcher: &CurlFetcher, url: &str, max: u64) -> anyhow::Result<Vec<u8>> {
+    let mut sink = Vec::new();
+    fetcher.fetch(url, max, &mut sink)?;
+    Ok(sink)
+}
+
+#[test]
+fn curl_fetcher_returns_the_body() {
+    // Arrange
+    let server = Loopback::start();
+
+    // Act
+    let body = fetch_bytes(&CurlFetcher::plain_http(), &server.url("/ok"), 1024).unwrap();
+
+    // Assert
+    assert_eq!(body, OK_BODY);
+}
+
+#[test]
+fn curl_fetcher_follows_a_redirect() {
+    // Arrange
+    let server = Loopback::start();
+
+    // Act
+    let body = fetch_bytes(&CurlFetcher::plain_http(), &server.url("/redirect"), 1024).unwrap();
+
+    // Assert
+    assert_eq!(body, OK_BODY);
+}
+
+#[test]
+fn curl_fetcher_gives_up_on_a_redirect_loop() {
+    // Arrange
+    let server = Loopback::start();
+
+    // Act
+    let error = fetch_bytes(&CurlFetcher::plain_http(), &server.url("/loop"), 1024).unwrap_err();
+
+    // Assert
+    assert!(error.to_string().contains("curl failed"), "{error}");
+    assert!(server.requests.load(Ordering::SeqCst) <= 7);
+}
+
+#[test]
+fn curl_fetcher_stops_at_the_size_cap() {
+    // Arrange
+    let server = Loopback::start();
+    let mut sink = Vec::new();
+
+    // Act
+    let error = CurlFetcher::plain_http()
+        .fetch(&server.url("/big"), 1000, &mut sink)
+        .unwrap_err();
+
+    // Assert
+    assert!(error.to_string().contains("larger than"), "{error}");
+    assert!(sink.len() <= 1000);
+}
+
+#[test]
+fn curl_fetcher_reports_an_http_error() {
+    // Arrange
+    let server = Loopback::start();
+
+    // Act
+    let error = fetch_bytes(&CurlFetcher::plain_http(), &server.url("/missing"), 1024).unwrap_err();
+
+    // Assert
+    assert!(error.to_string().contains("curl failed"), "{error}");
+}
+
+#[test]
+fn https_only_fetcher_refuses_plain_http_without_connecting() {
+    // Arrange
+    let server = Loopback::start();
+
+    // Act
+    let result = fetch_bytes(&CurlFetcher::https_only(), &server.url("/ok"), 1024);
+
+    // Assert
+    assert!(result.is_err());
+    assert_eq!(server.requests.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn https_only_fetcher_restricts_redirects_and_ignores_curlrc() {
+    // Arrange / Act
+    let args = CurlFetcher::https_only().command_args("https://example.com/a");
+
+    // Assert
+    assert_eq!(args[0], "-q");
+    for flag in ["--proto", "--proto-redir"] {
+        let at = args.iter().position(|arg| arg == flag).unwrap();
+        assert_eq!(args[at + 1], "=https", "{flag}");
+    }
+    assert_eq!(args.last().unwrap(), "https://example.com/a");
+}
+
+/// Downloads the real server archive and checks the pin. Run with
+/// `cargo test -p liam-daemon -- --ignored real_server_asset`.
+#[test]
+#[ignore = "downloads the pinned llama.cpp release over the network"]
+fn real_server_asset_matches_its_pin() {
+    // Arrange
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().join("llama");
+
+    // Act
+    let outcome = install_server(&CurlFetcher::https_only(), &SERVER_ASSET, &dir).unwrap();
+
+    // Assert
+    assert_eq!(outcome, Installed::Downloaded);
+    assert!(is_executable_file(&dir.join(SERVER_BINARY)));
+}
+
+/// Downloads the real model (about 2.7 GB) and checks the pin.
+#[test]
+#[ignore = "downloads the pinned model, several gigabytes"]
+fn real_model_asset_matches_its_pin() {
+    // Arrange
+    let temp = TempDir::new().unwrap();
+    let dest = temp.path().join("extraction.gguf");
+
+    // Act
+    let outcome = install_model(&CurlFetcher::https_only(), &MODEL_ASSET, &dest).unwrap();
+
+    // Assert
+    assert_eq!(outcome, Installed::Downloaded);
 }
