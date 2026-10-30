@@ -12,6 +12,8 @@
 //! `LICENSE` is kept inside the installed release directory) and
 //! `Qwen3.5-4B` is Apache-2.0.
 
+mod curl;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -22,6 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
 use tracing::debug;
+
+pub use curl::CurlFetcher;
 
 /// The `llama.cpp` release the sidecar is tested against. The server's flags,
 /// environment variables and authentication behaviour were checked on this
