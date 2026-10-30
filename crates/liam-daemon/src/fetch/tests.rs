@@ -404,6 +404,137 @@ fn server_already_installed_is_not_downloaded_again() {
     assert_eq!(fetcher.calls(), 1);
 }
 
+fn extraction(enabled: bool, llm_enabled: bool) -> ExtractionConfig {
+    ExtractionConfig {
+        enabled,
+        llm_enabled,
+        ..ExtractionConfig::default()
+    }
+}
+
+/// Serves the server archive for the `/s` URL and the model bytes otherwise.
+struct RoutedFetcher {
+    server: Vec<u8>,
+    model: Vec<u8>,
+    urls: std::sync::Mutex<Vec<String>>,
+}
+
+impl Fetcher for RoutedFetcher {
+    fn fetch(&self, url: &str, _max: u64, sink: &mut dyn Write) -> anyhow::Result<()> {
+        self.urls.lock().unwrap().push(url.to_owned());
+        let body = if url.ends_with("/s") {
+            &self.server
+        } else {
+            &self.model
+        };
+        Ok(sink.write_all(body)?)
+    }
+}
+
+#[test]
+fn extraction_files_are_not_fetched_when_extraction_is_off() {
+    // Arrange
+    let temp = TempDir::new().unwrap();
+    let fetcher = FakeFetcher::serving(b"unused");
+    let mut out = Vec::new();
+
+    // Act
+    fetch_extraction(
+        &extraction(false, true),
+        temp.path().to_str().unwrap(),
+        &fetcher,
+        &PINNED,
+        &mut out,
+    )
+    .unwrap();
+
+    // Assert
+    assert_eq!(fetcher.calls(), 0);
+    assert!(out.is_empty());
+    assert!(files_in(temp.path()).is_empty());
+}
+
+#[test]
+fn extraction_with_rules_only_fetches_nothing() {
+    // Arrange / Act / Assert
+    assert!(!wants_files(&extraction(true, false)));
+    assert!(wants_files(&extraction(true, true)));
+    assert!(!wants_files(&extraction(false, true)));
+}
+
+#[test]
+fn extraction_enabled_fetches_the_server_and_the_model() {
+    // Arrange
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let scratch = temp.path().join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    let server = server_archive(&scratch, true);
+    let model = b"gguf stub".to_vec();
+    let (server_sha, model_sha) = (sha_of(&server), sha_of(&model));
+    let pinned = Pinned {
+        server: asset("https://x/s", &server_sha, &server),
+        model: asset("https://x/m", &model_sha, &model),
+    };
+    let fetcher = RoutedFetcher {
+        server,
+        model,
+        urls: Default::default(),
+    };
+    let mut out = Vec::new();
+
+    // Act
+    fetch_extraction(
+        &extraction(true, true),
+        home.to_str().unwrap(),
+        &fetcher,
+        &pinned,
+        &mut out,
+    )
+    .unwrap();
+
+    // Assert
+    assert_eq!(fetcher.urls.lock().unwrap().len(), 2);
+    let server_path = default_server_dir(home.to_str().unwrap()).join(SERVER_BINARY);
+    assert!(is_executable_file(&server_path));
+    assert!(default_model_path(home.to_str().unwrap()).is_file());
+    let report = String::from_utf8(out).unwrap();
+    assert!(report.contains("llama_server_path"), "{report}");
+}
+
+#[test]
+fn a_server_configured_elsewhere_is_kept() {
+    // Arrange
+    let temp = TempDir::new().unwrap();
+    let model = b"gguf stub".to_vec();
+    let model_sha = sha_of(&model);
+    let pinned = Pinned {
+        server: asset("https://x/s", "unused", b""),
+        model: asset("https://x/m", &model_sha, &model),
+    };
+    let fetcher = RoutedFetcher {
+        server: Vec::new(),
+        model,
+        urls: Default::default(),
+    };
+    let mut config = extraction(true, true);
+    config.llama_server_path = Some("/opt/own/llama-server".into());
+    let mut out = Vec::new();
+
+    // Act
+    fetch_extraction(
+        &config,
+        temp.path().to_str().unwrap(),
+        &fetcher,
+        &pinned,
+        &mut out,
+    )
+    .unwrap();
+
+    // Assert
+    assert_eq!(*fetcher.urls.lock().unwrap(), ["https://x/m"]);
+}
+
 #[test]
 fn platform_check_accepts_only_apple_silicon_macos() {
     // Arrange
@@ -660,6 +791,85 @@ fn https_only_fetcher_restricts_redirects_and_ignores_curlrc() {
         assert_eq!(args[at + 1], "=https", "{flag}");
     }
     assert_eq!(args.last().unwrap(), "https://example.com/a");
+}
+
+/// Runs `packaging/install.sh` from a scratch copy of an unpacked release, with
+/// a stub `liam` that records its arguments.
+struct InstallRun {
+    status: std::process::ExitStatus,
+    stderr: String,
+    recorded_args: Option<String>,
+}
+
+fn run_install_script(platform: &str, extra: &[&str]) -> InstallRun {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("release");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/install.sh");
+    fs::copy(script, src.join("install.sh")).unwrap();
+    for name in ["liamd", "liam.toml", "dev.protocortex.liamd.plist"] {
+        fs::write(src.join(name), "stub").unwrap();
+    }
+    let recorded = temp.path().join("args.txt");
+    let stub = format!("#!/bin/sh\necho \"$@\" > '{}'\n", recorded.display());
+    fs::write(src.join("liam"), stub).unwrap();
+    fs::set_permissions(src.join("liam"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new("sh")
+        .arg(src.join("install.sh"))
+        .arg("--prefix")
+        .arg(temp.path().join("bin"))
+        .arg("--no-launchd")
+        .args(extra)
+        .env("HOME", &home)
+        .env("LIAM_PLATFORM_OVERRIDE", platform)
+        .output()
+        .unwrap();
+    InstallRun {
+        status: output.status,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        recorded_args: fs::read_to_string(recorded).ok(),
+    }
+}
+
+#[test]
+fn install_script_fetches_models_through_the_cli() {
+    // Arrange / Act
+    let run = run_install_script("Darwin/arm64", &[]);
+
+    // Assert
+    assert!(run.status.success(), "{}", run.stderr);
+    let args = run.recorded_args.expect("liam was not invoked");
+    assert!(args.starts_with("fetch-models --config "), "{args}");
+    assert!(args.trim_end().ends_with("/.liam/liam.toml"), "{args}");
+}
+
+#[test]
+fn install_script_skips_the_fetch_when_asked() {
+    // Arrange / Act
+    let run = run_install_script("Darwin/arm64", &["--skip-models"]);
+
+    // Assert
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(run.recorded_args.is_none());
+}
+
+#[test]
+fn install_script_rejects_an_unsupported_platform() {
+    // Arrange / Act
+    let run = run_install_script("Linux/x86_64", &[]);
+
+    // Assert
+    assert_eq!(run.status.code(), Some(1));
+    assert!(
+        run.stderr
+            .contains("macOS on Apple Silicon only, found Linux/x86_64"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.recorded_args.is_none());
 }
 
 /// Downloads the real server archive and checks the pin. Run with
