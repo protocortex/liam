@@ -42,3 +42,71 @@ Concerns `zip`'s `ZipArchive::extract` only. `zip` 8.x is pinned by the latest
 fastembed calls `extract`. Drop this entry once candle moves to `zip` 9. The
 same advisory is ignored in deny.toml.
 """
+
+# The zip 8.6.0 and block-buffer 0.10.4 entries below expire on 2027-01-30, so
+# they get re-checked against newer candle releases instead of lingering.
+
+[[IgnoredVulns]]
+id = "GHSA-m665-v7pm-7grj"
+ignoreUntil = 2027-01-30
+reason = """
+`zip` parser differential (CVSS 10.0) between `ZipArchive` and
+`ZipStreamReader`, which matters when a streaming extractor writes files to disk
+using local header names. Only candle-core reads zip files here, and only
+through `ZipArchive::new` with `by_name` and `by_index` on local `.npz` and
+`.pt` model files. Nothing calls `ZipStreamReader`, `extract` or
+`shallow_copy_file`, and nothing writes archive entries to disk. candle-core
+0.11.0 pins `zip` 8.6.0 and zip 9 is semver incompatible, so no fixed version is
+reachable until candle releases with `zip` 9. Drop this entry then.
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-hjqx-j4rw-g7xv"
+ignoreUntil = 2027-01-30
+reason = """
+Symlink path escape in `ZipArchive::extract`. Nothing in candle or fastembed
+calls `extract`. `zip` 8.x is pinned by candle-core 0.11.0. Drop this entry once
+candle moves to `zip` 9.
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-q7v9-x93c-xqv3"
+ignoreUntil = 2027-01-30
+reason = """
+Unbounded symlink buffer allocation in `ZipArchive::extract`. Nothing in candle
+or fastembed calls `extract`. `zip` 8.x is pinned by candle-core 0.11.0. Drop
+this entry once candle moves to `zip` 9.
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-9hj8-73fh-9963"
+ignoreUntil = 2027-01-30
+reason = """
+Shrink decoder panic, reachable only with the `legacy-zip` feature and
+`ZipArchive::extract`. candle-core depends on `zip` with default features off,
+so `legacy-zip` is not compiled, and nothing calls `extract`. Drop this entry
+once candle moves to `zip` 9.
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-8hxf-qr8p-62x4"
+ignoreUntil = 2027-01-30
+reason = """
+Missing HMAC check on truncated AES-encrypted entries. AES needs the
+`aes-crypto` feature, which candle-core leaves off (`default-features = false`),
+and the model files read here are not encrypted. Drop this entry once candle
+moves to `zip` 9.
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+ignoreUntil = 2027-01-30
+reason = """
+`block-buffer` 0.10.4 has no fixed version. The flaw needs a caught panic inside
+a buffer callback followed by continued use of the buffer. This version is
+pulled only by `sha2` 0.10 under `cudaforge`, a build dependency of
+`candle-kernels` that exists only with the optional `cuda` feature. It runs at
+build time and never ships in the daemon. The shipped `sha2` 0.11 uses
+`block-buffer` 0.12.1. Drop this entry once candle moves off `cudaforge`'s old
+`sha2`.
+"""
