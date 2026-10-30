@@ -562,11 +562,12 @@ fn print_report(
 fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
     println!("config: {}", config_path.display());
 
-    let wants_embedder = config.embedder.provider == "local";
-    let wants_llm = config.llm.provider == "llama-cpp";
-    let wants_extraction = fetch::wants_files(&config.extraction);
+    let home = std::env::var("HOME").unwrap_or_default();
+    // Fails before any download when the packaged server cannot run here.
+    let plan =
+        fetch::FetchPlan::for_host(config, &home, std::env::consts::OS, std::env::consts::ARCH)?;
 
-    if !wants_embedder && !wants_llm && !wants_extraction {
+    if plan.is_empty() {
         // `Config::load` falls back to built-in defaults when the file is
         // absent, and both of those defaults are mock. So a mistyped
         // `--config` arrives here looking exactly like a deliberately mock
@@ -591,14 +592,7 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
             config.llm.provider
         );
     }
-    if wants_extraction {
-        // Checked before any download so a wrong host fails in seconds.
-        fetch::check_platform(std::env::consts::OS, std::env::consts::ARCH)?;
-    }
-
-    let home = std::env::var("HOME").unwrap_or_default();
-
-    if wants_embedder {
+    if plan.embedder {
         println!("embedder: {}", config.embedder.model);
         if let Some(cache_dir) = models::export_fastembed_cache_dir(config)? {
             println!("  cache_dir -> {}", cache_dir.display());
@@ -609,7 +603,7 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
         println!("embedder: ready, with its reranker");
     }
 
-    if wants_llm {
+    if plan.llm {
         let cache_dir =
             models::resolve_path_with_home("llm.cache_dir", &config.llm.cache_dir, &home)?;
         println!(
@@ -624,7 +618,7 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
         println!("llm: ready");
     }
 
-    if wants_extraction {
+    if plan.extraction.is_some() {
         fetch::fetch_extraction(
             &config.extraction,
             &home,
