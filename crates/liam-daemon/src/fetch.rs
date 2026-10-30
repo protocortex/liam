@@ -25,6 +25,9 @@ use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
+use crate::config::ExtractionConfig;
+use crate::models;
+
 pub use curl::CurlFetcher;
 
 /// The `llama.cpp` release the sidecar is tested against. The server's flags,
@@ -59,7 +62,23 @@ pub const MODEL_ASSET: Asset<'static> = Asset {
     size_bytes: 2_740_937_888,
 };
 
+/// Everything `fetch_extraction` downloads.
+#[derive(Debug, Clone, Copy)]
+pub struct Pinned<'a> {
+    pub server: Asset<'a>,
+    pub model: Asset<'a>,
+}
+
+pub const PINNED: Pinned<'static> = Pinned {
+    server: SERVER_ASSET,
+    model: MODEL_ASSET,
+};
+
 const SERVER_BINARY: &str = "llama-server";
+const LIAM_DIR: &str = ".liam";
+const BIN_DIR: &str = "bin";
+const MODELS_DIR: &str = "models";
+const DEFAULT_MODEL_FILE: &str = "extraction.gguf";
 const PARTIAL_SUFFIX: &str = ".partial";
 const UNPACKED_SUFFIX: &str = ".unpacked";
 const SUPPORTED_OS: &str = "macos";
@@ -94,6 +113,89 @@ pub fn check_platform(os: &str, arch: &str) -> anyhow::Result<()> {
          to a GGUF file instead"
     );
     Ok(())
+}
+
+/// Fetches whatever extraction needs that is not already on disk, reporting
+/// each step on `out`. Does nothing for a config that has no model pass.
+pub fn fetch_extraction(
+    config: &ExtractionConfig,
+    home: &str,
+    fetcher: &dyn Fetcher,
+    pinned: &Pinned<'_>,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    if !wants_files(config) {
+        return Ok(());
+    }
+    let server_dir = default_server_dir(home);
+    let default_server = server_dir.join(SERVER_BINARY);
+    let configured_server = configured_path(
+        "extraction.llama_server_path",
+        &config.llama_server_path,
+        home,
+    )?;
+    let model_path = match configured_path("extraction.model_gguf", &config.model_gguf, home)? {
+        Some(path) => path,
+        None => default_model_path(home),
+    };
+
+    writeln!(out, "extraction server: llama.cpp {SERVER_TAG}")?;
+    match &configured_server {
+        Some(path) if *path != default_server => {
+            writeln!(out, "  keeping your own server at {}", path.display())?;
+        }
+        _ => {
+            let outcome = install_server(fetcher, &pinned.server, &server_dir)?;
+            writeln!(out, "  {outcome:?}: {}", default_server.display())?;
+        }
+    }
+
+    writeln!(out, "extraction model: {}", model_path.display())?;
+    let outcome = install_model(fetcher, &pinned.model, &model_path)?;
+    writeln!(out, "  {outcome:?}")?;
+
+    if configured_server.is_none() || config.model_gguf.is_none() {
+        writeln!(
+            out,
+            "set these under [extraction] in liam.toml so the daemon finds them:\n  \
+             llama_server_path = \"{}\"\n  model_gguf = \"{}\"",
+            default_server.display(),
+            model_path.display()
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether extraction needs files at all: the model pass is the only part
+/// that does.
+pub fn wants_files(config: &ExtractionConfig) -> bool {
+    config.enabled && config.llm_enabled
+}
+
+fn configured_path(
+    key: &str,
+    value: &Option<String>,
+    home: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    value
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .map(|text| models::resolve_path_with_home(key, text, home).map(PathBuf::from))
+        .transpose()
+}
+
+fn default_server_dir(home: &str) -> PathBuf {
+    Path::new(home)
+        .join(LIAM_DIR)
+        .join(BIN_DIR)
+        .join(format!("llama-{SERVER_TAG}"))
+}
+
+fn default_model_path(home: &str) -> PathBuf {
+    Path::new(home)
+        .join(LIAM_DIR)
+        .join(MODELS_DIR)
+        .join(DEFAULT_MODEL_FILE)
 }
 
 /// Installs the GGUF at `dest`. A file already there with the pinned hash is
