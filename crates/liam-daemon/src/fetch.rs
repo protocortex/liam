@@ -25,7 +25,7 @@ use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use crate::config::ExtractionConfig;
+use crate::config::{Config, ExtractionConfig};
 use crate::models;
 
 pub use curl::CurlFetcher;
@@ -108,11 +108,83 @@ pub enum Installed {
 pub fn check_platform(os: &str, arch: &str) -> anyhow::Result<()> {
     ensure!(
         os == SUPPORTED_OS && arch == SUPPORTED_ARCH,
-        "the extraction server is packaged for macOS on Apple Silicon only, found {os}/{arch}; \
-         set extraction.llama_server_path to your own llama-server build and extraction.model_gguf \
-         to a GGUF file instead"
+        "the packaged llama-server runs on macOS on Apple Silicon only, found {os}/{arch}; \
+         point extraction.llama_server_path at your own llama-server build instead"
     );
     Ok(())
+}
+
+/// Where one extraction file comes from: downloaded to a default location, or
+/// already at a path the config names, which is never overwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Install(PathBuf),
+    Keep(PathBuf),
+}
+
+/// The extraction files a fetch handles: the server directory and the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionTargets {
+    pub server: Target,
+    pub model: Target,
+}
+
+/// Which parts of `liam fetch-models` the config asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FetchPlan {
+    pub embedder: bool,
+    pub llm: bool,
+    pub extraction: Option<ExtractionTargets>,
+}
+
+impl FetchPlan {
+    /// Decides from the config, and fails before any download when the packaged
+    /// server would have to be installed on a host it does not run on.
+    pub fn for_host(config: &Config, home: &str, os: &str, arch: &str) -> anyhow::Result<Self> {
+        let extraction = extraction_targets(&config.extraction, home)?;
+        if let Some(ExtractionTargets {
+            server: Target::Install(_),
+            ..
+        }) = &extraction
+        {
+            check_platform(os, arch)?;
+        }
+        Ok(Self {
+            embedder: config.embedder.provider == "local",
+            llm: config.llm.provider == "llama-cpp",
+            extraction,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.embedder && !self.llm && self.extraction.is_none()
+    }
+}
+
+/// `None` when extraction needs no files. A path that is not the default
+/// location is the user's own file and is kept.
+pub fn extraction_targets(
+    config: &ExtractionConfig,
+    home: &str,
+) -> anyhow::Result<Option<ExtractionTargets>> {
+    if !wants_files(config) {
+        return Ok(None);
+    }
+    let server_dir = default_server_dir(home);
+    let server = match configured_path(
+        "extraction.llama_server_path",
+        &config.llama_server_path,
+        home,
+    )? {
+        Some(path) if path != server_dir.join(SERVER_BINARY) => Target::Keep(path),
+        _ => Target::Install(server_dir),
+    };
+    let default_model = default_model_path(home);
+    let model = match configured_path("extraction.model_gguf", &config.model_gguf, home)? {
+        Some(path) if path != default_model => Target::Keep(path),
+        _ => Target::Install(default_model),
+    };
+    Ok(Some(ExtractionTargets { server, model }))
 }
 
 /// Fetches whatever extraction needs that is not already on disk, reporting
@@ -124,44 +196,24 @@ pub fn fetch_extraction(
     pinned: &Pinned<'_>,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    if !wants_files(config) {
+    let Some(targets) = extraction_targets(config, home)? else {
         return Ok(());
-    }
-    let server_dir = default_server_dir(home);
-    let default_server = server_dir.join(SERVER_BINARY);
-    let configured_server = configured_path(
-        "extraction.llama_server_path",
-        &config.llama_server_path,
-        home,
-    )?;
-    let model_path = match configured_path("extraction.model_gguf", &config.model_gguf, home)? {
-        Some(path) => path,
-        None => default_model_path(home),
     };
-
     writeln!(out, "extraction server: llama.cpp {SERVER_TAG}")?;
-    match &configured_server {
-        Some(path) if *path != default_server => {
-            writeln!(out, "  keeping your own server at {}", path.display())?;
+    match &targets.server {
+        Target::Install(dir) => {
+            let outcome = install_server(fetcher, &pinned.server, dir)?;
+            writeln!(out, "  {outcome:?}: {}", dir.join(SERVER_BINARY).display())?;
         }
-        _ => {
-            let outcome = install_server(fetcher, &pinned.server, &server_dir)?;
-            writeln!(out, "  {outcome:?}: {}", default_server.display())?;
-        }
+        Target::Keep(path) => writeln!(out, "  keeping your own server at {}", path.display())?,
     }
-
-    writeln!(out, "extraction model: {}", model_path.display())?;
-    let outcome = install_model(fetcher, &pinned.model, &model_path)?;
-    writeln!(out, "  {outcome:?}")?;
-
-    if configured_server.is_none() || config.model_gguf.is_none() {
-        writeln!(
-            out,
-            "set these under [extraction] in liam.toml so the daemon finds them:\n  \
-             llama_server_path = \"{}\"\n  model_gguf = \"{}\"",
-            default_server.display(),
-            model_path.display()
-        )?;
+    writeln!(out, "extraction model: Qwen3.5 4B Q4_K_M")?;
+    match &targets.model {
+        Target::Install(path) => {
+            let outcome = install_model(fetcher, &pinned.model, path)?;
+            writeln!(out, "  {outcome:?}: {}", path.display())?;
+        }
+        Target::Keep(path) => writeln!(out, "  keeping your own model at {}", path.display())?,
     }
     Ok(())
 }

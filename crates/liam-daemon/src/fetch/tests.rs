@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
+use crate::config::Config;
+
 use super::*;
 
 const STUB_SERVER_SCRIPT: &str = "#!/bin/sh\nexit 0\n";
@@ -499,7 +501,7 @@ fn extraction_enabled_fetches_the_server_and_the_model() {
     assert!(is_executable_file(&server_path));
     assert!(default_model_path(home.to_str().unwrap()).is_file());
     let report = String::from_utf8(out).unwrap();
-    assert!(report.contains("llama_server_path"), "{report}");
+    assert!(report.contains("Downloaded"), "{report}");
 }
 
 #[test]
@@ -533,6 +535,114 @@ fn a_server_configured_elsewhere_is_kept() {
 
     // Assert
     assert_eq!(*fetcher.urls.lock().unwrap(), ["https://x/m"]);
+}
+
+#[test]
+fn a_model_configured_elsewhere_is_kept() {
+    // Arrange
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().to_str().unwrap();
+    let own_model = temp.path().join("own.gguf");
+    fs::write(&own_model, b"mine").unwrap();
+    let server = server_archive(temp.path(), true);
+    let server_sha = sha_of(&server);
+    let pinned = Pinned {
+        server: asset("https://x/s", &server_sha, &server),
+        model: asset("https://x/m", "unused", b""),
+    };
+    let fetcher = RoutedFetcher {
+        server,
+        model: Vec::new(),
+        urls: Default::default(),
+    };
+    let mut config = extraction(true, true);
+    config.model_gguf = Some(own_model.to_string_lossy().into_owned());
+    let mut out = Vec::new();
+
+    // Act
+    fetch_extraction(&config, home, &fetcher, &pinned, &mut out).unwrap();
+
+    // Assert
+    assert_eq!(*fetcher.urls.lock().unwrap(), ["https://x/s"]);
+    assert_eq!(fs::read(&own_model).unwrap(), b"mine");
+    assert!(!default_model_path(home).exists());
+    assert!(String::from_utf8(out)
+        .unwrap()
+        .contains("keeping your own model"));
+}
+
+fn config_with(extraction: ExtractionConfig) -> Config {
+    Config {
+        extraction,
+        ..Config::default()
+    }
+}
+
+fn plan_for(config: &Config, os: &str, arch: &str) -> anyhow::Result<FetchPlan> {
+    FetchPlan::for_host(config, "/home/test", os, arch)
+}
+
+#[test]
+fn only_extraction_enabled_plans_the_extraction_files_with_mock_providers() {
+    // Arrange
+    let config = config_with(extraction(true, true));
+    assert_eq!(config.embedder.provider, "mock");
+    assert_eq!(config.llm.provider, "mock");
+
+    // Act
+    let plan = plan_for(&config, "macos", "aarch64").unwrap();
+
+    // Assert
+    assert!(!plan.is_empty());
+    assert!(!plan.embedder && !plan.llm);
+    assert_eq!(
+        plan.extraction,
+        Some(ExtractionTargets {
+            server: Target::Install(default_server_dir("/home/test")),
+            model: Target::Install(default_model_path("/home/test")),
+        })
+    );
+}
+
+#[test]
+fn mock_providers_with_extraction_off_plan_nothing() {
+    // Arrange
+    let config = config_with(extraction(true, false));
+
+    // Act
+    let plan = plan_for(&config, "linux", "x86_64").unwrap();
+
+    // Assert
+    assert!(plan.is_empty());
+}
+
+#[test]
+fn installing_the_packaged_server_on_another_platform_fails_before_any_download() {
+    // Arrange
+    let config = config_with(extraction(true, true));
+
+    // Act
+    let error = plan_for(&config, "linux", "x86_64").unwrap_err();
+
+    // Assert
+    assert!(error.to_string().contains("linux/x86_64"), "{error}");
+}
+
+#[test]
+fn an_own_server_needs_no_supported_platform() {
+    // Arrange
+    let config = config_with(ExtractionConfig {
+        llama_server_path: Some("/opt/own/llama-server".into()),
+        ..extraction(true, true)
+    });
+
+    // Act
+    let plan = plan_for(&config, "linux", "x86_64").unwrap();
+
+    // Assert
+    let targets = plan.extraction.unwrap();
+    assert_eq!(targets.server, Target::Keep("/opt/own/llama-server".into()));
+    assert!(matches!(targets.model, Target::Install(_)));
 }
 
 #[test]

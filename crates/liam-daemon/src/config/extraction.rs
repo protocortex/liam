@@ -169,6 +169,21 @@ impl ExtractionConfig {
 
     /// The model pass cannot start without the model and the server that runs
     /// it, so an incomplete setup fails at load, not on every run.
+    /// Expands `~` in the two file paths here, once, so every reader (the
+    /// sidecar start, the stale sweep, the model hash, `liam fetch-models`)
+    /// sees the same absolute path.
+    pub(super) fn expand_paths(&mut self, home: &str) -> anyhow::Result<()> {
+        for (key, value) in [
+            ("extraction.llama_server_path", &mut self.llama_server_path),
+            ("extraction.model_gguf", &mut self.model_gguf),
+        ] {
+            if let Some(text) = value.as_deref() {
+                *value = Some(crate::models::resolve_path_with_home(key, text, home)?);
+            }
+        }
+        Ok(())
+    }
+
     fn validate_model_files(&self) -> anyhow::Result<()> {
         if !(self.enabled && self.llm_enabled) {
             return Ok(());
