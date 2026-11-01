@@ -13,7 +13,7 @@ use super::{
 use crate::backend::BackendTx;
 use crate::error::{Error, Result};
 use crate::ids::{NodeId, FOREVER};
-use crate::types::relation;
+use crate::types::{relation, Derivation};
 use crate::value::Value;
 
 /// One statement of a projection, in the order it runs.
@@ -24,6 +24,13 @@ pub(super) enum Step {
         tx_to: i64,
     },
     Node(NodeRow),
+    /// Sets a written node's derivation. A live write adds it after `Node`
+    /// because the logged row does not carry one yet; `steps_for` never yields
+    /// it, so a replay leaves the column default.
+    Derivation {
+        id: String,
+        derivation: Derivation,
+    },
     Edge(EdgeRow),
     /// An edge written only while both ends are live and no live twin exists.
     GuardedEdge(EdgeRow),
@@ -93,6 +100,13 @@ pub(super) async fn apply_steps(
             Step::Node(row) => {
                 let (sql, params) = node_row_insert(row);
                 tx.execute(&sql, &params).await?;
+            }
+            Step::Derivation { id, derivation } => {
+                tx.execute(
+                    "UPDATE nodes SET derivation = ?1 WHERE id = ?2",
+                    &[derivation.as_str().into(), id.as_str().into()],
+                )
+                .await?;
             }
             Step::Edge(row) => {
                 tx.execute(EDGE_ROW_INSERT_SQL, &edge_row_params(row))

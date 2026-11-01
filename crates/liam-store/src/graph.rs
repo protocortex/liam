@@ -619,6 +619,16 @@ impl<B: Backend> Graph<B> {
             "TEXT NOT NULL DEFAULT 'unknown'",
         )
         .await?;
+        // Same shape of fix for `derivation`; the backfill then marks the
+        // entity pages that were written before the column existed.
+        crate::migrate::add_column_if_missing(
+            &backend,
+            "nodes",
+            "derivation",
+            "TEXT NOT NULL DEFAULT 'recorded'",
+        )
+        .await?;
+        crate::migrate::backfill_derivation(&backend, clock.now()).await?;
         // Gives an existing database the ON DELETE CASCADE that the DDL above
         // only grants a fresh one, by rebuilding the referencing tables
         // (ADR-0003). Detects and no-ops on a database that already has it.
@@ -2290,6 +2300,7 @@ mod tests {
     mod backfill;
     mod backwards_clock;
     mod catch_up;
+    mod derivation;
     mod fact_arbitration;
     mod fact_batch;
     mod fact_log;
