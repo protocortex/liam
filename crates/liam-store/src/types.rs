@@ -135,6 +135,128 @@ pub struct EventRef {
     pub synthetic: bool,
 }
 
+/// What a summary was made from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildKind {
+    Node,
+    Summary,
+}
+
+impl ChildKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Summary => "summary",
+        }
+    }
+}
+
+/// One child of a summary: a node at level 1, a lower summary above that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummaryChild {
+    pub id: String,
+    pub kind: ChildKind,
+}
+
+/// A summary to store. Its identity in the tree is the child set, so the
+/// children are given beside it and the store derives the `child_hash`.
+#[derive(Clone, Debug)]
+pub struct NewSummary {
+    pub level: u8,
+    /// '' for the unscoped tree.
+    pub scope: String,
+    pub text: String,
+    /// How many of the summary's source events had their item text in the prompt.
+    pub events_fed: u32,
+    pub valid_min: Millis,
+    pub valid_max: Millis,
+    pub model_id: String,
+    pub prompt_version: String,
+}
+
+/// What `put_summary` did. Both carry the id of the live row for the child set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PutOutcome {
+    Inserted(String),
+    /// A live row already covers this child set; nothing was written.
+    Unchanged(String),
+}
+
+/// A stored summary version.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Summary {
+    pub id: String,
+    pub level: u8,
+    pub scope: String,
+    pub child_hash: String,
+    pub text: InferredText,
+    pub derivation: Derivation,
+    pub events_fed: u32,
+    pub valid_min: Millis,
+    pub valid_max: Millis,
+    pub model_id: String,
+    pub prompt_version: String,
+    pub tx_from: Millis,
+    pub tx_to: Millis,
+}
+
+/// Whether a summary's events cover its children's, and how many of them are
+/// real log events. A closure of synthetic events only proves nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosureReport {
+    /// Children with an event the summary's own events lack.
+    pub uncovered_children: Vec<String>,
+    pub real_events: usize,
+    pub synthetic_events: usize,
+}
+
+impl ClosureReport {
+    pub fn is_closed(&self) -> bool {
+        self.uncovered_children.is_empty()
+    }
+}
+
+/// How often generation for one child set has failed, under the prompt and model
+/// that failed. A different prompt or model starts the count again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummaryFailure {
+    pub failures: u32,
+    pub last_error: String,
+    pub prompt_version: String,
+    pub model_id: String,
+}
+
+/// Where the last full build of one tree level left off, for the re-cluster policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeState {
+    pub scope: String,
+    pub level: u8,
+    pub last_full_build_at: Millis,
+    pub baseline_item_count: u32,
+    pub unattached_count: u32,
+}
+
+/// A live recorded or extracted node, as the tree builder reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SummaryInput {
+    pub id: NodeId,
+    pub kind: String,
+    pub label: String,
+    pub content: RecordedText,
+    pub valid_from: Millis,
+    pub scope: Option<String>,
+    pub origin_events: Vec<EventRef>,
+    pub vector: Vec<f32>,
+}
+
+/// The items of one scope that can be summarized.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SummaryInputs {
+    pub items: Vec<SummaryInput>,
+    /// Live nodes left out because they have no stored vector.
+    pub skipped_no_vector: usize,
+}
+
 /// A node to insert. Embedding is optional and supplied by the caller.
 #[derive(Clone, Debug)]
 pub struct NewNode {

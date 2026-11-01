@@ -23,6 +23,15 @@ pub enum Error {
     #[error("unknown derivation: {0}")]
     UnknownDerivation(String),
 
+    /// A summary was offered with no source events, so it could not be traced.
+    /// Names the child set, never the summary text.
+    #[error("the summary for child set {0} has no source events")]
+    SummaryWithoutSources(String),
+
+    /// A summary that was to be closed is not open: unknown, or closed already.
+    #[error("summary {0} is not open")]
+    SummaryNotOpen(String),
+
     #[error("no live node matches handle {0}")]
     HandleNotFound(String),
 
