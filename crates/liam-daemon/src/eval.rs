@@ -406,14 +406,12 @@ mod run {
         let llm = load_llm().await;
         let (system, user) = crate::ask::build_ask_prompt(
             "Which storage engine does LIAM use?",
-            &[crate::ask::Evidence {
-                kind: "decision".to_string(),
-                label: "Storage engine".to_string(),
-                content: "LIAM stores all memory in libSQL, a single-file SQLite fork.".to_string(),
-                valid_from_ms: 0,
-                confidence: 1.0,
-                attributes: None,
-            }],
+            &[crate::ask::Evidence::recorded(
+                "decision",
+                "Storage engine",
+                "LIAM stores all memory in libSQL, a single-file SQLite fork.",
+                0,
+            )],
         );
         let out = llm.complete(&system, &user).await.expect("completion");
         println!("--- raw model output ({} chars) ---\n{out}\n---", out.len());
@@ -478,6 +476,7 @@ mod run {
                     scope: None,
                     k: Some(4),
                     as_of: None,
+                    mode: None,
                 }))
                 .await;
             let elapsed = started.elapsed().as_secs_f64();
