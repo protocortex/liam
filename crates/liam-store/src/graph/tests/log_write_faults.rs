@@ -82,13 +82,15 @@ const OPS: [Op; 7] = [
 ];
 
 impl Op {
-    /// How many statements the path's transaction runs: its rows, one hash
-    /// index upsert per distinct row hash it carries, and the cursor last.
+    /// How many statements the path's transaction runs: its rows, one origin
+    /// event per node, one hash index upsert per distinct row hash it carries,
+    /// and the cursor last.
     fn statements(self) -> usize {
         match self {
-            Op::Insert | Op::UpsertInsert | Op::Relate | Op::Link => 3,
-            Op::UpsertSupersede | Op::Supersede => 6,
-            Op::Episode => 12,
+            Op::Relate | Op::Link => 3,
+            Op::Insert | Op::UpsertInsert => 4,
+            Op::UpsertSupersede | Op::Supersede => 7,
+            Op::Episode => 14,
         }
     }
 }

@@ -23,6 +23,7 @@ use liam_log::LogOffset;
 
 use super::logged_plan::{event, STORE_TRUST};
 use super::logged_write::{abandon, commit_or_abandon, HeldLog};
+use super::projection::{origin_steps, steps_for};
 use super::rebuild::{stored_edge, stored_node, EDGE_COLUMNS, NODE_COLUMNS};
 use super::replay::{for_each_unvoided, row_effects};
 use super::Graph;
@@ -35,7 +36,7 @@ use crate::value::{Row, Value};
 /// Rows one query reads, and rows logged between two saves of the resume point.
 const BACKFILL_BATCH: usize = 500;
 
-const BACKFILL_SOURCE: &str = "backfill";
+pub(super) const BACKFILL_SOURCE: &str = "backfill";
 
 /// What one backfill run did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -365,7 +366,9 @@ impl<B: Backend> Graph<B> {
                 }
                 // The resume point commits with the row that reaches it.
                 let tx = self.begin_saving(due.as_ref()).await?;
-                self.append_and_commit(tx, held, event, &[]).await?;
+                // The row is already stored, so only its origin is written.
+                let origin = origin_steps(&event, &steps_for(&event.payload));
+                self.append_and_commit(tx, held, event, &origin).await?;
                 match phase {
                     Phase::Nodes => run.report.nodes_logged += 1,
                     Phase::Edges | Phase::Supersedes => run.report.edges_logged += 1,

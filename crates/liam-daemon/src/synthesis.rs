@@ -69,6 +69,15 @@ pub fn build_synthesis_prompt(
     (system, user)
 }
 
+/// A synthesized profile and how many of the given mentions reached the prompt.
+#[derive(Debug)]
+pub struct Synthesis {
+    pub profile: String,
+    /// The mentions kept, which are the first of the list given: trimming to the
+    /// budget drops from the end.
+    pub mentions_kept: usize,
+}
+
 /// Acquire a permit from the same semaphore `ask` uses, trim `mentions` to
 /// `context_tokens`, then synthesize a profile capped at `max_new_tokens`.
 #[allow(clippy::too_many_arguments)] // each argument is a distinct value, no natural grouping
@@ -82,7 +91,7 @@ pub async fn synthesize_entity(
     mentions: &[Evidence],
     context_tokens: usize,
     max_new_tokens: usize,
-) -> Result<String> {
+) -> Result<Synthesis> {
     let acquire_start = tokio::time::Instant::now();
     let _permit =
         match tokio::time::timeout_at(deadline, aimd.generation_permits.clone().acquire_owned())
@@ -139,7 +148,10 @@ pub async fn synthesize_entity(
     // an ungrounded page compounds rather than being scoped to one response.
     let vocabulary_seed = format!("{entity_kind} {entity_label}");
     if is_grounded(&profile, &vocabulary_seed, mentions) {
-        Ok(profile)
+        Ok(Synthesis {
+            profile,
+            mentions_kept: mentions.len(),
+        })
     } else {
         Err(ModelError::Llm(
             "the synthesized profile was not grounded in the mentions".to_string(),
@@ -286,7 +298,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
         // Act
-        synthesize_entity(
+        let synthesis = synthesize_entity(
             &llm,
             &aimd,
             &window,
@@ -301,6 +313,7 @@ mod tests {
         .expect("recording llm never errors");
 
         // Assert
+        assert_eq!(synthesis.mentions_kept, 1);
         let sent = llm.last_user_prompt();
         assert!(sent.contains("Works as an engineer."));
         assert!(!sent.contains("Lives in Lisbon."));

@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use super::log_cursor;
 use super::logged_plan::{Dedup, Plan, Table};
-use super::projection::{apply_steps, Step};
+use super::projection::{apply_steps, unlogged, Step};
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
@@ -207,7 +207,7 @@ impl<B: Backend> Graph<B> {
             let plan = prepare(&mut *tx, now).await?;
             match plan.dedup.and_then(|dedup| dedup.refusal_if_absent) {
                 Some(refusal) => Err(refusal),
-                None => Ok(plan.steps),
+                None => Ok(unlogged(plan.steps)),
             }
         }
         .await;

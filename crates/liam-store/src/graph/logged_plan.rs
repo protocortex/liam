@@ -17,7 +17,7 @@ use liam_log::hash::{edge_row_hash, node_row_hash};
 use uuid::Uuid;
 
 use super::logged_write::{ready, WriteOutcome};
-use super::projection::{edge_guards, steps_for, Step};
+use super::projection::{edge_guards, origin_steps, steps_for, Step};
 use super::{
     collision_producer, edge_exists_message, edge_refusal, open_by_subject_query, open_node_query,
     resolve_episode_ref, resolve_node_row, Graph, EMPTY_ATTRIBUTES,
@@ -25,7 +25,7 @@ use super::{
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
-use crate::types::{relation, Derivation, EpisodeEdge, NewNode};
+use crate::types::{relation, Derivation, EpisodeEdge, EventRef, EventRole, NewNode};
 use crate::value::Value;
 
 /// Source and trust of a record no producer wrote, such as an edge.
@@ -82,6 +82,7 @@ impl Table {
             Table::Nodes => &[
                 concat!("DELETE FROM edges WHERE ", edges_of_node!()),
                 "DELETE FROM node_community WHERE node_id = ?1",
+                "DELETE FROM node_events WHERE node_id = ?1",
                 "DELETE FROM nodes WHERE id = ?1",
             ],
             Table::Edges => &["DELETE FROM edges WHERE id = ?1"],
@@ -109,6 +110,23 @@ impl Table {
     }
 }
 
+/// What a write stores about a node beyond the row it logs.
+struct Annotation {
+    id: String,
+    derivation: Derivation,
+    basis: Vec<EventRef>,
+}
+
+impl Annotation {
+    fn of(id: &NodeId, node: &NewNode) -> Self {
+        Self {
+            id: id.as_str().to_string(),
+            derivation: node.derivation,
+            basis: node.basis.clone(),
+        }
+    }
+}
+
 /// How a write is checked against the live carrier of its content.
 pub(super) struct Dedup {
     /// Where a live carrier of the event's content hash makes the write a
@@ -128,7 +146,8 @@ pub(super) struct Plan {
 
 impl Plan {
     fn new(event: LogEvent) -> Self {
-        let steps = steps_for(&event.payload);
+        let mut steps = steps_for(&event.payload);
+        steps.extend(origin_steps(&event, &steps));
         Self {
             event,
             steps,
@@ -136,14 +155,26 @@ impl Plan {
         }
     }
 
-    /// Marks the node `id` with `derivation` when it is not the column default.
-    fn derived(mut self, id: &str, derivation: Derivation) -> Self {
+    /// Adds what the logged row does not carry about the node it writes: a
+    /// derivation other than the column default, and its basis events.
+    fn annotated(mut self, extra: Annotation) -> Self {
+        let Annotation {
+            id,
+            derivation,
+            basis,
+        } = extra;
         if derivation != Derivation::Recorded {
             self.steps.push(Step::Derivation {
-                id: id.to_string(),
+                id: id.clone(),
                 derivation,
             });
         }
+        self.steps
+            .extend(basis.into_iter().map(|event| Step::NodeEvent {
+                node_id: id.clone(),
+                event,
+                role: EventRole::Basis,
+            }));
         self
     }
 
@@ -440,7 +471,7 @@ fn differing_attributes(stored: &str, given: &str) -> Vec<String> {
 struct EpisodeNode {
     row: NodeRow,
     collision: Option<Collision>,
-    derivation: Derivation,
+    annotation: Annotation,
 }
 
 /// An `ingest_episode`. Nothing is written yet, so a node that replaces an
@@ -451,32 +482,30 @@ async fn plan_episode(
     edges: Vec<EdgeRow>,
     now: Millis,
 ) -> Result<Plan> {
-    let derived: Vec<(String, Derivation)> = nodes
-        .iter()
-        .map(|node| (node.row.id.clone(), node.derivation))
-        .collect();
     let mut effects = Vec::new();
+    let mut annotations = Vec::new();
     for node in nodes {
-        stage_node(tx, &mut effects, node, now).await?;
+        annotations.push(node.annotation);
+        stage_node(tx, &mut effects, node.row, node.collision, now).await?;
     }
     effects.extend(edges.into_iter().map(RowEffect::Edge));
     let plan = Plan::episode(effects, now);
-    Ok(derived
+    Ok(annotations
         .into_iter()
-        .fold(plan, |plan, (id, derivation)| plan.derived(&id, derivation)))
+        .fold(plan, |plan, extra| plan.annotated(extra)))
 }
 
 async fn stage_node(
     tx: &mut dyn BackendTx,
     effects: &mut Vec<RowEffect>,
-    node: EpisodeNode,
+    mut row: NodeRow,
+    collision: Option<Collision>,
     now: Millis,
 ) -> Result<()> {
-    let superseded = match &node.collision {
+    let superseded = match &collision {
         Some(collision) => find_competitor(tx, effects, collision).await?,
         None => None,
     };
-    let mut row = node.row;
     let link = superseded.map(|old| succeed(&mut row, &old, now));
     effects.push(RowEffect::Node(row));
     effects.extend(link.map(RowEffect::Edge));
@@ -521,7 +550,7 @@ impl<B: Backend> Graph<B> {
             .project(|_, now| {
                 let row = resolve_node_row(id, node, now);
                 let plan =
-                    row.map(|row| Plan::node_write(row, now).derived(id.as_str(), node.derivation));
+                    row.map(|row| Plan::node_write(row, now).annotated(Annotation::of(id, node)));
                 ready(plan)
             })
             .await?;
@@ -537,10 +566,10 @@ impl<B: Backend> Graph<B> {
         let outcome = self
             .project(|tx, now| {
                 let row = resolve_node_row(&id, node, now);
-                let (id, derivation) = (id.as_str().to_string(), node.derivation);
+                let extra = Annotation::of(&id, node);
                 Box::pin(async move {
                     let plan = plan_upsert(tx, row?, collision, now).await?;
-                    Ok(plan.derived(&id, derivation))
+                    Ok(plan.annotated(extra))
                 })
             })
             .await?;
@@ -553,10 +582,10 @@ impl<B: Backend> Graph<B> {
             .project(|tx, now| {
                 let row = resolve_node_row(&id, node, now);
                 let old = old.clone();
-                let (id, derivation) = (id.as_str().to_string(), node.derivation);
+                let extra = Annotation::of(&id, node);
                 Box::pin(async move {
                     let plan = plan_supersede(tx, row?, &old, now).await?;
-                    Ok(plan.derived(&id, derivation))
+                    Ok(plan.annotated(extra))
                 })
             })
             .await?;
@@ -655,7 +684,7 @@ fn episode_nodes(ids: &[NodeId], nodes: &[NewNode], now: Millis) -> Result<Vec<E
             Ok(EpisodeNode {
                 row: resolve_node_row(id, node, now)?,
                 collision: Collision::of(node),
-                derivation: node.derivation,
+                annotation: Annotation::of(id, node),
             })
         })
         .collect()

@@ -17,7 +17,7 @@ use std::time::Duration;
 use liam_daemon::consolidation::shared_store::SharedStore;
 use liam_model::{Embedder, Llm, Reranker, TextKind};
 use liam_store::types::{EpisodeEdge, EpisodeRef};
-use liam_store::{relation, DefaultGraph, NewNode, Query, Vocabulary};
+use liam_store::{relation, DefaultGraph, EventRef, EventRole, NewNode, Query, Vocabulary};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
@@ -89,6 +89,19 @@ const MAX_EPISODE_ITEMS: usize = 100;
 /// Safety cap on `Graph::mentions` reads per triggered entity: generous
 /// relative to `MAX_EPISODE_ITEMS`, not a tuning knob.
 const MENTIONS_FETCH_LIMIT: usize = 200;
+
+/// The origin events of `mentions`, each listed once, for the page written from
+/// them.
+async fn mention_basis(
+    store: &DefaultGraph,
+    mentions: &[liam_store::Candidate],
+) -> liam_store::Result<Vec<EventRef>> {
+    let mut basis = std::collections::BTreeSet::new();
+    for mention in mentions {
+        basis.extend(store.node_event_ids(&mention.id, EventRole::Origin).await?);
+    }
+    Ok(basis.into_iter().collect())
+}
 
 /// Cap on entity-page synthesis output: a short compiled profile, not a
 /// full answer. Measured real output was ~55 tokens / ~270 chars.
@@ -1072,12 +1085,12 @@ impl MemoryServer {
             Err(e) => return Err(format!("{}: {e}", entity_id.as_str())),
         };
         let label = candidate.label.clone();
-        let mentions: Vec<ask::Evidence> =
-            match store.mentions(&entity_id, now, MENTIONS_FETCH_LIMIT).await {
-                Ok(rows) => rows.iter().map(ask::Evidence::from_candidate).collect(),
-                Err(e) => return Err(format!("{label}: {e}")),
-            };
-        let new_content = match synthesis::synthesize_entity(
+        let rows = match store.mentions(&entity_id, now, MENTIONS_FETCH_LIMIT).await {
+            Ok(rows) => rows,
+            Err(e) => return Err(format!("{label}: {e}")),
+        };
+        let mentions: Vec<ask::Evidence> = rows.iter().map(ask::Evidence::from_candidate).collect();
+        let synthesized = match synthesis::synthesize_entity(
             &*self.llm,
             &self.aimd_handles(),
             &self.rolling_window,
@@ -1090,7 +1103,12 @@ impl MemoryServer {
         )
         .await
         {
-            Ok(content) => content,
+            Ok(synthesized) => synthesized,
+            Err(e) => return Err(format!("{label}: {e}")),
+        };
+        let new_content = synthesized.profile;
+        let basis = match mention_basis(store, &rows[..synthesized.mentions_kept]).await {
+            Ok(basis) => basis,
             Err(e) => return Err(format!("{label}: {e}")),
         };
         let embedding = match self.embedder.embed(&new_content, TextKind::Document).await {
@@ -1100,6 +1118,7 @@ impl MemoryServer {
         let mut node = NewNode::entity(candidate.kind, candidate.label)
             .with_attributes(candidate.attributes)
             .with_embedding(embedding)
+            .with_basis(basis)
             .with_producer(write_source.map_or_else(|| self.producer(), str::to_owned));
         if let Some(scope) = candidate.scope.clone() {
             node = node.with_scope(scope);
@@ -3630,6 +3649,113 @@ mod tests {
         let calls = embedder.calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].1, TextKind::Document);
+    }
+
+    /// A page that mentions three facts: two written in one episode, so one
+    /// event, and a third written on its own.
+    async fn page_with_three_mentions(store: &DefaultGraph) -> liam_store::NodeId {
+        let page = store
+            .upsert_by(NewNode::entity("person", "Kim"))
+            .await
+            .unwrap();
+        let episode = store
+            .ingest_episode(
+                vec![
+                    NewNode::now("fact", "Role", "Kim works as an engineer."),
+                    NewNode::now("fact", "Home", "Kim lives in Lisbon."),
+                ],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let alone = store
+            .insert(NewNode::now("fact", "Pet", "Kim has a cat."))
+            .await
+            .unwrap();
+        for id in episode.node_ids.iter().chain([&alone]) {
+            store.relate(&page, id, relation::MENTIONS).await.unwrap();
+        }
+        page
+    }
+
+    /// The basis of the live page labelled Kim.
+    async fn basis_of_kim(store: &DefaultGraph) -> Vec<EventRef> {
+        let hits = store
+            .query_explained(&Query::text("person Kim"))
+            .await
+            .unwrap();
+        let written = hits
+            .iter()
+            .find(|h| h.hit.label == "Kim")
+            .expect("resynthesized page missing");
+        store
+            .node_event_ids(&written.hit.id, EventRole::Basis)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resynthesize_entity_lists_each_mentions_origin_event_once_as_the_pages_basis() {
+        // Arrange
+        let llm = Arc::new(CountingLlm::new());
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm).await;
+        let store = server.store().await.unwrap();
+        let page = page_with_three_mentions(&store).await;
+        let mut expected = std::collections::BTreeSet::new();
+        for mention in store
+            .mentions(&page, liam_store::Millis::now(), 10)
+            .await
+            .unwrap()
+        {
+            expected.extend(
+                store
+                    .node_event_ids(&mention.id, EventRole::Origin)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        server
+            .resynthesize_entity(page, deadline, ENTITY_SYNTHESIS_MAX_NEW_TOKENS)
+            .await
+            .expect("resynthesis should succeed");
+
+        // Assert
+        assert_eq!(expected.len(), 2);
+        assert_eq!(
+            basis_of_kim(&store).await,
+            expected.into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn resynthesize_entity_leaves_a_mention_the_budget_dropped_out_of_the_basis() {
+        // Arrange: a context budget that keeps only the first mention
+        let llm = Arc::new(CountingLlm::new());
+        let server =
+            server_with_timeout(Arc::new(liam_model::IdentityReranker), llm, 30, false, 1).await;
+        let store = server.store().await.unwrap();
+        let page = page_with_three_mentions(&store).await;
+        let mentions = store
+            .mentions(&page, liam_store::Millis::now(), 10)
+            .await
+            .unwrap();
+        let kept = store
+            .node_event_ids(&mentions[0].id, EventRole::Origin)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        // Act
+        server
+            .resynthesize_entity(page, deadline, ENTITY_SYNTHESIS_MAX_NEW_TOKENS)
+            .await
+            .expect("resynthesis should succeed");
+
+        // Assert
+        assert_eq!(basis_of_kim(&store).await, kept);
     }
 
     #[tokio::test]
