@@ -89,8 +89,8 @@ pub(super) fn origin_steps(event: &LogEvent, steps: &[Step]) -> Vec<Step> {
         .collect()
 }
 
-/// `steps` for a write that no log records, where an event id names nothing a
-/// log could produce again.
+/// `steps` for a write that no log records, where an origin event id names
+/// nothing a log could produce again. A basis event keeps the flag it came with.
 pub(super) fn unlogged(steps: Vec<Step>) -> Vec<Step> {
     steps
         .into_iter()
@@ -98,13 +98,13 @@ pub(super) fn unlogged(steps: Vec<Step>) -> Vec<Step> {
             Step::NodeEvent {
                 node_id,
                 mut event,
-                role,
+                role: EventRole::Origin,
             } => {
                 event.synthetic = true;
                 Step::NodeEvent {
                     node_id,
                     event,
-                    role,
+                    role: EventRole::Origin,
                 }
             }
             other => other,

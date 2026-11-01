@@ -148,6 +148,25 @@ async fn a_node_written_with_a_basis_lists_it_apart_from_its_origin() {
 }
 
 #[tokio::test]
+async fn a_basis_event_keeps_its_flag_when_the_write_has_no_log() {
+    // Arrange
+    let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(DIMS), clock())
+        .await
+        .unwrap();
+    let basis = vec![real("backed-by-a-log")];
+
+    // Act
+    let page = g
+        .insert(NewNode::entity("person", "Ada").with_basis(basis.clone()))
+        .await
+        .unwrap();
+
+    // Assert
+    let listed = g.node_event_ids(&page, EventRole::Basis).await.unwrap();
+    assert_eq!(listed, basis);
+}
+
+#[tokio::test]
 async fn a_legacy_node_with_no_listed_events_reads_as_empty() {
     // Arrange
     let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(DIMS), clock())
