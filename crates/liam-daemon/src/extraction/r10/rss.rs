@@ -23,7 +23,13 @@ fn tree_rss_bytes(system: &mut System, root: Pid) -> u64 {
     let mut members = BTreeSet::from([root]);
     loop {
         let before = members.len();
-        for (pid, process) in system.processes() {
+        // On Linux sysinfo lists each thread as a process that shares its
+        // owner's memory, which would count that memory once per thread.
+        for (pid, process) in system
+            .processes()
+            .iter()
+            .filter(|(_, process)| process.thread_kind().is_none())
+        {
             if process
                 .parent()
                 .is_some_and(|parent| members.contains(&parent))
