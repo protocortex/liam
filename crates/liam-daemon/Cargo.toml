@@ -88,6 +88,8 @@ sysinfo = "0.37"
 raunch = "1.0.1"
 
 [dev-dependencies]
+# Tests build typed hits and text without a store.
+liam-store = { path = "../liam-store", features = ["test-support"] }
 # storelock tests need an isolated, disposable directory per test.
 tempfile = "3"
 # Test log writers implement `LogWriter`, whose `log_id` returns a `Uuid`.

@@ -139,7 +139,9 @@ fn build_query(
     embedding: Option<Vec<f32>>,
     as_of: Option<i64>,
 ) -> Query {
-    let mut q = Query::text(text.to_string()).with_k(k.unwrap_or(8));
+    let mut q = Query::text(text.to_string())
+        .with_k(k.unwrap_or(8))
+        .with_inferred(true);
     if let Some(e) = embedding {
         q = q.with_embedding(e);
     }
@@ -1150,7 +1152,10 @@ impl MemoryServer {
         if hits.is_empty() {
             return "no relevant memory".to_string();
         }
-        let docs: Vec<String> = hits.iter().map(|h| h.hit.content.clone()).collect();
+        let docs: Vec<String> = hits
+            .iter()
+            .map(|h| h.hit.retrieved.as_text().to_string())
+            .collect();
         let order = self
             .reranker
             .order(&args.query, &docs)
@@ -1186,7 +1191,7 @@ impl MemoryServer {
                     hit.hit.kind,
                     hit.hit.id.handle(),
                     hit.hit.label,
-                    hit.hit.content
+                    hit.hit.retrieved.as_text()
                 )
             })
             .collect::<Vec<_>>()
@@ -1249,7 +1254,7 @@ impl MemoryServer {
 
     #[tool(description = "List memory clusters found by community detection, largest first.")]
     async fn clusters(&self, Parameters(args): Parameters<ClustersArgs>) -> String {
-        let groups = match on_store!(self, |store| store.community_groups()) {
+        let groups = match on_store!(self, |store| store.community_groups(true)) {
             Ok(g) => g,
             Err(e) => return format!("clusters failed: {e}"),
         };
@@ -1298,7 +1303,7 @@ impl MemoryServer {
             entity.kind,
             id.handle(),
             entity.label,
-            entity.content
+            entity.retrieved.as_text()
         );
         let mentions_section = if mentions.is_empty() {
             "no mentions yet".to_string()
@@ -1312,7 +1317,7 @@ impl MemoryServer {
                         m.id.handle(),
                         m.label,
                         ask::fmt_millis(m.valid_from.0),
-                        m.content
+                        m.retrieved.as_text()
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1442,7 +1447,10 @@ impl MemoryServer {
         if hits.is_empty() {
             return "no relevant memory".to_string();
         }
-        let docs: Vec<String> = hits.iter().map(|h| h.hit.content.clone()).collect();
+        let docs: Vec<String> = hits
+            .iter()
+            .map(|h| h.hit.retrieved.as_text().to_string())
+            .collect();
         let order = self
             .reranker
             .order(&args.question, &docs)
@@ -2799,7 +2807,7 @@ mod tests {
             .unwrap();
         assert!(
             top.iter()
-                .any(|h| h.hit.content == "episodetoplevelfactmarker"),
+                .any(|h| h.hit.retrieved.as_text() == "episodetoplevelfactmarker"),
             "{out}"
         );
         let nested = server
@@ -2812,7 +2820,7 @@ mod tests {
         assert!(
             nested
                 .iter()
-                .any(|h| h.hit.content == "episodenestedfactmarker"),
+                .any(|h| h.hit.retrieved.as_text() == "episodenestedfactmarker"),
             "{out}"
         );
 
@@ -3681,7 +3689,7 @@ mod tests {
     /// The basis of the live page labelled Kim.
     async fn basis_of_kim(store: &DefaultGraph) -> Vec<EventRef> {
         let hits = store
-            .query_explained(&Query::text("person Kim"))
+            .query_explained(&Query::text("person Kim").with_inferred(true))
             .await
             .unwrap();
         let written = hits
@@ -4152,12 +4160,12 @@ mod tests {
                 .store()
                 .await
                 .unwrap()
-                .query_explained(&Query::text(expected_content.as_str()))
+                .query_explained(&Query::text(expected_content.as_str()).with_inferred(true))
                 .await
                 .unwrap();
             assert!(
                 hits.iter()
-                    .any(|h| h.hit.label == label && h.hit.content == expected_content),
+                    .any(|h| h.hit.label == label && h.hit.retrieved.as_text() == expected_content),
                 "{label}'s resynthesized content should already be queryable: {out}"
             );
         }
@@ -4201,14 +4209,14 @@ mod tests {
             .store()
             .await
             .unwrap()
-            .query_explained(&Query::text("person Kim"))
+            .query_explained(&Query::text("person Kim").with_inferred(true))
             .await
             .unwrap();
         let new_entity = hits
             .iter()
             .find(|h| h.hit.label == "Kim")
             .expect("resynthesized entity missing");
-        assert_eq!(new_entity.hit.content, "person Kim");
+        assert_eq!(new_entity.hit.retrieved.as_text(), "person Kim");
         assert_eq!(new_entity.hit.attributes, json!({"role": "engineer"}));
     }
 
@@ -4255,7 +4263,11 @@ mod tests {
             .store()
             .await
             .unwrap()
-            .query_explained(&Query::text("person Priya").with_scope("proj-x"))
+            .query_explained(
+                &Query::text("person Priya")
+                    .with_scope("proj-x")
+                    .with_inferred(true),
+            )
             .await
             .unwrap();
         assert!(
@@ -4269,7 +4281,11 @@ mod tests {
             .store()
             .await
             .unwrap()
-            .query_explained(&Query::text("person Priya").with_scope("proj-y"))
+            .query_explained(
+                &Query::text("person Priya")
+                    .with_scope("proj-y")
+                    .with_inferred(true),
+            )
             .await
             .unwrap();
         assert!(
@@ -4355,7 +4371,7 @@ mod tests {
             .unwrap();
         assert!(
             top.iter()
-                .any(|h| h.hit.content == "synthesis failure top content"),
+                .any(|h| h.hit.retrieved.as_text() == "synthesis failure top content"),
             "{out}"
         );
         let entity_id = out
@@ -4467,22 +4483,22 @@ mod tests {
             .store()
             .await
             .unwrap()
-            .query_explained(&Query::text("person Mixed One"))
+            .query_explained(&Query::text("person Mixed One").with_inferred(true))
             .await
             .unwrap()
             .into_iter()
-            .filter(|h| h.hit.content == "person Mixed One")
+            .filter(|h| h.hit.retrieved.as_text() == "person Mixed One")
             .collect();
         if succeeded.is_empty() {
             succeeded = server
                 .store()
                 .await
                 .unwrap()
-                .query_explained(&Query::text("person Mixed Two"))
+                .query_explained(&Query::text("person Mixed Two").with_inferred(true))
                 .await
                 .unwrap()
                 .into_iter()
-                .filter(|h| h.hit.content == "person Mixed Two")
+                .filter(|h| h.hit.retrieved.as_text() == "person Mixed Two")
                 .collect();
         }
         assert_eq!(
@@ -4697,7 +4713,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                hits.iter().any(|h| h.hit.content == marker),
+                hits.iter().any(|h| h.hit.retrieved.as_text() == marker),
                 "{marker} missing: {out}"
             );
         }
@@ -4718,7 +4734,7 @@ mod tests {
             .store()
             .await
             .unwrap()
-            .query_explained(&Query::text("Henry"))
+            .query_explained(&Query::text("Henry").with_inferred(true))
             .await
             .unwrap();
         assert!(
@@ -4871,13 +4887,13 @@ mod tests {
                 .store()
                 .await
                 .unwrap()
-                .query_explained(&Query::text(marker).with_scope("proj-x"))
+                .query_explained(&Query::text(marker).with_scope("proj-x").with_inferred(true))
                 .await
                 .unwrap();
             assert!(
                 scoped
                     .iter()
-                    .any(|h| h.hit.content == marker || h.hit.label == marker),
+                    .any(|h| h.hit.retrieved.as_text() == marker || h.hit.label == marker),
                 "{marker} missing from the proj-x scope: {out}"
             );
 
@@ -4892,7 +4908,7 @@ mod tests {
                 .store()
                 .await
                 .unwrap()
-                .query_explained(&Query::text(marker).with_scope("proj-y"))
+                .query_explained(&Query::text(marker).with_scope("proj-y").with_inferred(true))
                 .await
                 .unwrap();
             assert!(

@@ -474,12 +474,15 @@ pub(super) async fn state(shared: &SharedStore) -> (BTreeSet<String>, Links) {
         let Some(node) = store.get(&change.id, ALL_LIVE).await.unwrap() else {
             continue;
         };
-        contents.insert(node.content.clone());
+        contents.insert(node.retrieved.as_text().to_string());
         for other in store.neighbors(&change.id, ALL_LIVE).await.unwrap() {
             let Some(other) = store.get(&other, ALL_LIVE).await.unwrap() else {
                 continue;
             };
-            links.insert((node.content.clone(), other.content));
+            links.insert((
+                node.retrieved.as_text().to_string(),
+                other.retrieved.as_text().to_string(),
+            ));
         }
     }
     (contents, links)

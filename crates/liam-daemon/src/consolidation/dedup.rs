@@ -195,10 +195,10 @@ async fn scan(
             continue;
         };
         // Entity pages carry no content of their own, so there is nothing to compare.
-        if node.content.is_empty() {
+        if node.retrieved.as_text().is_empty() {
             continue;
         }
-        match embedder.embed(&node.content).await {
+        match embedder.embed(node.retrieved.as_text()).await {
             Ok(embedding) => {
                 out.items.push(Embedded {
                     id: node.id,
@@ -247,11 +247,14 @@ async fn older_match(
             continue;
         };
         // The search reads a scope and its children; only the same scope merges.
-        if node.scope != item.scope || node.producer != item.producer || node.content.is_empty() {
+        if node.scope != item.scope
+            || node.producer != item.producer
+            || node.retrieved.as_text().is_empty()
+        {
             continue;
         }
         if !embedded.contains_key(node.id.as_str()) {
-            let vector = embedder.embed(&node.content).await.ok();
+            let vector = embedder.embed(node.retrieved.as_text()).await.ok();
             embedded.insert(node.id.as_str().to_string(), vector);
         }
         let Some(Some(vector)) = embedded.get(node.id.as_str()) else {
@@ -859,7 +862,10 @@ mod tests {
         let mut content_of = HashMap::new();
         for id in ids {
             let node = store.get(id, AS_OF).await.unwrap().unwrap();
-            content_of.insert(id.as_str().to_string(), node.content);
+            content_of.insert(
+                id.as_str().to_string(),
+                node.retrieved.as_text().to_string(),
+            );
         }
         drop(store);
         let reader = SequentialScanReader::local(&dir.join("events")).unwrap();

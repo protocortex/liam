@@ -309,6 +309,9 @@ pub struct Query {
     pub as_of: Option<Millis>,
     /// When set, older facts are down-weighted with this half-life.
     pub half_life: Option<Millis>,
+    /// Whether inferred rows, such as entity pages, may be retrieved. Off by
+    /// default: a strict read returns only what a client recorded.
+    pub include_inferred: bool,
 }
 
 impl Query {
@@ -327,6 +330,7 @@ impl Query {
             k: 8,
             as_of: None,
             half_life: None,
+            include_inferred: false,
         }
     }
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
@@ -357,6 +361,115 @@ impl Query {
         self.half_life = Some(half_life);
         self
     }
+    pub fn with_inferred(mut self, include_inferred: bool) -> Self {
+        self.include_inferred = include_inferred;
+        self
+    }
+}
+
+/// Text a client recorded. It has no conversion from [`InferredText`], so code
+/// cannot hand model-written text on as recorded:
+///
+/// ```compile_fail,E0308
+/// use liam_store::{InferredText, RecordedText};
+/// fn f(inferred: InferredText) -> RecordedText { inferred }
+/// ```
+///
+/// The same function over one type compiles, so the failure above is the type
+/// swap and not a bad import:
+///
+/// ```
+/// use liam_store::{InferredText, RecordedText};
+/// fn f(recorded: RecordedText) -> RecordedText { recorded }
+/// fn g(inferred: InferredText) -> InferredText { inferred }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedText(String);
+
+/// Text a model composed, such as an entity page. See [`RecordedText`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferredText(String);
+
+impl RecordedText {
+    pub(crate) fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// For fixtures in tests that build typed values without a store.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(text: impl Into<String>) -> Self {
+        Self::new(text)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl InferredText {
+    pub(crate) fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// For fixtures in tests that build typed values without a store.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(text: impl Into<String>) -> Self {
+        Self::new(text)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The events an inferred row rests on. A row written before events were
+/// listed has none, which reads as `Unknown` and not as an empty list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Basis {
+    Known(Vec<EventRef>),
+    Unknown,
+}
+
+/// A retrieved row that was recorded, with the events that wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedHit {
+    pub content: RecordedText,
+    pub events: Vec<EventRef>,
+    /// `Recorded` or `Extracted`.
+    pub derivation: Derivation,
+}
+
+/// A retrieved row a model composed, with what it rests on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferredHit {
+    pub text: InferredText,
+    pub basis: Basis,
+    pub derivation: Derivation,
+    /// The level of a summary; `None` for an entity page.
+    pub summary_level: Option<u8>,
+}
+
+/// The text of a retrieved row, typed by where it came from. Every reader gets
+/// the text through this, so recorded and inferred content stay apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Retrieved {
+    Recorded(RecordedHit),
+    Inferred(InferredHit),
+}
+
+impl Retrieved {
+    /// The text without its type, for a caller that only measures or matches it.
+    /// Rendering must go through the variant instead, so its label follows.
+    pub fn as_text(&self) -> &str {
+        match self {
+            Self::Recorded(hit) => hit.content.as_str(),
+            Self::Inferred(hit) => hit.text.as_str(),
+        }
+    }
+
+    pub fn is_inferred(&self) -> bool {
+        matches!(self, Self::Inferred(_))
+    }
 }
 
 /// A retrieved node with its final fused score.
@@ -365,7 +478,7 @@ pub struct Hit {
     pub id: NodeId,
     pub kind: String,
     pub label: String,
-    pub content: String,
+    pub retrieved: Retrieved,
     pub attributes: Value,
     pub score: f64,
 }
