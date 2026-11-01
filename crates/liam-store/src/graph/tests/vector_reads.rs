@@ -154,3 +154,85 @@ async fn a_vector_search_leaves_inferred_nodes_out_unless_asked() {
     let all: HashSet<NodeId> = all.into_iter().collect();
     assert_eq!(all, HashSet::from([recorded, inferred]));
 }
+
+#[tokio::test]
+async fn a_node_removed_by_gc_with_reclaim_has_no_vector() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("gc.db");
+    let clock = Arc::new(FixedClock::new(AS_OF));
+    let g = DefaultGraph::open_with_clock(
+        path.to_str().unwrap(),
+        GraphConfig::new(DIMS),
+        clock.clone(),
+    )
+    .await
+    .unwrap();
+    let id = g
+        .insert(embedded(Derivation::Recorded, "old", vector(0.2)))
+        .await
+        .unwrap();
+    assert!(g
+        .backend
+        .vector_get(id.as_str(), DIMS)
+        .await
+        .unwrap()
+        .is_some());
+    clock.set(Millis(AS_OF.0 + 5000));
+
+    // Act
+    let report = g
+        .gc(&RetentionPolicy::keep("fact", Millis(1)))
+        .await
+        .unwrap();
+    let read = g.backend.vector_get(id.as_str(), DIMS).await;
+
+    // Assert
+    assert_eq!(report.nodes_removed, 1);
+    assert_eq!(read.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_scoped_vector_search_still_leaves_inferred_nodes_out() {
+    // Arrange: the scope clause comes first, so the derivation parameter must
+    // be numbered after it
+    let dir = TempDir::new().unwrap();
+    let g = open(&dir).await;
+    let query = vector(0.3);
+    let recorded = g
+        .insert(embedded(Derivation::Recorded, "fact", query.clone()).with_scope("work/liam"))
+        .await
+        .unwrap();
+    let inferred = g
+        .insert(embedded(Derivation::Inferred, "Page", query.clone()).with_scope("work/liam"))
+        .await
+        .unwrap();
+    let elsewhere = g
+        .insert(embedded(Derivation::Recorded, "other", query.clone()).with_scope("personal"))
+        .await
+        .unwrap();
+
+    // Act
+    let strict = g
+        .backend
+        .vector_search(&query, 5, None, Some("work"), AS_OF, false)
+        .await
+        .unwrap();
+    let strict_kind = g
+        .backend
+        .vector_search(&query, 5, Some("fact"), Some("work"), AS_OF, false)
+        .await
+        .unwrap();
+    let all = g
+        .backend
+        .vector_search(&query, 5, None, Some("work"), AS_OF, true)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(strict, vec![recorded.clone()]);
+    assert_eq!(strict_kind, vec![recorded.clone()]);
+    let all: HashSet<NodeId> = all.into_iter().collect();
+    assert_eq!(all, HashSet::from([recorded, inferred]));
+    assert!(!all.contains(&elsewhere));
+}
