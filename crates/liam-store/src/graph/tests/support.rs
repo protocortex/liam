@@ -247,6 +247,9 @@ impl Backend for ReembedProbe {
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
         self.inner.vector_delete(node_id).await
     }
+    async fn vector_get(&self, node_id: &str, dims: usize) -> Result<Option<Vec<f32>>> {
+        self.inner.vector_get(node_id, dims).await
+    }
     async fn vector_search(
         &self,
         query: &[f32],
@@ -254,8 +257,11 @@ impl Backend for ReembedProbe {
         kind: Option<&str>,
         scope: Option<&str>,
         as_of: Millis,
+        include_inferred: bool,
     ) -> Result<Vec<NodeId>> {
-        self.inner.vector_search(query, k, kind, scope, as_of).await
+        self.inner
+            .vector_search(query, k, kind, scope, as_of, include_inferred)
+            .await
     }
     async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
         if self.listing_fails.load(std::sync::atomic::Ordering::SeqCst) {
