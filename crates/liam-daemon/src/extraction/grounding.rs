@@ -163,7 +163,8 @@ fn month(token: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{resolve_vocabulary, ExtractionConfig};
+    use super::super::response::parse_response;
+    use crate::config::{declared_predicates, resolve_vocabulary, ExtractionConfig};
 
     fn fact(subject: &str, predicate: &str, object: &str, polarity: Polarity) -> ParsedFact {
         ParsedFact {
@@ -322,6 +323,32 @@ mod tests {
             // Assert
             assert_eq!(found, expected, "{text}");
         }
+    }
+
+    #[test]
+    fn a_reply_that_marks_every_current_fact_ended_is_wholly_ungrounded() {
+        // Arrange: the shape of a real model reply to a batch of plain statements.
+        let texts = ["Alice moved to Lisbon.", "Bob works at Globex."];
+        let reply = r#"{"facts": [
+            {"subject": "Alice", "predicate": "lives_in", "object": "Lisbon", "polarity": "ended",
+             "valid_from": null, "valid_until": null, "confidence": 1.0, "events": [0]},
+            {"subject": "Bob", "predicate": "works_at", "object": "Globex", "polarity": "ended",
+             "valid_from": null, "valid_until": null, "confidence": 1.0, "events": [1]}
+        ]}"#;
+        let vocabulary = resolve_vocabulary(&ExtractionConfig::default());
+        let predicates = declared_predicates(&ExtractionConfig::default());
+
+        // Act
+        let parsed = parse_response(reply, texts.len(), &predicates).expect("a valid reply");
+        let grounded: Vec<usize> = parsed
+            .facts
+            .iter()
+            .map(|fact| supporting_events(fact, &texts, &vocabulary, &[]).len())
+            .collect();
+
+        // Assert
+        assert_eq!(parsed.facts.len(), 2);
+        assert_eq!(grounded, [0, 0]);
     }
 
     #[test]
