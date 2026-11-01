@@ -89,12 +89,12 @@ pub struct ExtractionConfig {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct PredicateOverride {
-    #[cfg_attr(test, serde(skip))]
+    #[cfg_attr(test, serde(skip_serializing))]
     pub cardinality: Option<Cardinality>,
     #[serde(rename = "match")]
-    #[cfg_attr(test, serde(skip))]
+    #[cfg_attr(test, serde(skip_serializing))]
     pub match_mode: Option<MatchMode>,
-    #[cfg_attr(test, serde(skip))]
+    #[cfg_attr(test, serde(skip_serializing))]
     pub grounding: Option<Grounding>,
 }
 
