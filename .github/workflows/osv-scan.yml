@@ -24,16 +24,18 @@ permissions: {}
 
 concurrency:
   group: osv-scan-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       security-events: write  # upload SARIF
     steps:
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+      - timeout-minutes: 5
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           # Block-mode allowlist derived from audit telemetry on a
           # known-good pure-fx run (run 26576056664). The set is small
@@ -59,7 +61,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+      # Bounds the scan only. The Docker image pull happens before this step
+      # starts, so the job timeout is what bounds a hung pull.
+      - timeout-minutes: 10
+        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
         with:
           # `--skip-git` was a v1.x flag; osv-scanner v2 rejects it as
           # "flag provided but not defined: -skip-git". The v2 scanner

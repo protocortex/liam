@@ -40,6 +40,7 @@ jobs:
   release:
     needs: soak
     runs-on: macos-latest
+    timeout-minutes: 45
     # Publishing the release asset is the only step that writes.
     permissions:
       contents: write
