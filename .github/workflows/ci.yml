@@ -214,6 +214,11 @@ jobs:
   macos:
     runs-on: macos-latest
     timeout-minutes: 20
+    env:
+      # The runner image now ships Homebrew OpenSSL 4, which llama.cpp's CMake
+      # finds but cannot link, so a cold build fails. The vendored server's
+      # HTTPS support is unused here.
+      CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: "ON"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
