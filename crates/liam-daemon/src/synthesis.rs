@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use liam_model::{Llm, ModelError, Result};
 
 use crate::ask::{
-    estimate_tokens, fit_evidence_to_budget, fmt_millis, is_grounded, neutralize_fence, truncate,
-    Evidence,
+    estimate_tokens, fit_evidence_to_budget, is_grounded, neutralize_fence, truncate, Evidence,
 };
+use crate::render::evidence_head;
 use crate::tuning::{self, AimdHandles, RollingWindow};
 
 /// Cap on the entity kind/label rendered into the prompt: both are
@@ -26,7 +26,7 @@ fn render_mentions(mentions: &[Evidence]) -> String {
         .enumerate()
         .map(|(i, e)| {
             let n = i + 1;
-            let mut body = vec![e.content.clone()];
+            let mut body = vec![e.content()];
             if e.confidence != 1.0 {
                 body.push(format!("confidence: {:.2}", e.confidence));
             }
@@ -34,10 +34,8 @@ fn render_mentions(mentions: &[Evidence]) -> String {
                 body.push(format!("attributes: {attrs}"));
             }
             format!(
-                "{FENCE_OPEN} {n}>>>\n[{n}] ({}) {} — known since {}\n{}\n{FENCE_CLOSE} {n}>>>",
-                e.kind,
-                e.label,
-                fmt_millis(e.valid_from_ms),
+                "{FENCE_OPEN} {n}>>>\n{}\n{}\n{FENCE_CLOSE} {n}>>>",
+                evidence_head(n, &e.kind, &e.label, e.valid_from_ms),
                 body.join("\n")
             )
         })
@@ -182,14 +180,7 @@ mod tests {
     }
 
     fn mention(kind: &str, label: &str, content: &str, valid_from_ms: i64) -> Evidence {
-        Evidence {
-            kind: kind.to_string(),
-            label: label.to_string(),
-            content: content.to_string(),
-            valid_from_ms,
-            confidence: 1.0,
-            attributes: None,
-        }
+        Evidence::recorded(kind, label, content, valid_from_ms)
     }
 
     #[test]

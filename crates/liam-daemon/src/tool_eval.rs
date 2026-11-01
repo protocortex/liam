@@ -275,6 +275,7 @@ mod real_tier {
                 scope: None,
                 k: Some(FIXTURE.len()),
                 as_of: None,
+                mode: None,
             }))
             .await;
         let real_recall_text = real_server
@@ -284,6 +285,7 @@ mod real_tier {
                 scope: None,
                 k: Some(FIXTURE.len()),
                 as_of: None,
+                mode: None,
             }))
             .await;
         println!("baseline (IdentityReranker) order: {baseline_recall_text}");
@@ -373,6 +375,7 @@ mod real_tier {
                 scope: None,
                 k: Some(1),
                 as_of: None,
+                mode: None,
             }))
             .await;
         println!("recall order: {recall_text}");
@@ -427,6 +430,7 @@ mod tests {
                 scope: None,
                 k: Some(1),
                 as_of: None,
+                mode: None,
             }))
             .await;
 

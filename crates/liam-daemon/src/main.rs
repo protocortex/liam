@@ -16,6 +16,7 @@ mod eval;
 mod extraction;
 mod log_startup;
 mod mcp;
+mod render;
 mod shutdown;
 mod synthesis;
 #[cfg(test)]

@@ -33,6 +33,7 @@ use crate::ask::{
 };
 use crate::clusters::{narrow_groups, render_clusters};
 use crate::config::{resolve_vocabulary, ExtractionConfig};
+use crate::render;
 use crate::synthesis;
 use crate::tuning::{record_and_maybe_evaluate, AimdHandles, RollingWindow};
 
@@ -138,10 +139,11 @@ fn build_query(
     scope: Option<String>,
     embedding: Option<Vec<f32>>,
     as_of: Option<i64>,
+    include_inferred: bool,
 ) -> Query {
     let mut q = Query::text(text.to_string())
         .with_k(k.unwrap_or(8))
-        .with_inferred(true);
+        .with_inferred(include_inferred);
     if let Some(e) = embedding {
         q = q.with_embedding(e);
     }
@@ -431,6 +433,27 @@ pub struct RecallArgs {
     /// "now"; a past instant surfaces the version of each subject that was
     /// live then.
     pub as_of: Option<i64>,
+    /// Only `strict` is supported: recall returns recorded memory.
+    pub mode: Option<Mode>,
+}
+
+/// What a read may return. Strict returns only what a client recorded; infer
+/// may also return what a model composed from it, each item labelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Strict,
+    Infer,
+}
+
+/// A tool that only reads recorded memory refuses `mode = infer`.
+fn require_strict(tool: &str, mode: Option<Mode>) -> Result<(), String> {
+    match mode {
+        Some(Mode::Infer) => Err(format!(
+            "{tool} failed: mode infer is not supported, {tool} returns recorded memory only"
+        )),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -460,6 +483,10 @@ pub struct AskArgs {
     /// "now"; a past instant retrieves the version of each subject that was
     /// live then.
     pub as_of: Option<i64>,
+    /// `infer` (the default) may compose the answer from entity pages as well
+    /// as recorded memory and labels what it used. `strict` returns recorded
+    /// evidence only and makes no model call.
+    pub mode: Option<Mode>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -470,6 +497,8 @@ pub struct ClustersArgs {
     /// Number of memories to show per cluster. Narrows within the token
     /// budget; cannot widen past it.
     pub members: Option<usize>,
+    /// Only `strict` is supported: clusters list recorded memory.
+    pub mode: Option<Mode>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -480,6 +509,9 @@ pub struct TimelineArgs {
     /// `DEFAULT_TIMELINE_LIMIT` (50); anything above `MAX_TIMELINE_LIMIT`
     /// (200) is capped, not rejected.
     pub limit: Option<usize>,
+    /// Only `strict` is supported: the entity page is shown labelled inferred,
+    /// and the mentions are recorded memory.
+    pub mode: Option<Mode>,
 }
 
 #[derive(Clone)]
@@ -1136,6 +1168,9 @@ impl MemoryServer {
     // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Retrieve relevant long-term memory, reranked for precision.")]
     pub(crate) async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
+        if let Err(refusal) = require_strict("recall", args.mode) {
+            return refusal;
+        }
         let embedding = self.embedder.embed(&args.query, TextKind::Query).await.ok();
         let q = build_query(
             &args.query,
@@ -1144,6 +1179,7 @@ impl MemoryServer {
             args.scope,
             embedding,
             args.as_of,
+            false,
         );
         let hits = match on_store!(self, |store| store.query_explained(&q)) {
             Ok(h) => h,
@@ -1175,24 +1211,18 @@ impl MemoryServer {
             .iter()
             .map(|&i| {
                 let hit = &hits[i];
-                let confidence_line = if hit.confidence != 1.0 {
-                    format!("\nconfidence: {:.2}", hit.confidence)
-                } else {
-                    String::new()
-                };
-                let attributes_line = match &hit.hit.attributes {
-                    serde_json::Value::Object(map) if !map.is_empty() => {
-                        format!("\nattributes: {}", hit.hit.attributes)
+                let mut trailing = Vec::new();
+                if hit.confidence != 1.0 {
+                    trailing.push(format!("confidence: {:.2}", hit.confidence));
+                }
+                if let serde_json::Value::Object(map) = &hit.hit.attributes {
+                    if !map.is_empty() {
+                        trailing.push(format!("attributes: {}", hit.hit.attributes));
                     }
-                    _ => String::new(),
-                };
-                format!(
-                    "[{} {}] {}\n{}{confidence_line}{attributes_line}",
-                    hit.hit.kind,
-                    hit.hit.id.handle(),
-                    hit.hit.label,
-                    hit.hit.retrieved.as_text()
-                )
+                }
+                let head =
+                    render::bracket_head(&hit.hit.kind, hit.hit.id.handle(), &hit.hit.label, None);
+                render::render_item(&head, &hit.hit.retrieved, &trailing)
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -1254,7 +1284,10 @@ impl MemoryServer {
 
     #[tool(description = "List memory clusters found by community detection, largest first.")]
     async fn clusters(&self, Parameters(args): Parameters<ClustersArgs>) -> String {
-        let groups = match on_store!(self, |store| store.community_groups(true)) {
+        if let Err(refusal) = require_strict("clusters", args.mode) {
+            return refusal;
+        }
+        let groups = match on_store!(self, |store| store.community_groups(false)) {
             Ok(g) => g,
             Err(e) => return format!("clusters failed: {e}"),
         };
@@ -1274,6 +1307,9 @@ impl MemoryServer {
         description = "Show an entity's compiled page and the mentions behind it, most recent first."
     )]
     async fn timeline(&self, Parameters(args): Parameters<TimelineArgs>) -> String {
+        if let Err(refusal) = require_strict("timeline", args.mode) {
+            return refusal;
+        }
         let id = match on_store!(self, |store| store.resolve_handle(&args.entity)) {
             Ok(id) => id,
             Err(e) => return format!("timeline failed: {e}"),
@@ -1294,16 +1330,17 @@ impl MemoryServer {
             Ok(m) => m,
             Err(e) => return format!("timeline failed: {e}"),
         };
+        // The page header is the one inferred item this tool shows; a mention
+        // that is itself inferred is left out.
+        mentions.retain(|m| !m.retrieved.is_inferred());
         let truncated = mentions.len() > limit;
         if truncated {
             mentions.truncate(limit);
         }
-        let header = format!(
-            "[{} {}] {}\n{}",
-            entity.kind,
-            id.handle(),
-            entity.label,
-            entity.retrieved.as_text()
+        let header = render::render_item(
+            &render::bracket_head(&entity.kind, id.handle(), &entity.label, None),
+            &entity.retrieved,
+            &[],
         );
         let mentions_section = if mentions.is_empty() {
             "no mentions yet".to_string()
@@ -1311,14 +1348,13 @@ impl MemoryServer {
             mentions
                 .iter()
                 .map(|m| {
-                    format!(
-                        "[{} {}] {} — known since {}\n{}",
-                        m.kind,
+                    let head = render::bracket_head(
+                        &m.kind,
                         m.id.handle(),
-                        m.label,
-                        ask::fmt_millis(m.valid_from.0),
-                        m.retrieved.as_text()
-                    )
+                        &m.label,
+                        Some(m.valid_from.0),
+                    );
+                    render::render_item(&head, &m.retrieved, &[])
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n")
@@ -1426,6 +1462,7 @@ impl MemoryServer {
     // path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
+        let mode = args.mode.unwrap_or(Mode::Infer);
         let embedding = self
             .embedder
             .embed(&args.question, TextKind::Query)
@@ -1439,6 +1476,7 @@ impl MemoryServer {
             args.scope,
             embedding,
             args.as_of,
+            mode == Mode::Infer,
         );
         let hits = match on_store!(self, |store| store.query_explained(&q)) {
             Ok(h) => h,
@@ -1460,6 +1498,9 @@ impl MemoryServer {
             .iter()
             .map(|&i| ask::Evidence::from_hit(&hits[i]))
             .collect();
+        if mode == Mode::Strict {
+            return ask::strict_answer(&evidence);
+        }
         // Trim ONCE, before the sufficiency pre-pass, and reuse this same
         // slice for both prompts below. Trimming twice, or only for the
         // answer prompt, would let the pre-pass vouch for evidence the answer
@@ -3554,6 +3595,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -3577,6 +3619,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -4997,6 +5040,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5011,7 +5055,8 @@ mod tests {
             llm.last_prompt()
         );
         assert!(
-            answer.starts_with("The zorbnax gadget uses libSQL for storage [1]."),
+            answer
+                .starts_with("answer (inferred):\nThe zorbnax gadget uses libSQL for storage [1]."),
             "answer is not the model's: {answer}"
         );
         assert!(
@@ -5062,6 +5107,7 @@ mod tests {
                 scope: None,
                 k: Some(5),
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5101,6 +5147,7 @@ mod tests {
                 scope: None,
                 k: Some(3),
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5143,6 +5190,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5186,12 +5234,14 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
         // Assert
         assert!(
-            answer.starts_with("The zorbnax gadget uses libSQL for storage [1]."),
+            answer
+                .starts_with("answer (inferred):\nThe zorbnax gadget uses libSQL for storage [1]."),
             "pre-pass blocked an answerable question: {answer}"
         );
         assert!(answer.contains("Sources:"), "{answer}");
@@ -5222,6 +5272,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5231,7 +5282,8 @@ mod tests {
             "unparseable verdict was treated as a refusal: {answer}"
         );
         assert!(
-            answer.starts_with("The zorbnax gadget uses libSQL for storage [1]."),
+            answer
+                .starts_with("answer (inferred):\nThe zorbnax gadget uses libSQL for storage [1]."),
             "{answer}"
         );
     }
@@ -5261,6 +5313,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5301,6 +5354,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5345,6 +5399,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5389,6 +5444,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
         let elapsed = start.elapsed();
@@ -5438,6 +5494,7 @@ mod tests {
             scope: None,
             k: None,
             as_of: None,
+            mode: None,
         };
 
         // Act: two ask calls in flight at once, contending for the single
@@ -5564,6 +5621,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
         let window = other_connection.rolling_window_handle();
@@ -5654,6 +5712,7 @@ mod tests {
             scope: None,
             k: None,
             as_of: None,
+            mode: None,
         };
 
         let holder = server.clone();
@@ -5850,14 +5909,12 @@ mod tests {
     /// above: its content is unused by `SufficiencyLlm`/`FailingLlm`/
     /// `SlowLlm`, only its presence in the prompt matters.
     fn sufficiency_evidence() -> ask::Evidence {
-        ask::Evidence {
-            kind: "fact".to_string(),
-            label: "Mascot".to_string(),
-            content: "The team mascot is a wombat named Pixel.".to_string(),
-            valid_from_ms: 0,
-            confidence: 1.0,
-            attributes: None,
-        }
+        ask::Evidence::recorded(
+            "fact",
+            "Mascot",
+            "The team mascot is a wombat named Pixel.",
+            0,
+        )
     }
 
     #[tokio::test]
@@ -5880,6 +5937,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5918,6 +5976,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5955,6 +6014,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -5984,6 +6044,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6023,6 +6084,7 @@ mod tests {
                 scope: Some("proj-a".to_string()),
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6048,6 +6110,7 @@ mod tests {
                 scope: None,
                 k: Some(1),
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6094,6 +6157,7 @@ mod tests {
                 scope: Some("proj-a".to_string()),
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6129,6 +6193,7 @@ mod tests {
                 scope: None,
                 k: Some(1),
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6139,14 +6204,15 @@ mod tests {
             .split_once("Sources:\n")
             .map(|(_, s)| s.to_string())
             .unwrap_or_else(|| panic!("answer has no sources section: {answer}"));
-        assert_eq!(sources.lines().count(), 1, "expected 1 source: {sources}");
+        let numbered = sources.lines().filter(|l| l.starts_with('[')).count();
+        assert_eq!(numbered, 1, "expected 1 source: {sources}");
         assert!(sources.starts_with("[1] fact/"), "sources: {sources}");
     }
 
     #[tokio::test]
     async fn recall_format_is_pinned() {
         // Regression pin: `recall`'s output shape is
-        // `[{kind} {handle}] {label}\n{content}`. The handle was added by
+        // `[{kind} {handle}] {label}\n{content}\nprovenance: ...`. The handle was added by
         // ADR-0001 so an agent can name what it recalled and pass it to
         // `relate`; before that, `recall` dropped `Hit::id` entirely.
         let server = server_with(
@@ -6163,13 +6229,23 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
         let handle = &id[..HANDLE_LEN];
+        let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
-            out,
-            format!("[decision {handle}] Use libSQL\nsingle file db")
+            lines[..2],
+            [
+                format!("[decision {handle}] Use libSQL").as_str(),
+                "single file db"
+            ]
+        );
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(
+            lines[2].starts_with("provenance: derivation: recorded; events: "),
+            "{out}"
         );
     }
 
@@ -6195,6 +6271,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6239,6 +6316,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6265,6 +6343,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6290,6 +6369,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6313,6 +6393,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6339,6 +6420,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6383,6 +6465,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -6579,6 +6662,7 @@ mod tests {
             .clusters(Parameters(ClustersArgs {
                 k: None,
                 members: None,
+                mode: None,
             }))
             .await;
 
@@ -6609,6 +6693,7 @@ mod tests {
             .clusters(Parameters(ClustersArgs {
                 k: None,
                 members: None,
+                mode: None,
             }))
             .await;
 
@@ -6632,6 +6717,7 @@ mod tests {
             .clusters(Parameters(ClustersArgs {
                 k: None,
                 members: None,
+                mode: None,
             }))
             .await;
 
@@ -6661,6 +6747,7 @@ mod tests {
             .clusters(Parameters(ClustersArgs {
                 k: None,
                 members: None,
+                mode: None,
             }))
             .await;
         let handle = rendered
@@ -6754,6 +6841,7 @@ mod tests {
             .timeline(Parameters(TimelineArgs {
                 entity: entity_id.as_str().to_string(),
                 limit: None,
+                mode: None,
             }))
             .await;
 
@@ -6781,6 +6869,7 @@ mod tests {
             .timeline(Parameters(TimelineArgs {
                 entity: "0000000000000".to_string(),
                 limit: None,
+                mode: None,
             }))
             .await;
 
@@ -6809,6 +6898,7 @@ mod tests {
             .timeline(Parameters(TimelineArgs {
                 entity: entity_id.as_str().to_string(),
                 limit: None,
+                mode: None,
             }))
             .await;
 
@@ -6840,6 +6930,7 @@ mod tests {
             .timeline(Parameters(TimelineArgs {
                 entity: entity_id.as_str().to_string(),
                 limit: None,
+                mode: None,
             }))
             .await;
 
@@ -6862,6 +6953,7 @@ mod tests {
             .timeline(Parameters(TimelineArgs {
                 entity: handle,
                 limit: None,
+                mode: None,
             }))
             .await;
 
@@ -6978,6 +7070,7 @@ mod tests {
             .timeline(Parameters(TimelineArgs {
                 entity: entity_id.as_str().to_string(),
                 limit: Some(2),
+                mode: None,
             }))
             .await;
 
@@ -7038,6 +7131,7 @@ mod tests {
             .timeline(Parameters(TimelineArgs {
                 entity: entity_id.as_str().to_string(),
                 limit: Some(2),
+                mode: None,
             }))
             .await;
 
@@ -7086,6 +7180,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: Some(1000),
+                mode: None,
             }))
             .await;
 
@@ -7112,6 +7207,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: Some(1000),
+                mode: None,
             }))
             .await;
 
@@ -7142,6 +7238,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: Some(500),
+                mode: None,
             }))
             .await;
 
@@ -7166,6 +7263,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: Some(3000),
+                mode: None,
             }))
             .await;
 
@@ -7195,6 +7293,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: Some(2000),
+                mode: None,
             }))
             .await;
 
@@ -7226,6 +7325,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -7258,6 +7358,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -7294,6 +7395,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: None,
+                mode: None,
             }))
             .await;
 
@@ -7323,6 +7425,7 @@ mod tests {
                 scope: None,
                 k: None,
                 as_of: Some(1000),
+                mode: None,
             }))
             .await;
 
@@ -7397,6 +7500,7 @@ mod tests {
             scope: None,
             k: None,
             as_of: None,
+            mode: None,
         }
     }
 
@@ -7473,5 +7577,192 @@ mod tests {
         // Assert
         assert!(answer.starts_with("recall failed"), "{answer}");
         assert!(answer.contains("store is unavailable"), "{answer}");
+    }
+
+    // ---- strict and infer modes ----
+
+    const PAGE_LABEL: &str = "Zorbnax";
+
+    /// A recorded fact and an entity page that both match `zorbnax`, the page
+    /// mentioning the fact. Returns the page's id.
+    async fn fact_and_page(server: &MemoryServer) -> liam_store::NodeId {
+        let fact = seed(server, "fact", "Preference", "zorbnax likes green tea").await;
+        let store = server.store().await.unwrap();
+        let mut page = NewNode::entity("person", PAGE_LABEL);
+        page.content = "zorbnax profile: likes green tea".to_string();
+        let page = store.upsert_by(page).await.unwrap();
+        let fact = store.resolve_handle(&fact).await.unwrap();
+        store
+            .relate(&page, &fact, relation::MENTIONS)
+            .await
+            .unwrap();
+        page
+    }
+
+    fn ask_args(mode: Option<Mode>) -> AskArgs {
+        AskArgs {
+            question: "What does zorbnax like?".to_string(),
+            kind: None,
+            scope: None,
+            k: None,
+            as_of: None,
+            mode,
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_leaves_out_an_entity_page_and_refuses_infer_mode() {
+        // Arrange
+        let server = plain_server().await;
+        fact_and_page(&server).await;
+        let args = |mode| RecallArgs {
+            query: "zorbnax".to_string(),
+            mode,
+            ..recall_args()
+        };
+
+        // Act
+        let default = server.recall(Parameters(args(None))).await;
+        let infer = server.recall(Parameters(args(Some(Mode::Infer)))).await;
+
+        // Assert
+        assert!(default.contains("green tea"), "{default}");
+        assert!(!default.contains("profile"), "{default}");
+        assert!(
+            infer.starts_with("recall failed") && infer.contains("mode infer"),
+            "{infer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_defaults_to_infer_with_labelled_evidence_and_an_inferred_answer() {
+        // Arrange
+        let llm = Arc::new(RecordingLlm::new("Zorbnax likes green tea [1]."));
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        fact_and_page(&server).await;
+
+        // Act
+        let answer = server.ask(Parameters(ask_args(None))).await;
+
+        // Assert: the model's block is marked, the page is among the sources
+        // labelled inferred, and the prompt carries derivations but no ids
+        assert!(answer.starts_with("answer (inferred):\n"), "{answer}");
+        assert!(
+            answer.contains("provenance: derivation: inferred; basis: unknown"),
+            "{answer}"
+        );
+        let prompt = llm.last_prompt();
+        assert!(prompt.contains("derivation: inferred"), "{prompt}");
+        assert!(prompt.contains("derivation: recorded"), "{prompt}");
+        assert!(!prompt.contains("provenance:"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn ask_in_strict_mode_makes_no_model_call_and_shows_no_inferred_row() {
+        // Arrange
+        let llm = Arc::new(RecordingLlm::new("Zorbnax likes green tea [1]."));
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        fact_and_page(&server).await;
+
+        // Act
+        let answer = server.ask(Parameters(ask_args(Some(Mode::Strict)))).await;
+
+        // Assert
+        assert!(llm.seen.lock().unwrap().is_empty(), "the model was called");
+        assert!(answer.starts_with("(strict mode:"), "{answer}");
+        assert!(answer.contains("zorbnax likes green tea"), "{answer}");
+        assert!(!answer.contains("answer (inferred)"), "{answer}");
+        assert!(!answer.contains("profile"), "{answer}");
+        assert!(!answer.contains("derivation: inferred"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn the_ask_fallback_labels_every_evidence_block() {
+        // Arrange
+        let server =
+            server_with(Arc::new(liam_model::IdentityReranker), Arc::new(FailingLlm)).await;
+        fact_and_page(&server).await;
+
+        // Act
+        let answer = server.ask(Parameters(ask_args(None))).await;
+
+        // Assert
+        let blocks = answer.matches("<<<EVIDENCE ").count();
+        let labelled = answer.matches("provenance: derivation: ").count();
+        assert_eq!(blocks, 2, "{answer}");
+        assert_eq!(labelled, blocks, "{answer}");
+        assert!(answer.contains("derivation: inferred"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn clusters_leave_out_a_page_that_mentions_recorded_memory() {
+        // Arrange
+        let server = plain_server().await;
+        let page = fact_and_page(&server).await;
+        let other = seed(&server, "fact", "Rollout owner", "y").await;
+        let store = server.store().await.unwrap();
+        let other = store.resolve_handle(&other).await.unwrap();
+        let fact = store
+            .mentions(&page, liam_store::Millis::now(), 10)
+            .await
+            .unwrap()
+            .remove(0)
+            .id;
+        store
+            .relate(&fact, &other, relation::MENTIONS)
+            .await
+            .unwrap();
+        drop(store);
+
+        // Act
+        let out = server
+            .clusters(Parameters(ClustersArgs {
+                k: None,
+                members: None,
+                mode: None,
+            }))
+            .await;
+        let infer = server
+            .clusters(Parameters(ClustersArgs {
+                k: None,
+                members: None,
+                mode: Some(Mode::Infer),
+            }))
+            .await;
+
+        // Assert
+        assert!(out.contains("Preference"), "{out}");
+        assert!(out.contains("Rollout owner"), "{out}");
+        assert!(!out.contains(PAGE_LABEL), "{out}");
+        assert!(infer.contains("mode infer"), "{infer}");
+    }
+
+    #[tokio::test]
+    async fn timeline_shows_the_page_labelled_inferred_and_refuses_infer_mode() {
+        // Arrange
+        let server = plain_server().await;
+        let page = fact_and_page(&server).await;
+        let args = |mode| TimelineArgs {
+            entity: page.as_str().to_string(),
+            limit: None,
+            mode,
+        };
+
+        // Act
+        let out = server.timeline(Parameters(args(None))).await;
+        let infer = server.timeline(Parameters(args(Some(Mode::Infer)))).await;
+
+        // Assert
+        let header: Vec<&str> = out.lines().take(3).collect();
+        assert!(
+            header[0].starts_with(&format!("[person {}", page.handle())),
+            "{out}"
+        );
+        assert!(
+            header[2].starts_with("provenance: derivation: inferred"),
+            "{out}"
+        );
+        assert!(out.contains("zorbnax likes green tea"), "{out}");
+        assert!(infer.contains("mode infer"), "{infer}");
     }
 }
