@@ -167,8 +167,6 @@ impl ExtractionConfig {
         Ok(())
     }
 
-    /// The model pass cannot start without the model and the server that runs
-    /// it, so an incomplete setup fails at load, not on every run.
     /// Expands `~` in the two file paths here, once, so every reader (the
     /// sidecar start, the stale sweep, the model hash, `liam fetch-models`)
     /// sees the same absolute path.
@@ -184,6 +182,8 @@ impl ExtractionConfig {
         Ok(())
     }
 
+    /// The model pass cannot start without the model and the server that runs
+    /// it, so an incomplete setup fails at load, not on every run.
     fn validate_model_files(&self) -> anyhow::Result<()> {
         if !(self.enabled && self.llm_enabled) {
             return Ok(());
