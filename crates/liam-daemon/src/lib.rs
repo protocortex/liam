@@ -33,6 +33,7 @@ pub mod config;
 pub mod consolidation;
 pub mod embedder_fingerprint;
 pub mod event_log;
+pub mod fetch;
 pub mod models;
 pub mod retrieval_eval;
 pub mod store_open;
