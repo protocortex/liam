@@ -85,6 +85,10 @@ jobs:
       # Builds both binaries the package declares: `liamd`, the daemon, and
       # `liam`, the CLI that fetches models at install time.
       - name: Build release binaries
+        env:
+          # Homebrew OpenSSL 4 on the runner breaks llama.cpp's CMake; its
+          # HTTPS support is unused.
+          CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: "ON"
         run: cargo build --release -p liam-daemon --features local,llama
 
       # Cheapest possible proof that each binary links and starts. Worth
