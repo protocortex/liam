@@ -742,8 +742,9 @@ async fn rebuild_without_an_embedder_reports_the_nodes_pending_instead_of_failin
     assert_eq!(report.live_nodes, LIVE_NODES);
 }
 
-/// Puts a row in every table a rebuild empties but `nodes`, `edges` and
-/// `log_hash_index`, which `populate` fills, and names the tables it did.
+/// Puts a row in every table a rebuild empties but `nodes`, `edges`,
+/// `node_events` and `log_hash_index`, which `populate` fills, and names the
+/// tables it did.
 async fn seed_derived_tables(live: &Opened) -> [&'static str; 11] {
     let g = &live.graph;
     let node_id = g
@@ -812,7 +813,7 @@ async fn reset_empties_every_derived_table_by_its_rule_and_keeps_the_log_id() {
             .await
             .unwrap();
         let mut seeded = seed_derived_tables(&live).await.to_vec();
-        seeded.extend(["nodes", "edges", "log_hash_index"]);
+        seeded.extend(["nodes", "edges", "log_hash_index", "node_events"]);
         let mut listed: Vec<_> = DERIVED_TABLES.iter().map(|(table, _)| *table).collect();
         seeded.sort_unstable();
         listed.sort_unstable();

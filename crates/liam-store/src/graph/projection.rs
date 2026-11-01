@@ -3,8 +3,9 @@
 //! its log record build them from the same payload through `steps_for`, so the
 //! two cannot drift apart.
 
-use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTarget};
+use liam_log::event::{EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTarget};
 
+use super::backfill::BACKFILL_SOURCE;
 use super::fact_projection::{apply_fact_step, fact_steps, FactStep};
 use super::logged_plan::Table;
 use super::{
@@ -13,7 +14,7 @@ use super::{
 use crate::backend::BackendTx;
 use crate::error::{Error, Result};
 use crate::ids::{NodeId, FOREVER};
-use crate::types::{relation, Derivation};
+use crate::types::{relation, Derivation, EventRef, EventRole};
 use crate::value::Value;
 
 /// One statement of a projection, in the order it runs.
@@ -30,6 +31,13 @@ pub(super) enum Step {
     Derivation {
         id: String,
         derivation: Derivation,
+    },
+    /// Lists a log event beside a node. Listing it twice changes nothing, so a
+    /// replay can run it again.
+    NodeEvent {
+        node_id: String,
+        event: EventRef,
+        role: EventRole,
     },
     Edge(EdgeRow),
     /// An edge written only while both ends are live and no live twin exists.
@@ -59,6 +67,49 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
         | LogPayload::Voided { .. }
         | LogPayload::RunRolledBack { .. } => Vec::new(),
     }
+}
+
+/// The origin of every node `steps` writes: `event`, which is synthetic when
+/// the backfill logged it for a row that predates the log.
+pub(super) fn origin_steps(event: &LogEvent, steps: &[Step]) -> Vec<Step> {
+    let synthetic = event.source == BACKFILL_SOURCE;
+    steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Node(row) => Some(Step::NodeEvent {
+                node_id: row.id.clone(),
+                event: EventRef {
+                    event_id: event.event_id.clone(),
+                    synthetic,
+                },
+                role: EventRole::Origin,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `steps` for a write that no log records, where an origin event id names
+/// nothing a log could produce again. A basis event keeps the flag it came with.
+pub(super) fn unlogged(steps: Vec<Step>) -> Vec<Step> {
+    steps
+        .into_iter()
+        .map(|step| match step {
+            Step::NodeEvent {
+                node_id,
+                mut event,
+                role: EventRole::Origin,
+            } => {
+                event.synthetic = true;
+                Step::NodeEvent {
+                    node_id,
+                    event,
+                    role: EventRole::Origin,
+                }
+            }
+            other => other,
+        })
+        .collect()
 }
 
 // `LoggedRows` in rebuild.rs repeats this supersede rule on purpose, to check a
@@ -108,6 +159,22 @@ pub(super) async fn apply_steps(
                 )
                 .await?;
             }
+            Step::NodeEvent {
+                node_id,
+                event,
+                role,
+            } => {
+                tx.execute(
+                    NODE_EVENT_INSERT_SQL,
+                    &[
+                        node_id.as_str().into(),
+                        event.event_id.as_str().into(),
+                        role.as_str().into(),
+                        i64::from(event.synthetic).into(),
+                    ],
+                )
+                .await?;
+            }
             Step::Edge(row) => {
                 tx.execute(EDGE_ROW_INSERT_SQL, &edge_row_params(row))
                     .await?;
@@ -139,6 +206,12 @@ async fn remove_row(
     }
     Ok(())
 }
+
+// Skips a node that is not there instead of failing on the foreign key: a row a
+// replay lost is for the rebuild check to report against the log.
+const NODE_EVENT_INSERT_SQL: &str =
+    "INSERT OR IGNORE INTO node_events (node_id, event_id, role, synthetic)
+     SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1)";
 
 const EDGE_ROW_INSERT_SQL: &str =
     "INSERT INTO edges (id, src, dst, type, attributes, tx_from, tx_to)

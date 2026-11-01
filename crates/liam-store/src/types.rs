@@ -108,6 +108,33 @@ impl Derivation {
     }
 }
 
+/// How a log event relates to the node it is listed for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EventRole {
+    /// The event that wrote the node.
+    Origin,
+    /// An event a composed node rests on, such as a mention an entity page
+    /// was written from.
+    Basis,
+}
+
+impl EventRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Origin => "origin",
+            Self::Basis => "basis",
+        }
+    }
+}
+
+/// A log event id kept beside a node. `synthetic` is set when no log record
+/// backs the id, so a caller never reads it as a real source.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventRef {
+    pub event_id: String,
+    pub synthetic: bool,
+}
+
 /// A node to insert. Embedding is optional and supplied by the caller.
 #[derive(Clone, Debug)]
 pub struct NewNode {
@@ -139,6 +166,9 @@ pub struct NewNode {
     pub(crate) entity_page: bool,
     /// Set only through `with_derivation`, which `NewNode::entity` alone calls.
     pub(crate) derivation: Derivation,
+    /// Events the node is composed from, written with the node as its `Basis`
+    /// events. Empty for a node that is not composed from other nodes.
+    pub basis: Vec<EventRef>,
 }
 
 impl NewNode {
@@ -160,6 +190,7 @@ impl NewNode {
             producer: "unknown".to_string(),
             entity_page: false,
             derivation: Derivation::Recorded,
+            basis: Vec::new(),
         }
     }
     /// An entity page node. `entity_type` becomes the `kind` (e.g. "person",
@@ -176,6 +207,10 @@ impl NewNode {
     }
     fn with_derivation(mut self, derivation: Derivation) -> Self {
         self.derivation = derivation;
+        self
+    }
+    pub fn with_basis(mut self, basis: Vec<EventRef>) -> Self {
+        self.basis = basis;
         self
     }
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {

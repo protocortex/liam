@@ -49,6 +49,7 @@ mod log_cursor;
 mod log_open;
 mod logged_plan;
 mod logged_write;
+mod node_events;
 mod projection;
 mod rebuild;
 mod reembed;
@@ -2310,6 +2311,7 @@ mod tests {
     mod log_open;
     mod log_write;
     mod log_write_faults;
+    mod node_events;
     mod ranking_ties;
     mod rebuild;
     mod reembed;

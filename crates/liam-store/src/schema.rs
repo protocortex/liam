@@ -110,6 +110,20 @@ CREATE TABLE IF NOT EXISTS node_community (
 
 CREATE INDEX IF NOT EXISTS node_community_by_community ON node_community (community);
 
+-- The log events behind a node: the one that wrote it (origin) and, for an
+-- entity page, the events of the mentions it was composed from (basis).
+-- synthetic marks an event id no log record backs, such as a write made with
+-- no log or one the backfill logged for a row that predates it.
+CREATE TABLE IF NOT EXISTS node_events (
+  node_id   TEXT    NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  event_id  TEXT    NOT NULL,
+  role      TEXT    NOT NULL CHECK (role IN ('origin', 'basis')),
+  synthetic INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (node_id, event_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS node_events_by_event ON node_events (event_id);
+
 CREATE TABLE IF NOT EXISTS cluster_state (
   edge_count         INTEGER NOT NULL,
   max_tx_from        INTEGER NOT NULL,
@@ -272,13 +286,14 @@ pub(crate) enum Clear {
 /// the assignments, otherwise its fingerprint would vouch for communities that
 /// are no longer there. The backend's vector table goes before all of them, as
 /// `Backend::vector_clear_sql` returns it.
-pub(crate) const DERIVED_TABLES: [(&str, Clear); 14] = [
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 15] = [
     // No foreign keys link the fact tables, so their order among themselves is free.
     ("fact_sources", Clear::Always),
     ("fact_suppressions", Clear::Always),
     ("facts", Clear::Always),
     // Extraction restarts from the first event, which the fact rules treat as a replay.
     ("extraction_cursor", Clear::Always),
+    ("node_events", Clear::Always),
     ("node_community", Clear::Always),
     ("cluster_state", Clear::Always),
     ("edges", Clear::Always),

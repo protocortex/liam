@@ -32,9 +32,10 @@ pub use graph::{
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{
     relation, ArbitrationCaps, ArbitrationOutcome, Cardinality, Change, ClusterMember,
-    ClusterState, Derivation, EndFact, EndOutcome, ExplainedHit, ExtractorName, Fact, Fingerprint,
-    GcReport, GraphConfig, Grounding, Hit, MatchMode, NewEdge, NewFact, NewNode, PredicateSpec,
-    Query, RetentionPolicy, RetentionRule, RetractOutcome, Vocabulary,
+    ClusterState, Derivation, EndFact, EndOutcome, EventRef, EventRole, ExplainedHit,
+    ExtractorName, Fact, Fingerprint, GcReport, GraphConfig, Grounding, Hit, MatchMode, NewEdge,
+    NewFact, NewNode, PredicateSpec, Query, RetentionPolicy, RetentionRule, RetractOutcome,
+    Vocabulary,
 };
 pub use value::{Row, Value};
 

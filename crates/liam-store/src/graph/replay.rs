@@ -16,7 +16,7 @@ use super::fact_projection::FactStep;
 use super::log_cursor;
 use super::logged_plan::Table;
 use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog};
-use super::projection::{steps_for, Step};
+use super::projection::{origin_steps, steps_for, Step};
 use super::reembed::ReembedReport;
 use super::rolled_back::{RolledBack, SeenFactWrite};
 use super::Graph;
@@ -169,7 +169,8 @@ impl<B: Backend> Graph<B> {
         last_void: &mut Option<LogOffset>,
     ) -> Result<Outcome> {
         let LogRecord { offset, event, .. } = record;
-        let steps = steps_for(&rolled_back.reconcile(event.payload.clone()));
+        let mut steps = steps_for(&rolled_back.reconcile(event.payload.clone()));
+        steps.extend(origin_steps(event, &steps));
         if steps.is_empty() {
             log_cursor::advance(&self.backend, held.log_id, *offset).await?;
             return Ok(Outcome::Passed);
@@ -451,7 +452,11 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
             Step::Node(row) => Some(WrittenRow::Node(&row.id)),
             Step::Edge(row) | Step::GuardedEdge(row) => Some(WrittenRow::Edge(row)),
             Step::Fact(FactStep::Insert(row)) => Some(WrittenRow::Fact(&row.id)),
-            Step::Close { .. } | Step::Derivation { .. } | Step::Remove(_) | Step::Fact(_) => None,
+            Step::Close { .. }
+            | Step::Derivation { .. }
+            | Step::NodeEvent { .. }
+            | Step::Remove(_)
+            | Step::Fact(_) => None,
         })
         .collect()
 }
