@@ -44,6 +44,8 @@ const RESERVED_LONG_FLAGS: [&str; 4] = ["--host", "--port", "--api-key", "--alia
 const RESERVED_SHORT_ALIAS: &str = "-a";
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+// Serialized only by the test that lists the keys the docs must cover.
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct ExtractionConfig {
     /// When false the whole extraction hook is a no-op.
@@ -84,11 +86,15 @@ pub struct ExtractionConfig {
 /// Fields left out keep the built-in value, or the undeclared-predicate
 /// default for a predicate the built-ins do not know.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct PredicateOverride {
+    #[cfg_attr(test, serde(skip))]
     pub cardinality: Option<Cardinality>,
     #[serde(rename = "match")]
+    #[cfg_attr(test, serde(skip))]
     pub match_mode: Option<MatchMode>,
+    #[cfg_attr(test, serde(skip))]
     pub grounding: Option<Grounding>,
 }
 
@@ -322,6 +328,9 @@ const MANY_EXACT_TEXT: PredicateSpec = PredicateSpec {
     match_mode: MatchMode::Exact,
     grounding: Grounding::Text,
 };
+
+#[cfg(test)]
+mod documented_keys;
 
 #[cfg(test)]
 mod tests {

@@ -64,7 +64,7 @@ max_concurrent_generations = 0   # 0 = auto-tune from a one-time benchmark; set 
 [extraction]
 enabled              = false     # false makes the whole hook a no-op
 llm_enabled          = true      # false extracts with the rules only
-# llama_server_path  = "/usr/local/bin/llama-server"
+# llama_server_path  = "~/.liam/bin/llama-b11860/llama-server"   # where liam fetch-models puts it
 # model_gguf         = "~/.liam/models/extraction.gguf"
 # extra_args         = ["--threads", "4"]   # --host, --port, --api-key and --alias are set by liam
 host                 = "127.0.0.1"   # loopback addresses only
