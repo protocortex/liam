@@ -33,6 +33,7 @@ use liam_daemon::consolidation::manifest::RunOutcome;
 use liam_daemon::consolidation::offline::{print_status, run_offline};
 use liam_daemon::embedder_fingerprint::{self, EmbedderFingerprint};
 use liam_daemon::event_log;
+use liam_daemon::fetch;
 use liam_daemon::models::{self, StoreEmbedder};
 use liam_daemon::retrieval_eval::{run_retrieval_eval, EvalModel, EvalReport};
 use liam_daemon::storelock::StoreLock;
@@ -561,10 +562,12 @@ fn print_report(
 fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
     println!("config: {}", config_path.display());
 
-    let wants_embedder = config.embedder.provider == "local";
-    let wants_llm = config.llm.provider == "llama-cpp";
+    let home = std::env::var("HOME").unwrap_or_default();
+    // Fails before any download when the packaged server cannot run here.
+    let plan =
+        fetch::FetchPlan::for_host(config, &home, std::env::consts::OS, std::env::consts::ARCH)?;
 
-    if !wants_embedder && !wants_llm {
+    if plan.is_empty() {
         // `Config::load` falls back to built-in defaults when the file is
         // absent, and both of those defaults are mock. So a mistyped
         // `--config` arrives here looking exactly like a deliberately mock
@@ -583,15 +586,13 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
             "nothing to fetch: embedder.provider = {:?} and llm.provider = {:?} are both \
              mock providers, and mocks load no weights. Mock embeddings are random and the \
              mock LLM invents answers, so set embedder.provider = \"local\" and \
-             llm.provider = \"llama-cpp\" before fetching.{note}",
+             llm.provider = \"llama-cpp\" before fetching, or enable [extraction] to fetch \
+             its server and model.{note}",
             config.embedder.provider,
             config.llm.provider
         );
     }
-
-    let home = std::env::var("HOME").unwrap_or_default();
-
-    if wants_embedder {
+    if plan.embedder {
         println!("embedder: {}", config.embedder.model);
         if let Some(cache_dir) = models::export_fastembed_cache_dir(config)? {
             println!("  cache_dir -> {}", cache_dir.display());
@@ -602,7 +603,7 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
         println!("embedder: ready, with its reranker");
     }
 
-    if wants_llm {
+    if plan.llm {
         let cache_dir =
             models::resolve_path_with_home("llm.cache_dir", &config.llm.cache_dir, &home)?;
         println!(
@@ -615,6 +616,16 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
         // a start the daemon then refuses.
         let _llm = models::build_llm(config)?;
         println!("llm: ready");
+    }
+
+    if plan.extraction.is_some() {
+        fetch::fetch_extraction(
+            &config.extraction,
+            &home,
+            &fetch::CurlFetcher::https_only(),
+            &fetch::PINNED,
+            &mut std::io::stdout(),
+        )?;
     }
 
     println!("done: liamd can now start without downloading anything.");

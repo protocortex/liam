@@ -25,6 +25,9 @@ use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
+use crate::config::{Config, ExtractionConfig};
+use crate::models;
+
 pub use curl::CurlFetcher;
 
 /// The `llama.cpp` release the sidecar is tested against. The server's flags,
@@ -59,7 +62,23 @@ pub const MODEL_ASSET: Asset<'static> = Asset {
     size_bytes: 2_740_937_888,
 };
 
+/// Everything `fetch_extraction` downloads.
+#[derive(Debug, Clone, Copy)]
+pub struct Pinned<'a> {
+    pub server: Asset<'a>,
+    pub model: Asset<'a>,
+}
+
+pub const PINNED: Pinned<'static> = Pinned {
+    server: SERVER_ASSET,
+    model: MODEL_ASSET,
+};
+
 const SERVER_BINARY: &str = "llama-server";
+const LIAM_DIR: &str = ".liam";
+const BIN_DIR: &str = "bin";
+const MODELS_DIR: &str = "models";
+const DEFAULT_MODEL_FILE: &str = "extraction.gguf";
 const PARTIAL_SUFFIX: &str = ".partial";
 const UNPACKED_SUFFIX: &str = ".unpacked";
 const SUPPORTED_OS: &str = "macos";
@@ -89,11 +108,146 @@ pub enum Installed {
 pub fn check_platform(os: &str, arch: &str) -> anyhow::Result<()> {
     ensure!(
         os == SUPPORTED_OS && arch == SUPPORTED_ARCH,
-        "the extraction server is packaged for macOS on Apple Silicon only, found {os}/{arch}; \
-         set extraction.llama_server_path to your own llama-server build and extraction.model_gguf \
-         to a GGUF file instead"
+        "the packaged llama-server runs on macOS on Apple Silicon only, found {os}/{arch}; \
+         point extraction.llama_server_path at your own llama-server build instead"
     );
     Ok(())
+}
+
+/// Where one extraction file comes from: downloaded to a default location, or
+/// already at a path the config names, which is never overwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Install(PathBuf),
+    Keep(PathBuf),
+}
+
+/// The extraction files a fetch handles: the server directory and the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionTargets {
+    pub server: Target,
+    pub model: Target,
+}
+
+/// Which parts of `liam fetch-models` the config asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FetchPlan {
+    pub embedder: bool,
+    pub llm: bool,
+    pub extraction: Option<ExtractionTargets>,
+}
+
+impl FetchPlan {
+    /// Decides from the config, and fails before any download when the packaged
+    /// server would have to be installed on a host it does not run on.
+    pub fn for_host(config: &Config, home: &str, os: &str, arch: &str) -> anyhow::Result<Self> {
+        let extraction = extraction_targets(&config.extraction, home)?;
+        if let Some(ExtractionTargets {
+            server: Target::Install(_),
+            ..
+        }) = &extraction
+        {
+            check_platform(os, arch)?;
+        }
+        Ok(Self {
+            embedder: config.embedder.provider == "local",
+            llm: config.llm.provider == "llama-cpp",
+            extraction,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.embedder && !self.llm && self.extraction.is_none()
+    }
+}
+
+/// `None` when extraction needs no files. A path that is not the default
+/// location is the user's own file and is kept.
+pub fn extraction_targets(
+    config: &ExtractionConfig,
+    home: &str,
+) -> anyhow::Result<Option<ExtractionTargets>> {
+    if !wants_files(config) {
+        return Ok(None);
+    }
+    let server_dir = default_server_dir(home);
+    let server = match configured_path(
+        "extraction.llama_server_path",
+        &config.llama_server_path,
+        home,
+    )? {
+        Some(path) if path != server_dir.join(SERVER_BINARY) => Target::Keep(path),
+        _ => Target::Install(server_dir),
+    };
+    let default_model = default_model_path(home);
+    let model = match configured_path("extraction.model_gguf", &config.model_gguf, home)? {
+        Some(path) if path != default_model => Target::Keep(path),
+        _ => Target::Install(default_model),
+    };
+    Ok(Some(ExtractionTargets { server, model }))
+}
+
+/// Fetches whatever extraction needs that is not already on disk, reporting
+/// each step on `out`. Does nothing for a config that has no model pass.
+pub fn fetch_extraction(
+    config: &ExtractionConfig,
+    home: &str,
+    fetcher: &dyn Fetcher,
+    pinned: &Pinned<'_>,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let Some(targets) = extraction_targets(config, home)? else {
+        return Ok(());
+    };
+    writeln!(out, "extraction server: llama.cpp {SERVER_TAG}")?;
+    match &targets.server {
+        Target::Install(dir) => {
+            let outcome = install_server(fetcher, &pinned.server, dir)?;
+            writeln!(out, "  {outcome:?}: {}", dir.join(SERVER_BINARY).display())?;
+        }
+        Target::Keep(path) => writeln!(out, "  keeping your own server at {}", path.display())?,
+    }
+    writeln!(out, "extraction model: Qwen3.5 4B Q4_K_M")?;
+    match &targets.model {
+        Target::Install(path) => {
+            let outcome = install_model(fetcher, &pinned.model, path)?;
+            writeln!(out, "  {outcome:?}: {}", path.display())?;
+        }
+        Target::Keep(path) => writeln!(out, "  keeping your own model at {}", path.display())?,
+    }
+    Ok(())
+}
+
+/// Whether extraction needs files at all: the model pass is the only part
+/// that does.
+pub fn wants_files(config: &ExtractionConfig) -> bool {
+    config.enabled && config.llm_enabled
+}
+
+fn configured_path(
+    key: &str,
+    value: &Option<String>,
+    home: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    value
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .map(|text| models::resolve_path_with_home(key, text, home).map(PathBuf::from))
+        .transpose()
+}
+
+fn default_server_dir(home: &str) -> PathBuf {
+    Path::new(home)
+        .join(LIAM_DIR)
+        .join(BIN_DIR)
+        .join(format!("llama-{SERVER_TAG}"))
+}
+
+fn default_model_path(home: &str) -> PathBuf {
+    Path::new(home)
+        .join(LIAM_DIR)
+        .join(MODELS_DIR)
+        .join(DEFAULT_MODEL_FILE)
 }
 
 /// Installs the GGUF at `dest`. A file already there with the pinned hash is
