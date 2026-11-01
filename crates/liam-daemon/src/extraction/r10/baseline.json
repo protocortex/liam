@@ -1,0 +1,15 @@
+{
+  "prompt_version": "1",
+  "model_sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+  "seed": 281075216,
+  "measured": {
+    "f1": 0.5,
+    "per_predicate_f1": {},
+    "peak_rss_mb": 0,
+    "facts_dropped_ungrounded": 0
+  },
+  "gate": {
+    "min_f1": 0.5,
+    "max_facts_dropped_ungrounded": 1000
+  }
+}
