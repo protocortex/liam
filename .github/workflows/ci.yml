@@ -43,9 +43,11 @@ on:
       - 'LICENSE'
       - '.github/ISSUE_TEMPLATE/**'
 
+# Only pull request runs are cancelled by a newer push; main, schedule and
+# dispatch runs always finish.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -69,9 +71,14 @@ env:
   # side of the trade here because the alternative evicts everyone's cache.
   CACHE_SAVE_IF: ${{ github.ref == 'refs/heads/main' }}
 
+# Job timeouts are about 3x the slowest successful run over the last 100 runs
+# (lint 37s, test 104s, build-local 109s, coverage 237s, macos 365s, deny 16s),
+# with a 5 minute floor and extra room for a cold cache. They make a hung
+# runner fail fast instead of holding the job for GitHub's 360 minute default.
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -93,6 +100,7 @@ jobs:
   # expensive one.
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -108,6 +116,7 @@ jobs:
 
   build-local:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -126,6 +135,7 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -158,6 +168,7 @@ jobs:
   # Ratchet it up over time; never lower it without a documented reason.
   coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       FLOOR: "94"
     steps:
@@ -202,6 +213,7 @@ jobs:
   # dependency graph, then each feature build adds only its own tree on top.
   macos:
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
