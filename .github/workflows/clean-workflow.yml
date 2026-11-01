@@ -15,7 +15,7 @@ permissions: {}
 
 concurrency:
   group: clean-workflow-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   clean:

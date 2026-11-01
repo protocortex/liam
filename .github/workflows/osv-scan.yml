@@ -61,6 +61,8 @@ jobs:
         with:
           persist-credentials: false
 
+      # Bounds the scan only. The Docker image pull happens before this step
+      # starts, so the job timeout is what bounds a hung pull.
       - timeout-minutes: 10
         uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
         with:

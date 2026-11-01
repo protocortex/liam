@@ -43,8 +43,8 @@ on:
       - 'LICENSE'
       - '.github/ISSUE_TEMPLATE/**'
 
-# Only pull request runs are cancelled by a newer push; main, schedule and
-# dispatch runs always finish.
+# A newer push cancels a pull request run in progress. On main, a run in
+# progress is left to finish; a third push replaces the one still queued.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
