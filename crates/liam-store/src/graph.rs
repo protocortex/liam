@@ -1212,7 +1212,7 @@ impl<B: Backend> Graph<B> {
             filters.push_str(&format!(" AND {}", scope_within("n.scope", next)));
             params.push(scope.into());
         }
-        filters.push_str(&not_inferred("n.id", include_inferred));
+        filters.push_str(&row_not_inferred("n", include_inferred));
         let sql = format!(
             "SELECT n.id FROM nodes_fts
              JOIN nodes n ON n.rowid = nodes_fts.rowid
@@ -2125,7 +2125,7 @@ impl<B: Backend> Graph<B> {
               WHERE {live}{strict}
               ORDER BY nc.community, n.id",
             live = live_at("n", 1),
-            strict = not_inferred("n.id", include_inferred),
+            strict = row_not_inferred("n", include_inferred),
         );
         let rows = self.backend.query(&sql, &[now.into()]).await?;
 
@@ -2169,15 +2169,26 @@ struct Filter<'a> {
     include_inferred: bool,
 }
 
-/// A predicate that leaves out an inferred node named by `column`, or nothing
-/// when inferred nodes are wanted. The derivation is a store constant, so it is
-/// written into the statement rather than bound.
+/// A predicate that leaves out an inferred node named by `column`, an edge end,
+/// or nothing when inferred nodes are wanted. The derivation is a store
+/// constant, so it is written into the statement rather than bound.
 fn not_inferred(column: &str, include_inferred: bool) -> String {
     if include_inferred {
         return String::new();
     }
     format!(
         " AND {column} NOT IN (SELECT id FROM nodes WHERE derivation = '{}')",
+        Derivation::Inferred.as_str()
+    )
+}
+
+/// `not_inferred` for a query that already reads the `nodes` row as `alias`.
+fn row_not_inferred(alias: &str, include_inferred: bool) -> String {
+    if include_inferred {
+        return String::new();
+    }
+    format!(
+        " AND {alias}.derivation != '{}'",
         Derivation::Inferred.as_str()
     )
 }
