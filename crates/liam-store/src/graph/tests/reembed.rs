@@ -31,7 +31,7 @@ async fn probed_graph() -> Graph<ReembedProbe> {
 /// The node whose vector is nearest to `vector`.
 async fn nearest<B: Backend>(g: &Graph<B>, vector: &[f32]) -> Vec<NodeId> {
     g.backend
-        .vector_search(vector, 1, None, None, Millis(1000))
+        .vector_search(vector, 1, None, None, Millis(1000), true)
         .await
         .unwrap()
 }

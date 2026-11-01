@@ -17,6 +17,7 @@ use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::graph::scope_within;
 use crate::ids::{Millis, NodeId, FOREVER};
+use crate::types::Derivation;
 use crate::value::{Row, Value};
 
 /// Milliseconds a connection waits on `SQLITE_BUSY` before giving up.
@@ -192,6 +193,29 @@ fn le_bytes(embedding: &[f32]) -> Vec<u8> {
     bytes
 }
 
+/// The `dims` floats in `bytes`, little endian as `le_bytes` writes them. The
+/// column accepts a vector of any width, so a blob of another length is an
+/// error here rather than a vector of the wrong size.
+fn decode_vector(bytes: &[u8], dims: usize) -> Result<Vec<f32>> {
+    let (chunks, rest) = bytes.as_chunks::<{ std::mem::size_of::<f32>() }>();
+    if !rest.is_empty() {
+        return Err(Error::Backend(format!(
+            "a stored vector of {} bytes is not whole f32 values",
+            bytes.len()
+        )));
+    }
+    if chunks.len() != dims {
+        return Err(Error::Dimension {
+            expected: dims,
+            got: chunks.len(),
+        });
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
+}
+
 fn vector_literal(embedding: &[f32]) -> String {
     let mut out = String::with_capacity(embedding.len() * 8 + 2);
     out.push('[');
@@ -343,6 +367,18 @@ impl Backend for LibsqlBackend {
         Ok(())
     }
 
+    async fn vector_get(&self, node_id: &str, dims: usize) -> Result<Option<Vec<f32>>> {
+        let rows = self
+            .query(
+                "SELECT embedding FROM node_vectors WHERE node_id = ?1",
+                &[node_id.into()],
+            )
+            .await?;
+        rows.first()
+            .map(|row| decode_vector(row.get_blob(0)?, dims))
+            .transpose()
+    }
+
     async fn vector_search(
         &self,
         query: &[f32],
@@ -350,6 +386,7 @@ impl Backend for LibsqlBackend {
         kind: Option<&str>,
         scope: Option<&str>,
         as_of: Millis,
+        include_inferred: bool,
     ) -> Result<Vec<NodeId>> {
         let mut params = vec![
             libsql::Value::Text(vector_literal(query)),
@@ -366,6 +403,13 @@ impl Backend for LibsqlBackend {
         if let Some(scope) = scope {
             filters.push_str(&format!(" AND {}", scope_within("n.scope", next)));
             params.push(libsql::Value::Text(scope.to_string()));
+            next += 1;
+        }
+        if !include_inferred {
+            filters.push_str(&format!(" AND n.derivation != ?{next}"));
+            params.push(libsql::Value::Text(
+                Derivation::Inferred.as_str().to_string(),
+            ));
         }
         // Same four-bound "live at T" predicate the lexical path enforces
         // (see `live_at` in graph.rs): recorded before T, not yet superseded
@@ -496,6 +540,63 @@ mod tests {
     /// `a_configured_read_pool_size_is_honoured_for_a_file_backed_database`)
     /// use their own explicit, meaningful values instead.
     const ARBITRARY_POOL_SIZE: usize = 4;
+
+    #[test]
+    fn decode_vector_reads_back_what_le_bytes_wrote() {
+        // Arrange
+        let floats = [0.25, -1.5, f32::MIN_POSITIVE];
+
+        // Act
+        let decoded = decode_vector(&le_bytes(&floats), floats.len());
+
+        // Assert
+        assert_eq!(decoded.unwrap(), floats);
+    }
+
+    #[test]
+    fn decode_vector_refuses_a_blob_that_does_not_match_the_dims() {
+        for (bytes, dims, expected) in [
+            (
+                12,
+                4,
+                Error::Dimension {
+                    expected: 4,
+                    got: 3,
+                },
+            ),
+            (
+                12,
+                2,
+                Error::Dimension {
+                    expected: 2,
+                    got: 3,
+                },
+            ),
+            (
+                0,
+                1,
+                Error::Dimension {
+                    expected: 1,
+                    got: 0,
+                },
+            ),
+        ] {
+            // Act
+            let decoded = decode_vector(&vec![0; bytes], dims);
+
+            // Assert
+            assert_eq!(decoded.unwrap_err().to_string(), expected.to_string());
+        }
+    }
+
+    #[test]
+    fn decode_vector_refuses_a_blob_that_is_not_whole_floats() {
+        // Act
+        let decoded = decode_vector(&[0; 13], 3);
+
+        // Assert
+        assert!(matches!(decoded, Err(Error::Backend(_))));
+    }
 
     #[test]
     fn a_constraint_failure_is_told_apart_from_a_busy_or_io_failure() {

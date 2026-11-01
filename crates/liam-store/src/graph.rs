@@ -995,8 +995,9 @@ impl<B: Backend> Graph<B> {
         };
         let vector = match q.embedding.as_deref() {
             Some(embedding) => {
+                // Queries do not filter on derivation yet, so every node ranks.
                 self.backend
-                    .vector_search(embedding, pool, kind, scope, now)
+                    .vector_search(embedding, pool, kind, scope, now, true)
                     .await?
             }
             None => Vec::new(),
@@ -2317,6 +2318,7 @@ mod tests {
     mod soak;
     mod support;
     mod swept_by;
+    mod vector_reads;
 
     /// A graph whose clock starts at 1000, with a handle to move it.
     async fn gc_graph() -> (DefaultGraph, Arc<FixedClock>) {
@@ -6480,6 +6482,9 @@ mod tests {
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.0.vector_delete(node_id).await
         }
+        async fn vector_get(&self, node_id: &str, dims: usize) -> Result<Option<Vec<f32>>> {
+            self.0.vector_get(node_id, dims).await
+        }
         async fn vector_search(
             &self,
             query: &[f32],
@@ -6487,8 +6492,11 @@ mod tests {
             kind: Option<&str>,
             scope: Option<&str>,
             as_of: Millis,
+            include_inferred: bool,
         ) -> Result<Vec<NodeId>> {
-            self.0.vector_search(query, k, kind, scope, as_of).await
+            self.0
+                .vector_search(query, k, kind, scope, as_of, include_inferred)
+                .await
         }
         async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
             self.0.nodes_missing_vectors().await
@@ -7708,7 +7716,7 @@ mod tests {
         // Assert
         let hits1 = g
             .backend
-            .vector_search(&e1, 5, None, None, Millis(1000))
+            .vector_search(&e1, 5, None, None, Millis(1000), true)
             .await
             .unwrap();
         assert!(
@@ -7717,7 +7725,7 @@ mod tests {
         );
         let hits2 = g
             .backend
-            .vector_search(&e2, 5, None, None, Millis(1000))
+            .vector_search(&e2, 5, None, None, Millis(1000), true)
             .await
             .unwrap();
         assert!(
@@ -7766,7 +7774,7 @@ mod tests {
         // past node 1's failure instead of aborting.
         let hits2 = g
             .backend
-            .vector_search(&e2, 5, None, None, Millis(1000))
+            .vector_search(&e2, 5, None, None, Millis(1000), true)
             .await
             .unwrap();
         assert!(
@@ -7775,7 +7783,7 @@ mod tests {
         );
         let hits3 = g
             .backend
-            .vector_search(&e3, 5, None, None, Millis(1000))
+            .vector_search(&e3, 5, None, None, Millis(1000), true)
             .await
             .unwrap();
         assert!(
@@ -7856,7 +7864,7 @@ mod tests {
         // Act: search with the ancestor scope.
         let hits = g
             .backend
-            .vector_search(&e, 10, None, Some("work"), Millis(1000))
+            .vector_search(&e, 10, None, Some("work"), Millis(1000), true)
             .await
             .unwrap();
 
@@ -8078,6 +8086,9 @@ mod tests {
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
         }
+        async fn vector_get(&self, node_id: &str, dims: usize) -> Result<Option<Vec<f32>>> {
+            self.inner.vector_get(node_id, dims).await
+        }
         async fn vector_search(
             &self,
             query: &[f32],
@@ -8085,8 +8096,11 @@ mod tests {
             kind: Option<&str>,
             scope: Option<&str>,
             as_of: Millis,
+            include_inferred: bool,
         ) -> Result<Vec<NodeId>> {
-            self.inner.vector_search(query, k, kind, scope, as_of).await
+            self.inner
+                .vector_search(query, k, kind, scope, as_of, include_inferred)
+                .await
         }
         async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
             self.inner.nodes_missing_vectors().await
@@ -8183,6 +8197,9 @@ mod tests {
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
             self.inner.vector_delete(node_id).await
         }
+        async fn vector_get(&self, node_id: &str, dims: usize) -> Result<Option<Vec<f32>>> {
+            self.inner.vector_get(node_id, dims).await
+        }
         async fn vector_search(
             &self,
             query: &[f32],
@@ -8190,8 +8207,11 @@ mod tests {
             kind: Option<&str>,
             scope: Option<&str>,
             as_of: Millis,
+            include_inferred: bool,
         ) -> Result<Vec<NodeId>> {
-            self.inner.vector_search(query, k, kind, scope, as_of).await
+            self.inner
+                .vector_search(query, k, kind, scope, as_of, include_inferred)
+                .await
         }
         async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {
             self.inner.nodes_missing_vectors().await

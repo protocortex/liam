@@ -97,10 +97,17 @@ pub trait Backend: Send + Sync + Sized {
             .collect()
     }
 
+    /// Read. The vector stored for `node_id`, closed nodes included, or `None`
+    /// when there is none. `dims` is the width the store was created with, and
+    /// a stored vector of another width is an error. Does not serialize with
+    /// writes or with other reads; see the trait's concurrency contract above.
+    async fn vector_get(&self, node_id: &str, dims: usize) -> Result<Option<Vec<f32>>>;
+
     /// Read. Nearest node ids to `query`, restricted to the live set at
-    /// `as_of` and, when given, to `kind` and `scope`. Each backend applies
-    /// the filter in its own layout. Does not serialize with writes or with
-    /// other reads; see the trait's concurrency contract above.
+    /// `as_of` and, when given, to `kind` and `scope`. Inferred nodes are left
+    /// out unless `include_inferred`, so a strict read never ranks them. Each
+    /// backend applies the filter in its own layout. Does not serialize with
+    /// writes or with other reads; see the trait's concurrency contract above.
     async fn vector_search(
         &self,
         query: &[f32],
@@ -108,6 +115,7 @@ pub trait Backend: Send + Sync + Sized {
         kind: Option<&str>,
         scope: Option<&str>,
         as_of: Millis,
+        include_inferred: bool,
     ) -> Result<Vec<NodeId>>;
 
     /// Read. Ids of the live nodes (not superseded or closed) that have no
