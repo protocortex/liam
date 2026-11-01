@@ -39,6 +39,10 @@ const EXTRACTION_SEED: u32 = 0;
 const EXTRACTION_TEMPERATURE: f32 = 0.0;
 /// The answer may use this share of the context window; the prompt has the rest.
 const ANSWER_CONTEXT_DIVISOR: usize = 4;
+/// The start gate has already checked `ram_budget_mb`. Once the model is
+/// loaded it holds that memory itself, so a call only needs this much left over
+/// to know the host is not out of memory.
+const RUNNING_FREE_RAM_FLOOR_MB: u64 = 512;
 /// Replies that say the request itself is unacceptable (a prompt over the
 /// context window is a 400 from llama-server), so a retry repeats the failure.
 const CONTENT_REJECTION_STATUSES: [u16; 3] = [400, 413, 422];
@@ -459,7 +463,7 @@ impl<'a> Run<'a> {
         let opened = self.session.as_ref().expect("the session was just opened");
         let (cached, alive) = (Arc::clone(&opened.cached), Arc::clone(&opened.alive));
         let free_mb = self.deps.free_ram.free_mb();
-        if !alive() || free_mb < self.deps.config.ram_budget_mb {
+        if !alive() || free_mb < RUNNING_FREE_RAM_FLOOR_MB {
             warn!(
                 free_mb,
                 "the model is gone or memory ran out, stopping the run"

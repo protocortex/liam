@@ -17,12 +17,13 @@ use sysinfo::Pid;
 
 use super::baseline::{Baseline, SANITY_FLOOR_F1};
 use super::rss::PeakRss;
-use super::tiers::{corpus, model_labels, run_pipeline, PlentyOfRam};
+use super::tiers::{corpus, model_labels, run_pipeline};
 use super::{score, score_by_predicate};
 use crate::config::ExtractionConfig;
 use crate::extraction::identity::{model_identity, GgufFile};
 use crate::extraction::prompt::PROMPT_VERSION;
 use crate::extraction::provider::{pidfile_path, SidecarProvider, SystemStarter};
+use crate::extraction::sidecar::SystemRam;
 use liam_daemon::fetch::{default_model_path, default_server_dir, SERVER_BINARY};
 
 const BYTES_PER_MB: u64 = 1 << 20;
@@ -68,9 +69,7 @@ async fn the_real_model_meets_the_committed_gate() {
 
     // Act
     let ram_budget_mb = config.ram_budget_mb;
-    // The run's own memory check would count the loaded model against the
-    // budget; the server's start-up check and the peak assertion below hold it.
-    let run = run_pipeline(&events, &provider, &identity, config, &PlentyOfRam).await;
+    let run = run_pipeline(&events, &provider, &identity, config, &SystemRam).await;
     let peak_rss_mb = sampler.stop() / BYTES_PER_MB;
 
     // Assert
