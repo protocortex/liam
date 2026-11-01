@@ -472,7 +472,7 @@ database that predates the log.
 
 ```toml
 [extraction.trust]
-claude = 0.9
+notetaker = 0.9
 backfill = 0.3
 ```
 
