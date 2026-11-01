@@ -162,8 +162,8 @@ fn month(token: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::response::parse_response;
+    use super::*;
     use crate::config::{declared_predicates, resolve_vocabulary, ExtractionConfig};
 
     fn fact(subject: &str, predicate: &str, object: &str, polarity: Polarity) -> ParsedFact {
