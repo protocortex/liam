@@ -260,15 +260,8 @@ pub async fn normalize_scope_column<B: Backend>(backend: &B) -> Result<()> {
 const BACKFILL_CHUNK: usize = 200;
 
 /// Marks the entity pages that predate the `derivation` column as inferred,
-/// once. A page is a node that is the source of any `mentions` edge, live or
-/// closed, whose subject is its trimmed, lowercased label, which is what
-/// `NewNode::entity` stores. The edge alone is not enough, because `relate`
-/// accepts a `mentions` edge from any node.
-///
-/// The subject test runs in Rust: SQLite's `lower()` folds ASCII only, and the
-/// constructor lowercases with Unicode rules. Only rows still `recorded` are
-/// touched, so a second run, or a race with another process, changes nothing.
-/// Returns how many rows it marked, `0` when the pass already ran.
+/// once, and records that it ran. Returns how many rows it marked, `0` when
+/// the pass already ran. See `mark_inferred_pages` for the rule.
 pub(crate) async fn backfill_derivation<B: Backend>(backend: &B, now: Millis) -> Result<u64> {
     let done = backend
         .query("SELECT 1 FROM derivation_backfill_state WHERE id = 1", &[])
@@ -276,6 +269,35 @@ pub(crate) async fn backfill_derivation<B: Backend>(backend: &B, now: Millis) ->
     if !done.is_empty() {
         return Ok(0);
     }
+    let flagged = mark_inferred_pages(backend).await?;
+    backend
+        .execute(
+            "INSERT OR IGNORE INTO derivation_backfill_state (id, completed_at, flagged)
+             VALUES (1, ?1, ?2)",
+            &[now.into(), Value::Int(flagged as i64)],
+        )
+        .await?;
+    tracing::info!(flagged, "derivation backfill: entity pages marked inferred");
+    let stubs = unlinked_stubs(backend).await?;
+    tracing::info!(
+        stubs,
+        "derivation backfill: nodes shaped like a page but with no mentions edge stay recorded"
+    );
+    Ok(flagged)
+}
+
+/// The rule behind the backfill, with no gate, for a replay too: the log does
+/// not carry a derivation yet, so pages a replay writes arrive `recorded`. A
+/// page is a node that is the source of any `mentions` edge, live or closed,
+/// whose subject is its trimmed, lowercased label, which is what
+/// `NewNode::entity` stores. The edge alone is not enough, because `relate`
+/// accepts a `mentions` edge from any node.
+///
+/// The subject test runs in Rust: SQLite's `lower()` folds ASCII only, and the
+/// constructor lowercases with Unicode rules. Only rows still `recorded` are
+/// touched, so a rerun, or a race with another process, changes nothing. The
+/// writes are one statement per `BACKFILL_CHUNK` ids.
+pub(crate) async fn mark_inferred_pages<B: Backend>(backend: &B) -> Result<u64> {
     let candidates = backend
         .query(
             "SELECT n.id, n.label, n.subject FROM nodes n
@@ -290,7 +312,7 @@ pub(crate) async fn backfill_derivation<B: Backend>(backend: &B, now: Millis) ->
         .await?;
     let mut pages = Vec::new();
     for row in &candidates {
-        if row.get_string(2)? == row.get_string(1)?.trim().to_lowercase() {
+        if subject_is_label(&row.get_string(2)?, &row.get_string(1)?) {
             pages.push(row.get_string(0)?);
         }
     }
@@ -314,15 +336,35 @@ pub(crate) async fn backfill_derivation<B: Backend>(backend: &B, now: Millis) ->
             )
             .await?;
     }
-    backend
-        .execute(
-            "INSERT OR IGNORE INTO derivation_backfill_state (id, completed_at, flagged)
-             VALUES (1, ?1, ?2)",
-            &[now.into(), Value::Int(flagged as i64)],
+    Ok(flagged)
+}
+
+fn subject_is_label(subject: &str, label: &str) -> bool {
+    subject == label.trim().to_lowercase()
+}
+
+/// How many recorded nodes have a page's subject but no `mentions` edge, such
+/// as an entity that was never synthesized. They stay recorded, so the count
+/// tells the operator what the rule leaves out.
+async fn unlinked_stubs<B: Backend>(backend: &B) -> Result<usize> {
+    let rows = backend
+        .query(
+            "SELECT n.label, n.subject FROM nodes n
+             WHERE n.derivation = ?1 AND n.subject IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.src = n.id AND e.type = ?2)",
+            &[
+                Derivation::Recorded.as_str().into(),
+                relation::MENTIONS.into(),
+            ],
         )
         .await?;
-    tracing::info!(flagged, "derivation backfill: entity pages marked inferred");
-    Ok(flagged)
+    let mut stubs = 0;
+    for row in &rows {
+        if subject_is_label(&row.get_string(1)?, &row.get_string(0)?) {
+            stubs += 1;
+        }
+    }
+    Ok(stubs)
 }
 
 /// Whether `table` already has `column`, read from `PRAGMA table_info`.

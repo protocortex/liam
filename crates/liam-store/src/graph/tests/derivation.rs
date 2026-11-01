@@ -2,7 +2,7 @@
 //! The `derivation` column: which write paths set it, and the backfill that
 //! marks the entity pages written before the column existed.
 
-use super::support::{count, Env};
+use super::support::{count, Env, ONE_SEGMENT};
 use super::*;
 use crate::types::{Derivation, EpisodeEdge, EpisodeRef};
 use crate::DefaultBackend;
@@ -243,6 +243,10 @@ async fn a_rebuild_marks_the_replayed_pages_inferred_again() {
     let env = Env::new();
     let (g, log) = env.open::<DefaultBackend>("live.db", clock()).await;
     let seeded = seed(&g).await;
+    assert_eq!(
+        derivation_of(&g, &seeded.empty_page).await,
+        Derivation::Inferred
+    );
 
     // Act
     let (rebuilt, _) = g
@@ -250,7 +254,132 @@ async fn a_rebuild_marks_the_replayed_pages_inferred_again() {
         .await
         .unwrap();
 
-    // Assert
+    // Assert: a page with no mentions edge has nothing to mark it by, so the
+    // rebuild turns that stub back into recorded until the log carries the value
     assert_only_pages_are_inferred(&rebuilt, &seeded).await;
     assert_eq!(count(&rebuilt, "derivation_backfill_state").await, 1);
+}
+
+/// A store attached to the log in `env`, opened over a new handle on its file.
+async fn reopen_logged(env: &Env, db: &str) -> DefaultGraph {
+    let (g, _log) = env
+        .open_over::<DefaultBackend>(env.log(ONE_SEGMENT), db, clock())
+        .await;
+    g
+}
+
+#[tokio::test]
+async fn pages_replayed_into_an_empty_store_by_catch_up_are_inferred() {
+    // Arrange: a log holding pages, and a new database that has never seen it
+    let env = Env::new();
+    let seeded = {
+        let (writer, _log) = env.open::<DefaultBackend>("writer.db", clock()).await;
+        seed(&writer).await
+    };
+    let fresh = reopen_logged(&env, "fresh.db").await;
+
+    // Act
+    let report = fresh.catch_up().await.unwrap();
+
+    // Assert
+    assert!(report.applied > 0);
+    assert_only_pages_are_inferred(&fresh, &seeded).await;
+}
+
+#[tokio::test]
+async fn pages_replayed_into_a_store_whose_backfill_is_done_are_inferred() {
+    // Arrange: a store that finished its backfill while the log was empty, as a
+    // restored snapshot does, then pages that other clients wrote to the log
+    let env = Env::new();
+    drop(reopen_logged(&env, "snapshot.db").await);
+    let seeded = {
+        let (writer, _log) = env.open::<DefaultBackend>("writer.db", clock()).await;
+        seed(&writer).await
+    };
+    let restored = reopen_logged(&env, "snapshot.db").await;
+    assert_eq!(count(&restored, "derivation_backfill_state").await, 1);
+
+    // Act
+    restored.catch_up().await.unwrap();
+
+    // Assert
+    assert_only_pages_are_inferred(&restored, &seeded).await;
+}
+
+#[tokio::test]
+async fn a_finished_backfill_leaves_a_page_reset_to_recorded_alone() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let g = open_unlogged(&dir).await;
+    let seeded = seed(&g).await;
+    forget_derivations(&g).await;
+    crate::migrate::backfill_derivation(&g.backend, Millis(2000))
+        .await
+        .unwrap();
+    g.backend
+        .execute(
+            "UPDATE nodes SET derivation = 'recorded' WHERE id = ?1",
+            &[seeded.page.as_str().into()],
+        )
+        .await
+        .unwrap();
+
+    // Act
+    let second = crate::migrate::backfill_derivation(&g.backend, Millis(3000)).await;
+
+    // Assert
+    assert_eq!(second.unwrap(), 0);
+    assert_eq!(derivation_of(&g, &seeded.page).await, Derivation::Recorded);
+}
+
+#[tokio::test]
+async fn the_backfill_never_overwrites_a_derivation_other_than_recorded() {
+    // Arrange: a page-shaped node an extractor already owns
+    let dir = TempDir::new().unwrap();
+    let g = open_unlogged(&dir).await;
+    let seeded = seed(&g).await;
+    forget_derivations(&g).await;
+    g.backend
+        .execute(
+            "UPDATE nodes SET derivation = ?1 WHERE id = ?2",
+            &[
+                Derivation::Extracted.as_str().into(),
+                seeded.page.as_str().into(),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Act
+    let flagged = crate::migrate::backfill_derivation(&g.backend, Millis(2000))
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(flagged, 1);
+    assert_eq!(derivation_of(&g, &seeded.page).await, Derivation::Extracted);
+    assert_eq!(
+        derivation_of(&g, &seeded.accented_page).await,
+        Derivation::Inferred
+    );
+}
+
+#[tokio::test]
+async fn the_backfill_logs_how_many_page_shaped_nodes_it_left_recorded() {
+    // Arrange: one stub with a page's subject and no mentions edge
+    let dir = TempDir::new().unwrap();
+    let g = open_unlogged(&dir).await;
+    seed(&g).await;
+    forget_derivations(&g).await;
+    super::support::capture_logs();
+
+    // Act
+    crate::migrate::backfill_derivation(&g.backend, Millis(2000))
+        .await
+        .unwrap();
+
+    // Assert
+    let logs = super::support::captured_logs();
+    assert!(logs.contains("flagged=2"), "{logs}");
+    assert!(logs.contains("stubs=1"), "{logs}");
 }

@@ -87,6 +87,10 @@ impl<B: Backend> Graph<B> {
             let mut held = HeldLog::acquire(log).await?;
             self.replay(&mut held).await?
         };
+        if report.applied > 0 {
+            // The log does not carry a derivation yet, so replayed pages are recorded.
+            crate::migrate::mark_inferred_pages(&self.backend).await?;
+        }
         Ok(self.reembedded(report).await)
     }
 
