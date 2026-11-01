@@ -20,6 +20,7 @@ pub use self::facts::batch_key;
 use self::logged_plan::{refuse_supersedes, Collision, STORE_SOURCE};
 use self::logged_write::WriteOutcome;
 pub use self::logged_write::{EventLog, PoisonHook, SharedLog};
+use self::node_events::ListedEvents;
 pub use self::rebuild::{RebuildMode, RebuildReport};
 pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
 pub use self::replay::CatchUpReport;
@@ -33,8 +34,9 @@ use crate::error::{Error, Result};
 use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
 use crate::schema::schema;
 use crate::types::{
-    Change, ClusterMember, ClusterState, EpisodeEdge, EpisodeRef, EpisodeResult, ExplainedHit,
-    Fingerprint, GraphConfig, Hit, NewEdge, NewNode, Query,
+    Basis, Change, ClusterMember, ClusterState, Derivation, EpisodeEdge, EpisodeRef, EpisodeResult,
+    ExplainedHit, Fingerprint, GraphConfig, Hit, InferredHit, InferredText, NewEdge, NewNode,
+    Query, RecordedHit, RecordedText, Retrieved,
 };
 use crate::value::{Row, Value};
 
@@ -460,7 +462,7 @@ pub struct Candidate {
     pub id: NodeId,
     pub kind: String,
     pub label: String,
-    pub content: String,
+    pub retrieved: Retrieved,
     pub scope: Option<String>,
     pub attributes: serde_json::Value,
     pub confidence: f64,
@@ -469,8 +471,8 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// A row with the given identity and text, no scope or attributes, full
-    /// confidence, valid from the epoch; set the public fields to refine it.
+    /// A recorded row with the given identity and text, no scope or attributes,
+    /// full confidence, valid from the epoch; set the public fields to refine it.
     pub fn new(
         id: NodeId,
         kind: impl Into<String>,
@@ -482,7 +484,11 @@ impl Candidate {
             id,
             kind: kind.into(),
             label: label.into(),
-            content: content.into(),
+            retrieved: Retrieved::Recorded(RecordedHit {
+                content: RecordedText::new(content),
+                events: Vec::new(),
+                derivation: Derivation::Recorded,
+            }),
             scope: None,
             attributes: serde_json::Value::Null,
             confidence: 1.0,
@@ -560,7 +566,7 @@ fn score_and_rank(
                     id: c.id.clone(),
                     kind: c.kind,
                     label: c.label,
-                    content: c.content,
+                    retrieved: c.retrieved,
                     attributes: c.attributes,
                     score,
                 },
@@ -991,14 +997,20 @@ impl<B: Backend> Graph<B> {
         let kind = q.kind.as_deref();
 
         let lexical = match q.text.as_deref() {
-            Some(text) => self.lexical(text, kind, scope, now, pool).await?,
+            Some(text) => {
+                let filter = Filter {
+                    kind,
+                    scope,
+                    include_inferred: q.include_inferred,
+                };
+                self.lexical(text, filter, now, pool).await?
+            }
             None => Vec::new(),
         };
         let vector = match q.embedding.as_deref() {
             Some(embedding) => {
-                // Queries do not filter on derivation yet, so every node ranks.
                 self.backend
-                    .vector_search(embedding, pool, kind, scope, now, true)
+                    .vector_search(embedding, pool, kind, scope, now, q.include_inferred)
                     .await?
             }
             None => Vec::new(),
@@ -1032,12 +1044,15 @@ impl<B: Backend> Graph<B> {
             .map(|id| NodeId::from_raw(id.clone()))
             .collect();
         for seed_id in &seed_ids {
-            for n in self.neighbors(seed_id, now).await? {
+            for n in self
+                .neighbors_where(seed_id, now, q.include_inferred)
+                .await?
+            {
                 expanded.insert(n.as_str().to_string());
             }
         }
         let same_as_ids: HashSet<String> = self
-            .same_as_closure(&seed_ids, now)
+            .same_as_closure(&seed_ids, now, q.include_inferred)
             .await?
             .into_iter()
             .map(|n| n.as_str().to_string())
@@ -1070,6 +1085,11 @@ impl<B: Backend> Graph<B> {
             }
             rows.extend(bridged);
         }
+        // Backstop for the filters above: an inferred row must not take a ranked
+        // slot, so it goes before the cut to `k`.
+        if !q.include_inferred {
+            rows.retain(|c| !c.retrieved.is_inferred());
+        }
 
         let out = score_and_rank(
             rows,
@@ -1086,11 +1106,27 @@ impl<B: Backend> Graph<B> {
     }
 
     pub async fn neighbors(&self, seed: &NodeId, as_of: Millis) -> Result<Vec<NodeId>> {
+        self.neighbors_where(seed, as_of, true).await
+    }
+
+    /// `neighbors`, leaving out inferred nodes unless `include_inferred`.
+    async fn neighbors_where(
+        &self,
+        seed: &NodeId,
+        as_of: Millis,
+        include_inferred: bool,
+    ) -> Result<Vec<NodeId>> {
+        let (dst_ok, src_ok) = (
+            not_inferred("dst", include_inferred),
+            not_inferred("src", include_inferred),
+        );
         let rows = self
             .backend
             .query(
-                "SELECT dst FROM edges WHERE src = ?1 AND tx_from <= ?2 AND tx_to > ?2
-                 UNION SELECT src FROM edges WHERE dst = ?1 AND tx_from <= ?2 AND tx_to > ?2",
+                &format!(
+                    "SELECT dst FROM edges WHERE src = ?1 AND tx_from <= ?2 AND tx_to > ?2{dst_ok}
+                     UNION SELECT src FROM edges WHERE dst = ?1 AND tx_from <= ?2 AND tx_to > ?2{src_ok}"
+                ),
                 &[seed.as_str().into(), as_of.into()],
             )
             .await?;
@@ -1103,11 +1139,18 @@ impl<B: Backend> Graph<B> {
     /// (a multi-source BFS), not one per seed, so a caller checking many
     /// seeds at once still pays for at most a handful of round trips rather
     /// than one per seed.
+    ///
+    /// Does not step onto an inferred node unless `include_inferred`.
     pub(crate) async fn same_as_closure(
         &self,
         seeds: &[NodeId],
         as_of: Millis,
+        include_inferred: bool,
     ) -> Result<HashSet<NodeId>> {
+        let (dst_ok, src_ok) = (
+            not_inferred("dst", include_inferred),
+            not_inferred("src", include_inferred),
+        );
         let mut visited: HashSet<NodeId> = seeds.iter().cloned().collect();
         let mut frontier: Vec<NodeId> = seeds.to_vec();
         while !frontier.is_empty() {
@@ -1118,8 +1161,8 @@ impl<B: Backend> Graph<B> {
             let type_idx = frontier.len() + 1;
             let as_of_idx = frontier.len() + 2;
             let sql = format!(
-                "SELECT dst FROM edges WHERE src IN ({placeholders}) AND type = ?{type_idx} AND tx_from <= ?{as_of_idx} AND tx_to > ?{as_of_idx}
-                 UNION SELECT src FROM edges WHERE dst IN ({placeholders}) AND type = ?{type_idx} AND tx_from <= ?{as_of_idx} AND tx_to > ?{as_of_idx}"
+                "SELECT dst FROM edges WHERE src IN ({placeholders}) AND type = ?{type_idx} AND tx_from <= ?{as_of_idx} AND tx_to > ?{as_of_idx}{dst_ok}
+                 UNION SELECT src FROM edges WHERE dst IN ({placeholders}) AND type = ?{type_idx} AND tx_from <= ?{as_of_idx} AND tx_to > ?{as_of_idx}{src_ok}"
             );
             let mut params: Vec<Value> = frontier.iter().map(|id| id.as_str().into()).collect();
             params.push(crate::types::relation::SAME_AS.into());
@@ -1139,11 +1182,15 @@ impl<B: Backend> Graph<B> {
     async fn lexical(
         &self,
         text: &str,
-        kind: Option<&str>,
-        scope: Option<&str>,
+        filter: Filter<'_>,
         now: Millis,
         k: usize,
     ) -> Result<Vec<NodeId>> {
+        let Filter {
+            kind,
+            scope,
+            include_inferred,
+        } = filter;
         // FTS5 parses the MATCH value as its own query expression, so a raw
         // question (`?`, apostrophes, bare operators) is a syntax error that
         // aborts the whole hybrid query. Sanitize to a term-quoted literal.
@@ -1165,6 +1212,7 @@ impl<B: Backend> Graph<B> {
             filters.push_str(&format!(" AND {}", scope_within("n.scope", next)));
             params.push(scope.into());
         }
+        filters.push_str(&not_inferred("n.id", include_inferred));
         let sql = format!(
             "SELECT n.id FROM nodes_fts
              JOIN nodes n ON n.rowid = nodes_fts.rowid
@@ -1248,19 +1296,31 @@ impl<B: Backend> Graph<B> {
             }
             let sql = format!(
                 "SELECT id, kind, label, content, scope, attributes, confidence, valid_from, rowid,
-                        producer
+                        producer, derivation
                  FROM nodes WHERE id IN ({placeholders}) AND {live}{filters}
                  ORDER BY rowid",
                 live = live_at("nodes", 1),
             );
             let rows = self.backend.query(&sql, &params).await?;
+            let row_ids: Vec<String> = rows
+                .iter()
+                .map(|row| row.get_string(0))
+                .collect::<Result<_>>()?;
+            let mut listed = self
+                .listed_events(&row_ids.iter().map(String::as_str).collect::<Vec<_>>())
+                .await?;
             for row in &rows {
+                let events = listed.remove(&row.get_string(0)?).unwrap_or_default();
                 out.push(Candidate {
                     rowid: row.get_i64(8)?,
                     id: NodeId::from_raw(row.get_string(0)?),
                     kind: row.get_string(1)?,
                     label: row.get_string(2)?,
-                    content: row.get_string(3)?,
+                    retrieved: retrieved(
+                        Derivation::parse(&row.get_string(10)?)?,
+                        row.get_string(3)?,
+                        events,
+                    ),
                     scope: opt_string(row, 4)?,
                     attributes: serde_json::from_str(&row.get_string(5)?)?,
                     confidence: row_f64(row, 6),
@@ -2050,15 +2110,22 @@ impl<B: Backend> Graph<B> {
     /// Filters on `live_at`, matching what `recall` would show, because
     /// `node_community` can legitimately hold a superseded node: clustering
     /// filters edge liveness, not node liveness (ADR-0001).
-    pub async fn community_groups(&self) -> Result<Vec<Vec<ClusterMember>>> {
+    ///
+    /// Inferred members are left out unless `include_inferred`; the stored
+    /// assignment is not changed, so a group may come out smaller.
+    pub async fn community_groups(
+        &self,
+        include_inferred: bool,
+    ) -> Result<Vec<Vec<ClusterMember>>> {
         self.refresh_communities().await?;
         let now = self.clock.now();
         let sql = format!(
             "SELECT nc.community, n.id, n.kind, n.label
                FROM node_community nc JOIN nodes n ON n.id = nc.node_id
-              WHERE {live}
+              WHERE {live}{strict}
               ORDER BY nc.community, n.id",
             live = live_at("n", 1),
+            strict = not_inferred("n.id", include_inferred),
         );
         let rows = self.backend.query(&sql, &[now.into()]).await?;
 
@@ -2091,6 +2158,48 @@ impl<B: Backend> Graph<B> {
             out.push((NodeId::from_raw(row.get_string(0)?), row.get_i64(1)?));
         }
         Ok(out)
+    }
+}
+
+/// What a lexical search narrows by.
+#[derive(Clone, Copy)]
+struct Filter<'a> {
+    kind: Option<&'a str>,
+    scope: Option<&'a str>,
+    include_inferred: bool,
+}
+
+/// A predicate that leaves out an inferred node named by `column`, or nothing
+/// when inferred nodes are wanted. The derivation is a store constant, so it is
+/// written into the statement rather than bound.
+fn not_inferred(column: &str, include_inferred: bool) -> String {
+    if include_inferred {
+        return String::new();
+    }
+    format!(
+        " AND {column} NOT IN (SELECT id FROM nodes WHERE derivation = '{}')",
+        Derivation::Inferred.as_str()
+    )
+}
+
+/// A stored row's text as the type its derivation says it is. An inferred row
+/// with no listed basis reads as `Unknown`, not as an empty list.
+fn retrieved(derivation: Derivation, content: String, events: ListedEvents) -> Retrieved {
+    match derivation {
+        Derivation::Inferred => Retrieved::Inferred(InferredHit {
+            text: InferredText::new(content),
+            basis: match events.basis.is_empty() {
+                true => Basis::Unknown,
+                false => Basis::Known(events.basis),
+            },
+            derivation,
+            summary_level: None,
+        }),
+        Derivation::Recorded | Derivation::Extracted => Retrieved::Recorded(RecordedHit {
+            content: RecordedText::new(content),
+            events: events.origin,
+            derivation,
+        }),
     }
 }
 
@@ -2320,6 +2429,7 @@ mod tests {
     mod soak;
     mod support;
     mod swept_by;
+    mod typed_retrieval;
     mod vector_reads;
 
     /// A graph whose clock starts at 1000, with a handle to move it.
@@ -2804,7 +2914,7 @@ mod tests {
         // traversed, so the assertions below prove it gets filtered as dead
         // data, not that it was simply never reached.
         assert!(
-            g.same_as_closure(std::slice::from_ref(&a), Millis(1000))
+            g.same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
                 .await
                 .unwrap()
                 .contains(&b),
@@ -3107,7 +3217,7 @@ mod tests {
         assert_eq!(candidate.id, id);
         assert_eq!(candidate.kind, "decision");
         assert_eq!(candidate.label, "Use libSQL");
-        assert_eq!(candidate.content, "single file");
+        assert_eq!(candidate.retrieved.as_text(), "single file");
     }
 
     #[tokio::test]
@@ -3894,7 +4004,7 @@ mod tests {
             1,
             "resynthesis must supersede the scoped entity, not fork a duplicate"
         );
-        assert_eq!(live[0].content, "profile v2");
+        assert_eq!(live[0].retrieved.as_text(), "profile v2");
     }
 
     #[tokio::test]
@@ -4468,7 +4578,16 @@ mod tests {
         // own scope re-check, so a broken `lexical` predicate cannot hide
         // behind it.
         let lexical_ids = g
-            .lexical("zorbnax rollout", None, Some("work"), Millis(1000), 10)
+            .lexical(
+                "zorbnax rollout",
+                Filter {
+                    kind: None,
+                    scope: Some("work"),
+                    include_inferred: true,
+                },
+                Millis(1000),
+                10,
+            )
             .await
             .unwrap();
         let lexical_id_set: HashSet<NodeId> = lexical_ids.into_iter().collect();
@@ -6679,7 +6798,7 @@ mod tests {
             .await
             .unwrap();
 
-        let groups = g.community_groups().await.unwrap();
+        let groups = g.community_groups(true).await.unwrap();
 
         let ids: Vec<&str> = groups.iter().flatten().map(|m| m.id.as_str()).collect();
         assert!(!ids.contains(&old.as_str()), "{ids:?}");
@@ -6708,7 +6827,7 @@ mod tests {
             .await
             .unwrap();
 
-        let groups = g.community_groups().await.unwrap();
+        let groups = g.community_groups(true).await.unwrap();
 
         assert!(
             groups.is_empty(),
@@ -6739,8 +6858,8 @@ mod tests {
         }
         g.relate(&pair_b[0], &pair_b[1], "mentions").await.unwrap();
 
-        let first = g.community_groups().await.unwrap();
-        let second = g.community_groups().await.unwrap();
+        let first = g.community_groups(true).await.unwrap();
+        let second = g.community_groups(true).await.unwrap();
 
         assert_eq!(first[0].len(), 3, "the triangle sorts first: {first:?}");
         assert_eq!(first[1].len(), 2);
@@ -6783,7 +6902,7 @@ mod tests {
             .unwrap();
         g.relate(&a, &b, "mentions").await.unwrap();
 
-        let groups = g.community_groups().await.unwrap();
+        let groups = g.community_groups(true).await.unwrap();
 
         let members = &groups[0];
         assert!(members
@@ -6799,7 +6918,7 @@ mod tests {
         let (g, _clock, a, b) = seeded_pair(Millis(1000)).await;
         let _ = (&a, &b);
 
-        let groups = g.community_groups().await.unwrap();
+        let groups = g.community_groups(true).await.unwrap();
 
         assert!(
             !groups.is_empty(),
@@ -8776,7 +8895,7 @@ mod tests {
 
         // Act
         let closure = g
-            .same_as_closure(std::slice::from_ref(&seed), Millis(1000))
+            .same_as_closure(std::slice::from_ref(&seed), Millis(1000), true)
             .await
             .unwrap();
 
@@ -8794,11 +8913,11 @@ mod tests {
 
         // Act
         let from_a = g
-            .same_as_closure(std::slice::from_ref(&a), Millis(1000))
+            .same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
             .await
             .unwrap();
         let from_b = g
-            .same_as_closure(std::slice::from_ref(&b), Millis(1000))
+            .same_as_closure(std::slice::from_ref(&b), Millis(1000), true)
             .await
             .unwrap();
 
@@ -8822,7 +8941,7 @@ mod tests {
 
         // Act
         let closure = g
-            .same_as_closure(std::slice::from_ref(&a), Millis(1000))
+            .same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
             .await
             .unwrap();
 
@@ -8844,7 +8963,7 @@ mod tests {
             g.relate(&a, &b, relation::SAME_AS).await.unwrap();
             g.relate(&b, &a, relation::SAME_AS).await.unwrap();
             let closure = g
-                .same_as_closure(std::slice::from_ref(&a), Millis(1000))
+                .same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
                 .await
                 .unwrap();
             (closure, a, b)
@@ -8873,7 +8992,7 @@ mod tests {
             g.relate(&b, &c, relation::SAME_AS).await.unwrap();
             g.relate(&c, &a, relation::SAME_AS).await.unwrap();
             let closure = g
-                .same_as_closure(std::slice::from_ref(&a), Millis(1000))
+                .same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
                 .await
                 .unwrap();
             (closure, a, b, c)
@@ -8900,7 +9019,7 @@ mod tests {
 
         // Act: as_of a time before the edge existed.
         let closure = g
-            .same_as_closure(std::slice::from_ref(&seed), Millis(1500))
+            .same_as_closure(std::slice::from_ref(&seed), Millis(1500), true)
             .await
             .unwrap();
 

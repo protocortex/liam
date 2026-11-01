@@ -67,8 +67,9 @@ pub async fn pick_probes(
     let mut candidates = Vec::new();
     for id in &ids {
         if let Some(node) = store.get(id, as_of).await? {
-            if !node.content.is_empty() {
-                candidates.push((node.content, node.id));
+            let text = node.retrieved.as_text();
+            if !text.is_empty() {
+                candidates.push((text.to_string(), node.id));
             }
         }
     }
@@ -291,7 +292,7 @@ mod tests {
         // Assert
         for probe in &probes {
             let node = store.get(&probe.relevant[0], AS_OF).await.unwrap().unwrap();
-            assert_eq!(node.content, probe.query);
+            assert_eq!(node.retrieved.as_text(), probe.query);
             assert_eq!(probe.relevant.len(), 1);
         }
     }

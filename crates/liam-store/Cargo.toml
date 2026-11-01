@@ -46,6 +46,10 @@ default = ["backend-libsql"]
 # `tokio::sync::Mutex`, which this crate depends on directly rather than
 # through libsql's own tokio features.
 backend-libsql = ["dep:libsql"]
+# Constructors for typed text and hits, for tests in other crates that build
+# fixtures without a store. Off in a release build, so production code cannot
+# mint a recorded value from a string it did not read from the store.
+test-support = []
 # There is deliberately NO `cluster` feature here, and adding one back would be
 # a regression. It was deleted per ADR-0002
 # (docs/adr/0002-cluster-recompute-cadence.md, milestone M5): clustering is part
