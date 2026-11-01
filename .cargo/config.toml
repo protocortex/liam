@@ -1,0 +1,6 @@
+[env]
+# llama.cpp's vendored httplib turns on HTTPS when CMake finds OpenSSL, and on
+# some macOS hosts it finds a copy it cannot link, which fails the build. The
+# in-process llama feature never serves HTTP, so skip the lookup everywhere.
+# llama-cpp-sys-2 forwards CMAKE_* variables to CMake.
+CMAKE_DISABLE_FIND_PACKAGE_OpenSSL = "ON"
