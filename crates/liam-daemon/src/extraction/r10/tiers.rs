@@ -83,11 +83,11 @@ const FLOORS: [Floor; 3] = [
     },
 ];
 
-fn corpus() -> Vec<LabelledEvent> {
+pub(super) fn corpus() -> Vec<LabelledEvent> {
     generate(&mut ChaCha8Rng::seed_from_u64(CORPUS_SEED))
 }
 
-fn model_labels(events: &[LabelledEvent]) -> Vec<Tuple> {
+pub(super) fn model_labels(events: &[LabelledEvent]) -> Vec<Tuple> {
     events
         .iter()
         .flat_map(|event| event.facts.iter().map(ExpectedFact::tuple))
@@ -194,7 +194,7 @@ fn a_degraded_predictor_fails_the_gate() {
     assert_eq!(missed, [REFERENCES_URL, REFERENCES_ID]);
 }
 
-struct PlentyOfRam;
+pub(super) struct PlentyOfRam;
 
 impl FreeRam for PlentyOfRam {
     fn free_mb(&self) -> u64 {
@@ -285,7 +285,7 @@ fn script(
         .collect()
 }
 
-fn input(event: &LabelledEvent) -> ExtractionInput {
+pub(super) fn input(event: &LabelledEvent) -> ExtractionInput {
     ExtractionInput {
         event_id: event.id.clone(),
         offset: LogOffset {
@@ -300,21 +300,16 @@ fn input(event: &LabelledEvent) -> ExtractionInput {
     }
 }
 
-struct Plumbing {
+pub(super) struct Plumbing {
     _dir: TempDir,
     store: DefaultGraph,
     config: ExtractionConfig,
-    report: ExtractionReport,
+    pub(super) report: ExtractionReport,
     read_at: Millis,
 }
 
 /// Runs the whole corpus through the pipeline against a real store.
 async fn run_plumbing(events: &[LabelledEvent], faults: &BTreeMap<usize, Fault>) -> Plumbing {
-    let dir = TempDir::new().expect("tempdir");
-    let database = dir.path().join("liam.db");
-    let store = DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(EMBEDDING_DIMS))
-        .await
-        .expect("open store");
     let config = ExtractionConfig {
         ram_budget_mb: 1,
         batch_events: BATCH_EVENTS,
@@ -322,15 +317,34 @@ async fn run_plumbing(events: &[LabelledEvent], faults: &BTreeMap<usize, Fault>)
     };
     let mock = Arc::new(MockExtractor::new(identity(), script(events, faults)));
     let provider = ScriptedProvider(Arc::clone(&mock));
-    let model = identity();
+
+    let run = run_pipeline(events, &provider, &identity(), config, &PlentyOfRam).await;
+
+    assert_eq!(mock.calls(), events.len().div_ceil(BATCH_EVENTS));
+    run
+}
+
+/// Runs the whole corpus through `provider` against a real store.
+pub(super) async fn run_pipeline(
+    events: &[LabelledEvent],
+    provider: &dyn ExtractorProvider,
+    model: &ModelIdentity,
+    config: ExtractionConfig,
+    free_ram: &(dyn FreeRam + Sync),
+) -> Plumbing {
+    let dir = TempDir::new().expect("tempdir");
+    let database = dir.path().join("liam.db");
+    let store = DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(EMBEDDING_DIMS))
+        .await
+        .expect("open store");
     let deps = ExtractionDeps {
-        provider: &provider,
-        identity: &model,
+        provider,
+        identity: model,
         cache: Arc::new(CacheStore::open(cache_path(&database)).expect("open cache")),
         store: &store,
         config: &config,
         permits: &Semaphore::new(1),
-        free_ram: &PlentyOfRam,
+        free_ram,
         write_source: WRITE_SOURCE,
         deadline: Instant::now() + RUN_BUDGET,
         stopping: &CancellationToken::new(),
@@ -343,7 +357,6 @@ async fn run_plumbing(events: &[LabelledEvent], faults: &BTreeMap<usize, Fault>)
 
     let report = extract_events(&inputs, deps).await.expect("a finished run");
 
-    assert_eq!(mock.calls(), events.len().div_ceil(BATCH_EVENTS));
     let read_at = Millis(FIRST_OBSERVED.0 + EVENT_GAP.0 * (EVENT_COUNT as i64 + 1));
     Plumbing {
         _dir: dir,
@@ -380,7 +393,7 @@ impl Plumbing {
     /// Rebuilds what the pipeline extracted from what the store holds: a
     /// fact that starts at an event's time was asserted by it, and one that
     /// stops there without a replacement was ended by it.
-    async fn extracted(&self, events: &[LabelledEvent]) -> Vec<Tuple> {
+    pub(super) async fn extracted(&self, events: &[LabelledEvent]) -> Vec<Tuple> {
         let mut tuples = Vec::new();
         for event in events {
             let at = event.observed_at;

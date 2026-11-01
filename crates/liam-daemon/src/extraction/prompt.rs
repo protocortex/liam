@@ -14,7 +14,7 @@ use super::response::{MAX_FACTS_PER_BATCH, MAX_FIELD_CHARS};
 /// Bumped on any change to the prompt text, the schema, or the built-in
 /// vocabulary. It is part of the response cache key and the run manifest, so a
 /// stale answer is never replayed for a changed prompt.
-pub const PROMPT_VERSION: &str = "1";
+pub const PROMPT_VERSION: &str = "2";
 
 /// Stands in for event text when the template is rendered for fingerprinting.
 const TEMPLATE_PLACEHOLDER: &str = "{event text}";
@@ -30,7 +30,10 @@ schema and nothing else.";
 const INSTRUCTIONS: &str = "Extract subject, predicate, object facts that the events below \
 state explicitly.\n\
 - Copy the subject and object from the event text; do not infer or invent them.\n\
-- Use polarity \"ended\" only when an event says the fact stopped being true.\n\
+- Use polarity \"asserted\" for a fact an event states as true, including a move, a job \
+or a relationship that has started or is current.\n\
+- Use polarity \"ended\" only when an event says the fact stopped being true, with words \
+such as \"left\", \"no longer\" or \"used to\".\n\
 - valid_from and valid_until are ISO dates (YYYY-MM-DD) the event gives, else null.\n\
 - confidence is between 0 and 1.\n\
 - events lists the numbers of the events that state the fact.\n\
@@ -139,8 +142,8 @@ mod tests {
     use crate::config::{declared_predicates, ExtractionConfig};
 
     const GOLDEN: GoldenPrompt = GoldenPrompt {
-        version: "1",
-        sha256: "715324321d338bb5d3452911d241f8047a5e4b4901b4d798d67098004881ee7c",
+        version: "2",
+        sha256: "d488e39ec953342ff8be9442fe8f28734a646e67d40669def6598c441053f153",
     };
 
     fn schema() -> Value {
@@ -209,6 +212,17 @@ mod tests {
     }
 
     #[test]
+    fn the_instructions_make_asserted_the_default_and_ended_the_exception() {
+        // Act
+        let (_, prompt) = build_prompt(&[]);
+
+        // Assert
+        assert!(prompt.contains("Use polarity \"asserted\" for a fact an event states as true"));
+        assert!(prompt.contains("Use polarity \"ended\" only when"));
+        assert!(prompt.contains("no longer"));
+    }
+
+    #[test]
     fn the_golden_pair_holds_for_the_shipped_prompt() {
         // Act
         let ok = check_prompt_version(&prompt_template(), &schema(), PROMPT_VERSION, &GOLDEN);
@@ -233,7 +247,7 @@ mod tests {
         let results = [
             check_prompt_version(&format!("{template} "), &schema, PROMPT_VERSION, &GOLDEN),
             check_prompt_version(&template, &loosened, PROMPT_VERSION, &GOLDEN),
-            check_prompt_version(&template, &schema, "2", &GOLDEN),
+            check_prompt_version(&template, &schema, "1", &GOLDEN),
         ];
 
         // Assert

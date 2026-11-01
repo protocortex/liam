@@ -74,7 +74,7 @@ pub const PINNED: Pinned<'static> = Pinned {
     model: MODEL_ASSET,
 };
 
-const SERVER_BINARY: &str = "llama-server";
+pub const SERVER_BINARY: &str = "llama-server";
 const LIAM_DIR: &str = ".liam";
 const BIN_DIR: &str = "bin";
 const MODELS_DIR: &str = "models";
@@ -236,14 +236,14 @@ fn configured_path(
         .transpose()
 }
 
-fn default_server_dir(home: &str) -> PathBuf {
+pub fn default_server_dir(home: &str) -> PathBuf {
     Path::new(home)
         .join(LIAM_DIR)
         .join(BIN_DIR)
         .join(format!("llama-{SERVER_TAG}"))
 }
 
-fn default_model_path(home: &str) -> PathBuf {
+pub fn default_model_path(home: &str) -> PathBuf {
     Path::new(home)
         .join(LIAM_DIR)
         .join(MODELS_DIR)

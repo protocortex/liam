@@ -818,11 +818,12 @@ async fn a_model_that_dies_after_one_batch_ends_the_run_and_keeps_its_facts() {
 }
 
 #[tokio::test]
-async fn memory_below_the_budget_ends_the_run_as_lost_before_any_call() {
+async fn memory_below_the_running_floor_ends_the_run_as_lost_before_any_call() {
     // Arrange
-    let mut fx = Fixture::new().await;
-    fx.config.ram_budget_mb = 4096;
-    fx.ram.0.store(4095, Ordering::SeqCst);
+    let fx = Fixture::new().await;
+    fx.ram
+        .0
+        .store(RUNNING_FREE_RAM_FLOOR_MB - 1, Ordering::SeqCst);
     let script = Script::honest();
 
     // Act
@@ -834,11 +835,28 @@ async fn memory_below_the_budget_ends_the_run_as_lost_before_any_call() {
 }
 
 #[tokio::test]
-async fn memory_equal_to_the_budget_is_enough() {
+async fn memory_equal_to_the_running_floor_is_enough() {
     // Arrange
+    let fx = Fixture::new().await;
+    fx.ram.0.store(RUNNING_FREE_RAM_FLOOR_MB, Ordering::SeqCst);
+    let script = Script::honest();
+
+    // Act
+    let report = fx.run(&Provider::new(&script), &inputs(2)).await;
+
+    // Assert
+    assert_eq!(script.calls(), 1);
+    assert!(!report.sidecar_lost);
+}
+
+#[tokio::test]
+async fn free_memory_under_the_budget_does_not_stop_a_model_that_is_already_loaded() {
+    // Arrange: the loaded model itself holds the memory the budget reserved.
     let mut fx = Fixture::new().await;
-    fx.config.ram_budget_mb = 4096;
-    fx.ram.0.store(4096, Ordering::SeqCst);
+    fx.config.ram_budget_mb = RUNNING_FREE_RAM_FLOOR_MB * 8;
+    fx.ram
+        .0
+        .store(RUNNING_FREE_RAM_FLOOR_MB * 2, Ordering::SeqCst);
     let script = Script::honest();
 
     // Act
