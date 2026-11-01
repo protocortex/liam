@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::error::{Error, Result};
 use crate::ids::{EdgeId, FactId, Millis, NodeId};
 
 fn empty_attributes() -> Value {
@@ -74,6 +75,39 @@ impl GraphConfig {
     }
 }
 
+/// How a stored row came to be. Strict reads leave out `Inferred` rows, which
+/// a model composed, so they never stand in for something a client recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Derivation {
+    /// Written by a client as it was given.
+    #[default]
+    Recorded,
+    /// Taken out of recorded content by an extractor.
+    Extracted,
+    /// Composed by a model, such as an entity page.
+    Inferred,
+}
+
+impl Derivation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Extracted => "extracted",
+            Self::Inferred => "inferred",
+        }
+    }
+
+    /// The derivation `text` names. Anything else is an error, not a default.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "recorded" => Ok(Self::Recorded),
+            "extracted" => Ok(Self::Extracted),
+            "inferred" => Ok(Self::Inferred),
+            other => Err(Error::UnknownDerivation(other.to_string())),
+        }
+    }
+}
+
 /// A node to insert. Embedding is optional and supplied by the caller.
 #[derive(Clone, Debug)]
 pub struct NewNode {
@@ -103,6 +137,8 @@ pub struct NewNode {
     /// Set only by `NewNode::entity`; any path rebuilding a `NewNode` from a stored row must go
     /// through `NewNode::entity`, never a struct literal, or the marker silently resets to false.
     pub(crate) entity_page: bool,
+    /// Set only through `with_derivation`, which `NewNode::entity` alone calls.
+    pub(crate) derivation: Derivation,
 }
 
 impl NewNode {
@@ -123,6 +159,7 @@ impl NewNode {
             confidence: 1.0,
             producer: "unknown".to_string(),
             entity_page: false,
+            derivation: Derivation::Recorded,
         }
     }
     /// An entity page node. `entity_type` becomes the `kind` (e.g. "person",
@@ -135,7 +172,11 @@ impl NewNode {
         let subject = name.trim().to_lowercase();
         let mut node = Self::now(entity_type, name, String::new()).with_subject(subject);
         node.entity_page = true;
-        node
+        node.with_derivation(Derivation::Inferred)
+    }
+    fn with_derivation(mut self, derivation: Derivation) -> Self {
+        self.derivation = derivation;
+        self
     }
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
         self.embedding = Some(embedding);
@@ -663,5 +704,40 @@ mod tests {
 
         let page = NewNode::entity("person", "X");
         assert!(page.entity_page);
+    }
+
+    #[test]
+    fn only_the_entity_constructor_sets_an_inferred_derivation() {
+        // Arrange / Act
+        let page = NewNode::entity("person", "X");
+        let note = NewNode::now("fact", "l", "c");
+
+        // Assert
+        assert_eq!(page.derivation, Derivation::Inferred);
+        assert_eq!(note.derivation, Derivation::Recorded);
+    }
+
+    #[test]
+    fn every_derivation_parses_back_from_its_stored_text() {
+        for derivation in [
+            Derivation::Recorded,
+            Derivation::Extracted,
+            Derivation::Inferred,
+        ] {
+            // Act
+            let parsed = Derivation::parse(derivation.as_str());
+
+            // Assert
+            assert_eq!(parsed.unwrap(), derivation);
+        }
+    }
+
+    #[test]
+    fn an_unknown_derivation_text_is_a_typed_error_not_a_default() {
+        // Act
+        let parsed = Derivation::parse("weird");
+
+        // Assert
+        assert!(matches!(parsed, Err(Error::UnknownDerivation(text)) if text == "weird"));
     }
 }

@@ -25,7 +25,7 @@ use super::{
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
-use crate::types::{relation, EpisodeEdge, NewNode};
+use crate::types::{relation, Derivation, EpisodeEdge, NewNode};
 use crate::value::Value;
 
 /// Source and trust of a record no producer wrote, such as an edge.
@@ -134,6 +134,17 @@ impl Plan {
             steps,
             dedup: None,
         }
+    }
+
+    /// Marks the node `id` with `derivation` when it is not the column default.
+    fn derived(mut self, id: &str, derivation: Derivation) -> Self {
+        if derivation != Derivation::Recorded {
+            self.steps.push(Step::Derivation {
+                id: id.to_string(),
+                derivation,
+            });
+        }
+        self
     }
 
     fn deduplicated(mut self, table: Table, refusal_if_absent: Option<Error>) -> Self {
@@ -429,6 +440,7 @@ fn differing_attributes(stored: &str, given: &str) -> Vec<String> {
 struct EpisodeNode {
     row: NodeRow,
     collision: Option<Collision>,
+    derivation: Derivation,
 }
 
 /// An `ingest_episode`. Nothing is written yet, so a node that replaces an
@@ -439,12 +451,19 @@ async fn plan_episode(
     edges: Vec<EdgeRow>,
     now: Millis,
 ) -> Result<Plan> {
+    let derived: Vec<(String, Derivation)> = nodes
+        .iter()
+        .map(|node| (node.row.id.clone(), node.derivation))
+        .collect();
     let mut effects = Vec::new();
     for node in nodes {
         stage_node(tx, &mut effects, node, now).await?;
     }
     effects.extend(edges.into_iter().map(RowEffect::Edge));
-    Ok(Plan::episode(effects, now))
+    let plan = Plan::episode(effects, now);
+    Ok(derived
+        .into_iter()
+        .fold(plan, |plan, (id, derivation)| plan.derived(&id, derivation)))
 }
 
 async fn stage_node(
@@ -501,7 +520,9 @@ impl<B: Backend> Graph<B> {
         let outcome = self
             .project(|_, now| {
                 let row = resolve_node_row(id, node, now);
-                ready(row.map(|row| Plan::node_write(row, now)))
+                let plan =
+                    row.map(|row| Plan::node_write(row, now).derived(id.as_str(), node.derivation));
+                ready(plan)
             })
             .await?;
         Ok(outcome.node_id(id))
@@ -516,7 +537,11 @@ impl<B: Backend> Graph<B> {
         let outcome = self
             .project(|tx, now| {
                 let row = resolve_node_row(&id, node, now);
-                Box::pin(async move { plan_upsert(tx, row?, collision, now).await })
+                let (id, derivation) = (id.as_str().to_string(), node.derivation);
+                Box::pin(async move {
+                    let plan = plan_upsert(tx, row?, collision, now).await?;
+                    Ok(plan.derived(&id, derivation))
+                })
             })
             .await?;
         Ok(outcome.node_id(&id))
@@ -528,7 +553,11 @@ impl<B: Backend> Graph<B> {
             .project(|tx, now| {
                 let row = resolve_node_row(&id, node, now);
                 let old = old.clone();
-                Box::pin(async move { plan_supersede(tx, row?, &old, now).await })
+                let (id, derivation) = (id.as_str().to_string(), node.derivation);
+                Box::pin(async move {
+                    let plan = plan_supersede(tx, row?, &old, now).await?;
+                    Ok(plan.derived(&id, derivation))
+                })
             })
             .await?;
         Ok(outcome.node_id(&id))
@@ -626,6 +655,7 @@ fn episode_nodes(ids: &[NodeId], nodes: &[NewNode], now: Millis) -> Result<Vec<E
             Ok(EpisodeNode {
                 row: resolve_node_row(id, node, now)?,
                 collision: Collision::of(node),
+                derivation: node.derivation,
             })
         })
         .collect()

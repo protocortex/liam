@@ -18,6 +18,11 @@ pub enum Error {
     #[error("node not found: {0}")]
     NodeNotFound(String),
 
+    /// A stored or supplied derivation is none of `recorded`, `extracted`, or
+    /// `inferred`. It is never read as a default, so a typo cannot pass as data.
+    #[error("unknown derivation: {0}")]
+    UnknownDerivation(String),
+
     #[error("no live node matches handle {0}")]
     HandleNotFound(String),
 

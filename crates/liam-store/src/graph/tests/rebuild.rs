@@ -744,7 +744,7 @@ async fn rebuild_without_an_embedder_reports_the_nodes_pending_instead_of_failin
 
 /// Puts a row in every table a rebuild empties but `nodes`, `edges` and
 /// `log_hash_index`, which `populate` fills, and names the tables it did.
-async fn seed_derived_tables(live: &Opened) -> [&'static str; 10] {
+async fn seed_derived_tables(live: &Opened) -> [&'static str; 11] {
     let g = &live.graph;
     let node_id = g
         .backend
@@ -763,6 +763,8 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 10] {
         "INSERT INTO cluster_state (edge_count, max_tx_from, computed_at, last_cold_start_at)
          VALUES (1, 1, 1, 1)",
         "INSERT INTO provenance_repair_state (id, last_repaired_at) VALUES (1, 5)",
+        "INSERT OR REPLACE INTO derivation_backfill_state (id, completed_at, flagged)
+         VALUES (1, 5, 0)",
         "INSERT INTO entity_mention_state
          (subject, scope, mentions_count, mentions_max_tx_from, last_synthesized_at)
          VALUES ('s', '', 1, 1, 1)",
@@ -787,6 +789,7 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 10] {
         "node_community",
         "cluster_state",
         "provenance_repair_state",
+        "derivation_backfill_state",
         "entity_mention_state",
         "log_quarantine",
         "facts",

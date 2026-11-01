@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS nodes (
   -- written before producer existed, so they read back as 'unknown' instead
   -- of losing data. A fresh database gets the column from this DDL directly.
   producer    TEXT    NOT NULL DEFAULT 'unknown',
+  -- Added to existing databases the same way as producer. The log does not
+  -- carry it yet, so a replay writes the default and `derivation_backfill_state`
+  -- guards the pass that reclassifies entity pages.
+  derivation  TEXT    NOT NULL DEFAULT 'recorded',
   attributes  TEXT    NOT NULL DEFAULT '{}',
   scope       TEXT,
   subject     TEXT,
@@ -128,6 +132,14 @@ CREATE TABLE IF NOT EXISTS entity_mention_state (
 CREATE TABLE IF NOT EXISTS provenance_repair_state (
   id               INTEGER PRIMARY KEY CHECK (id = 1),
   last_repaired_at INTEGER NOT NULL
+);
+
+-- Set once the one-time pass that marks pre-existing entity pages inferred has
+-- run, with how many rows it marked.
+CREATE TABLE IF NOT EXISTS derivation_backfill_state (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  completed_at INTEGER NOT NULL,
+  flagged      INTEGER NOT NULL
 );
 
 -- How far the projection has caught up with the event log. The offsets stay
@@ -260,7 +272,7 @@ pub(crate) enum Clear {
 /// the assignments, otherwise its fingerprint would vouch for communities that
 /// are no longer there. The backend's vector table goes before all of them, as
 /// `Backend::vector_clear_sql` returns it.
-pub(crate) const DERIVED_TABLES: [(&str, Clear); 13] = [
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 14] = [
     // No foreign keys link the fact tables, so their order among themselves is free.
     ("fact_sources", Clear::Always),
     ("fact_suppressions", Clear::Always),
@@ -274,6 +286,8 @@ pub(crate) const DERIVED_TABLES: [(&str, Clear); 13] = [
     ("log_hash_index", Clear::Always),
     // Repair is idempotent, so a stale watermark would only skip work it owes.
     ("provenance_repair_state", Clear::Always),
+    // Replayed pages come back as recorded, so the pass has to run again.
+    ("derivation_backfill_state", Clear::Always),
     // The operator's refusal reasons, which the log cannot recreate.
     ("log_quarantine", Clear::OnAdoption),
     ("entity_mention_state", Clear::OnAdoption),

@@ -17,6 +17,9 @@
 
 use crate::backend::Backend;
 use crate::error::{Error, Result};
+use crate::ids::Millis;
+use crate::types::{relation, Derivation};
+use crate::value::Value;
 
 /// Adds `column` to `table` with `type_and_constraints` (for example
 /// `"TEXT NOT NULL DEFAULT 'unknown'"`) if it is not already present. Safe to
@@ -252,6 +255,76 @@ pub async fn normalize_scope_column<B: Backend>(backend: &B) -> Result<()> {
     Ok(())
 }
 
+/// Ids per `UPDATE`, so the write lock is held for one small statement at a
+/// time and never for the whole set of pages.
+const BACKFILL_CHUNK: usize = 200;
+
+/// Marks the entity pages that predate the `derivation` column as inferred,
+/// once. A page is a node that is the source of any `mentions` edge, live or
+/// closed, whose subject is its trimmed, lowercased label, which is what
+/// `NewNode::entity` stores. The edge alone is not enough, because `relate`
+/// accepts a `mentions` edge from any node.
+///
+/// The subject test runs in Rust: SQLite's `lower()` folds ASCII only, and the
+/// constructor lowercases with Unicode rules. Only rows still `recorded` are
+/// touched, so a second run, or a race with another process, changes nothing.
+/// Returns how many rows it marked, `0` when the pass already ran.
+pub(crate) async fn backfill_derivation<B: Backend>(backend: &B, now: Millis) -> Result<u64> {
+    let done = backend
+        .query("SELECT 1 FROM derivation_backfill_state WHERE id = 1", &[])
+        .await?;
+    if !done.is_empty() {
+        return Ok(0);
+    }
+    let candidates = backend
+        .query(
+            "SELECT n.id, n.label, n.subject FROM nodes n
+             WHERE n.derivation = ?1 AND n.subject IS NOT NULL
+               AND EXISTS (SELECT 1 FROM edges e WHERE e.src = n.id AND e.type = ?2)
+             ORDER BY n.id",
+            &[
+                Derivation::Recorded.as_str().into(),
+                relation::MENTIONS.into(),
+            ],
+        )
+        .await?;
+    let mut pages = Vec::new();
+    for row in &candidates {
+        if row.get_string(2)? == row.get_string(1)?.trim().to_lowercase() {
+            pages.push(row.get_string(0)?);
+        }
+    }
+    let mut flagged = 0;
+    for chunk in pages.chunks(BACKFILL_CHUNK) {
+        let marks = (3..chunk.len() + 3)
+            .map(|n| format!("?{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut params = vec![
+            Derivation::Inferred.as_str().into(),
+            Derivation::Recorded.as_str().into(),
+        ];
+        params.extend(chunk.iter().map(|id| Value::from(id.as_str())));
+        flagged += backend
+            .execute(
+                &format!(
+                    "UPDATE nodes SET derivation = ?1 WHERE derivation = ?2 AND id IN ({marks})"
+                ),
+                &params,
+            )
+            .await?;
+    }
+    backend
+        .execute(
+            "INSERT OR IGNORE INTO derivation_backfill_state (id, completed_at, flagged)
+             VALUES (1, ?1, ?2)",
+            &[now.into(), Value::Int(flagged as i64)],
+        )
+        .await?;
+    tracing::info!(flagged, "derivation backfill: entity pages marked inferred");
+    Ok(flagged)
+}
+
 /// Whether `table` already has `column`, read from `PRAGMA table_info`.
 ///
 /// Errors if `table` does not exist. `PRAGMA table_info` on a nonexistent
@@ -283,7 +356,6 @@ async fn column_exists<B: Backend>(backend: &B, table: &str, column: &str) -> Re
 #[cfg(all(test, feature = "backend-libsql"))]
 mod tests {
     use super::*;
-    use crate::value::Value;
     use crate::DefaultBackend;
     use std::sync::Arc;
     use tempfile::TempDir;

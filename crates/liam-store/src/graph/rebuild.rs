@@ -113,6 +113,8 @@ impl<B: Backend> Graph<B> {
         self.reset(&mut held, previous_log.is_some()).await?;
         let replayed = self.replay(&mut held).await?;
         tracing::info!(?replayed, "rebuild: log replayed");
+        // The log does not carry a derivation yet, so replayed pages are recorded.
+        crate::migrate::backfill_derivation(&self.backend, self.clock.now()).await?;
 
         let rebuilt = self.live_rows().await?;
         let expected = log_expected_state(&held).await?;

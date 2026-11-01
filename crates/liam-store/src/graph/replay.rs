@@ -447,7 +447,7 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
             Step::Node(row) => Some(WrittenRow::Node(&row.id)),
             Step::Edge(row) | Step::GuardedEdge(row) => Some(WrittenRow::Edge(row)),
             Step::Fact(FactStep::Insert(row)) => Some(WrittenRow::Fact(&row.id)),
-            Step::Close { .. } | Step::Remove(_) | Step::Fact(_) => None,
+            Step::Close { .. } | Step::Derivation { .. } | Step::Remove(_) | Step::Fact(_) => None,
         })
         .collect()
 }
