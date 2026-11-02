@@ -551,6 +551,48 @@ async fn the_inputs_are_the_recorded_nodes_of_one_scope_that_have_a_vector() {
 }
 
 #[tokio::test]
+async fn the_scopes_are_those_of_recorded_nodes_and_open_summaries_and_not_of_entity_pages() {
+    // Arrange
+    let g = open().await;
+    g.insert(fact("unscoped")).await.unwrap();
+    g.insert(fact("in work").with_scope("work")).await.unwrap();
+    g.insert(fact("in work too").with_scope("work"))
+        .await
+        .unwrap();
+    let mut page = NewNode::entity("person", "Ada").with_scope("pages");
+    page.content = "composed".into();
+    g.insert(page).await.unwrap();
+
+    // Act
+    let scopes = g.summary_scopes().await.unwrap();
+
+    // Assert
+    assert_eq!(scopes, ["", "work"]);
+}
+
+#[tokio::test]
+async fn a_scope_with_only_an_open_summary_is_still_listed() {
+    // Arrange
+    let g = open().await;
+    g.put_summary(
+        new_summary("retired"),
+        &nodes(&["child"]),
+        &[event("e")],
+        &vector(),
+        &[],
+        WRITER,
+    )
+    .await
+    .unwrap();
+
+    // Act
+    let scopes = g.summary_scopes().await.unwrap();
+
+    // Assert
+    assert_eq!(scopes, ["retired"]);
+}
+
+#[tokio::test]
 async fn a_summary_embedding_survives_the_orphan_sweep() {
     // Arrange
     let g = open().await;

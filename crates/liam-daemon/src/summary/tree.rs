@@ -10,11 +10,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use liam_daemon::config::MAX_SUMMARY_DEPTH;
 use liam_store::cluster::{self, Edge};
 use liam_store::{child_hash, Millis, SummaryInput, TreeState};
 
 /// The deepest tree the builder plans, whatever the configuration asks for.
-pub const MAX_DEPTH: u8 = 3;
+pub const MAX_DEPTH: u8 = MAX_SUMMARY_DEPTH;
 
 /// How items are linked, grouped and kept stable from one run to the next.
 #[derive(Clone, Debug)]

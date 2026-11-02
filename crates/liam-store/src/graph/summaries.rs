@@ -506,6 +506,26 @@ impl<B: Backend> Graph<B> {
         Ok(())
     }
 
+    /// The scopes that have a live recorded or extracted node or an open
+    /// summary, sorted, '' for the unscoped group. A scope whose nodes are all
+    /// gone is still listed while it has a summary to close.
+    pub async fn summary_scopes(&self) -> Result<Vec<String>> {
+        let rows = self
+            .backend
+            .query(
+                &format!(
+                    "SELECT COALESCE(scope, '') FROM nodes WHERE {live}{recorded}
+                     UNION SELECT scope FROM summaries WHERE tx_to = ?2
+                     ORDER BY 1",
+                    live = live_at("nodes", 1),
+                    recorded = row_not_inferred("nodes", false),
+                ),
+                &[self.clock.now().into(), FOREVER.into()],
+            )
+            .await?;
+        rows.iter().map(|row| row.get_string(0)).collect()
+    }
+
     /// The live recorded and extracted nodes of `scope` with a stored vector, in
     /// insertion order. `scope` is the exact scope, '' for the unscoped group, so
     /// a summary never mixes scopes. Entity pages are left out, being composed.

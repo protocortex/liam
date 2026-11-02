@@ -30,16 +30,35 @@ pub struct ExtractionReport {
 }
 
 /// Input to the summary part.
-#[derive(Debug, Default)]
-pub struct SummaryCtx {
+pub struct SummaryCtx<'a> {
+    /// The store the run guards, which the part reads and writes through.
+    pub store: &'a DefaultGraph,
     /// The log source to stamp on every write the part makes, so a rollback of
     /// the run cancels them.
     pub source: String,
 }
 
-/// What the summary part did.
+/// What the summary part did, in summaries.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct SummaryReport;
+pub struct SummaryReport {
+    /// Written as new rows.
+    pub written: usize,
+    /// Left as they were because their cluster did not change.
+    pub kept: usize,
+    /// Closed because their cluster dissolved.
+    pub closed: usize,
+    /// Wanted but not written: the model failed, its reply was not grounded in
+    /// the items, the child set had failed too often, or the cap or deadline
+    /// came first.
+    pub unwritten: usize,
+}
+
+impl SummaryReport {
+    /// Some summary is missing that a later run will try again.
+    pub fn partial(&self) -> bool {
+        self.unwritten > 0
+    }
+}
 
 /// Input to the tiering part.
 #[derive(Debug, Default)]
@@ -68,7 +87,7 @@ pub trait ExtractionHook: Send + Sync {
 /// An `Err` is recorded as a step status and does not abort the run.
 #[async_trait]
 pub trait SummaryHook: Send + Sync {
-    async fn summarize(&self, ctx: &SummaryCtx) -> Result<SummaryReport>;
+    async fn summarize(&self, ctx: &SummaryCtx<'_>) -> Result<SummaryReport>;
 }
 
 /// An `Err` is recorded as a step status and does not abort the run.
@@ -101,10 +120,10 @@ impl ConsolidationHookSet {
         }
     }
 
-    pub async fn summarize(&self, ctx: &SummaryCtx) -> Result<SummaryReport> {
+    pub async fn summarize(&self, ctx: &SummaryCtx<'_>) -> Result<SummaryReport> {
         match &self.summary {
             Some(hook) => hook.summarize(ctx).await,
-            None => Ok(SummaryReport),
+            None => Ok(SummaryReport::default()),
         }
     }
 
@@ -137,6 +156,13 @@ mod tests {
         }
     }
 
+    fn summary_ctx_over(store: &DefaultGraph) -> SummaryCtx<'_> {
+        SummaryCtx {
+            store,
+            source: String::new(),
+        }
+    }
+
     struct CountingExtraction(Arc<AtomicUsize>);
 
     #[async_trait]
@@ -160,7 +186,7 @@ mod tests {
 
     #[async_trait]
     impl SummaryHook for FailingSummary {
-        async fn summarize(&self, _ctx: &SummaryCtx) -> Result<SummaryReport> {
+        async fn summarize(&self, _ctx: &SummaryCtx<'_>) -> Result<SummaryReport> {
             self.0.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("summary part failed")
         }
@@ -174,9 +200,10 @@ mod tests {
             summary: Some(Arc::new(FailingSummary(calls.clone()))),
             ..Default::default()
         };
+        let store = memory_store().await;
 
         // Act
-        let result = hooks.summarize(&SummaryCtx::default()).await;
+        let result = hooks.summarize(&summary_ctx_over(&store)).await;
 
         // Assert
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -191,12 +218,12 @@ mod tests {
 
         // Act
         let extracted = hooks.extract(&ctx_over(&store)).await;
-        let summarized = hooks.summarize(&SummaryCtx::default()).await;
+        let summarized = hooks.summarize(&summary_ctx_over(&store)).await;
         let tiered = hooks.tier(&TierCtx::default()).await;
 
         // Assert
         assert_eq!(extracted.unwrap(), ExtractionReport::default());
-        assert_eq!(summarized.unwrap(), SummaryReport);
+        assert_eq!(summarized.unwrap(), SummaryReport::default());
         assert_eq!(tiered.unwrap(), TierReport);
     }
 
@@ -213,11 +240,28 @@ mod tests {
 
         // Act
         hooks.extract(&ctx_over(&store)).await.unwrap();
-        let summarized = hooks.summarize(&SummaryCtx::default()).await;
+        let summarized = hooks.summarize(&summary_ctx_over(&store)).await;
 
         // Assert
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(summarized.unwrap(), SummaryReport);
+        assert_eq!(summarized.unwrap(), SummaryReport::default());
+    }
+
+    #[test]
+    fn a_report_with_an_unwritten_summary_is_partial() {
+        // Arrange
+        let complete = SummaryReport {
+            written: 2,
+            ..Default::default()
+        };
+        let missing = SummaryReport {
+            unwritten: 1,
+            ..Default::default()
+        };
+
+        // Assert
+        assert!(!complete.partial());
+        assert!(missing.partial());
     }
 
     #[tokio::test]

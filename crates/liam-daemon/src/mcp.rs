@@ -721,6 +721,12 @@ impl MemoryServer {
         }
     }
 
+    /// Shares this server's language model, so a job that generates text takes
+    /// turns on the same permits as the server does.
+    pub(crate) fn llm_handle(&self) -> Arc<dyn Llm> {
+        self.llm.clone()
+    }
+
     /// Shares this server's generation semaphore so startup can grow it
     /// once the auto-tune benchmark learns the real ceiling.
     pub(crate) fn generation_permits_handle(&self) -> Arc<Semaphore> {

@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 mod consolidation;
 mod extraction;
+mod summary;
 
 pub(crate) use consolidation::default_snapshot_dir;
 pub use consolidation::ConsolidationConfig;
@@ -20,6 +21,7 @@ pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
     MAX_RUN_DEADLINE_SECS,
 };
+pub use summary::{SummaryConfig, MAX_SUMMARY_DEPTH};
 
 /// Producer ids starting with this are reserved for consolidation writes.
 pub const RESERVED_PRODUCER_PREFIX: &str = "consolidation";
@@ -66,6 +68,8 @@ pub struct Config {
     pub extraction: ExtractionConfig,
     /// The snapshot, merge, probe and commit job that wraps maintenance.
     pub consolidation: ConsolidationConfig,
+    /// The summary tree built over recorded nodes. Off by default.
+    pub summary: SummaryConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -180,6 +184,7 @@ impl Default for Config {
             log: LogConfig::default(),
             extraction: ExtractionConfig::default(),
             consolidation: ConsolidationConfig::default(),
+            summary: SummaryConfig::default(),
         }
     }
 }
@@ -395,6 +400,7 @@ impl Config {
         config.producers.validate()?;
         config.extraction.validate()?;
         config.consolidation.validate()?;
+        config.summary.validate()?;
         Ok(config)
     }
 
