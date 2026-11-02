@@ -7,7 +7,7 @@
 //! so a cap, a deadline or a model failure cannot leave a higher level
 //! summarizing a part of the tree as if it were the whole.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +38,9 @@ const SUMMARY_MAX_NEW_TOKENS: usize = 512;
 const MILLIS_PER_HOUR: i64 = 3_600_000;
 /// What a child summary is called in the prompt of the level above.
 const CHILD_SUMMARY_LABEL: &str = "Summary of earlier items";
+/// Items of its own that each child summary brings into the prompt of the level
+/// above, so that an error in a summary is not repeated unchecked in the next.
+const SAMPLED_ITEMS_PER_SUMMARY: usize = 2;
 
 pub struct SummaryHooks {
     pub config: SummaryConfig,
@@ -55,6 +58,8 @@ pub struct SummaryHooks {
 struct Item {
     point: Point,
     prompt: PromptItem,
+    /// Member items of a summary, shown beside it in the prompt of the level above.
+    sample: Vec<PromptItem>,
     sources: Vec<EventRef>,
     valid_min: Millis,
     valid_max: Millis,
@@ -72,13 +77,19 @@ fn node_item(input: &SummaryInput) -> Item {
                 .map(|event| event.event_id.clone())
                 .collect(),
         },
+        sample: Vec::new(),
         sources: input.origin_events.clone(),
         valid_min: input.valid_from,
         valid_max: input.valid_from,
     }
 }
 
-fn summary_item(summary: &Summary, vector: Vec<f32>, sources: Vec<EventRef>) -> Item {
+fn summary_item(
+    summary: &Summary,
+    vector: Vec<f32>,
+    sources: Vec<EventRef>,
+    sample: Vec<PromptItem>,
+) -> Item {
     let half_span = summary.valid_max.0.saturating_sub(summary.valid_min.0) / 2;
     Item {
         point: Point {
@@ -91,10 +102,30 @@ fn summary_item(summary: &Summary, vector: Vec<f32>, sources: Vec<EventRef>) -> 
             text: summary.text.as_str().to_string(),
             event_ids: sources.iter().map(|event| event.event_id.clone()).collect(),
         },
+        sample,
         sources,
         valid_min: summary.valid_min,
         valid_max: summary.valid_max,
     }
+}
+
+/// Up to `SAMPLED_ITEMS_PER_SUMMARY` of `ids`, spread evenly over their order so
+/// the same members are chosen on every run.
+fn sample_of(ids: &BTreeSet<String>, nodes: &HashMap<String, PromptItem>) -> Vec<PromptItem> {
+    let known: Vec<&PromptItem> = ids.iter().filter_map(|id| nodes.get(id)).collect();
+    if known.len() <= SAMPLED_ITEMS_PER_SUMMARY {
+        return known.into_iter().cloned().collect();
+    }
+    (0..SAMPLED_ITEMS_PER_SUMMARY)
+        .map(|n| known[n * known.len() / SAMPLED_ITEMS_PER_SUMMARY].clone())
+        .collect()
+}
+
+/// The share of `old`'s items that `new` holds.
+fn covered_share(old: &[String], new: &[String]) -> f64 {
+    let held: HashSet<&String> = new.iter().collect();
+    let shared = old.iter().filter(|id| held.contains(id)).count();
+    shared as f64 / old.len().max(1) as f64
 }
 
 const fn child_kind(level: u8) -> ChildKind {
@@ -194,11 +225,15 @@ impl<'a> Run<'a> {
             );
         }
         let mut items: Vec<Item> = inputs.items.iter().map(node_item).collect();
+        let nodes: HashMap<String, PromptItem> = items
+            .iter()
+            .map(|item| (item.point.id.clone(), item.prompt.clone()))
+            .collect();
         for level in 1..=self.params.max_depth {
             if !self.build_level(scope, level, &items).await? {
                 break;
             }
-            items = self.summary_items(scope, level).await?;
+            items = self.summary_items(scope, level, &nodes).await?;
         }
         Ok(())
     }
@@ -237,17 +272,21 @@ impl<'a> Run<'a> {
             .iter()
             .map(|item| (item.point.id.as_str(), item))
             .collect();
+        let mut stored: Vec<&[String]> = plan
+            .keep
+            .iter()
+            .map(|cluster| cluster.members.as_slice())
+            .collect();
         let mut complete = true;
         for regeneration in &plan.regenerate {
-            complete &= self.regenerate(scope, level, regeneration, &by_id).await?;
+            if self.regenerate(scope, level, regeneration, &by_id).await? {
+                stored.push(&regeneration.cluster.members);
+            } else {
+                complete = false;
+            }
         }
-        for id in &plan.dissolved {
-            self.store
-                .close_summary(id, Millis::now(), self.source)
-                .await
-                .context("could not close a dissolved summary")?;
-            self.report.closed += 1;
-        }
+        self.settle_dissolved(&previous, &plan.dissolved, &stored)
+            .await?;
         if complete {
             self.store.put_tree_state(&plan.next_state).await?;
         }
@@ -283,7 +322,11 @@ impl<'a> Run<'a> {
                 })
             })
             .collect::<anyhow::Result<Vec<&Item>>>()?;
-        let prompt: Vec<PromptItem> = members.iter().map(|item| item.prompt.clone()).collect();
+        let prompt: Vec<PromptItem> = members
+            .iter()
+            .map(|item| item.prompt.clone())
+            .chain(members.iter().flat_map(|item| item.sample.clone()))
+            .collect();
         let generation = self
             .generator()
             .generate(&regeneration.cluster.child_hash, &prompt, self.deadline)
@@ -348,6 +391,50 @@ impl<'a> Run<'a> {
         Ok(true)
     }
 
+    /// Closes the dissolved summaries that something else now stands in for,
+    /// or that have waited out their grace, and leaves the rest open so a
+    /// capped or failed run cannot leave their items uncovered.
+    async fn settle_dissolved(
+        &mut self,
+        previous: &[PreviousCluster],
+        dissolved: &[String],
+        stored: &[&[String]],
+    ) -> anyhow::Result<()> {
+        let hooks = self.hooks;
+        let config = &hooks.config;
+        let waiting: HashSet<&str> = dissolved.iter().map(String::as_str).collect();
+        for old in previous
+            .iter()
+            .filter(|old| waiting.contains(old.summary_id.as_str()))
+        {
+            let replaced = stored
+                .iter()
+                .any(|new| covered_share(&old.children, new) >= config.dissolve_overlap);
+            let waited = if replaced {
+                0
+            } else {
+                self.store.note_dissolving(&old.summary_id).await?
+            };
+            if replaced || waited >= config.dissolve_grace_runs {
+                self.store
+                    .close_summary(&old.summary_id, Millis::now(), self.source)
+                    .await
+                    .context("could not close a dissolved summary")?;
+                self.store.forget_dissolving(&old.summary_id).await?;
+                self.report.closed += 1;
+            } else {
+                debug!(summary = %old.summary_id, waited, "summary: a dissolved summary waits for a replacement");
+            }
+        }
+        for old in previous
+            .iter()
+            .filter(|old| !waiting.contains(old.summary_id.as_str()))
+        {
+            self.store.forget_dissolving(&old.summary_id).await?;
+        }
+        Ok(())
+    }
+
     fn generator(&self) -> Generator<'_> {
         Generator {
             llm: self.hooks.llm.as_ref(),
@@ -378,7 +465,12 @@ impl<'a> Run<'a> {
 
     /// The open summaries of `level`, as the items of the level above. One
     /// with no vector, because its embedding failed, is left out.
-    async fn summary_items(&self, scope: &str, level: u8) -> anyhow::Result<Vec<Item>> {
+    async fn summary_items(
+        &self,
+        scope: &str,
+        level: u8,
+        nodes: &HashMap<String, PromptItem>,
+    ) -> anyhow::Result<Vec<Item>> {
         let mut vectors: HashMap<String, Vec<f32>> = self
             .store
             .summary_embeddings(scope, level)
@@ -391,9 +483,32 @@ impl<'a> Run<'a> {
                 continue;
             };
             let sources = self.store.summary_sources(&summary.id).await?;
-            items.push(summary_item(&summary, vector, sources));
+            let members = self.member_nodes(&summary.id).await?;
+            items.push(summary_item(
+                &summary,
+                vector,
+                sources,
+                sample_of(&members, nodes),
+            ));
         }
         Ok(items)
+    }
+
+    /// The nodes under a summary, however many levels down.
+    async fn member_nodes(&self, summary_id: &str) -> anyhow::Result<BTreeSet<String>> {
+        let mut nodes = BTreeSet::new();
+        let mut pending = vec![summary_id.to_string()];
+        while let Some(parent) = pending.pop() {
+            for child in self.store.summary_children(&parent).await? {
+                match child.kind {
+                    ChildKind::Node => {
+                        nodes.insert(child.id);
+                    }
+                    ChildKind::Summary => pending.push(child.id),
+                }
+            }
+        }
+        Ok(nodes)
     }
 }
 

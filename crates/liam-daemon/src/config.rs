@@ -21,7 +21,7 @@ pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
     MAX_RUN_DEADLINE_SECS,
 };
-pub use summary::{SummaryConfig, MAX_SUMMARY_DEPTH};
+pub use summary::{SummaryConfig, DEFAULT_MAX_BASIS_IDS_RENDERED, MAX_SUMMARY_DEPTH};
 
 /// Producer ids starting with this are reserved for consolidation writes.
 pub const RESERVED_PRODUCER_PREFIX: &str = "consolidation";

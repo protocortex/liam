@@ -747,7 +747,7 @@ async fn rebuild_without_an_embedder_reports_the_nodes_pending_instead_of_failin
 /// Puts a row in every table a rebuild empties but `nodes`, `edges`,
 /// `node_events` and `log_hash_index`, which `populate` fills, and names the
 /// tables it did.
-async fn seed_derived_tables(live: &Opened) -> [&'static str; 17] {
+async fn seed_derived_tables(live: &Opened) -> [&'static str; 18] {
     let g = &live.graph;
     let node_id = g
         .backend
@@ -794,6 +794,7 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 17] {
         "INSERT INTO summary_embeddings (summary_id, dims, embedding) VALUES ('s', 1, x'00')",
         "INSERT INTO summary_failures (child_hash, failures, last_error, prompt_version, model_id)
          VALUES ('h', 1, 'timeout', 'p', 'm')",
+        "INSERT INTO summary_dissolving (summary_id, runs) VALUES ('s', 1)",
         "INSERT INTO summary_tree_state
          (scope, level, last_full_build_at, baseline_item_count, unattached_count)
          VALUES ('', 1, 1, 1, 0)",
@@ -817,6 +818,7 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 17] {
         "summary_sources",
         "summary_embeddings",
         "summary_failures",
+        "summary_dissolving",
         "summary_tree_state",
     ]
 }

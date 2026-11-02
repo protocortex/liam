@@ -73,6 +73,51 @@ impl Rig {
         self.store.insert(node).await.unwrap()
     }
 
+    /// A node of `group`'s text that sits on the first axis whatever its group.
+    async fn add_on_first_axis(&self, group: usize, n: usize) -> NodeId {
+        let content = format!(
+            "ledger notes number {n} cover quarterly forecasts for the {} team",
+            GROUP_NAMES[group]
+        );
+        let node = NewNode::now("fact", format!("Note {n}"), content)
+            .with_embedding(axis(0))
+            .with_valid_from(Millis(1000 + (group * 100 + n) as i64));
+        self.store.insert(node).await.unwrap()
+    }
+
+    /// Stores a summary of `children` as an earlier pass would have.
+    async fn seed_summary(&self, children: &[NodeId]) -> String {
+        let ids: Vec<SummaryChild> = children
+            .iter()
+            .map(|id| SummaryChild {
+                id: id.as_str().to_string(),
+                kind: ChildKind::Node,
+            })
+            .collect();
+        let source = EventRef {
+            event_id: "event-seed".to_string(),
+            synthetic: false,
+        };
+        let summary = NewSummary {
+            level: 1,
+            scope: String::new(),
+            text: LEVEL_ONE_REPLY.to_string(),
+            events_fed: 1,
+            valid_min: Millis(1000),
+            valid_max: Millis(2000),
+            model_id: "model".to_string(),
+            prompt_version: SUMMARY_PROMPT_VERSION.to_string(),
+        };
+        match self
+            .store
+            .put_summary(summary, &ids, &[source], &axis(0), &[], SOURCE)
+            .await
+            .unwrap()
+        {
+            PutOutcome::Inserted(id) | PutOutcome::Unchanged(id) => id,
+        }
+    }
+
     async fn add_groups(&self, groups: usize) -> Vec<Vec<NodeId>> {
         let mut all = Vec::new();
         for group in 0..groups {
@@ -349,9 +394,8 @@ async fn a_cluster_that_gained_a_member_replaces_its_summary_in_one_step() {
     assert_eq!(children.len(), GROUP_SIZE + 1);
 }
 
-#[tokio::test]
-async fn a_cluster_whose_items_are_gone_has_its_summary_closed() {
-    // Arrange
+/// Supersedes every item of the second group, so its summary has no cluster.
+async fn rig_with_a_gone_group(grace: u32) -> (Rig, SummaryConfig) {
     let rig = Rig::answering_a_tree().await;
     let groups = rig.add_groups(3).await;
     rig.run(enabled()).await;
@@ -363,9 +407,20 @@ async fn a_cluster_whose_items_are_gone_has_its_summary_closed() {
         llm: Arc::new(ScriptedLlm::replying(&[])),
         ..rig
     };
+    let config = SummaryConfig {
+        dissolve_grace_runs: grace,
+        ..enabled()
+    };
+    (rig, config)
+}
+
+#[tokio::test]
+async fn a_cluster_whose_items_are_gone_has_its_summary_closed_when_its_grace_is_one_run() {
+    // Arrange
+    let (rig, config) = rig_with_a_gone_group(1).await;
 
     // Act
-    let report = rig.run(enabled()).await;
+    let report = rig.run(config).await;
 
     // Assert
     assert_eq!(report.closed, 1);
@@ -373,6 +428,182 @@ async fn a_cluster_whose_items_are_gone_has_its_summary_closed() {
     assert!(!report.partial());
 }
 
+#[tokio::test]
+async fn a_summary_with_no_replacement_stays_open_until_its_grace_runs_out() {
+    // Arrange
+    let (rig, config) = rig_with_a_gone_group(2).await;
+
+    // Act
+    let first = rig.run(config.clone()).await;
+    let after_first = rig.live(1).await.len();
+    let second = rig.run(config).await;
+
+    // Assert
+    assert_eq!((first.closed, after_first), (0, 3));
+    assert_eq!((second.closed, rig.live(1).await.len()), (1, 2));
+}
+
+/// Eight items on one axis, summarized earlier as two halves.
+async fn rig_with_two_summaries_of_one_cluster(
+    model: ScriptedLlm,
+) -> (Rig, [String; 2], [Vec<NodeId>; 2]) {
+    let rig = Rig::new(model).await;
+    let mut halves = [Vec::new(), Vec::new()];
+    for (half, group) in halves.iter_mut().zip(0..) {
+        for n in 0..GROUP_SIZE {
+            half.push(rig.add_on_first_axis(group, n).await);
+        }
+    }
+    let old = [
+        rig.seed_summary(&halves[0]).await,
+        rig.seed_summary(&halves[1]).await,
+    ];
+    (rig, old, halves)
+}
+
+#[tokio::test]
+async fn a_merge_closes_the_second_old_summary_once_the_new_one_is_stored() {
+    // Arrange
+    let (rig, old, _) =
+        rig_with_two_summaries_of_one_cluster(ScriptedLlm::replying(&[LEVEL_ONE_REPLY])).await;
+
+    // Act
+    let report = rig.run(enabled()).await;
+
+    // Assert
+    assert_eq!((report.written, report.closed), (1, 1));
+    let live = rig.live(1).await;
+    assert_eq!(live.len(), 1);
+    assert!(old.iter().all(|id| *id != live[0].id));
+}
+
+#[tokio::test]
+async fn a_merge_whose_summary_cannot_be_written_leaves_both_old_summaries_open() {
+    // Arrange
+    let (rig, old, _) = rig_with_two_summaries_of_one_cluster(ScriptedLlm::failing("down")).await;
+
+    // Act
+    let report = rig.run(enabled()).await;
+
+    // Assert
+    assert_eq!((report.written, report.closed), (0, 0));
+    let live: BTreeSet<String> = rig.live(1).await.into_iter().map(|s| s.id).collect();
+    assert_eq!(live, BTreeSet::from(old));
+}
+
+#[tokio::test]
+async fn a_dissolved_summary_is_closed_when_its_grace_runs_out_without_a_replacement() {
+    // Arrange
+    let (rig, old, _) = rig_with_two_summaries_of_one_cluster(ScriptedLlm::scripted(vec![
+        Err("down".to_string()),
+        Err("down".to_string()),
+    ]))
+    .await;
+    let config = SummaryConfig {
+        dissolve_grace_runs: 2,
+        ..enabled()
+    };
+
+    // Act
+    let first = rig.run(config.clone()).await;
+    let second = rig.run(config).await;
+
+    // Assert
+    assert_eq!((first.closed, second.closed), (0, 1));
+    assert_eq!(rig.live(1).await.len(), 1, "{old:?}");
+}
+
+#[tokio::test]
+async fn a_replacement_closes_an_old_summary_only_when_it_holds_enough_of_its_items() {
+    for (overlap, closed) in [(0.5, 0), (0.25, 1)] {
+        // Arrange: of the first half's four items only one is left in the new cluster
+        let (rig, _old, halves) =
+            rig_with_two_summaries_of_one_cluster(ScriptedLlm::replying(&[LEVEL_ONE_REPLY])).await;
+        for id in &halves[0][1..] {
+            let bare = NewNode::now("fact", "gone", "left without a vector");
+            rig.store.supersede(id, bare).await.unwrap();
+        }
+        let config = SummaryConfig {
+            dissolve_overlap: overlap,
+            ..enabled()
+        };
+
+        // Act
+        let report = rig.run(config).await;
+
+        // Assert: the second half's summary is replaced in the same step either way
+        assert_eq!(report.written, 1, "overlap {overlap}");
+        assert_eq!(report.closed, closed, "overlap {overlap}");
+    }
+}
+
+#[tokio::test]
+async fn the_prompt_of_a_level_above_holds_its_summaries_then_a_few_of_their_items() {
+    // Arrange
+    let rig = Rig::answering_a_tree().await;
+    rig.add_groups(3).await;
+
+    // Act
+    rig.run(enabled()).await;
+
+    // Assert
+    let prompts = rig.llm.prompts();
+    let (_, user) = &prompts[3];
+    for name in GROUP_NAMES {
+        let sampled = user.matches(&format!("for the {name} team")).count();
+        assert_eq!(sampled, 2, "{name}");
+    }
+    let last_summary = user.rfind(CHILD_SUMMARY_LABEL).unwrap();
+    let first_item = user.find("ledger notes number").unwrap();
+    assert!(first_item > last_summary, "{user}");
+    assert_eq!(user.matches(CHILD_SUMMARY_LABEL).count(), 3);
+}
+
+fn prompt_items(ids: &[&str]) -> HashMap<String, PromptItem> {
+    ids.iter()
+        .map(|id| {
+            let item = PromptItem {
+                label: (*id).to_string(),
+                text: format!("text of {id}"),
+                event_ids: Vec::new(),
+            };
+            ((*id).to_string(), item)
+        })
+        .collect()
+}
+
+fn labels(items: &[PromptItem]) -> Vec<&str> {
+    items.iter().map(|item| item.label.as_str()).collect()
+}
+
+#[test]
+fn the_sample_is_spread_over_the_members_in_id_order_whatever_the_order_they_came_in() {
+    // Arrange
+    let nodes = prompt_items(&["a", "b", "c", "d", "e", "f"]);
+    let forward: BTreeSet<String> = ["a", "b", "c", "d", "e", "f"].map(String::from).into();
+    let backward: BTreeSet<String> = ["f", "e", "d", "c", "b", "a"].map(String::from).into();
+
+    // Act
+    let from_forward = sample_of(&forward, &nodes);
+    let from_backward = sample_of(&backward, &nodes);
+
+    // Assert
+    assert_eq!(labels(&from_forward), ["a", "d"]);
+    assert_eq!(from_forward, from_backward);
+}
+
+#[test]
+fn a_summary_with_few_members_samples_all_of_those_still_in_the_store() {
+    // Arrange
+    let nodes = prompt_items(&["a", "c"]);
+    let members: BTreeSet<String> = ["a", "b", "c"].map(String::from).into();
+
+    // Act
+    let sample = sample_of(&members, &nodes);
+
+    // Assert
+    assert_eq!(labels(&sample), ["a", "c"]);
+}
 #[tokio::test]
 async fn a_summary_text_that_cannot_be_embedded_is_not_written() {
     // Arrange

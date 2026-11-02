@@ -32,7 +32,7 @@ use crate::ask::{
     format_answer,
 };
 use crate::clusters::{narrow_groups, render_clusters};
-use crate::config::{resolve_vocabulary, ExtractionConfig};
+use crate::config::{resolve_vocabulary, ExtractionConfig, DEFAULT_MAX_BASIS_IDS_RENDERED};
 use crate::render;
 use crate::synthesis;
 use crate::tuning::{record_and_maybe_evaluate, AimdHandles, RollingWindow};
@@ -534,6 +534,9 @@ pub struct MemoryServer {
     /// `clusters` reads this too, as one tenth of it (ADR-0002 S4): same
     /// underlying config value, not an `ask`-only budget despite the name.
     ask_context_tokens: usize,
+    /// Event ids a provenance line lists before it counts the rest; see
+    /// `config::SummaryConfig::max_basis_ids_rendered`.
+    max_basis_ids_rendered: usize,
     /// Bounds how many `ask` calls may be inside a model call (sufficiency
     /// pre-pass or synthesis) at once; see
     /// `config::LlmConfig::max_concurrent_generations`. A semaphore, not a
@@ -662,6 +665,7 @@ impl MemoryServer {
             ask_timeout_secs,
             ask_sufficiency_check,
             ask_context_tokens,
+            max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
             generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
             rolling_window: Arc::new(Mutex::new(RollingWindow::new())),
             granted_capacity: Arc::new(AtomicUsize::new(max_concurrent_generations)),
@@ -678,6 +682,12 @@ impl MemoryServer {
     /// Ties this server to the daemon's shutdown token.
     pub(crate) fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
         self.shutdown = shutdown;
+        self
+    }
+
+    /// Lists at most `max` event ids on a provenance line.
+    pub(crate) fn with_max_basis_ids_rendered(mut self, max: usize) -> Self {
+        self.max_basis_ids_rendered = max;
         self
     }
 
@@ -1228,7 +1238,12 @@ impl MemoryServer {
                 }
                 let head =
                     render::bracket_head(&hit.hit.kind, hit.hit.id.handle(), &hit.hit.label, None);
-                render::render_item(&head, &hit.hit.retrieved, &trailing)
+                render::render_item(
+                    &head,
+                    &hit.hit.retrieved,
+                    &trailing,
+                    self.max_basis_ids_rendered,
+                )
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -1347,6 +1362,7 @@ impl MemoryServer {
             &render::bracket_head(&entity.kind, id.handle(), &entity.label, None),
             &entity.retrieved,
             &[],
+            self.max_basis_ids_rendered,
         );
         let mentions_section = if mentions.is_empty() {
             "no mentions yet".to_string()
@@ -1360,7 +1376,7 @@ impl MemoryServer {
                         &m.label,
                         Some(m.valid_from.0),
                     );
-                    render::render_item(&head, &m.retrieved, &[])
+                    render::render_item(&head, &m.retrieved, &[], self.max_basis_ids_rendered)
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n")
@@ -1453,14 +1469,24 @@ impl MemoryServer {
                 // Unlike the prompt rules, this does not depend on the model
                 // cooperating. See `ask::is_grounded`.
                 if ask::is_grounded(answer, question, evidence) {
-                    format_answer(answer, evidence)
+                    format_answer(answer, evidence, self.max_basis_ids_rendered)
                 } else {
-                    fallback_answer("the answer was not grounded in the evidence", evidence)
+                    fallback_answer(
+                        "the answer was not grounded in the evidence",
+                        evidence,
+                        self.max_basis_ids_rendered,
+                    )
                 }
             }
-            Ok(Ok(_)) => fallback_answer("the model returned an empty answer", evidence),
-            Ok(Err(_)) => fallback_answer("the model failed", evidence),
-            Err(_) => fallback_answer("synthesis timed out", evidence),
+            Ok(Ok(_)) => fallback_answer(
+                "the model returned an empty answer",
+                evidence,
+                self.max_basis_ids_rendered,
+            ),
+            Ok(Err(_)) => {
+                fallback_answer("the model failed", evidence, self.max_basis_ids_rendered)
+            }
+            Err(_) => fallback_answer("synthesis timed out", evidence, self.max_basis_ids_rendered),
         }
     }
 
@@ -1505,7 +1531,7 @@ impl MemoryServer {
             .map(|&i| ask::Evidence::from_hit(&hits[i]))
             .collect();
         if mode == Mode::Strict {
-            return ask::strict_answer(&evidence);
+            return ask::strict_answer(&evidence, self.max_basis_ids_rendered);
         }
         // Trim ONCE, before the sufficiency pre-pass, and reuse this same
         // slice for both prompts below. Trimming twice, or only for the
@@ -1543,7 +1569,7 @@ impl MemoryServer {
         let acquire_start = tokio::time::Instant::now();
         let _generation_permit = match self.acquire_generation_permit(deadline).await {
             Ok(permit) => permit,
-            Err(reason) => return fallback_answer(reason, evidence),
+            Err(reason) => return fallback_answer(reason, evidence, self.max_basis_ids_rendered),
         };
         // Covers every return path below, not just one model call.
         let _permit_timer = PermitTimer::new(
@@ -1561,7 +1587,7 @@ impl MemoryServer {
                 .passes_sufficiency_check(&args.question, evidence, deadline)
                 .await
         {
-            return ask::insufficient_answer(evidence);
+            return ask::insufficient_answer(evidence, self.max_basis_ids_rendered);
         }
 
         self.synthesize_answer(&args.question, evidence, deadline)

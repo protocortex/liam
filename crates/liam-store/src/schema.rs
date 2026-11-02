@@ -330,6 +330,11 @@ CREATE TABLE IF NOT EXISTS summary_failures (
   model_id       TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS summary_dissolving (
+  summary_id TEXT    PRIMARY KEY,
+  runs       INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS summary_tree_state (
   scope               TEXT    NOT NULL,
   level               INTEGER NOT NULL,
@@ -356,14 +361,15 @@ pub(crate) enum Clear {
 /// the assignments, otherwise its fingerprint would vouch for communities that
 /// are no longer there. The backend's vector table goes before all of them, as
 /// `Backend::vector_clear_sql` returns it.
-pub(crate) const DERIVED_TABLES: [(&str, Clear); 21] = [
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 22] = [
     // No foreign keys link the fact tables, so their order among themselves is free.
     ("fact_sources", Clear::Always),
     ("fact_suppressions", Clear::Always),
     ("facts", Clear::Always),
-    // Summaries come back from the log once it carries them; their failure counts
-    // and build baselines describe rows that are gone with them.
+    // Summaries come back from the log once it carries them; their failure counts,
+    // dissolve waits and build baselines describe rows that are gone with them.
     ("summary_failures", Clear::Always),
+    ("summary_dissolving", Clear::Always),
     ("summary_tree_state", Clear::Always),
     ("summary_embeddings", Clear::Always),
     ("summary_sources", Clear::Always),

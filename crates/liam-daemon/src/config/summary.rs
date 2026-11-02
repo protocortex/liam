@@ -21,6 +21,10 @@ const DEFAULT_MAX_SUMMARIES_PER_RUN: usize = 20;
 const DEFAULT_RUN_DEADLINE_SECS: u64 = 600;
 const DEFAULT_MIN_GROUNDED_SHARE: f64 = 0.5;
 const DEFAULT_MAX_SUMMARY_FAILURES: u32 = 3;
+const DEFAULT_DISSOLVE_GRACE_RUNS: u32 = 3;
+const DEFAULT_DISSOLVE_OVERLAP: f64 = 0.5;
+/// Event ids shown on one provenance line before the rest are counted.
+pub const DEFAULT_MAX_BASIS_IDS_RENDERED: usize = 8;
 /// A typo of a few extra zeros would stall a run or overflow the arithmetic on
 /// the duration it turns into.
 const MAX_RUN_DEADLINE_SECS: u64 = 86_400;
@@ -60,6 +64,12 @@ pub struct SummaryConfig {
     pub min_grounded_share: f64,
     /// Failures of one child set after which it is skipped.
     pub max_summary_failures: u32,
+    /// Runs a summary whose cluster is gone waits for a replacement before it is closed.
+    pub dissolve_grace_runs: u32,
+    /// Share of a dissolved summary's items that a stored summary must hold to replace it.
+    pub dissolve_overlap: f64,
+    /// Event ids a provenance line lists before it counts the rest.
+    pub max_basis_ids_rendered: usize,
 }
 
 impl Default for SummaryConfig {
@@ -80,6 +90,9 @@ impl Default for SummaryConfig {
             run_deadline_secs: DEFAULT_RUN_DEADLINE_SECS,
             min_grounded_share: DEFAULT_MIN_GROUNDED_SHARE,
             max_summary_failures: DEFAULT_MAX_SUMMARY_FAILURES,
+            dissolve_grace_runs: DEFAULT_DISSOLVE_GRACE_RUNS,
+            dissolve_overlap: DEFAULT_DISSOLVE_OVERLAP,
+            max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
         }
     }
 }
@@ -91,6 +104,8 @@ impl SummaryConfig {
             ("knn", self.knn as u64),
             ("max_summaries_per_run", self.max_summaries_per_run as u64),
             ("max_summary_failures", u64::from(self.max_summary_failures)),
+            ("dissolve_grace_runs", u64::from(self.dissolve_grace_runs)),
+            ("max_basis_ids_rendered", self.max_basis_ids_rendered as u64),
             ("run_deadline_secs", self.run_deadline_secs),
             ("time_window_hours", self.time_window_hours),
             ("recluster_interval_days", self.recluster_interval_days),
@@ -139,6 +154,7 @@ impl SummaryConfig {
         for (key, value) in [
             ("recluster_change_ratio", self.recluster_change_ratio),
             ("min_grounded_share", self.min_grounded_share),
+            ("dissolve_overlap", self.dissolve_overlap),
         ] {
             anyhow::ensure!(
                 value > 0.0 && value <= 1.0,
@@ -192,6 +208,14 @@ mod tests {
             ("knn = 0", "summary.knn"),
             ("max_summaries_per_run = 0", "summary.max_summaries_per_run"),
             ("max_summary_failures = 0", "summary.max_summary_failures"),
+            ("dissolve_grace_runs = 0", "summary.dissolve_grace_runs"),
+            (
+                "max_basis_ids_rendered = 0",
+                "summary.max_basis_ids_rendered",
+            ),
+            ("dissolve_overlap = 0.0", "summary.dissolve_overlap"),
+            ("dissolve_overlap = 1.5", "summary.dissolve_overlap"),
+            ("dissolve_overlap = nan", "summary.dissolve_overlap"),
             ("run_deadline_secs = 0", "summary.run_deadline_secs"),
             ("run_deadline_secs = 86401", "summary.run_deadline_secs"),
             ("time_window_hours = 0", "summary.time_window_hours"),
@@ -247,6 +271,9 @@ mod tests {
             "min_attach_similarity = 1.0",
             "recluster_change_ratio = 1.0",
             "min_grounded_share = 1.0",
+            "dissolve_grace_runs = 1",
+            "dissolve_overlap = 1.0",
+            "max_basis_ids_rendered = 1",
             "max_unattached = 0",
         ] {
             // Act
@@ -289,6 +316,9 @@ mod tests {
             "run_deadline_secs",
             "min_grounded_share",
             "max_summary_failures",
+            "dissolve_grace_runs",
+            "dissolve_overlap",
+            "max_basis_ids_rendered",
         ] {
             assert!(
                 documented
