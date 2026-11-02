@@ -149,6 +149,17 @@ impl ChildKind {
             Self::Summary => "summary",
         }
     }
+
+    /// The kind `text` names. Anything else is an error, not a default.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "node" => Ok(Self::Node),
+            "summary" => Ok(Self::Summary),
+            other => Err(Error::Backend(format!(
+                "summary_children holds an unknown child kind {other}"
+            ))),
+        }
+    }
 }
 
 /// One child of a summary: a node at level 1, a lower summary above that.

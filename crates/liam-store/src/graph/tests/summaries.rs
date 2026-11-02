@@ -115,6 +115,40 @@ async fn a_new_summary_is_stored_with_its_children_sources_and_vector() {
 }
 
 #[tokio::test]
+async fn the_children_of_a_summary_are_listed_with_their_kind() {
+    // Arrange
+    let g = open().await;
+    let mut children = nodes(&["b"]);
+    children.push(SummaryChild {
+        id: "a".to_string(),
+        kind: ChildKind::Summary,
+    });
+    let outcome = g
+        .put_summary(new_summary(""), &children, &[event("e1")], &vector(), &[])
+        .await
+        .unwrap();
+
+    // Act
+    let listed = g.summary_children(&id_of(outcome)).await.unwrap();
+
+    // Assert
+    assert_eq!(
+        listed,
+        [
+            SummaryChild {
+                id: "a".to_string(),
+                kind: ChildKind::Summary
+            },
+            SummaryChild {
+                id: "b".to_string(),
+                kind: ChildKind::Node
+            },
+        ]
+    );
+    assert!(ChildKind::parse("edge").is_err());
+}
+
+#[tokio::test]
 async fn the_same_child_set_is_unchanged_and_a_changed_one_replaces_it_in_one_step() {
     // Arrange
     let g = open().await;

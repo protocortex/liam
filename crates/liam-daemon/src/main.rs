@@ -18,6 +18,7 @@ mod log_startup;
 mod mcp;
 mod render;
 mod shutdown;
+mod summary;
 mod synthesis;
 #[cfg(test)]
 mod test_logs;
