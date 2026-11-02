@@ -82,8 +82,12 @@ impl PromptItem {
         truncate(&self.text, MAX_EVIDENCE_CHARS)
     }
 
+    fn included_label(&self) -> String {
+        truncate(&self.label, MAX_EVIDENCE_CHARS)
+    }
+
     fn grounding_text(&self) -> String {
-        format!("{}\n{}", self.label, self.included_text())
+        format!("{}\n{}", self.included_label(), self.included_text())
     }
 }
 
@@ -125,7 +129,7 @@ fn render_items(items: &[PromptItem]) -> String {
             let n = index + 1;
             format!(
                 "{FENCE_OPEN} {n}>>>\n{}\n{}\n{FENCE_CLOSE} {n}>>>",
-                neutralize_fence(&truncate(&item.label, MAX_EVIDENCE_CHARS)),
+                neutralize_fence(&item.included_label()),
                 neutralize_fence(&item.included_text())
             )
         })
