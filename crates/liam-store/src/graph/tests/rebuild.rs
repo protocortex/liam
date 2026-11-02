@@ -745,7 +745,7 @@ async fn rebuild_without_an_embedder_reports_the_nodes_pending_instead_of_failin
 /// Puts a row in every table a rebuild empties but `nodes`, `edges`,
 /// `node_events` and `log_hash_index`, which `populate` fills, and names the
 /// tables it did.
-async fn seed_derived_tables(live: &Opened) -> [&'static str; 11] {
+async fn seed_derived_tables(live: &Opened) -> [&'static str; 17] {
     let g = &live.graph;
     let node_id = g
         .backend
@@ -783,6 +783,18 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 11] {
          VALUES ('rules', 0, 0, 1)",
         "INSERT INTO extraction_attempts (batch_key, event_ids, failures, last_error, updated_at)
          VALUES ('b', 'event-x', 1, 'timeout', 1)",
+        "INSERT INTO summaries
+         (id, level, child_hash, text, events_fed, valid_min, valid_max, model_id,
+          prompt_version, tx_from)
+         VALUES ('s', 1, 'h', 't', 1, 1, 1, 'm', 'p', 1)",
+        "INSERT INTO summary_children (parent_id, child_id, child_kind) VALUES ('s', 'c', 'node')",
+        "INSERT INTO summary_sources (summary_id, event_id) VALUES ('s', 'event-x')",
+        "INSERT INTO summary_embeddings (summary_id, dims, embedding) VALUES ('s', 1, x'00')",
+        "INSERT INTO summary_failures (child_hash, failures, last_error, prompt_version, model_id)
+         VALUES ('h', 1, 'timeout', 'p', 'm')",
+        "INSERT INTO summary_tree_state
+         (scope, level, last_full_build_at, baseline_item_count, unattached_count)
+         VALUES ('', 1, 1, 1, 0)",
     ] {
         g.backend.execute(sql, &[]).await.unwrap();
     }
@@ -798,6 +810,12 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 11] {
         "fact_suppressions",
         "extraction_cursor",
         "extraction_attempts",
+        "summaries",
+        "summary_children",
+        "summary_sources",
+        "summary_embeddings",
+        "summary_failures",
+        "summary_tree_state",
     ]
 }
 

@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS log_quarantine (
 ",
     );
     sql.push_str(&fact_tables());
+    sql.push_str(&summary_tables());
 
     sql
 }
@@ -272,6 +273,75 @@ CREATE TABLE IF NOT EXISTS extraction_attempts (
     )
 }
 
+/// Summaries of clusters of recorded nodes. A summary row is a version: only
+/// `tx_to` is set later, when a newer summary replaces it. The partial unique
+/// index keeps one live row per child set. `summary_embeddings` is its own table
+/// because `node_vectors` is bound to `nodes` and swept with them. `scope` uses
+/// '' for none. None of these tables has a foreign key, so their order is free.
+fn summary_tables() -> String {
+    let forever = FOREVER.0;
+    format!(
+        "
+CREATE TABLE IF NOT EXISTS summaries (
+  id             TEXT    PRIMARY KEY,
+  level          INTEGER NOT NULL,
+  scope          TEXT    NOT NULL DEFAULT '',
+  child_hash     TEXT    NOT NULL,
+  text           TEXT    NOT NULL,
+  derivation     TEXT    NOT NULL DEFAULT 'inferred',
+  events_fed     INTEGER NOT NULL,
+  valid_min      INTEGER NOT NULL,
+  valid_max      INTEGER NOT NULL,
+  model_id       TEXT    NOT NULL,
+  prompt_version TEXT    NOT NULL,
+  tx_from        INTEGER NOT NULL,
+  tx_to          INTEGER NOT NULL DEFAULT {forever}
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS summaries_one_live_per_child_set
+  ON summaries (child_hash) WHERE tx_to = {forever};
+CREATE INDEX IF NOT EXISTS summaries_by_level ON summaries (scope, level, tx_to);
+
+CREATE TABLE IF NOT EXISTS summary_children (
+  parent_id  TEXT NOT NULL,
+  child_id   TEXT NOT NULL,
+  child_kind TEXT NOT NULL CHECK (child_kind IN ('node', 'summary')),
+  PRIMARY KEY (parent_id, child_id)
+);
+
+CREATE TABLE IF NOT EXISTS summary_sources (
+  summary_id TEXT    NOT NULL,
+  event_id   TEXT    NOT NULL,
+  synthetic  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (summary_id, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS summary_embeddings (
+  summary_id TEXT    PRIMARY KEY,
+  dims       INTEGER NOT NULL,
+  embedding  BLOB    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS summary_failures (
+  child_hash     TEXT    PRIMARY KEY,
+  failures       INTEGER NOT NULL,
+  last_error     TEXT    NOT NULL,
+  prompt_version TEXT    NOT NULL,
+  model_id       TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS summary_tree_state (
+  scope               TEXT    NOT NULL,
+  level               INTEGER NOT NULL,
+  last_full_build_at  INTEGER NOT NULL,
+  baseline_item_count INTEGER NOT NULL,
+  unattached_count    INTEGER NOT NULL,
+  PRIMARY KEY (scope, level)
+);
+"
+    )
+}
+
 /// When a rebuild empties a derived table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Clear {
@@ -286,11 +356,19 @@ pub(crate) enum Clear {
 /// the assignments, otherwise its fingerprint would vouch for communities that
 /// are no longer there. The backend's vector table goes before all of them, as
 /// `Backend::vector_clear_sql` returns it.
-pub(crate) const DERIVED_TABLES: [(&str, Clear); 15] = [
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 21] = [
     // No foreign keys link the fact tables, so their order among themselves is free.
     ("fact_sources", Clear::Always),
     ("fact_suppressions", Clear::Always),
     ("facts", Clear::Always),
+    // Summaries come back from the log once it carries them; their failure counts
+    // and build baselines describe rows that are gone with them.
+    ("summary_failures", Clear::Always),
+    ("summary_tree_state", Clear::Always),
+    ("summary_embeddings", Clear::Always),
+    ("summary_sources", Clear::Always),
+    ("summary_children", Clear::Always),
+    ("summaries", Clear::Always),
     // Extraction restarts from the first event, which the fact rules treat as a replay.
     ("extraction_cursor", Clear::Always),
     ("node_events", Clear::Always),

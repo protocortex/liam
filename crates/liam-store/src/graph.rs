@@ -28,6 +28,7 @@ pub use self::rolled_back::RUN_SOURCE_PREFIX;
 pub use self::snapshot::{
     recover_interrupted_restore, verify_snapshot, Snapshot, SnapshotLog, SnapshotMeta,
 };
+pub use self::summaries::child_hash;
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};
@@ -59,6 +60,7 @@ mod replay;
 mod rolled_back;
 mod run_marker;
 mod snapshot;
+mod summaries;
 mod swept_by;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
@@ -2438,6 +2440,7 @@ mod tests {
     mod run_marker;
     mod snapshot;
     mod soak;
+    mod summaries;
     mod support;
     mod swept_by;
     mod typed_retrieval;
