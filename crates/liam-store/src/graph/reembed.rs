@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Re-embedding of live nodes that have no vector. A log record carries a
-//! node's row and never its embedding, so a replay leaves its nodes without
-//! one until this runs.
+//! Re-embedding of live nodes and summaries that have no vector. A log record
+//! carries a row and never its embedding, so a replay leaves them without one
+//! until this runs.
 
 use std::sync::Arc;
 
@@ -25,13 +25,14 @@ pub trait ContentEmbedder: Send + Sync {
 /// What one `reembed_missing` pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReembedReport {
-    /// Nodes that now have a vector.
+    /// Nodes and summaries that now have a vector.
     pub re_embedded: usize,
-    /// Nodes that still have none: the embedder, the content read or the
-    /// vector write failed, or the vector's size does not match the store's.
+    /// Nodes and summaries that still have none: the embedder, the content
+    /// read or the vector write failed, or the vector's size does not match the
+    /// store's.
     pub failed: usize,
-    /// Nodes that have none and were not embedded because no embedder is
-    /// configured.
+    /// Nodes and summaries that have none and were not embedded because no
+    /// embedder is configured.
     pub pending: usize,
 }
 
@@ -51,21 +52,22 @@ impl<B: Backend> Graph<B> {
         self
     }
 
-    /// Embeds the content of every live node that has no vector and stores it
-    /// unless a concurrent write stored one first. A node that cannot be
-    /// embedded is left as it is and counted instead of returned, so one bad
-    /// node does not hide the rest; the next pass finds it again. Without an
-    /// embedder it only counts the nodes it would have embedded. Fails only
-    /// when the nodes cannot be listed.
+    /// Embeds the content of every live node, and the text of every live
+    /// summary, that has no vector and stores it unless a concurrent write
+    /// stored one first. One that cannot be embedded is left as it is and
+    /// counted instead of returned, so one bad row does not hide the rest; the
+    /// next pass finds it again. Without an embedder it only counts the rows it
+    /// would have embedded. Fails only when the rows cannot be listed.
     pub async fn reembed_missing(&self) -> Result<ReembedReport> {
         let mut report = ReembedReport::default();
         let missing = self.backend.nodes_missing_vectors().await?;
+        let summaries = self.summaries_missing_embeddings().await?;
         let Some(embedder) = &self.embedder else {
-            report.pending = missing.len();
+            report.pending = missing.len() + summaries.len();
             if report.pending > 0 {
                 tracing::warn!(
                     pending = report.pending,
-                    "nodes have no vector and no embedder is configured"
+                    "nodes or summaries have no vector and no embedder is configured"
                 );
             }
             return Ok(report);
@@ -80,7 +82,36 @@ impl<B: Backend> Graph<B> {
                 }
             }
         }
+        for (id, text) in summaries {
+            match self.reembed_summary(embedder.as_ref(), &id, &text).await {
+                Ok(Outcome::Stored) => report.re_embedded += 1,
+                Ok(Outcome::AlreadyHeld | Outcome::Gone) => {}
+                Err(reason) => {
+                    tracing::error!(summary = id.as_str(), %reason, "re-embedding failed, the summary stays without a vector");
+                    report.failed += 1;
+                }
+            }
+        }
         Ok(report)
+    }
+
+    async fn reembed_summary(
+        &self,
+        embedder: &dyn ContentEmbedder,
+        id: &str,
+        text: &str,
+    ) -> std::result::Result<Outcome, String> {
+        let embedding = embedder.embed(text).await.map_err(|e| e.to_string())?;
+        self.check_dims(&embedding).map_err(|e| e.to_string())?;
+        let stored = self
+            .store_summary_embedding_if_absent(id, &embedding)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(if stored {
+            Outcome::Stored
+        } else {
+            Outcome::AlreadyHeld
+        })
     }
 
     async fn reembed_one(

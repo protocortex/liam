@@ -5,11 +5,14 @@
 
 use std::iter;
 
-use liam_log::event::{EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTarget};
+use liam_log::event::{
+    DerivedArtifact, EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTarget,
+};
 
 use super::backfill::BACKFILL_SOURCE;
 use super::fact_projection::{apply_fact_step, fact_steps, FactStep};
 use super::logged_plan::Table;
+use super::summaries::{apply_artifact, close_if_open, store_embedding};
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
 };
@@ -41,6 +44,21 @@ pub(super) enum Step {
     /// gone changes nothing, so a replay can run it again.
     Remove(TombstoneTarget),
     Fact(FactStep),
+    /// Stores a derived artifact with its children and source events.
+    Summary(Box<DerivedArtifact>),
+    /// Ends an open summary, if it is still open.
+    SummaryClose {
+        id: String,
+        at: i64,
+    },
+    /// Stores a summary's vector. A live write adds it after `Summary`; the log
+    /// does not carry vectors, so `steps_for` never yields it and a replay
+    /// leaves the summary to the re-embed pass.
+    SummaryEmbedding {
+        id: String,
+        embedding: Vec<u8>,
+        dims: usize,
+    },
 }
 
 /// The statements that project a logged payload. A `supersedes` edge closes its
@@ -58,6 +76,11 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
             .collect(),
         LogPayload::Tombstone(targets) => targets.iter().cloned().map(Step::Remove).collect(),
         LogPayload::FactWrite { .. } => fact_steps(payload).into_iter().map(Step::Fact).collect(),
+        LogPayload::DerivedArtifact(artifact) => vec![Step::Summary(Box::new(artifact.clone()))],
+        LogPayload::DerivedArtifactClosed { artifact_id, at } => vec![Step::SummaryClose {
+            id: artifact_id.clone(),
+            at: *at,
+        }],
         LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
         | LogPayload::RunRolledBack { .. } => Vec::new(),
@@ -183,6 +206,13 @@ pub(super) async fn apply_steps(
             Step::GuardedEdge(row) => insert_guarded_edge(tx, row).await?,
             Step::Remove(target) => remove_row(tx, target, vector_delete).await?,
             Step::Fact(step) => apply_fact_step(tx, step).await?,
+            Step::Summary(artifact) => apply_artifact(tx, artifact).await?,
+            Step::SummaryClose { id, at } => close_if_open(tx, id, *at).await?,
+            Step::SummaryEmbedding {
+                id,
+                embedding,
+                dims,
+            } => store_embedding(tx, id, *dims, embedding).await?,
         }
     }
     Ok(())

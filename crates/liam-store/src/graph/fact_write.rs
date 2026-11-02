@@ -208,9 +208,9 @@ async fn read_state(tx: &mut dyn BackendTx, key: &Key) -> Result<KeyState> {
 }
 
 /// A fact write between its open and its finish: the log lock and the transaction.
-struct OpenWrite<'a> {
-    held: Option<HeldLog>,
-    tx: Box<dyn BackendTx + 'a>,
+pub(super) struct OpenWrite<'a> {
+    pub(super) held: Option<HeldLog>,
+    pub(super) tx: Box<dyn BackendTx + 'a>,
 }
 
 /// The log event for a decision, or `None` when it changes nothing. It is
@@ -390,7 +390,7 @@ impl<B: Backend> Graph<B> {
     /// Takes the log lock, when there is a log, and opens the transaction. The
     /// lock is held until `finish_write`, so the reads a decision makes cannot
     /// go stale before it is appended.
-    async fn open_write(&self) -> Result<OpenWrite<'_>> {
+    pub(super) async fn open_write(&self) -> Result<OpenWrite<'_>> {
         let held = match &self.log {
             Some(log) => Some(HeldLog::acquire_for_write(log).await?),
             None => None,

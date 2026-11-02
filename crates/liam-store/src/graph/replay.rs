@@ -349,7 +349,7 @@ impl Removed {
                     || self.nodes.contains(&edge.src)
                     || self.nodes.contains(&edge.dst)
             }
-            WrittenRow::Fact(_) => false,
+            WrittenRow::Fact(_) | WrittenRow::Summary(_) => false,
         }
     }
 }
@@ -446,7 +446,9 @@ pub(super) fn row_effects(payload: LogPayload) -> Vec<RowEffect> {
         | LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
         | LogPayload::FactWrite { .. }
-        | LogPayload::RunRolledBack { .. } => Vec::new(),
+        | LogPayload::RunRolledBack { .. }
+        | LogPayload::DerivedArtifact(_)
+        | LogPayload::DerivedArtifactClosed { .. } => Vec::new(),
     }
 }
 
@@ -463,6 +465,7 @@ enum WrittenRow<'a> {
     Node(&'a str),
     Edge(&'a EdgeRow),
     Fact(&'a str),
+    Summary(&'a str),
 }
 
 impl WrittenRow<'_> {
@@ -471,6 +474,7 @@ impl WrittenRow<'_> {
             WrittenRow::Node(id) => (Table::Nodes.exists_query(), id),
             WrittenRow::Edge(edge) => (Table::Edges.exists_query(), &edge.id),
             WrittenRow::Fact(id) => ("SELECT 1 FROM facts WHERE id = ?1", id),
+            WrittenRow::Summary(id) => ("SELECT 1 FROM summaries WHERE id = ?1", id),
         }
     }
 }
@@ -484,7 +488,13 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
             Step::Node(row) => Some(WrittenRow::Node(&row.id)),
             Step::Edge(row) | Step::GuardedEdge(row) => Some(WrittenRow::Edge(row)),
             Step::Fact(FactStep::Insert(row)) => Some(WrittenRow::Fact(&row.id)),
-            Step::Close { .. } | Step::NodeEvent { .. } | Step::Remove(_) | Step::Fact(_) => None,
+            Step::Summary(artifact) => Some(WrittenRow::Summary(&artifact.artifact_id)),
+            Step::Close { .. }
+            | Step::NodeEvent { .. }
+            | Step::Remove(_)
+            | Step::Fact(_)
+            | Step::SummaryClose { .. }
+            | Step::SummaryEmbedding { .. } => None,
         })
         .collect()
 }

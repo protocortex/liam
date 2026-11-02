@@ -13,11 +13,15 @@ mod legacy;
 use legacy::{LegacyEvent, LegacyPayload};
 
 /// Schema version this build writes and the newest it can read. Version 2 adds
-/// the fact payloads, which an older build cannot replay. Version 3 adds the
-/// derivation and basis of a node row, which changes its layout, so frames of
-/// older versions are read through [`legacy`] and come back stamped with this
-/// version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+/// the fact payloads and version 4 the derived artifacts, which an older build
+/// cannot replay. Version 3 adds the derivation and basis of a node row, which
+/// changes its layout, so frames of versions before it are read through
+/// [`legacy`]. Every frame comes back stamped with this version, since what
+/// is returned is the current representation of the event.
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+
+/// The first version whose node rows carry a derivation and a basis.
+pub(crate) const NODE_DERIVATION_SCHEMA_VERSION: u32 = 3;
 
 /// Why an encoded event could not be turned back into a [`LogEvent`].
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -155,6 +159,45 @@ pub enum LogPayload {
     RunRolledBack {
         run_id: String,
     },
+    /// A text composed from other rows, with the rows and events it rests on.
+    DerivedArtifact(DerivedArtifact),
+    /// Ends a derived artifact that nothing replaces, such as a cluster that
+    /// dissolved.
+    DerivedArtifactClosed {
+        artifact_id: String,
+        at: i64,
+    },
+}
+
+/// The `kind` of a summary of a cluster of nodes.
+pub const ARTIFACT_KIND_SUMMARY: &str = "summary";
+
+/// A composed text, resolved so a replay stores it without composing again. The
+/// artifacts in `closes` end at `at` as this one begins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DerivedArtifact {
+    pub artifact_id: String,
+    pub kind: String,
+    /// How many compositions deep: 1 summarizes nodes, 2 summarizes level 1.
+    pub level: u8,
+    /// The scope of the rows composed, empty for none.
+    pub scope: String,
+    pub text: String,
+    /// The nodes (level 1) or lower artifacts the text was composed from.
+    pub child_ids: Vec<String>,
+    /// Every log event behind the children, so tracing needs no walk down.
+    pub source_event_ids: Vec<BasisRef>,
+    /// How many of those events had their item text in the prompt.
+    pub events_fed: u32,
+    pub derivation: String,
+    pub model_id: String,
+    pub prompt_version: String,
+    /// Artifacts this one replaces.
+    pub closes: Vec<String>,
+    pub valid_min: i64,
+    pub valid_max: i64,
+    /// When the artifact begins, in transaction time.
+    pub at: i64,
 }
 
 /// Table a tombstone targets.
@@ -227,14 +270,14 @@ impl LogEvent {
                 supported: CURRENT_SCHEMA_VERSION,
             });
         }
-        let (event, rest) = if version < CURRENT_SCHEMA_VERSION {
+        let (event, rest) = if version < NODE_DERIVATION_SCHEMA_VERSION {
             let (legacy, rest) =
                 postcard::take_from_bytes::<LegacyEvent>(body).map_err(EventError::Decode)?;
             (LogEvent::from(legacy), rest)
         } else {
             let (mut event, rest) =
                 postcard::take_from_bytes::<LogEvent>(body).map_err(EventError::Decode)?;
-            event.schema_version = version;
+            event.schema_version = CURRENT_SCHEMA_VERSION;
             (event, rest)
         };
         if !rest.is_empty() {
@@ -247,7 +290,7 @@ impl LogEvent {
 /// Decodes a payload written by a build that stamped `version`, in the layout
 /// of that version, and returns it in the current one.
 pub fn decode_payload(version: u32, bytes: &[u8]) -> Result<LogPayload, postcard::Error> {
-    if version < CURRENT_SCHEMA_VERSION {
+    if version < NODE_DERIVATION_SCHEMA_VERSION {
         return postcard::from_bytes::<LegacyPayload>(bytes).map(LogPayload::from);
     }
     postcard::from_bytes(bytes)
@@ -856,7 +899,7 @@ mod tests {
         let newer = postcard::to_stdvec(&current).expect("encode payload");
 
         // Act
-        let from_older = decode_payload(CURRENT_SCHEMA_VERSION - 1, &older);
+        let from_older = decode_payload(NODE_DERIVATION_SCHEMA_VERSION - 1, &older);
         let from_current = decode_payload(CURRENT_SCHEMA_VERSION, &newer);
 
         // Assert
@@ -872,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_node_rows_wire_format_is_pinned() {
+    fn v3_node_rows_are_still_read() {
         // Arrange
         let mut inferred = node_row();
         inferred.derivation = Some("inferred".into());
@@ -890,11 +933,83 @@ mod tests {
         let golden = from_hex("03076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f0000066e6f64652d310466616374056c6162656c07636f6e74656e74076167656e742d61027b7d010670726f6a2f6100000000000000e83fd00f0180e09ecce5ee01a01f80e09ecce5ee010108696e66657272656402076576656e742d3700076576656e742d3801");
 
         // Act
-        let encoded = event.encode().expect("encode event");
         let decoded = LogEvent::decode(&golden);
 
         // Assert
-        assert_eq!(encoded, golden, "encoding drifted for {event:?}");
         assert_eq!(decoded, Ok(event));
+    }
+
+    fn artifact() -> DerivedArtifact {
+        DerivedArtifact {
+            artifact_id: "artifact-1".into(),
+            kind: ARTIFACT_KIND_SUMMARY.into(),
+            level: 2,
+            scope: "proj/a".into(),
+            text: "A summary.".into(),
+            child_ids: vec!["child-1".into(), "child-2".into()],
+            source_event_ids: vec![
+                BasisRef {
+                    event_id: "event-7".into(),
+                    synthetic: false,
+                },
+                BasisRef {
+                    event_id: "event-8".into(),
+                    synthetic: true,
+                },
+            ],
+            events_fed: 1,
+            derivation: "inferred".into(),
+            model_id: "model-a".into(),
+            prompt_version: "prompt-1".into(),
+            closes: vec!["artifact-0".into()],
+            valid_min: 1_000,
+            valid_max: 2_000,
+            at: 3_000,
+        }
+    }
+
+    #[test]
+    fn derived_artifact_payloads_round_trip() {
+        // Arrange
+        let payloads = [
+            LogPayload::DerivedArtifact(artifact()),
+            LogPayload::DerivedArtifactClosed {
+                artifact_id: "artifact-1".into(),
+                at: 4_000,
+            },
+        ];
+
+        for payload in payloads {
+            // Act and Assert
+            assert_round_trips(event_with(payload));
+        }
+    }
+
+    #[test]
+    fn v4_artifact_payloads_wire_format_is_pinned() {
+        // Arrange
+        let golden = [
+            (LogPayload::DerivedArtifact(artifact()), "04076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f00080a61727469666163742d310773756d6d617279020670726f6a2f610a412073756d6d6172792e02076368696c642d31076368696c642d3202076576656e742d3700076576656e742d38010108696e666572726564076d6f64656c2d610870726f6d70742d31010a61727469666163742d30d00fa01ff02e"),
+            (
+                LogPayload::DerivedArtifactClosed {
+                    artifact_id: "artifact-1".into(),
+                    at: 4_000,
+                },
+                "04076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f00090a61727469666163742d31c03e",
+            ),
+        ];
+
+        for (payload, hex) in golden {
+            let event = event_with(payload);
+            let expected_bytes = from_hex(hex);
+
+            // Act
+            let encoded = event.encode().expect("encode event");
+            let decoded = LogEvent::decode(&expected_bytes);
+
+            // Assert
+            assert_eq!(encoded, expected_bytes, "encoding drifted for {event:?}");
+            assert_eq!(decoded, Ok(event));
+        }
     }
 }
