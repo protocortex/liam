@@ -6,7 +6,7 @@
 /// Cap on per-item evidence content fed to the LLM. WHY: `ask` is the first
 /// caller passing arbitrary node content to `Llm::complete`; one oversized node
 /// must not blow a small local model's context window.
-const MAX_EVIDENCE_CHARS: usize = 2000;
+pub(crate) const MAX_EVIDENCE_CHARS: usize = 2000;
 
 /// Default and upper bound on the number of evidence items `ask` feeds the LLM.
 /// WHY the cap: caller-supplied `k` is otherwise unbounded and each item can be
@@ -263,7 +263,7 @@ pub fn build_ask_prompt(question: &str, evidence: &[Evidence]) -> (String, Strin
 /// only becomes a smaller or larger safety margin, never a correctness bug,
 /// because it is a floor on free space, not a promise about how many tokens
 /// generation actually uses.
-const ANSWER_TOKEN_RESERVE: usize = 512;
+pub(crate) const ANSWER_TOKEN_RESERVE: usize = 512;
 
 /// Trim `evidence` from the tail until the rendered prompt (system AND user,
 /// both returned by the caller's `render` closure, so a long fixed system
@@ -290,24 +290,34 @@ pub fn fit_evidence_to_budget(
     budget: usize,
     count: impl Fn(&str) -> usize,
 ) -> &[Evidence] {
+    fit_texts_to_budget(render, evidence, budget, count)
+}
+
+/// `fit_evidence_to_budget` for any list of items a prompt is built from.
+pub fn fit_texts_to_budget<T>(
+    render: impl Fn(&[T]) -> (String, String),
+    items: &[T],
+    budget: usize,
+    count: impl Fn(&str) -> usize,
+) -> &[T] {
     let allowance = budget.saturating_sub(ANSWER_TOKEN_RESERVE);
-    let mut kept = evidence.len();
+    let mut kept = items.len();
     while kept > 1 {
-        let (system, user) = render(&evidence[..kept]);
+        let (system, user) = render(&items[..kept]);
         if count(&system) + count(&user) <= allowance {
             break;
         }
         kept -= 1;
     }
-    let dropped = evidence.len() - kept;
+    let dropped = items.len() - kept;
     if dropped > 0 {
         tracing::warn!(
             dropped,
             remaining = kept,
-            "evidence trimmed to fit context budget"
+            "items trimmed to fit context budget"
         );
     }
-    &evidence[..kept]
+    &items[..kept]
 }
 
 /// (system, user) prompt for the sufficiency pre-pass: does this evidence

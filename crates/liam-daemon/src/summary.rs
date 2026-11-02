@@ -5,4 +5,7 @@
 //! when the consolidation job calls the builder.
 #![cfg_attr(not(test), allow(dead_code))]
 
+pub mod generate;
+#[cfg(test)]
+mod test_support;
 pub mod tree;
