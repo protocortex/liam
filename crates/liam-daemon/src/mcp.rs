@@ -489,8 +489,8 @@ pub struct AskArgs {
     /// live then.
     pub as_of: Option<i64>,
     /// `infer` (the default) may compose the answer from entity pages and
-    /// summaries as well as recorded memory and labels what it used. `strict` returns recorded
-    /// evidence only and makes no model call.
+    /// summaries as well as recorded memory and labels what it used. `strict`
+    /// returns recorded evidence only and makes no model call.
     pub mode: Option<Mode>,
 }
 

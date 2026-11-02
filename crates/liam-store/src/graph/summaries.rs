@@ -311,11 +311,13 @@ impl<B: Backend> Graph<B> {
                 &params,
             )
             .await?;
+        // The joined embedding columns follow the summary's own.
+        let dims_column = SUMMARY_COLUMNS.split(", ").count();
         rows.iter()
             .map(|row| {
-                let vector = match row.0.get(14) {
+                let vector = match row.0.get(dims_column + 1) {
                     Some(Value::Blob(bytes)) => {
-                        let dims = usize::try_from(row.get_i64(13)?).map_err(|_| {
+                        let dims = usize::try_from(row.get_i64(dims_column)?).map_err(|_| {
                             Error::Backend("summary_embeddings holds a bad width".into())
                         })?;
                         decode_vector(bytes, dims)
