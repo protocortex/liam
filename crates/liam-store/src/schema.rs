@@ -22,9 +22,9 @@ CREATE TABLE IF NOT EXISTS nodes (
   -- written before producer existed, so they read back as 'unknown' instead
   -- of losing data. A fresh database gets the column from this DDL directly.
   producer    TEXT    NOT NULL DEFAULT 'unknown',
-  -- Added to existing databases the same way as producer. The log does not
-  -- carry it yet, so a replay writes the default and `derivation_backfill_state`
-  -- guards the pass that reclassifies entity pages.
+  -- Added to existing databases the same way as producer. Events written
+  -- since it was logged carry it; `derivation_backfill_state` guards the pass
+  -- that reclassifies the entity pages of a database from before the column.
   derivation  TEXT    NOT NULL DEFAULT 'recorded',
   attributes  TEXT    NOT NULL DEFAULT '{}',
   scope       TEXT,

@@ -215,7 +215,7 @@ impl Backend for ReembedProbe {
             }
         };
         if let Some((_, row)) = landed {
-            let (insert, params) = node_row_insert(&row);
+            let (insert, params) = node_row_insert(&row).unwrap();
             self.inner.execute(&insert, &params).await?;
         }
         Ok(rows)
@@ -557,6 +557,8 @@ pub(super) fn node(id: &str, content: &str) -> NodeRow {
         valid_until: FOREVER.0,
         tx_from: 1000,
         tx_to: FOREVER.0,
+        derivation: None,
+        basis: Vec::new(),
     }
 }
 

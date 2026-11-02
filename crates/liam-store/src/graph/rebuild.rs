@@ -64,7 +64,7 @@ struct LoggedState {
 
 /// The columns `stored_node` and `stored_edge` read, in their order.
 pub(super) const NODE_COLUMNS: &str = "id, kind, label, content, producer, attributes, scope, \
-     subject, confidence, valid_from, valid_until, tx_from, tx_to";
+     subject, confidence, valid_from, valid_until, tx_from, tx_to, derivation";
 pub(super) const EDGE_COLUMNS: &str = "id, src, dst, type, attributes, tx_from, tx_to";
 
 impl<B: Backend> Graph<B> {
@@ -113,8 +113,14 @@ impl<B: Backend> Graph<B> {
         self.reset(&mut held, previous_log.is_some()).await?;
         let replayed = self.replay(&mut held).await?;
         tracing::info!(?replayed, "rebuild: log replayed");
-        // The log does not carry a derivation yet, so replayed pages are recorded.
-        crate::migrate::backfill_derivation(&self.backend, self.clock.now()).await?;
+        // The projection starts empty, so the open-time pass that classifies
+        // every existing node must not run over the rebuilt rows.
+        crate::migrate::record_derivation_backfill(
+            &self.backend,
+            self.clock.now(),
+            replayed.pages_marked,
+        )
+        .await?;
 
         let rebuilt = self.live_rows().await?;
         let expected = log_expected_state(&held).await?;
@@ -266,6 +272,8 @@ pub(super) fn stored_node(row: &Row) -> Result<NodeRow> {
         valid_until: row.get_i64(10)?,
         tx_from: row.get_i64(11)?,
         tx_to: row.get_i64(12)?,
+        derivation: Some(row.get_string(13)?),
+        basis: Vec::new(),
     })
 }
 

@@ -212,6 +212,8 @@ mod tests {
             valid_until: 4_102_444_800_000,
             tx_from: 2_000,
             tx_to: 4_102_444_800_000,
+            derivation: None,
+            basis: Vec::new(),
         }
     }
 

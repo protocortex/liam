@@ -236,6 +236,39 @@ async fn a_rebuild_lists_the_same_origins_again() {
 }
 
 #[tokio::test]
+async fn a_rebuild_lists_the_basis_a_page_rests_on_again() {
+    // Arrange: a page whose basis is a real mention event and a placeholder
+    let env = Env::new();
+    let (g, log) = env.open::<DefaultBackend>("live.db", clock()).await;
+    let mention = g.insert(fact("mention")).await.unwrap();
+    let mut basis = origins(&g, &mention).await;
+    basis.push(EventRef {
+        event_id: "placeholder".to_string(),
+        synthetic: true,
+    });
+    let mut page = NewNode::entity("person", "Ada").with_basis(basis);
+    page.content = "profile".into();
+    let page = g.upsert_by(page).await.unwrap();
+    let before = g.node_event_ids(&page, EventRole::Basis).await.unwrap();
+
+    // Act
+    let (rebuilt, _) = g
+        .rebuild_from_log(log, RebuildMode::ResetChecked)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(before.len(), 2);
+    assert_eq!(
+        rebuilt
+            .node_event_ids(&page, EventRole::Basis)
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn a_row_the_backfill_logs_lists_a_synthetic_origin() {
     // Arrange: a node written before the store had a log
     let env = Env::new();

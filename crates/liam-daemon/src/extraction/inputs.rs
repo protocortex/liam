@@ -148,6 +148,8 @@ mod tests {
             valid_until: 0,
             tx_from: 0,
             tx_to: 0,
+            derivation: None,
+            basis: Vec::new(),
         }
     }
 

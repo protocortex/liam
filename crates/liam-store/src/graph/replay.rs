@@ -44,9 +44,21 @@ pub struct CatchUpReport {
     pub skipped_voided: usize,
     /// Events the projection refused, recorded in `log_quarantine`.
     pub quarantined: usize,
+    /// Replayed nodes from events written before derivations were logged that
+    /// the replay marked inferred because they are entity pages.
+    pub pages_marked: u64,
     /// The re-embed pass that follows the replay, which covers every live
     /// node without a vector, not only the replayed ones.
     pub reembedded: ReembedReport,
+}
+
+/// What a replay gathers while it goes, beyond the report.
+#[derive(Default)]
+struct Progress {
+    /// The last `Voided` a quarantine appended, which the cursor passes at the end.
+    last_void: Option<LogOffset>,
+    /// Nodes from events that carry no derivation.
+    legacy_nodes: Vec<String>,
 }
 
 /// What became of one record.
@@ -87,10 +99,6 @@ impl<B: Backend> Graph<B> {
             let mut held = HeldLog::acquire(log).await?;
             self.replay(&mut held).await?
         };
-        if report.applied > 0 {
-            // The log does not carry a derivation yet, so replayed pages are recorded.
-            crate::migrate::mark_inferred_pages(&self.backend).await?;
-        }
         Ok(self.reembedded(report).await)
     }
 
@@ -127,7 +135,7 @@ impl<B: Backend> Graph<B> {
         // Both scans stop at `head`, so the voids a quarantine appends below it
         // are not read back as new work.
         let mut records = reader.scan_through(cursor, head);
-        let mut last_void = None;
+        let mut progress = Progress::default();
         while let Some(record) = records.next().await {
             let record = record?;
             let event_id = &record.event.event_id;
@@ -146,7 +154,7 @@ impl<B: Backend> Graph<B> {
                     rolled_back,
                     ..
                 } = &mut ahead;
-                self.replay_event(held, &record, removed, rolled_back, &mut last_void)
+                self.replay_event(held, &record, removed, rolled_back, &mut progress)
                     .await?
             };
             tracing::debug!(event = %event_id, offset = %record.offset, "replay: record accounted for");
@@ -154,8 +162,21 @@ impl<B: Backend> Graph<B> {
         }
         // Every record the scan covered is accounted for, so the cursor can pass
         // the voids appended behind them, which carry no rows.
-        if let Some(void) = last_void {
+        if let Some(void) = progress.last_void {
             log_cursor::advance(&self.backend, held.log_id, void).await?;
+        }
+        // Whether a node written before derivations were logged was an entity
+        // page depends on the mentions edges, which can follow it, so it is
+        // worked out once the events are in.
+        if !progress.legacy_nodes.is_empty() {
+            report.pages_marked =
+                crate::migrate::mark_inferred_pages(&self.backend, Some(&progress.legacy_nodes))
+                    .await?;
+            tracing::info!(
+                legacy = progress.legacy_nodes.len(),
+                marked = report.pages_marked,
+                "replay: nodes from before derivations were logged classified"
+            );
         }
         Ok(report)
     }
@@ -166,7 +187,7 @@ impl<B: Backend> Graph<B> {
         record: &LogRecord,
         removed: &Removed,
         rolled_back: &mut RolledBack,
-        last_void: &mut Option<LogOffset>,
+        progress: &mut Progress,
     ) -> Result<Outcome> {
         let LogRecord { offset, event, .. } = record;
         let mut steps = steps_for(&rolled_back.reconcile(event.payload.clone()));
@@ -191,6 +212,9 @@ impl<B: Backend> Graph<B> {
         match commit_or_abandon(tx, projected).await {
             Ok(outcome) => {
                 held.remember(&carried);
+                if matches!(outcome, Outcome::Applied) {
+                    progress.legacy_nodes.extend(legacy_nodes(&steps));
+                }
                 Ok(outcome)
             }
             Err(error) if is_refusal(&error) => {
@@ -198,7 +222,7 @@ impl<B: Backend> Graph<B> {
                 let void = self
                     .quarantine_record(held, record, &error.to_string())
                     .await?;
-                *last_void = Some(void);
+                progress.last_void = Some(void);
                 Ok(Outcome::Quarantined)
             }
             Err(error) => Err(error),
@@ -426,6 +450,14 @@ pub(super) fn row_effects(payload: LogPayload) -> Vec<RowEffect> {
     }
 }
 
+/// The nodes the steps write whose event predates logged derivations.
+fn legacy_nodes(steps: &[Step]) -> impl Iterator<Item = String> + '_ {
+    steps.iter().filter_map(|step| match step {
+        Step::Node(row) if row.derivation.is_none() => Some(row.id.clone()),
+        _ => None,
+    })
+}
+
 /// A row the steps insert.
 enum WrittenRow<'a> {
     Node(&'a str),
@@ -452,11 +484,7 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
             Step::Node(row) => Some(WrittenRow::Node(&row.id)),
             Step::Edge(row) | Step::GuardedEdge(row) => Some(WrittenRow::Edge(row)),
             Step::Fact(FactStep::Insert(row)) => Some(WrittenRow::Fact(&row.id)),
-            Step::Close { .. }
-            | Step::Derivation { .. }
-            | Step::NodeEvent { .. }
-            | Step::Remove(_)
-            | Step::Fact(_) => None,
+            Step::Close { .. } | Step::NodeEvent { .. } | Step::Remove(_) | Step::Fact(_) => None,
         })
         .collect()
 }
@@ -483,6 +511,7 @@ fn is_refusal(error: &Error) -> bool {
             | Error::Constraint(_)
             | Error::PartlyApplied(_)
             | Error::CorruptFactState(_)
+            | Error::UnknownDerivation(_)
     )
 }
 

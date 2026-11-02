@@ -2,7 +2,10 @@
 //! The `derivation` column: which write paths set it, and the backfill that
 //! marks the entity pages written before the column existed.
 
-use super::support::{count, Env, ONE_SEGMENT};
+use liam_log::event::{EdgeRow, LogEvent, LogPayload};
+use liam_log::hash::{edge_row_hash, node_row_hash};
+
+use super::support::{count, edge, event, node, Env, ONE_SEGMENT};
 use super::*;
 use crate::types::{Derivation, EpisodeEdge, EpisodeRef};
 use crate::DefaultBackend;
@@ -94,6 +97,17 @@ async fn assert_only_pages_are_inferred<B: Backend>(g: &Graph<B>, s: &Seeded) {
     }
     for kept in [&s.fact, &s.plain, &s.empty_page, &s.user_node] {
         assert_eq!(derivation_of(g, kept).await, Derivation::Recorded);
+    }
+}
+
+/// What the live store held right after `seed`: the pages and the stub
+/// synthesized from `NewNode::entity` are inferred, everything else recorded.
+async fn assert_derivations_as_written<B: Backend>(g: &Graph<B>, s: &Seeded) {
+    for inferred in [&s.page, &s.accented_page, &s.empty_page] {
+        assert_eq!(derivation_of(g, inferred).await, Derivation::Inferred);
+    }
+    for recorded in [&s.fact, &s.plain, &s.user_node] {
+        assert_eq!(derivation_of(g, recorded).await, Derivation::Recorded);
     }
 }
 
@@ -238,15 +252,39 @@ async fn every_write_path_stores_the_derivation_of_its_constructor() {
 }
 
 #[tokio::test]
-async fn a_rebuild_marks_the_replayed_pages_inferred_again() {
-    // Arrange: a logged store, whose log does not carry the derivation
+async fn a_rebuild_restores_every_derivation_from_the_log() {
+    // Arrange: a logged store, with a stub that has no mentions edge to mark it by
     let env = Env::new();
     let (g, log) = env.open::<DefaultBackend>("live.db", clock()).await;
     let seeded = seed(&g).await;
-    assert_eq!(
-        derivation_of(&g, &seeded.empty_page).await,
-        Derivation::Inferred
-    );
+    assert_derivations_as_written(&g, &seeded).await;
+
+    // Act
+    let (rebuilt, report) = g
+        .rebuild_from_log(Arc::clone(&log), RebuildMode::ResetChecked)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_derivations_as_written(&rebuilt, &seeded).await;
+    assert_eq!(report.replayed.pages_marked, 0);
+    assert_eq!(count(&rebuilt, "derivation_backfill_state").await, 1);
+}
+
+#[tokio::test]
+async fn a_rebuild_keeps_a_recorded_node_shaped_like_a_page_recorded() {
+    // Arrange: a user's own node with a page's subject and a mentions edge
+    let env = Env::new();
+    let (g, log) = env.open::<DefaultBackend>("live.db", clock()).await;
+    let fact = g
+        .insert(NewNode::now("fact", "note", "met Ada"))
+        .await
+        .unwrap();
+    let lookalike = g
+        .insert(NewNode::now("person", "Ada", "my own note").with_subject("ada"))
+        .await
+        .unwrap();
+    g.relate(&lookalike, &fact, MENTIONS).await.unwrap();
 
     // Act
     let (rebuilt, _) = g
@@ -254,10 +292,11 @@ async fn a_rebuild_marks_the_replayed_pages_inferred_again() {
         .await
         .unwrap();
 
-    // Assert: a page with no mentions edge has nothing to mark it by, so the
-    // rebuild turns that stub back into recorded until the log carries the value
-    assert_only_pages_are_inferred(&rebuilt, &seeded).await;
-    assert_eq!(count(&rebuilt, "derivation_backfill_state").await, 1);
+    // Assert
+    assert_eq!(
+        derivation_of(&rebuilt, &lookalike).await,
+        Derivation::Recorded
+    );
 }
 
 /// A store attached to the log in `env`, opened over a new handle on its file.
@@ -283,7 +322,8 @@ async fn pages_replayed_into_an_empty_store_by_catch_up_are_inferred() {
 
     // Assert
     assert!(report.applied > 0);
-    assert_only_pages_are_inferred(&fresh, &seeded).await;
+    assert_derivations_as_written(&fresh, &seeded).await;
+    assert_eq!(report.pages_marked, 0);
 }
 
 #[tokio::test]
@@ -303,7 +343,7 @@ async fn pages_replayed_into_a_store_whose_backfill_is_done_are_inferred() {
     restored.catch_up().await.unwrap();
 
     // Assert
-    assert_only_pages_are_inferred(&restored, &seeded).await;
+    assert_derivations_as_written(&restored, &seeded).await;
 }
 
 #[tokio::test]
@@ -382,4 +422,97 @@ async fn the_backfill_logs_how_many_page_shaped_nodes_it_left_recorded() {
     let logs = super::support::captured_logs();
     assert!(logs.contains("flagged=2"), "{logs}");
     assert!(logs.contains("stubs=1"), "{logs}");
+}
+
+fn legacy_node(id: &str, label: &str, subject: Option<&str>) -> LogEvent {
+    let mut row = node(id, "text");
+    row.label = label.into();
+    row.subject = subject.map(String::from);
+    event(
+        &format!("event-{id}"),
+        node_row_hash(&row),
+        LogPayload::NodeWrite(row),
+    )
+}
+
+fn legacy_mentions(id: &str, src: &str, dst: &str) -> LogEvent {
+    let mut row: EdgeRow = edge(id, src, dst);
+    row.edge_type = MENTIONS.into();
+    event(
+        &format!("event-{id}"),
+        edge_row_hash(&row),
+        LogPayload::EdgeWrite(row),
+    )
+}
+
+#[tokio::test]
+async fn nodes_from_events_without_a_derivation_are_classified_once_the_replay_is_in() {
+    // Arrange: events as an older build wrote them, with the mentions edges after the nodes
+    let env = Env::new();
+    env.append(&[
+        legacy_node("fact", "note", None),
+        legacy_node("page", " Ada ", Some("ada")),
+        legacy_node("user", "Shout", Some("quiet")),
+        legacy_mentions("m-page", "page", "fact"),
+        legacy_mentions("m-user", "user", "fact"),
+    ]);
+    let fresh = reopen_logged(&env, "fresh.db").await;
+
+    // Act
+    let report = fresh.catch_up().await.unwrap();
+
+    // Assert
+    let derivation = |id: &str| {
+        let id = NodeId::from_raw(id);
+        let fresh = &fresh;
+        async move { derivation_of(fresh, &id).await }
+    };
+    assert_eq!(derivation("page").await, Derivation::Inferred);
+    assert_eq!(derivation("user").await, Derivation::Recorded);
+    assert_eq!(derivation("fact").await, Derivation::Recorded);
+    assert_eq!(report.pages_marked, 1);
+}
+
+#[tokio::test]
+async fn a_second_replay_of_the_same_log_marks_nothing_again() {
+    // Arrange
+    let env = Env::new();
+    env.append(&[
+        legacy_node("fact", "note", None),
+        legacy_node("page", "Ada", Some("ada")),
+        legacy_mentions("m-page", "page", "fact"),
+    ]);
+    let fresh = reopen_logged(&env, "fresh.db").await;
+    fresh.catch_up().await.unwrap();
+
+    // Act
+    let again = fresh.catch_up().await.unwrap();
+
+    // Assert
+    assert_eq!(again.pages_marked, 0);
+    assert_eq!(
+        derivation_of(&fresh, &NodeId::from_raw("page")).await,
+        Derivation::Inferred
+    );
+}
+
+#[tokio::test]
+async fn a_logged_derivation_that_names_no_derivation_is_quarantined() {
+    // Arrange
+    let env = Env::new();
+    let mut row = node("odd", "text");
+    row.derivation = Some("guessed".into());
+    env.append(&[event(
+        "event-odd",
+        node_row_hash(&row),
+        LogPayload::NodeWrite(row),
+    )]);
+    let fresh = reopen_logged(&env, "fresh.db").await;
+
+    // Act
+    let report = fresh.catch_up().await.unwrap();
+
+    // Assert
+    assert_eq!(report.quarantined, 1);
+    assert!(!super::support::has_node(&fresh, "odd").await);
 }

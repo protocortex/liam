@@ -8,9 +8,16 @@
 
 use serde::{Deserialize, Serialize};
 
+mod legacy;
+
+use legacy::{LegacyEvent, LegacyPayload};
+
 /// Schema version this build writes and the newest it can read. Version 2 adds
-/// the fact payloads, which an older build cannot replay.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+/// the fact payloads, which an older build cannot replay. Version 3 adds the
+/// derivation and basis of a node row, which changes its layout, so frames of
+/// older versions are read through [`legacy`] and come back stamped with this
+/// version.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Why an encoded event could not be turned back into a [`LogEvent`].
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -27,6 +34,18 @@ pub enum EventError {
     /// A complete event was decoded and bytes were left over, so the frame is corrupt.
     #[error("{count} unexpected bytes after the event")]
     TrailingBytes { count: usize },
+    /// The event is stamped with an older version than the layout it would be
+    /// written in, so the frame's prefix would describe the wrong layout.
+    #[error("event is stamped schema version {found}, but this build writes version {current}")]
+    StaleSchemaVersion { found: u32, current: u32 },
+}
+
+/// A log event a node row rests on, as a node's basis lists it. `synthetic` is
+/// set when no log record backs the id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BasisRef {
+    pub event_id: String,
+    pub synthetic: bool,
 }
 
 /// A `nodes` row with every value already resolved.
@@ -49,6 +68,12 @@ pub struct NodeRow {
     pub valid_until: i64,
     pub tx_from: i64,
     pub tx_to: i64,
+    /// How the row's text came about: `recorded`, `extracted` or `inferred`.
+    /// `None` only on a row read from an event written before the field
+    /// existed, whose derivation a replay works out from the rows around it.
+    pub derivation: Option<String>,
+    /// The events a synthesized row rests on, beyond the one that wrote it.
+    pub basis: Vec<BasisRef>,
 }
 
 /// An `edges` row with every value already resolved.
@@ -178,6 +203,12 @@ impl LogEvent {
                 supported: CURRENT_SCHEMA_VERSION,
             });
         }
+        if self.schema_version < CURRENT_SCHEMA_VERSION {
+            return Err(EventError::StaleSchemaVersion {
+                found: self.schema_version,
+                current: CURRENT_SCHEMA_VERSION,
+            });
+        }
         let mut frame = postcard::to_stdvec(&self.schema_version).map_err(EventError::Encode)?;
         frame.extend(postcard::to_stdvec(self).map_err(EventError::Encode)?);
         Ok(frame)
@@ -196,14 +227,30 @@ impl LogEvent {
                 supported: CURRENT_SCHEMA_VERSION,
             });
         }
-        let (mut event, rest) =
-            postcard::take_from_bytes::<LogEvent>(body).map_err(EventError::Decode)?;
+        let (event, rest) = if version < CURRENT_SCHEMA_VERSION {
+            let (legacy, rest) =
+                postcard::take_from_bytes::<LegacyEvent>(body).map_err(EventError::Decode)?;
+            (LogEvent::from(legacy), rest)
+        } else {
+            let (mut event, rest) =
+                postcard::take_from_bytes::<LogEvent>(body).map_err(EventError::Decode)?;
+            event.schema_version = version;
+            (event, rest)
+        };
         if !rest.is_empty() {
             return Err(EventError::TrailingBytes { count: rest.len() });
         }
-        event.schema_version = version;
         Ok(event)
     }
+}
+
+/// Decodes a payload written by a build that stamped `version`, in the layout
+/// of that version, and returns it in the current one.
+pub fn decode_payload(version: u32, bytes: &[u8]) -> Result<LogPayload, postcard::Error> {
+    if version < CURRENT_SCHEMA_VERSION {
+        return postcard::from_bytes::<LegacyPayload>(bytes).map(LogPayload::from);
+    }
+    postcard::from_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -226,6 +273,8 @@ mod tests {
             valid_until: 4_102_444_800_000,
             tx_from: 2_000,
             tx_to: 4_102_444_800_000,
+            derivation: None,
+            basis: Vec::new(),
         }
     }
 
@@ -444,13 +493,22 @@ mod tests {
     }
 
     #[test]
-    fn older_schema_version_round_trips() {
+    fn an_event_stamped_with_an_older_version_is_not_encoded() {
         // Arrange
         let mut event = event_with(LogPayload::NodeWrite(node_row()));
         event.schema_version = CURRENT_SCHEMA_VERSION - 1;
 
-        // Act and Assert
-        assert_round_trips(event);
+        // Act
+        let result = event.encode();
+
+        // Assert
+        assert_eq!(
+            result,
+            Err(EventError::StaleSchemaVersion {
+                found: CURRENT_SCHEMA_VERSION - 1,
+                current: CURRENT_SCHEMA_VERSION,
+            })
+        );
     }
 
     fn versioned(version: u32, body: &[u8]) -> Vec<u8> {
@@ -595,19 +653,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_carried_only_by_the_frame_prefix() {
+    fn the_frame_starts_with_the_current_version_and_the_body_does_not_repeat_it() {
         // Arrange
-        let current = event_with(LogPayload::NodeWrite(node_row()));
-        let mut older = current.clone();
-        older.schema_version = CURRENT_SCHEMA_VERSION - 1;
+        let event = event_with(LogPayload::NodeWrite(node_row()));
+        let prefix = postcard::to_stdvec(&CURRENT_SCHEMA_VERSION).expect("encode version prefix");
+        let body = postcard::to_stdvec(&event).expect("encode body");
 
         // Act
-        let current_bytes = current.encode().expect("encode current");
-        let older_bytes = older.encode().expect("encode older");
+        let encoded = event.encode().expect("encode event");
 
         // Assert
-        assert_eq!(current_bytes[1..], older_bytes[1..]);
-        assert_ne!(current_bytes[0], older_bytes[0]);
+        assert_eq!(encoded, [prefix, body].concat());
     }
 
     #[test]
@@ -643,6 +699,8 @@ mod tests {
             valid_until: i64::MAX,
             tx_from: i64::MIN,
             tx_to: i64::MAX,
+            derivation: None,
+            basis: Vec::new(),
         };
         let edge = EdgeRow {
             id: String::new(),
@@ -704,8 +762,8 @@ mod tests {
     }
 
     #[test]
-    fn v1_wire_format_is_pinned() {
-        // Arrange: one fixed event per version 1 payload variant, in declaration order.
+    fn v1_frames_are_still_read() {
+        // Arrange: one fixed frame per version 1 payload variant, in declaration order.
         let golden = [
             (LogPayload::NodeWrite(node_row()), "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f0000066e6f64652d310466616374056c6162656c07636f6e74656e74076167656e742d61027b7d010670726f6a2f6100000000000000e83fd00f0180e09ecce5ee01a01f80e09ecce5ee01"),
             (LogPayload::EdgeWrite(edge_row()), "01076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f000106656467652d31066e6f64652d31066e6f64652d320a72656c617465735f746f027b7da01f80e09ecce5ee01"),
@@ -735,16 +793,14 @@ mod tests {
         ];
 
         for (payload, hex) in golden {
-            let mut event = event_with(payload);
-            event.schema_version = 1;
-            let expected_bytes = from_hex(hex);
+            let event = event_with(payload);
+            let frame = from_hex(hex);
 
             // Act
-            let encoded = event.encode().expect("encode event");
-            let decoded = LogEvent::decode(&expected_bytes);
+            let decoded = LogEvent::decode(&frame);
 
-            // Assert
-            assert_eq!(encoded, expected_bytes, "encoding drifted for {event:?}");
+            // Assert: a version 1 frame reads back in the current layout, with
+            // no derivation on its rows, and is stamped with the current version.
             assert_eq!(decoded, Ok(event));
         }
     }
@@ -764,15 +820,81 @@ mod tests {
 
         for (payload, hex) in golden {
             let event = event_with(payload);
-            let expected_bytes = from_hex(hex);
+            let frame = from_hex(hex);
 
             // Act
-            let encoded = event.encode().expect("encode event");
-            let decoded = LogEvent::decode(&expected_bytes);
+            let decoded = LogEvent::decode(&frame);
 
             // Assert
-            assert_eq!(encoded, expected_bytes, "encoding drifted for {event:?}");
             assert_eq!(decoded, Ok(event));
         }
+    }
+
+    #[test]
+    fn a_payload_is_read_in_the_layout_of_its_version() {
+        // Arrange
+        let legacy = LegacyPayload::EpisodeBatch(vec![legacy::LegacyRowEffect::Node(
+            legacy::LegacyNodeRow {
+                id: "node-1".into(),
+                kind: "fact".into(),
+                label: "label".into(),
+                content: "content".into(),
+                producer: "agent-a".into(),
+                attributes: "{}".into(),
+                scope: None,
+                subject: Some("label".into()),
+                confidence: 1.0,
+                valid_from: 1,
+                valid_from_supplied: false,
+                valid_until: 2,
+                tx_from: 3,
+                tx_to: 4,
+            },
+        )]);
+        let older = postcard::to_stdvec(&legacy).expect("encode legacy payload");
+        let current = LogPayload::NodeWrite(node_row());
+        let newer = postcard::to_stdvec(&current).expect("encode payload");
+
+        // Act
+        let from_older = decode_payload(CURRENT_SCHEMA_VERSION - 1, &older);
+        let from_current = decode_payload(CURRENT_SCHEMA_VERSION, &newer);
+
+        // Assert
+        let Ok(LogPayload::EpisodeBatch(effects)) = from_older else {
+            panic!("expected an episode batch, got {from_older:?}");
+        };
+        let [RowEffect::Node(row)] = effects.as_slice() else {
+            panic!("expected one node, got {effects:?}");
+        };
+        assert_eq!((row.id.as_str(), row.derivation.clone()), ("node-1", None));
+        assert!(row.basis.is_empty());
+        assert_eq!(from_current, Ok(current));
+    }
+
+    #[test]
+    fn v3_node_rows_wire_format_is_pinned() {
+        // Arrange
+        let mut inferred = node_row();
+        inferred.derivation = Some("inferred".into());
+        inferred.basis = vec![
+            BasisRef {
+                event_id: "event-7".into(),
+                synthetic: false,
+            },
+            BasisRef {
+                event_id: "event-8".into(),
+                synthetic: true,
+            },
+        ];
+        let event = event_with(LogPayload::NodeWrite(inferred));
+        let golden = from_hex("03076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f0000066e6f64652d310466616374056c6162656c07636f6e74656e74076167656e742d61027b7d010670726f6a2f6100000000000000e83fd00f0180e09ecce5ee01a01f80e09ecce5ee010108696e66657272656402076576656e742d3700076576656e742d3801");
+
+        // Act
+        let encoded = event.encode().expect("encode event");
+        let decoded = LogEvent::decode(&golden);
+
+        // Assert
+        assert_eq!(encoded, golden, "encoding drifted for {event:?}");
+        assert_eq!(decoded, Ok(event));
     }
 }
