@@ -36,6 +36,14 @@ impl ScriptedLlm {
         }
     }
 
+    /// Each call takes the next outcome, an error text for a failed call.
+    pub fn scripted(outcomes: Vec<std::result::Result<String, String>>) -> Self {
+        Self {
+            replies: Mutex::new(outcomes.into()),
+            ..Self::default()
+        }
+    }
+
     /// Counts tokens as characters, so a test can size a budget exactly.
     pub fn counting_chars(mut self) -> Self {
         self.count_chars = true;

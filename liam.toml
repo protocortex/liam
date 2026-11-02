@@ -43,6 +43,25 @@ dedup_similarity_threshold = 0.95   # cosine similarity at or above which two no
 probe_count                = 20     # most probes drawn from the store to gate a run
 # snapshot_dir             = "~/.liam/liam.snapshots"   # default: <database stem>.snapshots beside the database
 
+# Summaries of clusters of recorded nodes, built level by level by the
+# consolidation job. Off until enabled. Needs a real llm provider, not the mock.
+[summary]
+enabled                 = false   # false makes the whole hook a no-op
+knn                     = 8       # nearest neighbours considered for each item
+min_similarity          = 0.5     # least cosine similarity at which two items are linked
+time_window_hours       = 720     # items further apart than this are not linked
+min_cluster_size        = 3       # fewest members of a cluster that gets a summary
+max_cluster_size        = 30      # a larger cluster is split
+max_depth               = 3       # levels of summaries above the nodes, at most 3
+recluster_change_ratio  = 0.2     # share of a level that may change before it is clustered again
+recluster_interval_days = 7       # age of the last full build after which a level is clustered again
+min_attach_similarity   = 0.6     # least similarity to a cluster's centroid for a new item to join it
+max_unattached          = 20      # new items that may wait unattached before a level is clustered again
+max_summaries_per_run   = 20      # most summaries one run generates
+run_deadline_secs       = 600     # bounds the generation of one run
+min_grounded_share      = 0.5     # least share of a summary's content words its items must hold
+max_summary_failures    = 3       # failures of one child set after which it is skipped
+
 [embedder]
 provider  = "mock"                       # "mock" (dev) or "local" (in-process)
 model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"

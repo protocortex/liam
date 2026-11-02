@@ -328,8 +328,9 @@ impl Consolidator {
             }
             SUMMARIZE => {
                 let configured = self.parts.hooks.summary.is_some();
-                let result = self.parts.hooks.summarize(&SummaryCtx { source }).await;
-                self.note_hook(step, configured, result.map(|_| false), manifest)?;
+                let ctx = SummaryCtx { store, source };
+                let result = self.parts.hooks.summarize(&ctx).await;
+                self.note_hook(step, configured, result.map(|r| r.partial()), manifest)?;
             }
             TIER => {
                 let configured = self.parts.hooks.tiering.is_some();

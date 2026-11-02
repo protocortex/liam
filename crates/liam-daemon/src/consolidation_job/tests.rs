@@ -810,3 +810,4 @@ async fn the_maintenance_step_is_done_when_the_daemon_keeps_running() {
 }
 
 mod extraction;
+mod summary;

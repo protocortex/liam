@@ -6,9 +6,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use liam_daemon::config::Config;
-use liam_daemon::consolidation::hooks::ConsolidationHookSet;
+use liam_daemon::consolidation::hooks::{ConsolidationHookSet, ExtractionHook, SummaryHook};
 use liam_daemon::consolidation::manifest::RunOutcome;
 use liam_daemon::consolidation::run::{
     Consolidator, Maintenance, Parts, ProbeRunner, StoreProbes, StoreReopener,
@@ -21,9 +22,12 @@ use liam_model::Embedder;
 use liam_store::{DefaultGraph, RetentionPolicy, SharedLog};
 use tokio_util::sync::CancellationToken;
 
+use crate::extraction::client::ModelIdentity;
 use crate::extraction::setup::{self as extraction_setup, sweep_stale_sidecar, DaemonFiles};
 use crate::mcp::MemoryServer;
 use crate::shutdown::Shutdown;
+use crate::summary::file_cache::{summary_cache_path, FileSummaryCache};
+use crate::summary::hooks::SummaryHooks;
 use crate::{maintenance_steps, Resynthesis};
 
 /// Runs the tick's steps over the store the run guards, stamping every log
@@ -66,14 +70,22 @@ pub struct JobSetup<'a> {
     pub shutdown: &'a Shutdown,
 }
 
-/// The hook parts a run calls: extraction when the config turns it on. A model
-/// server an earlier daemon left behind is cleared first, whether extraction is
-/// on or off, when the server's path is configured.
+/// The hook parts a run calls: extraction and summaries, each when the config
+/// turns it on. A model server an earlier daemon left behind is cleared first,
+/// whether extraction is on or off, when the server's path is configured.
 fn hooks_for(setup: &JobSetup<'_>) -> anyhow::Result<ConsolidationHookSet> {
+    sweep_stale_sidecar(&setup.config.extraction, setup.database_path);
+    Ok(ConsolidationHookSet {
+        extraction: extraction_hook(setup)?,
+        summary: summary_hook(setup)?,
+        ..Default::default()
+    })
+}
+
+fn extraction_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn ExtractionHook>>> {
     let config = &setup.config.extraction;
-    sweep_stale_sidecar(config, setup.database_path);
     if !config.enabled {
-        return Ok(ConsolidationHookSet::default());
+        return Ok(None);
     }
     let files = DaemonFiles {
         database_path: setup.database_path,
@@ -81,11 +93,31 @@ fn hooks_for(setup: &JobSetup<'_>) -> anyhow::Result<ConsolidationHookSet> {
         permits: setup.server.generation_permits_handle(),
         stopping: setup.shutdown.token(),
     };
-    let extraction = extraction_setup::build(config, files)?;
-    Ok(ConsolidationHookSet {
-        extraction: Some(Arc::new(extraction)),
-        ..Default::default()
-    })
+    Ok(Some(Arc::new(extraction_setup::build(config, files)?)))
+}
+
+fn summary_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn SummaryHook>>> {
+    let config = &setup.config.summary;
+    if !config.enabled {
+        return Ok(None);
+    }
+    let llm = &setup.config.llm;
+    // The in-process model is named by its repository and file, and not hashed.
+    let identity = ModelIdentity {
+        model_id: format!("{}:{}/{}", llm.provider, llm.model, llm.gguf_file),
+        model_sha256: String::new(),
+    };
+    let cache = FileSummaryCache::open(summary_cache_path(setup.database_path), identity.clone())
+        .context("could not open the summary cache")?;
+    Ok(Some(Arc::new(SummaryHooks {
+        config: config.clone(),
+        llm: setup.server.llm_handle(),
+        permits: setup.server.generation_permits_handle(),
+        cache: Arc::new(cache),
+        embedder: Arc::new(StoreEmbedder(setup.embedder.clone())),
+        identity,
+        context_tokens: llm.context_tokens,
+    })))
 }
 
 /// The consolidation job as the daemon runs it, on a schedule and at start.
