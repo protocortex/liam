@@ -25,7 +25,7 @@ use super::{
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
-use crate::types::{relation, Derivation, EpisodeEdge, EventRef, EventRole, NewNode};
+use crate::types::{relation, EpisodeEdge, NewNode};
 use crate::value::Value;
 
 /// Source and trust of a record no producer wrote, such as an edge.
@@ -110,23 +110,6 @@ impl Table {
     }
 }
 
-/// What a write stores about a node beyond the row it logs.
-struct Annotation {
-    id: String,
-    derivation: Derivation,
-    basis: Vec<EventRef>,
-}
-
-impl Annotation {
-    fn of(id: &NodeId, node: &NewNode) -> Self {
-        Self {
-            id: id.as_str().to_string(),
-            derivation: node.derivation,
-            basis: node.basis.clone(),
-        }
-    }
-}
-
 /// How a write is checked against the live carrier of its content.
 pub(super) struct Dedup {
     /// Where a live carrier of the event's content hash makes the write a
@@ -153,29 +136,6 @@ impl Plan {
             steps,
             dedup: None,
         }
-    }
-
-    /// Adds what the logged row does not carry about the node it writes: a
-    /// derivation other than the column default, and its basis events.
-    fn annotated(mut self, extra: Annotation) -> Self {
-        let Annotation {
-            id,
-            derivation,
-            basis,
-        } = extra;
-        if derivation != Derivation::Recorded {
-            self.steps.push(Step::Derivation {
-                id: id.clone(),
-                derivation,
-            });
-        }
-        self.steps
-            .extend(basis.into_iter().map(|event| Step::NodeEvent {
-                node_id: id.clone(),
-                event,
-                role: EventRole::Basis,
-            }));
-        self
     }
 
     fn deduplicated(mut self, table: Table, refusal_if_absent: Option<Error>) -> Self {
@@ -471,7 +431,6 @@ fn differing_attributes(stored: &str, given: &str) -> Vec<String> {
 struct EpisodeNode {
     row: NodeRow,
     collision: Option<Collision>,
-    annotation: Annotation,
 }
 
 /// An `ingest_episode`. Nothing is written yet, so a node that replaces an
@@ -483,16 +442,11 @@ async fn plan_episode(
     now: Millis,
 ) -> Result<Plan> {
     let mut effects = Vec::new();
-    let mut annotations = Vec::new();
     for node in nodes {
-        annotations.push(node.annotation);
         stage_node(tx, &mut effects, node.row, node.collision, now).await?;
     }
     effects.extend(edges.into_iter().map(RowEffect::Edge));
-    let plan = Plan::episode(effects, now);
-    Ok(annotations
-        .into_iter()
-        .fold(plan, |plan, extra| plan.annotated(extra)))
+    Ok(Plan::episode(effects, now))
 }
 
 async fn stage_node(
@@ -549,9 +503,7 @@ impl<B: Backend> Graph<B> {
         let outcome = self
             .project(|_, now| {
                 let row = resolve_node_row(id, node, now);
-                let plan =
-                    row.map(|row| Plan::node_write(row, now).annotated(Annotation::of(id, node)));
-                ready(plan)
+                ready(row.map(|row| Plan::node_write(row, now)))
             })
             .await?;
         Ok(outcome.node_id(id))
@@ -566,11 +518,7 @@ impl<B: Backend> Graph<B> {
         let outcome = self
             .project(|tx, now| {
                 let row = resolve_node_row(&id, node, now);
-                let extra = Annotation::of(&id, node);
-                Box::pin(async move {
-                    let plan = plan_upsert(tx, row?, collision, now).await?;
-                    Ok(plan.annotated(extra))
-                })
+                Box::pin(async move { plan_upsert(tx, row?, collision, now).await })
             })
             .await?;
         Ok(outcome.node_id(&id))
@@ -582,11 +530,7 @@ impl<B: Backend> Graph<B> {
             .project(|tx, now| {
                 let row = resolve_node_row(&id, node, now);
                 let old = old.clone();
-                let extra = Annotation::of(&id, node);
-                Box::pin(async move {
-                    let plan = plan_supersede(tx, row?, &old, now).await?;
-                    Ok(plan.annotated(extra))
-                })
+                Box::pin(async move { plan_supersede(tx, row?, &old, now).await })
             })
             .await?;
         Ok(outcome.node_id(&id))
@@ -684,7 +628,6 @@ fn episode_nodes(ids: &[NodeId], nodes: &[NewNode], now: Millis) -> Result<Vec<E
             Ok(EpisodeNode {
                 row: resolve_node_row(id, node, now)?,
                 collision: Collision::of(node),
-                annotation: Annotation::of(id, node),
             })
         })
         .collect()

@@ -15,6 +15,8 @@
 //! `ensure_cascade` handles a CONSTRAINT, which `ALTER TABLE` cannot change at
 //! all, so it rebuilds the table.
 
+use std::collections::HashSet;
+
 use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::ids::Millis;
@@ -269,14 +271,8 @@ pub(crate) async fn backfill_derivation<B: Backend>(backend: &B, now: Millis) ->
     if !done.is_empty() {
         return Ok(0);
     }
-    let flagged = mark_inferred_pages(backend).await?;
-    backend
-        .execute(
-            "INSERT OR IGNORE INTO derivation_backfill_state (id, completed_at, flagged)
-             VALUES (1, ?1, ?2)",
-            &[now.into(), Value::Int(flagged as i64)],
-        )
-        .await?;
+    let flagged = mark_inferred_pages(backend, None).await?;
+    record_derivation_backfill(backend, now, flagged).await?;
     tracing::info!(flagged, "derivation backfill: entity pages marked inferred");
     let stubs = unlinked_stubs(backend).await?;
     tracing::info!(
@@ -286,9 +282,24 @@ pub(crate) async fn backfill_derivation<B: Backend>(backend: &B, now: Millis) ->
     Ok(flagged)
 }
 
-/// The rule behind the backfill, with no gate, for a replay too: the log does
-/// not carry a derivation yet, so pages a replay writes arrive `recorded`. A
-/// page is a node that is the source of any `mentions` edge, live or closed,
+/// Records that the derivation pass ran, so the open-time pass does not run
+/// again, and how many rows it marked.
+pub(crate) async fn record_derivation_backfill<B: Backend>(
+    backend: &B,
+    now: Millis,
+    flagged: u64,
+) -> Result<()> {
+    backend
+        .execute(
+            "INSERT OR IGNORE INTO derivation_backfill_state (id, completed_at, flagged)
+             VALUES (1, ?1, ?2)",
+            &[now.into(), Value::Int(flagged as i64)],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The rule behind the backfill, with no gate: a page is a node that is the source of any `mentions` edge, live or closed,
 /// whose subject is its trimmed, lowercased label, which is what
 /// `NewNode::entity` stores. The edge alone is not enough, because `relate`
 /// accepts a `mentions` edge from any node.
@@ -297,7 +308,14 @@ pub(crate) async fn backfill_derivation<B: Backend>(backend: &B, now: Millis) ->
 /// constructor lowercases with Unicode rules. Only rows still `recorded` are
 /// touched, so a rerun, or a race with another process, changes nothing. The
 /// writes are one statement per `BACKFILL_CHUNK` ids.
-pub(crate) async fn mark_inferred_pages<B: Backend>(backend: &B) -> Result<u64> {
+///
+/// `only` limits the pass to those node ids, as a replay does for the nodes of
+/// events that carry no derivation; a node written with one is never touched.
+pub(crate) async fn mark_inferred_pages<B: Backend>(
+    backend: &B,
+    only: Option<&[String]>,
+) -> Result<u64> {
+    let allowed: Option<HashSet<&str>> = only.map(|ids| ids.iter().map(String::as_str).collect());
     let candidates = backend
         .query(
             "SELECT n.id, n.label, n.subject FROM nodes n
@@ -312,8 +330,10 @@ pub(crate) async fn mark_inferred_pages<B: Backend>(backend: &B) -> Result<u64> 
         .await?;
     let mut pages = Vec::new();
     for row in &candidates {
-        if subject_is_label(&row.get_string(2)?, &row.get_string(1)?) {
-            pages.push(row.get_string(0)?);
+        let id = row.get_string(0)?;
+        let wanted = allowed.as_ref().is_none_or(|ids| ids.contains(id.as_str()));
+        if wanted && subject_is_label(&row.get_string(2)?, &row.get_string(1)?) {
+            pages.push(id);
         }
     }
     let mut flagged = 0;

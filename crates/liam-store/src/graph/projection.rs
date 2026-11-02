@@ -3,6 +3,8 @@
 //! its log record build them from the same payload through `steps_for`, so the
 //! two cannot drift apart.
 
+use std::iter;
+
 use liam_log::event::{EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTarget};
 
 use super::backfill::BACKFILL_SOURCE;
@@ -14,7 +16,7 @@ use super::{
 use crate::backend::BackendTx;
 use crate::error::{Error, Result};
 use crate::ids::{NodeId, FOREVER};
-use crate::types::{relation, Derivation, EventRef, EventRole};
+use crate::types::{relation, EventRef, EventRole};
 use crate::value::Value;
 
 /// One statement of a projection, in the order it runs.
@@ -25,13 +27,6 @@ pub(super) enum Step {
         tx_to: i64,
     },
     Node(NodeRow),
-    /// Sets a written node's derivation. A live write adds it after `Node`
-    /// because the logged row does not carry one yet; `steps_for` never yields
-    /// it, so a replay leaves the column default.
-    Derivation {
-        id: String,
-        derivation: Derivation,
-    },
     /// Lists a log event beside a node. Listing it twice changes nothing, so a
     /// replay can run it again.
     NodeEvent {
@@ -52,12 +47,12 @@ pub(super) enum Step {
 /// `dst` at the edge's `tx_from`, so a payload never carries the close itself.
 pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
     match payload {
-        LogPayload::NodeWrite(row) => vec![Step::Node(row.clone())],
+        LogPayload::NodeWrite(row) => node_steps(row),
         LogPayload::EdgeWrite(row) => edge_steps(row),
         LogPayload::EpisodeBatch(effects) => effects
             .iter()
             .flat_map(|effect| match effect {
-                RowEffect::Node(row) => vec![Step::Node(row.clone())],
+                RowEffect::Node(row) => node_steps(row),
                 RowEffect::Edge(row) => edge_steps(row),
             })
             .collect(),
@@ -67,6 +62,19 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
         | LogPayload::Voided { .. }
         | LogPayload::RunRolledBack { .. } => Vec::new(),
     }
+}
+
+/// A node row and the basis events it lists, which a replay restores with it.
+fn node_steps(row: &NodeRow) -> Vec<Step> {
+    let basis = row.basis.iter().map(|event| Step::NodeEvent {
+        node_id: row.id.clone(),
+        event: EventRef {
+            event_id: event.event_id.clone(),
+            synthetic: event.synthetic,
+        },
+        role: EventRole::Basis,
+    });
+    iter::once(Step::Node(row.clone())).chain(basis).collect()
 }
 
 /// The origin of every node `steps` writes: `event`, which is synthetic when
@@ -149,15 +157,8 @@ pub(super) async fn apply_steps(
                 }
             }
             Step::Node(row) => {
-                let (sql, params) = node_row_insert(row);
+                let (sql, params) = node_row_insert(row)?;
                 tx.execute(&sql, &params).await?;
-            }
-            Step::Derivation { id, derivation } => {
-                tx.execute(
-                    "UPDATE nodes SET derivation = ?1 WHERE id = ?2",
-                    &[derivation.as_str().into(), id.as_str().into()],
-                )
-                .await?;
             }
             Step::NodeEvent {
                 node_id,

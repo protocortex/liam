@@ -236,6 +236,8 @@ async fn node_hashes<B: Backend>(g: &Graph<B>, filter: &str) -> Vec<[u8; 32]> {
                 valid_until: row.get_i64(10).unwrap(),
                 tx_from: row.get_i64(11).unwrap(),
                 tx_to: row.get_i64(12).unwrap(),
+                derivation: None,
+                basis: Vec::new(),
             })
         })
         .collect()

@@ -28,7 +28,7 @@ use parquet::file::properties::WriterProperties;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::event::{LogEvent, LogPayload, CURRENT_SCHEMA_VERSION};
+use crate::event::{decode_payload, LogEvent, CURRENT_SCHEMA_VERSION};
 use crate::wal::{
     read_segment, segment_paths, segment_sequence, sequence_stem, sync_dir, sync_dir_for,
     SegmentSink, WalError, PARQUET_EXTENSION, SEGMENT_EXTENSION,
@@ -207,8 +207,8 @@ pub(crate) fn batch_to_events(batch: &RecordBatch) -> Result<Vec<LogEvent>, Comp
                 .value(row)
                 .try_into()
                 .map_err(|_| CompactError::HashLength { row })?;
-            let payload: LogPayload =
-                postcard::from_bytes(payloads.value(row)).map_err(CompactError::Payload)?;
+            let payload = decode_payload(schema_version, payloads.value(row))
+                .map_err(CompactError::Payload)?;
             Ok(LogEvent {
                 event_id: event_ids.value(row).to_owned(),
                 content_hash,
@@ -217,7 +217,8 @@ pub(crate) fn batch_to_events(batch: &RecordBatch) -> Result<Vec<LogEvent>, Comp
                 observed_at: observed_at.value(row),
                 ingested_at: ingested_at.value(row),
                 encryption_key_id: key_ids.is_valid(row).then(|| key_ids.value(row).to_owned()),
-                schema_version,
+                // An older payload comes back in the current layout.
+                schema_version: CURRENT_SCHEMA_VERSION,
                 payload,
             })
         })
@@ -742,6 +743,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::event::LogPayload;
     use crate::event::{RowEffect, TombstoneTable, TombstoneTarget};
     use crate::fixtures::{
         edge_row, event, frame_len, log_event, node_row, parquet_path, sample_hash, snapshot,
@@ -846,6 +848,29 @@ mod tests {
             .put(&object_path(sequence), PutPayload::from(bytes))
             .await
             .expect("put parquet bytes");
+    }
+
+    #[test]
+    fn a_row_of_an_older_schema_version_is_read_in_its_own_layout() {
+        // Arrange: the payload an earlier build stored, which lacks the two
+        // trailing fields of a node row (an unset derivation and no basis)
+        let original = log_event("old", LogPayload::NodeWrite(node_row("node-old", "text")));
+        let batch = events_to_batch(std::slice::from_ref(&original)).expect("batch");
+        let mut payload = postcard::to_stdvec(&original.payload).expect("encode payload");
+        payload.truncate(payload.len() - 2);
+        let mut columns = batch.columns().to_vec();
+        let older = CURRENT_SCHEMA_VERSION - 1;
+        let position = |name: &str| batch.schema().index_of(name).expect("column");
+        columns[position(column::SCHEMA_VERSION)] = Arc::new(UInt32Array::from(vec![older]));
+        columns[position(column::PAYLOAD)] =
+            Arc::new(LargeBinaryArray::from_iter_values([payload.as_slice()]));
+        let old_batch = RecordBatch::try_new(batch.schema(), columns).expect("older batch");
+
+        // Act
+        let events = batch_to_events(&old_batch).expect("read older rows");
+
+        // Assert: it reads back as the current layout, stamped with the current version
+        assert_same_events(&events, &[original]);
     }
 
     #[test]

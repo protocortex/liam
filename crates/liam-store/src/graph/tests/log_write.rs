@@ -272,6 +272,8 @@ async fn stored_row<B: Backend>(g: &Graph<B>, id: &NodeId, valid_from_supplied: 
         valid_until: row.get_i64(10).unwrap(),
         tx_from: row.get_i64(11).unwrap(),
         tx_to: row.get_i64(12).unwrap(),
+        derivation: Some("recorded".into()),
+        basis: Vec::new(),
     }
 }
 

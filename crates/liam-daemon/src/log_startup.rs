@@ -302,6 +302,8 @@ pub(crate) mod test_support {
             valid_until: FOREVER.0,
             tx_from: 1000,
             tx_to: FOREVER.0,
+            derivation: None,
+            basis: Vec::new(),
         };
         let event = LogEvent {
             event_id: format!("event-{id}"),

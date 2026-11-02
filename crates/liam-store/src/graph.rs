@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use liam_log::event::NodeRow;
+use liam_log::event::{BasisRef, NodeRow};
 use liam_log::LogOffset;
 
 pub use self::backfill::BackfillReport;
@@ -417,14 +417,31 @@ fn resolve_node_row(id: &NodeId, node: &NewNode, now: Millis) -> Result<NodeRow>
         valid_until: FOREVER.0,
         tx_from: now.0,
         tx_to: FOREVER.0,
+        derivation: Some(node.derivation.as_str().to_string()),
+        basis: node
+            .basis
+            .iter()
+            .map(|event| BasisRef {
+                event_id: event.event_id.clone(),
+                synthetic: event.synthetic,
+            })
+            .collect(),
     })
 }
 
-fn node_row_insert(row: &NodeRow) -> (String, Vec<Value>) {
+/// The statement that stores `row`. A row from an event written before
+/// derivations were logged is stored `recorded`, and a replay then works out
+/// which of those were pages. A derivation that is none of the three is an
+/// error, so a bad value never reaches a column that reads back as a type.
+fn node_row_insert(row: &NodeRow) -> Result<(String, Vec<Value>)> {
+    let derivation = match &row.derivation {
+        Some(text) => Derivation::parse(text)?,
+        None => Derivation::Recorded,
+    };
     let sql = "INSERT INTO nodes
          (id, kind, label, content, producer, attributes, scope, subject, confidence,
-          valid_from, valid_until, tx_from, tx_to)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+          valid_from, valid_until, tx_from, tx_to, derivation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
         .to_string();
     let params = vec![
         row.id.clone().into(),
@@ -440,8 +457,9 @@ fn node_row_insert(row: &NodeRow) -> (String, Vec<Value>) {
         row.valid_until.into(),
         row.tx_from.into(),
         row.tx_to.into(),
+        derivation.as_str().into(),
     ];
-    (sql, params)
+    Ok((sql, params))
 }
 
 fn decay_factor(valid_from: Millis, now: Millis, half_life: Option<Millis>) -> f64 {

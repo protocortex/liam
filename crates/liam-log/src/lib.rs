@@ -360,6 +360,8 @@ pub(crate) mod fixtures {
             valid_until: FOREVER,
             tx_from: 2_000,
             tx_to: FOREVER,
+            derivation: None,
+            basis: Vec::new(),
         }
     }
 
