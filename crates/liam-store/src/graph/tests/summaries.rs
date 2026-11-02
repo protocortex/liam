@@ -647,6 +647,22 @@ async fn failures_count_up_and_start_again_under_a_new_prompt_or_model() {
 }
 
 #[tokio::test]
+async fn a_dissolving_summary_counts_its_runs_until_it_is_forgotten() {
+    // Arrange
+    let g = open().await;
+
+    // Act
+    let first = g.note_dissolving("s1").await.unwrap();
+    let second = g.note_dissolving("s1").await.unwrap();
+    let other = g.note_dissolving("s2").await.unwrap();
+    g.forget_dissolving("s1").await.unwrap();
+    let again = g.note_dissolving("s1").await.unwrap();
+
+    // Assert
+    assert_eq!((first, second, other, again), (1, 2, 1, 1));
+}
+
+#[tokio::test]
 async fn tree_state_is_stored_per_scope_and_level_and_overwritten() {
     // Arrange
     let g = open().await;

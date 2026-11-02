@@ -8,9 +8,6 @@ use liam_store::{Basis, EventRef, Retrieved};
 
 use crate::ask::fmt_millis;
 
-/// Event ids shown on one provenance line before the rest are counted.
-pub const MAX_PROVENANCE_IDS: usize = 8;
-
 /// The derivation a variant stands for.
 pub fn derivation_label(retrieved: &Retrieved) -> &'static str {
     match retrieved {
@@ -42,13 +39,15 @@ fn with_known_since(head: String, known_since_ms: Option<i64>) -> String {
 /// `provenance: derivation: recorded; events: a, b` for a recorded row, and
 /// `provenance: derivation: inferred; basis: a, b` (or `basis: unknown`, plus
 /// `summary: <level>`) for an inferred one.
-pub fn provenance_line(retrieved: &Retrieved) -> String {
+pub fn provenance_line(retrieved: &Retrieved, max_ids: usize) -> String {
     let mut parts = vec![format!("derivation: {}", derivation_label(retrieved))];
     match retrieved {
-        Retrieved::Recorded(hit) => parts.push(format!("events: {}", event_list(&hit.events))),
+        Retrieved::Recorded(hit) => {
+            parts.push(format!("events: {}", event_list(&hit.events, max_ids)))
+        }
         Retrieved::Inferred(hit) => {
             parts.push(match &hit.basis {
-                Basis::Known(events) => format!("basis: {}", event_list(events)),
+                Basis::Known(events) => format!("basis: {}", event_list(events, max_ids)),
                 Basis::Unknown => "basis: unknown".to_string(),
             });
             if let Some(level) = hit.summary_level {
@@ -59,20 +58,20 @@ pub fn provenance_line(retrieved: &Retrieved) -> String {
     format!("provenance: {}", parts.join("; "))
 }
 
-/// The ids, `MAX_PROVENANCE_IDS` at most, with the number left out stated.
-fn event_list(events: &[EventRef]) -> String {
+/// The ids, `max_ids` at most, with the number left out stated.
+fn event_list(events: &[EventRef], max_ids: usize) -> String {
     if events.is_empty() {
         return "none".to_string();
     }
     let shown: Vec<String> = events
         .iter()
-        .take(MAX_PROVENANCE_IDS)
+        .take(max_ids)
         .map(|event| match event.synthetic {
             true => format!("{} (synthetic)", event.event_id),
             false => event.event_id.clone(),
         })
         .collect();
-    let left_out = events.len().saturating_sub(MAX_PROVENANCE_IDS);
+    let left_out = events.len().saturating_sub(max_ids);
     match left_out {
         0 => shown.join(", "),
         n => format!("{} (+{n} more)", shown.join(", ")),
@@ -81,10 +80,15 @@ fn event_list(events: &[EventRef]) -> String {
 
 /// An item as a tool prints it: its head, its text, any trailing lines, then
 /// its provenance line.
-pub fn render_item(head: &str, retrieved: &Retrieved, trailing: &[String]) -> String {
+pub fn render_item(
+    head: &str,
+    retrieved: &Retrieved,
+    trailing: &[String],
+    max_ids: usize,
+) -> String {
     let mut lines = vec![head.to_string(), retrieved.as_text().to_string()];
     lines.extend(trailing.iter().cloned());
-    lines.push(provenance_line(retrieved));
+    lines.push(provenance_line(retrieved, max_ids));
     lines.join("\n")
 }
 
@@ -93,6 +97,8 @@ mod tests {
     use liam_store::{Derivation, InferredHit, InferredText, RecordedHit, RecordedText};
 
     use super::*;
+
+    const SHOWN: usize = 8;
 
     fn event(id: &str, synthetic: bool) -> EventRef {
         EventRef {
@@ -142,7 +148,7 @@ mod tests {
 
         for (retrieved, expected) in cases {
             // Act
-            let line = provenance_line(&retrieved);
+            let line = provenance_line(&retrieved, SHOWN);
 
             // Assert
             assert_eq!(line, expected);
@@ -156,11 +162,13 @@ mod tests {
         let retrieved = inferred(Basis::Known(events), None);
 
         // Act
-        let line = provenance_line(&retrieved);
+        let line = provenance_line(&retrieved, SHOWN);
+        let narrow = provenance_line(&retrieved, 2);
 
         // Assert
         assert!(line.contains("e07 (+32 more)"), "{line}");
         assert!(!line.contains("e08"), "{line}");
+        assert!(narrow.ends_with("basis: e00, e01 (+38 more)"), "{narrow}");
     }
 
     #[test]
@@ -170,7 +178,10 @@ mod tests {
         let bare = recorded(Derivation::Recorded, Vec::new());
 
         // Act
-        let (marked, bare) = (provenance_line(&marked), provenance_line(&bare));
+        let (marked, bare) = (
+            provenance_line(&marked, SHOWN),
+            provenance_line(&bare, SHOWN),
+        );
 
         // Assert
         assert!(marked.ends_with("events: e1 (synthetic)"), "{marked}");
@@ -201,6 +212,7 @@ mod tests {
             "[fact h] Role",
             &retrieved,
             &["confidence: 0.50".to_string()],
+            SHOWN,
         );
 
         // Assert

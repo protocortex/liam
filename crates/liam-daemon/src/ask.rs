@@ -177,11 +177,11 @@ pub fn fmt_millis(ms: i64) -> String {
 
 /// Who reads a rendered block. The model sees the derivation of each block, not
 /// its event ids, which would cost prompt budget and mean nothing to it; a
-/// reader sees the full provenance line.
+/// reader sees the full provenance line, with at most `max_ids` event ids.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Audience {
     Model,
-    Reader,
+    Reader { max_ids: usize },
 }
 
 /// Numbered evidence blocks shared by the prompt's user section and the
@@ -205,7 +205,7 @@ fn render_evidence(evidence: &[Evidence], audience: Audience) -> String {
             }
             body.push(match audience {
                 Audience::Model => format!("derivation: {}", derivation_label(&e.retrieved)),
-                Audience::Reader => provenance_line(&e.retrieved),
+                Audience::Reader { max_ids } => provenance_line(&e.retrieved, max_ids),
             });
             format!(
                 "{FENCE_OPEN} {n}>>>\n{}\n{}\n{FENCE_CLOSE} {n}>>>",
@@ -362,10 +362,10 @@ pub fn parse_sufficiency(reply: &str) -> Option<bool> {
 /// Body returned when the pre-pass says the evidence cannot answer the question:
 /// an explicit refusal, then the evidence that was searched, so the caller can
 /// judge for themselves rather than being told only "no".
-pub fn insufficient_answer(evidence: &[Evidence]) -> String {
+pub fn insufficient_answer(evidence: &[Evidence], max_ids: usize) -> String {
     format!(
         "The memory does not contain an answer to that question. Closest evidence found:\n\n{}",
-        render_evidence(evidence, Audience::Reader)
+        render_evidence(evidence, Audience::Reader { max_ids })
     )
 }
 
@@ -412,7 +412,7 @@ pub fn is_grounded(answer: &str, question: &str, evidence: &[Evidence]) -> bool 
 /// The model's answer as an `answer (inferred)` block whose provenance names the
 /// evidence it was built from, followed by a compact `Sources:` index mapping [n]
 /// to `kind/label — known since <date>` and each source's provenance line.
-pub fn format_answer(answer: &str, evidence: &[Evidence]) -> String {
+pub fn format_answer(answer: &str, evidence: &[Evidence], max_ids: usize) -> String {
     let sources = evidence
         .iter()
         .enumerate()
@@ -423,7 +423,7 @@ pub fn format_answer(answer: &str, evidence: &[Evidence]) -> String {
                 e.kind,
                 e.label,
                 fmt_millis(e.valid_from_ms),
-                provenance_line(&e.retrieved)
+                provenance_line(&e.retrieved, max_ids)
             )
         })
         .collect::<Vec<_>>()
@@ -441,10 +441,10 @@ pub fn format_answer(answer: &str, evidence: &[Evidence]) -> String {
 
 /// The reply to a strict `ask`: the recorded evidence as retrieved and nothing
 /// a model wrote.
-pub fn strict_answer(evidence: &[Evidence]) -> String {
+pub fn strict_answer(evidence: &[Evidence], max_ids: usize) -> String {
     format!(
         "(strict mode: recorded evidence only, no generated answer)\n\n{}",
-        render_evidence(evidence, Audience::Reader)
+        render_evidence(evidence, Audience::Reader { max_ids })
     )
 }
 
@@ -456,16 +456,18 @@ pub fn strict_answer(evidence: &[Evidence]) -> String {
 /// `reason` is stated because the failure modes need different operator
 /// responses (raise `ask_timeout_secs`, check the model, distrust the answer),
 /// and a single opaque marker hides which one happened.
-pub fn fallback_answer(reason: &str, evidence: &[Evidence]) -> String {
+pub fn fallback_answer(reason: &str, evidence: &[Evidence], max_ids: usize) -> String {
     format!(
         "(synthesis unavailable: {reason}; showing the retrieved evidence)\n\n{}",
-        render_evidence(evidence, Audience::Reader)
+        render_evidence(evidence, Audience::Reader { max_ids })
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_MAX_IDS: usize = 8;
 
     fn recorded(text: &str) -> liam_store::Retrieved {
         liam_store::Retrieved::Recorded(liam_store::RecordedHit {
@@ -808,7 +810,7 @@ mod tests {
         let items = vec![evidence("fact", "Sky color", "The sky is blue.", 0)];
 
         // Act
-        let out = format_answer("The sky is blue.", &items);
+        let out = format_answer("The sky is blue.", &items, TEST_MAX_IDS);
 
         // Assert
         assert!(out.starts_with("answer (inferred):\nThe sky is blue."));
@@ -934,7 +936,7 @@ mod tests {
         let items = vec![evidence("fact", "Sky color", "The sky is blue.", 0)];
 
         // Act
-        let out = fallback_answer("synthesis timed out", &items);
+        let out = fallback_answer("synthesis timed out", &items, TEST_MAX_IDS);
 
         // Assert: the marker the caller keys on, the reason an operator needs,
         // and the evidence itself.
@@ -1011,7 +1013,7 @@ mod tests {
         let items = vec![evidence("fact", "Sky color", "The sky is blue.", 0)];
 
         // Act
-        let out = insufficient_answer(&items);
+        let out = insufficient_answer(&items, TEST_MAX_IDS);
 
         // Assert
         assert!(

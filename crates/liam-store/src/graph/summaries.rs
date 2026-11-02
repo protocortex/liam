@@ -391,6 +391,36 @@ impl<B: Backend> Graph<B> {
             .transpose()
     }
 
+    /// Counts one more run in which the open summary `id` has stood dissolved
+    /// and not yet been replaced, and returns how many there have been.
+    pub async fn note_dissolving(&self, id: &str) -> Result<u32> {
+        let rows = self
+            .backend
+            .query(
+                "INSERT INTO summary_dissolving (summary_id, runs) VALUES (?1, 1)
+                 ON CONFLICT(summary_id) DO UPDATE SET runs = runs + 1
+                 RETURNING runs",
+                &[id.into()],
+            )
+            .await?;
+        let row = rows.first().ok_or_else(|| {
+            Error::Backend("noting a dissolving summary returned no count".into())
+        })?;
+        u32::try_from(row.get_i64(0)?)
+            .map_err(|_| Error::Backend("summary_dissolving holds a bad count".into()))
+    }
+
+    /// Forgets the wait of `id`, once it is closed or is no longer dissolving.
+    pub async fn forget_dissolving(&self, id: &str) -> Result<()> {
+        self.backend
+            .execute(
+                "DELETE FROM summary_dissolving WHERE summary_id = ?1",
+                &[id.into()],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// The open summaries that have no vector, as `(id, text)`, by id.
     pub(super) async fn summaries_missing_embeddings(&self) -> Result<Vec<(String, String)>> {
         let rows = self
