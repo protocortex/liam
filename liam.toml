@@ -61,6 +61,7 @@ max_summaries_per_run   = 20      # most summaries one run generates
 run_deadline_secs       = 600     # bounds the generation of one run
 min_grounded_share      = 0.5     # least share of a summary's content words its items must hold
 max_summary_failures    = 3       # failures of one child set after which it is skipped
+min_summary_similarity  = 0.5     # least similarity of a question to a summary for ask to use it
 dissolve_grace_runs     = 3       # runs a summary whose cluster is gone waits for a replacement
 dissolve_overlap        = 0.5     # share of its items a stored summary must hold to replace it
 max_basis_ids_rendered  = 8       # event ids a provenance line lists before it counts the rest

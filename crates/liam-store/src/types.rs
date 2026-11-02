@@ -211,6 +211,15 @@ pub struct Summary {
     pub tx_to: Millis,
 }
 
+/// A summary and its vector, as a read that ranks summaries needs them. The
+/// vector is `None` when the summary has none, or one of another width than the
+/// store's, as after an embedder change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SummaryEntry {
+    pub summary: Summary,
+    pub vector: Option<Vec<f32>>,
+}
+
 /// Whether a summary's events cover its children's, and how many of them are
 /// real log events. A closure of synthetic events only proves nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]

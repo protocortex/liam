@@ -38,10 +38,14 @@ const FENCE_CLOSE: &str = "<<<END EVIDENCE";
 
 use liam_store::{Derivation, Retrieved};
 
+/// What a summary is called where evidence is listed.
+const SUMMARY_KIND: &str = "summary";
+
 use crate::render::{derivation_label, evidence_head, provenance_line};
 
 /// An owned, LLM-ready view of one retrieved row. The label fields are
 /// fence-neutralized, and `content()` cuts the typed text to the prompt cap.
+#[derive(Clone)]
 pub struct Evidence {
     pub kind: String,
     pub label: String,
@@ -91,6 +95,20 @@ impl Evidence {
             valid_from_ms: c.valid_from.0,
             confidence: c.confidence,
             attributes,
+        }
+    }
+}
+
+impl Evidence {
+    /// A summary as evidence, known since it was stored.
+    pub fn from_summary(summary: &liam_store::Summary, sources: Vec<liam_store::EventRef>) -> Self {
+        Self {
+            kind: SUMMARY_KIND.to_string(),
+            label: format!("level {}", summary.level),
+            retrieved: crate::summary::as_retrieved(summary, sources),
+            valid_from_ms: summary.tx_from.0,
+            confidence: 1.0,
+            attributes: None,
         }
     }
 }

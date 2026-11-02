@@ -9,6 +9,7 @@
 
 pub mod facts;
 pub mod producer;
+pub mod summaries;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,12 +28,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use self::facts::FactsArgs;
+use self::summaries::SummariesArgs;
 use crate::ask::{
     self, build_ask_prompt, clamp_ask_k, estimate_tokens, fallback_answer, fit_evidence_to_budget,
     format_answer,
 };
 use crate::clusters::{narrow_groups, render_clusters};
-use crate::config::{resolve_vocabulary, ExtractionConfig, DEFAULT_MAX_BASIS_IDS_RENDERED};
+use crate::config::{
+    resolve_vocabulary, ExtractionConfig, DEFAULT_MAX_BASIS_IDS_RENDERED,
+    DEFAULT_MIN_SUMMARY_SIMILARITY,
+};
 use crate::render;
 use crate::synthesis;
 use crate::tuning::{record_and_maybe_evaluate, AimdHandles, RollingWindow};
@@ -483,9 +488,9 @@ pub struct AskArgs {
     /// "now"; a past instant retrieves the version of each subject that was
     /// live then.
     pub as_of: Option<i64>,
-    /// `infer` (the default) may compose the answer from entity pages as well
-    /// as recorded memory and labels what it used. `strict` returns recorded
-    /// evidence only and makes no model call.
+    /// `infer` (the default) may compose the answer from entity pages and
+    /// summaries as well as recorded memory and labels what it used. `strict`
+    /// returns recorded evidence only and makes no model call.
     pub mode: Option<Mode>,
 }
 
@@ -537,6 +542,9 @@ pub struct MemoryServer {
     /// Event ids a provenance line lists before it counts the rest; see
     /// `config::SummaryConfig::max_basis_ids_rendered`.
     max_basis_ids_rendered: usize,
+    /// Least similarity of a question to a summary for `ask` to use it; see
+    /// `config::SummaryConfig::min_summary_similarity`.
+    min_summary_similarity: f32,
     /// Bounds how many `ask` calls may be inside a model call (sufficiency
     /// pre-pass or synthesis) at once; see
     /// `config::LlmConfig::max_concurrent_generations`. A semaphore, not a
@@ -666,6 +674,7 @@ impl MemoryServer {
             ask_sufficiency_check,
             ask_context_tokens,
             max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
+            min_summary_similarity: DEFAULT_MIN_SUMMARY_SIMILARITY,
             generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
             rolling_window: Arc::new(Mutex::new(RollingWindow::new())),
             granted_capacity: Arc::new(AtomicUsize::new(max_concurrent_generations)),
@@ -688,6 +697,12 @@ impl MemoryServer {
     /// Lists at most `max` event ids on a provenance line.
     pub(crate) fn with_max_basis_ids_rendered(mut self, max: usize) -> Self {
         self.max_basis_ids_rendered = max;
+        self
+    }
+
+    /// Uses summaries at least this close to a question in `ask`.
+    pub(crate) fn with_min_summary_similarity(mut self, min: f32) -> Self {
+        self.min_summary_similarity = min;
         self
     }
 
@@ -1398,6 +1413,16 @@ impl MemoryServer {
         facts::read(self, args).await
     }
 
+    #[tool(
+        description = "List the summaries LIAM has written over memory, or show one with what it \
+         was built from. Summaries are inferred: model-written from recorded memory, never \
+         recorded themselves, and each lists the events it rests on. Filter by level, scope or a \
+         query; pass id to see one summary's children."
+    )]
+    pub(crate) async fn summaries(&self, Parameters(args): Parameters<SummariesArgs>) -> String {
+        summaries::read(self, args).await
+    }
+
     /// Acquires one slot from `generation_permits`, racing the shared request
     /// `deadline` rather than a fresh timeout of its own: see the `deadline`
     /// comment in `ask` for why every stage has to share one instant. Returns
@@ -1505,8 +1530,8 @@ impl MemoryServer {
             &args.question,
             Some(k),
             args.kind,
-            args.scope,
-            embedding,
+            args.scope.clone(),
+            embedding.clone(),
             args.as_of,
             mode == Mode::Infer,
         );
@@ -1514,22 +1539,31 @@ impl MemoryServer {
             Ok(h) => h,
             Err(e) => return format!("ask failed: {e}"),
         };
-        if hits.is_empty() {
+        // Summaries are model-written, so only infer mode looks for them.
+        let summaries = match (&embedding, mode) {
+            (Some(question), Mode::Infer) => {
+                summaries::matching(self, question, &args.scope, args.as_of).await
+            }
+            _ => Vec::new(),
+        };
+        if hits.is_empty() && summaries.is_empty() {
             return "no relevant memory".to_string();
         }
-        let docs: Vec<String> = hits
+        let candidates: Vec<ask::Evidence> = hits
             .iter()
-            .map(|h| h.hit.retrieved.as_text().to_string())
+            .map(ask::Evidence::from_hit)
+            .chain(summaries)
+            .collect();
+        let docs: Vec<String> = candidates
+            .iter()
+            .map(|e| e.retrieved.as_text().to_string())
             .collect();
         let order = self
             .reranker
             .order(&args.question, &docs)
             .await
-            .unwrap_or_else(|_| (0..hits.len()).collect());
-        let evidence: Vec<ask::Evidence> = order
-            .iter()
-            .map(|&i| ask::Evidence::from_hit(&hits[i]))
-            .collect();
+            .unwrap_or_else(|_| (0..docs.len()).collect());
+        let evidence: Vec<ask::Evidence> = order.iter().map(|&i| candidates[i].clone()).collect();
         if mode == Mode::Strict {
             return ask::strict_answer(&evidence, self.max_basis_ids_rendered);
         }

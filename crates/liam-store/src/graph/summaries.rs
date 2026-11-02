@@ -16,14 +16,14 @@ use super::fact_write::OpenWrite;
 use super::logged_plan::{event, STORE_TRUST};
 use super::logged_write::{abandon, commit_or_abandon};
 use super::projection::{steps_for, Step};
-use super::{live_at, row_not_inferred, Graph};
+use super::{live_at, row_not_inferred, scope_within, Graph};
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{Millis, NodeId, FOREVER};
 use crate::types::{
     ChildKind, ClosureReport, Derivation, EventRef, EventRole, InferredText, NewSummary,
-    PutOutcome, RecordedText, Summary, SummaryChild, SummaryFailure, SummaryInput, SummaryInputs,
-    TreeState,
+    PutOutcome, RecordedText, Summary, SummaryChild, SummaryEntry, SummaryFailure, SummaryInput,
+    SummaryInputs, TreeState,
 };
 use crate::value::{Row, Value};
 
@@ -256,6 +256,82 @@ impl<B: Backend> Graph<B> {
             )
             .await?;
         rows.iter().map(summary_from_row).collect()
+    }
+
+    /// The summary `id` in any state, open or closed.
+    pub async fn summary(&self, id: &str) -> Result<Option<Summary>> {
+        let rows = self
+            .backend
+            .query(
+                &format!("SELECT {SUMMARY_COLUMNS} FROM summaries WHERE id = ?1"),
+                &[id.into()],
+            )
+            .await?;
+        rows.first().map(summary_from_row).transpose()
+    }
+
+    /// The open summaries within `scope` (that scope and its descendants; every
+    /// scope when `None`), at `level` when given, each with its vector, ordered
+    /// by level then id. With `as_of`, only those known by then: stored at or
+    /// before it and not covering any later time.
+    pub async fn summaries_within(
+        &self,
+        scope: Option<&str>,
+        level: Option<u8>,
+        as_of: Option<Millis>,
+    ) -> Result<Vec<SummaryEntry>> {
+        let mut params: Vec<Value> = vec![FOREVER.into()];
+        let mut filters = String::new();
+        if let Some(scope) = scope {
+            params.push(scope.into());
+            filters.push_str(&format!(" AND {}", scope_within("s.scope", params.len())));
+        }
+        if let Some(level) = level {
+            params.push(i64::from(level).into());
+            filters.push_str(&format!(" AND s.level = ?{}", params.len()));
+        }
+        if let Some(as_of) = as_of {
+            params.push(as_of.into());
+            let n = params.len();
+            filters.push_str(&format!(" AND s.tx_from <= ?{n} AND s.valid_max <= ?{n}"));
+        }
+        let columns = SUMMARY_COLUMNS
+            .split(", ")
+            .map(|column| format!("s.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = self
+            .backend
+            .query(
+                &format!(
+                    "SELECT {columns}, e.dims, e.embedding
+                     FROM summaries s LEFT JOIN summary_embeddings e ON e.summary_id = s.id
+                     WHERE s.tx_to = ?1{filters} ORDER BY s.level, s.id"
+                ),
+                &params,
+            )
+            .await?;
+        // The joined embedding columns follow the summary's own.
+        let dims_column = SUMMARY_COLUMNS.split(", ").count();
+        rows.iter()
+            .map(|row| {
+                let vector = match row.0.get(dims_column + 1) {
+                    Some(Value::Blob(bytes)) => {
+                        let dims = usize::try_from(row.get_i64(dims_column)?).map_err(|_| {
+                            Error::Backend("summary_embeddings holds a bad width".into())
+                        })?;
+                        decode_vector(bytes, dims)
+                            .ok()
+                            .filter(|vector| vector.len() == self.dims)
+                    }
+                    _ => None,
+                };
+                Ok(SummaryEntry {
+                    summary: summary_from_row(row)?,
+                    vector,
+                })
+            })
+            .collect()
     }
 
     /// The children of `summary_id`, ordered by id.

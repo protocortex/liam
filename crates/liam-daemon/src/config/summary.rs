@@ -21,6 +21,9 @@ const DEFAULT_MAX_SUMMARIES_PER_RUN: usize = 20;
 const DEFAULT_RUN_DEADLINE_SECS: u64 = 600;
 const DEFAULT_MIN_GROUNDED_SHARE: f64 = 0.5;
 const DEFAULT_MAX_SUMMARY_FAILURES: u32 = 3;
+/// Cosine similarity of a question to a summary below which `ask` leaves the
+/// summary out.
+pub const DEFAULT_MIN_SUMMARY_SIMILARITY: f32 = 0.5;
 const DEFAULT_DISSOLVE_GRACE_RUNS: u32 = 3;
 const DEFAULT_DISSOLVE_OVERLAP: f64 = 0.5;
 /// Event ids shown on one provenance line before the rest are counted.
@@ -64,6 +67,8 @@ pub struct SummaryConfig {
     pub min_grounded_share: f64,
     /// Failures of one child set after which it is skipped.
     pub max_summary_failures: u32,
+    /// Least cosine similarity of a question to a summary for `ask` to use it.
+    pub min_summary_similarity: f32,
     /// Runs a summary whose cluster is gone waits for a replacement before it is closed.
     pub dissolve_grace_runs: u32,
     /// Share of a dissolved summary's items that a stored summary must hold to replace it.
@@ -90,6 +95,7 @@ impl Default for SummaryConfig {
             run_deadline_secs: DEFAULT_RUN_DEADLINE_SECS,
             min_grounded_share: DEFAULT_MIN_GROUNDED_SHARE,
             max_summary_failures: DEFAULT_MAX_SUMMARY_FAILURES,
+            min_summary_similarity: DEFAULT_MIN_SUMMARY_SIMILARITY,
             dissolve_grace_runs: DEFAULT_DISSOLVE_GRACE_RUNS,
             dissolve_overlap: DEFAULT_DISSOLVE_OVERLAP,
             max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
@@ -144,6 +150,10 @@ impl SummaryConfig {
             (
                 "min_attach_similarity",
                 f64::from(self.min_attach_similarity),
+            ),
+            (
+                "min_summary_similarity",
+                f64::from(self.min_summary_similarity),
             ),
         ] {
             anyhow::ensure!(
@@ -239,6 +249,14 @@ mod tests {
                 "summary.min_attach_similarity",
             ),
             (
+                "min_summary_similarity = 1.1",
+                "summary.min_summary_similarity",
+            ),
+            (
+                "min_summary_similarity = nan",
+                "summary.min_summary_similarity",
+            ),
+            (
                 "recluster_change_ratio = 0.0",
                 "summary.recluster_change_ratio",
             ),
@@ -269,6 +287,8 @@ mod tests {
             "min_similarity = 1.0",
             "min_attach_similarity = -1.0",
             "min_attach_similarity = 1.0",
+            "min_summary_similarity = -1.0",
+            "min_summary_similarity = 1.0",
             "recluster_change_ratio = 1.0",
             "min_grounded_share = 1.0",
             "dissolve_grace_runs = 1",
@@ -316,6 +336,7 @@ mod tests {
             "run_deadline_secs",
             "min_grounded_share",
             "max_summary_failures",
+            "min_summary_similarity",
             "dissolve_grace_runs",
             "dissolve_overlap",
             "max_basis_ids_rendered",
