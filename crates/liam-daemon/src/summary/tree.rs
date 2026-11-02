@@ -377,11 +377,6 @@ fn incremental<'a>(request: &LevelRequest<'a>, params: &TreeParams) -> Increment
         .iter()
         .map(|point| (point.id.as_str(), point))
         .collect();
-    let known: BTreeSet<&str> = request
-        .previous
-        .iter()
-        .flat_map(|old| old.children.iter().map(String::as_str))
-        .collect();
     let mut slots = Vec::new();
     let mut dissolved = Vec::new();
     let mut removed = 0;
@@ -402,6 +397,11 @@ fn incremental<'a>(request: &LevelRequest<'a>, params: &TreeParams) -> Increment
             });
         }
     }
+    // The members left by a dissolved cluster are items to place again.
+    let known: BTreeSet<String> = slots
+        .iter()
+        .flat_map(|slot| slot.members.iter().cloned())
+        .collect();
     let centroids: Vec<Vec<f32>> = slots
         .iter()
         .map(|slot| centroid(&slot.members, &by_id))
@@ -410,7 +410,7 @@ fn incremental<'a>(request: &LevelRequest<'a>, params: &TreeParams) -> Increment
     for point in request
         .points
         .iter()
-        .filter(|point| !known.contains(point.id.as_str()))
+        .filter(|point| !known.contains(&point.id))
     {
         let nearest = centroids
             .iter()
