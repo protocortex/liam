@@ -16,6 +16,7 @@ const DIMS: usize = 8;
 const LEVEL: u8 = 1;
 const MODEL: &str = "model-a";
 const PROMPT: &str = "prompt-1";
+const WRITER: &str = "consolidation:test";
 
 fn clock() -> Arc<FixedClock> {
     Arc::new(FixedClock::new(Millis(1000)))
@@ -67,6 +68,7 @@ async fn put<B: Backend>(g: &Graph<B>, children: &[&str], closes: &[String]) -> 
         &[event("e1"), event("e2")],
         &vector(),
         closes,
+        WRITER,
     )
     .await
 }
@@ -118,13 +120,19 @@ async fn a_new_summary_is_stored_with_its_children_sources_and_vector() {
 async fn the_children_of_a_summary_are_listed_with_their_kind() {
     // Arrange
     let g = open().await;
-    let mut children = nodes(&["b"]);
-    children.push(SummaryChild {
-        id: "a".to_string(),
-        kind: ChildKind::Summary,
-    });
+    let upper = NewSummary {
+        level: 2,
+        ..new_summary("")
+    };
+    let children: Vec<SummaryChild> = ["b", "a"]
+        .iter()
+        .map(|id| SummaryChild {
+            id: (*id).to_string(),
+            kind: ChildKind::Summary,
+        })
+        .collect();
     let outcome = g
-        .put_summary(new_summary(""), &children, &[event("e1")], &vector(), &[])
+        .put_summary(upper, &children, &[event("e1")], &vector(), &[], WRITER)
         .await
         .unwrap();
 
@@ -132,20 +140,50 @@ async fn the_children_of_a_summary_are_listed_with_their_kind() {
     let listed = g.summary_children(&id_of(outcome)).await.unwrap();
 
     // Assert
-    assert_eq!(
-        listed,
-        [
-            SummaryChild {
-                id: "a".to_string(),
-                kind: ChildKind::Summary
-            },
-            SummaryChild {
-                id: "b".to_string(),
-                kind: ChildKind::Node
-            },
-        ]
-    );
+    let ids: Vec<(&str, ChildKind)> = listed.iter().map(|c| (c.id.as_str(), c.kind)).collect();
+    assert_eq!(ids, [("a", ChildKind::Summary), ("b", ChildKind::Summary)]);
     assert!(ChildKind::parse("edge").is_err());
+}
+
+#[tokio::test]
+async fn a_child_of_the_wrong_kind_for_the_level_is_refused_and_leaves_no_row() {
+    // Arrange
+    let g = open().await;
+    let summary_child = vec![SummaryChild {
+        id: "a".to_string(),
+        kind: ChildKind::Summary,
+    }];
+    let upper = NewSummary {
+        level: 2,
+        ..new_summary("")
+    };
+
+    // Act
+    let at_level_one = g
+        .put_summary(
+            new_summary(""),
+            &summary_child,
+            &[event("e1")],
+            &vector(),
+            &[],
+            WRITER,
+        )
+        .await;
+    let at_level_two = g
+        .put_summary(
+            upper,
+            &nodes(&["a"]),
+            &[event("e1")],
+            &vector(),
+            &[],
+            WRITER,
+        )
+        .await;
+
+    // Assert
+    assert!(matches!(at_level_one, Err(Error::InvalidReference(_))));
+    assert!(matches!(at_level_two, Err(Error::InvalidReference(_))));
+    assert_eq!(count(&g, "summaries").await, 0);
 }
 
 #[tokio::test]
@@ -201,10 +239,10 @@ async fn a_summary_with_no_sources_or_no_children_is_refused_and_leaves_no_row()
 
     // Act
     let no_sources = g
-        .put_summary(new_summary(""), &nodes(&["a"]), &[], &vector(), &[])
+        .put_summary(new_summary(""), &nodes(&["a"]), &[], &vector(), &[], WRITER)
         .await;
     let no_children = g
-        .put_summary(new_summary(""), &[], &[event("e1")], &vector(), &[])
+        .put_summary(new_summary(""), &[], &[event("e1")], &vector(), &[], WRITER)
         .await;
 
     // Assert
@@ -226,6 +264,7 @@ async fn a_vector_of_the_wrong_width_is_refused() {
             &[event("e1")],
             &[0.5; DIMS + 1],
             &[],
+            WRITER,
         )
         .await;
 
@@ -239,10 +278,10 @@ async fn closing_a_summary_that_is_not_open_is_an_error() {
     // Arrange
     let g = open().await;
     let id = id_of(put(&g, &["a"], &[]).await.unwrap());
-    g.close_summary(&id, Millis(2000)).await.unwrap();
+    g.close_summary(&id, Millis(2000), WRITER).await.unwrap();
 
     // Act
-    let again = g.close_summary(&id, Millis(3000)).await;
+    let again = g.close_summary(&id, Millis(3000), WRITER).await;
     let replace = put(&g, &["b"], std::slice::from_ref(&id)).await;
 
     // Assert
@@ -273,9 +312,16 @@ async fn the_closure_reports_a_child_whose_events_the_summary_lacks() {
         },
     ];
     let id = id_of(
-        g.put_summary(new_summary(""), &children, &covered_events, &vector(), &[])
-            .await
-            .unwrap(),
+        g.put_summary(
+            new_summary(""),
+            &children,
+            &covered_events,
+            &vector(),
+            &[],
+            WRITER,
+        )
+        .await
+        .unwrap(),
     );
 
     // Act
@@ -308,6 +354,7 @@ async fn the_closure_of_a_parent_covers_the_events_of_its_child_summary() {
             &[event("e1"), event("e2"), event("e3")],
             &vector(),
             &[],
+            WRITER,
         )
         .await
         .unwrap(),

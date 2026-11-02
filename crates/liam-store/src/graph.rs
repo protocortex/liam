@@ -2459,6 +2459,7 @@ mod tests {
     mod snapshot;
     mod soak;
     mod summaries;
+    mod summary_log;
     mod support;
     mod swept_by;
     mod typed_retrieval;

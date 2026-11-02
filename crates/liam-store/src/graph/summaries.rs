@@ -9,9 +9,13 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use liam_log::event::{BasisRef, DerivedArtifact, LogPayload, ARTIFACT_KIND_SUMMARY};
 use sha2::{Digest, Sha256};
 
-use super::logged_write::commit_or_abandon;
+use super::fact_write::OpenWrite;
+use super::logged_plan::{event, STORE_TRUST};
+use super::logged_write::{abandon, commit_or_abandon};
+use super::projection::{steps_for, Step};
 use super::{live_at, row_not_inferred, Graph};
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
@@ -107,16 +111,23 @@ const RECORD_FAILURE_SQL: &str =
 
 impl<B: Backend> Graph<B> {
     /// Stores a summary with its children, source events and vector, and closes
-    /// the summaries in `closes` that it replaces, all in one transaction. A live
-    /// summary of the same child set makes this a no-op that names it, and
-    /// `closes` is then left alone. A closed summary of the same child set does
-    /// not block a new one, so a child set that returns to an earlier value
-    /// gets a new row.
+    /// the summaries in `closes` that it replaces, all in one transaction. A
+    /// live summary of the same child set makes this a no-op that names it,
+    /// appends nothing and leaves `closes` alone. A closed summary of the same
+    /// child set does not block a new one, so a child set that returns to an
+    /// earlier value gets a new row.
+    ///
+    /// On a logged store the summary is appended to the log first, with
+    /// `write_source` as its source, so a rolled-back run's summaries can be
+    /// told apart. The vector is not logged; a replay leaves it to the re-embed
+    /// pass.
     ///
     /// # Errors
     ///
-    /// Fails when there are no children or no source events, when the vector is
-    /// not `dims` wide, and when a summary in `closes` is not open.
+    /// Fails when there are no children, when a child is not of the kind the
+    /// level takes (nodes at level 1, summaries above), when there are no source
+    /// events, when the vector is not `dims` wide, and when a summary in
+    /// `closes` is not open.
     pub async fn put_summary(
         &self,
         summary: NewSummary,
@@ -124,6 +135,7 @@ impl<B: Backend> Graph<B> {
         source_event_ids: &[EventRef],
         embedding: &[f32],
         closes: &[String],
+        write_source: &str,
     ) -> Result<PutOutcome> {
         let child_ids: Vec<String> = children.iter().map(|child| child.id.clone()).collect();
         let hash = child_hash(summary.level, &summary.scope, &child_ids);
@@ -132,44 +144,103 @@ impl<B: Backend> Graph<B> {
                 "the summary for child set {hash} has no children"
             )));
         }
+        let kind = child_kind_of(summary.level);
+        if children.iter().any(|child| child.kind != kind) {
+            return Err(Error::InvalidReference(format!(
+                "the summary for child set {hash} at level {} takes {} children",
+                summary.level,
+                kind.as_str()
+            )));
+        }
         if source_event_ids.is_empty() {
             return Err(Error::SummaryWithoutSources(hash));
         }
         self.check_dims(embedding)?;
 
-        let mut tx = self.backend.begin().await?;
-        let written = async {
+        let OpenWrite { held, mut tx } = self.open_write().await?;
+        let at = self.clock.now();
+        let decided = async {
             if let Some(live) = live_with_hash(&mut *tx, &hash).await? {
                 return Ok(PutOutcome::Unchanged(live));
             }
-            let id = ulid::Ulid::gen().to_string();
-            let at = self.clock.now();
-            insert_summary(&mut *tx, &id, &hash, &summary, at).await?;
-            insert_children(&mut *tx, &id, children).await?;
-            insert_sources(&mut *tx, &id, source_event_ids).await?;
-            tx.execute(
-                "INSERT INTO summary_embeddings (summary_id, dims, embedding) VALUES (?1, ?2, ?3)",
-                &[
-                    id.as_str().into(),
-                    (self.dims as i64).into(),
-                    encode_vector(embedding).into(),
-                ],
-            )
-            .await?;
             for old in closes {
-                close_in(&mut *tx, old, at).await?;
+                require_open(&mut *tx, old).await?;
             }
-            Ok(PutOutcome::Inserted(id))
+            Ok(PutOutcome::Inserted(ulid::Ulid::gen().to_string()))
         }
         .await;
-        commit_or_abandon(tx, written).await
+        let id = match decided {
+            Ok(PutOutcome::Inserted(id)) => id,
+            Ok(unchanged) => {
+                abandon(tx).await;
+                return Ok(unchanged);
+            }
+            Err(error) => {
+                abandon(tx).await;
+                return Err(error);
+            }
+        };
+        let artifact = DerivedArtifact {
+            artifact_id: id.clone(),
+            kind: ARTIFACT_KIND_SUMMARY.to_string(),
+            level: summary.level,
+            scope: summary.scope,
+            text: summary.text,
+            child_ids,
+            source_event_ids: logged_events(source_event_ids),
+            events_fed: summary.events_fed,
+            derivation: Derivation::Inferred.as_str().to_string(),
+            model_id: summary.model_id,
+            prompt_version: summary.prompt_version,
+            closes: closes.to_vec(),
+            valid_min: summary.valid_min.0,
+            valid_max: summary.valid_max.0,
+            at: at.0,
+        };
+        let event = event(
+            [0; 32],
+            (write_source, STORE_TRUST),
+            at.0,
+            at,
+            LogPayload::DerivedArtifact(artifact),
+        );
+        let mut steps = steps_for(&event.payload);
+        steps.push(Step::SummaryEmbedding {
+            id: id.clone(),
+            embedding: encode_vector(embedding),
+            dims: self.dims,
+        });
+        match held {
+            Some(mut held) => self.append_and_commit(tx, &mut held, event, &steps).await?,
+            None => self.apply_and_commit(tx, &steps).await?,
+        }
+        Ok(PutOutcome::Inserted(id))
     }
 
-    /// Ends the transaction time of the open summary `id` at `at`.
-    pub async fn close_summary(&self, id: &str, at: Millis) -> Result<()> {
-        let mut tx = self.backend.begin().await?;
-        let closed = close_in(&mut *tx, id, at).await;
-        commit_or_abandon(tx, closed).await
+    /// Ends the transaction time of the open summary `id` at `at`, for a
+    /// cluster that dissolved with nothing to replace it. A logged store
+    /// records the close with `write_source`.
+    pub async fn close_summary(&self, id: &str, at: Millis, write_source: &str) -> Result<()> {
+        let OpenWrite { held, mut tx } = self.open_write().await?;
+        if let Err(error) = require_open(&mut *tx, id).await {
+            abandon(tx).await;
+            return Err(error);
+        }
+        let event = event(
+            [0; 32],
+            (write_source, STORE_TRUST),
+            at.0,
+            self.clock.now(),
+            LogPayload::DerivedArtifactClosed {
+                artifact_id: id.to_string(),
+                at: at.0,
+            },
+        );
+        let steps = steps_for(&event.payload);
+        match held {
+            Some(mut held) => self.append_and_commit(tx, &mut held, event, &steps).await,
+            None => self.apply_and_commit(tx, &steps).await,
+        }
     }
 
     /// The open summaries of `scope` at `level`, oldest first.
@@ -320,6 +391,45 @@ impl<B: Backend> Graph<B> {
             .transpose()
     }
 
+    /// The open summaries that have no vector, as `(id, text)`, by id.
+    pub(super) async fn summaries_missing_embeddings(&self) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .backend
+            .query(
+                "SELECT s.id, s.text FROM summaries s
+                 WHERE s.tx_to = ?1
+                   AND NOT EXISTS (SELECT 1 FROM summary_embeddings e WHERE e.summary_id = s.id)
+                 ORDER BY s.id",
+                &[FOREVER.into()],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| Ok((row.get_string(0)?, row.get_string(1)?)))
+            .collect()
+    }
+
+    /// Stores `embedding` for the summary `id` unless it has one, and says
+    /// whether it did.
+    pub(super) async fn store_summary_embedding_if_absent(
+        &self,
+        id: &str,
+        embedding: &[f32],
+    ) -> Result<bool> {
+        let stored = self
+            .backend
+            .execute(
+                "INSERT OR IGNORE INTO summary_embeddings (summary_id, dims, embedding)
+                 VALUES (?1, ?2, ?3)",
+                &[
+                    id.into(),
+                    (self.dims as i64).into(),
+                    encode_vector(embedding).into(),
+                ],
+            )
+            .await?;
+        Ok(stored == 1)
+    }
+
     /// The vectors of the open summaries of `scope` at `level`, oldest first.
     /// This is the only read of the table.
     pub async fn summary_embeddings(
@@ -459,66 +569,85 @@ async fn live_with_hash(tx: &mut dyn BackendTx, hash: &str) -> Result<Option<Str
     rows.first().map(|row| row.get_string(0)).transpose()
 }
 
-async fn insert_summary(
+/// The kind of child a summary of `level` is made of.
+fn child_kind_of(level: u8) -> ChildKind {
+    match level {
+        1 => ChildKind::Node,
+        _ => ChildKind::Summary,
+    }
+}
+
+fn logged_events(events: &[EventRef]) -> Vec<BasisRef> {
+    events
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|event| BasisRef {
+            event_id: event.event_id.clone(),
+            synthetic: event.synthetic,
+        })
+        .collect()
+}
+
+/// Projects a logged artifact: closes the artifacts it replaces, then stores it
+/// with its children and source events. Closing one that is already closed or
+/// gone changes nothing, so a replay can run it again, and a replacement can
+/// follow a run that was rolled back.
+pub(super) async fn apply_artifact(
     tx: &mut dyn BackendTx,
-    id: &str,
-    hash: &str,
-    summary: &NewSummary,
-    at: Millis,
+    artifact: &DerivedArtifact,
 ) -> Result<()> {
+    if artifact.kind != ARTIFACT_KIND_SUMMARY {
+        return Err(Error::Constraint(format!(
+            "artifact {} has the unknown kind {}",
+            artifact.artifact_id, artifact.kind
+        )));
+    }
+    let derivation = Derivation::parse(&artifact.derivation)?;
+    for old in &artifact.closes {
+        close_if_open(tx, old, artifact.at).await?;
+    }
+    let hash = child_hash(artifact.level, &artifact.scope, &artifact.child_ids);
     tx.execute(
         &format!(
             "INSERT INTO summaries ({SUMMARY_COLUMNS})
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         ),
         &[
-            id.into(),
-            i64::from(summary.level).into(),
-            summary.scope.as_str().into(),
+            artifact.artifact_id.as_str().into(),
+            i64::from(artifact.level).into(),
+            artifact.scope.as_str().into(),
             hash.into(),
-            summary.text.as_str().into(),
-            Derivation::Inferred.as_str().into(),
-            i64::from(summary.events_fed).into(),
-            summary.valid_min.into(),
-            summary.valid_max.into(),
-            summary.model_id.as_str().into(),
-            summary.prompt_version.as_str().into(),
-            at.into(),
+            artifact.text.as_str().into(),
+            derivation.as_str().into(),
+            i64::from(artifact.events_fed).into(),
+            artifact.valid_min.into(),
+            artifact.valid_max.into(),
+            artifact.model_id.as_str().into(),
+            artifact.prompt_version.as_str().into(),
+            artifact.at.into(),
             FOREVER.into(),
         ],
     )
     .await?;
-    Ok(())
-}
-
-async fn insert_children(
-    tx: &mut dyn BackendTx,
-    parent: &str,
-    children: &[SummaryChild],
-) -> Result<()> {
-    for child in children {
+    let kind = child_kind_of(artifact.level);
+    for child in &artifact.child_ids {
         tx.execute(
             "INSERT INTO summary_children (parent_id, child_id, child_kind) VALUES (?1, ?2, ?3)",
             &[
-                parent.into(),
-                child.id.as_str().into(),
-                child.kind.as_str().into(),
+                artifact.artifact_id.as_str().into(),
+                child.as_str().into(),
+                kind.as_str().into(),
             ],
         )
         .await?;
     }
-    Ok(())
-}
-
-/// Each event once, whatever order or repeats the caller gave.
-async fn insert_sources(tx: &mut dyn BackendTx, summary: &str, events: &[EventRef]) -> Result<()> {
-    let unique: BTreeSet<&EventRef> = events.iter().collect();
-    for event in unique {
+    for event in &artifact.source_event_ids {
         tx.execute(
             "INSERT OR IGNORE INTO summary_sources (summary_id, event_id, synthetic)
              VALUES (?1, ?2, ?3)",
             &[
-                summary.into(),
+                artifact.artifact_id.as_str().into(),
                 event.event_id.as_str().into(),
                 i64::from(event.synthetic).into(),
             ],
@@ -528,15 +657,39 @@ async fn insert_sources(tx: &mut dyn BackendTx, summary: &str, events: &[EventRe
     Ok(())
 }
 
-async fn close_in(tx: &mut dyn BackendTx, id: &str, at: Millis) -> Result<()> {
-    let closed = tx
-        .execute(
-            "UPDATE summaries SET tx_to = ?1 WHERE id = ?2 AND tx_to = ?3",
-            &[at.into(), id.into(), FOREVER.into()],
+/// Ends the open summary `id` at `at`; one that is not open is left alone.
+pub(super) async fn close_if_open(tx: &mut dyn BackendTx, id: &str, at: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE summaries SET tx_to = ?1 WHERE id = ?2 AND tx_to = ?3",
+        &[at.into(), id.into(), FOREVER.into()],
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn store_embedding(
+    tx: &mut dyn BackendTx,
+    id: &str,
+    dims: usize,
+    embedding: &[u8],
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO summary_embeddings (summary_id, dims, embedding) VALUES (?1, ?2, ?3)",
+        &[id.into(), (dims as i64).into(), embedding.to_vec().into()],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn require_open(tx: &mut dyn BackendTx, id: &str) -> Result<()> {
+    let open = tx
+        .query(
+            "SELECT 1 FROM summaries WHERE id = ?1 AND tx_to = ?2",
+            &[id.into(), FOREVER.into()],
         )
         .await?;
-    match closed {
-        1 => Ok(()),
-        _ => Err(Error::SummaryNotOpen(id.to_string())),
+    match open.is_empty() {
+        true => Err(Error::SummaryNotOpen(id.to_string())),
+        false => Ok(()),
     }
 }

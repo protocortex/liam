@@ -80,7 +80,9 @@ fn texts_by_scope(payload: &LogPayload) -> BTreeMap<Option<String>, String> {
         | LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
         | LogPayload::FactWrite { .. }
-        | LogPayload::RunRolledBack { .. } => Vec::new(),
+        | LogPayload::RunRolledBack { .. }
+        | LogPayload::DerivedArtifact(_)
+        | LogPayload::DerivedArtifactClosed { .. } => Vec::new(),
     };
     let mut by_scope: BTreeMap<Option<String>, String> = BTreeMap::new();
     for row in rows.into_iter().filter(|row| !is_entity_page(row)) {

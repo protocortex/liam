@@ -15,7 +15,10 @@ use super::log_write::{
 };
 use super::support::{count, fact_at, injected, share};
 use super::*;
+use crate::types::{ChildKind, EventRef, NewSummary, PutOutcome, SummaryChild};
 use crate::DefaultBackend;
+
+const SUMMARY_WRITER: &str = "consolidation:faults";
 
 // ---- projection and cursor faults, per write path ----
 
@@ -24,6 +27,7 @@ use crate::DefaultBackend;
 struct Snapshot {
     nodes: Vec<(String, i64)>,
     edges: Vec<(String, i64)>,
+    summaries: Vec<(String, i64)>,
     index: Vec<(String, String, String)>,
 }
 
@@ -56,6 +60,7 @@ async fn snapshot<B: Backend>(g: &Graph<B>) -> Snapshot {
     Snapshot {
         nodes: id_and_tx_to(g, "nodes").await,
         edges: id_and_tx_to(g, "edges").await,
+        summaries: id_and_tx_to(g, "summaries").await,
         index,
     }
 }
@@ -69,8 +74,12 @@ enum Op {
     Relate,
     Link,
     Episode,
+    /// A summary that replaces the seeded one.
+    PutSummary,
 }
 
+/// The write paths the concurrency test mixes. A summary event covers no
+/// content, so it never reaches the hash index that test reads the order from.
 const OPS: [Op; 7] = [
     Op::Insert,
     Op::UpsertInsert,
@@ -91,6 +100,9 @@ impl Op {
             Op::Insert | Op::UpsertInsert => 4,
             Op::UpsertSupersede | Op::Supersede => 7,
             Op::Episode => 14,
+            // The summary, its child, source and vector, the replaced summary's
+            // close, and the cursor.
+            Op::PutSummary => 6,
         }
     }
 }
@@ -101,15 +113,48 @@ struct Seeded {
     tag: usize,
     x: NodeId,
     y: NodeId,
+    /// A live summary of a child set of its own.
+    summary: String,
+}
+
+fn summary_of(tag: usize) -> (NewSummary, Vec<SummaryChild>, Vec<EventRef>) {
+    let summary = NewSummary {
+        level: 1,
+        scope: String::new(),
+        text: format!("summary {tag}"),
+        events_fed: 1,
+        valid_min: Millis(1),
+        valid_max: Millis(2),
+        model_id: "model".to_string(),
+        prompt_version: "prompt".to_string(),
+    };
+    let children = vec![SummaryChild {
+        id: format!("child-{tag}"),
+        kind: ChildKind::Node,
+    }];
+    let sources = vec![EventRef {
+        event_id: format!("event-{tag}"),
+        synthetic: false,
+    }];
+    (summary, children, sources)
 }
 
 async fn seed<B: Backend>(g: &Graph<B>, tag: usize) -> Seeded {
+    let (summary, children, sources) = summary_of(tag);
+    let PutOutcome::Inserted(summary) = g
+        .put_summary(summary, &children, &sources, &[0.5; 8], &[], SUMMARY_WRITER)
+        .await
+        .unwrap()
+    else {
+        panic!("the seeded summary is new");
+    };
     Seeded {
         tag,
         x: g.insert(fact_at(&format!("v1-{tag}")).with_subject(format!("subject-{tag}")))
             .await
             .unwrap(),
         y: g.insert(fact_at(&format!("peer-{tag}"))).await.unwrap(),
+        summary,
     }
 }
 
@@ -138,6 +183,19 @@ async fn run_op<B: Backend>(g: &Graph<B>, op: Op, seeded: &Seeded) -> Result<()>
             .link(NewEdge::new(&seeded.x, &seeded.y, "mentions"))
             .await
             .map(drop),
+        Op::PutSummary => {
+            let (summary, children, sources) = summary_of(tag + 1000);
+            g.put_summary(
+                summary,
+                &children,
+                &sources,
+                &[0.5; 8],
+                std::slice::from_ref(&seeded.summary),
+                SUMMARY_WRITER,
+            )
+            .await
+            .map(drop)
+        }
         Op::Episode => {
             let cites = EpisodeEdge {
                 from: EpisodeRef::New(1),
@@ -340,6 +398,7 @@ write_path_fault_tests! {
     relate => Op::Relate,
     link => Op::Link,
     ingest_episode => Op::Episode,
+    put_summary => Op::PutSummary,
 }
 
 // ---- concurrency ----

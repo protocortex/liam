@@ -147,7 +147,9 @@ pub fn content_hashes(event: &LogEvent) -> Vec<([u8; 32], String)> {
         | LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
         | LogPayload::FactWrite { .. }
-        | LogPayload::RunRolledBack { .. } => Vec::new(),
+        | LogPayload::RunRolledBack { .. }
+        | LogPayload::DerivedArtifact(_)
+        | LogPayload::DerivedArtifactClosed { .. } => Vec::new(),
     }
 }
 

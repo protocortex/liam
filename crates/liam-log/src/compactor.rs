@@ -859,7 +859,7 @@ mod tests {
         let mut payload = postcard::to_stdvec(&original.payload).expect("encode payload");
         payload.truncate(payload.len() - 2);
         let mut columns = batch.columns().to_vec();
-        let older = CURRENT_SCHEMA_VERSION - 1;
+        let older = crate::event::NODE_DERIVATION_SCHEMA_VERSION - 1;
         let position = |name: &str| batch.schema().index_of(name).expect("column");
         columns[position(column::SCHEMA_VERSION)] = Arc::new(UInt32Array::from(vec![older]));
         columns[position(column::PAYLOAD)] =
