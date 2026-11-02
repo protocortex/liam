@@ -690,3 +690,158 @@ async fn tree_state_is_stored_per_scope_and_level_and_overwritten() {
     );
     assert_eq!(g.tree_state("", 1).await.unwrap(), None);
 }
+
+async fn put_in(g: &DefaultGraph, scope: &str, level: u8, children: &[&str]) -> String {
+    let summary = NewSummary {
+        level,
+        ..new_summary(scope)
+    };
+    let kind = if level == 1 {
+        ChildKind::Node
+    } else {
+        ChildKind::Summary
+    };
+    let children: Vec<SummaryChild> = children
+        .iter()
+        .map(|id| SummaryChild {
+            id: (*id).to_string(),
+            kind,
+        })
+        .collect();
+    let outcome = g
+        .put_summary(summary, &children, &[event("e1")], &vector(), &[], WRITER)
+        .await
+        .unwrap();
+    id_of(outcome)
+}
+
+#[tokio::test]
+async fn summaries_within_a_scope_include_its_descendants_and_not_a_lookalike() {
+    // Arrange
+    let g = open().await;
+    let work = put_in(&g, "work", 1, &["a"]).await;
+    let child = put_in(&g, "work/liam", 1, &["b"]).await;
+    put_in(&g, "work-archive", 1, &["c"]).await;
+    let none = put_in(&g, "", 1, &["d"]).await;
+
+    // Act
+    let within = g.summaries_within(Some("work"), None, None).await.unwrap();
+    let every = g.summaries_within(None, None, None).await.unwrap();
+
+    // Assert
+    let ids = |entries: &[crate::types::SummaryEntry]| -> BTreeSet<String> {
+        entries.iter().map(|e| e.summary.id.clone()).collect()
+    };
+    assert_eq!(ids(&within), BTreeSet::from([work, child]));
+    assert_eq!(every.len(), 4);
+    assert!(ids(&every).contains(&none));
+}
+
+#[tokio::test]
+async fn summaries_come_back_by_level_then_id_with_closed_ones_left_out() {
+    // Arrange
+    let g = open().await;
+    let low = put_in(&g, "", 1, &["a"]).await;
+    let other = put_in(&g, "", 1, &["b"]).await;
+    let upper = put_in(&g, "", 2, &[&low, &other]).await;
+    let gone = put_in(&g, "", 1, &["c"]).await;
+    g.close_summary(&gone, Millis(1500), WRITER).await.unwrap();
+
+    // Act
+    let all = g.summaries_within(None, None, None).await.unwrap();
+    let level_two = g.summaries_within(None, Some(2), None).await.unwrap();
+
+    // Assert
+    let mut level_one = [low, other];
+    level_one.sort();
+    let [first, second] = level_one;
+    let order: Vec<&str> = all.iter().map(|e| e.summary.id.as_str()).collect();
+    assert_eq!(order, [first.as_str(), second.as_str(), upper.as_str()]);
+    assert_eq!(level_two.len(), 1);
+    assert_eq!(level_two[0].summary.id, upper);
+    assert_eq!(level_two[0].vector.as_deref(), Some(vector().as_slice()));
+}
+
+#[tokio::test]
+async fn only_summaries_known_and_finished_by_the_instant_are_returned_for_it() {
+    // Arrange
+    let clock = clock();
+    let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(DIMS), clock.clone())
+        .await
+        .unwrap();
+    let early = put_in(&g, "", 1, &["a"]).await;
+    clock.set(Millis(2000));
+    let late = NewSummary {
+        valid_max: Millis(3000),
+        ..new_summary("")
+    };
+    g.put_summary(late, &nodes(&["b"]), &[event("e1")], &vector(), &[], WRITER)
+        .await
+        .unwrap();
+
+    // Act
+    let before_either = g
+        .summaries_within(None, None, Some(Millis(500)))
+        .await
+        .unwrap();
+    let after_the_first = g
+        .summaries_within(None, None, Some(Millis(1000)))
+        .await
+        .unwrap();
+    let stored_but_still_running = g
+        .summaries_within(None, None, Some(Millis(2500)))
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(before_either.is_empty());
+    assert_eq!(after_the_first.len(), 1);
+    assert_eq!(after_the_first[0].summary.id, early);
+    assert_eq!(stored_but_still_running.len(), 1);
+}
+
+#[tokio::test]
+async fn a_summary_without_a_vector_of_the_stores_width_has_none() {
+    // Arrange
+    let g = open().await;
+    let wide = put_in(&g, "", 1, &["a"]).await;
+    g.backend
+        .execute(
+            "UPDATE summary_embeddings SET dims = 2, embedding = x'0000803f00000040'
+             WHERE summary_id = ?1",
+            &[wide.as_str().into()],
+        )
+        .await
+        .unwrap();
+    let bare = put_in(&g, "", 1, &["b"]).await;
+    g.backend
+        .execute(
+            "DELETE FROM summary_embeddings WHERE summary_id = ?1",
+            &[bare.as_str().into()],
+        )
+        .await
+        .unwrap();
+
+    // Act
+    let entries = g.summaries_within(None, None, None).await.unwrap();
+
+    // Assert
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| entry.vector.is_none()));
+}
+
+#[tokio::test]
+async fn a_summary_is_found_by_id_open_or_closed() {
+    // Arrange
+    let g = open().await;
+    let id = put_in(&g, "", 1, &["a"]).await;
+    g.close_summary(&id, Millis(1500), WRITER).await.unwrap();
+
+    // Act
+    let found = g.summary(&id).await.unwrap();
+    let missing = g.summary("nope").await.unwrap();
+
+    // Assert
+    assert_eq!(found.unwrap().tx_to, Millis(1500));
+    assert!(missing.is_none());
+}

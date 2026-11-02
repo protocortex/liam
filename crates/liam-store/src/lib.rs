@@ -36,8 +36,8 @@ pub use types::{
     EventRole, ExplainedHit, ExtractorName, Fact, Fingerprint, GcReport, GraphConfig, Grounding,
     Hit, InferredHit, InferredText, MatchMode, NewEdge, NewFact, NewNode, NewSummary,
     PredicateSpec, PutOutcome, Query, RecordedHit, RecordedText, RetentionPolicy, RetentionRule,
-    RetractOutcome, Retrieved, Summary, SummaryChild, SummaryFailure, SummaryInput, SummaryInputs,
-    TreeState, Vocabulary,
+    RetractOutcome, Retrieved, Summary, SummaryChild, SummaryEntry, SummaryFailure, SummaryInput,
+    SummaryInputs, TreeState, Vocabulary,
 };
 pub use value::{Row, Value};
 
