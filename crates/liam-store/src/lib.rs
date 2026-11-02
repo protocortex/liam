@@ -31,11 +31,13 @@ pub use graph::{
 };
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{
-    relation, ArbitrationCaps, ArbitrationOutcome, Basis, Cardinality, Change, ClusterMember,
-    ClusterState, Derivation, EndFact, EndOutcome, EventRef, EventRole, ExplainedHit,
-    ExtractorName, Fact, Fingerprint, GcReport, GraphConfig, Grounding, Hit, InferredHit,
-    InferredText, MatchMode, NewEdge, NewFact, NewNode, PredicateSpec, Query, RecordedHit,
-    RecordedText, RetentionPolicy, RetentionRule, RetractOutcome, Retrieved, Vocabulary,
+    relation, ArbitrationCaps, ArbitrationOutcome, Basis, Cardinality, Change, ChildKind,
+    ClosureReport, ClusterMember, ClusterState, Derivation, EndFact, EndOutcome, EventRef,
+    EventRole, ExplainedHit, ExtractorName, Fact, Fingerprint, GcReport, GraphConfig, Grounding,
+    Hit, InferredHit, InferredText, MatchMode, NewEdge, NewFact, NewNode, NewSummary,
+    PredicateSpec, PutOutcome, Query, RecordedHit, RecordedText, RetentionPolicy, RetentionRule,
+    RetractOutcome, Retrieved, Summary, SummaryChild, SummaryFailure, SummaryInput, SummaryInputs,
+    TreeState, Vocabulary,
 };
 pub use value::{Row, Value};
 

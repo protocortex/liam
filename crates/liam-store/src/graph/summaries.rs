@@ -187,6 +187,26 @@ impl<B: Backend> Graph<B> {
         rows.iter().map(summary_from_row).collect()
     }
 
+    /// The children of `summary_id`, ordered by id.
+    pub async fn summary_children(&self, summary_id: &str) -> Result<Vec<SummaryChild>> {
+        let rows = self
+            .backend
+            .query(
+                "SELECT child_id, child_kind FROM summary_children
+                 WHERE parent_id = ?1 ORDER BY child_id",
+                &[summary_id.into()],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(SummaryChild {
+                    id: row.get_string(0)?,
+                    kind: ChildKind::parse(&row.get_string(1)?)?,
+                })
+            })
+            .collect()
+    }
+
     /// The source events of `summary_id`, ordered by event id.
     pub async fn summary_sources(&self, summary_id: &str) -> Result<Vec<EventRef>> {
         let rows = self
