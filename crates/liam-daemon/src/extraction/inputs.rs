@@ -34,10 +34,7 @@ pub fn events_to_inputs(
 ) -> Vec<ExtractionInput> {
     let voided: HashSet<&str> = events
         .iter()
-        .filter_map(|(_, event)| match &event.payload {
-            LogPayload::Voided { target_event_id } => Some(target_event_id.as_str()),
-            _ => None,
-        })
+        .filter_map(|(_, event)| event.payload.voided_target())
         .collect();
 
     events
@@ -79,6 +76,7 @@ fn texts_by_scope(payload: &LogPayload) -> BTreeMap<Option<String>, String> {
         | LogPayload::Tombstone(_)
         | LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
+        | LogPayload::Quarantined { .. }
         | LogPayload::FactWrite { .. }
         | LogPayload::RunRolledBack { .. }
         | LogPayload::DerivedArtifact(_)

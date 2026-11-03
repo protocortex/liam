@@ -365,6 +365,16 @@ daemon logs `backfill completed`. The log reports `logged/total` at every saved
 resume point. An interrupted copy resumes where it stopped, and a database that
 is already logged is not copied again.
 
+### Quarantined events
+
+When replay refuses an event, the daemon appends a `Quarantined` record that
+cancels it and carries the reason, and keeps the reason in the store's
+`log_quarantine` table. A store restored from a snapshot, or rebuilt from the
+log, gets the row back from that record. A log written before this record
+existed holds a plain `Voided` record instead, which has no reason, so a replay
+skips the event and recreates no row. Schema version 7 adds the record; a build
+that reads only version 6 refuses a log that holds one.
+
 ### Garbage collection
 
 A sweep is recorded in the log as tombstones before the rows are deleted, so a

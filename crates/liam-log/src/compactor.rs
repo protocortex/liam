@@ -985,7 +985,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sealed_event_round_trips_through_parquet_under_schema_version_six() {
+    async fn a_sealed_event_round_trips_through_parquet_under_the_current_schema_version() {
         // Arrange
         let keys = tempfile::tempdir().expect("temp dir");
         let registry = Arc::new(
@@ -1012,7 +1012,7 @@ mod tests {
         assert_eq!(back[0].encryption_key_id, sealed.encryption_key_id);
         assert_eq!(
             batch.schema().metadata().get(SCHEMA_VERSION_KEY),
-            Some(&"6".to_string())
+            Some(&CURRENT_SCHEMA_VERSION.to_string())
         );
     }
 

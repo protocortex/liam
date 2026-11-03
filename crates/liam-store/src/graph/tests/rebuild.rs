@@ -935,7 +935,7 @@ async fn rebuild_on_the_same_log_keeps_the_operators_records_and_clears_the_repa
     // the reason it was refused is still on record, and no second void exists
     let expected = CatchUpReport {
         applied: 2,
-        skipped_voided: 1,
+        quarantined: 1,
         ..CatchUpReport::default()
     };
     assert_eq!(record_counts(report.replayed), expected);
@@ -977,7 +977,7 @@ async fn rebuild_quarantines_a_refused_event_the_log_has_not_voided_yet() {
             .await
             .last()
             .map(|record| &record.event.payload),
-        Some(LogPayload::Voided { .. })
+        Some(LogPayload::Quarantined { .. })
     ));
 }
 

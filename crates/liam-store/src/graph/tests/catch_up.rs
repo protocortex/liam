@@ -198,10 +198,7 @@ async fn set_cursor<B: Backend>(g: &Graph<B>, offset: LogOffset) {
 fn voided_targets_of(records: &[LogRecord]) -> Vec<String> {
     records
         .iter()
-        .filter_map(|record| match &record.event.payload {
-            LogPayload::Voided { target_event_id } => Some(target_event_id.clone()),
-            _ => None,
-        })
+        .filter_map(|record| record.event.payload.voided_target().map(str::to_owned))
         .collect()
 }
 
@@ -476,6 +473,14 @@ async fn catch_up_quarantines_a_refused_event_and_applies_the_ones_after_it() {
         vec![refused_id],
         "the log records the refusal as a void, as a live failure does"
     );
+    assert!(
+        matches!(
+            &records[3].event.payload,
+            LogPayload::Quarantined { reason: logged, .. } if logged == reason
+        ),
+        "the log carries the reason: {:?}",
+        records[3].event.payload
+    );
     let void_at = records[3].offset;
     assert_eq!(void_at.index, offsets[2].index + 1);
     assert_eq!(cursor_offset(&g).await, Some(offset_pair(void_at)));
@@ -688,7 +693,7 @@ async fn catch_up_refuses_a_poisoned_log_and_applies_nothing() {
 }
 
 #[tokio::test]
-async fn catch_up_voids_a_quarantined_event_so_a_store_rebuilt_from_the_log_skips_it_too() {
+async fn catch_up_restores_the_quarantine_of_an_event_on_a_store_rebuilt_from_the_log() {
     // Arrange
     let env = Env::new();
     env.append(&[
@@ -696,10 +701,10 @@ async fn catch_up_voids_a_quarantined_event_so_a_store_rebuilt_from_the_log_skip
         edge_write("edge-ghost", "node-a", "node-ghost"),
         node_write("node-b", "beta"),
     ]);
-    let first_tables = {
+    let (first_tables, first_quarantine) = {
         let (first, _first_log) = env.open::<DefaultBackend>("first.db", clock_at(9000)).await;
         first.catch_up().await.unwrap();
-        snapshot(&first).await
+        (snapshot(&first).await, quarantined(&first).await)
     };
     let (rebuilt, _log) = env
         .open::<DefaultBackend>("rebuilt.db", clock_at(9000))
@@ -711,16 +716,42 @@ async fn catch_up_voids_a_quarantined_event_so_a_store_rebuilt_from_the_log_skip
     // Assert
     let expected = CatchUpReport {
         applied: 2,
-        skipped_voided: 1,
+        quarantined: 1,
         ..CatchUpReport::default()
     };
     assert_eq!(record_counts(report), expected);
     assert_eq!(dump(&rebuilt, "nodes").await, first_tables[0]);
     assert_eq!(dump(&rebuilt, "edges").await, first_tables[1]);
-    assert!(
-        quarantined(&rebuilt).await.is_empty(),
-        "only the store that refused the event holds the refusal"
+    let restored = quarantined(&rebuilt).await;
+    assert_eq!(restored, first_quarantine, "the refusal and its reason");
+    assert!(restored[0].3.contains("node-ghost"), "{restored:?}");
+}
+
+#[tokio::test]
+async fn catch_up_restores_no_quarantine_for_a_plain_void() {
+    // Arrange: a void an older build wrote for a refused event carries no reason
+    let env = Env::new();
+    let doomed = node_write("node-a", "alpha");
+    let void = follow_up(
+        "event-void",
+        &doomed,
+        LogPayload::Voided {
+            target_event_id: doomed.event_id.clone(),
+        },
     );
+    env.append(&[doomed, void]);
+    let (g, _log) = env.open::<DefaultBackend>("graph.db", clock_at(9000)).await;
+
+    // Act
+    let report = g.catch_up().await.unwrap();
+
+    // Assert
+    let expected = CatchUpReport {
+        skipped_voided: 1,
+        ..CatchUpReport::default()
+    };
+    assert_eq!(record_counts(report), expected);
+    assert!(quarantined(&g).await.is_empty());
 }
 
 #[tokio::test]
@@ -749,7 +780,7 @@ async fn catch_up_moves_the_cursor_onto_the_void_when_the_refused_event_is_the_l
     let void_at = records.last().expect("the void").offset;
     assert!(matches!(
         records.last().map(|r| &r.event.payload),
-        Some(LogPayload::Voided { .. })
+        Some(LogPayload::Quarantined { .. })
     ));
     assert_eq!(cursor_offset(&g).await, Some(offset_pair(void_at)));
 }
