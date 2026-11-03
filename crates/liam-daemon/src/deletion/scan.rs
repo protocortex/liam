@@ -131,7 +131,7 @@ impl State {
     fn visit(&mut self, target: &DeleteTarget, record: &LogRecord) -> Result<(), ScanError> {
         let event = &record.event;
         if record.row_keys.is_empty() {
-            if target.covers_plain(event) {
+            if target.covers_plain(event) || self.cites_doomed(&event.payload) {
                 return Err(ScanError::PlaintextLogPresent {
                     event_id: event.event_id.clone(),
                 });
@@ -465,6 +465,22 @@ mod tests {
     async fn a_plain_row_of_the_subject_refuses_the_scan() {
         // Arrange
         let mut plain = node_event(1, "e2", "n2", Some("alice"), ALICE);
+        plain.row_keys.clear();
+        let log = reader(vec![node_event(0, "e1", "n1", Some("alice"), ALICE), plain]);
+
+        // Act
+        let result = scan(&log, &alice(), &groups()).await;
+
+        // Assert
+        assert!(
+            matches!(result, Err(ScanError::PlaintextLogPresent { event_id }) if event_id == "e2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_fact_write_citing_the_target_refuses_the_scan() {
+        // Arrange
+        let mut plain = fact_write(1, "e2", "e1", "key-fact");
         plain.row_keys.clear();
         let log = reader(vec![node_event(0, "e1", "n1", Some("alice"), ALICE), plain]);
 
