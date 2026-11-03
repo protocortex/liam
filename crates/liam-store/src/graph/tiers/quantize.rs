@@ -125,6 +125,18 @@ impl QuantIndex {
         self.write(|entries| ids.into_iter().for_each(|id| drop(entries.remove(id))));
     }
 
+    /// Marks the entries of `ids` cold or hot. An id the index does not hold is
+    /// skipped.
+    pub fn set_cold<'a>(&self, ids: impl IntoIterator<Item = &'a str>, cold: bool) {
+        self.write(|entries| {
+            for id in ids {
+                if let Some(entry) = entries.get_mut(id) {
+                    entry.cold = cold;
+                }
+            }
+        });
+    }
+
     /// Replaces every entry at once, so a reader sees the old index or the new.
     pub fn replace_all(&self, replacement: impl IntoIterator<Item = IndexedEntry>) {
         let replacement = replacement

@@ -33,12 +33,13 @@ pub use graph::{
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{
     relation, ArbitrationCaps, ArbitrationOutcome, Basis, Cardinality, Change, ChildKind,
-    ClosureReport, ClusterMember, ClusterState, Derivation, EndFact, EndOutcome, EventRef,
-    EventRole, ExplainedHit, ExtractorName, Fact, Fingerprint, GcReport, GraphConfig, Grounding,
-    Hit, InferredHit, InferredText, LineageKey, MatchMode, NewEdge, NewFact, NewNode, NewSummary,
-    PredicateSpec, PutOutcome, Query, RecordedHit, RecordedText, RetentionPolicy, RetentionRule,
-    RetractOutcome, Retrieved, Summary, SummaryChild, SummaryEntry, SummaryFailure, SummaryInput,
-    SummaryInputs, TreeState, Vocabulary,
+    ClosureReport, ClusterMember, ClusterState, CountedFeedback, Derivation, EndFact, EndOutcome,
+    EventRef, EventRole, ExplainedHit, ExtractorName, Fact, FeedbackEvent, Fingerprint, GcReport,
+    GraphConfig, Grounding, Hit, InferredHit, InferredText, ItemView, LineageKey, LineageNode,
+    MatchMode, NewEdge, NewFact, NewNode, NewSummary, PredicateSpec, PutOutcome, Query,
+    ReconcileReport, RecordedHit, RecordedText, RetentionPolicy, RetentionRule, RetractOutcome,
+    Retrieved, Summary, SummaryChild, SummaryEntry, SummaryFailure, SummaryInput, SummaryInputs,
+    Tier, TierMove, TreeState, UsageEntry, UsageSnapshot, Vocabulary,
 };
 pub use value::{Row, Value};
 

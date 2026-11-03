@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+const MILLIS_PER_DAY: i64 = 86_400_000;
+
 /// Milliseconds since the Unix epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Millis(pub i64);
@@ -25,7 +27,17 @@ impl Millis {
 
     /// A duration of `days` expressed in milliseconds, for retention windows.
     pub fn days(days: i64) -> Self {
-        Millis(days * 86_400_000)
+        Millis(days * MILLIS_PER_DAY)
+    }
+
+    /// The UTC day this instant falls in, as days since the epoch.
+    pub fn day_number(self) -> i64 {
+        self.0.div_euclid(MILLIS_PER_DAY)
+    }
+
+    /// The first instant of UTC day `day`, counted from the epoch.
+    pub fn start_of_day(day: i64) -> Self {
+        Self::days(day)
     }
 }
 

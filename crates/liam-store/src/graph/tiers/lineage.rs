@@ -6,10 +6,12 @@
 //! batch wrote, so the log needs no field for it. A node that replaces another
 //! copies that node's key; any other node gets its own.
 
-use crate::backend::BackendTx;
+use crate::backend::{Backend, BackendTx};
 use crate::error::Result;
-use crate::graph::opt_string;
-use crate::types::{relation, Derivation, LineageKey};
+use crate::graph::logged_write::commit_or_abandon;
+use crate::graph::{opt_string, Graph};
+use crate::ids::{NodeId, FOREVER};
+use crate::types::{relation, Derivation, LineageKey, Tier};
 
 /// Stands for a missing scope, which no length-prefixed field can equal.
 const NO_SCOPE: &str = "!";
@@ -70,14 +72,31 @@ const REPLACED_KEY_SQL: &str = "SELECT l.lineage_key FROM edges e
      WHERE e.src = ?1 AND e.type = ?2 ORDER BY e.id LIMIT 1";
 
 const NODE_FIELDS_SQL: &str =
-    "SELECT scope, subject, producer, derivation FROM nodes WHERE id = ?1";
+    "SELECT scope, subject, producer, derivation, tx_from FROM nodes WHERE id = ?1";
 
 const LINEAGE_INSERT_SQL: &str =
     "INSERT OR IGNORE INTO node_lineage (node_id, lineage_key) VALUES (?1, ?2)";
 
+/// Sets a cold lineage hot when a node is written for it, unless another live
+/// node of it is still cold. A cold node has no int8 form, which is how the
+/// transaction tells, because the vector table is the backend's. A lineage left
+/// cold is repaired by the next reconcile, which deletes the new node's vector
+/// only if it was written before the lineage went cold, so it keeps it.
+const COLD_TO_HOT_SQL: &str = "UPDATE item_tier
+     SET tier = ?5, changed_at = ?2, residency_until = NULL, last_event_id = NULL
+     WHERE lineage_key = ?1 AND tier = ?6
+       AND NOT EXISTS (
+         SELECT 1 FROM node_lineage l
+         JOIN nodes n ON n.id = l.node_id
+         JOIN node_quant q ON q.node_id = n.id
+         WHERE l.lineage_key = ?1 AND n.tx_to = ?3 AND n.id != ?4 AND q.i8 IS NULL)";
+
+const COLD_LINEAGE_SQL: &str = "SELECT 1 FROM item_tier WHERE lineage_key = ?1 AND tier = ?2";
+
 /// Records the lineage of `node_id`, which must already be in `tx` together
-/// with the `supersedes` edge that replaced another node, if any. A node that
-/// is gone is left alone, and so is one that has a key already.
+/// with the `supersedes` edge that replaced another node, if any, and wakes the
+/// lineage when it was cold. A node that is gone is left alone, and so is one
+/// that has a key already.
 pub(in crate::graph) async fn assign_lineage(tx: &mut dyn BackendTx, node_id: &str) -> Result<()> {
     let id = [node_id.into()];
     let fields = tx.query(NODE_FIELDS_SQL, &id).await?;
@@ -108,7 +127,116 @@ pub(in crate::graph) async fn assign_lineage(tx: &mut dyn BackendTx, node_id: &s
     };
     tx.execute(LINEAGE_INSERT_SQL, &[node_id.into(), key.as_str().into()])
         .await?;
+    // Most lineages have no tier row, so look before writing.
+    let cold = tx
+        .query(
+            COLD_LINEAGE_SQL,
+            &[key.as_str().into(), Tier::Cold.as_str().into()],
+        )
+        .await?;
+    if cold.is_empty() {
+        return Ok(());
+    }
+    let params = [
+        key.as_str().into(),
+        fields.get_i64(4)?.into(),
+        FOREVER.into(),
+        node_id.into(),
+        Tier::Hot.as_str().into(),
+        Tier::Cold.as_str().into(),
+    ];
+    tx.execute(COLD_TO_HOT_SQL, &params).await?;
     Ok(())
+}
+
+/// Nodes the lineage backfill assigns in one transaction.
+const BACKFILL_CHUNK: usize = 200;
+
+impl<B: Backend> Graph<B> {
+    /// The lineage of `node_id`, `None` when there is no such node. A node with
+    /// no stored key, which the backfill at open leaves none of, gets the key it
+    /// would be written with if it replaced nothing.
+    pub async fn lineage_of(&self, node_id: &NodeId) -> Result<Option<LineageKey>> {
+        let id = [node_id.as_str().into()];
+        let stored = self
+            .backend
+            .query(
+                "SELECT lineage_key FROM node_lineage WHERE node_id = ?1",
+                &id,
+            )
+            .await?;
+        if let Some(row) = stored.first() {
+            return Ok(Some(LineageKey::from_raw(row.get_string(0)?)));
+        }
+        let fields = self.backend.query(NODE_FIELDS_SQL, &id).await?;
+        let Some(fields) = fields.first() else {
+            return Ok(None);
+        };
+        let scope = opt_string(fields, 0)?;
+        let subject = opt_string(fields, 1)?;
+        let producer = fields.get_string(2)?;
+        Ok(Some(key_of_row(&KeyedRow {
+            id: node_id.as_str(),
+            scope: scope.as_deref(),
+            subject: subject.as_deref(),
+            producer: &producer,
+            derivation: Derivation::parse(&fields.get_string(3)?)?,
+        })))
+    }
+
+    /// Gives every node that has no lineage one, once. Nodes go in transaction
+    /// time order, so a version finds the key of the node it replaced already
+    /// stored and copies it, with no walk down the chain. The same step a write
+    /// runs assigns each one, so the two cannot differ. Returns how many it
+    /// assigned.
+    pub async fn backfill_lineage(&self) -> Result<usize> {
+        let done = self
+            .backend
+            .query("SELECT 1 FROM lineage_backfill_state WHERE id = 1", &[])
+            .await?;
+        if !done.is_empty() {
+            return Ok(0);
+        }
+        let mut assigned = 0;
+        let mut after = (i64::MIN, i64::MIN);
+        loop {
+            let rows = self
+                .backend
+                .query(
+                    "SELECT id, tx_from, rowid FROM nodes n
+                     WHERE NOT EXISTS (SELECT 1 FROM node_lineage WHERE node_id = n.id)
+                       AND (tx_from > ?1 OR (tx_from = ?1 AND rowid > ?2))
+                     ORDER BY tx_from, rowid LIMIT ?3",
+                    &[
+                        after.0.into(),
+                        after.1.into(),
+                        (BACKFILL_CHUNK as i64).into(),
+                    ],
+                )
+                .await?;
+            let Some(last) = rows.last() else { break };
+            after = (last.get_i64(1)?, last.get_i64(2)?);
+            let mut tx = self.backend.begin().await?;
+            let chunk = async {
+                for row in &rows {
+                    assign_lineage(&mut *tx, &row.get_string(0)?).await?;
+                }
+                Ok(())
+            }
+            .await;
+            commit_or_abandon(tx, chunk).await?;
+            assigned += rows.len();
+        }
+        self.backend
+            .execute(
+                "INSERT OR REPLACE INTO lineage_backfill_state (id, completed_at, filled)
+                 VALUES (1, ?1, ?2)",
+                &[self.clock.now().into(), (assigned as i64).into()],
+            )
+            .await?;
+        tracing::info!(assigned, "lineage assigned to nodes that had none");
+        Ok(assigned)
+    }
 }
 
 #[cfg(test)]

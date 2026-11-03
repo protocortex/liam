@@ -93,6 +93,124 @@ impl LineageKey {
     }
 }
 
+/// Where an item's embeddings are kept. A hot item has its f32 vector, int8 form
+/// and signature; a cold one keeps its row, text index, edges and signature only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tier {
+    Hot,
+    Cold,
+}
+
+impl Tier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hot => "hot",
+            Self::Cold => "cold",
+        }
+    }
+
+    /// The tier `text` names. Anything else is an error, not a default.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "hot" => Ok(Self::Hot),
+            "cold" => Ok(Self::Cold),
+            other => Err(Error::UnknownTier(other.to_string())),
+        }
+    }
+}
+
+/// A change of tier for one lineage. `run_id` and `reason` say who moved it and
+/// why, for the record that logs the move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TierMove {
+    pub lineage_key: LineageKey,
+    pub to: Tier,
+    pub run_id: String,
+    pub reason: String,
+    pub changed_at: Millis,
+    /// Until when the lineage stays where it was put, for a promotion.
+    pub residency_until: Option<Millis>,
+}
+
+/// The accesses of one lineage in one logged batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageEntry {
+    pub lineage_key: LineageKey,
+    pub hits: u32,
+    pub last_access_at: Millis,
+}
+
+/// A verdict on one result, as a producer gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedbackEvent {
+    pub event_id: String,
+    pub lineage_key: LineageKey,
+    pub producer: String,
+    pub at: Millis,
+    pub correct: bool,
+}
+
+/// A feedback event that counted, as the utility reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CountedFeedback {
+    pub producer: String,
+    pub at: Millis,
+    pub correct: bool,
+}
+
+/// Everything the planner reads about one lineage that has a live node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ItemView {
+    pub lineage_key: LineageKey,
+    /// When the newest live version was written, by transaction time.
+    pub newest_tx_from: Millis,
+    /// Hits per day as (day, hits), for the days inside the window, oldest first.
+    pub hits_by_day: Vec<(i64, i64)>,
+    pub last_access_at: Option<Millis>,
+    /// Counted feedback, newest first.
+    pub feedback: Vec<CountedFeedback>,
+    pub tier: Tier,
+    pub changed_at: Option<Millis>,
+    pub residency_until: Option<Millis>,
+    /// Some live node of the lineage has a vector.
+    pub has_vector: bool,
+    /// Every live node of the lineage that has a vector also has a signature.
+    pub has_signature: bool,
+    /// The producer of the newest live node.
+    pub producer: String,
+}
+
+/// A consistent read of usage, feedback and tiers, taken once per run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageSnapshot {
+    pub now: Millis,
+    /// The start of the day of the earliest logged usage batch, `None` before
+    /// the first.
+    pub observation_since: Option<Millis>,
+    /// Ordered by lineage key.
+    pub items: Vec<ItemView>,
+}
+
+/// What `reconcile_tier_vectors` did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Vectors deleted from nodes of a cold lineage.
+    pub deleted: usize,
+    /// Nodes written after the lineage went cold, which keep their vector.
+    pub skipped_late: usize,
+    /// Nodes with a vector and no signature, which keep it.
+    pub skipped_unsigned: usize,
+}
+
+/// A live node of a lineage and what it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineageNode {
+    pub node_id: NodeId,
+    pub tx_from: Millis,
+    pub has_vector: bool,
+    pub has_signature: bool,
+}
+
 /// How a stored row came to be. Strict reads leave out `Inferred` rows, which
 /// a model composed, so they never stand in for something a client recorded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

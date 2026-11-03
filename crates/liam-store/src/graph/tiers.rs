@@ -6,6 +6,7 @@
 
 mod lineage;
 mod quantize;
+mod state;
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::Result;
 use crate::ids::{NodeId, FOREVER};
+use crate::types::Tier;
 use crate::value::Value;
 use liam_log::event::TombstoneTable;
 
@@ -86,16 +88,19 @@ impl<B: Backend> Graph<B> {
         let rows = self
             .backend
             .query(
-                "SELECT q.node_id, q.bin FROM node_quant q
-                 JOIN nodes n ON n.id = q.node_id WHERE n.tx_to = ?1",
-                &[FOREVER.into()],
+                "SELECT q.node_id, q.bin, t.tier IS NOT NULL
+                 FROM node_quant q JOIN nodes n ON n.id = q.node_id
+                 LEFT JOIN node_lineage l ON l.node_id = q.node_id
+                 LEFT JOIN item_tier t ON t.lineage_key = l.lineage_key AND t.tier = ?2
+                 WHERE n.tx_to = ?1",
+                &[FOREVER.into(), Tier::Cold.as_str().into()],
             )
             .await?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in &rows {
             let id = row.get_string(0)?;
             match bytes_to_words(row.get_blob(1)?) {
-                Some(bin) => entries.push((id, false, bin)),
+                Some(bin) => entries.push((id, row.get_i64(2)? != 0, bin)),
                 None => {
                     tracing::warn!(node = %id, "signature has a ragged length, left out of the index")
                 }
@@ -129,8 +134,25 @@ impl<B: Backend> Graph<B> {
             .into_iter()
             .filter(|(id, _)| !gone.contains(&id.as_str()))
         {
-            self.quant.insert(id, false, bin.clone());
+            // A node written into a cold lineage that stayed cold is cold too.
+            let cold = self.node_is_cold(id).await.unwrap_or_else(|error| {
+                tracing::warn!(node = %id, %error, "tier unreadable, indexed hot until the next reload");
+                false
+            });
+            self.quant.insert(id, cold, bin.clone());
         }
+    }
+
+    async fn node_is_cold(&self, node_id: &str) -> Result<bool> {
+        let rows = self
+            .backend
+            .query(
+                "SELECT 1 FROM node_lineage l JOIN item_tier t ON t.lineage_key = l.lineage_key
+                 WHERE l.node_id = ?1 AND t.tier = ?2",
+                &[node_id.into(), Tier::Cold.as_str().into()],
+            )
+            .await?;
+        Ok(!rows.is_empty())
     }
 
     /// Stores the forms of `embedding` for a live node that has none, so a

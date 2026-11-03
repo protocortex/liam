@@ -685,6 +685,8 @@ impl<B: Backend> Graph<B> {
             quant: QuantIndex::default(),
             quant_gate: tiers::IndexGate::default(),
         };
+        // Lineage first: it is what the index reload joins the tiers through.
+        graph.backfill_lineage().await?;
         graph.reload_quant_index().await?;
         Ok(graph)
     }
@@ -2479,6 +2481,7 @@ mod tests {
     mod summary_log;
     mod support;
     mod swept_by;
+    mod tiers;
     mod typed_retrieval;
     mod vector_reads;
 

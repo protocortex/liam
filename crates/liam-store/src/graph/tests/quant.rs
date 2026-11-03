@@ -11,21 +11,21 @@ use super::*;
 use crate::types::{LineageKey, RetentionPolicy};
 use crate::DefaultBackend;
 
-const DIMS: usize = 8;
+pub(super) const DIMS: usize = 8;
 
 /// A vector whose sign pattern is `pattern`: component `j` is positive when bit
 /// `j` is set. Its signature is `pattern`, so distances are easy to state.
-fn signed(pattern: u8) -> Vec<f32> {
+pub(super) fn signed(pattern: u8) -> Vec<f32> {
     (0..DIMS)
         .map(|bit| if pattern >> bit & 1 == 1 { 1.0 } else { -1.0 })
         .collect()
 }
 
-fn node(label: &str, pattern: u8) -> NewNode {
+pub(super) fn node(label: &str, pattern: u8) -> NewNode {
     NewNode::now("fact", label, format!("content of {label}")).with_embedding(signed(pattern))
 }
 
-async fn open_at(t: Millis) -> DefaultGraph {
+pub(super) async fn open_at(t: Millis) -> DefaultGraph {
     DefaultGraph::open_with_clock(
         ":memory:",
         GraphConfig::new(DIMS),
@@ -35,11 +35,11 @@ async fn open_at(t: Millis) -> DefaultGraph {
     .unwrap()
 }
 
-async fn quant_ids<B: Backend>(g: &Graph<B>) -> Vec<String> {
+pub(super) async fn quant_ids<B: Backend>(g: &Graph<B>) -> Vec<String> {
     column(g, "SELECT node_id FROM node_quant ORDER BY node_id").await
 }
 
-async fn column<B: Backend>(g: &Graph<B>, sql: &str) -> Vec<String> {
+pub(super) async fn column<B: Backend>(g: &Graph<B>, sql: &str) -> Vec<String> {
     g.backend
         .query(sql, &[])
         .await
@@ -49,7 +49,7 @@ async fn column<B: Backend>(g: &Graph<B>, sql: &str) -> Vec<String> {
         .collect()
 }
 
-fn indexed_ids<B: Backend>(g: &Graph<B>) -> Vec<String> {
+pub(super) fn indexed_ids<B: Backend>(g: &Graph<B>) -> Vec<String> {
     g.quant_index()
         .snapshot()
         .into_iter()
@@ -59,7 +59,7 @@ fn indexed_ids<B: Backend>(g: &Graph<B>) -> Vec<String> {
 
 /// The ids of the live nodes that have a signature row, which the index must
 /// hold exactly.
-async fn live_signed<B: Backend>(g: &Graph<B>) -> Vec<String> {
+pub(super) async fn live_signed<B: Backend>(g: &Graph<B>) -> Vec<String> {
     column(
         g,
         "SELECT q.node_id FROM node_quant q JOIN nodes n ON n.id = q.node_id
@@ -68,7 +68,7 @@ async fn live_signed<B: Backend>(g: &Graph<B>) -> Vec<String> {
     .await
 }
 
-async fn lineages<B: Backend>(g: &Graph<B>) -> BTreeMap<String, String> {
+pub(super) async fn lineages<B: Backend>(g: &Graph<B>) -> BTreeMap<String, String> {
     g.backend
         .query("SELECT node_id, lineage_key FROM node_lineage", &[])
         .await
