@@ -32,7 +32,7 @@ const QUANT_COLUMNS: &str = "node_id, bin, i8, scale, quant_version";
 pub(super) type IndexGate = Arc<tokio::sync::Mutex<()>>;
 
 fn quant_params(node_id: &str, quantized: &Quantized) -> Vec<Value> {
-    let int8 = quantized.i8.iter().map(|c| c.to_le_bytes()[0]).collect();
+    let int8 = quantized.i8.iter().map(|c| *c as u8).collect();
     vec![
         node_id.into(),
         words_to_bytes(&quantized.bin).into(),
