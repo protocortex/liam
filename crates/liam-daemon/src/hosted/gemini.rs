@@ -23,8 +23,12 @@ impl Dialect for Gemini {
         format!("https://{HOST}/v1beta/models/{model}:generateContent")
     }
 
-    fn headers(&self, key: &SecretString, _call: &ChatCall<'_>) -> Vec<(String, SecretString)> {
+    fn auth_headers(&self, key: &SecretString) -> Vec<(String, SecretString)> {
         base_headers(KEY_HEADER, SecretString::new(key.expose()))
+    }
+
+    fn headers(&self, key: &SecretString, _call: &ChatCall<'_>) -> Vec<(String, SecretString)> {
+        self.auth_headers(key)
     }
 
     fn body(&self, _model: &str, call: &ChatCall<'_>) -> Value {

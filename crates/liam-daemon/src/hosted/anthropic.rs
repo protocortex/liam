@@ -23,13 +23,17 @@ impl Dialect for Anthropic {
         format!("https://{HOST}{PATH}")
     }
 
-    fn headers(&self, key: &SecretString, _call: &ChatCall<'_>) -> Vec<(String, SecretString)> {
+    fn auth_headers(&self, key: &SecretString) -> Vec<(String, SecretString)> {
         let mut headers = base_headers(KEY_HEADER, SecretString::new(key.expose()));
         headers.push((
             VERSION_HEADER.0.to_owned(),
             SecretString::new(VERSION_HEADER.1),
         ));
         headers
+    }
+
+    fn headers(&self, key: &SecretString, _call: &ChatCall<'_>) -> Vec<(String, SecretString)> {
+        self.auth_headers(key)
     }
 
     fn body(&self, model: &str, call: &ChatCall<'_>) -> Value {

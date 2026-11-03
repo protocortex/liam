@@ -11,7 +11,7 @@ use liam_daemon::consolidation::manifest::manifest_path_for;
 use liam_daemon::consolidation::tier_history::history_path_for;
 use liam_store::{DefaultGraph, LineageHits, LineageStore, LineageTarget, PurgeReport, Residual};
 
-use super::batch_lineage::{BatchLineage, NoProviderDelete};
+use super::batch_lineage::{BatchCanceller, BatchLineage};
 use super::batch_store::{batch_store_path_for, BatchStore};
 use super::files::{BloomLineage, CacheStoreLineage, SnapshotLineage, StateFileLineage};
 use super::job::{job_file_path_for, JobStore};
@@ -36,12 +36,14 @@ impl LineageRegistry {
 
     /// Every store a delete of the database at `database_path` reaches, the
     /// database first. `states` are the in-memory holders of node ids that are
-    /// alive in this process.
+    /// alive in this process. `canceller` reaches the providers that hold
+    /// batches of the database.
     pub fn for_database(
         database_path: &Path,
         snapshot_dir: &Path,
         graph: Arc<DefaultGraph>,
         states: Vec<Arc<dyn NodeState>>,
+        canceller: Arc<dyn BatchCanceller>,
     ) -> anyhow::Result<Self> {
         let mut registry = Self::new()
             .with(Arc::clone(&graph))
@@ -61,7 +63,7 @@ impl LineageRegistry {
                 batches,
                 ledger,
                 JobStore::new(job_file_path_for(database_path)),
-                Arc::new(NoProviderDelete),
+                canceller,
             ));
         }
         Ok(registry

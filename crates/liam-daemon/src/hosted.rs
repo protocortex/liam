@@ -4,11 +4,16 @@
 //! redirects and inside its limits are tested without a socket.
 
 pub mod anthropic;
+// Only cancel is used so far; the extraction loop takes submit, poll and collect.
+#[allow(dead_code)]
+pub mod batch;
+pub mod canceller;
 pub mod client;
 pub mod cost;
 pub mod dialect;
 pub mod gemini;
 pub mod model;
+pub mod multipart;
 pub mod openai;
 pub mod secrets;
 pub mod summariser;
@@ -21,21 +26,26 @@ use anyhow::Context;
 use async_trait::async_trait;
 use liam_log::crypto::KeychainItems;
 
+use self::batch::{AnthropicBatch, GeminiBatch, HostedBatch, OpenAiBatch};
+use self::canceller::HostedCanceller;
 use self::client::HostedClient;
 use self::cost::CostRecorder;
 use self::dialect::Dialect;
 use self::model::{hosted_identity, HostedModel};
-use self::secrets::SecretSource;
+use self::secrets::{SecretSource, SecretString};
 use self::summariser::{HostedExtractorProvider, HostedSummariser};
 use self::transport::UreqTransport;
-use crate::config::{Config, Provider};
+use crate::config::{Config, ModelPin, Provider};
+use crate::deletion::BatchCanceller;
 use crate::extraction::client::ModelIdentity;
 use crate::extraction::gate::ProviderGate;
 use crate::extraction::identity::IdentitySource;
 use crate::extraction::setup::Backend;
 use crate::extraction::sidecar::FreeRam;
 use crate::metrics::recorder::Metrics;
+use crate::metrics::sink::LogSink;
 use crate::summary::summariser::Summariser;
+use liam_store::SystemClock;
 
 const KEYCHAIN_SERVICE_PREFIX: &str = "liam-";
 
@@ -68,17 +78,11 @@ fn key_source(config: &Config, provider: Provider) -> SecretSource {
     }
 }
 
-/// The pinned model of `provider`, with its key read and its calls counted in
-/// `metrics`.
-///
-/// # Errors
-///
-/// Fails when the provider has no pin or its key cannot be read.
-pub fn open_model(
+/// The client, pin and key every call to `provider` needs.
+fn connect(
     config: &Config,
     provider: Provider,
-    metrics: Arc<Metrics>,
-) -> anyhow::Result<Arc<HostedModel<UreqTransport>>> {
+) -> anyhow::Result<(HostedClient<UreqTransport>, ModelPin, SecretString)> {
     let pin = config
         .hosted
         .pin_for(provider)
@@ -93,13 +97,60 @@ pub fn open_model(
         })?;
     let hosted = &config.hosted;
     let transport = UreqTransport::new(Duration::from_secs(hosted.request_timeout_secs));
+    Ok((HostedClient::new(transport, hosted), pin, key))
+}
+
+/// The pinned model of `provider`, with its key read and its calls counted in
+/// `metrics`.
+///
+/// # Errors
+///
+/// Fails when the provider has no pin or its key cannot be read.
+pub fn open_model(
+    config: &Config,
+    provider: Provider,
+    metrics: Arc<Metrics>,
+) -> anyhow::Result<Arc<HostedModel<UreqTransport>>> {
+    let (client, pin, key) = connect(config, provider)?;
     Ok(Arc::new(HostedModel::new(
-        HostedClient::new(transport, hosted),
+        client,
         dialect_for(provider)?,
         pin,
         key,
-        CostRecorder::new(metrics, hosted.prices.clone()),
+        CostRecorder::new(metrics, config.hosted.prices.clone()),
     )))
+}
+
+/// The batch client of `provider`, with its key read and its results counted
+/// in `metrics` at the batch rate.
+///
+/// # Errors
+///
+/// Fails as [`open_model`] does.
+pub fn open_batch(
+    config: &Config,
+    provider: Provider,
+    metrics: Arc<Metrics>,
+) -> anyhow::Result<Arc<dyn HostedBatch>> {
+    let (client, pin, key) = connect(config, provider)?;
+    let costs = CostRecorder::new(metrics, config.hosted.prices.clone());
+    Ok(match provider {
+        Provider::Anthropic => Arc::new(AnthropicBatch::new(client, pin, key, costs)),
+        Provider::OpenAi => Arc::new(OpenAiBatch::new(client, pin, key, costs)),
+        Provider::Gemini => Arc::new(GeminiBatch::new(client, pin, key, costs)),
+        Provider::Local => anyhow::bail!("the local model is not a hosted provider"),
+    })
+}
+
+/// Cancels and deletes hosted batches for a delete job.
+pub fn canceller(config: &Config) -> Arc<dyn BatchCanceller> {
+    let clock = Arc::new(SystemClock);
+    let sink = Arc::new(LogSink::new(clock.clone()));
+    let metrics = Arc::new(Metrics::new(sink, clock, 1));
+    let config = config.clone();
+    Arc::new(HostedCanceller::new(move |provider| {
+        open_batch(&config, provider, metrics.clone())
+    }))
 }
 
 /// The summariser for a hosted `provider`.
@@ -236,6 +287,27 @@ mod tests {
         assert!(format!("{loose_error:#}").contains("anthropic key"));
         assert!(format!("{pin_error:#}").contains("hosted.models.anthropic"));
         assert!(local.to_string().contains("not a hosted provider"));
+    }
+
+    #[tokio::test]
+    async fn a_batch_client_opens_under_its_pin_and_a_delete_without_a_pin_keeps_the_copy() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_key(dir.path(), 0o600);
+        let (metrics, _) = metrics();
+
+        // Act
+        let batch = open_batch(&config, Provider::Anthropic, metrics.clone());
+        let local = open_batch(&config, Provider::Local, metrics).err().unwrap();
+        let kept = canceller(&Config::default())
+            .cancel("anthropic", "msgbatch_1")
+            .await
+            .unwrap();
+
+        // Assert
+        assert!(batch.is_ok());
+        assert!(local.to_string().contains("hosted.models.local"), "{local}");
+        assert_eq!(kept, crate::deletion::ProviderCopies::Kept);
     }
 
     #[tokio::test]

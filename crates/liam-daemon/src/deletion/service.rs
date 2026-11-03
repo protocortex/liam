@@ -19,6 +19,7 @@ use liam_log::crypto::KeyRegistry;
 use liam_log::reader::LogReader;
 use liam_store::{Clock, DefaultGraph, DeletionRecord, LineageHits, LineageTarget};
 
+use super::batch_lineage::canceller_for;
 use super::job::{job_file_path_for, DeadlineAlert, DeleteJob, Failure, JobState, JobStore};
 use super::memory::NodeState;
 use super::registry::LineageRegistry;
@@ -197,6 +198,7 @@ impl DeleteService {
             &snapshot_dir,
             Arc::clone(&parts.store),
             states,
+            canceller_for(config),
         )?;
         Ok(Self::new(
             DeleteDeps {

@@ -13,7 +13,7 @@ use super::cost::CostRecorder;
 use super::dialect::Dialect;
 use super::model::HostedModel;
 use super::secrets::SecretString;
-use super::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
+use super::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 use crate::config::{HostedConfig, ModelPin, Price, PricesConfig, Provider};
 use crate::metrics::recorder::Metrics;
 use crate::metrics::sink::{MemorySink, MetricsSink};
@@ -24,9 +24,13 @@ pub const PRICE_VERSION: &str = "test-2026-11";
 /// One recorded request, with the secrets read out for assertions.
 #[derive(Debug, Clone)]
 pub struct Seen {
+    pub method: Method,
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// The body as JSON, or `Null` when it is not JSON.
     pub body: serde_json::Value,
+    pub content_type: Option<String>,
+    pub raw_body: Vec<u8>,
 }
 
 /// Answers each call from a script and records what it was sent.
@@ -57,15 +61,18 @@ impl FakeTransport {
 
 #[async_trait]
 impl HttpTransport for FakeTransport {
-    async fn post_json(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
         self.seen.lock().unwrap().push(Seen {
+            method: request.method,
             url: request.url.clone(),
             headers: request
                 .headers
                 .iter()
                 .map(|(name, value)| (name.clone(), value.expose().to_owned()))
                 .collect(),
-            body: serde_json::from_slice(&request.body).expect("a JSON request"),
+            body: serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null),
+            content_type: request.content_type.clone(),
+            raw_body: request.body.clone(),
         });
         self.answers
             .lock()

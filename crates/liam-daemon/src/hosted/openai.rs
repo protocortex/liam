@@ -25,11 +25,15 @@ impl Dialect for OpenAi {
         format!("https://{HOST}{PATH}")
     }
 
-    fn headers(&self, key: &SecretString, call: &ChatCall<'_>) -> Vec<(String, SecretString)> {
-        let mut headers = base_headers(
+    fn auth_headers(&self, key: &SecretString) -> Vec<(String, SecretString)> {
+        base_headers(
             KEY_HEADER,
             SecretString::new(format!("{BEARER}{}", key.expose())),
-        );
+        )
+    }
+
+    fn headers(&self, key: &SecretString, call: &ChatCall<'_>) -> Vec<(String, SecretString)> {
+        let mut headers = self.auth_headers(key);
         headers.push((
             REQUEST_ID_HEADER.to_owned(),
             SecretString::new(call.request_id),
