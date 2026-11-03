@@ -18,7 +18,15 @@ pub async fn open_database(config: &Config, database_path: &Path) -> anyhow::Res
     let path = database_path
         .to_str()
         .context("the database path is not UTF-8")?;
-    let graph = GraphConfig::new(config.embedding_dims).with_read_pool_size(config.read_pool_size);
+    let tiering = &config.tiering;
+    let graph = GraphConfig::new(config.embedding_dims)
+        .with_read_pool_size(config.read_pool_size)
+        .with_cold_arm(
+            tiering.cold_arm_weight,
+            tiering.cold_max_hamming_ratio,
+            tiering.cold_oversample,
+            tiering.cold_probe_pool,
+        );
     Ok(DefaultGraph::open(path, graph).await?)
 }
 

@@ -22,6 +22,7 @@ mod summary;
 mod synthesis;
 #[cfg(test)]
 mod test_logs;
+mod tiering;
 /// Grounding eval for remember/recall/relate; test-only, see the module docs to run each tier.
 #[cfg(test)]
 mod tool_eval;

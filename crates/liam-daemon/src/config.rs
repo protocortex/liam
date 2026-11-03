@@ -14,6 +14,7 @@ use serde::Deserialize;
 mod consolidation;
 mod extraction;
 mod summary;
+mod tiering;
 
 pub(crate) use consolidation::default_snapshot_dir;
 pub use consolidation::ConsolidationConfig;
@@ -25,6 +26,7 @@ pub use summary::{
     SummaryConfig, DEFAULT_MAX_BASIS_IDS_RENDERED, DEFAULT_MIN_SUMMARY_SIMILARITY,
     MAX_SUMMARY_DEPTH,
 };
+pub use tiering::TieringConfig;
 
 /// Producer ids starting with this are reserved for consolidation writes.
 pub const RESERVED_PRODUCER_PREFIX: &str = "consolidation";
@@ -73,6 +75,8 @@ pub struct Config {
     pub consolidation: ConsolidationConfig,
     /// The summary tree built over recorded nodes. Off by default.
     pub summary: SummaryConfig,
+    /// Moving unused items' vectors out of the hot tier. Off by default.
+    pub tiering: TieringConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -188,6 +192,7 @@ impl Default for Config {
             extraction: ExtractionConfig::default(),
             consolidation: ConsolidationConfig::default(),
             summary: SummaryConfig::default(),
+            tiering: TieringConfig::default(),
         }
     }
 }
@@ -404,6 +409,7 @@ impl Config {
         config.extraction.validate()?;
         config.consolidation.validate()?;
         config.summary.validate()?;
+        config.tiering.validate()?;
         Ok(config)
     }
 
