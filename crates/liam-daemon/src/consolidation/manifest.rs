@@ -17,12 +17,12 @@ const MANIFEST_SUFFIX: &str = ".consolidation.json";
 /// Layout version of the manifest file, written as `version`. Any new manifest
 /// field must bump it: `flatten` rules out `deny_unknown_fields`, so an older
 /// build would silently drop the field and rewrite the file without it.
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 
 /// Versions this build reads. A file with any other version is refused rather
-/// than guessed at. Version 3 lacks only `extraction_model`, which defaults, so
-/// a run it records stays resumable and never blocks a new one.
-const READABLE_VERSIONS: [u32; 2] = [3, FORMAT_VERSION];
+/// than guessed at. Older versions lack only fields that default, so a run they
+/// record stays resumable and never blocks a new one.
+const READABLE_VERSIONS: [u32; 3] = [3, 4, FORMAT_VERSION];
 
 /// How a finished run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +59,13 @@ pub struct RunManifest {
     /// Set when the extraction step ran a model.
     #[serde(default)]
     pub extraction_model: Option<ExtractionModel>,
+    /// The hash of the plan the tier step applied.
+    #[serde(default)]
+    pub tier_plan_hash: Option<String>,
+    /// The lineages the tier step moved, so a rollback can leave them alone for
+    /// a while.
+    #[serde(default)]
+    pub tier_moved_lineages: Vec<String>,
     pub completed_steps: Vec<String>,
     pub outcome: Option<RunOutcome>,
 }
@@ -146,6 +153,8 @@ impl RunManifest {
             snapshot_database_path: None,
             dedup_resume_from: None,
             extraction_model: None,
+            tier_plan_hash: None,
+            tier_moved_lineages: Vec::new(),
             completed_steps: Vec::new(),
             outcome: None,
         }
@@ -385,8 +394,8 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let previous: String = text
             .lines()
-            .filter(|line| !line.contains("extraction_model"))
-            .map(|line| line.replace("\"version\": 4", "\"version\": 3") + "\n")
+            .filter(|line| !line.contains("extraction_model") && !line.contains("tier_"))
+            .map(|line| line.replace("\"version\": 5", "\"version\": 3") + "\n")
             .collect();
         assert!(previous.contains("\"version\": 3"));
         std::fs::write(&path, previous).unwrap();

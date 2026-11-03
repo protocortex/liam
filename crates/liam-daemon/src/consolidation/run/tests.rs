@@ -22,6 +22,7 @@ pub(super) const MARGIN: f64 = 0.02;
 pub(super) const THRESHOLD: f32 = 0.9;
 pub(super) const PROBE_COUNT: usize = 4;
 pub(super) const SEED: u64 = 11;
+pub(super) const COOLDOWN_RUNS: u32 = 3;
 pub(super) const TOPICS: usize = 6;
 pub(super) const DUPLICATE: &str = "topic0 detail again";
 const MANY_NODES: usize = 520;
@@ -135,7 +136,7 @@ pub(super) struct FailingTier;
 
 #[async_trait]
 impl TierHook for FailingTier {
-    async fn tier(&self, _ctx: &TierCtx) -> anyhow::Result<TierReport> {
+    async fn tier(&self, _ctx: &TierCtx<'_>) -> anyhow::Result<TierReport> {
         anyhow::bail!("tier part failed")
     }
 }
@@ -399,6 +400,7 @@ impl Env {
             dedup_similarity_threshold: THRESHOLD,
             snapshot_dir: self.dir.path().join("snapshots"),
             probe_count,
+            tier_cooldown_runs: COOLDOWN_RUNS,
         };
         let identity = Identity {
             embedder: fingerprint(),

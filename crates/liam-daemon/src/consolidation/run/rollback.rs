@@ -119,6 +119,7 @@ impl Consolidator {
         manifest.outcome = Some(outcome);
         manifest.save(&self.manifest_path())?;
         if outcome == RunOutcome::RolledBack {
+            self.record_tier_outcome(&manifest);
             self.discard_leftovers(&manifest);
         }
         Ok(manifest)

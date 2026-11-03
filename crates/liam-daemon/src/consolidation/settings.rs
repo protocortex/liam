@@ -20,6 +20,7 @@ pub fn run_settings(config: &Config, database: &Path) -> anyhow::Result<RunSetti
         dedup_similarity_threshold: section.dedup_similarity_threshold,
         snapshot_dir: resolve_snapshot_dir(config, database)?,
         probe_count: section.probe_count,
+        tier_cooldown_runs: config.tiering.cooldown_runs,
     })
 }
 
