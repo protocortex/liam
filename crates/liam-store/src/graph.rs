@@ -655,6 +655,8 @@ pub struct Graph<B: Backend> {
     /// Orders each update of `quant` after the commit it reports, and a reload
     /// of it after the tables it reads.
     quant_gate: tiers::IndexGate,
+    /// Lets one tier move at a time read the lineage it moves and then move it.
+    tier_gate: tokio::sync::Mutex<()>,
 }
 
 impl<B: Backend> Graph<B> {
@@ -716,6 +718,7 @@ impl<B: Backend> Graph<B> {
             quant: QuantIndex::default(),
             cold_arm: ColdArm::of(&config),
             quant_gate: tiers::IndexGate::default(),
+            tier_gate: tokio::sync::Mutex::new(()),
         };
         // Lineage first: it is what the index reload joins the tiers through.
         graph.backfill_lineage().await?;
@@ -2517,7 +2520,10 @@ mod tests {
     mod summary_log;
     mod support;
     mod swept_by;
+    mod tier_apply;
     mod tier_log;
+    mod tier_race;
+    mod tier_verify;
     mod tiers;
     mod typed_retrieval;
     mod vector_reads;
@@ -8226,12 +8232,24 @@ mod tests {
         /// Fails the first statement of a transaction that binds this row id,
         /// whatever its position in the transaction.
         fail_on_row: std::sync::Mutex<Option<String>>,
+        /// The `vector_delete` call, counted from `set_fail_on_vector_delete`,
+        /// that fails.
+        fail_on_vector_delete: std::sync::atomic::AtomicUsize,
+        vector_deletes: std::sync::atomic::AtomicUsize,
         probe: TxProbe,
     }
 
     impl FailingBackend {
         fn set_fail_on_execute(&self, n: usize) {
             self.fail_on_execute
+                .store(n, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Fails the `n`th (1-based) `vector_delete` from now on.
+        fn set_fail_on_vector_delete(&self, n: usize) {
+            self.vector_deletes
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            self.fail_on_vector_delete
                 .store(n, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -8253,6 +8271,8 @@ mod tests {
                 inner: crate::backends::DefaultBackend::open(path, read_pool_size).await?,
                 fail_on_execute: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 fail_on_row: std::sync::Mutex::new(None),
+                fail_on_vector_delete: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                vector_deletes: std::sync::atomic::AtomicUsize::new(0),
                 probe: TxProbe::default(),
             })
         }
@@ -8284,6 +8304,17 @@ mod tests {
             self.inner.vector_clear_sql()
         }
         async fn vector_delete(&self, node_id: &str) -> Result<()> {
+            let call = self
+                .vector_deletes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if call
+                == self
+                    .fail_on_vector_delete
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Backend("injected vector_delete failure".to_string()));
+            }
             self.inner.vector_delete(node_id).await
         }
         async fn vector_get(&self, node_id: &str, dims: usize) -> Result<Option<Vec<f32>>> {

@@ -14,7 +14,8 @@ use super::fact_projection::{apply_fact_step, fact_steps, FactStep};
 use super::logged_plan::Table;
 use super::summaries::{apply_artifact, close_if_open, store_embedding};
 use super::tiers::{
-    apply_feedback_in, apply_tier_in, apply_usage_in, assign_lineage, insert_quant, Quantized,
+    apply_feedback_in, apply_tier_in, apply_usage_in, assign_lineage, insert_quant, replace_quant,
+    Quantized,
 };
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
@@ -59,6 +60,12 @@ pub(super) enum Step {
     /// node; the log does not carry embeddings, so `steps_for` never yields it
     /// and a replay leaves the node to the re-embed pass.
     Quant {
+        node_id: String,
+        quantized: Quantized,
+    },
+    /// Replaces the forms of a node's embedding, as a promotion does when it
+    /// brings the vector back. Like `Quant`, only a live write adds it.
+    Requant {
         node_id: String,
         quantized: Quantized,
     },
@@ -313,6 +320,7 @@ pub(super) async fn apply_steps(
             Step::Remove(target) => remove_row(tx, target, vector_delete).await?,
             Step::Lineage { node_id } => assign_lineage(tx, node_id).await?,
             Step::Quant { node_id, quantized } => insert_quant(tx, node_id, quantized).await?,
+            Step::Requant { node_id, quantized } => replace_quant(tx, node_id, quantized).await?,
             Step::Usage {
                 event_id,
                 day,

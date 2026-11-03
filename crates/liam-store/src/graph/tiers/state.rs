@@ -11,8 +11,8 @@ use crate::graph::logged_write::commit_or_abandon;
 use crate::graph::Graph;
 use crate::ids::{Millis, NodeId, FOREVER};
 use crate::types::{
-    CountedFeedback, FeedbackEvent, ItemView, LineageKey, LineageNode, ReconcileReport, Tier,
-    TierMove, UsageEntry, UsageSnapshot,
+    CountedFeedback, FeedbackEvent, ItemView, LineageKey, LineageNode, NodeText, ReconcileReport,
+    Tier, TierMove, UsageEntry, UsageSnapshot,
 };
 use crate::value::{Row, Value};
 
@@ -22,6 +22,12 @@ pub(in crate::graph) const TIER_UPSERT_SQL: &str = "INSERT INTO item_tier
      ON CONFLICT(lineage_key) DO UPDATE SET
        tier = excluded.tier, changed_at = excluded.changed_at,
        residency_until = excluded.residency_until, last_event_id = excluded.last_event_id";
+
+/// The nodes a demotion leaves without an int8 form: those of the lineage in
+/// `?1` that are live at `?2` and were written no later than `?3`.
+const DROP_INT8_SQL: &str = "UPDATE node_quant SET i8 = NULL WHERE i8 IS NOT NULL AND node_id IN
+       (SELECT n.id FROM nodes n JOIN node_lineage l ON l.node_id = n.id
+        WHERE l.lineage_key = ?1 AND n.tx_to = ?2 AND n.tx_from <= ?3)";
 
 const USAGE_EPOCH_SQL: &str = "INSERT OR IGNORE INTO usage_epochs (event_id, day) VALUES (?1, ?2)";
 
@@ -45,6 +51,34 @@ const DEMOTED_NODES: &str = "FROM nodes n
      JOIN item_tier t ON t.lineage_key = l.lineage_key AND t.tier = ?1
      JOIN node_quant q ON q.node_id = n.id
      WHERE n.tx_to = ?2 AND n.tx_from <= t.changed_at";
+
+/// What a cold lineage still holds in vectors: those to drop, and those kept
+/// because the node was written after the lineage went cold or has no signature.
+pub(in crate::graph) struct Held {
+    pub(in crate::graph) droppable: Vec<NodeId>,
+    pub(in crate::graph) late: usize,
+    pub(in crate::graph) unsigned: usize,
+}
+
+impl Held {
+    pub(in crate::graph) fn of(nodes: &[LineageNode], went_cold_at: Millis) -> Self {
+        let mut held = Self {
+            droppable: Vec::new(),
+            late: 0,
+            unsigned: 0,
+        };
+        for node in nodes.iter().filter(|node| node.has_vector) {
+            if node.tx_from > went_cold_at {
+                held.late += 1;
+            } else if !node.has_signature {
+                held.unsigned += 1;
+            } else {
+                held.droppable.push(node.node_id.clone());
+            }
+        }
+        held
+    }
+}
 
 fn optional_i64(row: &Row, index: usize) -> Result<Option<i64>> {
     match row.0.get(index) {
@@ -172,6 +206,31 @@ impl<B: Backend> Graph<B> {
             .collect()
     }
 
+    /// The text of each live node of a lineage, in id order.
+    pub async fn lineage_texts(&self, key: &LineageKey) -> Result<Vec<NodeText>> {
+        let with_vector = self.live_vector_ids().await?;
+        let rows = self
+            .backend
+            .query(
+                "SELECT n.id, n.label, n.content FROM node_lineage l
+                 JOIN nodes n ON n.id = l.node_id
+                 WHERE l.lineage_key = ?1 AND n.tx_to = ?2 ORDER BY n.id",
+                &[key.as_str().into(), FOREVER.into()],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let id = row.get_string(0)?;
+                Ok(NodeText {
+                    has_vector: with_vector.contains(&id),
+                    node_id: NodeId::from_raw(id),
+                    label: row.get_string(1)?,
+                    content: row.get_string(2)?,
+                })
+            })
+            .collect()
+    }
+
     /// The ids of the live nodes that have a vector. A node with no text to
     /// embed has none.
     async fn live_vector_ids(&self) -> Result<HashSet<String>> {
@@ -217,16 +276,13 @@ impl<B: Backend> Graph<B> {
         for row in &cold {
             let (key, changed_at) = (LineageKey::from_raw(row.get_string(0)?), row.get_i64(1)?);
             let nodes = self.lineage_nodes_among(&key, &with_vector).await?;
-            for node in nodes.iter().filter(|n| n.has_vector) {
-                if node.tx_from.0 > changed_at {
-                    report.skipped_late += 1;
-                } else if !node.has_signature {
-                    report.skipped_unsigned += 1;
-                } else {
-                    self.backend.vector_delete(node.node_id.as_str()).await?;
-                    report.deleted += 1;
-                }
+            let held = Held::of(&nodes, Millis(changed_at));
+            for node in &held.droppable {
+                self.backend.vector_delete(node.as_str()).await?;
             }
+            report.deleted += held.droppable.len();
+            report.skipped_late += held.late;
+            report.skipped_unsigned += held.unsigned;
         }
         tracing::info!(?report, "tier rows and vectors reconciled");
         Ok(report)
@@ -352,6 +408,19 @@ pub(in crate::graph) async fn apply_tier_in(
 ) -> Result<()> {
     tx.execute(TIER_UPSERT_SQL, &tier_params(change, event_id))
         .await?;
+    if change.to == Tier::Cold {
+        // A node with no int8 form is how a write inside a transaction tells a
+        // demoted node from a hot one.
+        tx.execute(
+            DROP_INT8_SQL,
+            &[
+                change.lineage_key.as_str().into(),
+                FOREVER.into(),
+                change.changed_at.into(),
+            ],
+        )
+        .await?;
+    }
     Ok(())
 }
 

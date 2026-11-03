@@ -318,20 +318,21 @@ async fn replay_projection(
 }
 
 /// What a replay range holds besides the events to apply.
+#[derive(Default)]
 pub(super) struct Ahead {
     /// The ids of the events a `Voided` record cancels.
-    voided: HashSet<String>,
+    pub(super) voided: HashSet<String>,
     /// The rows named by the tombstones that ran, so a voided one is left out.
-    removed: Removed,
+    pub(super) removed: Removed,
     /// The runs a `RunRolledBack` record cancels.
-    rolled_back: RolledBack,
+    pub(super) rolled_back: RolledBack,
 }
 
 /// Rows named by a tombstone. Ids are never reused, so once the tombstone has
 /// run a row it names is gone for good.
 #[derive(Default)]
-struct Removed {
-    nodes: HashSet<String>,
+pub(super) struct Removed {
+    pub(super) nodes: HashSet<String>,
     edges: HashSet<String>,
 }
 
@@ -503,6 +504,7 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
             | Step::Remove(_)
             | Step::Lineage { .. }
             | Step::Quant { .. }
+            | Step::Requant { .. }
             | Step::Usage { .. }
             | Step::Feedback(_)
             | Step::Tier { .. }
