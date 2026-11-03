@@ -2,20 +2,17 @@
 //! Deleting what a client asked to forget. The log holds sealed rows, so a
 //! delete destroys keys; this module holds the commands that act on them.
 
-// The delete job that builds the registry from these arrives after them, so
-// only their tests call them until then.
-#[allow(dead_code)]
 mod files;
-#[allow(dead_code)]
+mod job;
 mod memory;
 mod migrate;
-#[allow(dead_code)]
 mod registry;
-#[allow(dead_code)]
 mod scan;
-#[allow(dead_code)]
 mod scrub;
+// `liamd serve` and `liamd delete` run the service in the changes that follow, so
+// until then only its tests do, and everything it uses is kept alive through it.
 #[allow(dead_code)]
+mod service;
 mod target;
 #[cfg(test)]
 mod test_support;

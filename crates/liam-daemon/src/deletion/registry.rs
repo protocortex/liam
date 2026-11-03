@@ -3,8 +3,17 @@
 //! database first, because the stores that read it (the dedup filter) must see
 //! it purged.
 
+use std::path::Path;
+use std::sync::Arc;
+
 use anyhow::Context;
-use liam_store::{LineageHits, LineageStore, LineageTarget, PurgeReport, Residual};
+use liam_daemon::consolidation::manifest::manifest_path_for;
+use liam_daemon::consolidation::tier_history::history_path_for;
+use liam_store::{DefaultGraph, LineageHits, LineageStore, LineageTarget, PurgeReport, Residual};
+
+use super::files::{BloomLineage, CacheStoreLineage, SnapshotLineage, StateFileLineage};
+use super::memory::{InMemoryLineage, NodeState};
+use crate::extraction::cache::{cache_path, CacheStore};
 
 #[derive(Default)]
 pub struct LineageRegistry {
@@ -21,6 +30,40 @@ impl LineageRegistry {
         self
     }
 
+    /// Every store a delete of the database at `database_path` reaches, the
+    /// database first. `states` are the in-memory holders of node ids that are
+    /// alive in this process.
+    pub fn for_database(
+        database_path: &Path,
+        snapshot_dir: &Path,
+        graph: Arc<DefaultGraph>,
+        states: Vec<Arc<dyn NodeState>>,
+    ) -> anyhow::Result<Self> {
+        let mut registry = Self::new()
+            .with(Arc::clone(&graph))
+            .with(BloomLineage::new(graph, None));
+        // Opening the cache would make a file for a database that never used one.
+        let cache_file = cache_path(database_path);
+        if cache_file.exists() {
+            let cache = CacheStore::open(cache_file.clone())
+                .with_context(|| format!("could not open the cache {}", cache_file.display()))?;
+            registry = registry.with(CacheStoreLineage::new(Arc::new(cache)));
+        }
+        Ok(registry
+            .with(SnapshotLineage::new(snapshot_dir.to_path_buf()))
+            .with(StateFileLineage::new(
+                manifest_path_for(database_path),
+                history_path_for(database_path),
+            ))
+            .with(InMemoryLineage::new(states)))
+    }
+
+    pub fn store_count(&self) -> usize {
+        self.stores.len()
+    }
+
+    // The operator command lists these in the change that adds it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn names(&self) -> Vec<String> {
         self.stores
             .iter()
@@ -29,6 +72,7 @@ impl LineageRegistry {
     }
 
     /// What each store would remove, by store name.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn find_all(
         &self,
         target: &LineageTarget,
@@ -44,26 +88,25 @@ impl LineageRegistry {
         Ok(found)
     }
 
-    /// Purges the stores in turn and stops at the first failure, which names
-    /// the store. A purge is safe to run again, so the job resumes from there.
-    pub async fn purge_all(
+    /// Purges the store at `index`. A job runs the stores in turn and stops at
+    /// the first failure, which names the store; a purge is safe to run again,
+    /// so the job resumes from there.
+    pub async fn purge_at(
         &self,
+        index: usize,
         target: &LineageTarget,
-    ) -> anyhow::Result<Vec<(String, PurgeReport)>> {
-        let mut purged = Vec::new();
-        for store in &self.stores {
-            let report = store
-                .purge(target)
-                .await
-                .with_context(|| format!("purging {} failed", store.name()))?;
-            tracing::info!(
-                store = store.name(),
-                removed = report.removed,
-                "store purged"
-            );
-            purged.push((store.name().to_owned(), report));
-        }
-        Ok(purged)
+    ) -> anyhow::Result<(String, PurgeReport)> {
+        let store = &self.stores[index];
+        let report = store
+            .purge(target)
+            .await
+            .with_context(|| format!("purging {} failed", store.name()))?;
+        tracing::info!(
+            store = store.name(),
+            removed = report.removed,
+            "store purged"
+        );
+        Ok((store.name().to_owned(), report))
     }
 
     /// Every residual of every store, each carrying its store's name.
@@ -151,7 +194,10 @@ mod tests {
         let before = registry.verify_all(&target).await.unwrap();
         subjects.store.purge(&target).await.unwrap();
         let after_database = registry.verify_all(&target).await.unwrap();
-        let purged = registry.purge_all(&target).await.unwrap();
+        let mut purged = Vec::new();
+        for index in 0..registry.store_count() {
+            purged.push(registry.purge_at(index, &target).await.unwrap());
+        }
         let after = registry.verify_all(&target).await.unwrap();
         let found = registry.find_all(&target).await.unwrap();
 
