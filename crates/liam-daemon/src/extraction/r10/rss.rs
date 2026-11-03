@@ -4,49 +4,15 @@
 //! stop, so a short spike between two reads is missed: the figure is a lower
 //! bound on the true peak.
 
-use std::collections::BTreeSet;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, System};
+
+use crate::metrics::memory::tree_rss_bytes;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Resident bytes of `root` plus every process descended from it.
-fn tree_rss_bytes(system: &mut System, root: Pid) -> u64 {
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing().with_memory(),
-    );
-    let mut members = BTreeSet::from([root]);
-    loop {
-        let before = members.len();
-        // On Linux sysinfo lists each thread as a process that shares its
-        // owner's memory, which would count that memory once per thread.
-        for (pid, process) in system
-            .processes()
-            .iter()
-            .filter(|(_, process)| process.thread_kind().is_none())
-        {
-            if process
-                .parent()
-                .is_some_and(|parent| members.contains(&parent))
-            {
-                members.insert(*pid);
-            }
-        }
-        if members.len() == before {
-            break;
-        }
-    }
-    members
-        .iter()
-        .filter_map(|pid| system.process(*pid))
-        .map(sysinfo::Process::memory)
-        .sum()
-}
 
 /// Samples in a background thread until stopped.
 pub(super) struct PeakRss {
