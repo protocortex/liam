@@ -6,12 +6,28 @@
 pub mod alerts;
 pub mod collect;
 pub mod memory;
+pub mod recorder;
 pub mod sink;
+pub mod sources;
+
+use std::sync::Arc;
 
 use alerts::{Rule, RuleSet};
-use sink::MetricId;
+use liam_store::SystemClock;
+use recorder::Metrics;
+use sink::{LogSink, MemorySink, MetricId, MetricsSink};
 
-use crate::config::MetricsConfig;
+use crate::config::{MetricsConfig, SinkKind};
+
+/// The recorder over the sink `config` names.
+pub fn build(config: &MetricsConfig) -> Arc<Metrics> {
+    let clock = Arc::new(SystemClock);
+    let sink: Arc<dyn MetricsSink> = match config.sink {
+        SinkKind::Memory => Arc::new(MemorySink::new(clock.clone())),
+        SinkKind::Log => Arc::new(LogSink::new(clock.clone())),
+    };
+    Arc::new(Metrics::new(sink, clock, config.min_samples as usize))
+}
 
 /// The share of a delete's deadline after which the backlog is warned about.
 const DELETION_WARNING_SHARE: f64 = 0.8;

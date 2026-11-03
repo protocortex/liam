@@ -19,6 +19,7 @@ fn started(harness: &Harness, server: &MemoryServer, config: &Config) -> Consoli
         embedder: embedder(),
         server,
         shutdown: &harness.shutdown,
+        metrics: None,
     })
     .unwrap()
 }

@@ -115,6 +115,17 @@ impl Harness {
         reopener: Option<Arc<dyn StoreReopener>>,
         hooks: ConsolidationHookSet,
     ) -> ConsolidationJob {
+        self.job_measured(server, probes, reopener, hooks, None)
+    }
+
+    fn job_measured(
+        &self,
+        server: &MemoryServer,
+        probes: Arc<dyn ProbeRunner>,
+        reopener: Option<Arc<dyn StoreReopener>>,
+        hooks: ConsolidationHookSet,
+        metrics: Option<Arc<Metrics>>,
+    ) -> ConsolidationJob {
         ConsolidationJob::with_parts(
             JobSetup {
                 keys: None,
@@ -125,6 +136,7 @@ impl Harness {
                 embedder: embedder(),
                 server,
                 shutdown: &self.shutdown,
+                metrics,
             },
             probes,
             reopener,
@@ -177,6 +189,8 @@ async fn linked_pair(store: &DefaultGraph, kind: &str) {
     let b = store.insert(NewNode::now(kind, "b", "x")).await.unwrap();
     store.link(NewEdge::new(&a, &b, "mentions")).await.unwrap();
 }
+
+mod metrics;
 
 #[tokio::test]
 async fn the_tick_refreshes_clusters_after_the_sweep_through_a_consolidation_run() {
@@ -952,6 +966,7 @@ fn archiving_job(
             embedder: embedder(),
             server,
             shutdown: &harness.shutdown,
+            metrics: None,
         },
         honest(),
         None,

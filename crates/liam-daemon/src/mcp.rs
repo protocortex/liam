@@ -52,6 +52,7 @@ use crate::config::{
 };
 use crate::consolidation_job::ConsolidationJob;
 use crate::deletion::DeletePreview;
+use crate::metrics::recorder::{Metrics, Tool, ToolTimer};
 use crate::render;
 use crate::synthesis;
 use crate::tiering::usage::UsageRecorder;
@@ -628,6 +629,8 @@ pub struct MemoryServer {
     delete_preview: Option<Arc<DeletePreview>>,
     /// What `consolidate` runs.
     consolidator: Option<Arc<ConsolidationJob>>,
+    /// Where `recall` and `ask` report their timings, when metrics are on.
+    metrics: Option<Arc<Metrics>>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -715,6 +718,7 @@ impl MemoryServer {
             admin: Arc::new(AdminConfig::default()),
             delete_preview: None,
             consolidator: None,
+            metrics: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -772,6 +776,28 @@ impl MemoryServer {
     pub(crate) fn with_consolidator(mut self, job: Arc<ConsolidationJob>) -> Self {
         self.consolidator = Some(job);
         self
+    }
+
+    /// Reports the timings of `recall` and `ask` to `metrics`.
+    pub(crate) fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn time(&self, tool: Tool) -> Option<ToolTimer> {
+        self.metrics.as_ref().map(|metrics| metrics.time(tool))
+    }
+
+    /// Runs `q` and reports how long each retrieval arm took.
+    async fn explained(
+        &self,
+        q: &Query,
+    ) -> Result<Vec<liam_store::ExplainedHit>, liam_store::Error> {
+        let (hits, timings) = on_store!(self, |store| store.query_timed(q))?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_arms(timings);
+        }
+        Ok(hits)
     }
 
     /// Makes the results a client is shown ones it can give a verdict on.
@@ -1285,6 +1311,7 @@ impl MemoryServer {
     // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Retrieve relevant long-term memory, reranked for precision.")]
     pub(crate) async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
+        let _timer = self.time(Tool::Recall);
         if let Err(refusal) = require_strict("recall", args.mode) {
             return refusal;
         }
@@ -1298,7 +1325,7 @@ impl MemoryServer {
             args.as_of,
             false,
         );
-        let hits = match on_store!(self, |store| store.query_explained(&q)) {
+        let hits = match self.explained(&q).await {
             Ok(h) => h,
             Err(e) => return format!("recall failed: {e}"),
         };
@@ -1632,6 +1659,7 @@ impl MemoryServer {
     // path an MCP client hits, rather than a re-implementation of it.
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
+        let _timer = self.time(Tool::Ask);
         let mode = args.mode.unwrap_or(Mode::Infer);
         let embedding = self
             .embedder
@@ -1648,7 +1676,7 @@ impl MemoryServer {
             args.as_of,
             mode == Mode::Infer,
         );
-        let hits = match on_store!(self, |store| store.query_explained(&q)) {
+        let hits = match self.explained(&q).await {
             Ok(h) => h,
             Err(e) => return format!("ask failed: {e}"),
         };
@@ -7951,5 +7979,71 @@ mod tests {
         );
         assert!(out.contains("zorbnax likes green tea"), "{out}");
         assert!(infer.contains("mode infer"), "{infer}");
+    }
+
+    fn metered(server: MemoryServer) -> (MemoryServer, Arc<crate::metrics::sink::MemorySink>) {
+        let clock = Arc::new(FixedClock::new(Millis(1_000)));
+        let sink = Arc::new(crate::metrics::sink::MemorySink::new(clock.clone()));
+        let metrics = Arc::new(Metrics::new(sink.clone(), clock, 2));
+        (server.with_metrics(metrics), sink)
+    }
+
+    fn reported(
+        sink: &crate::metrics::sink::MemorySink,
+        metric: crate::metrics::sink::MetricId,
+    ) -> bool {
+        use crate::metrics::sink::MetricsSink;
+        sink.snapshot()
+            .readings
+            .iter()
+            .any(|reading| reading.metric == metric)
+    }
+
+    #[tokio::test]
+    async fn recall_times_itself_and_the_arms_it_ran_and_not_ask() {
+        use crate::metrics::sink::MetricId;
+        // Arrange
+        let (server, sink) = metered(plain_server().await);
+        seed(&server, "fact", "One", "zorbnax note one").await;
+
+        // Act
+        server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax note".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+                mode: None,
+            }))
+            .await;
+
+        // Assert
+        assert!(reported(&sink, MetricId::RecallLatencyP95Ms));
+        assert!(reported(&sink, MetricId::ArmLatencyP95Ms));
+        assert!(!reported(&sink, MetricId::AskLatencyP95Ms));
+    }
+
+    #[tokio::test]
+    async fn ask_times_itself() {
+        use crate::metrics::sink::MetricId;
+        // Arrange
+        let (server, sink) = metered(plain_server().await);
+
+        // Act
+        server
+            .ask(Parameters(AskArgs {
+                question: "anything?".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+                mode: None,
+            }))
+            .await;
+
+        // Assert
+        assert!(reported(&sink, MetricId::AskLatencyP50Ms));
+        assert!(!reported(&sink, MetricId::RecallLatencyP50Ms));
     }
 }

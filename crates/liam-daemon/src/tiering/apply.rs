@@ -27,6 +27,8 @@ pub struct TierReport {
     pub planned: usize,
     pub demoted: usize,
     pub promoted: usize,
+    /// Vectors computed for promoted items that had none.
+    pub reembedded: usize,
     /// Demotions the log did not vouch for.
     pub skipped_unverified: usize,
     /// Moves whose lineage had already changed or gone.
@@ -223,7 +225,10 @@ async fn promote(planned: &[PlannedMove], deps: &ApplyDeps<'_>, report: &mut Tie
             .promote_lineage(&change, &vectors, deps.source)
             .await
         {
-            Ok(ApplyOutcome::Applied) => moved(report, item, Tier::Hot),
+            Ok(ApplyOutcome::Applied) => {
+                moved(report, item, Tier::Hot);
+                report.reembedded += vectors.len();
+            }
             Ok(ApplyOutcome::Stale) => report.skipped_stale += 1,
             Ok(other) => {
                 error!(?other, "a promotion ended as only a demotion can");

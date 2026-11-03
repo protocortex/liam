@@ -59,6 +59,11 @@ pub async fn encrypt_log(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Every delete job in the job file beside `database_path`.
+pub(crate) fn open_jobs(database_path: &Path) -> anyhow::Result<Vec<DeleteJob>> {
+    JobStore::new(job_file_path_for(database_path)).load()
+}
+
 /// Finishes the delete jobs a stopped daemon left, before it serves anyone. A
 /// job that cannot finish (a failure, or a scrub a reader still holds) refuses
 /// the start with [`DeleteJobPending`], because rows of a half-deleted subject

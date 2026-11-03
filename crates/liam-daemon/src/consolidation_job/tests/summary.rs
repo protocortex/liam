@@ -194,6 +194,7 @@ fn hooks_for_config(harness: &Harness, server: &MemoryServer, enabled: bool) -> 
         embedder: embedder(),
         server,
         shutdown: &harness.shutdown,
+        metrics: None,
     };
     hooks_for(&setup).unwrap().summary.is_some()
 }

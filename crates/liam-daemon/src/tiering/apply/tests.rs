@@ -145,6 +145,7 @@ async fn demotions_then_promotions_are_applied_logged_and_reported() {
             planned: 2,
             demoted: 1,
             promoted: 1,
+            reembedded: 1,
             plan_hash: "hash".to_string(),
             moved_lineages: vec![going_cold.clone(), coming_back.clone()],
             ..TierReport::default()

@@ -368,6 +368,7 @@ pub fn hooks(fixture: &Fixture, config: TieringConfig, embedder: Arc<dyn Embedde
         permits: Arc::new(Semaphore::new(1)),
         free_ram: Arc::new(FixedRam::plenty()),
         clock: fixture.clock.clone(),
+        metrics: None,
     }
 }
 

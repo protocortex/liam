@@ -13,7 +13,9 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use liam_daemon::consolidation::hooks::{ExtractCtx, ExtractionHook, ExtractionReport};
+use liam_daemon::consolidation::hooks::{
+    CacheLookups, ExtractCtx, ExtractionHook, ExtractionReport,
+};
 use liam_daemon::consolidation::manifest::ExtractionModel;
 use liam_log::event::LogEvent;
 use liam_log::reader::LogReader;
@@ -63,6 +65,10 @@ struct Window {
 
 #[async_trait]
 impl ExtractionHook for ExtractionHooks {
+    fn cache_lookups(&self) -> Option<CacheLookups> {
+        Some(self.cache.stats())
+    }
+
     async fn extract(&self, ctx: &ExtractCtx<'_>) -> anyhow::Result<ExtractionReport> {
         if !self.config.enabled {
             return Ok(ExtractionReport::default());

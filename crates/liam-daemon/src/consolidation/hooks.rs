@@ -95,6 +95,19 @@ pub trait ExtractionHook: Send + Sync {
     async fn model(&self) -> Option<ExtractionModel> {
         None
     }
+
+    /// How the response cache has answered since the daemon started, or `None`
+    /// when there is no cache.
+    fn cache_lookups(&self) -> Option<CacheLookups> {
+        None
+    }
+}
+
+/// How many cache lookups were answered and how many were not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheLookups {
+    pub hits: u64,
+    pub misses: u64,
 }
 
 /// An `Err` is recorded as a step status and does not abort the run.
