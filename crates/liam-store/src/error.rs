@@ -28,6 +28,11 @@ pub enum Error {
     #[error("unknown tier: {0}")]
     UnknownTier(String),
 
+    /// A demotion was given a move to the hot tier, or a promotion one to the
+    /// cold tier.
+    #[error("expected a move to the {expected} tier")]
+    UnexpectedTierMove { expected: &'static str },
+
     #[error("node not found: {0}")]
     NodeNotFound(String),
 

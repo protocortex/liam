@@ -4,11 +4,13 @@
 //! binary forms. Quantizing is model-free, so it lives here; deciding what to
 //! move between tiers does not.
 
+mod apply;
 mod cold;
 mod lineage;
 mod logged;
 mod quantize;
 mod state;
+mod verify;
 
 use std::sync::Arc;
 
@@ -55,6 +57,21 @@ pub(super) async fn insert_quant(
     quantized: &Quantized,
 ) -> Result<()> {
     let sql = format!("INSERT INTO node_quant ({QUANT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5)");
+    tx.execute(&sql, &quant_params(node_id, quantized)).await?;
+    Ok(())
+}
+
+/// Stores the forms of a node's embedding over any it already has.
+pub(super) async fn replace_quant(
+    tx: &mut dyn BackendTx,
+    node_id: &str,
+    quantized: &Quantized,
+) -> Result<()> {
+    let sql = format!(
+        "INSERT INTO node_quant ({QUANT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(node_id) DO UPDATE SET bin = excluded.bin, i8 = excluded.i8,
+           scale = excluded.scale, quant_version = excluded.quant_version"
+    );
     tx.execute(&sql, &quant_params(node_id, quantized)).await?;
     Ok(())
 }
@@ -182,6 +199,22 @@ impl<B: Backend> Graph<B> {
             let _gate = self.quant_gate.lock().await;
             let cold = self.node_is_cold(node_id.as_str()).await?;
             self.quant.insert(node_id.as_str(), cold, quantized.bin);
+            return Ok(());
+        }
+        // A hot node that lost its int8 form, as when a logged promotion was
+        // replayed without the vectors it came with, gets it back. A cold node
+        // is meant to have none.
+        if !self.node_is_cold(node_id.as_str()).await? {
+            self.backend
+                .execute(
+                    "UPDATE node_quant SET i8 = ?2, scale = ?3 WHERE node_id = ?1 AND i8 IS NULL",
+                    &[
+                        node_id.as_str().into(),
+                        Value::Blob(quantized.i8.iter().map(|c| *c as u8).collect()),
+                        f64::from(quantized.scale).into(),
+                    ],
+                )
+                .await?;
         }
         Ok(())
     }

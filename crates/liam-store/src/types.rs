@@ -251,6 +251,55 @@ pub struct ReconcileReport {
     pub skipped_unsigned: usize,
 }
 
+/// How a demotion or promotion ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    /// The tier moved, and `remaining` nodes of a demoted lineage still have a
+    /// vector, which the next reconcile deletes.
+    Partial {
+        remaining: usize,
+    },
+    /// A node has a vector and no signature, so dropping the vector would lose it.
+    NoSignature,
+    /// The plan no longer fits: the lineage is already in the tier, or has no
+    /// live node.
+    Stale,
+}
+
+/// A live node's text, as it is embedded and as the log must still hold it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeText {
+    pub node_id: NodeId,
+    pub label: String,
+    pub content: String,
+    /// Whether the node has a vector.
+    pub has_vector: bool,
+}
+
+/// What the log must hold for a node before its vector may be dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginClaim {
+    pub node_id: NodeId,
+    pub origin_event_ids: Vec<String>,
+    pub label: String,
+    pub content: String,
+}
+
+/// What the log says of an `OriginClaim`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginVerdict {
+    /// An origin event is in the log, in force, and says what the node says.
+    Verified,
+    /// The node lists no origin event, or none of them is in the log.
+    OriginMissing,
+    /// The event was voided, belongs to a rolled back run, or the node was
+    /// removed.
+    Excluded,
+    /// The event is in force and says something else.
+    Mismatch,
+}
+
 /// A live node of a lineage and what it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineageNode {

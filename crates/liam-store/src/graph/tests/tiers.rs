@@ -32,7 +32,7 @@ pub(super) fn cold_at(lineage: &LineageKey, at: i64) -> TierMove {
     }
 }
 
-fn hot_at(lineage: &LineageKey, at: i64, residency_until: Option<i64>) -> TierMove {
+pub(super) fn hot_at(lineage: &LineageKey, at: i64, residency_until: Option<i64>) -> TierMove {
     TierMove {
         to: Tier::Hot,
         reason: "used".to_string(),
