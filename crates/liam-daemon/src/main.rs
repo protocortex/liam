@@ -213,7 +213,10 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         .enabled
         .then(|| Arc::new(UsageRecorder::new(config.tiering.max_tracked_items)));
     let server = match &usage {
-        Some(recorder) => server.with_usage_recorder(recorder.clone()),
+        Some(recorder) => server.with_usage_recorder(recorder.clone()).with_feedback(
+            config.tiering.feedback_per_producer_per_hour,
+            config.tiering.max_tracked_items,
+        ),
         None => server,
     };
     let server = server
