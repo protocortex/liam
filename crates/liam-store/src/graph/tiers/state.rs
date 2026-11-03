@@ -127,6 +127,16 @@ impl<B: Backend> Graph<B> {
         commit_or_abandon(tx, applied).await
     }
 
+    /// Whether any usage batch, even an empty one, has been recorded. Counting
+    /// began when one did.
+    pub async fn usage_started(&self) -> Result<bool> {
+        let rows = self
+            .backend
+            .query("SELECT 1 FROM usage_epochs LIMIT 1", &[])
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
     /// The live nodes of a lineage and whether each holds a vector and a
     /// signature.
     pub async fn lineage_nodes(&self, key: &LineageKey) -> Result<Vec<LineageNode>> {

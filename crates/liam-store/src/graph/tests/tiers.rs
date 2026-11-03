@@ -481,6 +481,20 @@ async fn a_usage_batch_applied_twice_leaves_one_set_of_rows_and_an_empty_one_lea
 }
 
 #[tokio::test]
+async fn counting_has_started_once_any_batch_even_an_empty_one_is_recorded() {
+    // Arrange
+    let g = open_at(Millis(1000)).await;
+    let before = g.usage_started().await.unwrap();
+
+    // Act
+    g.apply_usage("event-1", 10, &[]).await.unwrap();
+
+    // Assert
+    assert!(!before);
+    assert!(g.usage_started().await.unwrap());
+}
+
+#[tokio::test]
 async fn of_a_producers_verdicts_on_a_lineage_in_a_day_the_first_counts() {
     // Arrange
     let g = open_at(Millis(1000)).await;
