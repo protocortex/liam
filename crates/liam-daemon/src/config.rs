@@ -11,6 +11,7 @@ use liam_log::wal::WalConfig;
 use liam_store::{Millis, RetentionPolicy};
 use serde::Deserialize;
 
+mod admin;
 mod consolidation;
 mod deletion;
 mod encryption;
@@ -18,6 +19,7 @@ mod extraction;
 mod summary;
 mod tiering;
 
+pub use admin::AdminConfig;
 pub(crate) use consolidation::default_snapshot_dir;
 pub use consolidation::ConsolidationConfig;
 pub use deletion::DeletionConfig;
@@ -85,6 +87,8 @@ pub struct Config {
     pub encryption: EncryptionConfig,
     /// How a delete behaves: its deadline and whether freed pages are zeroed.
     pub deletion: DeletionConfig,
+    /// Who may call the admin tools.
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -203,6 +207,7 @@ impl Default for Config {
             tiering: TieringConfig::default(),
             encryption: EncryptionConfig::default(),
             deletion: DeletionConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 }
@@ -423,6 +428,7 @@ impl Config {
         config.tiering.validate()?;
         config.encryption.validate()?;
         config.deletion.validate()?;
+        config.admin.validate()?;
         Ok(config)
     }
 

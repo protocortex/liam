@@ -9,18 +9,27 @@ mod migrate;
 mod registry;
 mod scan;
 mod scrub;
-// `liamd serve` and `liamd delete` run the service in the changes that follow, so
-// until then only its tests do, and everything it uses is kept alive through it.
+// `liamd delete` calls `request`, `cancel` and `dry_run` in the change that adds
+// it; until then only the tests do, and what they use stays alive through here.
 #[allow(dead_code)]
 mod service;
 mod target;
 #[cfg(test)]
 mod test_support;
 
+use std::path::Path;
+use std::sync::Arc;
+
 use anyhow::Context;
+use liam_daemon::event_log;
+use liam_log::crypto::KeyRegistry;
+use liam_store::{DefaultGraph, SystemClock};
 
 use crate::config::Config;
 use crate::{resolve_config_path, resolve_log_dir, storelock};
+use job::{job_file_path_for, DeadlineAlert, JobStore};
+pub use memory::NodeState;
+use service::{DeleteJobPending, DeleteService, StoreParts};
 
 /// `liamd encrypt-log`: seals the plaintext events of the log in place. Takes
 /// the store lock, so it refuses to run beside a daemon.
@@ -40,6 +49,55 @@ pub async fn encrypt_log(config: &Config) -> anyhow::Result<()> {
         report.events_sealed, report.partitions_rewritten
     );
     Ok(())
+}
+
+/// Finishes the delete jobs a stopped daemon left, before it serves anyone. A
+/// job that cannot finish (a failure, or a scrub a reader still holds) refuses
+/// the start with [`DeleteJobPending`], because rows of a half-deleted subject
+/// would otherwise be served. The caller holds the store lock.
+pub async fn resume_pending(
+    config: &Config,
+    database_path: &Path,
+    log_dir: &Path,
+    store: Arc<DefaultGraph>,
+    keys: Option<Arc<KeyRegistry>>,
+    states: Vec<Arc<dyn NodeState>>,
+    lock: &storelock::StoreLock,
+) -> anyhow::Result<()> {
+    let open = JobStore::new(job_file_path_for(database_path))
+        .load()?
+        .iter()
+        .filter(|job| !job.state.is_final())
+        .count();
+    if open == 0 {
+        return Ok(());
+    }
+    let keys =
+        keys.context("a delete job is open, but the log has no key registry to resume it")?;
+    let parts = StoreParts {
+        store,
+        reader: event_log::log_reader(log_dir, Some(&keys))?,
+        keys,
+        clock: Arc::new(SystemClock),
+    };
+    let service = DeleteService::open(config, database_path, parts, states, lock)?;
+    tracing::info!(open, "resuming delete jobs");
+    let report = service.resume_all(false).await?;
+    for (job_id, alert) in service.alerts()? {
+        match alert {
+            DeadlineAlert::Overdue => {
+                tracing::error!(job = %job_id, "delete job is past its deadline");
+            }
+            _ => tracing::warn!(job = %job_id, "delete job is close to its deadline"),
+        }
+    }
+    if report.pending.is_empty() {
+        return Ok(());
+    }
+    Err(DeleteJobPending {
+        job_ids: report.pending,
+    }
+    .into())
 }
 
 #[cfg(test)]
@@ -155,6 +213,42 @@ mod tests {
             let node = restarted.store.get(id, Millis::now()).await.unwrap();
             assert!(node.is_some(), "{id:?} must still be there");
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_job_refuses_the_start_before_anything_is_served() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let config = {
+            let subjects = test_support::sealed_subjects(dir.path()).await;
+            subjects.config.clone()
+        };
+        let database = database_in(dir.path());
+        crate::embedder_fingerprint::record(
+            &database,
+            &crate::embedder_fingerprint::EmbedderFingerprint::from_config(&config),
+        )
+        .unwrap();
+        let mut job = job::DeleteJob::new(
+            "job-failed".into(),
+            target::DeleteTarget::Event {
+                event_id: "e".into(),
+            },
+            0,
+            1,
+        );
+        job.state = job::JobState::Failed;
+        job::JobStore::new(job::job_file_path_for(&database))
+            .save(&job)
+            .unwrap();
+
+        // Act
+        let result = crate::serve_until(crate::cli::Mode::Stdio, config, Shutdown::default()).await;
+
+        // Assert
+        let error = result.expect_err("the start must be refused");
+        let pending = error.downcast_ref::<DeleteJobPending>().expect("typed");
+        assert_eq!(pending.job_ids, ["job-failed"]);
     }
 
     #[tokio::test]

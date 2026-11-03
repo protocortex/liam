@@ -862,3 +862,131 @@ async fn every_error_says_what_failed() {
     assert!(texts[4].contains("a step broke"));
     assert!(texts[5].contains("the file broke"));
 }
+
+impl Env {
+    async fn resume_pending(&self, keys: bool) -> anyhow::Result<()> {
+        super::super::resume_pending(
+            &self.subjects.config,
+            &self.database(),
+            &log_dir_in(self.dir.path()),
+            Arc::clone(&self.subjects.store),
+            keys.then(|| Arc::clone(&self.subjects.keys)),
+            Vec::new(),
+            &self.lock,
+        )
+        .await
+    }
+
+    /// A job saved as failed before it did anything, as a store failure leaves it.
+    fn save_failed_job(&self, id: &str) {
+        let mut job = DeleteJob::new(id.into(), alice(), START, DEADLINE_DAYS);
+        job.state = JobState::Failed;
+        job.failure = Some(Failure {
+            at: JobState::Requested,
+            reason: "the store was down".into(),
+        });
+        self.jobs().save(&job).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_start_with_no_open_job_needs_no_key_registry() {
+    // Arrange
+    let env = Env::new().await;
+    delete_alice(&env.service()).await.unwrap();
+
+    // Act
+    let result = env.resume_pending(false).await;
+
+    // Assert
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[tokio::test]
+async fn a_start_finishes_the_job_a_crash_left_and_then_serves() {
+    // Arrange
+    let env = Env::new().await;
+    delete_alice(&env.service().stopping_at(CrashPoint::AfterKeyDestroyed(0)))
+        .await
+        .unwrap_err();
+    let handles = Arc::strong_count(&env.subjects.store);
+
+    // Act
+    let result = env.resume_pending(true).await;
+
+    // Assert
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(env.only_job().state, JobState::Done);
+    assert_eq!(Arc::strong_count(&env.subjects.store), handles);
+}
+
+#[tokio::test]
+async fn a_failed_job_refuses_the_start_until_it_is_resumed() {
+    // Arrange
+    let env = Env::new().await;
+    env.save_failed_job("job-failed");
+
+    // Act
+    let refused = env.resume_pending(true).await.unwrap_err();
+    env.service().run("job-failed").await.unwrap();
+    let started = env.resume_pending(true).await;
+
+    // Assert
+    let pending = refused.downcast_ref::<DeleteJobPending>().expect("typed");
+    assert_eq!(pending.job_ids, ["job-failed"]);
+    assert!(refused.to_string().contains("job-failed"));
+    assert!(started.is_ok(), "{started:?}");
+}
+
+#[tokio::test]
+async fn a_scrub_a_reader_holds_refuses_the_start_until_it_is_released() {
+    // Arrange
+    let env = Env::new().await;
+    let database = libsql::Builder::new_local(env.database().to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let reader = database.connect().unwrap();
+    reader.execute("BEGIN", ()).await.unwrap();
+    let mut rows = reader
+        .query("SELECT COUNT(*) FROM nodes", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+    env.subjects
+        .store
+        .insert(NewNode::now("fact", "later", "after the reader"))
+        .await
+        .unwrap();
+    assert_eq!(
+        delete_alice(&env.service()).await.unwrap(),
+        RunOutcome::ScrubPending
+    );
+
+    // Act
+    let refused = env.resume_pending(true).await;
+    drop(rows);
+    drop(reader);
+    let started = env.resume_pending(true).await;
+
+    // Assert
+    assert!(refused
+        .unwrap_err()
+        .downcast_ref::<DeleteJobPending>()
+        .is_some());
+    assert!(started.is_ok(), "{started:?}");
+    assert_eq!(env.only_job().state, JobState::Done);
+}
+
+#[tokio::test]
+async fn an_open_job_with_no_key_registry_cannot_be_resumed() {
+    // Arrange
+    let env = Env::new().await;
+    env.save_failed_job("job-failed");
+
+    // Act
+    let error = env.resume_pending(false).await.unwrap_err();
+
+    // Assert
+    assert!(format!("{error:#}").contains("key registry"), "{error:#}");
+}

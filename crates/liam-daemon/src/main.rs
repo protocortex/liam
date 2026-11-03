@@ -241,7 +241,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         database_path: &database_path,
         log_dir: &log_dir,
         log,
-        keys,
+        keys: keys.clone(),
         embedder: job_embedder,
         server: &server,
         shutdown: &shutdown,
@@ -250,6 +250,28 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         .start(config.gc.run_on_start)
         .await
         .context("could not finish the consolidation rollback a crash interrupted")?;
+    // After the crash recovery above and before anything is served, written or
+    // consolidated, so no reader or writer meets a half-deleted subject. The
+    // slot stays locked for the whole resume, and the service gives its handle
+    // back when it ends, which a later rollback needs.
+    let node_states: Vec<Arc<dyn deletion::NodeState>> = usage
+        .iter()
+        .map(|recorder| recorder.clone() as Arc<dyn deletion::NodeState>)
+        .collect();
+    let shared = server.shared_store();
+    let slot = shared.exclusive().await;
+    let resumed = slot.as_ref().cloned().context("the store is unavailable")?;
+    deletion::resume_pending(
+        &config,
+        &database_path,
+        &log_dir,
+        resumed,
+        keys,
+        node_states,
+        &_lock,
+    )
+    .await?;
+    drop(slot);
     let maintenance = spawn_gc(&config, job, run_now);
     let usage_flush = usage.map(|recorder| {
         UsageFlush::start(UsageFlusher::new(
