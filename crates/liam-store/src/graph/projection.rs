@@ -13,6 +13,7 @@ use super::backfill::BACKFILL_SOURCE;
 use super::fact_projection::{apply_fact_step, fact_steps, FactStep};
 use super::logged_plan::Table;
 use super::summaries::{apply_artifact, close_if_open, store_embedding};
+use super::tiers::{assign_lineage, insert_quant, Quantized};
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
 };
@@ -44,6 +45,18 @@ pub(super) enum Step {
     /// gone changes nothing, so a replay can run it again.
     Remove(TombstoneTarget),
     Fact(FactStep),
+    /// Records the lineage of a node written earlier in the same projection.
+    /// It follows the node and its `supersedes` edge, which it reads.
+    Lineage {
+        node_id: String,
+    },
+    /// Stores the forms of a node's embedding. A live write adds it with the
+    /// node; the log does not carry embeddings, so `steps_for` never yields it
+    /// and a replay leaves the node to the re-embed pass.
+    Quant {
+        node_id: String,
+        quantized: Quantized,
+    },
     /// Stores a derived artifact with its children and source events.
     Summary(Box<DerivedArtifact>),
     /// Ends an open summary, if it is still open.
@@ -65,15 +78,17 @@ pub(super) enum Step {
 /// `dst` at the edge's `tx_from`, so a payload never carries the close itself.
 pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
     match payload {
-        LogPayload::NodeWrite(row) => node_steps(row),
+        LogPayload::NodeWrite(row) => with_lineage(node_steps(row)),
         LogPayload::EdgeWrite(row) => edge_steps(row),
-        LogPayload::EpisodeBatch(effects) => effects
-            .iter()
-            .flat_map(|effect| match effect {
-                RowEffect::Node(row) => node_steps(row),
-                RowEffect::Edge(row) => edge_steps(row),
-            })
-            .collect(),
+        LogPayload::EpisodeBatch(effects) => with_lineage(
+            effects
+                .iter()
+                .flat_map(|effect| match effect {
+                    RowEffect::Node(row) => node_steps(row),
+                    RowEffect::Edge(row) => edge_steps(row),
+                })
+                .collect(),
+        ),
         LogPayload::Tombstone(targets) => targets.iter().cloned().map(Step::Remove).collect(),
         LogPayload::FactWrite { .. } => fact_steps(payload).into_iter().map(Step::Fact).collect(),
         LogPayload::DerivedArtifact(artifact) => vec![Step::Summary(Box::new(artifact.clone()))],
@@ -85,6 +100,22 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
         | LogPayload::Voided { .. }
         | LogPayload::RunRolledBack { .. } => Vec::new(),
     }
+}
+
+/// `steps` followed by the lineage of each node they write. A lineage reads the
+/// `supersedes` edge of its node, so it runs after every edge of the batch.
+fn with_lineage(mut steps: Vec<Step>) -> Vec<Step> {
+    let lineages: Vec<Step> = steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Node(row) => Some(Step::Lineage {
+                node_id: row.id.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    steps.extend(lineages);
+    steps
 }
 
 /// A node row and the basis events it lists, which a replay restores with it.
@@ -205,6 +236,8 @@ pub(super) async fn apply_steps(
             }
             Step::GuardedEdge(row) => insert_guarded_edge(tx, row).await?,
             Step::Remove(target) => remove_row(tx, target, vector_delete).await?,
+            Step::Lineage { node_id } => assign_lineage(tx, node_id).await?,
+            Step::Quant { node_id, quantized } => insert_quant(tx, node_id, quantized).await?,
             Step::Fact(step) => apply_fact_step(tx, step).await?,
             Step::Summary(artifact) => apply_artifact(tx, artifact).await?,
             Step::SummaryClose { id, at } => close_if_open(tx, id, *at).await?,

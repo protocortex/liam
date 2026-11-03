@@ -161,6 +161,7 @@ impl<B: Backend> Graph<B> {
             None => {
                 let applied = apply_steps(&mut *tx, &steps, self.backend.vector_delete_sql()).await;
                 commit_or_abandon(tx, applied).await?;
+                self.sync_quant(&steps).await;
             }
         }
         tracing::debug!(rows = ids.len(), edges, "gc chunk removed");

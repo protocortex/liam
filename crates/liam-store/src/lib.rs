@@ -24,17 +24,18 @@ pub use backends::DefaultBackend;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::{Error, MismatchSource, Result};
 pub use graph::{
-    batch_key, child_hash, recover_interrupted_restore, validate_scope, verify_snapshot,
-    BackfillReport, Candidate, CatchUpReport, ContentEmbedder, EmbedError, EventLog, FactPage,
-    Graph, PoisonHook, RebuildMode, RebuildReport, ReembedReport, SharedLog, Snapshot, SnapshotLog,
-    SnapshotMeta, MAX_FACTS_PER_BATCH, MAX_SOURCES_PER_FACT, RUN_SOURCE_PREFIX,
+    batch_key, child_hash, dequantize, hamming, quantize, recover_interrupted_restore,
+    validate_scope, verify_snapshot, BackfillReport, Candidate, CatchUpReport, ContentEmbedder,
+    EmbedError, EventLog, FactPage, Graph, IndexedEntry, PoisonHook, QuantIndex, Quantized,
+    RebuildMode, RebuildReport, ReembedReport, SharedLog, Snapshot, SnapshotLog, SnapshotMeta,
+    BITS_PER_WORD, MAX_FACTS_PER_BATCH, MAX_SOURCES_PER_FACT, RUN_SOURCE_PREFIX,
 };
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{
     relation, ArbitrationCaps, ArbitrationOutcome, Basis, Cardinality, Change, ChildKind,
     ClosureReport, ClusterMember, ClusterState, Derivation, EndFact, EndOutcome, EventRef,
     EventRole, ExplainedHit, ExtractorName, Fact, Fingerprint, GcReport, GraphConfig, Grounding,
-    Hit, InferredHit, InferredText, MatchMode, NewEdge, NewFact, NewNode, NewSummary,
+    Hit, InferredHit, InferredText, LineageKey, MatchMode, NewEdge, NewFact, NewNode, NewSummary,
     PredicateSpec, PutOutcome, Query, RecordedHit, RecordedText, RetentionPolicy, RetentionRule,
     RetractOutcome, Retrieved, Summary, SummaryChild, SummaryEntry, SummaryFailure, SummaryInput,
     SummaryInputs, TreeState, Vocabulary,

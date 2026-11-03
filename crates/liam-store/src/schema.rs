@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS log_quarantine (
     );
     sql.push_str(&fact_tables());
     sql.push_str(&summary_tables());
+    sql.push_str(&tier_tables());
 
     sql
 }
@@ -347,6 +348,39 @@ CREATE TABLE IF NOT EXISTS summary_tree_state (
     )
 }
 
+/// What tiering keeps beside a node. `node_lineage` names the line of versions a
+/// node belongs to, so state keyed by it survives a supersession. `node_quant`
+/// holds the binary signature, and the int8 form while the node is hot. Both
+/// follow their node: deleting it deletes them.
+fn tier_tables() -> String {
+    String::from(
+        "
+CREATE TABLE IF NOT EXISTS node_lineage (
+  node_id     TEXT NOT NULL PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+  lineage_key TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS node_lineage_by_key ON node_lineage (lineage_key);
+
+CREATE TABLE IF NOT EXISTS node_quant (
+  node_id       TEXT    NOT NULL PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+  bin           BLOB    NOT NULL,
+  i8            BLOB,
+  scale         REAL    NOT NULL,
+  quant_version INTEGER NOT NULL DEFAULT 1
+);
+
+-- Set once the one-time pass that gives an existing vector its signature has
+-- run, with how many signatures it wrote.
+CREATE TABLE IF NOT EXISTS quant_backfill_state (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  completed_at INTEGER NOT NULL,
+  filled       INTEGER NOT NULL
+);
+",
+    )
+}
+
 /// When a rebuild empties a derived table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Clear {
@@ -361,7 +395,7 @@ pub(crate) enum Clear {
 /// the assignments, otherwise its fingerprint would vouch for communities that
 /// are no longer there. The backend's vector table goes before all of them, as
 /// `Backend::vector_clear_sql` returns it.
-pub(crate) const DERIVED_TABLES: [(&str, Clear); 22] = [
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 25] = [
     // No foreign keys link the fact tables, so their order among themselves is free.
     ("fact_sources", Clear::Always),
     ("fact_suppressions", Clear::Always),
@@ -378,6 +412,9 @@ pub(crate) const DERIVED_TABLES: [(&str, Clear); 22] = [
     // Extraction restarts from the first event, which the fact rules treat as a replay.
     ("extraction_cursor", Clear::Always),
     ("node_events", Clear::Always),
+    ("node_quant", Clear::Always),
+    ("node_lineage", Clear::Always),
+    ("quant_backfill_state", Clear::Always),
     ("node_community", Clear::Always),
     ("cluster_state", Clear::Always),
     ("edges", Clear::Always),
