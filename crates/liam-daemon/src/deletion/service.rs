@@ -101,6 +101,25 @@ impl From<anyhow::Error> for DeleteError {
     }
 }
 
+/// Jobs that did not finish when the daemon tried to resume them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeleteJobPending {
+    pub job_ids: Vec<String>,
+}
+
+impl fmt::Display for DeleteJobPending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "delete jobs {} did not finish, and serving would expose a half-deleted subject; \
+             resolve them before starting",
+            self.job_ids.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for DeleteJobPending {}
+
 /// How a run that did not fail ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
