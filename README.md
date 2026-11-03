@@ -223,6 +223,20 @@ unknown key fails loudly.
 | `metrics.rollback_ceiling` | `1.0` | Rollbacks at which an alert is raised. |
 | `metrics.extraction_backlog_ceiling` | `10000.0` | Events past an extraction cursor at which an alert is raised. |
 | `metrics.model_calls_per_hour` | `1000.0` | Model calls an hour at which an alert is raised. |
+| `hosted.enabled` | `false` | Allow calls to hosted model providers. Needs a build with `--features hosted`. |
+| `hosted.allowed_hosts` | empty | The only hosts a request may go to, each lowercase with no scheme, port or path. Required when `hosted.enabled` is true. |
+| `hosted.request_timeout_secs` | `60` | How long one request may take, answer included. At least `1`. |
+| `hosted.max_response_bytes` | `4194304` | The most bytes of a response that are read. A larger one is an error. At least `1`. |
+| `hosted.privacy` | empty | The gate every item passes before it goes into a hosted prompt. See Hosted providers. |
+| `hosted.privacy.allowed_scopes` | empty | Scopes whose items may be sent. A scope covers its descendants, and `""` is the unscoped group. Empty sends nothing. |
+| `hosted.privacy.local_only_sources` | empty | Producers whose items are never sent, in any scope. |
+| `hosted.privacy.provider_regions` | empty | The region each provider processes requests in, as you declare it. |
+| `hosted.privacy.attested_regions` | empty | For a scope and its descendants, the regions it may be sent to. |
+| `hosted.models` | empty | The dated model id each provider is pinned to. An alias is refused. |
+| `hosted.prices` | empty | What each pinned model costs. |
+| `hosted.prices.version` | empty | Names the price table, so a recorded cost can be tied to its rates. |
+| `hosted.prices.models` | empty | Rates by pinned model id, in millionths of a dollar per million tokens: input, output, cached input, batch input and batch output. |
+| `hosted.key_files` | empty | A provider's key file, an absolute path only its owner can read. Without one the key is read from the Keychain item `liam-<provider>` (macOS). |
 | `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
 | `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
 
@@ -924,6 +938,69 @@ move of `delta_pct` percent (recall, latency, `ece`, Bloom rate), a ceiling
 failed restore is neither judged nor remembered. The previous values live in
 `<database>.metrics-state.json`.
 
+## Hosted providers
+
+LIAM can send extraction and summary requests to Anthropic, OpenAI or Gemini
+instead of the local model. It is off by default, the default build links no
+TLS code for it, and nothing is sent until you build with `--features hosted`
+and set `extraction.provider` or `summary.provider` along with every part of
+`[hosted]`.
+
+A request goes out only when all of this holds:
+
+- `hosted.enabled` is true and the request's host is in `hosted.allowed_hosts`.
+  The host must match as written: a port, a trailing dot, capitals, a user name
+  or an IP address is a different string and is refused. Redirects are never
+  followed, and only https is used.
+- The item passes the privacy gate. The default is to deny. An item is sent
+  only when its scope (or an ancestor) is in `hosted.privacy.allowed_scopes`,
+  none of its sources is in `local_only_sources`, and the provider's declared
+  region is attested for that scope. A summary is judged on everything behind
+  it: one local-only source keeps the whole summary at home. A cached answer is
+  used only while the item still passes.
+- The provider has a dated model id in `hosted.models` and a price in
+  `hosted.prices`. The reply must name the pinned model, or it is refused and
+  nothing is cached. A provider that no longer has the model is an error, never
+  a fallback.
+
+Keys never go in `liam.toml`. Put one in a file only you can read and name it in
+`hosted.key_files`, or on macOS in a Keychain item called `liam-<provider>`. A
+key does not appear in logs, errors or the cache.
+
+Extraction asks hosted providers through their batch APIs, which cost less and
+answer later. A run sends the requests the cache cannot answer in one batch,
+records them in `<database>.hosted-batches.json`, and a later run collects the
+answers into the response cache before it writes any fact. Events whose request
+is still with the provider are not passed, so the cursor waits for them. A
+request that expires is sent once more, and a second expiry fails it. Summaries
+are asked directly. `ask` and entity synthesis stay on the local model whatever
+the setting.
+
+Every request, batch or direct, is first noted in `<database>.hosted-sends.jsonl`
+with the provider, an opaque request id, the events it was built from and the
+time. The file holds no text. If a run stops where it cannot tell whether a
+request reached the provider, the next run sends it again and logs a warning
+that it may be billed twice.
+
+What a delete does about it: `liamd delete` cancels the batches that hold a
+deleted request and asks the provider to delete their files where it has an
+endpoint for that. A provider that keeps a copy anyway, one that cannot be
+reached with the key and pin you set, and every direct request, leave a notice in
+the job result and in `liamd delete --status`. A provider's own retention terms
+decide how long its copy lasts, and LIAM cannot reach it. Treat anything you
+allow into a hosted prompt as leaving your control.
+
+Costs are counted per provider and model in the `model_calls` and
+`model_cost_micro_dollars` metrics, using the price table you set. A model with
+no price counts as free and is logged.
+
+The endpoint paths and field names of the three adapters follow each
+provider's public documentation and have not been checked against a live
+account. Hosted R10, the extraction quality check, runs in two tiers. The
+recorded tier replays answers shaped like each provider's through the real
+adapters in normal CI. The live tier is ignored, needs a key, and has not been
+run yet, so `r10_results.toml` has no rows.
+
 ## Feature flags
 
 `liam-store`:
@@ -938,6 +1015,8 @@ Leiden community detection is unconditional; there is no feature to disable it.
   Off by default, which keeps the dev build small.
 - `llama`: llama.cpp text generation, which is what `ask` needs. Metal comes
   from the macOS target, not from this flag.
+- `hosted`: calls to Anthropic, OpenAI and Gemini over HTTPS (see Hosted
+  providers). Off by default, which keeps TLS out of the default build.
 - `cuda`: NVIDIA support. Needs the CUDA toolkit at build time, so it is
   opt-in; Apple GPU support is automatic and needs nothing.
 
@@ -987,8 +1066,11 @@ What is built:
   that extract facts and link near-duplicates.
 - Summary trees with strict and infer reading modes, and utility-based
   tiering.
-- Deletion and log archive, with the first metrics. The rest of the work on
-  trust caps, metrics and hosted adapters is in progress.
+- Deletion and log archive, with metrics and alerts, and a producer trust cap
+  on usage.
+- Hosted providers behind the `hosted` feature: pinned models, a default-deny
+  privacy gate, batch submit and collect, cost metrics, and cancel on delete.
+  The provider request shapes are unchecked against live accounts.
 
 What is checked: the workspace builds, `cargo test --workspace` is green, the
 `local` build compiles against fastembed v5, and the community-detection
@@ -997,7 +1079,8 @@ real-model tests are gated and run on demand, not in the default test run.
 
 ## Roadmap
 
-- Finish trust caps, metrics and hosted adapters, the last event log milestone.
+- Check the hosted adapters against live accounts and record the live R10
+  results.
 - Hosted deployment: HTTP transport, OAuth and per-tenant scoping. Not
   planned yet.
 - Agent Client Protocol support. Not planned yet.

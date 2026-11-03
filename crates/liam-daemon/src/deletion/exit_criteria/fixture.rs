@@ -18,7 +18,10 @@ use liam_store::{
 use liam_store::{Clock, SummaryChild};
 use tempfile::TempDir;
 
+use crate::deletion::batch_lineage::BatchCanceller;
+use crate::deletion::batch_store::{batch_store_path_for, BatchEntry, BatchState, BatchStore};
 use crate::deletion::memory::NodeState;
+use crate::deletion::send_ledger::{send_ledger_path_for, SendLedger, SendRow};
 use crate::deletion::service::{DeleteService, StoreParts};
 use crate::deletion::target::DeleteTarget;
 use crate::deletion::test_support::{sealed_subjects_with, Subjects};
@@ -37,6 +40,10 @@ pub const ROLLED_BACK_CANARY: &str = "hsvt9042rolledcanary";
 /// Bob's content, which a delete of alice must leave readable.
 pub const BOB_CANARY: &str = "kdwm2958survivor";
 const ROLLED_BACK_RUN: &str = "run-rolled-back";
+pub const HOSTED_PROVIDER: &str = "anthropic";
+pub const HOSTED_BATCH: &str = "msgbatch_pending";
+pub const ALICE_REQUEST: &str = "request-alice";
+pub const BOB_REQUEST: &str = "request-bob";
 const NOW: Millis = Millis(1_000);
 const DAY_NUMBER: i64 = 1;
 const USAGE_CAPACITY: usize = 16;
@@ -56,6 +63,8 @@ pub struct Fixture {
     pub bob_note: NodeId,
     /// Alice's lineage key, the text the state files hold.
     pub alice_lineage: LineageKey,
+    /// The event that wrote alice's note, which the hosted batch files name.
+    pub alice_event: String,
 }
 
 pub fn alice() -> DeleteTarget {
@@ -97,6 +106,7 @@ impl Fixture {
             alice_note: subjects.alice.clone(),
             bob_note: subjects.alice.clone(),
             alice_lineage: LineageKey::from_raw(""),
+            alice_event: String::new(),
             subjects,
         };
         fixture.plant().await;
@@ -136,20 +146,37 @@ impl Fixture {
     }
 
     pub fn service(&self) -> DeleteService {
+        self.service_with(None)
+    }
+
+    /// The service with `canceller` reaching the hosted providers, or the one
+    /// the config gives when there is none.
+    pub fn service_with(&self, canceller: Option<Arc<dyn BatchCanceller>>) -> DeleteService {
         let reader = event_log::log_reader(&self.log_dir(), Some(&self.subjects.keys)).unwrap();
         let states: Vec<Arc<dyn NodeState>> = vec![self.usage.clone()];
-        DeleteService::open(
-            &self.subjects.config,
-            &self.database(),
-            StoreParts {
-                store: Arc::clone(&self.subjects.store),
-                keys: Arc::clone(&self.subjects.keys),
-                reader,
-                clock: Arc::clone(&self.clock) as Arc<dyn Clock>,
-            },
-            states,
-            &self.lock,
-        )
+        let parts = StoreParts {
+            store: Arc::clone(&self.subjects.store),
+            keys: Arc::clone(&self.subjects.keys),
+            reader,
+            clock: Arc::clone(&self.clock) as Arc<dyn Clock>,
+        };
+        match canceller {
+            Some(canceller) => DeleteService::open_with(
+                &self.subjects.config,
+                &self.database(),
+                parts,
+                states,
+                canceller,
+                &self.lock,
+            ),
+            None => DeleteService::open(
+                &self.subjects.config,
+                &self.database(),
+                parts,
+                states,
+                &self.lock,
+            ),
+        }
         .unwrap()
     }
 
@@ -182,10 +209,43 @@ impl Fixture {
 
         let alice_events = self.origin_events(&self.alice_note).await;
         let bob_events = self.origin_events(&self.bob_note).await;
+        self.alice_event = alice_events[0].clone();
+        self.plant_hosted_batch(&alice_events, &bob_events);
         self.plant_derived(&alice_events, &bob_events).await;
         self.plant_rolled_back_run(&alice_events, &bob_events).await;
         self.plant_rows_beside_the_database(&alice_events).await;
         store.snapshot(&self.snapshot_dir()).await.unwrap();
+    }
+
+    /// A batch still with its provider, holding a request for alice and one for
+    /// bob, and the ledger rows of both sends. Neither file holds text.
+    fn plant_hosted_batch(&self, alice_events: &[String], bob_events: &[String]) {
+        let entry = |cache_key: &str, events: &[String]| BatchEntry {
+            cache_key: cache_key.to_owned(),
+            provider: HOSTED_PROVIDER.to_owned(),
+            batch_id: HOSTED_BATCH.to_owned(),
+            state: BatchState::Submitted,
+            submitted_at: NOW.0,
+            input_hash: "hash".to_owned(),
+            source_event_ids: events.to_vec(),
+            attempts: 1,
+            failure: None,
+        };
+        let row = |cache_key: &str, events: &[String]| SendRow {
+            provider: HOSTED_PROVIDER.to_owned(),
+            cache_key: cache_key.to_owned(),
+            source_event_ids: events.to_vec(),
+            sent_at: NOW.0,
+        };
+        BatchStore::new(batch_store_path_for(&self.database()))
+            .replace(vec![
+                entry(ALICE_REQUEST, alice_events),
+                entry(BOB_REQUEST, bob_events),
+            ])
+            .unwrap();
+        let ledger = SendLedger::new(send_ledger_path_for(&self.database()));
+        ledger.append(&row(ALICE_REQUEST, alice_events)).unwrap();
+        ledger.append(&row(BOB_REQUEST, bob_events)).unwrap();
     }
 
     async fn plant_derived(&self, alice_events: &[String], bob_events: &[String]) {

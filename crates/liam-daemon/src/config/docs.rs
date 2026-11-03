@@ -1,33 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The shipped `liam.toml` and the README name every key of the sections that
-//! guard deletion, archive and metrics, so a key added in code cannot ship
-//! undocumented.
+//! guard deletion, archive, metrics and hosted calls, so a key added in code
+//! cannot ship undocumented.
 
 use serde_json::Value;
 
-use super::{AdminConfig, ArchiveConfig, DeletionConfig, EncryptionConfig, MetricsConfig};
+use super::{
+    AdminConfig, ArchiveConfig, DeletionConfig, EncryptionConfig, HostedConfig, MetricsConfig,
+};
 
-/// Each section with its default config as JSON. A key whose default is
-/// `None` stays visible as `null`.
-fn sections() -> Vec<(&'static str, Value)> {
+/// Each section with its default config as JSON, and each table nested in one
+/// as a section of its own (`hosted.privacy`). A key whose default is `None`
+/// stays visible as `null`.
+fn sections() -> Vec<(String, Value)> {
     fn json<T: serde::Serialize>(value: T) -> Value {
         serde_json::to_value(value).unwrap()
     }
-    vec![
+    fn with_tables(name: &str, value: Value, found: &mut Vec<(String, Value)>) {
+        let tables: Vec<(String, Value)> = value
+            .as_object()
+            .expect("a section serialises as a table")
+            .iter()
+            .filter(|(_, inner)| inner.is_object())
+            .map(|(key, inner)| (format!("{name}.{key}"), inner.clone()))
+            .collect();
+        found.push((name.to_owned(), value));
+        for (table, inner) in tables {
+            with_tables(&table, inner, found);
+        }
+    }
+    let mut found = Vec::new();
+    for (name, value) in [
         ("encryption", json(EncryptionConfig::default())),
         ("deletion", json(DeletionConfig::default())),
         ("admin", json(AdminConfig::default())),
         ("archive", json(ArchiveConfig::default())),
         ("metrics", json(MetricsConfig::default())),
-    ]
+        ("hosted", json(HostedConfig::default())),
+    ] {
+        with_tables(name, value, &mut found);
+    }
+    found
 }
 
+/// The keys a section assigns itself. The tables nested in it are sections of
+/// their own.
 fn keys_of(value: &Value) -> Vec<String> {
     value
         .as_object()
         .expect("a section serialises as a table")
-        .keys()
-        .cloned()
+        .iter()
+        .filter(|(_, inner)| !inner.is_object())
+        .map(|(key, _)| key.clone())
         .collect()
 }
 
@@ -58,7 +82,13 @@ fn assigns(line: &str, key: &str) -> bool {
 fn missing_from_toml(text: &str) -> Vec<String> {
     let mut missing = Vec::new();
     for (section, value) in sections() {
-        let table = toml_table(text, section);
+        if !text
+            .lines()
+            .any(|line| line.trim_end() == format!("[{section}]"))
+        {
+            missing.push(format!("[{section}]"));
+        }
+        let table = toml_table(text, &section);
         for key in keys_of(&value) {
             if !table.iter().any(|line| assigns(line, &key)) {
                 missing.push(format!("{section}.{key}"));
@@ -71,10 +101,18 @@ fn missing_from_toml(text: &str) -> Vec<String> {
 fn missing_from_readme(text: &str) -> Vec<String> {
     let mut missing = Vec::new();
     for (section, value) in sections() {
-        for key in keys_of(&value) {
-            let row = format!("| `{section}.{key}` |");
+        let mut named: Vec<String> = keys_of(&value)
+            .into_iter()
+            .map(|key| format!("{section}.{key}"))
+            .collect();
+        // A nested table has a row of its own, besides its keys.
+        if section.contains('.') {
+            named.push(section.clone());
+        }
+        for name in named {
+            let row = format!("| `{name}` |");
             if !text.lines().any(|line| line.starts_with(&row)) {
-                missing.push(format!("{section}.{key}"));
+                missing.push(name);
             }
         }
     }
@@ -142,6 +180,78 @@ fn the_notices_name_each_dependency_the_core_changes_added() {
         "fastbloom",
         "sysinfo",
         "object_store",
+    ];
+
+    // Act
+    let missing: Vec<&str> = added
+        .into_iter()
+        .filter(|name| !text.contains(name))
+        .collect();
+
+    // Assert
+    assert!(missing.is_empty(), "the notices must name {missing:?}");
+}
+
+#[test]
+fn the_hosted_tables_and_keys_are_all_named() {
+    // Arrange
+    let names: Vec<String> = sections().into_iter().map(|(name, _)| name).collect();
+
+    // Assert
+    for table in [
+        "hosted",
+        "hosted.privacy",
+        "hosted.models",
+        "hosted.prices",
+        "hosted.prices.models",
+        "hosted.key_files",
+    ] {
+        assert!(
+            names.iter().any(|name| name == table),
+            "{table} in {names:?}"
+        );
+    }
+}
+
+#[test]
+fn a_hosted_key_missing_from_either_file_fails_the_check() {
+    // Arrange
+    let toml: String = read_root("liam.toml")
+        .lines()
+        .filter(|line| !assigns(line, "allowed_hosts"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let readme: String = read_root("README.md")
+        .lines()
+        .filter(|line| !line.starts_with("| `hosted.privacy.allowed_scopes` |"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+
+    // Act
+    let (from_toml, from_readme) = (missing_from_toml(&toml), missing_from_readme(&readme));
+
+    // Assert
+    assert_eq!(from_toml, vec!["hosted.allowed_hosts".to_string()]);
+    assert_eq!(
+        from_readme,
+        vec!["hosted.privacy.allowed_scopes".to_string()]
+    );
+}
+
+#[test]
+fn the_notices_name_each_crate_the_hosted_feature_adds() {
+    // Arrange
+    let text = read_root("THIRD-PARTY-NOTICES.md");
+    let added = [
+        "ureq",
+        "ureq-proto",
+        "rustls",
+        "rustls-webpki",
+        "rustls-pki-types",
+        "webpki-roots",
+        "ring",
+        "untrusted",
+        "subtle",
     ];
 
     // Act

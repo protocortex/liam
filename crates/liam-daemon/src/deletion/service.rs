@@ -19,7 +19,7 @@ use liam_log::crypto::KeyRegistry;
 use liam_log::reader::LogReader;
 use liam_store::{Clock, DefaultGraph, DeletionRecord, LineageHits, LineageTarget};
 
-use super::batch_lineage::canceller_for;
+use super::batch_lineage::{canceller_for, BatchCanceller};
 use super::job::{job_file_path_for, DeadlineAlert, DeleteJob, Failure, JobState, JobStore};
 use super::memory::NodeState;
 use super::registry::LineageRegistry;
@@ -192,13 +192,33 @@ impl DeleteService {
         states: Vec<Arc<dyn NodeState>>,
         lock: &StoreLock,
     ) -> anyhow::Result<Self> {
+        Self::open_with(
+            config,
+            database_path,
+            parts,
+            states,
+            canceller_for(config),
+            lock,
+        )
+    }
+
+    /// As [`Self::open`], with `canceller` reaching the providers that hold
+    /// batches of the database.
+    pub fn open_with(
+        config: &Config,
+        database_path: &Path,
+        parts: StoreParts,
+        states: Vec<Arc<dyn NodeState>>,
+        canceller: Arc<dyn BatchCanceller>,
+        lock: &StoreLock,
+    ) -> anyhow::Result<Self> {
         let snapshot_dir = resolve_snapshot_dir(config, database_path)?;
         let registry = LineageRegistry::for_database(
             database_path,
             &snapshot_dir,
             Arc::clone(&parts.store),
             states,
-            canceller_for(config),
+            canceller,
         )?;
         Ok(Self::new(
             DeleteDeps {
