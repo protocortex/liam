@@ -63,6 +63,7 @@ impl<K: Clone + Eq + Hash, V> BoundedMap<K, V> {
         self.entries.iter()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

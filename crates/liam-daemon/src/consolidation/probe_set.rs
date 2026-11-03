@@ -102,6 +102,17 @@ pub struct Surviving {
 }
 
 impl ProbeSet {
+    /// Every node some probe expects to find.
+    pub fn relevant_nodes(&self) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = Vec::new();
+        for id in self.probes.iter().flat_map(|probe| &probe.relevant) {
+            if !nodes.contains(id) {
+                nodes.push(id.clone());
+            }
+        }
+        nodes
+    }
+
     /// Splits the set by whether each probe can still be answered. A probe
     /// with a live node stays. A probe whose nodes are all in `swept`, the ones
     /// the run's own sweep removed, is dropped with its baseline score. A probe

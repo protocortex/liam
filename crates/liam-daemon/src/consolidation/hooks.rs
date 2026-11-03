@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use liam_store::DefaultGraph;
+use liam_store::{DefaultGraph, NodeId};
 
 use super::manifest::ExtractionModel;
+use super::tier_history::TierHistory;
 
 /// Input to the extraction part.
 pub struct ExtractCtx<'a> {
@@ -61,16 +62,28 @@ impl SummaryReport {
 }
 
 /// Input to the tiering part.
-#[derive(Debug, Default)]
-pub struct TierCtx {
+pub struct TierCtx<'a> {
+    /// The store the run guards, which the part reads and writes through.
+    pub store: &'a DefaultGraph,
     /// The log source to stamp on every write the part makes, so a rollback of
     /// the run cancels them.
     pub source: String,
+    pub run_id: String,
+    /// The nodes the run's probes expect to find, which must keep their vectors.
+    pub probed_nodes: Vec<NodeId>,
+    /// What earlier rolled back runs left for this one.
+    pub history: TierHistory,
 }
 
 /// What the tiering part did.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct TierReport;
+pub struct TierReport {
+    /// Some planned work was left for a later run.
+    pub partial: bool,
+    pub plan_hash: String,
+    /// The lineage keys whose tier changed.
+    pub moved_lineages: Vec<String>,
+}
 
 /// An `Err` is recorded as a step status and does not abort the run.
 #[async_trait]
@@ -93,7 +106,7 @@ pub trait SummaryHook: Send + Sync {
 /// An `Err` is recorded as a step status and does not abort the run.
 #[async_trait]
 pub trait TierHook: Send + Sync {
-    async fn tier(&self, ctx: &TierCtx) -> Result<TierReport>;
+    async fn tier(&self, ctx: &TierCtx<'_>) -> Result<TierReport>;
 }
 
 /// The hook parts a run calls. The default set has none, so every step is a
@@ -127,10 +140,10 @@ impl ConsolidationHookSet {
         }
     }
 
-    pub async fn tier(&self, ctx: &TierCtx) -> Result<TierReport> {
+    pub async fn tier(&self, ctx: &TierCtx<'_>) -> Result<TierReport> {
         match &self.tiering {
             Some(hook) => hook.tier(ctx).await,
-            None => Ok(TierReport),
+            None => Ok(TierReport::default()),
         }
     }
 }
@@ -173,11 +186,21 @@ mod tests {
         }
     }
 
+    fn tier_ctx_over(store: &DefaultGraph) -> TierCtx<'_> {
+        TierCtx {
+            store,
+            source: String::new(),
+            run_id: String::new(),
+            probed_nodes: Vec::new(),
+            history: TierHistory::default(),
+        }
+    }
+
     struct FailingTier;
 
     #[async_trait]
     impl TierHook for FailingTier {
-        async fn tier(&self, _ctx: &TierCtx) -> Result<TierReport> {
+        async fn tier(&self, _ctx: &TierCtx<'_>) -> Result<TierReport> {
             anyhow::bail!("tier part failed")
         }
     }
@@ -219,12 +242,12 @@ mod tests {
         // Act
         let extracted = hooks.extract(&ctx_over(&store)).await;
         let summarized = hooks.summarize(&summary_ctx_over(&store)).await;
-        let tiered = hooks.tier(&TierCtx::default()).await;
+        let tiered = hooks.tier(&tier_ctx_over(&store)).await;
 
         // Assert
         assert_eq!(extracted.unwrap(), ExtractionReport::default());
         assert_eq!(summarized.unwrap(), SummaryReport::default());
-        assert_eq!(tiered.unwrap(), TierReport);
+        assert_eq!(tiered.unwrap(), TierReport::default());
     }
 
     #[tokio::test]
@@ -272,8 +295,10 @@ mod tests {
             ..Default::default()
         };
 
+        let store = memory_store().await;
+
         // Act
-        let result = hooks.tier(&TierCtx::default()).await;
+        let result = hooks.tier(&tier_ctx_over(&store)).await;
 
         // Assert
         assert_eq!(result.unwrap_err().to_string(), "tier part failed");

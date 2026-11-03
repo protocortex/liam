@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use liam_store::{ContentEmbedder, DefaultGraph, Millis, FOREVER};
+use liam_store::{ContentEmbedder, DefaultGraph, Millis, NodeId, FOREVER};
 
 use super::dedup::merge_near_duplicates;
 use super::dedup_cursor;
@@ -23,6 +23,7 @@ use super::manifest::{manifest_path_for, ResumeRefused, RunManifest, RunOutcome}
 use super::probe_set::{pick_probes, probe_set_path_for, ProbeSet};
 use super::probes::{compare, run_probes, Probe, ProbeError, ProbeReport};
 use super::shared_store::SharedStore;
+use super::tier_history::{self, history_path_for, TierHistory};
 use crate::embedder_fingerprint::EmbedderFingerprint;
 
 const SNAPSHOT: &str = "snapshot";
@@ -38,6 +39,8 @@ const PROBES: &str = "probes";
 const PARTIAL_SUFFIX: &str = ":partial";
 /// Suffix of the step name recorded when no hook part is configured for it.
 const SKIPPED_SUFFIX: &str = ":skipped";
+/// The tier step recorded as skipped, which leaves the tier history alone.
+const TIER_SKIPPED: &str = "tier:skipped";
 
 /// The steps of a forward run, in order.
 const STEPS: [&str; 8] = [
@@ -64,6 +67,8 @@ pub struct RunSettings {
     pub snapshot_dir: PathBuf,
     /// Most probes drawn from the store.
     pub probe_count: usize,
+    /// Runs a lineage moved by a rolled back run is left alone.
+    pub tier_cooldown_runs: u32,
 }
 
 /// The models a run records, so a resume under other models is refused.
@@ -232,6 +237,10 @@ impl Consolidator {
         probe_set_path_for(&self.database_path)
     }
 
+    fn history_path(&self) -> PathBuf {
+        history_path_for(&self.database_path)
+    }
+
     /// A run that ended in `RestoreFailed` keeps its snapshot for inspection and
     /// leaves the store possibly mixed. A new run would sweep that snapshot away
     /// and build on the store, so it waits for an operator to clear the manifest.
@@ -332,15 +341,56 @@ impl Consolidator {
                 let result = self.parts.hooks.summarize(&ctx).await;
                 self.note_hook(step, configured, result.map(|r| r.partial()), manifest)?;
             }
-            TIER => {
-                let configured = self.parts.hooks.tiering.is_some();
-                let result = self.parts.hooks.tier(&TierCtx { source }).await;
-                self.note_hook(step, configured, result.map(|_| false), manifest)?;
-            }
+            TIER => self.run_tier(store, source, manifest).await?,
             PROBES => return self.check_probes(store, manifest).await,
             other => anyhow::bail!("the consolidation run has no step named {other}"),
         }
         Ok(StepOutcome::Done)
+    }
+
+    async fn run_tier(
+        &self,
+        store: &DefaultGraph,
+        source: String,
+        manifest: &mut RunManifest,
+    ) -> anyhow::Result<()> {
+        let configured = self.parts.hooks.tiering.is_some();
+        let ctx = TierCtx {
+            store,
+            source,
+            run_id: manifest.run_id.clone(),
+            probed_nodes: self.probed_nodes()?,
+            history: self.tier_history(),
+        };
+        let result = self.parts.hooks.tier(&ctx).await.map(|report| {
+            manifest.tier_plan_hash = Some(report.plan_hash);
+            for lineage in report.moved_lineages {
+                if !manifest.tier_moved_lineages.contains(&lineage) {
+                    manifest.tier_moved_lineages.push(lineage);
+                }
+            }
+            report.partial
+        });
+        self.note_hook(TIER, configured, result, manifest)
+    }
+
+    /// An unreadable history is planned without, since a tier step never fails
+    /// the run.
+    fn tier_history(&self) -> TierHistory {
+        tier_history::load(&self.history_path()).unwrap_or_else(|error| {
+            tracing::warn!(%error, "consolidation: the tier history is unreadable, so the step plans without it");
+            TierHistory::default()
+        })
+    }
+
+    /// The nodes the baseline's probes expect to find; none when no probe set
+    /// was drawn.
+    fn probed_nodes(&self) -> anyhow::Result<Vec<NodeId>> {
+        let path = self.probe_set_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        Ok(ProbeSet::load(&path)?.relevant_nodes())
     }
 
     /// Each run snapshots into a directory of its own, named by its id, so an
@@ -481,9 +531,34 @@ impl Consolidator {
         }
         manifest.outcome = Some(RunOutcome::Committed);
         manifest.save(&self.manifest_path())?;
+        self.record_tier_outcome(&manifest);
         self.discard_leftovers(&manifest);
         tracing::info!(run_id = %manifest.run_id, "consolidation: run committed");
         Ok(manifest)
+    }
+
+    /// Notes in the tier history how the run's tier moves ended. The history
+    /// only steers later plans, so a failure to save it is logged, not raised.
+    fn record_tier_outcome(&self, manifest: &RunManifest) {
+        let moved = &manifest.tier_moved_lineages;
+        let tier_ran = manifest.is_complete(TIER) && !manifest.is_complete(TIER_SKIPPED);
+        let outcome = manifest.outcome;
+        if !tier_ran || outcome.is_none() {
+            return;
+        }
+        let saved = tier_history::load(&self.history_path()).and_then(|mut history| {
+            match outcome {
+                Some(RunOutcome::Committed) => history.after_commit(!moved.is_empty()),
+                Some(RunOutcome::RolledBack) => {
+                    history.after_rollback(moved, self.settings.tier_cooldown_runs);
+                }
+                _ => return Ok(()),
+            }
+            tier_history::save(&self.history_path(), &history)
+        });
+        if let Err(error) = saved {
+            tracing::warn!(run_id = %manifest.run_id, %error, "consolidation: the tier history could not be updated");
+        }
     }
 
     /// Removes the snapshot and probe set once nothing can need them. A
@@ -543,3 +618,5 @@ mod rollback;
 mod rollback_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tier_tests;
