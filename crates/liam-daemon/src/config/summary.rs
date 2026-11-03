@@ -3,6 +3,8 @@
 //! recorded nodes. Off until enabled.
 
 use serde::Deserialize;
+
+use super::pricing::Provider;
 #[cfg(test)]
 use serde::Serialize;
 
@@ -42,6 +44,9 @@ const MAX_RECLUSTER_INTERVAL_DAYS: u64 = 365 * 10;
 pub struct SummaryConfig {
     /// False makes the whole hook a no-op.
     pub enabled: bool,
+    /// Who writes the summaries: the local model, or a hosted provider (which
+    /// also needs `[hosted]`). `ask` and entity synthesis always stay local.
+    pub provider: Provider,
     /// Nearest neighbours considered for each item.
     pub knn: usize,
     /// Least cosine similarity at which two items are linked.
@@ -84,6 +89,7 @@ impl Default for SummaryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: Provider::Local,
             knn: DEFAULT_KNN,
             min_similarity: DEFAULT_MIN_SIMILARITY,
             time_window_hours: DEFAULT_TIME_WINDOW_HOURS,

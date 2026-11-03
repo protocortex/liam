@@ -47,6 +47,7 @@ probe_count                = 20     # most probes drawn from the store to gate a
 # consolidation job. Off until enabled. Needs a real llm provider, not the mock.
 [summary]
 enabled                 = false   # false makes the whole hook a no-op
+provider                = "local"  # who writes summaries: local, or a hosted provider (needs [hosted])
 knn                     = 8       # nearest neighbours considered for each item
 min_similarity          = 0.5     # least cosine similarity at which two items are linked
 time_window_hours       = 720     # items further apart than this are not linked
@@ -158,6 +159,7 @@ max_concurrent_generations = 0   # 0 = auto-tune from a one-time benchmark; set 
 # Derives subject/predicate/object facts from the log. Off until enabled.
 [extraction]
 enabled              = false     # false makes the whole hook a no-op
+provider             = "local"   # who answers the model half: local, or a hosted provider (needs [hosted])
 llm_enabled          = true      # false extracts with the rules only
 # llama_server_path  = "~/.liam/bin/llama-b11860/llama-server"   # where liam fetch-models puts it
 # model_gguf         = "~/.liam/models/extraction.gguf"

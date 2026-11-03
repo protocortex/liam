@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::pins::{ModelPin, PIN_PROVIDERS};
+use super::pricing::{Price, Provider};
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// Four MiB, far above a model answer and far below a memory problem.
@@ -30,6 +31,20 @@ pub struct HostedConfig {
     pub privacy: PrivacyConfig,
     /// The dated model id each provider is pinned to.
     pub models: BTreeMap<String, String>,
+    /// What each pinned model costs.
+    pub prices: PricesConfig,
+}
+
+/// `[hosted.prices]`: a versioned price table, so a recorded cost can be tied
+/// to the rates it was computed with.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+#[serde(default, deny_unknown_fields)]
+pub struct PricesConfig {
+    /// Names this table, for example the month the rates were read.
+    pub version: String,
+    /// Rates by pinned model id, in millionths of a dollar per million tokens.
+    pub models: BTreeMap<String, Price>,
 }
 
 /// `[hosted.privacy]`: the gate every item passes before it goes into a hosted
@@ -59,6 +74,7 @@ impl Default for HostedConfig {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             privacy: PrivacyConfig::default(),
             models: BTreeMap::new(),
+            prices: PricesConfig::default(),
         }
     }
 }
@@ -88,6 +104,42 @@ impl HostedConfig {
         for (provider, model_id) in &self.models {
             ModelPin::new(provider, model_id)?;
         }
+        anyhow::ensure!(
+            self.prices.models.is_empty() || !self.prices.version.trim().is_empty(),
+            "hosted.prices.version must name the price table"
+        );
+        Ok(())
+    }
+
+    /// The pin of `provider`, if one is set.
+    pub fn pin_for(&self, provider: Provider) -> Option<ModelPin> {
+        let model_id = self.models.get(provider.name())?;
+        ModelPin::new(provider.name(), model_id).ok()
+    }
+
+    /// The rates of a pinned model id.
+    pub fn price_for(&self, model_id: &str) -> Option<Price> {
+        self.prices.models.get(model_id).copied()
+    }
+
+    /// Checks that `provider`, chosen for `key`, can be called: hosted calls
+    /// are on, the model is pinned, and its price is known.
+    pub fn check_provider(&self, key: &str, provider: Provider) -> anyhow::Result<()> {
+        if provider == Provider::Local {
+            return Ok(());
+        }
+        let name = provider.name();
+        anyhow::ensure!(self.enabled, "{key} = {name:?} needs hosted.enabled = true");
+        let pin = self.pin_for(provider);
+        anyhow::ensure!(
+            pin.is_some(),
+            "{key} = {name:?} needs hosted.models.{name} to be set"
+        );
+        let pinned = pin.map(|pin| pin.model_id).unwrap_or_default();
+        anyhow::ensure!(
+            self.price_for(&pinned).is_some(),
+            "{key} = {name:?} needs hosted.prices.models.{pinned}"
+        );
         Ok(())
     }
 
@@ -216,5 +268,59 @@ mod tests {
         assert!(format!("{no_timeout:#}").contains("hosted.request_timeout_secs"));
         assert!(format!("{no_size:#}").contains("hosted.max_response_bytes"));
         assert!(format!("{unknown:#}").contains("api_key"));
+    }
+
+    const HOSTED_ANTHROPIC: &str =
+        "[hosted]\nenabled = true\nallowed_hosts = [\"api.anthropic.com\"]\n\
+        [hosted.models]\nanthropic = \"claude-sonnet-4-5-20250929\"\n";
+    const ANTHROPIC_PRICE: &str = "[hosted.prices]\nversion = \"2026-11\"\n\
+        [hosted.prices.models.\"claude-sonnet-4-5-20250929\"]\n\
+        input_micro_per_mtok = 3000000\noutput_micro_per_mtok = 15000000\n";
+
+    #[test]
+    fn a_hosted_provider_for_a_stage_needs_hosted_on_a_pin_a_price_and_metrics() {
+        // Arrange
+        let stage = "[extraction]\nprovider = \"anthropic\"\n";
+        let off = format!("{stage}[hosted]\nenabled = false\n");
+        let unpinned =
+            format!("{stage}[hosted]\nenabled = true\nallowed_hosts = [\"api.anthropic.com\"]\n");
+        let unpriced = format!("{stage}{HOSTED_ANTHROPIC}");
+        let blind =
+            format!("{stage}{HOSTED_ANTHROPIC}{ANTHROPIC_PRICE}[metrics]\nenabled = false\n");
+
+        // Act
+        let errors: Vec<String> = [off, unpinned, unpriced, blind]
+            .iter()
+            .map(|toml| format!("{:#}", load(toml).unwrap_err()))
+            .collect();
+        let ready = load(&format!("{stage}{HOSTED_ANTHROPIC}{ANTHROPIC_PRICE}")).unwrap();
+
+        // Assert
+        assert!(errors[0].contains("extraction.provider") && errors[0].contains("hosted.enabled"));
+        assert!(errors[1].contains("hosted.models.anthropic"));
+        assert!(errors[2].contains("hosted.prices.models.claude-sonnet-4-5-20250929"));
+        assert!(errors[3].contains("metrics.enabled"));
+        assert_eq!(ready.extraction.provider, Provider::Anthropic);
+        assert_eq!(ready.summary.provider, Provider::Local);
+    }
+
+    #[test]
+    fn the_summary_stage_is_checked_the_same_way() {
+        // Act
+        let error = load("[summary]\nprovider = \"openai\"\n").unwrap_err();
+
+        // Assert
+        assert!(format!("{error:#}").contains("summary.provider"));
+    }
+
+    #[test]
+    fn a_price_table_needs_a_version() {
+        // Act
+        let unversioned =
+            load("[hosted.prices.models.\"gpt-4o-2024-08-06\"]\ninput_micro_per_mtok = 1\n")
+                .unwrap_err();
+
+        // Assert
+        assert!(format!("{unversioned:#}").contains("hosted.prices.version"));
     }
 }

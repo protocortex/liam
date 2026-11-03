@@ -222,7 +222,12 @@ async fn each_kind_of_rule_raises_its_alert_on_a_staged_excursion() {
     run(&metrics, &clock, 0, RunOutcome::Committed, healthy).await;
     assert!(alerting(&sink).is_empty(), "the first run raises nothing");
     let mut model_calls = Sample {
-        labels: Labels::Provider(crate::metrics::sink::Provider::Local),
+        labels: Labels::Model {
+            provider: crate::metrics::sink::Provider::Local,
+            model: crate::metrics::sink::ModelCatalog::default()
+                .intern("local-model")
+                .unwrap(),
+        },
         ..sample(MetricId::ModelCalls, 0.0, 0)
     };
     metrics.sink.record(model_calls);
@@ -356,4 +361,50 @@ async fn a_reader_never_sees_one_runs_readings_with_the_previous_runs_alerts() {
         tokio::task::yield_now().await;
     }
     writer.await.unwrap();
+}
+
+#[test]
+fn a_model_call_is_counted_with_its_cost_under_provider_and_model_labels() {
+    // Arrange
+    let (metrics, sink) = recorder();
+    let price = crate::metrics::collect::Price {
+        input_micro_per_mtok: 2_000_000,
+        output_micro_per_mtok: 10_000_000,
+        ..Default::default()
+    };
+    let tokens = crate::metrics::sink::TokenUsage {
+        input_tokens: 1_000_000,
+        output_tokens: 100_000,
+        cached_input_tokens: 0,
+    };
+
+    // Act
+    metrics.model_call(
+        crate::metrics::sink::Provider::OpenAi,
+        "gpt-4o-2024-08-06",
+        tokens,
+        false,
+        price,
+    );
+    metrics.model_call(
+        crate::metrics::sink::Provider::OpenAi,
+        "gpt-4o-2024-08-06",
+        tokens,
+        false,
+        price,
+    );
+    metrics.model_call(
+        crate::metrics::sink::Provider::OpenAi,
+        "not a model id",
+        tokens,
+        false,
+        price,
+    );
+
+    // Assert
+    let readings = sink.snapshot().readings;
+    let value = |metric| readings.iter().find(|r| r.metric == metric).unwrap().value;
+    assert_eq!(value(MetricId::ModelCalls), 2.0);
+    assert_eq!(value(MetricId::ModelCostMicroDollars), 6_000_000.0);
+    assert_eq!(readings.len(), 2);
 }

@@ -7,6 +7,8 @@ use std::collections::BTreeSet;
 use liam_store::{EmbedError, GraphConfig, NewNode, NodeId};
 
 use super::*;
+use crate::extraction::client::ModelIdentity;
+use crate::summary::summariser::LocalSummariser;
 use crate::summary::test_support::{MemoryCache, ScriptedLlm};
 
 const DIMS: usize = 8;
@@ -133,14 +135,16 @@ impl Rig {
     fn hooks(&self, config: SummaryConfig) -> SummaryHooks {
         SummaryHooks {
             config,
-            llm: self.llm.clone(),
+            summariser: Arc::new(LocalSummariser::new(
+                self.llm.clone(),
+                ModelIdentity {
+                    model_id: "model".to_string(),
+                    model_sha256: String::new(),
+                },
+            )),
             permits: Arc::new(Semaphore::new(1)),
             cache: self.cache.clone(),
             embedder: Arc::new(FixedEmbedder),
-            identity: ModelIdentity {
-                model_id: "model".to_string(),
-                model_sha256: String::new(),
-            },
             context_tokens: 8192,
         }
     }

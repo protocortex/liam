@@ -23,6 +23,7 @@ use crate::log_startup::test_support::{database_in, log_dir_in, standalone_log, 
 use crate::mcp::summaries::SummariesArgs;
 use crate::mcp::{AskArgs, ClustersArgs, MemoryServer, RecallArgs, TimelineArgs};
 use crate::summary::hooks::SummaryHooks;
+use crate::summary::summariser::LocalSummariser;
 use crate::summary::test_support::{MemoryCache, ScriptedLlm};
 
 const FACT_SENTINEL: &str = "fxsentinel7";
@@ -543,19 +544,21 @@ async fn summarize(store: &DefaultGraph) {
             enabled: true,
             ..SummaryConfig::default()
         },
-        llm: Arc::new(ScriptedLlm::replying(&[
-            LEVEL_ONE_REPLY,
-            LEVEL_ONE_REPLY,
-            LEVEL_ONE_REPLY,
-            LEVEL_TWO_REPLY,
-        ])),
+        summariser: Arc::new(LocalSummariser::new(
+            Arc::new(ScriptedLlm::replying(&[
+                LEVEL_ONE_REPLY,
+                LEVEL_ONE_REPLY,
+                LEVEL_ONE_REPLY,
+                LEVEL_TWO_REPLY,
+            ])),
+            ModelIdentity {
+                model_id: "model".to_string(),
+                model_sha256: String::new(),
+            },
+        )),
         permits: Arc::new(Semaphore::new(1)),
         cache: Arc::new(MemoryCache::default()),
         embedder: Arc::new(FirstAxisEmbedder),
-        identity: ModelIdentity {
-            model_id: "model".to_string(),
-            model_sha256: String::new(),
-        },
         context_tokens: CONTEXT_TOKENS,
     };
     let report = hooks
