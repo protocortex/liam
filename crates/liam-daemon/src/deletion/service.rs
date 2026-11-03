@@ -508,6 +508,8 @@ impl DeleteService {
             self.deps.registry.purge_at(index, &target).await?;
             self.crash_at(CrashPoint::AfterStorePurged(index))?;
         }
+        // A store may have added notices to the saved job.
+        job.notices = self.load(&job.id)?.notices;
         self.crash_at(CrashPoint::AfterPurge)?;
         self.move_to(job, JobState::Scrubbing)
     }

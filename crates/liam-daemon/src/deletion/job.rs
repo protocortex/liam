@@ -84,6 +84,10 @@ pub struct DeleteJob {
     /// cancelled.
     pub destroy_started: bool,
     pub failure: Option<Failure>,
+    /// What the job could not remove, for the operator to act on. A job file
+    /// written before notices existed reads as having none.
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
 
 impl DeleteJob {
@@ -99,6 +103,7 @@ impl DeleteJob {
             key_ids: Vec::new(),
             destroy_started: false,
             failure: None,
+            notices: Vec::new(),
         }
     }
 
@@ -185,6 +190,24 @@ impl JobStore {
             )
         })
     }
+
+    /// Adds the `notices` job `id` does not have yet, so a step that runs
+    /// again adds each once.
+    pub fn add_notices(&self, id: &str, notices: &[String]) -> anyhow::Result<()> {
+        let mut job = self
+            .get(id)?
+            .ok_or_else(|| anyhow::anyhow!("there is no delete job {id} to add a notice to"))?;
+        let before = job.notices.len();
+        for notice in notices {
+            if !job.notices.contains(notice) {
+                job.notices.push(notice.clone());
+            }
+        }
+        if job.notices.len() == before {
+            return Ok(());
+        }
+        self.save(&job)
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +229,34 @@ mod tests {
             START,
             DAYS,
         )
+    }
+
+    #[test]
+    fn a_notice_is_added_once_and_a_job_saved_without_notices_reads_as_having_none() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let store = JobStore::new(dir.path().join("jobs.json"));
+        store.save(&job()).unwrap();
+        let notice = "openai keeps a copy".to_owned();
+
+        // Act
+        store
+            .add_notices("job-1", std::slice::from_ref(&notice))
+            .unwrap();
+        store
+            .add_notices("job-1", std::slice::from_ref(&notice))
+            .unwrap();
+        let missing = store
+            .add_notices("job-9", std::slice::from_ref(&notice))
+            .unwrap_err();
+        let mut old: serde_json::Value = serde_json::to_value(job()).unwrap();
+        old.as_object_mut().unwrap().remove("notices");
+        let read: DeleteJob = serde_json::from_value(old).unwrap();
+
+        // Assert
+        assert_eq!(store.get("job-1").unwrap().unwrap().notices, [notice]);
+        assert!(missing.to_string().contains("job-9"), "{missing}");
+        assert!(read.notices.is_empty());
     }
 
     #[test]
