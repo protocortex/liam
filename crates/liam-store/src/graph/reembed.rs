@@ -60,7 +60,10 @@ impl<B: Backend> Graph<B> {
     /// would have embedded. Fails only when the rows cannot be listed.
     pub async fn reembed_missing(&self) -> Result<ReembedReport> {
         let mut report = ReembedReport::default();
-        let missing = self.backend.nodes_missing_vectors().await?;
+        // A demoted node has no vector by design, so it is not missing one.
+        let demoted = self.demoted_node_ids().await?;
+        let mut missing = self.backend.nodes_missing_vectors().await?;
+        missing.retain(|id| !demoted.contains(id.as_str()));
         let summaries = self.summaries_missing_embeddings().await?;
         let Some(embedder) = &self.embedder else {
             report.pending = missing.len() + summaries.len();
@@ -92,6 +95,8 @@ impl<B: Backend> Graph<B> {
                 }
             }
         }
+        // A node embedded for its signature may belong to a cold lineage.
+        self.settle_cold_tiers().await?;
         Ok(report)
     }
 

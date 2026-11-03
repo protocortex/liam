@@ -38,6 +38,14 @@ const FEEDBACK_INSERT_SQL: &str = "INSERT OR IGNORE INTO item_feedback
        (event_id, lineage_key, producer, at, day, correct, counted)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
+/// The rows a demotion leaves without a vector, with `?1` the cold tier and
+/// `?2` the end of an open node.
+const DEMOTED_NODES: &str = "FROM nodes n
+     JOIN node_lineage l ON l.node_id = n.id
+     JOIN item_tier t ON t.lineage_key = l.lineage_key AND t.tier = ?1
+     JOIN node_quant q ON q.node_id = n.id
+     WHERE n.tx_to = ?2 AND n.tx_from <= t.changed_at";
+
 fn optional_i64(row: &Row, index: usize) -> Result<Option<i64>> {
     match row.0.get(index) {
         Some(Value::Null) | None => Ok(None),
@@ -69,17 +77,18 @@ impl<B: Backend> Graph<B> {
     /// `event_id` is the log record that made the move, if one did.
     pub async fn set_tier(&self, change: &TierMove, event_id: Option<&str>) -> Result<()> {
         let _gate = self.quant_gate.lock().await;
-        let params = [
-            change.lineage_key.as_str().into(),
-            change.to.as_str().into(),
-            change.changed_at.into(),
-            change.residency_until.map_or(Value::Null, Value::from),
-            event_id.map_or(Value::Null, Value::from),
-        ];
-        self.backend.execute(TIER_UPSERT_SQL, &params).await?;
-        let nodes = self.lineage_node_ids(&change.lineage_key).await?;
+        self.backend
+            .execute(TIER_UPSERT_SQL, &tier_params(change, event_id))
+            .await?;
+        self.flag_lineage(&change.lineage_key, change.to).await
+    }
+
+    /// Flags the nodes of a lineage in the index as `tier` holds them. The
+    /// caller holds the index gate.
+    pub(in crate::graph) async fn flag_lineage(&self, key: &LineageKey, tier: Tier) -> Result<()> {
+        let nodes = self.lineage_node_ids(key).await?;
         self.quant
-            .set_cold(nodes.iter().map(String::as_str), change.to == Tier::Cold);
+            .set_cold(nodes.iter().map(String::as_str), tier == Tier::Cold);
         Ok(())
     }
 
@@ -103,60 +112,18 @@ impl<B: Backend> Graph<B> {
         day: i64,
         entries: &[UsageEntry],
     ) -> Result<()> {
-        let mut statements = vec![(
-            USAGE_EPOCH_SQL.to_string(),
-            vec![event_id.into(), day.into()],
-        )];
-        statements.extend(entries.iter().map(|entry| {
-            let params = vec![
-                event_id.into(),
-                entry.lineage_key.as_str().into(),
-                day.into(),
-                i64::from(entry.hits).into(),
-                entry.last_access_at.into(),
-            ];
-            (USAGE_ENTRY_SQL.to_string(), params)
-        }));
-        self.backend.execute_atomic(&statements).await
+        let mut tx = self.backend.begin().await?;
+        let applied = apply_usage_in(&mut *tx, event_id, day, entries).await;
+        commit_or_abandon(tx, applied).await
     }
 
     /// Records one logged verdict and says whether it was newly counted. Of a
-    /// producer's verdicts on one lineage in one day only the first applied
-    /// counts, and replay applies in log order, so it agrees. A verdict already
-    /// applied changes nothing.
+    /// producer's verdicts on a lineage in a day only the first applied counts,
+    /// and replay applies in log order, so it agrees. A verdict already applied
+    /// changes nothing.
     pub async fn apply_feedback(&self, event: &FeedbackEvent) -> Result<bool> {
         let mut tx = self.backend.begin().await?;
-        let day = event.at.day_number();
-        let applied = async {
-            let earlier = tx
-                .query(
-                    FEEDBACK_COUNTED_SQL,
-                    &[
-                        event.lineage_key.as_str().into(),
-                        event.producer.as_str().into(),
-                        day.into(),
-                        event.event_id.as_str().into(),
-                    ],
-                )
-                .await?;
-            let counted = earlier.is_empty();
-            let stored = tx
-                .execute(
-                    FEEDBACK_INSERT_SQL,
-                    &[
-                        event.event_id.as_str().into(),
-                        event.lineage_key.as_str().into(),
-                        event.producer.as_str().into(),
-                        event.at.into(),
-                        day.into(),
-                        i64::from(event.correct).into(),
-                        i64::from(counted).into(),
-                    ],
-                )
-                .await?;
-            Ok(counted && stored == 1)
-        }
-        .await;
+        let applied = apply_feedback_in(&mut *tx, event).await;
         commit_or_abandon(tx, applied).await
     }
 
@@ -255,6 +222,34 @@ impl<B: Backend> Graph<B> {
         Ok(report)
     }
 
+    /// The live nodes a demotion left without a vector: those of a cold lineage
+    /// that were written no later than it went cold and have a signature.
+    pub(in crate::graph) async fn demoted_node_ids(&self) -> Result<HashSet<String>> {
+        let rows = self
+            .backend
+            .query(
+                &format!("SELECT n.id {DEMOTED_NODES}"),
+                &[Tier::Cold.as_str().into(), FOREVER.into()],
+            )
+            .await?;
+        rows.iter().map(|row| row.get_string(0)).collect()
+    }
+
+    /// Makes what a replay or a re-embed brought back agree with the tier rows:
+    /// a demoted node loses its int8 form and its vector again.
+    pub(in crate::graph) async fn settle_cold_tiers(&self) -> Result<ReconcileReport> {
+        self.backend
+            .execute(
+                &format!(
+                    "UPDATE node_quant SET i8 = NULL WHERE i8 IS NOT NULL AND node_id IN
+                     (SELECT n.id {DEMOTED_NODES})"
+                ),
+                &[Tier::Cold.as_str().into(), FOREVER.into()],
+            )
+            .await?;
+        self.reconcile_tier_vectors().await
+    }
+
     /// Drops usage older than `before_day` and every epoch but the earliest,
     /// which `observation_since` is read from, so it never moves forward.
     /// Returns how many rows went.
@@ -326,6 +321,83 @@ impl<B: Backend> Graph<B> {
         // Nothing was written, so rolling back is the same as committing.
         commit_or_abandon(tx, read).await
     }
+}
+
+fn tier_params(change: &TierMove, event_id: Option<&str>) -> [Value; 5] {
+    [
+        change.lineage_key.as_str().into(),
+        change.to.as_str().into(),
+        change.changed_at.into(),
+        change.residency_until.map_or(Value::Null, Value::from),
+        event_id.map_or(Value::Null, Value::from),
+    ]
+}
+
+/// Sets the tier row of a lineage inside `tx`. A move already applied is set
+/// again to the same values, and the last move replayed wins.
+pub(in crate::graph) async fn apply_tier_in(
+    tx: &mut dyn BackendTx,
+    change: &TierMove,
+    event_id: Option<&str>,
+) -> Result<()> {
+    tx.execute(TIER_UPSERT_SQL, &tier_params(change, event_id))
+        .await?;
+    Ok(())
+}
+
+pub(in crate::graph) async fn apply_usage_in(
+    tx: &mut dyn BackendTx,
+    event_id: &str,
+    day: i64,
+    entries: &[UsageEntry],
+) -> Result<()> {
+    tx.execute(USAGE_EPOCH_SQL, &[event_id.into(), day.into()])
+        .await?;
+    for entry in entries {
+        let params = [
+            event_id.into(),
+            entry.lineage_key.as_str().into(),
+            day.into(),
+            i64::from(entry.hits).into(),
+            entry.last_access_at.into(),
+        ];
+        tx.execute(USAGE_ENTRY_SQL, &params).await?;
+    }
+    Ok(())
+}
+
+pub(in crate::graph) async fn apply_feedback_in(
+    tx: &mut dyn BackendTx,
+    event: &FeedbackEvent,
+) -> Result<bool> {
+    let day = event.at.day_number();
+    let earlier = tx
+        .query(
+            FEEDBACK_COUNTED_SQL,
+            &[
+                event.lineage_key.as_str().into(),
+                event.producer.as_str().into(),
+                day.into(),
+                event.event_id.as_str().into(),
+            ],
+        )
+        .await?;
+    let counted = earlier.is_empty();
+    let stored = tx
+        .execute(
+            FEEDBACK_INSERT_SQL,
+            &[
+                event.event_id.as_str().into(),
+                event.lineage_key.as_str().into(),
+                event.producer.as_str().into(),
+                event.at.into(),
+                day.into(),
+                i64::from(event.correct).into(),
+                i64::from(counted).into(),
+            ],
+        )
+        .await?;
+    Ok(counted && stored == 1)
 }
 
 /// A lineage while its nodes are being read.

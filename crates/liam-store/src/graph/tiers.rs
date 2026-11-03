@@ -5,6 +5,7 @@
 //! move between tiers does not.
 
 mod lineage;
+mod logged;
 mod quantize;
 mod state;
 
@@ -15,6 +16,7 @@ use quantize::{bytes_to_words, words_to_bytes, QUANT_VERSION};
 pub use quantize::{
     dequantize, hamming, quantize, IndexedEntry, QuantIndex, Quantized, BITS_PER_WORD,
 };
+pub(super) use state::{apply_feedback_in, apply_tier_in, apply_usage_in};
 
 use super::projection::Step;
 use super::Graph;
@@ -115,6 +117,7 @@ impl<B: Backend> Graph<B> {
     pub(super) async fn sync_quant(&self, steps: &[Step]) {
         let mut gone: Vec<&str> = Vec::new();
         let mut added = Vec::new();
+        let mut moved = Vec::new();
         for step in steps {
             match step {
                 Step::Close { id, .. } => gone.push(id),
@@ -122,10 +125,11 @@ impl<B: Backend> Graph<B> {
                     gone.push(&target.id)
                 }
                 Step::Quant { node_id, quantized } => added.push((node_id, &quantized.bin)),
+                Step::Tier { change, .. } => moved.push((&change.lineage_key, change.to)),
                 _ => {}
             }
         }
-        if gone.is_empty() && added.is_empty() {
+        if gone.is_empty() && added.is_empty() && moved.is_empty() {
             return;
         }
         let _gate = self.quant_gate.lock().await;
@@ -140,6 +144,11 @@ impl<B: Backend> Graph<B> {
                 false
             });
             self.quant.insert(id, cold, bin.clone());
+        }
+        for (lineage, tier) in moved {
+            if let Err(error) = self.flag_lineage(lineage, tier).await {
+                tracing::warn!(%error, "tier move not flagged in the index until the next reload");
+            }
         }
     }
 
@@ -169,7 +178,8 @@ impl<B: Backend> Graph<B> {
         params.push(FOREVER.into());
         if self.backend.execute(&sql, &params).await? == 1 {
             let _gate = self.quant_gate.lock().await;
-            self.quant.insert(node_id.as_str(), false, quantized.bin);
+            let cold = self.node_is_cold(node_id.as_str()).await?;
+            self.quant.insert(node_id.as_str(), cold, quantized.bin);
         }
         Ok(())
     }

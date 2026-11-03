@@ -13,12 +13,12 @@ mod legacy;
 use legacy::{LegacyEvent, LegacyPayload};
 
 /// Schema version this build writes and the newest it can read. Version 2 adds
-/// the fact payloads and version 4 the derived artifacts, which an older build
-/// cannot replay. Version 3 adds the derivation and basis of a node row, which
+/// the fact payloads, version 4 the derived artifacts and version 5 the usage,
+/// feedback and tier payloads, which an older build cannot replay. Version 3 adds the derivation and basis of a node row, which
 /// changes its layout, so frames of versions before it are read through
 /// [`legacy`]. Every frame comes back stamped with this version, since what
 /// is returned is the current representation of the event.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// The first version whose node rows carry a derivation and a basis.
 pub(crate) const NODE_DERIVATION_SCHEMA_VERSION: u32 = 3;
@@ -167,6 +167,45 @@ pub enum LogPayload {
         artifact_id: String,
         at: i64,
     },
+    /// The reads that returned each lineage in a period, counted in memory and
+    /// flushed together. `day` is the UTC day of the flush, in days since the
+    /// epoch. An empty batch is legal and marks when counting began.
+    AccessBatch {
+        day: i64,
+        entries: Vec<UsageRow>,
+    },
+    /// A producer's verdict on a result, by the lineage the result came from.
+    Feedback {
+        lineage_key: String,
+        correct: bool,
+        producer: String,
+        at: i64,
+    },
+    /// A lineage put in a tier, with the residency it carries so a replay needs
+    /// no configuration.
+    TierMove {
+        lineage_key: String,
+        to: TierName,
+        run_id: String,
+        reason: String,
+        changed_at: i64,
+        residency_until: Option<i64>,
+    },
+}
+
+/// The reads of one lineage in an `AccessBatch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageRow {
+    pub lineage_key: String,
+    pub hits: u32,
+    pub last_access_at: i64,
+}
+
+/// The tier a `TierMove` puts a lineage in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TierName {
+    Hot,
+    Cold,
 }
 
 /// The `kind` of a summary of a cluster of nodes.
@@ -986,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_artifact_payloads_wire_format_is_pinned() {
+    fn v4_artifact_frames_still_decode_and_v5_frames_carry_the_new_prefix() {
         // Arrange
         let golden = [
             (LogPayload::DerivedArtifact(artifact()), "04076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f00080a61727469666163742d310773756d6d617279020670726f6a2f610a412073756d6d6172792e02076368696c642d31076368696c642d3202076576656e742d3700076576656e742d38010108696e666572726564076d6f64656c2d610870726f6d70742d31010a61727469666163742d30d00fa01ff02e"),
@@ -1001,10 +1040,90 @@ mod tests {
 
         for (payload, hex) in golden {
             let event = event_with(payload);
+            let v4_bytes = from_hex(hex);
+
+            // Act
+            let decoded = LogEvent::decode(&v4_bytes);
+            let encoded = event.encode().expect("encode event");
+
+            // Assert: the old frame reads back as the current event, and the
+            // new frame differs from it in the version prefix alone
+            assert_eq!(decoded, Ok(event.clone()), "{event:?}");
+            assert_eq!(encoded[0], CURRENT_SCHEMA_VERSION as u8);
+            assert_eq!(encoded[1..], v4_bytes[1..], "layout drifted for {event:?}");
+        }
+    }
+
+    fn tier_payloads() -> [LogPayload; 4] {
+        [
+            LogPayload::AccessBatch {
+                day: 20_000,
+                entries: vec![
+                    UsageRow {
+                        lineage_key: "n:3:abc".into(),
+                        hits: 4,
+                        last_access_at: 1_728_000_000_000,
+                    },
+                    UsageRow {
+                        lineage_key: "s:!:1:x:0:".into(),
+                        hits: 1,
+                        last_access_at: 5,
+                    },
+                ],
+            },
+            LogPayload::AccessBatch {
+                day: 20_001,
+                entries: Vec::new(),
+            },
+            LogPayload::Feedback {
+                lineage_key: "n:3:abc".into(),
+                correct: false,
+                producer: "agent-a".into(),
+                at: 1_728_000_000_000,
+            },
+            LogPayload::TierMove {
+                lineage_key: "n:3:abc".into(),
+                to: TierName::Cold,
+                run_id: "run-1".into(),
+                reason: "unused".into(),
+                changed_at: 1_728_000_000_000,
+                residency_until: Some(1_730_000_000_000),
+            },
+        ]
+    }
+
+    #[test]
+    fn usage_feedback_and_tier_payloads_round_trip() {
+        for payload in tier_payloads() {
+            // Act and Assert
+            assert_round_trips(event_with(payload));
+        }
+        assert_round_trips(event_with(LogPayload::TierMove {
+            lineage_key: "n:1:x".into(),
+            to: TierName::Hot,
+            run_id: "run-2".into(),
+            reason: "used".into(),
+            changed_at: 7,
+            residency_until: None,
+        }));
+    }
+
+    #[test]
+    fn v5_usage_feedback_and_tier_payloads_wire_format_is_pinned() {
+        // Arrange
+        let golden = [
+            "05076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f000ac0b80202076e3a333a6162630480809ccdca640a733a213a313a783a303a010a",
+            "05076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f000ac2b80200",
+            "05076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f000b076e3a333a61626300076167656e742d6180809ccdca64",
+            "05076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f000c076e3a333a616263010572756e2d3106756e7573656480809ccdca640180d0c8c0d964",
+        ];
+
+        for (payload, hex) in tier_payloads().into_iter().zip(golden) {
+            let event = event_with(payload);
+            let encoded = event.encode().expect("encode event");
             let expected_bytes = from_hex(hex);
 
             // Act
-            let encoded = event.encode().expect("encode event");
             let decoded = LogEvent::decode(&expected_bytes);
 
             // Assert

@@ -149,7 +149,10 @@ pub fn content_hashes(event: &LogEvent) -> Vec<([u8; 32], String)> {
         | LogPayload::FactWrite { .. }
         | LogPayload::RunRolledBack { .. }
         | LogPayload::DerivedArtifact(_)
-        | LogPayload::DerivedArtifactClosed { .. } => Vec::new(),
+        | LogPayload::DerivedArtifactClosed { .. }
+        | LogPayload::AccessBatch { .. }
+        | LogPayload::Feedback { .. }
+        | LogPayload::TierMove { .. } => Vec::new(),
     }
 }
 

@@ -16,7 +16,7 @@ use super::fact_projection::FactStep;
 use super::log_cursor;
 use super::logged_plan::Table;
 use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog};
-use super::projection::{origin_steps, steps_for, Step};
+use super::projection::{origin_steps, state_steps, steps_for, Step};
 use super::reembed::ReembedReport;
 use super::rolled_back::{RolledBack, SeenFactWrite};
 use super::Graph;
@@ -197,6 +197,7 @@ impl<B: Backend> Graph<B> {
         let LogRecord { offset, event, .. } = record;
         let mut steps = steps_for(&rolled_back.reconcile(event.payload.clone()));
         steps.extend(origin_steps(event, &steps));
+        steps.extend(state_steps(event));
         if steps.is_empty() {
             log_cursor::advance(&self.backend, held.log_id, *offset).await?;
             return Ok(Outcome::Passed);
@@ -453,7 +454,10 @@ pub(super) fn row_effects(payload: LogPayload) -> Vec<RowEffect> {
         | LogPayload::FactWrite { .. }
         | LogPayload::RunRolledBack { .. }
         | LogPayload::DerivedArtifact(_)
-        | LogPayload::DerivedArtifactClosed { .. } => Vec::new(),
+        | LogPayload::DerivedArtifactClosed { .. }
+        | LogPayload::AccessBatch { .. }
+        | LogPayload::Feedback { .. }
+        | LogPayload::TierMove { .. } => Vec::new(),
     }
 }
 
@@ -499,6 +503,9 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
             | Step::Remove(_)
             | Step::Lineage { .. }
             | Step::Quant { .. }
+            | Step::Usage { .. }
+            | Step::Feedback(_)
+            | Step::Tier { .. }
             | Step::Fact(_)
             | Step::SummaryClose { .. }
             | Step::SummaryEmbedding { .. } => None,

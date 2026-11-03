@@ -82,7 +82,10 @@ fn texts_by_scope(payload: &LogPayload) -> BTreeMap<Option<String>, String> {
         | LogPayload::FactWrite { .. }
         | LogPayload::RunRolledBack { .. }
         | LogPayload::DerivedArtifact(_)
-        | LogPayload::DerivedArtifactClosed { .. } => Vec::new(),
+        | LogPayload::DerivedArtifactClosed { .. }
+        | LogPayload::AccessBatch { .. }
+        | LogPayload::Feedback { .. }
+        | LogPayload::TierMove { .. } => Vec::new(),
     };
     let mut by_scope: BTreeMap<Option<String>, String> = BTreeMap::new();
     for row in rows.into_iter().filter(|row| !is_entity_page(row)) {

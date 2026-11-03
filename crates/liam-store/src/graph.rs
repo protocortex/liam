@@ -2481,6 +2481,7 @@ mod tests {
     mod summary_log;
     mod support;
     mod swept_by;
+    mod tier_log;
     mod tiers;
     mod typed_retrieval;
     mod vector_reads;
