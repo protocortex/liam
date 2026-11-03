@@ -4,9 +4,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use liam_log::crypto::KeyRegistry;
 use liam_store::{DefaultGraph, EventRole, LineageTarget, NewNode, NodeId};
 
-use crate::config::{EncryptionConfig, MasterKeySource};
+use crate::config::{Config, EncryptionConfig, MasterKeySource};
 use crate::log_startup::open_store_with_log;
 use crate::log_startup::test_support::{config_in, database_in, embedder, log_dir_in};
 use crate::shutdown::Shutdown;
@@ -14,6 +15,8 @@ use crate::shutdown::Shutdown;
 pub const JOB: &str = "job-1";
 
 pub struct Subjects {
+    pub config: Config,
+    pub keys: Arc<KeyRegistry>,
     pub store: Arc<DefaultGraph>,
     pub alice: NodeId,
     /// Alice's key group and the event that wrote her note, resolved.
@@ -62,6 +65,8 @@ pub async fn sealed_subjects(dir: &Path) -> Subjects {
         .await
         .unwrap();
     Subjects {
+        config,
+        keys: started.keys.expect("a sealed log has a key registry"),
         store,
         alice: ids[0].clone(),
         target,
