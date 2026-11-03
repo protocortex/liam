@@ -415,8 +415,10 @@ impl World {
                 let sentinel = if marked { FACT_SENTINEL } else { "" };
                 let node = NewNode::now(
                     "fact",
-                    format!("Note {n} {sentinel}"),
-                    format!("ledger notes number {n} cover quarterly forecasts for the {name} team {sentinel}"),
+                    format!("Note {n} {sentinel}").trim_end().to_string(),
+                    format!("ledger notes number {n} cover quarterly forecasts for the {name} team {sentinel}")
+                    .trim_end()
+                    .to_string(),
                 )
                 .with_embedding(axis(group))
                 .with_valid_from(Millis(1000 + (group * 100 + n) as i64));
