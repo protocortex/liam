@@ -10,14 +10,14 @@
 use std::collections::BTreeSet;
 
 use liam_log::event::{
-    EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTable, TombstoneTarget,
+    EdgeRow, LogEvent, LogPayload, NodeRow, RowEffect, TombstoneTable, TombstoneTarget, UsageRow,
     CURRENT_SCHEMA_VERSION,
 };
 use liam_log::hash::{edge_row_hash, node_row_hash};
 use uuid::Uuid;
 
 use super::logged_write::{ready, WriteOutcome};
-use super::projection::{edge_guards, origin_steps, steps_for, Step};
+use super::projection::{edge_guards, origin_steps, state_steps, steps_for, Step};
 use super::{
     collision_producer, edge_exists_message, edge_refusal, open_by_subject_query, open_node_query,
     resolve_episode_ref, resolve_node_row, Graph, EMPTY_ATTRIBUTES,
@@ -25,11 +25,17 @@ use super::{
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
-use crate::types::{relation, EpisodeEdge, NewNode};
+use crate::types::{relation, EpisodeEdge, LineageKey, NewNode, TierMove, UsageEntry};
 use crate::value::Value;
 
 /// Source and trust of a record no producer wrote, such as an edge.
 pub(super) const STORE_SOURCE: &str = "liam-store";
+/// Source of the usage batches. It is never a `consolidation:` source, so a
+/// run's rollback keeps the accesses made while it ran.
+pub(super) const USAGE_SOURCE: &str = "usage";
+/// Source of the verdicts, apart from the producer they name so that a
+/// producer's name can never read as a run.
+pub(super) const FEEDBACK_SOURCE: &str = "feedback";
 pub(super) const STORE_TRUST: f64 = 1.0;
 
 /// A table whose rows a content hash or a tombstone can point at.
@@ -133,6 +139,7 @@ impl Plan {
     fn new(event: LogEvent) -> Self {
         let mut steps = steps_for(&event.payload);
         steps.extend(origin_steps(&event, &steps));
+        steps.extend(state_steps(&event));
         Self {
             event,
             steps,
@@ -152,6 +159,62 @@ impl Plan {
             refusal_if_absent,
         });
         self
+    }
+
+    /// A usage batch. Like the other state records it covers no content, so it
+    /// is never taken for a duplicate of an earlier one.
+    pub(super) fn usage(day: i64, entries: &[UsageEntry], now: Millis) -> Self {
+        let entries = entries
+            .iter()
+            .map(|entry| UsageRow {
+                lineage_key: entry.lineage_key.as_str().to_string(),
+                hits: entry.hits,
+                last_access_at: entry.last_access_at.0,
+            })
+            .collect();
+        let payload = LogPayload::AccessBatch { day, entries };
+        Self::new(event(
+            [0; 32],
+            (USAGE_SOURCE, STORE_TRUST),
+            now.0,
+            now,
+            payload,
+        ))
+    }
+
+    pub(super) fn feedback(
+        lineage_key: &LineageKey,
+        producer: &str,
+        correct: bool,
+        now: Millis,
+    ) -> Self {
+        let payload = LogPayload::Feedback {
+            lineage_key: lineage_key.as_str().to_string(),
+            correct,
+            producer: producer.to_string(),
+            at: now.0,
+        };
+        Self::new(event(
+            [0; 32],
+            (FEEDBACK_SOURCE, STORE_TRUST),
+            now.0,
+            now,
+            payload,
+        ))
+    }
+
+    /// A tier move, stamped with `source` so that the rollback of the run that
+    /// made it cancels it.
+    pub(super) fn tier_move(change: &TierMove, source: &str, now: Millis) -> Self {
+        let payload = LogPayload::TierMove {
+            lineage_key: change.lineage_key.as_str().to_string(),
+            to: change.to.into(),
+            run_id: change.run_id.clone(),
+            reason: change.reason.clone(),
+            changed_at: change.changed_at.0,
+            residency_until: change.residency_until.map(|at| at.0),
+        };
+        Self::new(event([0; 32], (source, STORE_TRUST), now.0, now, payload))
     }
 
     fn node_write(row: NodeRow, now: Millis) -> Self {

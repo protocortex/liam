@@ -119,6 +119,24 @@ impl Tier {
     }
 }
 
+impl From<liam_log::event::TierName> for Tier {
+    fn from(name: liam_log::event::TierName) -> Self {
+        match name {
+            liam_log::event::TierName::Hot => Self::Hot,
+            liam_log::event::TierName::Cold => Self::Cold,
+        }
+    }
+}
+
+impl From<Tier> for liam_log::event::TierName {
+    fn from(tier: Tier) -> Self {
+        match tier {
+            Tier::Hot => Self::Hot,
+            Tier::Cold => Self::Cold,
+        }
+    }
+}
+
 /// A change of tier for one lineage. `run_id` and `reason` say who moved it and
 /// why, for the record that logs the move.
 #[derive(Clone, Debug, PartialEq, Eq)]

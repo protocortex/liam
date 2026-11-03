@@ -13,14 +13,19 @@ use super::backfill::BACKFILL_SOURCE;
 use super::fact_projection::{apply_fact_step, fact_steps, FactStep};
 use super::logged_plan::Table;
 use super::summaries::{apply_artifact, close_if_open, store_embedding};
-use super::tiers::{assign_lineage, insert_quant, Quantized};
+use super::tiers::{
+    apply_feedback_in, apply_tier_in, apply_usage_in, assign_lineage, insert_quant, Quantized,
+};
 use super::{
     edge_guard_flags, edge_refusal, node_row_insert, EDGE_INSERT_SQL, EDGE_REFUSAL_DIAGNOSTIC_SQL,
 };
 use crate::backend::BackendTx;
 use crate::error::{Error, Result};
+use crate::ids::Millis;
 use crate::ids::{NodeId, FOREVER};
-use crate::types::{relation, EventRef, EventRole};
+use crate::types::{
+    relation, EventRef, EventRole, FeedbackEvent, LineageKey, TierMove, UsageEntry,
+};
 use crate::value::Value;
 
 /// One statement of a projection, in the order it runs.
@@ -56,6 +61,19 @@ pub(super) enum Step {
     Quant {
         node_id: String,
         quantized: Quantized,
+    },
+    /// Records one logged usage batch, which a replay can apply again.
+    Usage {
+        event_id: String,
+        day: i64,
+        entries: Vec<UsageEntry>,
+    },
+    /// Records one logged verdict, which a replay can apply again.
+    Feedback(FeedbackEvent),
+    /// Sets the tier of a lineage. The last move applied wins.
+    Tier {
+        event_id: String,
+        change: TierMove,
     },
     /// Stores a derived artifact with its children and source events.
     Summary(Box<DerivedArtifact>),
@@ -98,7 +116,64 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
         }],
         LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
-        | LogPayload::RunRolledBack { .. } => Vec::new(),
+        | LogPayload::RunRolledBack { .. }
+        // These payloads are applied as the event that carries them, because
+        // their rows are keyed by its id; see `state_steps`.
+        | LogPayload::AccessBatch { .. }
+        | LogPayload::Feedback { .. }
+        | LogPayload::TierMove { .. } => Vec::new(),
+    }
+}
+
+/// The statements of a usage batch, a verdict or a tier move. Each row they
+/// write is keyed by the id of the event, so a replay that meets the event again
+/// writes nothing twice.
+pub(super) fn state_steps(event: &LogEvent) -> Vec<Step> {
+    let event_id = event.event_id.clone();
+    match &event.payload {
+        LogPayload::AccessBatch { day, entries } => vec![Step::Usage {
+            event_id,
+            day: *day,
+            entries: entries
+                .iter()
+                .map(|row| UsageEntry {
+                    lineage_key: LineageKey::from_raw(row.lineage_key.as_str()),
+                    hits: row.hits,
+                    last_access_at: Millis(row.last_access_at),
+                })
+                .collect(),
+        }],
+        LogPayload::Feedback {
+            lineage_key,
+            correct,
+            producer,
+            at,
+        } => vec![Step::Feedback(FeedbackEvent {
+            event_id,
+            lineage_key: LineageKey::from_raw(lineage_key.as_str()),
+            producer: producer.clone(),
+            at: Millis(*at),
+            correct: *correct,
+        })],
+        LogPayload::TierMove {
+            lineage_key,
+            to,
+            run_id,
+            reason,
+            changed_at,
+            residency_until,
+        } => vec![Step::Tier {
+            event_id,
+            change: TierMove {
+                lineage_key: LineageKey::from_raw(lineage_key.as_str()),
+                to: (*to).into(),
+                run_id: run_id.clone(),
+                reason: reason.clone(),
+                changed_at: Millis(*changed_at),
+                residency_until: residency_until.map(Millis),
+            },
+        }],
+        _ => Vec::new(),
     }
 }
 
@@ -238,6 +313,13 @@ pub(super) async fn apply_steps(
             Step::Remove(target) => remove_row(tx, target, vector_delete).await?,
             Step::Lineage { node_id } => assign_lineage(tx, node_id).await?,
             Step::Quant { node_id, quantized } => insert_quant(tx, node_id, quantized).await?,
+            Step::Usage {
+                event_id,
+                day,
+                entries,
+            } => apply_usage_in(tx, event_id, *day, entries).await?,
+            Step::Feedback(event) => drop(apply_feedback_in(tx, event).await?),
+            Step::Tier { event_id, change } => apply_tier_in(tx, change, Some(event_id)).await?,
             Step::Fact(step) => apply_fact_step(tx, step).await?,
             Step::Summary(artifact) => apply_artifact(tx, artifact).await?,
             Step::SummaryClose { id, at } => close_if_open(tx, id, *at).await?,
