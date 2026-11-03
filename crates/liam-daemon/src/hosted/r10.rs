@@ -654,6 +654,25 @@ async fn every_provider_sends_the_corpus_as_one_batch_and_never_asks_directly() 
 }
 
 #[tokio::test]
+async fn each_hosted_adapter_passes_r10_in_the_recorded_tier() {
+    // Arrange: the F1 of each committed fixture, as derived above
+    let expected = [
+        (Provider::Anthropic, 1.0),
+        (Provider::OpenAi, 74.0 / 75.0),
+        (Provider::Gemini, 58.0 / 59.0),
+    ];
+
+    for (provider, f1) in expected {
+        // Act
+        let run = run_recorded(provider, fixtures()[provider.name()].clone(), false).await;
+
+        // Assert
+        assert!((run.score.f1 - f1).abs() < 1e-12, "{}", provider.name());
+        assert!(run.score.f1 >= RECORDED_FLOOR_F1, "{}", provider.name());
+    }
+}
+
+#[tokio::test]
 async fn a_degraded_fixture_falls_below_the_floor_by_a_hand_computed_amount() {
     // Arrange: all 30 title events keep only the first word of their object:
     // tp = 120, fp = 30, fn = 30, and F1 = 240 / (240 + 60) = 4 / 5, which is

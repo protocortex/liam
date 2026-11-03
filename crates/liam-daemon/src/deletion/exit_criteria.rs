@@ -15,11 +15,15 @@ use liam_store::{LineageTarget, NewNode, Residual};
 
 use self::detect::{lineage_scan, log_view, Deleted, FileClass};
 use self::fixture::{
-    alice, files_under, Fixture, BOB_CANARY, CANARY, EDGE_CANARY, ROLLED_BACK_CANARY,
+    alice, files_under, Fixture, ALICE_REQUEST, BOB_CANARY, BOB_REQUEST, CANARY, EDGE_CANARY,
+    HOSTED_BATCH, HOSTED_PROVIDER, ROLLED_BACK_CANARY,
 };
+use super::batch_lineage::{BatchCanceller, ProviderCopies};
+use super::batch_store::{batch_store_path_for, BatchState, BatchStore};
 use super::job::{DeleteJob, JobStore};
 use super::registry::LineageRegistry;
 use super::scan::ScanError;
+use super::send_ledger::{send_ledger_path_for, SendLedger};
 use super::service::{CrashPoint, DeleteError, RunOutcome};
 use super::target::DeleteTarget;
 use super::JobState;
@@ -72,6 +76,7 @@ async fn the_canary_is_in_every_class_before_a_subject_delete_and_in_none_after(
         FileClass::Cache,
         FileClass::Manifest,
         FileClass::Cooldown,
+        FileClass::HostedBatches,
     ];
     for class in naturally_holding {
         assert!(class.holds_needle(&fixture), "{class:?} control");
@@ -261,11 +266,7 @@ async fn plant_residual(fixture: &Fixture, class: FileClass) {
                 .unwrap();
         }
         other => {
-            let needle = if matches!(other, FileClass::Manifest | FileClass::Cooldown) {
-                fixture.alice_lineage.as_str().to_owned()
-            } else {
-                CANARY.to_owned()
-            };
+            let needle = other.needle(fixture);
             let file = other.files(fixture).remove(0);
             let mut handle = std::fs::OpenOptions::new()
                 .create(true)
@@ -516,4 +517,93 @@ async fn wait_for_compaction(log_dir: &std::path::Path) {
         tokio::time::sleep(POLL).await;
     }
     panic!("closed segments were not compacted");
+}
+
+/// Cancels every batch it is asked about and reports whether the provider
+/// still holds a copy, remembering the calls.
+struct Cancelling {
+    copies: ProviderCopies,
+    calls: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl BatchCanceller for Cancelling {
+    async fn cancel(&self, provider: &str, batch_id: &str) -> anyhow::Result<ProviderCopies> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((provider.to_owned(), batch_id.to_owned()));
+        Ok(self.copies)
+    }
+}
+
+#[tokio::test]
+async fn a_pending_hosted_batch_is_cancelled_and_nothing_of_alice_is_left_in_its_files() {
+    // Arrange
+    let fixture = Fixture::new().await;
+    let canceller = std::sync::Arc::new(Cancelling {
+        copies: ProviderCopies::Deleted,
+        calls: std::sync::Mutex::default(),
+    });
+    let service = fixture.service_with(Some(canceller.clone()));
+    let target = alice();
+    let held_before = FileClass::HostedBatches.holds_needle(&fixture);
+
+    // Act
+    let id = service.request(target).unwrap();
+    let outcome = service.run(&id).await.unwrap();
+
+    // Assert
+    let job = job_named(&fixture, &id);
+    let database = fixture.database();
+    let table = BatchStore::new(batch_store_path_for(&database))
+        .load()
+        .unwrap();
+    let ledger = SendLedger::new(send_ledger_path_for(&database))
+        .load()
+        .unwrap();
+    assert!(held_before, "the batch files named alice before");
+    assert_eq!(outcome, RunOutcome::Done);
+    assert!(!FileClass::HostedBatches.holds_needle(&fixture));
+    assert!(!FileClass::Cache.holds_needle(&fixture));
+    assert_eq!(
+        *canceller.calls.lock().unwrap(),
+        [(HOSTED_PROVIDER.to_owned(), HOSTED_BATCH.to_owned())]
+    );
+    assert!(job.notices.is_empty(), "{:?}", job.notices);
+    assert_eq!(table.len(), 1);
+    assert_eq!(table[0].cache_key, BOB_REQUEST);
+    assert_eq!(
+        table[0].state,
+        BatchState::Cancelled,
+        "bob's request is sent again"
+    );
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].cache_key, BOB_REQUEST);
+    assert!(table.iter().all(|entry| entry.cache_key != ALICE_REQUEST));
+}
+
+#[tokio::test]
+async fn a_provider_with_no_delete_endpoint_leaves_one_notice_in_the_job_result() {
+    // Arrange
+    let fixture = Fixture::new().await;
+    let canceller = std::sync::Arc::new(Cancelling {
+        copies: ProviderCopies::Kept,
+        calls: std::sync::Mutex::default(),
+    });
+    let service = fixture.service_with(Some(canceller));
+
+    // Act
+    let id = service.request(alice()).unwrap();
+    service.run(&id).await.unwrap();
+
+    // Assert
+    let job = job_named(&fixture, &id);
+    assert_eq!(job.notices.len(), 1, "{:?}", job.notices);
+    assert!(
+        job.notices[0].starts_with(HOSTED_PROVIDER),
+        "{:?}",
+        job.notices
+    );
+    assert!(!FileClass::HostedBatches.holds_needle(&fixture));
 }

@@ -11,6 +11,9 @@ use futures_util::StreamExt;
 use liam_daemon::event_log;
 use liam_log::crypto::KeyRegistry;
 
+use crate::deletion::batch_store::batch_store_path_for;
+use crate::deletion::send_ledger::send_ledger_path_for;
+
 use super::fixture::{files_under, Fixture, CANARY, ROLLED_BACK_CANARY};
 
 /// A class of file the canary must not survive in.
@@ -25,10 +28,12 @@ pub enum FileClass {
     Jobs,
     MetricsState,
     Registry,
+    /// The batch table and the send ledger, which name events, not text.
+    HostedBatches,
 }
 
 impl FileClass {
-    pub const ALL: [FileClass; 8] = [
+    pub const ALL: [FileClass; 9] = [
         Self::Database,
         Self::Snapshots,
         Self::Cache,
@@ -37,13 +42,15 @@ impl FileClass {
         Self::Jobs,
         Self::MetricsState,
         Self::Registry,
+        Self::HostedBatches,
     ];
 
     /// What the class holds when the delete has not reached it: the state files
     /// name lineages, not content.
-    fn needle(self, fixture: &Fixture) -> String {
+    pub fn needle(self, fixture: &Fixture) -> String {
         match self {
             Self::Manifest | Self::Cooldown => fixture.alice_lineage.as_str().to_owned(),
+            Self::HostedBatches => fixture.alice_event.clone(),
             _ => CANARY.to_owned(),
         }
     }
@@ -63,6 +70,10 @@ impl FileClass {
             Self::Jobs => vec![crate::deletion::job_file_path_for(&database)],
             Self::MetricsState => vec![fixture.metrics_state_file()],
             Self::Registry => vec![fixture.subjects.keys.path()],
+            Self::HostedBatches => vec![
+                batch_store_path_for(&database),
+                send_ledger_path_for(&database),
+            ],
         }
     }
 
