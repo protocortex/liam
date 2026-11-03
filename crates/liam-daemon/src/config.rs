@@ -12,12 +12,14 @@ use liam_store::{Millis, RetentionPolicy};
 use serde::Deserialize;
 
 mod consolidation;
+mod encryption;
 mod extraction;
 mod summary;
 mod tiering;
 
 pub(crate) use consolidation::default_snapshot_dir;
 pub use consolidation::ConsolidationConfig;
+pub use encryption::{EncryptionConfig, MasterKeySource};
 pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
     MAX_RUN_DEADLINE_SECS,
@@ -77,6 +79,8 @@ pub struct Config {
     pub summary: SummaryConfig,
     /// Moving unused items' vectors out of the hot tier. Off by default.
     pub tiering: TieringConfig,
+    /// Sealing the log's payloads so a delete can destroy their keys. Off by default.
+    pub encryption: EncryptionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -193,6 +197,7 @@ impl Default for Config {
             consolidation: ConsolidationConfig::default(),
             summary: SummaryConfig::default(),
             tiering: TieringConfig::default(),
+            encryption: EncryptionConfig::default(),
         }
     }
 }
@@ -404,12 +409,14 @@ impl Config {
 
         let mut config: Self = toml::from_str(&text)?;
         config.extraction.expand_paths(home)?;
+        config.encryption.expand_paths(home)?;
         config.log.validate()?;
         config.producers.validate()?;
         config.extraction.validate()?;
         config.consolidation.validate()?;
         config.summary.validate()?;
         config.tiering.validate()?;
+        config.encryption.validate()?;
         Ok(config)
     }
 
