@@ -2,22 +2,23 @@
 //! Rebuilding the projection from the event log alone, and checking the result
 //! row by row against what the log says should be live.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use liam_log::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTable};
 use liam_log::hash::{edge_row_hash, node_row_hash};
 use uuid::Uuid;
 
 use super::log_cursor;
+use super::log_open::hash_of;
 use super::logged_write::{commit_or_abandon, HeldLog, SharedLog};
-use super::replay::{for_each_replayed, row_effects, CatchUpReport};
+use super::replay::{deletion_ledger, for_each_replayed, row_effects, CatchUpReport};
 use super::{opt_string, row_f64, Graph};
 use crate::backend::Backend;
 use crate::error::{Error, MismatchSource, Result};
 use crate::ids::FOREVER;
 use crate::schema::{Clear, DERIVED_TABLES};
 use crate::types::relation;
-use crate::value::Row;
+use crate::value::{Row, Value};
 
 /// What a rebuild does with rows the projection already holds. A mode that
 /// clears the projection refuses first, under the log lock, whatever it would
@@ -61,6 +62,17 @@ struct LoggedState {
     hashes: Vec<[u8; 32]>,
     facts: BTreeSet<String>,
 }
+
+/// The hashes, and the rows they stand for, an event carried.
+const HASH_OF_EVENT_SQL: &str =
+    "SELECT content_hash, row_ids FROM log_hash_index WHERE first_event_id = ?1";
+
+const NODE_KEYS_OF_EVENT_SQL: &str = "SELECT node_id, key_id FROM node_keys WHERE source = ?1";
+
+const LIVE_EDGES_OF_NODE_SQL: &str = concat!(
+    "SELECT id, src, dst, type, attributes, tx_from, tx_to FROM edges ",
+    "WHERE tx_to = ?1 AND (src = ?2 OR dst = ?2)"
+);
 
 /// The columns `stored_node` and `stored_edge` read, in their order.
 pub(super) const NODE_COLUMNS: &str = "id, kind, label, content, producer, attributes, scope, \
@@ -154,7 +166,7 @@ impl<B: Backend> Graph<B> {
             RebuildMode::RequireEmpty => Ok(()),
             RebuildMode::ResetChecked => {
                 let expected = log_expected_state(held).await?;
-                let stored = self.live_rows().await?;
+                let stored = self.stored_rows_outside_ledger(held).await?;
                 verify(MismatchSource::PriorProjection, &expected, &stored)
             }
             RebuildMode::Replace if !holds_rows(&self.backend).await? => Ok(()),
@@ -178,9 +190,64 @@ impl<B: Backend> Graph<B> {
 
     async fn unknown_rows(&self, held: &HeldLog) -> Result<usize> {
         let known = log_expected_state(held).await?;
-        let stored = self.live_rows().await?;
+        let stored = self.stored_rows_outside_ledger(held).await?;
         let unknown_facts = stored.facts.difference(&known.facts).count();
         Ok(multiset_difference(&stored.hashes, &known.hashes).0 + unknown_facts)
+    }
+
+    /// The live rows less the rows a delete job committed to destroying: the
+    /// nodes of the recorded events under the recorded key groups, and the
+    /// edges that end at them. The log can no longer describe them, so an
+    /// unfinished delete is not mistaken for rows the log does not know. They
+    /// are found by the plain hash index, which a delete purges last.
+    async fn stored_rows_outside_ledger(&self, held: &HeldLog) -> Result<LiveRows> {
+        let mut rows = self.live_rows().await?;
+        for (event_id, key_ids) in deletion_ledger(held.reader()?, held.head()?).await? {
+            let nodes = self.recorded_nodes(&event_id, &key_ids).await?;
+            let mut hashes = Vec::new();
+            for indexed in self
+                .backend
+                .query(HASH_OF_EVENT_SQL, &[Value::from(event_id.as_str())])
+                .await?
+            {
+                let row_ids: Vec<String> = serde_json::from_str(&indexed.get_string(1)?)
+                    .map_err(|error| Error::CorruptLogState(error.to_string()))?;
+                if row_ids.iter().any(|id| nodes.contains(id)) {
+                    hashes.push(hash_of(&indexed)?);
+                }
+            }
+            for node_id in &nodes {
+                let params = [FOREVER.into(), Value::from(node_id.as_str())];
+                for edge in self.backend.query(LIVE_EDGES_OF_NODE_SQL, &params).await? {
+                    hashes.push(edge_row_hash(&stored_edge(&edge)?));
+                }
+            }
+            for hash in hashes {
+                if let Ok(at) = rows.hashes.binary_search(&hash) {
+                    rows.hashes.remove(at);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The nodes an event wrote under the key groups a delete recorded.
+    async fn recorded_nodes(
+        &self,
+        event_id: &str,
+        key_ids: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        let mut nodes = HashSet::new();
+        for row in self
+            .backend
+            .query(NODE_KEYS_OF_EVENT_SQL, &[Value::from(event_id)])
+            .await?
+        {
+            if key_ids.contains(&row.get_string(1)?) {
+                nodes.insert(row.get_string(0)?);
+            }
+        }
+        Ok(nodes)
     }
 
     async fn live_rows(&self) -> Result<LiveRows> {

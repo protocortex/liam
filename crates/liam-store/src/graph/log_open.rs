@@ -99,7 +99,7 @@ async fn rebuild_bloom<B: Backend>(backend: &B, configured: &BloomConfig) -> Res
     }
 }
 
-fn hash_of(row: &Row) -> Result<[u8; 32]> {
+pub(super) fn hash_of(row: &Row) -> Result<[u8; 32]> {
     let stored = row.get_blob(0)?;
     <[u8; 32]>::try_from(stored).map_err(|_| {
         Error::CorruptLogState(format!(

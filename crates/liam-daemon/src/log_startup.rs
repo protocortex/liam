@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use liam_log::compactor::{ChannelSink, Compactor};
+use liam_log::crypto::KeyRegistry;
 use liam_model::Embedder;
 use liam_store::{DefaultGraph, SharedLog};
 use tokio::task::JoinHandle;
@@ -26,6 +27,8 @@ pub struct StartedStore {
     /// The log the store writes through, kept so a rollback can reopen the
     /// store on the same writer.
     pub log: SharedLog,
+    /// The key registry of a sealed log, which other readers of the log need.
+    pub keys: Option<Arc<KeyRegistry>>,
 }
 
 /// The store at `database_path` over the log in `log_dir`. Every failure is
@@ -62,7 +65,7 @@ pub async fn open_store_with_log(
         log_dir,
         config.log.bloom()?,
         Some(shutdown.poison_hook()),
-        keys,
+        keys.clone(),
     )?;
     let store = open_store_on_log(store, database_path, log_dir, log.clone(), embedder).await?;
     let compactor = compactor_for(log_dir)?.spawn(closed_segments);
@@ -70,6 +73,7 @@ pub async fn open_store_with_log(
         store,
         compactor,
         log,
+        keys,
     })
 }
 

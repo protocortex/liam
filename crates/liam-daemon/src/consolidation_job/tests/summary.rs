@@ -186,6 +186,7 @@ fn hooks_for_config(harness: &Harness, server: &MemoryServer, enabled: bool) -> 
     let mut config = harness.config.clone();
     config.summary.enabled = enabled;
     let setup = JobSetup {
+        keys: None,
         config: &config,
         database_path: &database_in(&harness.root),
         log_dir: &log_dir_in(&harness.root),

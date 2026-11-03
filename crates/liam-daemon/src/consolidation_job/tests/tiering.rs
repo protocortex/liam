@@ -179,6 +179,7 @@ async fn with_tiering_off_the_tier_step_is_skipped() {
         server, lineages, ..
     } = aged(&harness).await;
     let job = ConsolidationJob::new(JobSetup {
+        keys: None,
         config: &harness.config,
         database_path: &database_in(&harness.root),
         log_dir: &log_dir_in(&harness.root),

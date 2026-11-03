@@ -393,12 +393,29 @@ pub(super) struct Ahead {
     pub(super) rolled_back: RolledBack,
     /// Nodes whose key group is destroyed, so an edge to one cannot be applied.
     pub(super) shredded_nodes: HashSet<String>,
+    /// The key groups, by event, a delete job committed to destroying and did
+    /// not cancel. The other rows of such an event are untouched.
+    pub(super) deleted_rows: HashMap<String, HashSet<String>>,
 }
 
 /// What a replay leaves out of the records it applies.
 struct Skipped<'a> {
     removed: &'a Removed,
     shredded_nodes: &'a HashSet<String>,
+}
+
+/// The key groups, by event, that a delete job committed to destroying, read
+/// from the log up to `head`.
+pub(super) async fn deletion_ledger(
+    reader: Arc<dyn LogReader>,
+    head: Option<LogOffset>,
+) -> Result<HashMap<String, HashSet<String>>> {
+    let Some(head) = head else {
+        return Ok(HashMap::new());
+    };
+    Ok(scan_ahead(reader.scan_through(None, head))
+        .await?
+        .deleted_rows)
 }
 
 /// Drops the edges that end at a shredded node, which the store does not hold,
@@ -464,6 +481,8 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
     let mut markers = Vec::new();
     let mut fact_writes = Vec::new();
     let mut shredded_nodes = HashSet::new();
+    let mut recorded = Vec::new();
+    let mut cancelled = HashSet::new();
     while let Some(record) = records.next().await {
         let record = record?;
         shredded_nodes.extend(
@@ -489,7 +508,28 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
             }
             LogPayload::Tombstone(targets) => tombstones.push((event.event_id, targets)),
             LogPayload::RunRolledBack { run_id } => markers.push((event.event_id, run_id)),
+            LogPayload::DeletionRecorded {
+                job_id,
+                event_ids,
+                key_ids,
+                ..
+            } => recorded.push((job_id, event_ids, key_ids)),
+            LogPayload::DeletionCancelled { job_id } => {
+                cancelled.insert(job_id);
+            }
             _ => {}
+        }
+    }
+    let mut deleted_rows: HashMap<String, HashSet<String>> = HashMap::new();
+    for (_, event_ids, key_ids) in recorded
+        .into_iter()
+        .filter(|(job_id, ..)| !cancelled.contains(job_id))
+    {
+        for event_id in event_ids {
+            deleted_rows
+                .entry(event_id)
+                .or_default()
+                .extend(key_ids.iter().cloned());
         }
     }
     let mut removed = Removed::default();
@@ -510,6 +550,7 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
         removed,
         rolled_back,
         shredded_nodes,
+        deleted_rows,
     })
 }
 
@@ -550,10 +591,11 @@ async fn for_each_logged(
         if ahead.voided.contains(&event.event_id) {
             continue;
         }
+        let payload = without_dangling_edges(event.payload.clone(), &ahead.shredded_nodes);
         if !replayed {
-            visit(event.payload);
+            visit(payload);
         } else if !ahead.rolled_back.skips(&event) {
-            visit(ahead.rolled_back.reconcile(event.payload));
+            visit(ahead.rolled_back.reconcile(payload));
         }
     }
     Ok(())

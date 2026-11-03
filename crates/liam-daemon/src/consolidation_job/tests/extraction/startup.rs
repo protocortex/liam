@@ -11,6 +11,7 @@ const ABSENT_SERVER: &str = "/nonexistent/llama-server";
 
 fn started(harness: &Harness, server: &MemoryServer, config: &Config) -> ConsolidationJob {
     ConsolidationJob::new(JobSetup {
+        keys: None,
         config,
         database_path: &database_in(&harness.root),
         log_dir: &log_dir_in(&harness.root),

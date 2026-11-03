@@ -9,7 +9,7 @@ use anyhow::Context;
 use liam_log::crypto::{FileMaster, KeyRegistry, MasterKeyProvider, REGISTRY_FILE};
 use liam_log::dedup::{BloomConfig, HashBloom};
 use liam_log::envelope::{OpeningReader, Sealer};
-use liam_log::reader::SequentialScanReader;
+use liam_log::reader::{LogReader, SequentialScanReader};
 use liam_log::wal::{SystemClock, WalConfig, WalWriter, LOCK_NAME, MANIFEST_NAME};
 use liam_log::LogWriter;
 use liam_store::{EventLog, PoisonHook, SharedLog};
@@ -95,6 +95,21 @@ fn keychain_master() -> anyhow::Result<Arc<dyn MasterKeyProvider>> {
     anyhow::bail!("the keychain is only available on macOS; set encryption.master_key = \"file\"")
 }
 
+/// A reader of the log in `log_dir` that opens sealed records when it has
+/// `keys`. Every consumer of the log reads through it, so none sees a sealed
+/// payload.
+pub fn log_reader(
+    log_dir: &Path,
+    keys: Option<&Arc<KeyRegistry>>,
+) -> anyhow::Result<Arc<dyn LogReader>> {
+    let reader = SequentialScanReader::local(log_dir)
+        .with_context(|| format!("could not read the log in {}", log_dir.display()))?;
+    Ok(match keys {
+        Some(registry) => Arc::new(OpeningReader::new(reader, Arc::clone(registry))),
+        None => Arc::new(reader),
+    })
+}
+
 /// The log over `writer` and a reader of the same directory. `on_poisoned` is
 /// called whenever a write meets a poisoned log. With a key registry the log
 /// seals what it appends and its reader opens sealed records.
@@ -105,17 +120,11 @@ pub fn shared_log(
     on_poisoned: Option<PoisonHook>,
     keys: Option<Arc<KeyRegistry>>,
 ) -> anyhow::Result<SharedLog> {
-    let reader = SequentialScanReader::local(log_dir)
-        .with_context(|| format!("could not read the log in {}", log_dir.display()))?;
-    let mut log = match keys {
-        Some(registry) => EventLog::new(
-            Box::new(writer),
-            Arc::new(OpeningReader::new(reader, Arc::clone(&registry))),
-            HashBloom::new(bloom),
-        )
-        .with_sealer(Sealer::new(registry)),
-        None => EventLog::new(Box::new(writer), Arc::new(reader), HashBloom::new(bloom)),
-    };
+    let reader = log_reader(log_dir, keys.as_ref())?;
+    let mut log = EventLog::new(Box::new(writer), reader, HashBloom::new(bloom));
+    if let Some(registry) = keys {
+        log = log.with_sealer(Sealer::new(registry));
+    }
     if let Some(hook) = on_poisoned {
         log = log.with_poison_hook(hook);
     }

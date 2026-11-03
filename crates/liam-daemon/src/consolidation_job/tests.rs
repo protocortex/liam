@@ -117,6 +117,7 @@ impl Harness {
     ) -> ConsolidationJob {
         ConsolidationJob::with_parts(
             JobSetup {
+                keys: None,
                 config: &self.config,
                 database_path: &database_in(&self.root),
                 log_dir: &log_dir_in(&self.root),
