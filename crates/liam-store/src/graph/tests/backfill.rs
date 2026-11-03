@@ -183,6 +183,7 @@ async fn assert_rebuild_equals(env: &Env, expected: &Live) {
 struct State {
     phase: String,
     last_id: Option<String>,
+    last_rowid: Option<i64>,
     complete: bool,
 }
 
@@ -190,7 +191,7 @@ async fn state<B: Backend>(g: &Graph<B>) -> Option<State> {
     let rows = g
         .backend
         .query(
-            "SELECT phase, last_id, completed_at FROM log_backfill_state",
+            "SELECT phase, last_id, completed_at, last_rowid FROM log_backfill_state",
             &[],
         )
         .await
@@ -199,6 +200,10 @@ async fn state<B: Backend>(g: &Graph<B>) -> Option<State> {
     Some(State {
         phase: row.get_string(0).unwrap(),
         last_id: opt_string(row, 1).unwrap(),
+        last_rowid: match row.0[3] {
+            Value::Null => None,
+            _ => Some(row.get_i64(3).unwrap()),
+        },
         complete: !matches!(row.0[2], Value::Null),
     })
 }
@@ -355,12 +360,21 @@ async fn wait_until_queued(log: &SharedLog, handles_before: usize) {
 }
 
 /// The state row as a backfill that stopped partway leaves it.
-async fn write_unfinished_state<B: Backend>(g: &Graph<B>, phase: &str, last_id: Option<&str>) {
+async fn write_unfinished_state<B: Backend>(
+    g: &Graph<B>,
+    phase: &str,
+    last_id: Option<&str>,
+    last_rowid: Option<i64>,
+) {
     g.backend
         .execute(
-            "INSERT INTO log_backfill_state (id, phase, last_id, completed_at)
-             VALUES (1, ?1, ?2, NULL)",
-            &[phase.into(), opt_text(last_id.map(str::to_owned))],
+            "INSERT INTO log_backfill_state (id, phase, last_id, last_rowid, completed_at)
+             VALUES (1, ?1, ?2, ?3, NULL)",
+            &[
+                phase.into(),
+                opt_text(last_id.map(str::to_owned)),
+                last_rowid.map_or(Value::Null, Value::Int),
+            ],
         )
         .await
         .unwrap();
@@ -812,7 +826,7 @@ async fn backfill_resumes_to_the_same_log_wherever_a_chain_store_is_interrupted(
 #[tokio::test]
 async fn backfill_state_trails_the_log_by_less_than_a_batch_and_a_resume_appends_only_the_rest() {
     // Each case is how many rows were logged before the append failed, and the
-    // index, among the nodes by id, of the last row the state records.
+    // index, among the nodes by rowid, of the last row the state records.
     let cases = [
         (1, None),
         (2, Some(1)),
@@ -827,7 +841,6 @@ async fn backfill_state_trails_the_log_by_less_than_a_batch_and_a_resume_appends
         let pre = pre_log(&env, "live.db", &clock).await;
         seed_standard(&pre, &clock).await;
         let before = live_of(&pre).await;
-        let ids = node_ids(&pre).await;
         drop(pre);
         let logged = open_logged(&env, "live.db").await;
         logged.control.fail_nth_from_now(appended as u64 + 1);
@@ -840,7 +853,8 @@ async fn backfill_state_trails_the_log_by_less_than_a_batch_and_a_resume_appends
         assert_eq!(logged_events(&env).await.len(), appended, "{appended}");
         let expected = recorded.map(|index| State {
             phase: "nodes".into(),
-            last_id: Some(ids[index].clone()),
+            last_id: None,
+            last_rowid: Some(index as i64 + 1),
             complete: false,
         });
         assert_eq!(state(&logged.graph).await, expected, "{appended}");
@@ -1388,7 +1402,7 @@ async fn backfill_carries_on_after_the_row_the_state_names() {
     let ids = node_ids(&pre).await;
     drop(pre);
     let logged = open_logged(&env, "live.db").await;
-    write_unfinished_state(&logged.graph, "nodes", Some(&ids[2])).await;
+    write_unfinished_state(&logged.graph, "nodes", None, Some(3)).await;
 
     // Act
     let report = logged.graph.backfill_log_from_projection().await.unwrap();
@@ -1418,7 +1432,7 @@ async fn backfill_starts_in_the_phase_the_state_names() {
     seed_chain(&pre, &clock).await;
     drop(pre);
     let logged = open_logged(&env, "live.db").await;
-    write_unfinished_state(&logged.graph, "supersedes", None).await;
+    write_unfinished_state(&logged.graph, "supersedes", None, None).await;
 
     // Act
     let report = logged.graph.backfill_log_from_projection().await.unwrap();
@@ -1440,6 +1454,88 @@ async fn backfill_starts_in_the_phase_the_state_names() {
         .all(|edge| edge.edge_type == relation::SUPERSEDES));
 }
 
+#[tokio::test]
+async fn backfill_logs_nodes_in_rowid_order_so_a_rebuild_keeps_ranking_ties() {
+    // Arrange: ids that sort against the order the rows were inserted in
+    let env = Env::new();
+    let clock = clock_at(1000);
+    let pre = pre_log(&env, "live.db", &clock).await;
+    seed_nodes(&pre, &clock, 3).await;
+    // The vector rows keep the old ids, which the walk never reads.
+    pre.backend
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             UPDATE nodes SET id = CASE rowid WHEN 1 THEN 'c' WHEN 2 THEN 'b' ELSE 'a' END;",
+        )
+        .await
+        .unwrap();
+    drop(pre);
+    let logged = open_logged(&env, "live.db").await;
+
+    // Act
+    logged.graph.backfill_log_from_projection().await.unwrap();
+
+    // Assert
+    let events = logged_events(&env).await;
+    let order: Vec<&str> = node_writes(&events).iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(order, ["c", "b", "a"]);
+}
+
+#[tokio::test]
+async fn a_cursor_an_older_build_saved_by_id_restarts_the_nodes_without_logging_any_twice() {
+    // Arrange: a state row of the old shape, with no rowid column, whose id
+    // cursor says two nodes are done and the log holds only the first
+    let env = Env::new();
+    let clock = clock_at(1000);
+    let pre = pre_log(&env, "live.db", &clock).await;
+    seed_standard(&pre, &clock).await;
+    let before = live_of(&pre).await;
+    let ids = node_ids(&pre).await;
+    drop(pre);
+    let logged = open_logged(&env, "live.db").await;
+    logged.control.fail_nth_from_now(2);
+    let failed = logged.graph.backfill_in_batches(BATCH).await;
+    assert!(is_log_append(&failed), "{failed:?}");
+    logged
+        .graph
+        .backend
+        .execute_batch(
+            "DROP TABLE log_backfill_state;
+             CREATE TABLE log_backfill_state (
+               id INTEGER PRIMARY KEY CHECK (id = 1),
+               phase TEXT NOT NULL,
+               last_id TEXT,
+               completed_at INTEGER
+             );",
+        )
+        .await
+        .unwrap();
+    logged
+        .graph
+        .backend
+        .execute(
+            "INSERT INTO log_backfill_state (id, phase, last_id, completed_at)
+             VALUES (1, 'nodes', ?1, NULL)",
+            &[ids[1].as_str().into()],
+        )
+        .await
+        .unwrap();
+    drop(logged);
+
+    // Act
+    let resumed = open_logged(&env, "live.db").await;
+    let report = resumed.graph.backfill_in_batches(BATCH).await.unwrap();
+
+    // Assert: the walk began again from the first node, and the one already
+    // logged was skipped
+    assert!(report.resumed);
+    assert_eq!(report.nodes_logged, STANDARD_NODES - 1);
+    assert_each_row_logged_once(&logged_events(&env).await, STANDARD_ROWS);
+    assert!(state(&resumed.graph).await.expect("state").complete);
+    drop(resumed);
+    assert_rebuild_equals(&env, &before).await;
+}
+
 // ---- a state that is not one a backfill wrote ----
 
 #[tokio::test]
@@ -1449,7 +1545,7 @@ async fn backfill_refuses_a_state_in_an_unknown_phase_and_appends_nothing() {
     let clock = clock_at(1000);
     seed_standard(&pre_log(&env, "live.db", &clock).await, &clock).await;
     let logged = open_logged(&env, "live.db").await;
-    write_unfinished_state(&logged.graph, "bogus", None).await;
+    write_unfinished_state(&logged.graph, "bogus", None, None).await;
 
     // Act
     let needed = logged.graph.needs_backfill().await;
@@ -1474,7 +1570,7 @@ async fn a_store_with_a_state_in_an_unknown_phase_does_not_open_on_a_log() {
     let clock = clock_at(1000);
     let pre = pre_log(&env, "live.db", &clock).await;
     seed_standard(&pre, &clock).await;
-    write_unfinished_state(&pre, "bogus", None).await;
+    write_unfinished_state(&pre, "bogus", None, None).await;
 
     // Act
     let opened = pre.with_log(env.log(ONE_SEGMENT)).await;

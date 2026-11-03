@@ -7,6 +7,11 @@
 //! its target and a plain edge needs both of its ends open. A superseded node is
 //! logged open and left to its `supersedes` edge to close, as it was written.
 //!
+//! Nodes are walked in rowid order, which is the order they were inserted in, so
+//! a store rebuilt from the log gets the rowids it had and ranking ties between
+//! rows that predate the log fall as they did. Edges have no ranking, so they
+//! walk by id.
+//!
 //! A closed node that no live `supersedes` edge closes, such as one whose
 //! superseder a retention sweep removed, is logged as it is stored. A live edge
 //! that a replay would refuse because of it cannot be logged, so it is skipped
@@ -78,24 +83,42 @@ impl Phase {
             })
     }
 
-    /// The next `limit` rows of this phase after `after`, by id, each with one
-    /// trailing flag column that `trailing_flag` reads: for a node, whether a
-    /// live `supersedes` edge closes it; for an edge, whether a replay would
-    /// refuse it.
-    fn page_query(self, after: &str, limit: usize) -> (String, Vec<Value>) {
+    /// The column this phase walks in order and resumes by.
+    fn order_column(self) -> &'static str {
+        match self {
+            Phase::Nodes => "rowid",
+            Phase::Edges | Phase::Supersedes => "id",
+        }
+    }
+
+    /// Where a walk of this phase begins: before its first row.
+    fn origin(self) -> Cursor {
+        match self {
+            Phase::Nodes => Cursor::Rowid(0),
+            Phase::Edges | Phase::Supersedes => Cursor::Id(String::new()),
+        }
+    }
+
+    /// The next `limit` rows of this phase after `after`, each with a flag
+    /// column that `trailing_flag` reads (for a node, whether a live
+    /// `supersedes` edge closes it; for an edge, whether a replay would refuse
+    /// it) and then the order column that `Cursor::of_row` reads.
+    fn page_query(self, after: &Cursor, limit: usize) -> (String, Vec<Value>) {
         let (columns, table, flag, condition) = self.parts();
+        let order = self.order_column();
         let sql = format!(
-            "SELECT {columns}, {flag} FROM {table}
-             WHERE id > ?1 {condition} ORDER BY id LIMIT ?2"
+            "SELECT {columns}, {flag}, {order} FROM {table}
+             WHERE {order} > ?1 {condition} ORDER BY {order} LIMIT ?2"
         );
-        (sql, vec![after.into(), Value::Int(limit as i64)])
+        (sql, vec![after.param(), Value::Int(limit as i64)])
     }
 
     /// How many rows `page_query` walks through for this phase after `after`.
-    fn count_query(self, after: &str) -> (String, Vec<Value>) {
+    fn count_query(self, after: &Cursor) -> (String, Vec<Value>) {
         let (_, table, _, condition) = self.parts();
-        let sql = format!("SELECT COUNT(*) FROM {table} WHERE id > ?1 {condition}");
-        (sql, vec![after.into()])
+        let order = self.order_column();
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {order} > ?1 {condition}");
+        (sql, vec![after.param()])
     }
 
     /// The columns, table, trailing flag expression and extra condition that
@@ -154,27 +177,57 @@ fn live_closer(node: &str) -> String {
     )
 }
 
+/// The flag column of a page row, which sits just before the order column.
 fn trailing_flag(row: &Row) -> Result<bool> {
-    match row.0.last() {
+    match row.0.iter().rev().nth(1) {
         Some(Value::Int(flag)) => Ok(*flag != 0),
         _ => Err(Error::Backend("the flag column is not an integer".into())),
     }
 }
 
-const READ_SQL: &str = "SELECT phase, last_id, completed_at FROM log_backfill_state WHERE id = 1";
+/// A position in a phase's walk: the rowid of a node, or the id of an edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Cursor {
+    Rowid(i64),
+    Id(String),
+}
 
-const SAVE_SQL: &str = "INSERT INTO log_backfill_state (id, phase, last_id, completed_at)
-     VALUES (1, ?1, ?2, ?3)
+impl Cursor {
+    fn param(&self) -> Value {
+        match self {
+            Cursor::Rowid(rowid) => Value::Int(*rowid),
+            Cursor::Id(id) => id.as_str().into(),
+        }
+    }
+
+    /// The order column, which `page_query` selects last.
+    fn of_row(row: &Row) -> Result<Self> {
+        match row.0.last() {
+            Some(Value::Int(rowid)) => Ok(Cursor::Rowid(*rowid)),
+            Some(Value::Text(id)) => Ok(Cursor::Id(id.clone())),
+            _ => Err(Error::Backend(
+                "the order column is not a rowid or an id".into(),
+            )),
+        }
+    }
+}
+
+const READ_SQL: &str =
+    "SELECT phase, last_id, completed_at, last_rowid FROM log_backfill_state WHERE id = 1";
+
+const SAVE_SQL: &str =
+    "INSERT INTO log_backfill_state (id, phase, last_id, completed_at, last_rowid)
+     VALUES (1, ?1, ?2, ?3, ?4)
      ON CONFLICT(id) DO UPDATE SET
        phase = excluded.phase, last_id = excluded.last_id,
-       completed_at = excluded.completed_at";
+       completed_at = excluded.completed_at, last_rowid = excluded.last_rowid";
 
-/// How far the backfill has got: `last_id` is the last row of `phase` accounted
+/// How far the backfill has got: `last` is the last row of `phase` accounted
 /// for, and `completed_at` is set once every row is in the log.
 #[derive(Debug)]
 pub(super) struct Progress {
     phase: Phase,
-    last_id: Option<String>,
+    last: Option<Cursor>,
     completed_at: Option<i64>,
 }
 
@@ -182,15 +235,15 @@ impl Progress {
     fn start() -> Self {
         Self {
             phase: Phase::Nodes,
-            last_id: None,
+            last: None,
             completed_at: None,
         }
     }
 
-    fn at(phase: Phase, last_id: &str) -> Self {
+    fn at(phase: Phase, last: &Cursor) -> Self {
         Self {
             phase,
-            last_id: Some(last_id.to_owned()),
+            last: Some(last.clone()),
             completed_at: None,
         }
     }
@@ -198,7 +251,7 @@ impl Progress {
     fn complete(now: Millis) -> Self {
         Self {
             phase: Phase::Supersedes,
-            last_id: None,
+            last: None,
             completed_at: Some(now.0),
         }
     }
@@ -210,9 +263,17 @@ impl Progress {
     }
 
     fn from_row(row: &Row) -> Result<Self> {
+        let phase = Phase::parse(&row.get_string(0)?)?;
+        let last = match phase {
+            Phase::Nodes => match row.0[3] {
+                Value::Null => None,
+                _ => Some(Cursor::Rowid(row.get_i64(3)?)),
+            },
+            Phase::Edges | Phase::Supersedes => super::opt_string(row, 1)?.map(Cursor::Id),
+        };
         Ok(Self {
-            phase: Phase::parse(&row.get_string(0)?)?,
-            last_id: super::opt_string(row, 1)?,
+            phase,
+            last,
             completed_at: match row.0[2] {
                 Value::Null => None,
                 _ => Some(row.get_i64(2)?),
@@ -225,20 +286,27 @@ impl Progress {
     }
 
     async fn save(&self, tx: &mut dyn BackendTx) -> Result<()> {
+        let (last_id, last_rowid) = match &self.last {
+            Some(Cursor::Id(id)) => (super::opt_text(Some(id.clone())), Value::Null),
+            Some(Cursor::Rowid(rowid)) => (Value::Null, Value::Int(*rowid)),
+            None => (Value::Null, Value::Null),
+        };
         let params = [
             self.phase.name().into(),
-            super::opt_text(self.last_id.clone()),
+            last_id,
             self.completed_at.map_or(Value::Null, Value::Int),
+            last_rowid,
         ];
         tx.execute(SAVE_SQL, &params).await?;
         Ok(())
     }
 }
 
-/// A row read from the store, with the id the walk resumes after. The event is
+/// A row read from the store, with the position the walk resumes after. The event is
 /// `None` for a row a replay would refuse.
 struct Pending {
     id: String,
+    cursor: Cursor,
     event: Option<LogEvent>,
 }
 
@@ -301,8 +369,8 @@ impl<B: Backend> Graph<B> {
                 .skip_while(|p| *p != start.phase)
                 .map(|phase| {
                     let after = match phase == start.phase {
-                        true => start.last_id.clone().unwrap_or_default(),
-                        false => String::new(),
+                        true => start.last.clone().unwrap_or_else(|| phase.origin()),
+                        false => phase.origin(),
                     };
                     (phase, after)
                 })
@@ -341,15 +409,15 @@ impl<B: Backend> Graph<B> {
         held: &mut HeldLog,
         run: &mut Run,
         phase: Phase,
-        mut after: String,
+        mut after: Cursor,
     ) -> Result<()> {
         loop {
             let page = self.pending_page(phase, &after, run).await?;
             let Some(last) = page.last() else {
                 return Ok(());
             };
-            after = last.id.clone();
-            for Pending { id, event } in page {
+            after = last.cursor.clone();
+            for Pending { id, cursor, event } in page {
                 run.examined += 1;
                 if run.logged.contains(&id) {
                     continue;
@@ -360,7 +428,7 @@ impl<B: Backend> Graph<B> {
                     continue;
                 };
                 run.unrecorded += 1;
-                let due = (run.unrecorded == run.batch).then(|| Progress::at(phase, &id));
+                let due = (run.unrecorded == run.batch).then(|| Progress::at(phase, &cursor));
                 if due.is_some() {
                     run.unrecorded = 0;
                 }
@@ -384,7 +452,7 @@ impl<B: Backend> Graph<B> {
         }
     }
 
-    async fn count_phase(&self, phase: Phase, after: &str) -> Result<usize> {
+    async fn count_phase(&self, phase: Phase, after: &Cursor) -> Result<usize> {
         let (sql, params) = phase.count_query(after);
         let rows = self.backend.query(&sql, &params).await?;
         let count = rows
@@ -413,7 +481,7 @@ impl<B: Backend> Graph<B> {
         Ok(())
     }
 
-    async fn pending_page(&self, phase: Phase, after: &str, run: &Run) -> Result<Vec<Pending>> {
+    async fn pending_page(&self, phase: Phase, after: &Cursor, run: &Run) -> Result<Vec<Pending>> {
         let (sql, params) = phase.page_query(after, run.batch);
         let rows = self.backend.query(&sql, &params).await?;
         rows.iter()
@@ -435,6 +503,7 @@ fn node_pending(row: &Row, now: Millis) -> Result<Pending> {
     let stamp = (BACKFILL_SOURCE, node.confidence);
     Ok(Pending {
         id: node.id.clone(),
+        cursor: Cursor::of_row(row)?,
         event: Some(event(
             node_row_hash(&node),
             stamp,
@@ -449,11 +518,16 @@ fn edge_pending(row: &Row, now: Millis) -> Result<Pending> {
     let edge = stored_edge(row)?;
     let id = edge.id.clone();
     if trailing_flag(row)? {
-        return Ok(Pending { id, event: None });
+        return Ok(Pending {
+            id,
+            cursor: Cursor::of_row(row)?,
+            event: None,
+        });
     }
     let stamp = (BACKFILL_SOURCE, STORE_TRUST);
     Ok(Pending {
         id,
+        cursor: Cursor::of_row(row)?,
         event: Some(event(
             edge_row_hash(&edge),
             stamp,

@@ -167,14 +167,17 @@ CREATE TABLE IF NOT EXISTS log_cursor (
 );
 
 -- How far the one-time copy of pre-log rows into the log has got. phase names
--- the part of the walk (nodes, edges, supersedes) and last_id the last row of it
--- that is accounted for, NULL before the first. completed_at stays NULL until
--- every row is in the log.
+-- the part of the walk (nodes, edges, supersedes). The last row of it that is
+-- accounted for is last_rowid in the nodes phase, which walks in insertion
+-- order, and last_id in the edge phases; both are NULL before the first.
+-- completed_at stays NULL until every row is in the log. A database from before
+-- last_rowid existed gets the column from `migrate::add_backfill_node_rowid_cursor`.
 CREATE TABLE IF NOT EXISTS log_backfill_state (
   id           INTEGER PRIMARY KEY CHECK (id = 1),
   phase        TEXT    NOT NULL,
   last_id      TEXT,
-  completed_at INTEGER
+  completed_at INTEGER,
+  last_rowid   INTEGER
 );
 
 -- Derived from the log: the live carrier of each content hash. row_ids is a
