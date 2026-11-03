@@ -6,6 +6,19 @@ All notable changes to LIAM are recorded here. The format follows
 
 ## [Unreleased]
 
+### Upgrading
+
+- An existing store is refused at its first start on this version until you run `liam rebuild
+  --database PATH` with `liamd` stopped. Stores written before the event log have no log, so
+  `liamd` first copies their rows into a new one, then refuses the start and names the rebuild
+  command. The copy and the rebuild both read every row, so a large store takes a while: the
+  rebuild re-embeds every live node with the configured embedder.
+- The event schema is now version 7.
+- The embedder prompt scheme is now 2, which wraps Qwen3 search queries in the model's
+  instruction format. A store written under scheme 1 needs the same `liam rebuild` once.
+- Do not delete `<database>.embedder.json` to get past the refusal. The old vectors would stay
+  mixed with the new ones.
+
 ### Added
 
 - Two producers writing the same `subject` in one scope now each keep a live fact instead of
@@ -38,6 +51,19 @@ All notable changes to LIAM are recorded here. The format follows
 - `timeline` MCP tool: given an entity handle, returns its compiled page plus its live mentions,
   most recent first. Accepts an optional `limit` (default 50, max 200); a capped result ends with
   a "(more mentions exist)" trailer instead of claiming an exact total it cannot prove.
+
+- `liamd delete`, which destroys everything held about a subject across the database, the log and
+  the caches as a resumable job, and a `delete` tool that only counts what a delete would destroy.
+  The `delete` and `consolidate` tools are limited to the producers named in `admin.producers`.
+- A `metrics` tool, with alert rules judged after each run and set under `[metrics]`.
+- A trust ceiling for the fallback producer, `tiering.unknown_trust_ceiling`, so a writer that
+  names no producer cannot outrank a known one.
+- Archive of old closed log partitions to `archive.dir`, under `[archive]`. A rebuild reads
+  archived partitions.
+- Sealing of new log events when `encryption.master_key` is set. Unset keeps a plaintext log.
+- Hosted model providers (Anthropic, OpenAI and Gemini) for extraction and summaries. They are
+  off by default: they need a build with `--features hosted`, `hosted.enabled = true`, and an
+  allow-list of hosts.
 
 ### Changed
 
