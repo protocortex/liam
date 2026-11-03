@@ -165,10 +165,19 @@ mod tests {
         assert!(!pidfile.exists());
     }
 
+    /// Writes the two sealed events and hands back the still-open writer, so a
+    /// test that needs more appends never reopens the log. Reopening races any
+    /// concurrently spawned child process: until it execs, the child holds a
+    /// copy of the released lock descriptor, so the lock reads as held.
     fn sealed_log(
         dir: &TempDir,
         shred_second: bool,
-    ) -> (Arc<KeyRegistry>, Vec<liam_log::event::LogEvent>) {
+        wal: liam_log::wal::WalConfig,
+    ) -> (
+        Arc<KeyRegistry>,
+        Vec<liam_log::event::LogEvent>,
+        liam_log::wal::WalWriter<liam_log::wal::SystemClock>,
+    ) {
         use liam_log::envelope::{KeyHints, Sealer};
         use liam_log::event::{LogEvent, LogPayload, NodeRow, CURRENT_SCHEMA_VERSION};
         use liam_log::wal::WalWriter;
@@ -214,11 +223,7 @@ mod tests {
             .iter()
             .map(|event| sealer.seal(event, &KeyHints::default()).unwrap())
             .collect();
-        let mut writer = WalWriter::open_with_system_clock(
-            dir.path(),
-            crate::config::LogConfig::default().wal(),
-        )
-        .unwrap();
+        let mut writer = WalWriter::open_with_system_clock(dir.path(), wal).unwrap();
         for event in &events {
             writer.append(event).unwrap();
         }
@@ -228,7 +233,7 @@ mod tests {
             };
             registry.destroy(&record.rows[0].key_id).unwrap();
         }
-        (registry, events)
+        (registry, events, writer)
     }
 
     #[tokio::test]
@@ -238,7 +243,8 @@ mod tests {
 
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let (registry, _events) = sealed_log(&dir, true);
+        let (registry, _events, _writer) =
+            sealed_log(&dir, true, crate::config::LogConfig::default().wal());
         let files = DaemonFiles {
             database_path: &dir.path().join("liam.db"),
             log_dir: dir.path(),
@@ -266,7 +272,7 @@ mod tests {
 
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        sealed_log(&dir, false);
+        let _log = sealed_log(&dir, false, crate::config::LogConfig::default().wal());
         let elsewhere = tempfile::tempdir().unwrap();
         let lost = event_log::open_key_registry(
             elsewhere.path(),
@@ -307,21 +313,19 @@ mod tests {
         use liam_log::archive::{archive_partitions, ArchivePolicy, NoFault};
         use liam_log::compactor::Compactor;
         use liam_log::reader::ReaderError;
-        use liam_log::wal::{WalConfig, WalWriter};
+        use liam_log::wal::WalConfig;
         use liam_log::LogWriter;
 
         // Arrange: segment 0 is compacted, archived, and then lost
         let dir = tempfile::tempdir().unwrap();
-        let (registry, events) = sealed_log(&dir, false);
-        // One more append on a writer that rotates at once closes segment 0.
-        let mut writer = WalWriter::open_with_system_clock(
-            dir.path(),
+        let (registry, events, mut writer) = sealed_log(
+            &dir,
+            false,
             WalConfig {
                 segment_max_bytes: 1,
                 rotate_interval_secs: u64::MAX,
             },
-        )
-        .unwrap();
+        );
         let filler = liam_log::event::LogEvent {
             event_id: "filler".into(),
             encryption_key_id: None,
