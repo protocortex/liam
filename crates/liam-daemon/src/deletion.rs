@@ -2,7 +2,17 @@
 //! Deleting what a client asked to forget. The log holds sealed rows, so a
 //! delete destroys keys; this module holds the commands that act on them.
 
+// The delete job that builds the registry from these arrives after them, so
+// only their tests call them until then.
+#[allow(dead_code)]
+mod files;
+#[allow(dead_code)]
+mod memory;
 mod migrate;
+#[allow(dead_code)]
+mod registry;
+#[cfg(test)]
+mod test_support;
 
 use anyhow::Context;
 

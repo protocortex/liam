@@ -113,6 +113,15 @@ pub enum Error {
     #[error("a logged write is not reconciled with the log; reopen the store")]
     LogPoisoned,
 
+    /// A lineage store outside the database could not find, purge or verify
+    /// what a delete job named. Names the store and the cause, never the rows.
+    #[error("lineage store {store}: {reason}")]
+    LineageStore { store: String, reason: String },
+
+    /// The dedup filter file could not be written.
+    #[error("dedup filter file: {0}")]
+    FilterFile(#[from] std::io::Error),
+
     /// The dedup filter could not be sized for the hash index.
     #[error("dedup filter sizing is invalid: {0}")]
     BloomConfig(#[from] liam_log::dedup::BloomConfigError),

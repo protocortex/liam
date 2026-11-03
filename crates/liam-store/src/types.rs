@@ -1198,6 +1198,12 @@ pub struct LineageTarget {
     pub job_id: String,
     pub event_ids: Vec<String>,
     pub key_ids: Vec<String>,
+    /// The nodes the key groups sealed, as `Graph::resolve_target` fills them
+    /// in for the stores that live outside the database. The graph store works
+    /// them out itself.
+    pub node_ids: Vec<String>,
+    /// The lineage keys of those nodes.
+    pub lineage_keys: Vec<String>,
 }
 
 /// How many rows of each table a purge would remove.

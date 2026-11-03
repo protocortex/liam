@@ -426,3 +426,23 @@ fn the_throttle_refuses_past_the_budget_and_allows_again_when_the_window_passes(
     assert_eq!(just_inside, Err(Duration::from_secs(1)));
     assert!(after_first_expires.is_ok());
 }
+
+#[test]
+fn a_handle_forgotten_for_a_deleted_node_is_no_longer_accepted() {
+    // Arrange
+    let node = NodeId::new();
+    let handles = IssuedHandles::new(MAX_ISSUED);
+    handles.issue([&node]);
+    let handle = node.as_str()[..8].to_owned();
+    assert!(handles.resolve(&handle).is_ok());
+
+    // Act
+    let forgotten = handles.forget(&[node.as_str().to_owned()].into());
+
+    // Assert
+    assert_eq!(forgotten, 1);
+    assert!(matches!(
+        handles.resolve(&handle),
+        Err(FeedbackError::NotIssued(_))
+    ));
+}

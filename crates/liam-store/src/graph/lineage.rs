@@ -56,6 +56,25 @@ pub trait LineageStore: Send + Sync {
     async fn verify(&self, target: &LineageTarget) -> Result<Vec<Residual>>;
 }
 
+#[async_trait]
+impl<T: LineageStore + ?Sized> LineageStore for std::sync::Arc<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    async fn find(&self, target: &LineageTarget) -> Result<LineageHits> {
+        (**self).find(target).await
+    }
+
+    async fn purge(&self, target: &LineageTarget) -> Result<PurgeReport> {
+        (**self).purge(target).await
+    }
+
+    async fn verify(&self, target: &LineageTarget) -> Result<Vec<Residual>> {
+        (**self).verify(target).await
+    }
+}
+
 /// What a purge is told to remove. A replay of the logged removal has only this.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct PurgeInput {
@@ -694,6 +713,18 @@ impl<B: Backend> Graph<B> {
                 commit_or_abandon(tx, applied).await
             }
         }
+    }
+
+    /// `target` with the nodes and lineage keys its key groups reach, fixed in
+    /// the outbox before anything is deleted, for the stores that cannot read
+    /// the database.
+    pub async fn resolve_target(&self, target: &LineageTarget) -> Result<LineageTarget> {
+        let outbox = self.open_outbox(target).await?;
+        Ok(LineageTarget {
+            node_ids: outbox.input.node_ids,
+            lineage_keys: outbox.doomed.lineages,
+            ..target.clone()
+        })
     }
 
     /// The key group that sealed `node_id`, `None` when none is recorded.
