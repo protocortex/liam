@@ -8,11 +8,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use liam_store::{scope_is_within, SummaryInput};
+use liam_store::scope_is_within;
 
-use super::cache::CacheStore;
 use super::inputs::ExtractionInput;
-use crate::config::PrivacyConfig;
+use crate::config::{PrivacyConfig, Provider};
 
 /// What the gate looks at in one item. The unscoped group has no scope.
 pub struct GateItem<'a> {
@@ -48,6 +47,7 @@ pub enum Decision {
 pub struct GateCounts(BTreeMap<DenyReason, usize>);
 
 impl GateCounts {
+    #[cfg(test)]
     pub fn of(&self, reason: DenyReason) -> usize {
         self.0.get(&reason).copied().unwrap_or(0)
     }
@@ -145,40 +145,31 @@ impl PrivacyGate {
         report(provider, inputs.len(), &counts);
         (allowed, counts)
     }
+}
 
-    /// Whether a cluster of nodes may be summarised by `provider`. One
-    /// local-only source among the nodes keeps the whole summary at home, and
-    /// so does one node in a scope that is not allowed.
-    pub fn decide_summary(&self, provider: &str, items: &[SummaryInput]) -> Decision {
-        let sources: Vec<String> = items
-            .iter()
-            .flat_map(|item| item.sources.iter().cloned())
-            .collect();
-        for item in items {
-            let gate_item = GateItem {
-                scope: item.scope.as_deref(),
-                sources: &sources,
-            };
-            if let deny @ Decision::Deny { .. } = self.decide(&gate_item, provider) {
-                return deny;
-            }
+/// A gate bound to the one provider it guards, as the hosted hooks hold it.
+pub struct ProviderGate {
+    gate: PrivacyGate,
+    provider: Provider,
+}
+
+impl ProviderGate {
+    pub fn new(policy: PrivacyConfig, provider: Provider) -> Self {
+        Self {
+            gate: PrivacyGate::new(policy),
+            provider,
         }
-        Decision::Allow
     }
 
-    /// A cached hosted answer, served only while its item still passes the
-    /// gate, so a scope taken off the allow list stops its cached answers too.
-    pub fn cached(
-        &self,
-        provider: &str,
-        item: &GateItem<'_>,
-        cache: &CacheStore,
-        key: &str,
-    ) -> Option<String> {
-        match self.decide(item, provider) {
-            Decision::Allow => cache.get(key),
-            Decision::Deny { .. } => None,
-        }
+    /// Whether `item` may be sent. A summary cluster is one item: its scope and
+    /// every producer behind it, so one local-only source keeps it at home.
+    pub fn decide(&self, item: &GateItem<'_>) -> Decision {
+        self.gate.decide(item, self.provider.name())
+    }
+
+    /// The inputs that may be sent, and a count of the rest.
+    pub fn filter_inputs(&self, inputs: &[ExtractionInput]) -> (Vec<ExtractionInput>, GateCounts) {
+        self.gate.filter_inputs(self.provider.name(), inputs)
     }
 }
 

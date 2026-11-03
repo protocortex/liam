@@ -6,10 +6,9 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use liam_log::LogOffset;
-use liam_store::{Millis, NodeId, RecordedText};
+use liam_store::Millis;
 
 use super::*;
-use crate::extraction::cache::{CacheStore, NewEntry};
 
 const PROVIDER: &str = "anthropic";
 const REGION: &str = "us";
@@ -40,20 +39,6 @@ fn input(scope: Option<&str>, source: &str, text: &str) -> ExtractionInput {
         observed_at: Millis(0),
         ingested_at: Millis(0),
         text: text.to_owned(),
-    }
-}
-
-fn summary_input(scope: Option<&str>, sources: &[&str]) -> SummaryInput {
-    SummaryInput {
-        id: NodeId::from_raw("node"),
-        kind: "note".into(),
-        label: "label".into(),
-        content: RecordedText::for_test(SECRET_TEXT),
-        valid_from: Millis(0),
-        scope: scope.map(str::to_owned),
-        origin_events: Vec::new(),
-        sources: sources.iter().map(|s| (*s).to_owned()).collect(),
-        vector: Vec::new(),
     }
 }
 
@@ -229,21 +214,15 @@ fn when_all_ten_are_denied_nothing_is_left_to_send() {
 }
 
 #[test]
-fn one_local_only_source_keeps_the_whole_summary_at_home() {
+fn a_cluster_with_one_local_only_source_stays_at_home_through_the_bound_gate() {
     // Arrange
-    let gate = PrivacyGate::new(policy());
-    let clean = [
-        summary_input(Some("work"), &["client:mcp"]),
-        summary_input(Some("work"), &["client:mcp"]),
-    ];
-    let mixed = [
-        summary_input(Some("work"), &["client:mcp"]),
-        summary_input(Some("work"), &["client:diary"]),
-    ];
+    let gate = ProviderGate::new(policy(), Provider::Anthropic);
+    let clean = vec!["client:mcp".to_owned(), "client:mcp".to_owned()];
+    let mixed = vec!["client:mcp".to_owned(), "client:diary".to_owned()];
 
     // Act
-    let sent = gate.decide_summary(PROVIDER, &clean);
-    let kept = gate.decide_summary(PROVIDER, &mixed);
+    let sent = gate.decide(&item(Some("work"), &clean));
+    let kept = gate.decide(&item(Some("work"), &mixed));
 
     // Assert
     assert_eq!(sent, Decision::Allow);
@@ -256,34 +235,20 @@ fn one_local_only_source_keeps_the_whole_summary_at_home() {
 }
 
 #[test]
-fn a_cached_answer_is_not_served_once_its_scope_leaves_the_allow_list() {
+fn the_bound_gate_filters_inputs_for_its_own_provider_only() {
     // Arrange
-    let dir = tempfile::tempdir().unwrap();
-    let cache = CacheStore::open(dir.path().join("cache.jsonl")).unwrap();
-    cache
-        .put(NewEntry {
-            key: "k",
-            response: "{}",
-            model_id: "m",
-            model_sha256: "s",
-            prompt_version: "p",
-            source_event_ids: &[],
-        })
-        .unwrap();
-    let before = PrivacyGate::new(policy());
-    let after = PrivacyGate::new(PrivacyConfig {
-        allowed_scopes: Vec::new(),
-        ..policy()
-    });
-    let work = item(Some("work"), &[]);
+    let anthropic = ProviderGate::new(policy(), Provider::Anthropic);
+    let openai = ProviderGate::new(policy(), Provider::OpenAi);
+    let inputs = [input(Some("work"), "client:mcp", "kept")];
 
     // Act
-    let served = before.cached(PROVIDER, &work, &cache, "k");
-    let withheld = after.cached(PROVIDER, &work, &cache, "k");
+    let (sent, _) = anthropic.filter_inputs(&inputs);
+    let (withheld, counts) = openai.filter_inputs(&inputs);
 
     // Assert
-    assert_eq!(served.as_deref(), Some("{}"));
-    assert_eq!(withheld, None);
+    assert_eq!(sent.len(), 1);
+    assert!(withheld.is_empty());
+    assert_eq!(counts.of(DenyReason::RegionNotAttested), 1);
 }
 
 #[derive(Clone, Default)]

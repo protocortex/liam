@@ -8,6 +8,7 @@ use liam_store::{EmbedError, GraphConfig, NewNode, NodeId};
 
 use super::*;
 use crate::extraction::client::ModelIdentity;
+use crate::extraction::gate::ProviderGate;
 use crate::summary::summariser::LocalSummariser;
 use crate::summary::test_support::{MemoryCache, ScriptedLlm};
 
@@ -142,6 +143,7 @@ impl Rig {
                     model_sha256: String::new(),
                 },
             )),
+            gate: None,
             permits: Arc::new(Semaphore::new(1)),
             cache: self.cache.clone(),
             embedder: Arc::new(FixedEmbedder),
@@ -641,4 +643,67 @@ async fn a_summary_text_that_cannot_be_embedded_is_not_written() {
     assert_eq!(report.written, 0);
     assert!(report.partial());
     assert!(rig.live_ids().await.is_empty());
+}
+
+fn gate_allowing(scopes: &[&str]) -> Arc<ProviderGate> {
+    use crate::config::{PrivacyConfig, Provider};
+    Arc::new(ProviderGate::new(
+        PrivacyConfig {
+            allowed_scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            local_only_sources: Vec::new(),
+            provider_regions: [("anthropic".to_owned(), "us".to_owned())].into(),
+            attested_regions: [(String::new(), vec!["us".to_owned()])].into(),
+        },
+        Provider::Anthropic,
+    ))
+}
+
+#[tokio::test]
+async fn a_hosted_summariser_with_no_policy_is_never_asked_and_nothing_is_written() {
+    // Arrange
+    let rig = Rig::answering_a_tree().await;
+    rig.add_groups(3).await;
+    let hooks = SummaryHooks {
+        gate: Some(gate_allowing(&[])),
+        ..rig.hooks(enabled())
+    };
+
+    // Act
+    let report = hooks
+        .summarize(&SummaryCtx {
+            store: &rig.store,
+            source: SOURCE.to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(rig.llm.calls(), 0);
+    assert_eq!(report.written, 0);
+    assert!(report.partial());
+    assert!(rig.live_ids().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_allowed_scope_builds_the_whole_tree_through_the_gate() {
+    // Arrange
+    let rig = Rig::answering_a_tree().await;
+    rig.add_groups(3).await;
+    let hooks = SummaryHooks {
+        gate: Some(gate_allowing(&[""])),
+        ..rig.hooks(enabled())
+    };
+
+    // Act
+    let report = hooks
+        .summarize(&SummaryCtx {
+            store: &rig.store,
+            source: SOURCE.to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(report.written, 4);
+    assert_eq!(rig.llm.calls(), 4);
 }

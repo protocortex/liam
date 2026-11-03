@@ -29,7 +29,10 @@ use tokio_util::sync::CancellationToken;
 use crate::extraction::client::ModelIdentity;
 use liam_log::crypto::KeyRegistry;
 
-use crate::extraction::setup::{self as extraction_setup, sweep_stale_sidecar, DaemonFiles};
+use crate::extraction::gate::ProviderGate;
+use crate::extraction::setup::{
+    self as extraction_setup, sweep_stale_sidecar, Backend, DaemonFiles,
+};
 use crate::extraction::sidecar::SystemRam;
 use crate::mcp::MemoryServer;
 use crate::metrics::recorder::Metrics;
@@ -118,11 +121,6 @@ fn extraction_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn Extrac
     if !config.enabled {
         return Ok(None);
     }
-    anyhow::ensure!(
-        config.provider == Provider::Local,
-        "extraction.provider = {:?} has no adapter in this build yet",
-        config.provider.name()
-    );
     let files = DaemonFiles {
         database_path: setup.database_path,
         log_dir: setup.log_dir,
@@ -130,7 +128,47 @@ fn extraction_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn Extrac
         permits: setup.server.generation_permits_handle(),
         stopping: setup.shutdown.token(),
     };
-    Ok(Some(Arc::new(extraction_setup::build(config, files)?)))
+    let hooks = match config.provider {
+        Provider::Local => extraction_setup::build(config, files)?,
+        hosted => extraction_setup::build_with(config, files, hosted_extraction(setup, hosted)?)?,
+    };
+    Ok(Some(Arc::new(hooks)))
+}
+
+#[cfg(feature = "hosted")]
+fn hosted_extraction(setup: &JobSetup<'_>, provider: Provider) -> anyhow::Result<Backend> {
+    let metrics = setup
+        .metrics
+        .clone()
+        .context("hosted extraction needs the metrics recorder")?;
+    crate::hosted::extraction_backend(setup.config, provider, metrics)
+}
+
+#[cfg(not(feature = "hosted"))]
+fn hosted_extraction(_: &JobSetup<'_>, _: Provider) -> anyhow::Result<Backend> {
+    Err(no_hosted_support("extraction.provider"))
+}
+
+#[cfg(feature = "hosted")]
+fn hosted_summariser(
+    setup: &JobSetup<'_>,
+    provider: Provider,
+) -> anyhow::Result<Arc<dyn Summariser>> {
+    let metrics = setup
+        .metrics
+        .clone()
+        .context("hosted summaries need the metrics recorder")?;
+    crate::hosted::summariser(setup.config, provider, metrics)
+}
+
+#[cfg(not(feature = "hosted"))]
+fn hosted_summariser(_: &JobSetup<'_>, _: Provider) -> anyhow::Result<Arc<dyn Summariser>> {
+    Err(no_hosted_support("summary.provider"))
+}
+
+#[cfg(not(feature = "hosted"))]
+fn no_hosted_support(key: &str) -> anyhow::Error {
+    anyhow::anyhow!("{key} names a hosted provider, but this build has no hosted support; rebuild with the hosted feature")
 }
 
 fn summary_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn SummaryHook>>> {
@@ -139,20 +177,25 @@ fn summary_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn SummaryHo
         return Ok(None);
     }
     let llm = &setup.config.llm;
-    anyhow::ensure!(
-        config.provider == Provider::Local,
-        "summary.provider = {:?} has no adapter in this build yet",
-        config.provider.name()
-    );
-    let summariser: Arc<dyn Summariser> = Arc::new(local_summariser(setup));
+    let summariser: Arc<dyn Summariser> = match config.provider {
+        Provider::Local => Arc::new(local_summariser(setup)),
+        hosted => hosted_summariser(setup, hosted)?,
+    };
     let cache = FileSummaryCache::open(
         summary_cache_path(setup.database_path),
         summariser.identity().clone(),
     )
     .context("could not open the summary cache")?;
+    let gate = (config.provider != Provider::Local).then(|| {
+        Arc::new(ProviderGate::new(
+            setup.config.hosted.privacy.clone(),
+            config.provider,
+        ))
+    });
     Ok(Some(Arc::new(SummaryHooks {
         config: config.clone(),
         summariser,
+        gate,
         permits: setup.server.generation_permits_handle(),
         cache: Arc::new(cache),
         embedder: Arc::new(StoreEmbedder(setup.embedder.clone())),

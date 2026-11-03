@@ -352,6 +352,7 @@ pub(super) async fn run_pipeline(
             segment: 0,
             index: EVENT_COUNT as u64,
         },
+        gate: None,
     };
     let inputs: Vec<ExtractionInput> = events.iter().map(input).collect();
 

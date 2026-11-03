@@ -13,6 +13,7 @@ use tempfile::TempDir;
 
 use super::super::cache::{cache_key, cache_path, KeyParts, NewEntry};
 use super::super::client::ExtractError;
+use super::super::gate::ProviderGate;
 use super::failures::{tracking_id, CANARY_TEXT};
 use super::*;
 use crate::config::ExtractionConfig;
@@ -211,6 +212,7 @@ struct Fixture {
     permits: Semaphore,
     ram: FakeRam,
     stopping: CancellationToken,
+    gate: Option<ProviderGate>,
 }
 
 impl Fixture {
@@ -236,6 +238,7 @@ impl Fixture {
             permits: Semaphore::new(1),
             ram: FakeRam(AtomicU64::new(u64::MAX)),
             stopping: CancellationToken::new(),
+            gate: None,
         }
     }
 
@@ -288,6 +291,7 @@ impl Fixture {
             deadline,
             stopping: &self.stopping,
             window_end: WINDOW_END,
+            gate: self.gate.as_ref(),
         };
         extract_events(inputs, deps).await.expect("a finished run")
     }
@@ -1318,4 +1322,66 @@ async fn a_live_answer_earlier_in_the_run_is_proof_without_a_canary() {
 
     // Assert
     assert_eq!(fx.failures_in(1, Some("a")).await, 1);
+}
+
+fn hosted_gate(allowed: &[&str]) -> ProviderGate {
+    use crate::config::{PrivacyConfig, Provider as Hosted};
+    ProviderGate::new(
+        PrivacyConfig {
+            allowed_scopes: allowed.iter().map(|scope| (*scope).to_owned()).collect(),
+            local_only_sources: Vec::new(),
+            provider_regions: [("anthropic".to_owned(), "us".to_owned())].into(),
+            attested_regions: [("work".to_owned(), vec!["us".to_owned()])].into(),
+        },
+        Hosted::Anthropic,
+    )
+}
+
+#[tokio::test]
+async fn events_the_gate_denies_never_reach_a_prompt_and_the_cursor_passes_them() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.gate = Some(hosted_gate(&["work"]));
+    let script = Script::honest();
+    let provider = Provider::new(&script);
+    let events = [
+        input(0, Some("work")),
+        input(1, Some("private")),
+        input(2, Some("work")),
+        input(3, Some("private")),
+    ];
+
+    // Act
+    let report = fx.run(&provider, &events).await;
+
+    // Assert
+    assert_eq!(script.calls(), 1);
+    let people: Vec<_> = prompt_texts(&script.prompt(0))
+        .iter()
+        .map(|text| text.chars().nth(6).unwrap())
+        .collect();
+    assert_eq!(people, ['0', '2']);
+    assert_eq!(report.events_withheld, 2);
+    assert_eq!(report.completed_offset, Some(WINDOW_END));
+}
+
+#[tokio::test]
+async fn a_cached_answer_is_not_used_once_the_gate_no_longer_allows_its_scope() {
+    // Arrange
+    let mut fx = Fixture::new().await;
+    fx.gate = Some(hosted_gate(&["work"]));
+    let script = Script::honest();
+    let provider = Provider::new(&script);
+    let events = [input(0, Some("work")), input(1, Some("work"))];
+    let first = fx.run(&provider, &events).await;
+    fx.gate = Some(hosted_gate(&[]));
+
+    // Act
+    let second = fx.run(&provider, &events).await;
+
+    // Assert
+    assert!(first.facts_written > 0);
+    assert_eq!(script.calls(), 1);
+    assert_eq!((second.facts_written, second.events_withheld), (0, 2));
+    assert_eq!(second.completed_offset, Some(WINDOW_END));
 }

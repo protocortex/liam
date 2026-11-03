@@ -31,6 +31,7 @@ use super::tree::{
     detect_cold, plan_level, should_descend, LevelRequest, Point, PreviousCluster, Regeneration,
     TreeParams,
 };
+use crate::extraction::gate::{Decision, GateItem, ProviderGate};
 
 /// Tokens a summary may run to: two to four sentences, with room to spare.
 const SUMMARY_MAX_NEW_TOKENS: usize = 512;
@@ -44,6 +45,8 @@ const SAMPLED_ITEMS_PER_SUMMARY: usize = 2;
 pub struct SummaryHooks {
     pub config: SummaryConfig,
     pub summariser: Arc<dyn Summariser>,
+    /// Set for a hosted provider: what it may be sent.
+    pub gate: Option<Arc<ProviderGate>>,
     /// The daemon's generation permits, shared with the other model users.
     pub permits: Arc<Semaphore>,
     pub cache: Arc<dyn SummaryCache>,
@@ -171,6 +174,8 @@ struct Run<'a> {
     /// Summaries this pass may still generate.
     budget: usize,
     report: SummaryReport,
+    /// The producers behind each node of the scope being built, for the gate.
+    producers: HashMap<String, Vec<String>>,
 }
 
 impl<'a> Run<'a> {
@@ -207,6 +212,7 @@ impl<'a> Run<'a> {
             deadline: Instant::now() + Duration::from_secs(config.run_deadline_secs),
             budget: config.max_summaries_per_run,
             report: SummaryReport::default(),
+            producers: HashMap::new(),
         }
     }
 
@@ -222,6 +228,11 @@ impl<'a> Run<'a> {
                 "summary: nodes without a vector are left out until they are embedded"
             );
         }
+        self.producers = inputs
+            .items
+            .iter()
+            .map(|input| (input.id.as_str().to_string(), input.sources.clone()))
+            .collect();
         let mut items: Vec<Item> = inputs.items.iter().map(node_item).collect();
         let nodes: HashMap<String, PromptItem> = items
             .iter()
@@ -319,6 +330,10 @@ impl<'a> Run<'a> {
                 })
             })
             .collect::<anyhow::Result<Vec<&Item>>>()?;
+        if self.withheld_by_gate(scope, level, &members).await? {
+            self.report.unwritten += 1;
+            return Ok(false);
+        }
         self.budget -= 1;
         let prompt: Vec<PromptItem> = members
             .iter()
@@ -387,6 +402,45 @@ impl<'a> Run<'a> {
             PutOutcome::Unchanged(_) => self.report.kept += 1,
         }
         Ok(true)
+    }
+
+    /// Whether the privacy gate keeps this cluster away from a hosted
+    /// provider. The whole cluster is judged on every producer behind it, down
+    /// to the nodes, so a summary of summaries cannot carry local-only text out.
+    async fn withheld_by_gate(
+        &self,
+        scope: &str,
+        level: u8,
+        members: &[&Item],
+    ) -> anyhow::Result<bool> {
+        let Some(gate) = &self.hooks.gate else {
+            return Ok(false);
+        };
+        let mut nodes = BTreeSet::new();
+        for member in members {
+            if level == 1 {
+                nodes.insert(member.point.id.clone());
+            } else {
+                nodes.extend(self.member_nodes(&member.point.id).await?);
+            }
+        }
+        let sources: Vec<String> = nodes
+            .iter()
+            .filter_map(|node| self.producers.get(node))
+            .flatten()
+            .cloned()
+            .collect();
+        let item = GateItem {
+            scope: Some(scope),
+            sources: &sources,
+        };
+        match gate.decide(&item) {
+            Decision::Allow => Ok(false),
+            Decision::Deny { reason } => {
+                info!(level, %reason, "summary: a cluster is kept from the hosted provider");
+                Ok(true)
+            }
+        }
     }
 
     /// Closes the dissolved summaries that something else now stands in for,
