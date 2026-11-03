@@ -85,7 +85,11 @@ fn texts_by_scope(payload: &LogPayload) -> BTreeMap<Option<String>, String> {
         | LogPayload::Feedback { .. }
         | LogPayload::TierMove { .. }
         // Rows are opened by the log reader before extraction sees them.
-        | LogPayload::Sealed(_) => Vec::new(),
+        | LogPayload::Sealed(_)
+        | LogPayload::KeyDestroyed { .. }
+        | LogPayload::DeletionRecorded { .. }
+        | LogPayload::LineageRemoval { .. }
+        | LogPayload::DeletionCancelled { .. } => Vec::new(),
     };
     let mut by_scope: BTreeMap<Option<String>, String> = BTreeMap::new();
     for row in rows.into_iter().filter(|row| !is_entity_page(row)) {

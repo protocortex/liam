@@ -117,6 +117,32 @@ pub enum OpenError {
     Crypto(#[from] CryptoError),
 }
 
+/// The plain header of one sealed row: which row it is and whose key seals it.
+/// A replay reads these to learn which key group each node belongs to, with no
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowKeyRef {
+    pub row_id: String,
+    pub kind: RowKind,
+    pub key_id: KeyId,
+}
+
+/// The headers of the rows of a sealed event, empty for a plain one.
+pub fn row_keys(event: &LogEvent) -> Vec<RowKeyRef> {
+    let LogPayload::Sealed(record) = &event.payload else {
+        return Vec::new();
+    };
+    record
+        .rows
+        .iter()
+        .map(|row| RowKeyRef {
+            row_id: row.row_id.clone(),
+            kind: row.kind,
+            key_id: row.key_id.clone(),
+        })
+        .collect()
+}
+
 /// A record with the rows that could be opened, and the key groups whose rows
 /// could not because the group was destroyed or is being destroyed.
 #[derive(Debug, Clone, PartialEq)]
@@ -362,7 +388,11 @@ fn split_rows(
         | LogPayload::Quarantined { .. }
         | LogPayload::RunRolledBack { .. }
         | LogPayload::DerivedArtifactClosed { .. }
-        | LogPayload::Sealed(_) => return Ok(None),
+        | LogPayload::Sealed(_)
+        | LogPayload::KeyDestroyed { .. }
+        | LogPayload::DeletionRecorded { .. }
+        | LogPayload::LineageRemoval { .. }
+        | LogPayload::DeletionCancelled { .. } => return Ok(None),
     };
     Ok(Some(split))
 }
@@ -639,6 +669,7 @@ fn open_scanned(registry: &KeyRegistry, mut record: LogRecord) -> Result<LogReco
             source: other,
         },
     })?;
+    record.row_keys = row_keys(&record.event);
     record.event = opened.event;
     record.shredded = opened.shredded;
     Ok(record)

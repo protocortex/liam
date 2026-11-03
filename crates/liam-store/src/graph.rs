@@ -62,6 +62,7 @@ mod rebuild;
 mod reembed;
 mod replay;
 mod rolled_back;
+mod row_keys;
 mod run_marker;
 mod snapshot;
 mod summaries;
@@ -2515,6 +2516,7 @@ mod tests {
     mod rebuild;
     mod reembed;
     mod run_marker;
+    mod sealed;
     mod snapshot;
     mod soak;
     mod summaries;

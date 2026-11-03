@@ -33,7 +33,8 @@ pub async fn logged_store(dir: &Path, clock: Arc<FixedClock>, dims: usize) -> De
 pub fn shared_test_log(dir: &Path) -> SharedLog {
     let log_dir = dir.join("events");
     let writer = liam_daemon::event_log::open_writer(&log_dir, LogConfig::default().wal()).unwrap();
-    liam_daemon::event_log::shared_log(writer, &log_dir, BloomConfig::default(), None).unwrap()
+    liam_daemon::event_log::shared_log(writer, &log_dir, BloomConfig::default(), None, None)
+        .unwrap()
 }
 
 /// Like `logged_store`, and the log handle beside it, for tests that rebuild.

@@ -59,7 +59,8 @@ pub async fn run_offline(
         embedder_fingerprint::verify(database, &EmbedderFingerprint::from_config(config))?;
 
     let writer = event_log::open_writer(&log_dir, config.log.wal())?;
-    let log = event_log::shared_log(writer, &log_dir, config.log.bloom()?, None)?;
+    let keys = event_log::open_key_registry(&log_dir, &config.encryption)?;
+    let log = event_log::shared_log(writer, &log_dir, config.log.bloom()?, None, keys)?;
     let store = open_database(config, database).await?;
     let store = open_store_on_log(store, database, &log_dir, log.clone(), embedder.clone()).await?;
     if let Some(fingerprint) = fingerprint {

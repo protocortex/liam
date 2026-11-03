@@ -198,11 +198,37 @@ pub enum LogPayload {
     Sealed(SealedRecord),
     /// Cancels the event `target_event_id` like `Voided`, and records that the
     /// store refused it at `at` for `reason`, so a replay can restore the
-    /// refusal. It goes last so the payloads before it keep their positions.
+    /// refusal. It is appended so the payloads before it keep their positions.
     Quarantined {
         target_event_id: String,
         reason: String,
         at: i64,
+    },
+    /// A key group was destroyed at `at`.
+    KeyDestroyed {
+        key_id: String,
+        at: i64,
+    },
+    /// A delete job committed to destroying the rows under `key_ids`.
+    DeletionRecorded {
+        job_id: String,
+        event_ids: Vec<String>,
+        key_ids: Vec<String>,
+        at: i64,
+    },
+    /// What a delete job purged from one derived store, so a replay purges it
+    /// again.
+    LineageRemoval {
+        job_id: String,
+        store: String,
+        event_ids: Vec<String>,
+        key_ids: Vec<String>,
+        node_ids: Vec<String>,
+    },
+    /// Withdraws a `DeletionRecorded` of a job cancelled before it destroyed
+    /// anything.
+    DeletionCancelled {
+        job_id: String,
     },
 }
 
@@ -1284,6 +1310,26 @@ mod tests {
                 target_event_id: String::new(),
                 reason: String::new(),
                 at: 0,
+            },
+            LogPayload::KeyDestroyed {
+                key_id: String::new(),
+                at: 0,
+            },
+            LogPayload::DeletionRecorded {
+                job_id: String::new(),
+                event_ids: Vec::new(),
+                key_ids: Vec::new(),
+                at: 0,
+            },
+            LogPayload::LineageRemoval {
+                job_id: String::new(),
+                store: String::new(),
+                event_ids: Vec::new(),
+                key_ids: Vec::new(),
+                node_ids: Vec::new(),
+            },
+            LogPayload::DeletionCancelled {
+                job_id: String::new(),
             },
         ];
 

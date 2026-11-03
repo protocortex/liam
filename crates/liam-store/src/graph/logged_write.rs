@@ -21,9 +21,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use liam_log::crypto::CryptoError;
 use liam_log::dedup::{
     find_first_write, BloomConfig, HashBloom, HashIndex, IndexedWrite, PreCheck,
 };
+use liam_log::envelope::{row_keys, KeyHints, RowKeyRef, SealError, Sealer};
 use liam_log::event::{LogEvent, LogPayload};
 use liam_log::hash::content_hashes;
 use liam_log::reader::LogReader;
@@ -35,6 +37,7 @@ use uuid::Uuid;
 use super::log_cursor;
 use super::logged_plan::{Dedup, Plan, Table};
 use super::projection::{apply_steps, unlogged, Step};
+use super::row_keys::{key_hints, record_row_keys};
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
@@ -70,6 +73,21 @@ pub struct EventLog {
     /// Told each time a write is refused for a poisoned log, which only a
     /// reopen clears, so the process can restart itself into the replay.
     on_poisoned: Option<PoisonHook>,
+    /// Seals every event before it is appended. `None` keeps a plaintext log.
+    sealer: Option<Sealer>,
+}
+
+/// An event that reached the log.
+pub(super) struct Appended {
+    pub(super) offset: LogOffset,
+    /// The headers of the rows the event was sealed into, empty if it is plain.
+    pub(super) row_keys: Vec<RowKeyRef>,
+}
+
+enum AppendFailure {
+    /// Nothing was appended.
+    Seal(SealError),
+    Wal(WalError),
 }
 
 /// What the owner of the log wants done when a write meets a poisoned log.
@@ -85,7 +103,43 @@ impl EventLog {
             poisoned: false,
             backfill_pending: false,
             on_poisoned: None,
+            sealer: None,
         }
+    }
+
+    /// Seals every event with `sealer` before it is appended.
+    pub fn with_sealer(mut self, sealer: Sealer) -> Self {
+        self.sealer = Some(sealer);
+        self
+    }
+
+    /// Seals `event` if the log seals, then appends it. The seal and the
+    /// append share the key registry's write gate.
+    fn append_event(
+        &mut self,
+        event: &LogEvent,
+        hints: &KeyHints,
+    ) -> std::result::Result<Appended, AppendFailure> {
+        let Some(sealer) = self.sealer.clone() else {
+            // Set before the append and cleared only by `reconcile` or a
+            // failed append, so a dropped future or a panic leaves it set.
+            self.poisoned = true;
+            let offset = self.writer.append(event).map_err(AppendFailure::Wal)?;
+            return Ok(Appended {
+                offset,
+                row_keys: Vec::new(),
+            });
+        };
+        sealer
+            .seal_then(event, hints, |sealed| {
+                self.poisoned = true;
+                self.writer.append(sealed).map(|offset| Appended {
+                    offset,
+                    row_keys: row_keys(sealed),
+                })
+            })
+            .map_err(AppendFailure::Seal)?
+            .map_err(AppendFailure::Wal)
     }
 
     /// Calls `hook` every time a write is refused because the log is poisoned.
@@ -279,8 +333,8 @@ impl<B: Backend> Graph<B> {
                 target_event_id: event_id.clone(),
             },
         );
-        let offset = match held.append(event).await {
-            Ok(offset) => offset,
+        let appended = match self.append_event(&mut *tx, held, event).await {
+            Ok(appended) => appended,
             Err(error) => {
                 abandon(tx).await;
                 return Err(error);
@@ -288,15 +342,19 @@ impl<B: Backend> Graph<B> {
         };
         tracing::debug!(%event_id, "event appended to the log");
         let vector_delete = self.backend.vector_delete_sql();
-        let projected = project_logged(
-            &mut *tx,
-            steps,
-            &carried,
-            &event_id,
-            held.log_id,
-            offset,
-            vector_delete,
-        )
+        let projected = async {
+            record_row_keys(&mut *tx, &event_id, &appended.row_keys).await?;
+            project_logged(
+                &mut *tx,
+                steps,
+                &carried,
+                &event_id,
+                held.log_id,
+                appended.offset,
+                vector_delete,
+            )
+            .await
+        }
         .await;
         match commit_or_abandon(tx, projected).await {
             Ok(()) => {
@@ -310,6 +368,22 @@ impl<B: Backend> Graph<B> {
                 Err(error)
             }
         }
+    }
+
+    /// Reads the key hints a sealing log needs from the open transaction, then
+    /// appends.
+    async fn append_event(
+        &self,
+        tx: &mut dyn BackendTx,
+        held: &mut HeldLog,
+        event: LogEvent,
+    ) -> Result<Appended> {
+        let hints = if held.seals() {
+            key_hints(tx, &event).await?
+        } else {
+            KeyHints::default()
+        };
+        held.append_sealed(event, hints).await
     }
 
     /// Cancels an appended write the store failed to apply. Never fails: if
@@ -393,34 +467,50 @@ impl HeldLog {
         Ok(held)
     }
 
+    /// Appends an event that needs no key hints.
     pub(super) async fn append(&mut self, event: LogEvent) -> Result<LogOffset> {
+        let appended = self.append_sealed(event, KeyHints::default()).await?;
+        Ok(appended.offset)
+    }
+
+    /// Whether the log seals what it appends, so a write must read key hints.
+    fn seals(&self) -> bool {
+        self.guard
+            .as_deref()
+            .is_some_and(|log| log.sealer.is_some())
+    }
+
+    pub(super) async fn append_sealed(
+        &mut self,
+        event: LogEvent,
+        hints: KeyHints,
+    ) -> Result<Appended> {
         let Some(mut guard) = self.guard.take() else {
             return Err(Error::LogPoisoned);
         };
         let joined = tokio::task::spawn_blocking(move || {
-            // Set before the append and cleared only by `reconcile` or a
-            // failed append, so a dropped future or a panic from here on
-            // leaves it set, and a record that did land is never orphaned.
-            guard.poisoned = true;
-            let appended = guard.writer.append(&event);
+            let appended = guard.append_event(&event, &hints);
             (guard, appended)
         })
         .await;
         let (guard, appended) = joined.map_err(|error| Error::LogTask(error.to_string()))?;
         self.guard = Some(guard);
+        let wal_error = match appended {
+            Ok(appended) => return Ok(appended),
+            Err(AppendFailure::Seal(error)) => return Err(sealing_error(error)),
+            Err(AppendFailure::Wal(error)) => error,
+        };
         // A writer that refuses every append until reopened is a poisoned log
         // too, whichever layer noticed.
-        if matches!(appended, Err(WalError::Poisoned)) {
+        if matches!(wal_error, WalError::Poisoned) {
             self.set_poisoned(true);
             if let Some(log) = self.guard.as_deref() {
                 log.report_poisoned();
             }
             return Err(Error::LogPoisoned);
         }
-        if appended.is_err() {
-            self.set_poisoned(false);
-        }
-        Ok(appended?)
+        self.set_poisoned(false);
+        Err(wal_error.into())
     }
 
     fn might_contain(&self, hash: &[u8; 32]) -> bool {
@@ -640,5 +730,12 @@ pub(super) async fn commit_or_abandon<T>(
 pub(super) async fn abandon(tx: Box<dyn BackendTx + '_>) {
     if let Err(error) = tx.rollback().await {
         tracing::warn!(%error, "rollback of an abandoned write failed");
+    }
+}
+
+fn sealing_error(error: SealError) -> Error {
+    match error {
+        SealError::Crypto(CryptoError::KeyGroupLocked { key_id }) => Error::KeyGroupLocked(key_id),
+        other => Error::Sealing(other.to_string()),
     }
 }
