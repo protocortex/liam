@@ -15,6 +15,8 @@ mod admin;
 mod archive;
 mod consolidation;
 mod deletion;
+#[cfg(test)]
+mod docs;
 mod encryption;
 mod extraction;
 mod metrics;

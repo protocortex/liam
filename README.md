@@ -207,6 +207,22 @@ unknown key fails loudly.
 | `consolidation.dedup_similarity_threshold` | `0.95` | Cosine similarity at or above which two nodes are linked as near-duplicates. Above `0` and at most `1`. |
 | `consolidation.probe_count` | `20` | Most probes drawn from the store to gate a run. From `1` to `1000`. |
 | `consolidation.snapshot_dir` | `<database stem>.snapshots` beside the database | Where runs keep their snapshots. `~` is expanded, and a relative path is taken from the database's directory. Must not be empty. |
+| `encryption.master_key` | unset | Seals new log events when set: `keychain` (the macOS login keychain) or `file`. Unset keeps a plaintext log. |
+| `encryption.key_file` | unset | The master key file for `master_key = "file"`. `~` is expanded. Only its owner may read it. |
+| `deletion.deadline_days` | `30` | Days a delete job has before it is reported as overdue. At least `1`. |
+| `deletion.secure_delete` | `true` | Zero the database pages a delete frees. |
+| `admin.producers` | empty | Producers that may call the `delete` and `consolidate` tools. Empty refuses everyone. |
+| `archive.enabled` | `false` | Move old closed log partitions to `archive.dir`. |
+| `archive.after_days` | `90` | Archive a closed partition once its newest event is this many days old. At least `1`. |
+| `archive.dir` | unset | Where archived partitions go. Required when `archive.enabled` is true, and must exist. |
+| `archive.zstd_level` | `3` | The zstd level of an archived copy, from `1` to `22`. |
+| `metrics.enabled` | `true` | Keep metrics and raise alerts. `false` exposes no readings. |
+| `metrics.sink` | `memory` | `memory`, or `log` to also log each active alert at error level. |
+| `metrics.min_samples` | `5` | Samples a metric needs before a relative or rate rule can alert. At least `1`. |
+| `metrics.delta_pct` | `20.0` | Percent a recall, latency, `ece` or Bloom rate may move between runs before an alert. |
+| `metrics.rollback_ceiling` | `1.0` | Rollbacks at which an alert is raised. |
+| `metrics.extraction_backlog_ceiling` | `10000.0` | Events past an extraction cursor at which an alert is raised. |
+| `metrics.model_calls_per_hour` | `1000.0` | Model calls an hour at which an alert is raised. |
 | `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
 | `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
 
@@ -813,6 +829,98 @@ cache. A run that is rolled back stays gone after a rebuild.
 The store can retract a fact so a restated old event does not revive it
 (`retract_fact`, with an option to restore what the fact replaced). No tool
 exposes it yet.
+
+## Deleting a subject
+
+LIAM can forget a subject. Set `[encryption]` and the log is sealed: each row
+is encrypted under a key for its subject, and the keys are wrapped by a master
+key. Deleting a subject destroys its keys, removes what was derived from its
+rows (summaries, facts, cache entries, tier and usage rows, snapshots), and
+scrubs the database. The data stays unreadable even where a copy of the log
+remains.
+
+Only `liamd delete` destroys data, and it needs the daemon stopped. The `delete`
+tool is a dry run: it counts what a delete would destroy, store by store, and
+changes nothing.
+
+```sh
+liamd delete --subject alice           # the counts, nothing changes
+liamd delete --subject alice --yes     # start the job
+liamd delete --status                  # job ids and states, never subjects
+liamd delete --resume                  # finish every open job
+liamd delete --cancel JOB              # only before a key was destroyed
+```
+
+A job has `deletion.deadline_days` to finish. It is warned about at 80 percent
+of that time and alerted at the deadline (the `deletion_backlog_age_days`
+metric). The daemon finishes open jobs when it starts, and refuses to start if
+one cannot finish, because rows of a half-deleted subject would otherwise be
+served.
+
+What to know before you rely on it:
+
+- Backups and cloud-synced copies of the database are out of reach. A copy made
+  before a delete still holds the old pages.
+- Losing the master key or the key registry (`keys.registry` in the log
+  directory) loses all log content. There is no escrow.
+- A client name is a claim, not an authenticated identity. `[admin].producers`
+  guards against mistakes, and any client that claims an admin name can read the
+  dry-run counts.
+- An edge body is sealed under its source subject's key. Deleting only the
+  destination subject does not make it unreadable.
+- On Linux there is no keychain. A `0600` key file beside the data gives little
+  protection against a local reader.
+- Dedup applies within a key group. A subject that changed names across versions
+  needs each name deleted.
+- `secure_delete` lowers the risk that freed pages keep text, and does not
+  remove it on an SSD or a copy-on-write file system.
+- Nothing is deleted by age unless the owner sets a retention policy.
+
+`liamd encrypt-log` seals an existing plaintext log in place, with the daemon
+stopped.
+
+### Archive
+
+With `[archive]` enabled, a closed log partition whose newest event is older
+than `after_days` is copied to `archive.dir` as zstd, checked, and removed from
+the log directory. Nothing is deleted. A rebuild or a catch-up reads archived
+partitions, and one that was archived and then lost fails with an error naming
+the partition instead of rebuilding a store with a hole in it. Sealed bodies
+barely compress, so zstd saves little on an encrypted log. The 90 days and
+level 3 are starting values, not measured.
+
+### Metrics and alerts
+
+The `metrics` tool shows the latest reading of each metric and the active
+alerts. Pass `metric` for one, and `limit` to cap the readings (200 at most).
+Readings carry only a small fixed set of labels (tier, retrieval arm, provider,
+model) and never a subject, a producer or a lineage key, so keeping them cannot
+defeat a delete.
+
+| Metric | Meaning |
+|---|---|
+| `probe_recall_at_10` | Mean recall at 10 over the consolidation probes. |
+| `arm_latency_p50_ms`, `arm_latency_p95_ms` | Nearest-rank percentiles of the last 50 timings of each retrieval arm. |
+| `recall_latency_*`, `ask_latency_*` | The same for the `recall` and `ask` tools. |
+| `tier_bytes` | Bytes of vectors and signatures in the hot and the cold tier. |
+| `log_bytes`, `archive_bytes` | Size of the log and archive directories. |
+| `peak_rss_bytes` | Resident memory of the daemon and the processes it started. |
+| `consolidation_seconds`, `rollback_count` | Duration of the last run, and rolled-back runs since start. |
+| `items_promoted`, `items_reembedded` | What the last tier step moved, and the vectors it computed. |
+| `bloom_false_positive_rate` | Filter passes the log did not confirm, over those plus rejections. |
+| `ece` | Expected calibration error of item utility against feedback verdicts, in ten bins. Absent below `min_samples` verdicts. |
+| `rules_extraction_backlog`, `model_extraction_backlog` | Events past each extraction cursor. |
+| `model_calls`, `model_cost_micro_dollars` | Running totals per provider and model. |
+| `cache_hit_rate` | Hits over lookups in the extraction response cache. |
+| `deletion_backlog_count`, `deletion_backlog_age_days` | Open delete jobs, and the age of the oldest. |
+
+After each consolidation run the readings are compared with the previous run's.
+Three kinds of rule raise an alert, each inclusive of its bound: a relative
+move of `delta_pct` percent (recall, latency, `ece`, Bloom rate), a ceiling
+(rollbacks, extraction backlog, delete job age), and a rate of growth an hour
+(model calls). A first run raises only ceiling alerts. A run that ends in a
+failed restore is neither judged nor remembered. The previous values live in
+`<database>.metrics-state.json`.
 
 ## Feature flags
 
