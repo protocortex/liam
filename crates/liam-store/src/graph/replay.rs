@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use liam_log::envelope::RowKind;
 use liam_log::event::{EdgeRow, LogPayload, RowEffect, TombstoneTable, TombstoneTarget};
 use liam_log::hash::content_hashes;
 use liam_log::reader::{LogReader, LogRecord, LogStream};
@@ -19,6 +20,7 @@ use super::logged_write::{commit_or_abandon, follow_up, project_logged, HeldLog}
 use super::projection::{origin_steps, state_steps, steps_for, Step};
 use super::reembed::ReembedReport;
 use super::rolled_back::{RolledBack, SeenFactWrite};
+use super::row_keys::record_row_keys;
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
@@ -157,10 +159,20 @@ impl<B: Backend> Graph<B> {
                 let Ahead {
                     removed,
                     rolled_back,
+                    shredded_nodes,
                     ..
                 } = &mut ahead;
-                self.replay_event(held, &record, removed, rolled_back, &mut progress)
-                    .await?
+                self.replay_event(
+                    held,
+                    &record,
+                    Skipped {
+                        removed,
+                        shredded_nodes,
+                    },
+                    rolled_back,
+                    &mut progress,
+                )
+                .await?
             };
             tracing::debug!(event = %event_id, offset = %record.offset, "replay: record accounted for");
             report.count(outcome);
@@ -190,16 +202,22 @@ impl<B: Backend> Graph<B> {
         &self,
         held: &mut HeldLog,
         record: &LogRecord,
-        removed: &Removed,
+        skipped: Skipped<'_>,
         rolled_back: &mut RolledBack,
         progress: &mut Progress,
     ) -> Result<Outcome> {
-        let LogRecord { offset, event, .. } = record;
-        let mut steps = steps_for(&rolled_back.reconcile(event.payload.clone()));
+        let Skipped {
+            removed,
+            shredded_nodes,
+        } = skipped;
+        let LogRecord { event, .. } = record;
+        let payload =
+            without_dangling_edges(rolled_back.reconcile(event.payload.clone()), shredded_nodes);
+        let mut steps = steps_for(&payload);
         steps.extend(origin_steps(event, &steps));
         steps.extend(state_steps(event));
         if steps.is_empty() {
-            log_cursor::advance(&self.backend, held.log_id, *offset).await?;
+            self.pass_record(held.log_id, record).await?;
             return Ok(Outcome::Passed);
         }
         let carried = content_hashes(event);
@@ -233,6 +251,21 @@ impl<B: Backend> Graph<B> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Moves the cursor onto a record that projects nothing. A sealed record
+    /// still leaves the key groups of its rows behind.
+    async fn pass_record(&self, log_id: Uuid, record: &LogRecord) -> Result<()> {
+        if record.row_keys.is_empty() {
+            return log_cursor::advance(&self.backend, log_id, record.offset).await;
+        }
+        let mut tx = self.backend.begin().await?;
+        let passed = async {
+            record_row_keys(&mut *tx, &record.event.event_id, &record.row_keys).await?;
+            log_cursor::advance_in_tx(&mut *tx, log_id, record.offset).await
+        }
+        .await;
+        commit_or_abandon(tx, passed).await
     }
 
     /// Appends a `Voided` for the refused event, so a rebuild from the log
@@ -288,6 +321,7 @@ async fn replay_projection(
     vector_delete: Option<&str>,
 ) -> Result<Outcome> {
     let LogRecord { offset, event, .. } = record;
+    record_row_keys(tx, &event.event_id, &record.row_keys).await?;
     let rows = written_rows(steps);
     if rows.is_empty() {
         // Only removals: there is no row to look for, and running them again
@@ -326,6 +360,31 @@ pub(super) struct Ahead {
     pub(super) removed: Removed,
     /// The runs a `RunRolledBack` record cancels.
     pub(super) rolled_back: RolledBack,
+    /// Nodes whose key group is destroyed, so an edge to one cannot be applied.
+    pub(super) shredded_nodes: HashSet<String>,
+}
+
+/// What a replay leaves out of the records it applies.
+struct Skipped<'a> {
+    removed: &'a Removed,
+    shredded_nodes: &'a HashSet<String>,
+}
+
+/// Drops the edges that end at a shredded node, which the store does not hold,
+/// so a rebuild after a delete violates no foreign key.
+fn without_dangling_edges(payload: LogPayload, shredded: &HashSet<String>) -> LogPayload {
+    let dangling = |edge: &EdgeRow| shredded.contains(&edge.src) || shredded.contains(&edge.dst);
+    match payload {
+        LogPayload::EdgeWrite(edge) if dangling(&edge) => LogPayload::EpisodeBatch(Vec::new()),
+        LogPayload::EpisodeBatch(mut effects) => {
+            effects.retain(|effect| match effect {
+                RowEffect::Edge(edge) => !dangling(edge),
+                RowEffect::Node(_) => true,
+            });
+            LogPayload::EpisodeBatch(effects)
+        }
+        other => other,
+    }
 }
 
 /// Rows named by a tombstone. Ids are never reused, so once the tombstone has
@@ -366,8 +425,17 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
     let mut tombstones = Vec::new();
     let mut markers = Vec::new();
     let mut fact_writes = Vec::new();
+    let mut shredded_nodes = HashSet::new();
     while let Some(record) = records.next().await {
-        let event = record?.event;
+        let record = record?;
+        shredded_nodes.extend(
+            record
+                .row_keys
+                .iter()
+                .filter(|row| row.kind == RowKind::Node && record.shredded.contains(&row.key_id))
+                .map(|row| row.row_id.clone()),
+        );
+        let event = record.event;
         fact_writes.extend(SeenFactWrite::of(&event));
         match event.payload {
             LogPayload::Voided { target_event_id } => {
@@ -394,6 +462,7 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
         voided,
         removed,
         rolled_back,
+        shredded_nodes,
     })
 }
 
@@ -459,7 +528,11 @@ pub(super) fn row_effects(payload: LogPayload) -> Vec<RowEffect> {
         | LogPayload::AccessBatch { .. }
         | LogPayload::Feedback { .. }
         | LogPayload::TierMove { .. }
-        | LogPayload::Sealed(_) => Vec::new(),
+        | LogPayload::Sealed(_)
+        | LogPayload::KeyDestroyed { .. }
+        | LogPayload::DeletionRecorded { .. }
+        | LogPayload::LineageRemoval { .. }
+        | LogPayload::DeletionCancelled { .. } => Vec::new(),
     }
 }
 

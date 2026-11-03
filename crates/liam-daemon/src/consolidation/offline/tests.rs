@@ -44,8 +44,14 @@ impl Setup {
     async fn seeded(self) -> Self {
         let log_dir = models::resolve_log_dir(&self.config, &self.database()).unwrap();
         let writer = event_log::open_writer(&log_dir, self.config.log.wal()).unwrap();
-        let log = event_log::shared_log(writer, &log_dir, self.config.log.bloom().unwrap(), None)
-            .unwrap();
+        let log = event_log::shared_log(
+            writer,
+            &log_dir,
+            self.config.log.bloom().unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
         let pending = embedder_fingerprint::verify(
             &self.database(),
             &EmbedderFingerprint::from_config(&self.config),

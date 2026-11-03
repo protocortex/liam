@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex as StdMutex};
 
 use futures_util::{stream, StreamExt};
+use liam_log::crypto::{KeyRegistry, TestMaster};
 use liam_log::dedup::{BloomConfig, HashBloom};
+use liam_log::envelope::{OpeningReader, Sealer};
 use liam_log::event::{
     EdgeRow, LogEvent, LogPayload, NodeRow, TombstoneTable, TombstoneTarget, CURRENT_SCHEMA_VERSION,
 };
@@ -492,6 +494,22 @@ impl Env {
         shared(EventLog::new(Box::new(writer), Arc::new(reader), bloom))
     }
 
+    /// A log over the directory that seals what it appends and opens what it
+    /// reads with `registry`.
+    pub(super) fn sealing_log(&self, registry: &Arc<KeyRegistry>) -> SharedLog {
+        let writer =
+            WalWriter::open_with_system_clock(&self.wal_dir(), ONE_SEGMENT).expect("open wal");
+        let reader = OpeningReader::new(
+            SequentialScanReader::local(&self.wal_dir()).expect("open reader"),
+            Arc::clone(registry),
+        );
+        let bloom = HashBloom::new(BloomConfig::default());
+        shared(
+            EventLog::new(Box::new(writer), Arc::new(reader), bloom)
+                .with_sealer(Sealer::new(Arc::clone(registry))),
+        )
+    }
+
     /// Every record in the log directory, as a rebuild would read it.
     pub(super) async fn records(&self) -> Vec<LogRecord> {
         let reader = SequentialScanReader::local(&self.wal_dir()).expect("open reader");
@@ -525,6 +543,13 @@ impl Env {
             .expect("attach log");
         (graph, log)
     }
+}
+
+/// A key registry in a directory of its own.
+pub(super) fn key_registry() -> (TempDir, Arc<KeyRegistry>) {
+    let dir = TempDir::new().unwrap();
+    let registry = KeyRegistry::open(dir.path(), Arc::new(TestMaster::new(5))).expect("registry");
+    (dir, Arc::new(registry))
 }
 
 pub(super) fn event(event_id: &str, content_hash: [u8; 32], payload: LogPayload) -> LogEvent {

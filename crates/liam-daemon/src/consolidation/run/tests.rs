@@ -326,7 +326,8 @@ impl Env {
             marker_fails: marker_fails.clone(),
             poisoned: writer_poisoned.clone(),
         };
-        let log = event_log::shared_log(writer, &log_dir, BloomConfig::default(), None).unwrap();
+        let log =
+            event_log::shared_log(writer, &log_dir, BloomConfig::default(), None, None).unwrap();
         Self {
             dir,
             log,

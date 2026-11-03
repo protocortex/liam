@@ -153,7 +153,11 @@ pub fn content_hashes(event: &LogEvent) -> Vec<([u8; 32], String)> {
         | LogPayload::AccessBatch { .. }
         | LogPayload::Feedback { .. }
         | LogPayload::TierMove { .. }
-        | LogPayload::Sealed(_) => Vec::new(),
+        | LogPayload::Sealed(_)
+        | LogPayload::KeyDestroyed { .. }
+        | LogPayload::DeletionRecorded { .. }
+        | LogPayload::LineageRemoval { .. }
+        | LogPayload::DeletionCancelled { .. } => Vec::new(),
     }
 }
 

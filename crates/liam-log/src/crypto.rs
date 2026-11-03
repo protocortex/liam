@@ -27,7 +27,7 @@ pub use master::TestMaster;
 pub use master::{
     FileMaster, KeychainItems, KeychainMaster, MasterKeyProvider, MemoryKeychain, Wrapped,
 };
-pub use registry::{KeyLookup, KeyMaterial, KeyRegistry, KeyState};
+pub use registry::{KeyLookup, KeyMaterial, KeyRegistry, KeyState, REGISTRY_FILE};
 
 /// Bytes in a data key, a dedup key, and a master key.
 pub const KEY_LEN: usize = 32;

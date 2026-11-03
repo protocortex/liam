@@ -201,6 +201,7 @@ CREATE TABLE IF NOT EXISTS log_quarantine (
     sql.push_str(&fact_tables());
     sql.push_str(&summary_tables());
     sql.push_str(&tier_tables());
+    sql.push_str(&key_tables());
 
     sql
 }
@@ -351,6 +352,33 @@ CREATE TABLE IF NOT EXISTS summary_tree_state (
     )
 }
 
+/// Which key group seals each logged row, read from the plain row headers of a
+/// sealed record. No foreign keys: a row whose key was destroyed is not in
+/// `nodes`, and a hard-deleted node keeps its entry so the group still resolves
+/// to it. Both tables are derived from the log.
+fn key_tables() -> String {
+    String::from(
+        "
+CREATE TABLE IF NOT EXISTS node_keys (
+  node_id TEXT NOT NULL PRIMARY KEY,
+  key_id  TEXT NOT NULL,
+  source  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS node_keys_by_key ON node_keys (key_id);
+
+CREATE TABLE IF NOT EXISTS derived_keys (
+  row_kind TEXT NOT NULL,
+  row_id   TEXT NOT NULL,
+  key_id   TEXT NOT NULL,
+  PRIMARY KEY (row_kind, row_id)
+);
+
+CREATE INDEX IF NOT EXISTS derived_keys_by_key ON derived_keys (key_id);
+",
+    )
+}
+
 /// What tiering keeps beside a node. `node_lineage` names the line of versions a
 /// node belongs to, so state keyed by it survives a supersession. `node_quant`
 /// holds the binary signature, and the int8 form while the node is hot. Both
@@ -450,7 +478,10 @@ pub(crate) enum Clear {
 /// the assignments, otherwise its fingerprint would vouch for communities that
 /// are no longer there. The backend's vector table goes before all of them, as
 /// `Backend::vector_clear_sql` returns it.
-pub(crate) const DERIVED_TABLES: [(&str, Clear); 30] = [
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 32] = [
+    // No foreign keys, so their place in the order is free.
+    ("node_keys", Clear::Always),
+    ("derived_keys", Clear::Always),
     // No foreign keys link the fact tables, so their order among themselves is free.
     ("fact_sources", Clear::Always),
     ("fact_suppressions", Clear::Always),

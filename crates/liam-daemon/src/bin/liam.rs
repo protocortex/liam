@@ -338,7 +338,8 @@ async fn try_rebuild(
         log_dir.display()
     );
     // The rebuild's filter is sized like the daemon's, so both dedupe alike.
-    let log = event_log::shared_log(writer, &log_dir, config.log.bloom()?, None)?;
+    let keys = event_log::open_key_registry(&log_dir, &config.encryption)?;
+    let log = event_log::shared_log(writer, &log_dir, config.log.bloom()?, None, keys)?;
     let report = replay_log(
         &database,
         config.embedding_dims,
@@ -973,7 +974,7 @@ mod tests {
 
     fn log_at(log_dir: &Path) -> SharedLog {
         let writer = event_log::open_writer(log_dir, REBUILD_WAL).unwrap();
-        event_log::shared_log(writer, log_dir, BloomConfig::default(), None).unwrap()
+        event_log::shared_log(writer, log_dir, BloomConfig::default(), None, None).unwrap()
     }
 
     /// A store written through a real log: two nodes, an edge, and a supersede

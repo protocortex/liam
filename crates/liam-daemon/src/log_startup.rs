@@ -56,11 +56,13 @@ pub async fn open_store_with_log(
         })?;
     tracing::info!(report = ?recovered, "closed log segments recovered");
 
+    let keys = event_log::open_key_registry(log_dir, &config.encryption)?;
     let log = event_log::shared_log(
         writer,
         log_dir,
         config.log.bloom()?,
         Some(shutdown.poison_hook()),
+        keys,
     )?;
     let store = open_store_on_log(store, database_path, log_dir, log.clone(), embedder).await?;
     let compactor = compactor_for(log_dir)?.spawn(closed_segments);
@@ -86,7 +88,8 @@ pub async fn migrate_unlogged_rows(
     );
     let store = open_database_for_log(config, database_path, log_dir).await?;
     let writer = event_log::open_writer(log_dir, config.log.wal())?;
-    let log = event_log::shared_log(writer, log_dir, config.log.bloom()?, None)?;
+    let keys = event_log::open_key_registry(log_dir, &config.encryption)?;
+    let log = event_log::shared_log(writer, log_dir, config.log.bloom()?, None, keys)?;
     let store = store.with_log(log).await.with_context(|| {
         format!(
             "the event log in {} cannot be used with the database {}; the cause is below",
@@ -201,7 +204,8 @@ pub(crate) mod test_support {
     /// the way a store written by an older run of the daemon was logged.
     pub(crate) fn standalone_log(log_dir: &Path) -> SharedLog {
         let writer = event_log::open_writer(log_dir, WAL).expect("open the wal");
-        event_log::shared_log(writer, log_dir, BloomConfig::default(), None).expect("open the log")
+        event_log::shared_log(writer, log_dir, BloomConfig::default(), None, None)
+            .expect("open the log")
     }
 
     /// A log over `writer` and `reader`, which can be made to fail.
@@ -492,6 +496,51 @@ mod tests {
         // Assert
         let events = logged_events(&log_dir_in(dir.path())).await;
         assert_eq!(node_writes(&events), 1);
+    }
+
+    #[tokio::test]
+    async fn a_store_started_with_encryption_logs_sealed_records_and_restarts_over_them() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_in(dir.path());
+        config.encryption = crate::config::EncryptionConfig {
+            master_key: Some(crate::config::MasterKeySource::File),
+            key_file: Some(dir.path().join("master.key").to_str().unwrap().to_owned()),
+        };
+        let first = started(&config, dir.path()).await.expect("start");
+        let id = first
+            .store
+            .insert(NewNode::now("fact", "label", "secret text").with_subject("alice"))
+            .await
+            .expect("insert");
+        drop(first);
+
+        // Act
+        let second = started(&config, dir.path()).await.expect("restart");
+
+        // Assert
+        let events = logged_events(&log_dir_in(dir.path())).await;
+        assert!(matches!(events[0].payload, LogPayload::Sealed(_)));
+        assert!(has_node(&second.store, id.as_str()).await);
+    }
+
+    #[tokio::test]
+    async fn a_log_with_a_key_registry_does_not_start_without_encryption_configured() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_in(dir.path());
+        config.encryption = crate::config::EncryptionConfig {
+            master_key: Some(crate::config::MasterKeySource::File),
+            key_file: Some(dir.path().join("master.key").to_str().unwrap().to_owned()),
+        };
+        drop(started(&config, dir.path()).await.expect("start"));
+
+        // Act
+        let result = started(&config_in(dir.path()), dir.path()).await;
+
+        // Assert
+        let error = result.err().expect("must refuse").to_string();
+        assert!(error.contains("master_key"), "{error}");
     }
 
     #[tokio::test]
@@ -881,6 +930,7 @@ mod tests {
             writer,
             log_dir,
             liam_log::dedup::BloomConfig::default(),
+            None,
             None,
         )
         .unwrap()

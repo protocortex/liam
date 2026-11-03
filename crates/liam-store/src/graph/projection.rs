@@ -131,7 +131,12 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
         | LogPayload::TierMove { .. }
         // The opening reader turns a sealed record into its plain rows before
         // anything projects it.
-        | LogPayload::Sealed(_) => Vec::new(),
+        | LogPayload::Sealed(_)
+        // Records of a delete. Replay only moves the cursor past them.
+        | LogPayload::KeyDestroyed { .. }
+        | LogPayload::DeletionRecorded { .. }
+        | LogPayload::LineageRemoval { .. }
+        | LogPayload::DeletionCancelled { .. } => Vec::new(),
     }
 }
 

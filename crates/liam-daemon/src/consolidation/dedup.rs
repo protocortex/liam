@@ -441,7 +441,7 @@ mod tests {
     fn log_in(dir: &Path) -> SharedLog {
         let log_dir = dir.join("events");
         let writer = event_log::open_writer(&log_dir, WAL).unwrap();
-        event_log::shared_log(writer, &log_dir, BloomConfig::default(), None).unwrap()
+        event_log::shared_log(writer, &log_dir, BloomConfig::default(), None, None).unwrap()
     }
 
     async fn open(dir: &tempfile::TempDir) -> (DefaultGraph, Arc<FixedClock>) {

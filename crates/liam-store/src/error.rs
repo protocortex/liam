@@ -95,6 +95,14 @@ pub enum Error {
     #[error("event log append failed: {0}")]
     LogAppend(#[from] liam_log::wal::WalError),
 
+    /// A write targets a key group that is being deleted or is deleted.
+    #[error("key group {0} is being deleted or is deleted, nothing may be written under it")]
+    KeyGroupLocked(String),
+
+    /// An event could not be sealed, so it was not appended.
+    #[error("event could not be sealed: {0}")]
+    Sealing(String),
+
     /// The blocking task that runs an append panicked or was cancelled, so
     /// whether the record reached the log is unknown.
     #[error("event log append task failed: {0}")]

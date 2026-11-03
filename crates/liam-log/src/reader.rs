@@ -22,6 +22,7 @@ use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 
 use crate::compactor::{read_event_count, read_parquet, CompactError};
+use crate::envelope::RowKeyRef;
 use crate::event::LogEvent;
 use crate::wal::{
     numbered_files, open_segment_sequences, read_segment, segment_paths, WalError,
@@ -38,6 +39,9 @@ pub struct LogRecord {
     /// Key groups whose rows could not be opened because the group was
     /// destroyed. `event` holds the rows that could.
     pub shredded: Vec<KeyId>,
+    /// The headers of the sealed rows `event` was opened from, whether or not
+    /// they could be opened. Empty for a plain event.
+    pub row_keys: Vec<RowKeyRef>,
 }
 
 impl LogRecord {
@@ -46,6 +50,7 @@ impl LogRecord {
             offset,
             event,
             shredded: Vec::new(),
+            row_keys: Vec::new(),
         }
     }
 }
