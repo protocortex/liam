@@ -87,7 +87,7 @@ mod tests {
     use super::*;
     use crate::config::ExtractionConfig;
     use crate::extraction::prompt::PROMPT_VERSION;
-    use crate::extraction::r10::corpus::{CORPUS_SEED, HAS_TITLE, LIVES_IN, WORKS_AT};
+    use crate::extraction::r10::corpus::{CORPUS_SEED, EVENT_COUNT, HAS_TITLE, LIVES_IN, WORKS_AT};
     use liam_daemon::fetch::MODEL_ASSET;
 
     const OTHER_SHA: &str = "ab";
@@ -151,6 +151,19 @@ mod tests {
             }
             None => assert_eq!(gate.min_f1, SANITY_FLOOR_F1),
         }
+    }
+
+    #[test]
+    fn the_ungrounded_ceiling_is_below_the_corpus_size() {
+        // Arrange
+        let Baseline { gate, .. } = Baseline::committed();
+
+        // Assert
+        assert!(
+            gate.max_facts_dropped_ungrounded < EVENT_COUNT,
+            "a ceiling of {} cannot fail a run over {EVENT_COUNT} events",
+            gate.max_facts_dropped_ungrounded
+        );
     }
 
     #[test]

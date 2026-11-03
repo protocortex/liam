@@ -834,6 +834,26 @@ sha256 of each, and prints the two lines to set. `install.sh` runs it when
 `[extraction]` is enabled. Both steps need `curl` and `tar`, which ship with
 macOS. On another platform, point `llama_server_path` at your own build.
 
+### Experimental status and the real-model baseline
+
+Model extraction is experimental. Its quality on the real model has not been
+measured: `crates/liam-daemon/src/extraction/r10/baseline.json` holds
+`"measured": null`, so the only gates in force are an F1 floor of `0.5` and a
+ceiling of `150` facts dropped as ungrounded over the 300-event corpus. The
+rules and plumbing tiers run in CI. The real-model tier does not.
+
+To measure it, run `liam fetch-models`, then, on a machine with enough free
+memory:
+
+```sh
+cargo test -p liam-daemon --features llama real_model -- --ignored --nocapture
+```
+
+The run prints a JSON object with `measured`. Copy it into `baseline.json`, set
+`gate.min_f1` at or below the measured F1 and `gate.max_facts_dropped_ungrounded`
+at or above the measured count, and commit the file in a reviewed change. A new
+prompt version or model needs a new run.
+
 ### The cache and rebuilding
 
 Model answers are cached in `<database>.extraction-cache.jsonl`, mode `0600`,
