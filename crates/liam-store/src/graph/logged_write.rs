@@ -23,7 +23,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use liam_log::crypto::CryptoError;
 use liam_log::dedup::{
-    find_first_write, BloomConfig, HashBloom, HashIndex, IndexedWrite, PreCheck,
+    find_first_write_counted, BloomConfig, BloomCounters, HashBloom, HashIndex, IndexedWrite,
+    PreCheck,
 };
 use liam_log::envelope::{row_keys, KeyHints, RowKeyRef, SealError, Sealer};
 use liam_log::event::{LogEvent, LogPayload};
@@ -303,7 +304,7 @@ impl<B: Backend> Graph<B> {
         let resolved = match prepare(&mut *tx, now).await {
             Ok(plan) => {
                 let bloom_hit = held.might_contain(&plan.event.content_hash);
-                resolve_plan(&mut *tx, plan, bloom_hit).await
+                resolve_plan(&mut *tx, plan, bloom_hit, &self.bloom_counters).await
             }
             Err(error) => Err(error),
         };
@@ -587,7 +588,12 @@ enum Resolved {
 
 /// Checks a plan against the live carrier of its content, which is read in the
 /// same transaction the write commits in.
-async fn resolve_plan(tx: &mut dyn BackendTx, plan: Plan, bloom_hit: bool) -> Result<Resolved> {
+async fn resolve_plan(
+    tx: &mut dyn BackendTx,
+    plan: Plan,
+    bloom_hit: bool,
+    counters: &BloomCounters,
+) -> Result<Resolved> {
     let Plan {
         event,
         steps,
@@ -600,7 +606,7 @@ async fn resolve_plan(tx: &mut dyn BackendTx, plan: Plan, bloom_hit: bool) -> Re
     else {
         return Ok(Resolved::Fresh { event, steps });
     };
-    match live_duplicate(tx, bloom_hit, &event.content_hash, table).await? {
+    match live_duplicate(tx, bloom_hit, &event.content_hash, table, counters).await? {
         Some(first) => {
             let duplicate = LogPayload::DuplicateOf {
                 first_event_id: first.event_id.clone(),
@@ -641,10 +647,11 @@ async fn live_duplicate(
     bloom_hit: bool,
     hash: &[u8; 32],
     table: Table,
+    counters: &BloomCounters,
 ) -> Result<Option<Carrier>> {
     let hit = {
         let mut index = TxHashIndex { tx: &mut *tx };
-        find_first_write(&Seen(bloom_hit), &mut index, hash).await?
+        find_first_write_counted(&Seen(bloom_hit), &mut index, hash, counters).await?
     };
     let Some(IndexedWrite {
         first_event_id,

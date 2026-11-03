@@ -3,8 +3,9 @@
 use super::*;
 use crate::deletion::{DeleteTarget, JobState};
 use crate::metrics::memory::SystemMemory;
-use crate::metrics::sink::{ModelCatalog, Provider};
+use crate::metrics::sink::{ModelCatalog, Provider, TierLabel};
 use liam_daemon::consolidation::probes::ProbeScore;
+use liam_store::TierBytes;
 
 const AT: Millis = Millis(1_000);
 const DAY_MS: i64 = 86_400_000;
@@ -267,4 +268,37 @@ fn the_real_reader_sees_this_process() {
 
     // Assert
     assert!(sample.value > 0.0);
+}
+
+#[test]
+fn the_tier_bytes_carry_a_tier_label_each() {
+    // Act
+    let [hot, cold] = tier_bytes(TierBytes { hot: 40, cold: 8 }, AT);
+
+    // Assert
+    assert_eq!(
+        (hot.labels, hot.value),
+        (Labels::Tier(TierLabel::Hot), 40.0)
+    );
+    assert_eq!(
+        (cold.labels, cold.value),
+        (Labels::Tier(TierLabel::Cold), 8.0)
+    );
+}
+
+#[test]
+fn a_directory_adds_up_every_file_under_it_and_a_missing_one_is_empty() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a"), [0u8; 100]).unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    std::fs::write(dir.path().join("nested").join("b"), [0u8; 23]).unwrap();
+
+    // Act
+    let present = directory_bytes(MetricId::LogBytes, dir.path(), AT).unwrap();
+    let missing = directory_bytes(MetricId::ArchiveBytes, &dir.path().join("gone"), AT).unwrap();
+
+    // Assert
+    assert_eq!(present.value, 123.0);
+    assert_eq!(missing.value, 0.0);
 }

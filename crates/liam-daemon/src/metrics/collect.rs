@@ -4,11 +4,13 @@
 //! an empty window or a zero denominator never reports a made-up zero.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::io;
+use std::path::Path;
 
-use liam_store::Millis;
+use liam_store::{Millis, TierBytes};
 
 use super::memory::ProcessMemory;
-use super::sink::{Labels, MetricId, Sample, Usage};
+use super::sink::{Labels, MetricId, Sample, TierLabel, Usage};
 use crate::deletion::DeleteJob;
 use liam_daemon::consolidation::probes::ProbeReport;
 
@@ -199,6 +201,44 @@ pub fn probe_recall(report: &ProbeReport, at: Millis) -> Option<Sample> {
     }
     let mean = scores.values().map(|score| score.recall).sum::<f64>() / scores.len() as f64;
     Some(sample(MetricId::ProbeRecallAt10, mean, at))
+}
+
+/// The bytes the hot and the cold tier hold.
+pub fn tier_bytes(bytes: TierBytes, at: Millis) -> [Sample; 2] {
+    [(TierLabel::Hot, bytes.hot), (TierLabel::Cold, bytes.cold)].map(|(tier, size)| Sample {
+        metric: MetricId::TierBytes,
+        value: size as f64,
+        labels: Labels::Tier(tier),
+        at,
+    })
+}
+
+/// The size of every file under `dir`, as the sample of `metric`. A directory
+/// that does not exist holds nothing.
+///
+/// # Errors
+///
+/// Fails when a file or directory in the tree cannot be read.
+pub fn directory_bytes(metric: MetricId, dir: &Path, at: Millis) -> io::Result<Sample> {
+    fn walk(dir: &Path) -> io::Result<u64> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut total = 0;
+        for entry in entries {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            total += if meta.is_dir() {
+                walk(&entry.path())?
+            } else {
+                meta.len()
+            };
+        }
+        Ok(total)
+    }
+    Ok(sample(metric, walk(dir)? as f64, at))
 }
 
 /// The resident memory of the daemon and its children together.

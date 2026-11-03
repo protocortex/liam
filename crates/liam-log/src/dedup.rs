@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(any(test, feature = "test-support"))]
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use fastbloom::BloomFilter;
@@ -144,10 +145,50 @@ pub async fn find_first_write<P: PreCheck + ?Sized, I: HashIndex + ?Sized>(
     index: &mut I,
     hash: &[u8; 32],
 ) -> Result<Option<IndexedWrite>, I::Error> {
+    find_first_write_counted(pre_check, index, hash, &BloomCounters::default()).await
+}
+
+/// How often the pre-check was wrong, as far as the exact index shows.
+#[derive(Debug, Default)]
+pub struct BloomCounters {
+    confirmed_false: AtomicU64,
+    true_negatives: AtomicU64,
+}
+
+/// A reading of [`BloomCounters`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BloomStats {
+    /// Hashes the filter passed that the index did not hold.
+    pub confirmed_false: u64,
+    /// Hashes the filter turned away.
+    pub true_negatives: u64,
+}
+
+impl BloomCounters {
+    pub fn stats(&self) -> BloomStats {
+        BloomStats {
+            confirmed_false: self.confirmed_false.load(Ordering::Relaxed),
+            true_negatives: self.true_negatives.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// [`find_first_write`] that also counts the pre-check's misses in `counters`.
+pub async fn find_first_write_counted<P: PreCheck + ?Sized, I: HashIndex + ?Sized>(
+    pre_check: &P,
+    index: &mut I,
+    hash: &[u8; 32],
+    counters: &BloomCounters,
+) -> Result<Option<IndexedWrite>, I::Error> {
     if !pre_check.might_contain(hash) {
+        counters.true_negatives.fetch_add(1, Ordering::Relaxed);
         return Ok(None);
     }
-    index.lookup(hash).await
+    let found = index.lookup(hash).await?;
+    if found.is_none() {
+        counters.confirmed_false.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(found)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -640,6 +681,37 @@ mod tests {
                 "00000000000000100000000000000000000000000000000000",
                 "00000000000100000000000000000000000000000000000000",
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_counters_tell_a_false_positive_from_a_true_negative_and_a_hit() {
+        // Arrange
+        let counters = BloomCounters::default();
+        let mut index = CountingIndex::default();
+        let stored = sample_hash(1);
+        index
+            .stored
+            .push((stored, indexed_write("first", &["row"])));
+
+        // Act
+        find_first_write_counted(&AlwaysFalse, &mut index, &sample_hash(2), &counters)
+            .await
+            .unwrap();
+        find_first_write_counted(&AlwaysTrue, &mut index, &sample_hash(3), &counters)
+            .await
+            .unwrap();
+        find_first_write_counted(&AlwaysTrue, &mut index, &stored, &counters)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(
+            counters.stats(),
+            BloomStats {
+                confirmed_false: 1,
+                true_negatives: 1
+            }
         );
     }
 

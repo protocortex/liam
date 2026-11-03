@@ -10,6 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -123,6 +124,19 @@ pub struct CacheStore {
     state: Mutex<State>,
     ops: FileOps,
     max_entries: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+/// How many lookups the cache answered and how many it could not.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "read by the metrics collection once it is wired")
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
 }
 
 impl CacheStore {
@@ -148,14 +162,36 @@ impl CacheStore {
             }),
             ops,
             max_entries,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         })
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
-        self.lock()
+        let found = self
+            .lock()
             .entries
             .get(key)
-            .map(|entry| entry.response.clone())
+            .map(|entry| entry.response.clone());
+        let counter = if found.is_some() {
+            &self.hits
+        } else {
+            &self.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        found
+    }
+
+    /// The lookups answered and missed since the cache opened.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the metrics collection once it is wired")
+    )]
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
     }
 
     /// Appends the entry and syncs it, replacing any entry under the same key.
@@ -587,6 +623,22 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn lookups_count_as_hits_and_misses() {
+        // Arrange
+        let dir = TempDir::new().unwrap();
+        let store = store_at(&cache_file(&dir));
+        put(&store, "k", "v", &["e1"]);
+
+        // Act
+        store.get("k");
+        store.get("k");
+        store.get("absent");
+
+        // Assert
+        assert_eq!(store.stats(), CacheStats { hits: 2, misses: 1 });
     }
 
     #[test]

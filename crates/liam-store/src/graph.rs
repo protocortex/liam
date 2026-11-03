@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use liam_log::event::{BasisRef, NodeRow};
 use liam_log::LogOffset;
@@ -31,6 +32,7 @@ pub use self::scrub::ScrubReport;
 pub use self::snapshot::{
     recover_interrupted_restore, verify_snapshot, Snapshot, SnapshotLog, SnapshotMeta,
 };
+pub use self::stats::{QueryTimings, TierBytes};
 pub use self::summaries::child_hash;
 pub use self::tiers::{
     dequantize, hamming, quantize, IndexedEntry, QuantIndex, Quantized, BITS_PER_WORD,
@@ -71,6 +73,7 @@ mod row_keys;
 mod run_marker;
 mod scrub;
 mod snapshot;
+mod stats;
 mod summaries;
 mod swept_by;
 mod tiers;
@@ -664,6 +667,8 @@ pub struct Graph<B: Backend> {
     quant_gate: tiers::IndexGate,
     /// Lets one tier move at a time read the lineage it moves and then move it.
     tier_gate: tokio::sync::Mutex<()>,
+    /// How often the dedup filter was wrong, for the metrics.
+    bloom_counters: liam_log::dedup::BloomCounters,
 }
 
 impl<B: Backend> Graph<B> {
@@ -731,6 +736,7 @@ impl<B: Backend> Graph<B> {
             cold_arm: ColdArm::of(&config),
             quant_gate: tiers::IndexGate::default(),
             tier_gate: tokio::sync::Mutex::new(()),
+            bloom_counters: liam_log::dedup::BloomCounters::default(),
         };
         // Lineage first: it is what the index reload joins the tiers through.
         graph.backfill_lineage().await?;
@@ -1017,6 +1023,7 @@ impl<B: Backend> Graph<B> {
         Ok(self
             .query_core(q)
             .await?
+            .0
             .into_iter()
             .map(|e| e.hit)
             .collect())
@@ -1025,6 +1032,11 @@ impl<B: Backend> Graph<B> {
     /// Like `query`, but each result carries the score components that produced
     /// it: lexical rank, vector rank, fused RRF, confidence, decay, expansion.
     pub async fn query_explained(&self, q: &Query) -> Result<Vec<ExplainedHit>> {
+        Ok(self.query_core(q).await?.0)
+    }
+
+    /// Like `query_explained`, with how long each retrieval arm took.
+    pub async fn query_timed(&self, q: &Query) -> Result<(Vec<ExplainedHit>, QueryTimings)> {
         self.query_core(q).await
     }
 
@@ -1074,13 +1086,15 @@ impl<B: Backend> Graph<B> {
         Ok(reordered)
     }
 
-    async fn query_core(&self, q: &Query) -> Result<Vec<ExplainedHit>> {
+    async fn query_core(&self, q: &Query) -> Result<(Vec<ExplainedHit>, QueryTimings)> {
         let now = q.as_of.unwrap_or_else(|| self.clock.now());
         let pool = q.k.max(1) * 3;
         let scope = validate_scope(&q.scope)?;
         let scope = scope.as_deref();
         let kind = q.kind.as_deref();
 
+        let mut timings = QueryTimings::default();
+        let started = Instant::now();
         let lexical = match q.text.as_deref() {
             Some(text) => {
                 let filter = Filter {
@@ -1092,6 +1106,8 @@ impl<B: Backend> Graph<B> {
             }
             None => Vec::new(),
         };
+        timings.lexical = q.text.is_some().then(|| started.elapsed());
+        let started = Instant::now();
         let vector = match q.embedding.as_deref() {
             Some(embedding) => {
                 self.backend
@@ -1100,7 +1116,9 @@ impl<B: Backend> Graph<B> {
             }
             None => Vec::new(),
         };
+        timings.vector = q.embedding.is_some().then(|| started.elapsed());
 
+        let started = Instant::now();
         let cold = match q.embedding.as_deref() {
             Some(embedding) => {
                 let arm = ColdQuery {
@@ -1114,6 +1132,7 @@ impl<B: Backend> Graph<B> {
             }
             None => Vec::new(),
         };
+        timings.cold = q.embedding.is_some().then(|| started.elapsed());
 
         let ranks = Ranks::of(&lexical, &vector, &cold);
         let rrf = rrf_fuse(&lexical, &vector, &cold, self.rrf_k, self.cold_arm.weight);
@@ -1190,7 +1209,7 @@ impl<B: Backend> Graph<B> {
             floor,
             q.k,
         );
-        Ok(out)
+        Ok((out, timings))
     }
 
     pub async fn neighbors(&self, seed: &NodeId, as_of: Millis) -> Result<Vec<NodeId>> {
@@ -2533,6 +2552,7 @@ mod tests {
     mod sealed;
     mod snapshot;
     mod soak;
+    mod stats;
     mod summaries;
     mod summary_log;
     mod support;
