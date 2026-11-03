@@ -21,6 +21,7 @@ pub async fn open_database(config: &Config, database_path: &Path) -> anyhow::Res
     let tiering = &config.tiering;
     let graph = GraphConfig::new(config.embedding_dims)
         .with_read_pool_size(config.read_pool_size)
+        .with_secure_delete(config.deletion.secure_delete)
         .with_cold_arm(
             tiering.cold_arm_weight,
             tiering.cold_max_hamming_ratio,

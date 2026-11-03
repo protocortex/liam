@@ -59,6 +59,9 @@ pub struct GraphConfig {
     pub cold_oversample: usize,
     /// The most cold items the arm contributes to one query.
     pub cold_probe_pool: usize,
+    /// Zero the pages a delete frees, so removed text does not stay in the file.
+    /// It costs a write per freed page.
+    pub secure_delete: bool,
 }
 
 impl GraphConfig {
@@ -72,7 +75,12 @@ impl GraphConfig {
             cold_max_hamming_ratio: 0.35,
             cold_oversample: 4,
             cold_probe_pool: 24,
+            secure_delete: false,
         }
+    }
+    pub fn with_secure_delete(mut self, secure_delete: bool) -> Self {
+        self.secure_delete = secure_delete;
+        self
     }
     /// Sets the cold arm's knobs together, since none means anything alone.
     pub fn with_cold_arm(

@@ -8,12 +8,13 @@
 //! the version you pin.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use libsql::{Builder, Connection, Database};
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::backend::{Backend, BackendTx};
+use crate::backend::{Backend, BackendTx, CheckpointMode, CheckpointResult};
 use crate::error::{Error, Result};
 use crate::graph::scope_within;
 use crate::ids::{Millis, NodeId, FOREVER};
@@ -291,6 +292,47 @@ impl Backend for LibsqlBackend {
     async fn execute_batch(&self, sql: &str) -> Result<()> {
         let conn = self.write.lock().await;
         conn.execute_batch(sql).await.map(|_| ()).map_err(err)
+    }
+
+    async fn wal_checkpoint(
+        &self,
+        mode: CheckpointMode,
+        wait: Duration,
+    ) -> Result<CheckpointResult> {
+        let conn = self.write.lock().await;
+        conn.query(&format!("PRAGMA busy_timeout = {}", wait.as_millis()), ())
+            .await
+            .map_err(err)?;
+        let checkpoint = conn.query(mode.pragma(), ()).await.map_err(err);
+        // The wait is restored whether or not the checkpoint ran.
+        let restored = conn
+            .query(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"), ())
+            .await
+            .map_err(err);
+        let rows = read_rows(checkpoint?).await?;
+        restored?;
+        let row = rows
+            .first()
+            .ok_or_else(|| Error::Backend("wal_checkpoint returned no row".to_owned()))?;
+        Ok(CheckpointResult {
+            busy: row.get_i64(0)? != 0,
+            log_frames: row.get_i64(1)?,
+            checkpointed: row.get_i64(2)?,
+        })
+    }
+
+    async fn set_secure_delete(&self, on: bool) -> Result<bool> {
+        let conn = self.write.lock().await;
+        let set = if on { "ON" } else { "OFF" };
+        conn.query(&format!("PRAGMA secure_delete = {set}"), ())
+            .await
+            .map_err(err)?;
+        let rows = conn.query("PRAGMA secure_delete", ()).await.map_err(err)?;
+        let rows = read_rows(rows).await?;
+        let value = rows
+            .first()
+            .ok_or_else(|| Error::Backend("secure_delete returned no row".to_owned()))?;
+        Ok(value.get_i64(0)? != 0)
     }
 
     async fn execute_atomic(&self, statements: &[(String, Vec<Value>)]) -> Result<()> {

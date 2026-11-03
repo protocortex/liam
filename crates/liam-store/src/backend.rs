@@ -7,6 +7,8 @@
 //! extension), so those are their own methods and each backend owns its dialect
 //! and its physical layout.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 
 use crate::error::Result;
@@ -130,6 +132,21 @@ pub trait Backend: Send + Sync + Sized {
     /// concurrency contract above.
     async fn vector_sweep_orphans(&self) -> Result<u64>;
 
+    /// Write. Checkpoints the write-ahead log on the write connection, because a
+    /// read connection cannot. A reader that still needs the frames makes the
+    /// checkpoint report `busy` rather than fail, after waiting up to `wait`
+    /// for it. Serializes with every other write.
+    async fn wal_checkpoint(
+        &self,
+        mode: CheckpointMode,
+        wait: Duration,
+    ) -> Result<CheckpointResult>;
+
+    /// Write. Turns `secure_delete` on or off for the write connection, so the
+    /// pages a delete frees are zeroed or left as they were, and returns the
+    /// value the connection reports back.
+    async fn set_secure_delete(&self, on: bool) -> Result<bool>;
+
     /// Open a transaction. Write. Serializes with every other write, but
     /// for as long as the returned `BackendTx` stays open, not for one
     /// statement; see the trait's concurrency contract above.
@@ -151,4 +168,37 @@ pub trait BackendTx: Send {
     async fn commit(self: Box<Self>) -> Result<()>;
     /// Consume this transaction, discarding its writes.
     async fn rollback(self: Box<Self>) -> Result<()>;
+}
+
+/// How much of the log a checkpoint must move into the database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointMode {
+    /// As many frames as no reader needs; never waits.
+    Passive,
+    /// Every frame, then empties the log file.
+    Truncate,
+}
+
+impl CheckpointMode {
+    pub fn pragma(self) -> &'static str {
+        match self {
+            CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
+            CheckpointMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE)",
+        }
+    }
+}
+
+/// What a checkpoint reports. It is complete when it was not `busy` and every
+/// frame of the log is in the database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointResult {
+    pub busy: bool,
+    pub log_frames: i64,
+    pub checkpointed: i64,
+}
+
+impl CheckpointResult {
+    pub fn is_complete(&self) -> bool {
+        !self.busy && self.log_frames == self.checkpointed
+    }
 }
