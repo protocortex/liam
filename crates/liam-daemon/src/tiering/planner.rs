@@ -280,6 +280,7 @@ mod tests {
     fn snapshot(items: Vec<ItemView>) -> UsageSnapshot {
         UsageSnapshot {
             now: NOW,
+            producer_usage: Vec::new(),
             observation_since: Some(Millis(NOW.0 - 40 * DAY_MS)),
             items,
         }

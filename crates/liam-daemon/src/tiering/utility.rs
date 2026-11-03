@@ -24,8 +24,15 @@ pub struct TierParams {
     pub min_item_age_days: u32,
     pub max_promotions: usize,
     pub max_demotions: usize,
+    /// Most hits one producer adds to one item in a day.
+    pub hits_per_producer_item_day_cap: u32,
+    /// Most hits one producer adds across items in a day.
+    pub hits_per_producer_day_cap: u32,
     producer_trust: HashMap<String, f64>,
     default_trust: f64,
+    unknown_trust_ceiling: f64,
+    /// The fallback producer, whose trust is bounded by the ceiling.
+    unknown_producer: Option<String>,
 }
 
 impl TierParams {
@@ -44,16 +51,33 @@ impl TierParams {
             min_item_age_days: tiering.min_item_age_days,
             max_promotions: tiering.max_promotions_per_run,
             max_demotions: tiering.max_demotions_per_run,
+            hits_per_producer_item_day_cap: tiering.hits_per_producer_item_day_cap,
+            hits_per_producer_day_cap: tiering.hits_per_producer_day_cap,
             producer_trust: extraction.trust.clone(),
             default_trust: extraction.default_trust,
+            unknown_trust_ceiling: tiering.unknown_trust_ceiling,
+            unknown_producer: None,
         }
     }
 
+    /// Bounds the trust of `producer` (the fallback id of `[producers]`) by
+    /// `unknown_trust_ceiling`, which also bounds the weight of its verdicts.
+    pub fn with_unknown_producer(mut self, producer: &str) -> Self {
+        self.unknown_producer = Some(producer.to_owned());
+        self
+    }
+
     fn trust_of(&self, producer: &str) -> f64 {
-        self.producer_trust
+        let trust = self
+            .producer_trust
             .get(producer)
             .copied()
-            .unwrap_or(self.default_trust)
+            .unwrap_or(self.default_trust);
+        if self.unknown_producer.as_deref() == Some(producer) {
+            trust.min(self.unknown_trust_ceiling)
+        } else {
+            trust
+        }
     }
 }
 
@@ -420,5 +444,42 @@ mod tests {
 
         // Assert
         assert_eq!(score.value, ExtractionConfig::default().default_trust);
+    }
+
+    #[test]
+    fn the_fallback_producer_has_the_ceiling_as_its_trust() {
+        // Arrange
+        let item = ItemView {
+            producer: "unknown".into(),
+            ..used_item()
+        };
+        let ceiling = TieringConfig::default().unknown_trust_ceiling;
+        let params = params(ONLY_TRUST).with_unknown_producer("unknown");
+
+        // Act
+        let score = utility(&item, &params, NOW);
+
+        // Assert
+        assert!(ceiling < ExtractionConfig::default().default_trust);
+        assert_eq!(score.value, ceiling);
+    }
+
+    #[test]
+    fn a_verdict_from_the_fallback_producer_weighs_no_more_than_the_ceiling() {
+        // Arrange: one wrong verdict, from a trusted producer and from the fallback
+        let wrong_by = |producer: &str| ItemView {
+            feedback: vec![verdict(producer, false)],
+            ..used_item()
+        };
+        let mut params = params(ONLY_FEEDBACK).with_unknown_producer("unknown");
+        trusting(&mut params, "unknown", 1.0);
+        trusting(&mut params, "trusted", 1.0);
+
+        // Act
+        let fallback = utility(&wrong_by("unknown"), &params, NOW).value;
+        let trusted = utility(&wrong_by("trusted"), &params, NOW).value;
+
+        // Assert: the lighter wrong verdict pulls the score down less
+        assert!(fallback > trusted, "{fallback} {trusted}");
     }
 }

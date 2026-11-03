@@ -17,6 +17,7 @@ use tokio::time::Instant;
 use tracing::info;
 
 use super::apply::{apply_moves, ApplyDeps, TierReport as AppliedMoves};
+use super::caps::apply_caps;
 use super::planner::{plan, ExemptSet, PinnedSet, RollbackState};
 use super::utility::TierParams;
 use crate::extraction::sidecar::FreeRam;
@@ -24,6 +25,8 @@ use crate::extraction::sidecar::FreeRam;
 pub struct TierHooks {
     pub config: TieringConfig,
     pub extraction: ExtractionConfig,
+    /// The fallback producer id, whose trust `unknown_trust_ceiling` bounds.
+    pub unknown_producer: String,
     pub embedder: Arc<dyn Embedder>,
     /// The generation permits, shared with `ask`, because the embedder shares
     /// the model host with it.
@@ -41,13 +44,15 @@ impl TierHook for TierHooks {
 
         info!(run_id = %ctx.run_id, "tier step: planning");
         let now = self.clock.now();
-        let snapshot = store
+        let mut snapshot = store
             .usage_snapshot(now, i64::from(self.config.window_days))
             .await
             .context("could not read the usage of the items")?;
         let exempt: ExemptSet = store.tier_exempt_lineages().await?;
         let pinned = pinned_lineages(store, &ctx.probed_nodes).await?;
-        let params = TierParams::new(&self.config, &self.extraction);
+        let params = TierParams::new(&self.config, &self.extraction)
+            .with_unknown_producer(&self.unknown_producer);
+        apply_caps(&mut snapshot, &params);
         let tier_plan = plan(
             &snapshot,
             &params,

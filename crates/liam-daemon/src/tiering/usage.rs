@@ -139,14 +139,17 @@ pub struct FlushReport {
 /// Hits per node since the last flush, held in memory. Nothing here touches the
 /// store, so a request pays a lock and a map update.
 pub struct UsageRecorder {
-    counts: Mutex<BoundedMap<NodeId, Counted>>,
+    counts: Mutex<BoundedMap<CountKey, Counted>>,
 }
 
-fn counted_among(counts: &BoundedMap<NodeId, Counted>, nodes: &HashSet<String>) -> Vec<NodeId> {
+/// What a count is kept for: a node, and the producer whose read it was.
+type CountKey = (NodeId, String);
+
+fn counted_among(counts: &BoundedMap<CountKey, Counted>, nodes: &HashSet<String>) -> Vec<CountKey> {
     counts
         .iter()
-        .filter(|(node, _)| nodes.contains(node.as_str()))
-        .map(|(node, _)| node.clone())
+        .filter(|((node, _), _)| nodes.contains(node.as_str()))
+        .map(|(key, _)| key.clone())
         .collect()
 }
 
@@ -157,22 +160,28 @@ impl UsageRecorder {
         }
     }
 
-    fn counts(&self) -> MutexGuard<'_, BoundedMap<NodeId, Counted>> {
+    fn counts(&self) -> MutexGuard<'_, BoundedMap<CountKey, Counted>> {
         // A panic while counting leaves a count at worst a hit off.
         self.counts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Counts one hit on each of `nodes` at `at`.
-    pub fn record<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>, at: Millis) {
+    /// Counts one hit by `producer` on each of `nodes` at `at`.
+    pub fn record<'a>(
+        &self,
+        producer: &str,
+        nodes: impl IntoIterator<Item = &'a NodeId>,
+        at: Millis,
+    ) {
         let mut counts = self.counts();
         for node in nodes {
-            match counts.get_mut(node) {
+            let key = (node.clone(), producer.to_owned());
+            match counts.get_mut(&key) {
                 Some(counted) => {
                     counted.hits = counted.hits.saturating_add(1);
                     counted.last_access_at = counted.last_access_at.max(at);
                 }
                 None => counts.insert(
-                    node.clone(),
+                    key,
                     Counted {
                         hits: 1,
                         last_access_at: at,
@@ -182,23 +191,28 @@ impl UsageRecorder {
         }
     }
 
-    /// Drops the counts of `nodes` and returns how many nodes had one.
+    /// Drops the counts of `nodes`, whoever read them, and returns how many
+    /// nodes had one.
     pub fn forget(&self, nodes: &HashSet<String>) -> usize {
         let mut counts = self.counts();
         let held = counted_among(&counts, nodes);
-        for id in &held {
-            counts.remove(id);
+        for key in &held {
+            counts.remove(key);
         }
-        held.len()
+        held.iter()
+            .map(|(node, _)| node)
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     /// The ids among `nodes` that have a count waiting for a flush, sorted.
     pub fn holds(&self, nodes: &HashSet<String>) -> Vec<String> {
         let mut held: Vec<String> = counted_among(&self.counts(), nodes)
             .iter()
-            .map(|id| id.as_str().to_owned())
+            .map(|(id, _)| id.as_str().to_owned())
             .collect();
         held.sort();
+        held.dedup();
         held
     }
 
@@ -207,19 +221,20 @@ impl UsageRecorder {
         self.counts().dropped()
     }
 
-    /// Every counted node with its hits, by id, for tests.
+    /// Every counted node with its hits, summed over producers, by id, for
+    /// tests.
     #[cfg(test)]
     pub fn hits(&self) -> Vec<(NodeId, u32)> {
-        let mut hits: Vec<_> = self
-            .pending()
-            .into_iter()
-            .map(|(node, counted)| (node, counted.hits))
-            .collect();
-        hits.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-        hits
+        let mut hits: BTreeMap<String, u32> = BTreeMap::new();
+        for ((node, _), counted) in self.pending() {
+            *hits.entry(node.as_str().to_owned()).or_default() += counted.hits;
+        }
+        hits.into_iter()
+            .map(|(node, hits)| (NodeId::from_raw(node), hits))
+            .collect()
     }
 
-    fn pending(&self) -> Vec<(NodeId, Counted)> {
+    fn pending(&self) -> Vec<(CountKey, Counted)> {
         self.counts()
             .iter()
             .map(|(node, counted)| (node.clone(), *counted))
@@ -228,20 +243,20 @@ impl UsageRecorder {
 
     /// What a flush wrote is taken off the counts, and what a read added while
     /// it ran is kept, so no hit is lost or counted twice.
-    fn settle(&self, written: &[(NodeId, Counted)]) {
+    fn settle(&self, written: &[(CountKey, Counted)]) {
         let mut counts = self.counts();
-        for (node, counted) in written {
-            let Some(current) = counts.get_mut(node) else {
+        for (key, counted) in written {
+            let Some(current) = counts.get_mut(key) else {
                 continue;
             };
             current.hits = current.hits.saturating_sub(counted.hits);
             if current.hits == 0 {
-                counts.remove(node);
+                counts.remove(key);
             }
         }
     }
 
-    /// Appends the counts, grouped by lineage, as one batch for the day of
+    /// Appends the counts, grouped by lineage and producer, as one batch for the day of
     /// `now`. Nothing is written when nothing was counted. On failure the
     /// counts stay for the next flush.
     pub async fn flush(
@@ -253,24 +268,27 @@ impl UsageRecorder {
         if pending.is_empty() {
             return Ok(FlushReport::default());
         }
-        let mut grouped: BTreeMap<LineageKey, Counted> = BTreeMap::new();
+        let mut grouped: BTreeMap<(LineageKey, String), Counted> = BTreeMap::new();
         let mut unresolved = 0;
-        for (node, counted) in &pending {
+        for ((node, producer), counted) in &pending {
             let Some(lineage) = sink.lineage_of(node).await? else {
                 unresolved += 1;
                 continue;
             };
-            let total = grouped.entry(lineage).or_insert(Counted {
-                hits: 0,
-                last_access_at: counted.last_access_at,
-            });
+            let total = grouped
+                .entry((lineage, producer.clone()))
+                .or_insert(Counted {
+                    hits: 0,
+                    last_access_at: counted.last_access_at,
+                });
             total.hits = total.hits.saturating_add(counted.hits);
             total.last_access_at = total.last_access_at.max(counted.last_access_at);
         }
         let entries: Vec<UsageEntry> = grouped
             .into_iter()
-            .map(|(lineage_key, counted)| UsageEntry {
+            .map(|((lineage_key, producer), counted)| UsageEntry {
                 lineage_key,
+                producer,
                 hits: counted.hits,
                 last_access_at: counted.last_access_at,
             })
@@ -396,6 +414,7 @@ mod tests {
     use super::super::test_support::logged_store;
     use super::*;
 
+    const PRODUCER: &str = "agent-a";
     const AT: Millis = Millis(5 * 86_400_000);
     const DIMS: usize = 8;
 
@@ -513,11 +532,49 @@ mod tests {
         let (a, b, c) = (id("a"), id("b"), id("c"));
 
         // Act
-        recorder.record([&a, &b, &c], AT);
+        recorder.record(PRODUCER, [&a, &b, &c], AT);
 
         // Assert
         assert_eq!(recorder.dropped(), 1);
         assert_eq!(recorder.pending().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_flush_keeps_each_producers_hits_on_a_lineage_apart() {
+        // Arrange
+        let sink = StubSink::knowing(&[("n1", "L1")]);
+        let recorder = UsageRecorder::new(10);
+        let n1 = id("n1");
+        recorder.record("p1", [&n1, &n1], AT);
+        recorder.record("p2", [&n1], AT);
+
+        // Act
+        recorder.flush(&sink, AT).await.unwrap();
+
+        // Assert
+        let written: Vec<_> = sink
+            .batches()
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .map(|entry| (entry.producer, entry.hits))
+            .collect();
+        assert_eq!(written, [("p1".to_owned(), 2), ("p2".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn forgetting_a_node_drops_what_every_producer_counted_on_it() {
+        // Arrange
+        let recorder = UsageRecorder::new(10);
+        let n1 = id("n1");
+        recorder.record("p1", [&n1], AT);
+        recorder.record("p2", [&n1], AT);
+
+        // Act
+        let forgotten = recorder.forget(&HashSet::from(["n1".to_owned()]));
+
+        // Assert
+        assert_eq!(forgotten, 1);
+        assert!(recorder.hits().is_empty());
     }
 
     #[tokio::test]
@@ -526,9 +583,9 @@ mod tests {
         let sink = StubSink::knowing(&[("n1", "L1"), ("n2", "L1"), ("n3", "L2")]);
         let recorder = UsageRecorder::new(10);
         let (n1, n2, n3) = (id("n1"), id("n2"), id("n3"));
-        recorder.record([&n1, &n2, &n3], Millis(AT.0 + 10));
-        recorder.record([&n1], Millis(AT.0 + 30));
-        recorder.record([&n2], Millis(AT.0 + 20));
+        recorder.record(PRODUCER, [&n1, &n2, &n3], Millis(AT.0 + 10));
+        recorder.record(PRODUCER, [&n1], Millis(AT.0 + 30));
+        recorder.record(PRODUCER, [&n2], Millis(AT.0 + 20));
 
         // Act
         let report = recorder.flush(&sink, AT).await.unwrap();
@@ -536,6 +593,7 @@ mod tests {
         // Assert
         let entry = |key: &str, hits: u32, at: i64| UsageEntry {
             lineage_key: LineageKey::from_raw(key),
+            producer: PRODUCER.to_owned(),
             hits,
             last_access_at: Millis(AT.0 + at),
         };
@@ -564,9 +622,9 @@ mod tests {
         let n1 = id("n1");
 
         // Act
-        recorder.record([&n1], AT);
+        recorder.record(PRODUCER, [&n1], AT);
         recorder.flush(&sink, AT).await.unwrap();
-        recorder.record([&n1], AT);
+        recorder.record(PRODUCER, [&n1], AT);
         recorder.flush(&sink, AT).await.unwrap();
 
         // Assert
@@ -594,7 +652,7 @@ mod tests {
         let sink = StubSink::knowing(&[("n1", "L1")]);
         let recorder = UsageRecorder::new(10);
         let (n1, gone) = (id("n1"), id("gone"));
-        recorder.record([&n1, &gone], AT);
+        recorder.record(PRODUCER, [&n1, &gone], AT);
 
         // Act
         let report = recorder.flush(&sink, AT).await.unwrap();
@@ -616,12 +674,12 @@ mod tests {
         let sink = StubSink::knowing(&[("n1", "L1")]);
         let recorder = UsageRecorder::new(10);
         let n1 = id("n1");
-        recorder.record([&n1, &n1], AT);
+        recorder.record(PRODUCER, [&n1, &n1], AT);
         sink.failing.store(true, Ordering::SeqCst);
 
         // Act
         let failed = recorder.flush(&sink, AT).await;
-        recorder.record([&n1], AT);
+        recorder.record(PRODUCER, [&n1], AT);
         sink.failing.store(false, Ordering::SeqCst);
         let retried = recorder.flush(&sink, AT).await;
 
@@ -646,7 +704,7 @@ mod tests {
                     let n1 = id("n1");
                     barrier.wait().await;
                     for _ in 0..HITS_EACH {
-                        recorder.record([&n1], AT);
+                        recorder.record(PRODUCER, [&n1], AT);
                         tokio::task::yield_now().await;
                     }
                 })
@@ -690,9 +748,9 @@ mod tests {
         let recorder = UsageRecorder::new(10);
 
         // Act
-        recorder.record([&first, &second], AT);
+        recorder.record(PRODUCER, [&first, &second], AT);
         let report = recorder.flush(&store, AT).await.unwrap();
-        recorder.record([&second], AT);
+        recorder.record(PRODUCER, [&second], AT);
         recorder.flush(&store, AT).await.unwrap();
 
         // Assert
@@ -722,10 +780,10 @@ mod tests {
         // Act
         tokio::time::sleep(Duration::from_secs(1)).await;
         let after_start = sink.batches();
-        recorder.record([&n1], AT);
+        recorder.record(PRODUCER, [&n1], AT);
         tokio::time::sleep(period).await;
         let after_period = sink.batches();
-        recorder.record([&n1], AT);
+        recorder.record(PRODUCER, [&n1], AT);
         stop.cancel();
         task.await.unwrap();
 
@@ -778,7 +836,7 @@ mod tests {
             Duration::from_secs(3600),
         ));
         tokio::time::sleep(Duration::from_secs(1)).await;
-        recorder.record([&id("n1")], AT);
+        recorder.record(PRODUCER, [&id("n1")], AT);
 
         // Act
         flush.stop(Duration::from_secs(2)).await;

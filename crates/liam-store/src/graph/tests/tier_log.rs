@@ -37,6 +37,7 @@ fn move_to(lineage: &LineageKey, to: Tier, at: i64, residency: Option<i64>) -> T
 fn usage(lineage: &LineageKey, hits: u32, at: i64) -> UsageEntry {
     UsageEntry {
         lineage_key: lineage.clone(),
+        producer: String::new(),
         hits,
         last_access_at: Millis(at),
     }
@@ -168,6 +169,34 @@ async fn state_written_through_the_log_is_rebuilt_identically_and_only_hot_linea
         .snapshot()
         .iter()
         .any(|(id, cold, _)| id == a.as_str() && *cold));
+}
+
+#[tokio::test]
+async fn each_producers_hits_come_back_under_that_producer_after_a_rebuild() {
+    // Arrange
+    let live = live().await;
+    let key = LineageKey::from_raw("n:1:a");
+    let by = |producer: &str, hits| UsageEntry {
+        producer: producer.to_owned(),
+        ..usage(&key, hits, 5)
+    };
+    live.graph
+        .put_usage_logged(19_000, &[by("p1", 3), by("p2", 4), by("", 1)])
+        .await
+        .unwrap();
+    let before = state(&live.graph).await;
+
+    // Act
+    let graph = rebuilt(live).await;
+
+    // Assert
+    assert_eq!(state(&graph).await, before);
+    let producers = column(
+        &graph,
+        "SELECT producer FROM item_usage_events ORDER BY producer",
+    )
+    .await;
+    assert_eq!(producers, ["", "p1", "p2"]);
 }
 
 #[tokio::test]

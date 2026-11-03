@@ -38,8 +38,8 @@ pub use types::{
     EndOutcome, EventRef, EventRole, ExplainedHit, ExtractorName, Fact, FeedbackEvent, Fingerprint,
     GcReport, GraphConfig, Grounding, Hit, InferredHit, InferredText, ItemView, LineageHits,
     LineageKey, LineageNode, LineageTarget, MatchMode, NewEdge, NewFact, NewNode, NewSummary,
-    NodeText, OriginClaim, OriginVerdict, PredicateSpec, PurgeReport, PutOutcome, Query,
-    ReconcileReport, RecordedHit, RecordedText, Residual, RetentionPolicy, RetentionRule,
+    NodeText, OriginClaim, OriginVerdict, PredicateSpec, ProducerUsage, PurgeReport, PutOutcome,
+    Query, ReconcileReport, RecordedHit, RecordedText, Residual, RetentionPolicy, RetentionRule,
     RetractOutcome, Retrieved, Summary, SummaryChild, SummaryEntry, SummaryFailure, SummaryInput,
     SummaryInputs, Tier, TierMove, TreeState, UsageEntry, UsageSnapshot, Vocabulary,
 };

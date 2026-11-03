@@ -712,6 +712,7 @@ impl<B: Backend> Graph<B> {
         // only grants a fresh one, by rebuilding the referencing tables
         // (ADR-0003). Detects and no-ops on a database that already has it.
         crate::migrate::ensure_cascade(&backend).await?;
+        crate::migrate::ensure_usage_key(&backend).await?;
         crate::migrate::add_backfill_node_rowid_cursor(&backend).await?;
         // Trims whitespace from any scope value stored before `validate_scope`
         // existed, so it still matches a scope-filtered query under the new

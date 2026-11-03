@@ -440,15 +440,18 @@ CREATE TABLE IF NOT EXISTS item_tier (
   last_event_id   TEXT
 );
 
--- One row per logged usage batch and lineage, so a replay is idempotent by
--- event. day is days since the epoch.
+-- One row per logged usage batch, lineage and producer, so a replay is
+-- idempotent by event and a producer's hits can be capped on their own. day is
+-- days since the epoch. A row written before the producer was kept has ''.
+-- A database that has the older key is rebuilt by `migrate::ensure_usage_key`.
 CREATE TABLE IF NOT EXISTS item_usage_events (
   event_id       TEXT    NOT NULL,
   lineage_key    TEXT    NOT NULL,
+  producer       TEXT    NOT NULL DEFAULT '',
   day            INTEGER NOT NULL,
   hits           INTEGER NOT NULL,
   last_access_at INTEGER NOT NULL,
-  PRIMARY KEY (event_id, lineage_key)
+  PRIMARY KEY (event_id, lineage_key, producer)
 );
 
 CREATE INDEX IF NOT EXISTS item_usage_by_lineage ON item_usage_events (lineage_key);

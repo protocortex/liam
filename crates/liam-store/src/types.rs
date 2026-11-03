@@ -193,6 +193,9 @@ pub struct TierMove {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsageEntry {
     pub lineage_key: LineageKey,
+    /// Who the hits are credited to. Empty for hits logged before the producer
+    /// was kept.
+    pub producer: String,
     pub hits: u32,
     pub last_access_at: Millis,
 }
@@ -237,10 +240,22 @@ pub struct ItemView {
     pub producer: String,
 }
 
+/// The hits one producer got on one lineage in one day, inside the window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProducerUsage {
+    pub lineage_key: LineageKey,
+    pub producer: String,
+    pub day: i64,
+    pub hits: i64,
+}
+
 /// A consistent read of usage, feedback and tiers, taken once per run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageSnapshot {
     pub now: Millis,
+    /// The window's hits by producer, ordered by lineage key, producer, day.
+    /// `ItemView::hits_by_day` is their sum with no cap applied.
+    pub producer_usage: Vec<ProducerUsage>,
     /// The start of the day of the earliest logged usage batch, `None` before
     /// the first.
     pub observation_since: Option<Millis>,

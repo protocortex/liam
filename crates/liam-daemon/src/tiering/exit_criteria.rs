@@ -239,6 +239,7 @@ async fn tiers_of(fixture: &Fixture, lineages: &[&LineageKey]) -> Vec<Tier> {
 
 async fn hit(fixture: &Fixture, lineage: &LineageKey, hits: u32, at: Millis) {
     let entry = UsageEntry {
+        producer: String::new(),
         lineage_key: lineage.clone(),
         hits,
         last_access_at: at,
@@ -310,6 +311,7 @@ async fn a_new_version_of_a_cold_item_shares_its_lineage_keeps_its_history_and_i
     let (old_id, lineage) = add(&fixture, "fact", TARGET_PATTERN).await;
     demote(&fixture, &lineage).await;
     let entry = UsageEntry {
+        producer: String::new(),
         lineage_key: lineage.clone(),
         hits: 3,
         last_access_at: START,

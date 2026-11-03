@@ -71,6 +71,7 @@ fn tier_hooks(clock: &Arc<FixedClock>) -> ConsolidationHookSet {
         tiering: Some(Arc::new(TierHooks {
             config: config_on(),
             extraction: ExtractionConfig::default(),
+            unknown_producer: "unknown".to_owned(),
             embedder: Arc::new(ScriptedEmbedder::new(DIMS, &[])),
             permits: Arc::new(Semaphore::new(1)),
             free_ram: Arc::new(SystemRam),

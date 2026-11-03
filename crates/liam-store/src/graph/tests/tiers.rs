@@ -455,6 +455,7 @@ fn signed_zero() -> Vec<f32> {
 fn usage(lineage: &LineageKey, hits: u32, at: i64) -> UsageEntry {
     UsageEntry {
         lineage_key: lineage.clone(),
+        producer: String::new(),
         hits,
         last_access_at: Millis(at),
     }
@@ -478,6 +479,133 @@ async fn a_usage_batch_applied_twice_leaves_one_set_of_rows_and_an_empty_one_lea
     // Assert
     assert_eq!(count(&g, "item_usage_events").await, 1);
     assert_eq!(count(&g, "usage_epochs").await, 2);
+}
+
+fn usage_by(producer: &str, lineage: &LineageKey, hits: u32) -> UsageEntry {
+    UsageEntry {
+        producer: producer.to_owned(),
+        ..usage(lineage, hits, 5)
+    }
+}
+
+#[tokio::test]
+async fn two_producers_on_one_lineage_in_one_batch_each_keep_their_row() {
+    // Arrange
+    let g = open_at(Millis(1000)).await;
+    let a = key("n:1:a");
+
+    // Act
+    g.apply_usage(
+        "event-1",
+        10,
+        &[usage_by("p1", &a, 3), usage_by("p2", &a, 4)],
+    )
+    .await
+    .unwrap();
+
+    // Assert
+    assert_eq!(count(&g, "item_usage_events").await, 2);
+}
+
+#[tokio::test]
+async fn a_logged_usage_batch_is_written_per_producer_and_replays_to_the_same_rows() {
+    // Arrange
+    let g = open_at(Millis(1000)).await;
+    let a = key("n:1:a");
+    let entries = [
+        usage_by("p1", &a, 3),
+        usage_by("p2", &a, 4),
+        usage_by("", &a, 1),
+    ];
+
+    // Act
+    g.put_usage_logged(10, &entries).await.unwrap();
+    let rows = rows_of(
+        &g,
+        "SELECT producer, hits FROM item_usage_events ORDER BY producer",
+    )
+    .await;
+
+    // Assert
+    assert_eq!(
+        rows,
+        [
+            ("".to_owned(), 1),
+            ("p1".to_owned(), 3),
+            ("p2".to_owned(), 4)
+        ]
+    );
+}
+
+async fn rows_of<B: Backend>(g: &Graph<B>, sql: &str) -> Vec<(String, i64)> {
+    g.backend
+        .query(sql, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get_string(0).unwrap(), row.get_i64(1).unwrap()))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_snapshot_lists_the_window_hits_of_each_producer() {
+    // Arrange
+    let g = open_at(Millis(100 * DAY)).await;
+    let id = g.insert(subject_node("n", 1)).await.unwrap();
+    let lineage = g.lineage_of(&id).await.unwrap().unwrap();
+    g.apply_usage(
+        "e1",
+        98,
+        &[usage_by("p1", &lineage, 3), usage_by("p2", &lineage, 4)],
+    )
+    .await
+    .unwrap();
+    g.apply_usage("e2", 99, &[usage_by("p1", &lineage, 2)])
+        .await
+        .unwrap();
+
+    // Act
+    let snapshot = g.usage_snapshot(Millis(100 * DAY), 30).await.unwrap();
+
+    // Assert
+    let seen: Vec<_> = snapshot
+        .producer_usage
+        .iter()
+        .map(|row| (row.producer.as_str(), row.day, row.hits))
+        .collect();
+    assert_eq!(seen, [("p1", 98, 3), ("p1", 99, 2), ("p2", 98, 4)]);
+    assert_eq!(snapshot.items[0].hits_by_day, [(98, 7), (99, 2)]);
+}
+
+#[tokio::test]
+async fn a_table_with_the_old_key_is_rebuilt_once_and_its_rows_count_under_no_producer() {
+    // Arrange
+    let g = open_at(Millis(1000)).await;
+    for sql in [
+        "DROP TABLE item_usage_events",
+        "CREATE TABLE item_usage_events (event_id TEXT NOT NULL, lineage_key TEXT NOT NULL,
+           day INTEGER NOT NULL, hits INTEGER NOT NULL, last_access_at INTEGER NOT NULL,
+           PRIMARY KEY (event_id, lineage_key))",
+        "INSERT INTO item_usage_events VALUES ('e1', 'n:1:a', 10, 3, 5)",
+    ] {
+        g.backend.execute(sql, &[]).await.unwrap();
+    }
+
+    // Act
+    crate::migrate::ensure_usage_key(&g.backend).await.unwrap();
+    crate::migrate::ensure_usage_key(&g.backend).await.unwrap();
+
+    // Assert
+    let rows = rows_of(&g, "SELECT producer, hits FROM item_usage_events").await;
+    assert_eq!(rows, [("".to_owned(), 3)]);
+    g.apply_usage("e1", 10, &[usage_by("p1", &key("n:1:a"), 2)])
+        .await
+        .unwrap();
+    assert_eq!(
+        count(&g, "item_usage_events").await,
+        2,
+        "the key has the producer"
+    );
 }
 
 #[tokio::test]

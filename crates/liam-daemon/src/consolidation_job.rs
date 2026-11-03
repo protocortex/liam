@@ -97,6 +97,7 @@ fn tiering_hook(setup: &JobSetup<'_>) -> Option<Arc<dyn TierHook>> {
         Arc::new(TierHooks {
             config: config.clone(),
             extraction: setup.config.extraction.clone(),
+            unknown_producer: setup.config.producers.unknown_id.clone(),
             embedder: setup.embedder.clone(),
             permits: setup.server.generation_permits_handle(),
             free_ram: Arc::new(SystemRam),

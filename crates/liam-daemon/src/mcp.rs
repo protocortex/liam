@@ -785,7 +785,7 @@ impl MemoryServer {
     /// Neighbours pulled in beside a result are not credited.
     fn record_usage<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
         if let Some(recorder) = &self.usage {
-            recorder.record(nodes, Millis::now());
+            recorder.record(&self.producer(), nodes, Millis::now());
         }
     }
 

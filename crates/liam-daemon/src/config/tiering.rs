@@ -14,6 +14,9 @@ const DEFAULT_FEEDBACK_WEIGHT: f64 = 0.2;
 const DEFAULT_TRUST_WEIGHT: f64 = 0.1;
 const DEFAULT_TAU_DAYS: f64 = 30.0;
 const DEFAULT_HITS_CAP: u32 = 20;
+const DEFAULT_HITS_PER_PRODUCER_ITEM_DAY_CAP: u32 = 10;
+const DEFAULT_HITS_PER_PRODUCER_DAY_CAP: u32 = 100;
+const DEFAULT_UNKNOWN_TRUST_CEILING: f64 = 0.3;
 const DEFAULT_PROMOTE_THRESHOLD: f64 = 0.5;
 const DEFAULT_DEMOTE_THRESHOLD: f64 = 0.15;
 const DEFAULT_MIN_RESIDENCY_DAYS: u32 = 7;
@@ -51,6 +54,14 @@ pub struct TieringConfig {
     pub tau_days: f64,
     /// Hits in the window at which the hits term reaches 1.
     pub hits_cap: u32,
+    /// Most hits one producer can add to one item in a day.
+    pub hits_per_producer_item_day_cap: u32,
+    /// Most hits one producer can add across all items in a day. Past it the
+    /// largest contributions are cut first.
+    pub hits_per_producer_day_cap: u32,
+    /// The most trust the fallback producer (`producers.unknown_id`) can have,
+    /// as an author and as a giver of verdicts.
+    pub unknown_trust_ceiling: f64,
     /// Utility at or above which a cold item is promoted.
     pub promote_threshold: f64,
     /// Utility below which a hot item is demoted.
@@ -99,6 +110,9 @@ impl Default for TieringConfig {
             w4: DEFAULT_TRUST_WEIGHT,
             tau_days: DEFAULT_TAU_DAYS,
             hits_cap: DEFAULT_HITS_CAP,
+            hits_per_producer_item_day_cap: DEFAULT_HITS_PER_PRODUCER_ITEM_DAY_CAP,
+            hits_per_producer_day_cap: DEFAULT_HITS_PER_PRODUCER_DAY_CAP,
+            unknown_trust_ceiling: DEFAULT_UNKNOWN_TRUST_CEILING,
             promote_threshold: DEFAULT_PROMOTE_THRESHOLD,
             demote_threshold: DEFAULT_DEMOTE_THRESHOLD,
             min_residency_days: DEFAULT_MIN_RESIDENCY_DAYS,
@@ -163,10 +177,23 @@ impl TieringConfig {
                 "tiering.{key} must be above 0 and at most 1, got {value}"
             );
         }
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.unknown_trust_ceiling),
+            "tiering.unknown_trust_ceiling must be between 0 and 1, got {}",
+            self.unknown_trust_ceiling
+        );
         ensure_non_negative("feedback_prior_correct", self.feedback_prior_correct)?;
         ensure_non_negative("feedback_prior_incorrect", self.feedback_prior_incorrect)?;
         for (key, value) in [
             ("hits_cap", u64::from(self.hits_cap)),
+            (
+                "hits_per_producer_item_day_cap",
+                u64::from(self.hits_per_producer_item_day_cap),
+            ),
+            (
+                "hits_per_producer_day_cap",
+                u64::from(self.hits_per_producer_day_cap),
+            ),
             ("window_days", u64::from(self.window_days)),
             ("usage_flush_secs", self.usage_flush_secs),
             ("max_tracked_items", self.max_tracked_items as u64),
@@ -282,6 +309,22 @@ mod tests {
                 "tiering.feedback_prior_incorrect",
             ),
             ("hits_cap = 0", "tiering.hits_cap"),
+            (
+                "hits_per_producer_item_day_cap = 0",
+                "tiering.hits_per_producer_item_day_cap",
+            ),
+            (
+                "hits_per_producer_day_cap = 0",
+                "tiering.hits_per_producer_day_cap",
+            ),
+            (
+                "unknown_trust_ceiling = 1.5",
+                "tiering.unknown_trust_ceiling",
+            ),
+            (
+                "unknown_trust_ceiling = nan",
+                "tiering.unknown_trust_ceiling",
+            ),
             ("window_days = 0", "tiering.window_days"),
             ("usage_flush_secs = 0", "tiering.usage_flush_secs"),
             ("max_tracked_items = 0", "tiering.max_tracked_items"),

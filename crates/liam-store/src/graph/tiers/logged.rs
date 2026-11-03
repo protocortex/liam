@@ -3,19 +3,35 @@
 //! applied, as every other write is, so a rebuild from the log restores usage,
 //! verdicts and tiers.
 
+use std::collections::BTreeMap;
+
 use crate::backend::Backend;
 use crate::error::Result;
 use crate::graph::logged_plan::Plan;
 use crate::graph::logged_write::ready;
 use crate::graph::Graph;
+
 use crate::types::{LineageKey, TierMove, UsageEntry};
 
 impl<B: Backend> Graph<B> {
-    /// Logs and applies one batch of counted accesses. An empty batch is still
-    /// written, because its epoch marks when counting began.
+    /// Logs and applies counted accesses, one batch per producer, each written
+    /// under its producer as the event source. An empty list is still written
+    /// as one batch, because its epoch marks when counting began.
     pub async fn put_usage_logged(&self, day: i64, entries: &[UsageEntry]) -> Result<()> {
-        self.project(|_, now| ready(Ok(Plan::usage(day, entries, now))))
-            .await?;
+        let mut by_producer: BTreeMap<&str, Vec<UsageEntry>> = BTreeMap::new();
+        for entry in entries {
+            by_producer
+                .entry(entry.producer.as_str())
+                .or_default()
+                .push(entry.clone());
+        }
+        if by_producer.is_empty() {
+            by_producer.insert("", Vec::new());
+        }
+        for (producer, batch) in &by_producer {
+            self.project(|_, now| ready(Ok(Plan::usage(day, producer, batch, now))))
+                .await?;
+        }
         Ok(())
     }
 

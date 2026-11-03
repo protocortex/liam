@@ -562,7 +562,8 @@ verdicts. A new version is written hot.
 The utility of an item is the weighted mean of four terms, each from 0 to 1:
 
 - recent hits, `log(1 + hits) / log(1 + hits_cap)` over the last `window_days`,
-  weight `w1`;
+  weight `w1`. Each producer's hits are capped first, per item per day and in
+  total per day, so one client cannot keep an item hot alone;
 - recency, `exp(-days / tau_days)` since the item was last returned (or written,
   if it never was), weight `w2`;
 - answer contribution, the share of recent verdicts on the item that said it was
@@ -623,6 +624,9 @@ Keys, all under `[tiering]` in `liam.toml`:
 | `w4` | `0.1` | Weight of the producer trust term. |
 | `tau_days` | `30.0` | Days over which the recency term falls to 1/e. |
 | `hits_cap` | `20` | Hits in the window at which the hits term reaches 1. |
+| `hits_per_producer_item_day_cap` | `10` | Most hits one producer adds to one item in a day. |
+| `hits_per_producer_day_cap` | `100` | Most hits one producer adds across items in a day; past it the largest contributions are cut first. |
+| `unknown_trust_ceiling` | `0.3` | Most trust the fallback producer (`producers.unknown_id`) can have, as an author and as a giver of verdicts. |
 | `promote_threshold` | `0.5` | Utility at or above which a cold item is promoted. |
 | `demote_threshold` | `0.15` | Utility below which a hot item is demoted. |
 | `min_residency_days` | `7` | Days a promoted item is protected from demotion. |
