@@ -40,11 +40,12 @@ list and reranked for precision.
 
 ## Workspace
 
-Three crates, each usable on its own.
+Four crates, each usable on its own.
 
 | Crate | Role |
 |---|---|
 | `liam-store` | The core. Bitemporal graph, hybrid retrieval, GC, clustering. Backend-generic over libSQL or SQLite. No ML. |
+| `liam-log` | The append-only event log: write-ahead segments, Parquet compaction, encryption and archive. The store rebuilds from it. |
 | `liam-model` | In-process embedding and reranking via `fastembed`, behind the `local` feature. Mock and identity defaults keep dev builds light. |
 | `liam-daemon` | The MCP server (binary `liamd`). Wires store and model, serves `remember` and `recall` over stdio, runs GC in the background. |
 
@@ -862,22 +863,35 @@ still the route the current release workflow takes.
 
 ## Status
 
-LIAM v1 (MVP). It re-extracts the memory core of the retired v0 (the archived
-`liam-archive` repo, a larger code-intelligence engine), rebuilt smaller with RRF
-fusion and a full bitemporal model.
+LIAM is pre-1.0. The last release is v0.1.1 (macOS on Apple Silicon); `main`
+carries more since. It re-extracts the memory core of the retired v0 (the
+archived `liam-archive` repo, a larger code-intelligence engine), rebuilt
+smaller with RRF fusion and a full bitemporal model.
 
-The workspace compiles on default features and the daemon builds to a binary.
-`cargo test --workspace` is green. The store abstraction, the libSQL backend, and
-the shared graph logic are done.
+What is built:
 
-Not yet verified against their third-party APIs: the `local` build (fastembed v5
-signatures) and the leiden-rs membership accessor in `cluster.rs`.
+- Storage and retrieval: the bitemporal graph, hybrid search with a cold arm,
+  entity pages, scope hierarchy, producer-scoped collisions and `same_as`
+  links.
+- The event log, with rebuild, snapshots and restore, and consolidation runs
+  that extract facts and link near-duplicates.
+- Summary trees with strict and infer reading modes, and utility-based
+  tiering.
+- Deletion and log archive, with the first metrics. The rest of the work on
+  trust caps, metrics and hosted adapters is in progress.
+
+What is checked: the workspace builds, `cargo test --workspace` is green, the
+`local` build compiles against fastembed v5, and the community-detection
+wrapper in `cluster.rs` is covered by tests against `leiden-rs` 0.8.1. The
+real-model tests are gated and run on demand, not in the default test run.
 
 ## Roadmap
 
-- Confirm the fastembed and rmcp surfaces under a real end-to-end run.
-- Add a `liam` CLI as a second consumer of the store.
-- First tagged release with prebuilt binaries and a Homebrew formula.
+- Finish trust caps, metrics and hosted adapters, the last event log milestone.
+- Hosted deployment: HTTP transport, OAuth and per-tenant scoping. Not
+  planned yet.
+- Agent Client Protocol support. Not planned yet.
+- A Homebrew formula for the tagged releases.
 
 ## License
 
