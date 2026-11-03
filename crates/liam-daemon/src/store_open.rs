@@ -52,19 +52,26 @@ pub async fn open_store_on_log(
         })?
         .with_embedder(Arc::new(StoreEmbedder(embedder)));
 
-    if store.needs_backfill().await? {
-        let report = store.backfill_log_from_projection().await.context(
-            "copying the existing rows into the event log failed; fix the cause and \
-                 restart, the copy resumes where it stopped",
-        )?;
-        tracing::info!(?report, "backfill completed");
-    }
+    backfill_if_needed(&store).await?;
     let report = store
         .catch_up()
         .await
         .context("replaying the event log into the database failed")?;
     tracing::info!(?report, "event log caught up");
     Ok(store)
+}
+
+/// Copies the rows that predate the log into it, unless that already finished.
+/// `store` must have its log attached.
+pub async fn backfill_if_needed(store: &DefaultGraph) -> anyhow::Result<()> {
+    if store.needs_backfill().await? {
+        let report = store.backfill_log_from_projection().await.context(
+            "copying the existing rows into the event log failed; fix the cause and \
+             restart, the copy resumes where it stopped",
+        )?;
+        tracing::info!(?report, "backfill completed");
+    }
+    Ok(())
 }
 
 /// Reopens the database on the log already open, after a rollback replaced its
