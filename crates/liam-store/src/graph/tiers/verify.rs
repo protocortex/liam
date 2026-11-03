@@ -125,6 +125,7 @@ fn judge_event(
         ahead.voided.contains(&event.event_id)
             || ahead.rolled_back.skips(event)
             || ahead.removed.nodes.contains(claim.node_id.as_str())
+            || ahead.shredded_nodes.contains(claim.node_id.as_str())
     };
     if excluded(event) {
         return OriginVerdict::Excluded;

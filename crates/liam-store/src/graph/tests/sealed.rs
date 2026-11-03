@@ -7,6 +7,9 @@ use liam_log::envelope::{KeyHints, Sealer};
 use liam_log::event::{LogEvent, LogPayload, RowEffect, UsageRow};
 use liam_log::reader::ReaderError;
 
+use crate::error::MismatchSource;
+use crate::{OriginClaim, OriginVerdict};
+
 use super::log_write::mentions;
 use super::support::{
     count, cursor_offset, edge, event, has_node, key_registry, node, quarantined, snapshot, Env,
@@ -405,4 +408,184 @@ async fn a_write_into_a_destroying_group_is_refused_and_nothing_is_appended() {
     );
     assert_eq!(env.records().await.len(), 1);
     assert_eq!(count(&graph, "nodes").await, 1);
+}
+
+// ---- rebuild, the ledger and the origin verifier over a log with shredded rows ----
+
+fn claim(node: &NodeId, event_id: &str, content: &str) -> OriginClaim {
+    OriginClaim {
+        node_id: node.clone(),
+        origin_event_ids: vec![event_id.to_owned()],
+        label: "label".to_owned(),
+        content: content.to_owned(),
+    }
+}
+
+/// A store that replayed a sealed log of two subjects, with the group of
+/// `bob` destroyed afterwards, as after a delete whose purge did not finish.
+async fn store_with_bob_shredded(
+    env: &Env,
+    registry: &Arc<KeyRegistry>,
+    ledger: bool,
+) -> (DefaultGraph, SharedLog) {
+    let batch = episode(
+        "event-batch",
+        vec![
+            RowEffect::Node(subject_node("alice", Some("alice"))),
+            RowEffect::Node(subject_node("bob", Some("bob"))),
+            RowEffect::Edge(edge("a-to-b", "alice", "bob")),
+        ],
+    );
+    let sealed = seal(registry, &batch);
+    let bob = key_of(&sealed, "bob");
+    let mut events = vec![sealed];
+    if ledger {
+        events.push(event(
+            "event-ledger",
+            [0; 32],
+            LogPayload::DeletionRecorded {
+                job_id: "job-1".into(),
+                event_ids: vec!["event-batch".into()],
+                key_ids: vec![bob.clone()],
+                at: 5,
+            },
+        ));
+    }
+    env.append(&events);
+    let (graph, log) = open_over(env, registry, "live.db").await;
+    graph.catch_up().await.unwrap();
+    registry.destroy(&bob).unwrap();
+    (graph, log)
+}
+
+#[tokio::test]
+async fn a_rebuild_check_passes_for_rows_a_delete_job_recorded() {
+    // Arrange
+    let env = Env::new();
+    let (_keys, registry) = key_registry();
+    let (graph, log) = store_with_bob_shredded(&env, &registry, true).await;
+
+    // Act
+    let (rebuilt, _report) = graph
+        .rebuild_from_log(log, RebuildMode::ResetChecked)
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(has_node(&rebuilt, "alice").await && !has_node(&rebuilt, "bob").await);
+    assert_eq!(count(&rebuilt, "edges").await, 0);
+}
+
+#[tokio::test]
+async fn a_rebuild_check_fails_loudly_for_a_shred_the_log_never_recorded() {
+    // Arrange
+    let env = Env::new();
+    let (_keys, registry) = key_registry();
+    let (graph, log) = store_with_bob_shredded(&env, &registry, false).await;
+
+    // Act
+    let result = graph.rebuild_from_log(log, RebuildMode::ResetChecked).await;
+
+    // Assert
+    assert!(matches!(
+        result,
+        Err(Error::RebuildMismatch {
+            against: MismatchSource::PriorProjection,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_rebuild_of_an_empty_store_skips_the_edge_to_a_shredded_node_and_still_verifies() {
+    // Arrange
+    let env = Env::new();
+    let (_keys, registry) = key_registry();
+    let batch = episode(
+        "event-batch",
+        vec![
+            RowEffect::Node(subject_node("alice", Some("alice"))),
+            RowEffect::Node(subject_node("bob", Some("bob"))),
+            RowEffect::Edge(edge("a-to-b", "alice", "bob")),
+        ],
+    );
+    let sealed = seal(&registry, &batch);
+    registry.destroy(&key_of(&sealed, "bob")).unwrap();
+    env.append(&[sealed]);
+    let (graph, log) = open_over(&env, &registry, "fresh.db").await;
+
+    // Act
+    let (rebuilt, report) = graph
+        .rebuild_from_log(log, RebuildMode::RequireEmpty)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(report.live_nodes, 1);
+    assert_eq!(report.live_edges, 0);
+    assert!(has_node(&rebuilt, "alice").await);
+}
+
+#[tokio::test]
+async fn a_rebuild_stops_with_a_typed_error_when_the_registry_lost_a_key() {
+    // Arrange
+    let env = Env::new();
+    let (_keys, registry) = key_registry();
+    env.append(&[seal(
+        &registry,
+        &event(
+            "event-sealed",
+            [0; 32],
+            LogPayload::NodeWrite(subject_node("sealed", Some("alice"))),
+        ),
+    )]);
+    let (_other, lost) = key_registry();
+    let (graph, log) = open_over(&env, &lost, "fresh.db").await;
+
+    // Act
+    let result = graph.rebuild_from_log(log, RebuildMode::RequireEmpty).await;
+
+    // Assert
+    assert!(matches!(
+        result,
+        Err(Error::LogRead(ReaderError::KeyMissing { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn the_origin_verifier_excludes_a_node_whose_row_is_shredded() {
+    // Arrange
+    let env = Env::new();
+    let (_keys, registry) = key_registry();
+    let batch = episode(
+        "event-batch",
+        vec![
+            RowEffect::Node(subject_node("alice", Some("alice"))),
+            RowEffect::Node(subject_node("bob", Some("bob"))),
+        ],
+    );
+    let sealed = seal(&registry, &batch);
+    let bob_key = key_of(&sealed, "bob");
+    env.append(&[sealed]);
+    let (graph, _log) = open_over(&env, &registry, "live.db").await;
+    graph.catch_up().await.unwrap();
+    let claims = [
+        claim(
+            &NodeId::from_raw("alice"),
+            "event-batch",
+            "content of alice",
+        ),
+        claim(&NodeId::from_raw("bob"), "event-batch", "content of bob"),
+    ];
+    registry.destroy(&bob_key).unwrap();
+
+    // Act
+    let verdicts = graph.verify_origins(&claims).await.unwrap();
+
+    // Assert
+    assert_eq!(
+        verdicts[&NodeId::from_raw("alice")],
+        OriginVerdict::Verified
+    );
+    assert_eq!(verdicts[&NodeId::from_raw("bob")], OriginVerdict::Excluded);
 }

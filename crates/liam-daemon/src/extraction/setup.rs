@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use liam_log::reader::SequentialScanReader;
+use liam_daemon::event_log;
+use liam_log::crypto::KeyRegistry;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -22,6 +23,8 @@ use crate::config::ExtractionConfig;
 pub struct DaemonFiles<'a> {
     pub database_path: &'a Path,
     pub log_dir: &'a Path,
+    /// The key registry of a sealed log.
+    pub keys: Option<Arc<KeyRegistry>>,
     /// The daemon's generation permits, shared with the other model users.
     pub permits: Arc<Semaphore>,
     pub stopping: CancellationToken,
@@ -58,11 +61,11 @@ pub fn build(config: &ExtractionConfig, files: DaemonFiles<'_>) -> anyhow::Resul
     };
     let cache = CacheStore::open(cache_path(files.database_path))
         .context("could not open the extraction response cache")?;
-    let reader = SequentialScanReader::local(files.log_dir)
+    let reader = event_log::log_reader(files.log_dir, files.keys.as_ref())
         .context("could not open the event log for extraction")?;
     Ok(ExtractionHooks {
         config: config.clone(),
-        reader: Arc::new(reader),
+        reader,
         provider: Arc::new(SidecarProvider::new(Arc::new(starter), identity.clone())),
         identity,
         cache: Arc::new(cache),
@@ -83,6 +86,7 @@ mod tests {
         let files = DaemonFiles {
             database_path: &dir.path().join("liam.db"),
             log_dir: dir.path(),
+            keys: None,
             permits: Arc::new(Semaphore::new(1)),
             stopping: CancellationToken::new(),
         };
@@ -159,5 +163,141 @@ mod tests {
         // Assert
         assert!(kept);
         assert!(!pidfile.exists());
+    }
+
+    fn sealed_log(
+        dir: &TempDir,
+        shred_second: bool,
+    ) -> (Arc<KeyRegistry>, Vec<liam_log::event::LogEvent>) {
+        use liam_log::envelope::{KeyHints, Sealer};
+        use liam_log::event::{LogEvent, LogPayload, NodeRow, CURRENT_SCHEMA_VERSION};
+        use liam_log::wal::WalWriter;
+        use liam_log::LogWriter;
+
+        let encryption = crate::config::EncryptionConfig {
+            master_key: Some(crate::config::MasterKeySource::File),
+            key_file: Some(dir.path().join("master.key").to_str().unwrap().to_owned()),
+        };
+        let registry = event_log::open_key_registry(dir.path(), &encryption)
+            .unwrap()
+            .unwrap();
+        let sealer = Sealer::new(Arc::clone(&registry));
+        let write = |id: &str, subject: &str| LogEvent {
+            event_id: format!("event-{id}"),
+            content_hash: [1; 32],
+            source: "client".into(),
+            trust_score: 1.0,
+            observed_at: 1,
+            ingested_at: 1,
+            encryption_key_id: None,
+            schema_version: CURRENT_SCHEMA_VERSION,
+            payload: LogPayload::NodeWrite(NodeRow {
+                id: id.into(),
+                kind: "fact".into(),
+                label: format!("label {id}"),
+                content: format!("content {id}"),
+                producer: "p".into(),
+                attributes: "{}".into(),
+                scope: None,
+                subject: Some(subject.into()),
+                confidence: 1.0,
+                valid_from: 1,
+                valid_from_supplied: true,
+                valid_until: 2,
+                tx_from: 1,
+                tx_to: 2,
+                derivation: None,
+                basis: Vec::new(),
+            }),
+        };
+        let events: Vec<_> = [write("a", "alice"), write("b", "bob")]
+            .iter()
+            .map(|event| sealer.seal(event, &KeyHints::default()).unwrap())
+            .collect();
+        let mut writer = WalWriter::open_with_system_clock(
+            dir.path(),
+            crate::config::LogConfig::default().wal(),
+        )
+        .unwrap();
+        for event in &events {
+            writer.append(event).unwrap();
+        }
+        if shred_second {
+            let LogPayload::Sealed(record) = &events[1].payload else {
+                unreachable!()
+            };
+            registry.destroy(&record.rows[0].key_id).unwrap();
+        }
+        (registry, events)
+    }
+
+    #[tokio::test]
+    async fn the_extraction_reader_opens_sealed_records_and_passes_a_shredded_one() {
+        use futures_util::StreamExt;
+        use liam_log::event::LogPayload;
+
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _events) = sealed_log(&dir, true);
+        let files = DaemonFiles {
+            database_path: &dir.path().join("liam.db"),
+            log_dir: dir.path(),
+            keys: Some(registry),
+            permits: Arc::new(Semaphore::new(1)),
+            stopping: CancellationToken::new(),
+        };
+        let hooks = build(&ExtractionConfig::default(), files).unwrap();
+
+        // Act
+        let records: Vec<_> = hooks.reader.scan(None).collect().await;
+
+        // Assert
+        let first = records[0].as_ref().unwrap();
+        assert!(matches!(first.event.payload, LogPayload::NodeWrite(_)));
+        let second = records[1].as_ref().unwrap();
+        assert_eq!(second.event.payload, LogPayload::EpisodeBatch(Vec::new()));
+        assert_eq!(second.shredded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_extraction_reader_stops_at_a_key_the_registry_lost() {
+        use futures_util::StreamExt;
+        use liam_log::reader::ReaderError;
+
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        sealed_log(&dir, false);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let lost = event_log::open_key_registry(
+            elsewhere.path(),
+            &crate::config::EncryptionConfig {
+                master_key: Some(crate::config::MasterKeySource::File),
+                key_file: Some(
+                    elsewhere
+                        .path()
+                        .join("other.key")
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                ),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let files = DaemonFiles {
+            database_path: &dir.path().join("liam.db"),
+            log_dir: dir.path(),
+            keys: Some(lost),
+            permits: Arc::new(Semaphore::new(1)),
+            stopping: CancellationToken::new(),
+        };
+        let hooks = build(&ExtractionConfig::default(), files).unwrap();
+
+        // Act
+        let records: Vec<_> = hooks.reader.scan(None).collect().await;
+
+        // Assert
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0], Err(ReaderError::KeyMissing { .. })));
     }
 }

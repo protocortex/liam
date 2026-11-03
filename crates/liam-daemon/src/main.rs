@@ -158,6 +158,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         store,
         compactor,
         log,
+        keys,
     } = log_startup::open_store_with_log(
         &config,
         &database_path,
@@ -235,6 +236,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         database_path: &database_path,
         log_dir: &log_dir,
         log,
+        keys,
         embedder: job_embedder,
         server: &server,
         shutdown: &shutdown,

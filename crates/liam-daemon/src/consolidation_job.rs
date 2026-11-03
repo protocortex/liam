@@ -25,6 +25,8 @@ use liam_store::{DefaultGraph, RetentionPolicy, SharedLog, SystemClock};
 use tokio_util::sync::CancellationToken;
 
 use crate::extraction::client::ModelIdentity;
+use liam_log::crypto::KeyRegistry;
+
 use crate::extraction::setup::{self as extraction_setup, sweep_stale_sidecar, DaemonFiles};
 use crate::extraction::sidecar::SystemRam;
 use crate::mcp::MemoryServer;
@@ -69,6 +71,8 @@ pub struct JobSetup<'a> {
     pub database_path: &'a Path,
     pub log_dir: &'a Path,
     pub log: SharedLog,
+    /// The key registry of a sealed log, so the extraction pass reads it open.
+    pub keys: Option<Arc<KeyRegistry>>,
     pub embedder: Arc<dyn Embedder>,
     pub server: &'a MemoryServer,
     pub shutdown: &'a Shutdown,
@@ -108,6 +112,7 @@ fn extraction_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn Extrac
     let files = DaemonFiles {
         database_path: setup.database_path,
         log_dir: setup.log_dir,
+        keys: setup.keys.clone(),
         permits: setup.server.generation_permits_handle(),
         stopping: setup.shutdown.token(),
     };
@@ -170,6 +175,7 @@ impl ConsolidationJob {
             database_path,
             log_dir,
             log,
+            keys: _,
             embedder,
             server,
             shutdown,
