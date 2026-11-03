@@ -15,7 +15,6 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use liam_daemon::config::SummaryConfig;
 use liam_daemon::consolidation::hooks::{SummaryCtx, SummaryHook, SummaryReport};
-use liam_model::Llm;
 use liam_store::{
     ChildKind, ContentEmbedder, DefaultGraph, EventRef, Millis, NewSummary, PutOutcome, Summary,
     SummaryChild, SummaryInput,
@@ -27,11 +26,11 @@ use tracing::{debug, info, warn};
 use super::generate::{
     GenerateSettings, Generation, Generator, PromptItem, SummaryCache, SUMMARY_PROMPT_VERSION,
 };
+use super::summariser::Summariser;
 use super::tree::{
     detect_cold, plan_level, should_descend, LevelRequest, Point, PreviousCluster, Regeneration,
     TreeParams,
 };
-use crate::extraction::client::ModelIdentity;
 
 /// Tokens a summary may run to: two to four sentences, with room to spare.
 const SUMMARY_MAX_NEW_TOKENS: usize = 512;
@@ -44,12 +43,11 @@ const SAMPLED_ITEMS_PER_SUMMARY: usize = 2;
 
 pub struct SummaryHooks {
     pub config: SummaryConfig,
-    pub llm: Arc<dyn Llm>,
+    pub summariser: Arc<dyn Summariser>,
     /// The daemon's generation permits, shared with the other model users.
     pub permits: Arc<Semaphore>,
     pub cache: Arc<dyn SummaryCache>,
     pub embedder: Arc<dyn ContentEmbedder>,
-    pub identity: ModelIdentity,
     /// The model's context window, in tokens.
     pub context_tokens: usize,
 }
@@ -311,7 +309,6 @@ impl<'a> Run<'a> {
             self.report.unwritten += 1;
             return Ok(false);
         }
-        self.budget -= 1;
         let members = regeneration
             .cluster
             .members
@@ -322,6 +319,7 @@ impl<'a> Run<'a> {
                 })
             })
             .collect::<anyhow::Result<Vec<&Item>>>()?;
+        self.budget -= 1;
         let prompt: Vec<PromptItem> = members
             .iter()
             .map(|item| item.prompt.clone())
@@ -359,7 +357,7 @@ impl<'a> Run<'a> {
             events_fed: generated.events_fed,
             valid_min,
             valid_max,
-            model_id: self.hooks.identity.model_id.clone(),
+            model_id: self.hooks.summariser.identity().model_id.clone(),
             prompt_version: SUMMARY_PROMPT_VERSION.to_string(),
         };
         let children: Vec<SummaryChild> = regeneration
@@ -437,11 +435,10 @@ impl<'a> Run<'a> {
 
     fn generator(&self) -> Generator<'_> {
         Generator {
-            llm: self.hooks.llm.as_ref(),
+            summariser: self.hooks.summariser.as_ref(),
             permits: &self.hooks.permits,
             cache: self.hooks.cache.as_ref(),
             store: self.store,
-            identity: &self.hooks.identity,
             settings: &self.settings,
         }
     }

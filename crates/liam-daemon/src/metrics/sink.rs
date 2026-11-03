@@ -9,6 +9,7 @@ use liam_store::{Clock, Millis};
 use serde::{Deserialize, Serialize};
 
 use super::alerts::Alert;
+pub use crate::config::{Provider, TokenUsage};
 
 /// Every metric the daemon keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -122,33 +123,20 @@ pub enum RetrievalArm {
     ColdProbe,
 }
 
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Provider {
-    Local,
-    Anthropic,
-    OpenAi,
-    Gemini,
-}
-
 /// A model id from the pinned set, held as an index into a [`ModelCatalog`], so
 /// a label stays `Copy` and cannot carry free text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModelId(u16);
 
 /// The model ids a run has seen, each interned once.
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
 #[derive(Debug, Default)]
 pub struct ModelCatalog {
     names: Vec<String>,
 }
 
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
 const MAX_MODEL_NAME_CHARS: usize = 64;
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
 const MAX_MODELS: usize = 64;
 
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
 impl ModelCatalog {
     /// The id of `name`, added when new.
     ///
@@ -177,29 +165,28 @@ impl ModelCatalog {
         Ok(ModelId((self.names.len() - 1) as u16))
     }
 
+    #[cfg(test)]
     pub fn name(&self, id: ModelId) -> Option<&str> {
         self.names.get(usize::from(id.0)).map(String::as_str)
     }
 }
 
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
 /// What a model call used, as an adapter reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
     pub provider: Provider,
     pub model: ModelId,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    pub tokens: TokenUsage,
+    /// Billed at the provider's batch rates.
+    pub batch: bool,
 }
 
 /// The only dimensions a sample may carry.
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Labels {
     None,
     Tier(TierLabel),
     Arm(RetrievalArm),
-    Provider(Provider),
     Model { provider: Provider, model: ModelId },
 }
 

@@ -3,7 +3,7 @@
 use super::*;
 use crate::deletion::{DeleteTarget, JobState};
 use crate::metrics::memory::SystemMemory;
-use crate::metrics::sink::{ModelCatalog, Provider, TierLabel};
+use crate::metrics::sink::{ModelCatalog, Provider, TierLabel, TokenUsage};
 use liam_daemon::consolidation::probes::ProbeScore;
 use liam_store::TierBytes;
 
@@ -176,12 +176,17 @@ fn model_calls_and_cost_add_up_under_provider_and_model_labels_only() {
     let usage = Usage {
         provider: Provider::Anthropic,
         model,
-        input_tokens: 2_000_000,
-        output_tokens: 500_000,
+        tokens: TokenUsage {
+            input_tokens: 2_000_000,
+            output_tokens: 500_000,
+            cached_input_tokens: 0,
+        },
+        batch: false,
     };
     let price = Price {
         input_micro_per_mtok: 1_000_000,
         output_micro_per_mtok: 5_000_000,
+        ..Price::default()
     };
     let mut meter = ModelMeter::default();
     meter.record(usage, price, AT);
@@ -199,6 +204,71 @@ fn model_calls_and_cost_add_up_under_provider_and_model_labels_only() {
             model
         }
     );
+}
+
+#[test]
+fn cached_input_and_batch_calls_are_charged_at_their_own_rates() {
+    // Arrange
+    let model = catalog_id(&mut ModelCatalog::default());
+    let price = Price {
+        input_micro_per_mtok: 1_000_000,
+        output_micro_per_mtok: 5_000_000,
+        cached_input_micro_per_mtok: 100_000,
+        batch_input_micro_per_mtok: 500_000,
+        batch_output_micro_per_mtok: 2_500_000,
+    };
+    let call = |batch| Usage {
+        provider: Provider::OpenAi,
+        model,
+        tokens: TokenUsage {
+            input_tokens: 2_000_000,
+            output_tokens: 500_000,
+            cached_input_tokens: 1_000_000,
+        },
+        batch,
+    };
+
+    // Act
+    let live = {
+        let u = call(false);
+        price.cost_micro(&u.tokens, u.batch)
+    };
+    let batched = {
+        let u = call(true);
+        price.cost_micro(&u.tokens, u.batch)
+    };
+
+    // Assert: 1M fresh at 1.0, 1M cached at 0.1, 0.5M out at 5.0, and the
+    // same with the batch input and output rates
+    assert_eq!(live, 3_600_000);
+    assert_eq!(batched, 1_850_000);
+}
+
+#[test]
+fn more_cached_tokens_than_input_tokens_cannot_make_the_cost_negative() {
+    // Arrange
+    let model = catalog_id(&mut ModelCatalog::default());
+    let price = Price {
+        cached_input_micro_per_mtok: 100_000,
+        ..Price::default()
+    };
+    let usage = Usage {
+        provider: Provider::Gemini,
+        model,
+        tokens: TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cached_input_tokens: 5_000_000,
+        },
+        batch: false,
+    };
+
+    // Act and Assert
+    assert_eq!(price.cost_micro(&usage.tokens, usage.batch), 100_000);
+}
+
+fn catalog_id(catalog: &mut ModelCatalog) -> crate::metrics::sink::ModelId {
+    catalog.intern("gpt-4o-2024-08-06").unwrap()
 }
 
 #[test]

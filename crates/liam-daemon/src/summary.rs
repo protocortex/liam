@@ -6,6 +6,7 @@ mod exit_criteria;
 pub mod file_cache;
 pub mod generate;
 pub mod hooks;
+pub mod summariser;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tree;

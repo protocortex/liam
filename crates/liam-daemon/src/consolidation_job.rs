@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use liam_daemon::config::Config;
+use liam_daemon::config::{Config, Provider};
 use liam_daemon::consolidation::hooks::{
     ConsolidationHookSet, ExtractionHook, SummaryHook, TierHook,
 };
@@ -37,6 +37,7 @@ use crate::metrics::sources::RunSources;
 use crate::shutdown::Shutdown;
 use crate::summary::file_cache::{summary_cache_path, FileSummaryCache};
 use crate::summary::hooks::SummaryHooks;
+use crate::summary::summariser::{LocalSummariser, Summariser};
 use crate::tiering::hooks::TierHooks;
 use crate::{maintenance_steps, Resynthesis};
 
@@ -117,6 +118,11 @@ fn extraction_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn Extrac
     if !config.enabled {
         return Ok(None);
     }
+    anyhow::ensure!(
+        config.provider == Provider::Local,
+        "extraction.provider = {:?} has no adapter in this build yet",
+        config.provider.name()
+    );
     let files = DaemonFiles {
         database_path: setup.database_path,
         log_dir: setup.log_dir,
@@ -133,22 +139,39 @@ fn summary_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn SummaryHo
         return Ok(None);
     }
     let llm = &setup.config.llm;
+    anyhow::ensure!(
+        config.provider == Provider::Local,
+        "summary.provider = {:?} has no adapter in this build yet",
+        config.provider.name()
+    );
+    let summariser: Arc<dyn Summariser> = Arc::new(local_summariser(setup));
+    let cache = FileSummaryCache::open(
+        summary_cache_path(setup.database_path),
+        summariser.identity().clone(),
+    )
+    .context("could not open the summary cache")?;
+    Ok(Some(Arc::new(SummaryHooks {
+        config: config.clone(),
+        summariser,
+        permits: setup.server.generation_permits_handle(),
+        cache: Arc::new(cache),
+        embedder: Arc::new(StoreEmbedder(setup.embedder.clone())),
+        context_tokens: llm.context_tokens,
+    })))
+}
+
+fn local_summariser(setup: &JobSetup<'_>) -> LocalSummariser {
+    let llm = &setup.config.llm;
     // The in-process model is named by its repository and file, and not hashed.
     let identity = ModelIdentity {
         model_id: format!("{}:{}/{}", llm.provider, llm.model, llm.gguf_file),
         model_sha256: String::new(),
     };
-    let cache = FileSummaryCache::open(summary_cache_path(setup.database_path), identity.clone())
-        .context("could not open the summary cache")?;
-    Ok(Some(Arc::new(SummaryHooks {
-        config: config.clone(),
-        llm: setup.server.llm_handle(),
-        permits: setup.server.generation_permits_handle(),
-        cache: Arc::new(cache),
-        embedder: Arc::new(StoreEmbedder(setup.embedder.clone())),
-        identity,
-        context_tokens: llm.context_tokens,
-    })))
+    let summariser = LocalSummariser::new(setup.server.llm_handle(), identity);
+    match &setup.metrics {
+        Some(metrics) => summariser.with_metrics(metrics.clone()),
+        None => summariser,
+    }
 }
 
 /// Why a run asked for by hand did not finish.

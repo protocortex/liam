@@ -11,13 +11,13 @@ use std::collections::{BTreeSet, HashSet};
 use std::io;
 use std::sync::Arc;
 
-use liam_model::Llm;
 use liam_store::DefaultGraph;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout_at, Instant};
 use tracing::{debug, warn};
 
+use super::summariser::{Summariser, SummaryRequest};
 use crate::ask::{
     estimate_tokens, fit_texts_to_budget, neutralize_fence, truncate, MAX_EVIDENCE_CHARS,
 };
@@ -296,11 +296,10 @@ pub struct GenerateSettings {
 
 /// What a run shares across the summaries it writes.
 pub struct Generator<'a> {
-    pub llm: &'a dyn Llm,
+    pub summariser: &'a dyn Summariser,
     pub permits: &'a Arc<Semaphore>,
     pub cache: &'a dyn SummaryCache,
     pub store: &'a DefaultGraph,
-    pub identity: &'a ModelIdentity,
     pub settings: &'a GenerateSettings,
 }
 
@@ -350,14 +349,14 @@ impl Generator<'_> {
             return Generation::Failed(DEADLINE_PASSED.to_string());
         }
         let prompt = build_summary_prompt(items, self.settings.context_tokens, |text| {
-            self.llm
+            self.summariser
                 .count_tokens(text)
                 .unwrap_or_else(|| estimate_tokens(text))
         });
         let events_fed = prompt.events_fed();
         let key = summary_cache_key(
             SUMMARY_PROMPT_VERSION,
-            self.identity,
+            self.summariser.identity(),
             self.settings.max_new_tokens,
             &prompt,
         );
@@ -402,7 +401,7 @@ impl Generator<'_> {
             Ok(Some(failure)) => {
                 failure.failures >= self.settings.max_summary_failures
                     && failure.prompt_version == SUMMARY_PROMPT_VERSION
-                    && failure.model_id == self.identity.model_id
+                    && failure.model_id == self.summariser.identity().model_id
             }
             Ok(None) => false,
             Err(error) => {
@@ -419,7 +418,7 @@ impl Generator<'_> {
                 child_hash,
                 error,
                 SUMMARY_PROMPT_VERSION,
-                &self.identity.model_id,
+                &self.summariser.identity().model_id,
             )
             .await
         {
@@ -437,15 +436,16 @@ impl Generator<'_> {
             Ok(Err(_)) => return Err(Unanswered::Deadline(NO_SLOT)),
             Err(_) => return Err(Unanswered::Deadline(SLOT_TIMEOUT)),
         };
-        let reply = timeout_at(
-            deadline,
-            self.llm
-                .complete_capped(&prompt.system, &prompt.user, self.settings.max_new_tokens),
-        )
-        .await;
+        let request = SummaryRequest {
+            system: prompt.system.clone(),
+            prompt: prompt.user.clone(),
+            source_event_ids: prompt.event_ids().into_iter().map(String::from).collect(),
+            max_tokens: self.settings.max_new_tokens,
+        };
+        let reply = timeout_at(deadline, self.summariser.summarise(&request)).await;
         drop(permit);
         match reply {
-            Ok(Ok(text)) => Ok(text),
+            Ok(Ok(response)) => Ok(response.text),
             Ok(Err(error)) => Err(Unanswered::Model(error.to_string())),
             Err(_) => Err(Unanswered::Deadline(GENERATION_TIMEOUT)),
         }

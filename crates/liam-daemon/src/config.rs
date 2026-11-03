@@ -22,6 +22,7 @@ mod extraction;
 mod hosted;
 mod metrics;
 mod pins;
+mod pricing;
 mod summary;
 mod tiering;
 
@@ -35,9 +36,10 @@ pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
     MAX_RUN_DEADLINE_SECS,
 };
-pub use hosted::{HostedConfig, PrivacyConfig};
+pub use hosted::{HostedConfig, PricesConfig, PrivacyConfig};
 pub use metrics::{MetricsConfig, SinkKind};
 pub use pins::{ModelPin, PinError};
+pub use pricing::{Price, Provider, TokenUsage};
 pub use summary::{
     SummaryConfig, DEFAULT_MAX_BASIS_IDS_RENDERED, DEFAULT_MIN_SUMMARY_SIMILARITY,
     MAX_SUMMARY_DEPTH,
@@ -452,6 +454,18 @@ impl Config {
         config.archive.validate()?;
         config.metrics.validate()?;
         config.hosted.validate()?;
+        config
+            .hosted
+            .check_provider("extraction.provider", config.extraction.provider)?;
+        config
+            .hosted
+            .check_provider("summary.provider", config.summary.provider)?;
+        anyhow::ensure!(
+            config.metrics.enabled
+                || (config.extraction.provider == Provider::Local
+                    && config.summary.provider == Provider::Local),
+            "a hosted provider needs metrics.enabled = true, so its calls and cost are counted"
+        );
         Ok(config)
     }
 

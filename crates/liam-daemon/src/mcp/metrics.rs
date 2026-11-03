@@ -97,7 +97,6 @@ fn label_suffix(labels: Labels) -> String {
         Labels::None => String::new(),
         Labels::Tier(tier) => format!("{{tier={tier:?}}}").to_lowercase(),
         Labels::Arm(arm) => format!("{{arm={arm:?}}}").to_lowercase(),
-        Labels::Provider(provider) => format!("{{provider={provider:?}}}").to_lowercase(),
         Labels::Model { provider, model } => {
             format!("{{provider={provider:?},model={model:?}}}").to_lowercase()
         }

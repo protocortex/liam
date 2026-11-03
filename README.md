@@ -507,6 +507,7 @@ Keys, all under `[summary]` in `liam.toml`:
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | `false` makes the whole step a no-op. |
+| `provider` | `"local"` | Who writes summaries: `local`, or `anthropic`, `openai` or `gemini` (these need `[hosted]`). `ask` and entity synthesis stay local. |
 | `knn` | `8` | Nearest neighbours considered for each item. |
 | `min_similarity` | `0.5` | Least cosine similarity at which two items are linked. |
 | `time_window_hours` | `720` | Items further apart than this are not linked. |
@@ -689,6 +690,7 @@ all.
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Off makes the whole hook a no-op. |
+| `provider` | `"local"` | Who answers the model half: `local`, or `anthropic`, `openai` or `gemini` (these need `[hosted]`). |
 | `llm_enabled` | `true` | Off extracts with the rules only. |
 | `llama_server_path` | unset | The `llama-server` binary. Required while `enabled` and `llm_enabled` are on. `~` is expanded. |
 | `model_gguf` | unset | The GGUF file the server loads. Required under the same condition. `~` is expanded. |

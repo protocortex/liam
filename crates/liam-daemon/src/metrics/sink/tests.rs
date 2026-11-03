@@ -47,10 +47,10 @@ fn every_label_is_copy_and_none_holds_text() {
         Labels::None => 0,
         Labels::Tier(TierLabel::Hot | TierLabel::Cold) => 1,
         Labels::Arm(RetrievalArm::F32 | RetrievalArm::Lexical | RetrievalArm::ColdProbe) => 2,
-        Labels::Provider(
-            Provider::Local | Provider::Anthropic | Provider::OpenAi | Provider::Gemini,
-        ) => 3,
-        Labels::Model { .. } => 4,
+        Labels::Model {
+            provider: Provider::Local | Provider::Anthropic | Provider::OpenAi | Provider::Gemini,
+            ..
+        } => 3,
     };
     assert_eq!(label(Labels::None), 0);
 }

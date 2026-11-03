@@ -8,6 +8,8 @@ use std::net::IpAddr;
 use liam_store::{ArbitrationCaps, Cardinality, Grounding, MatchMode, PredicateSpec, Vocabulary};
 use serde::Deserialize;
 
+use super::pricing::Provider;
+
 /// Trust given to a source the `[extraction.trust]` table does not name.
 const DEFAULT_TRUST: f64 = 0.5;
 /// Share of an LLM fact's source trust that it keeps: a model can misread.
@@ -50,6 +52,9 @@ const RESERVED_SHORT_ALIAS: &str = "-a";
 pub struct ExtractionConfig {
     /// When false the whole extraction hook is a no-op.
     pub enabled: bool,
+    /// Who answers the model half: the local model, or a hosted provider
+    /// (which also needs `[hosted]`).
+    pub provider: Provider,
     /// False runs the rules extractor only.
     pub llm_enabled: bool,
     pub llama_server_path: Option<String>,
@@ -102,6 +107,7 @@ impl Default for ExtractionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: Provider::Local,
             llm_enabled: true,
             llama_server_path: None,
             extra_args: Vec::new(),

@@ -11,6 +11,7 @@ use liam_store::{Millis, TierBytes};
 
 use super::memory::ProcessMemory;
 use super::sink::{Labels, MetricId, Sample, TierLabel, Usage};
+pub use crate::config::Price;
 use crate::deletion::DeleteJob;
 use liam_daemon::consolidation::probes::ProbeReport;
 
@@ -129,18 +130,6 @@ pub fn deletion_backlog(jobs: &[DeleteJob], now: Millis) -> Vec<Sample> {
     samples
 }
 
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
-/// The price of a model's tokens, in millionths of a dollar per million tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Price {
-    pub input_micro_per_mtok: u64,
-    pub output_micro_per_mtok: u64,
-}
-
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
-const TOKENS_PER_MTOK: u64 = 1_000_000;
-
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
 /// Running totals of calls and cost per provider and model. The alert rules
 /// read growth between runs, so a sample carries the total, not one call.
 #[derive(Debug, Default)]
@@ -148,21 +137,17 @@ pub struct ModelMeter {
     totals: BTreeMap<Labels, (u64, u64)>,
 }
 
-#[allow(dead_code, reason = "the hosted adapters report model usage")]
 impl ModelMeter {
     pub fn record(&mut self, usage: Usage, price: Price, at: Millis) -> [Sample; 2] {
         let labels = Labels::Model {
             provider: usage.provider,
             model: usage.model,
         };
-        let cost = (u128::from(usage.input_tokens) * u128::from(price.input_micro_per_mtok)
-            + u128::from(usage.output_tokens) * u128::from(price.output_micro_per_mtok))
-            / u128::from(TOKENS_PER_MTOK);
         let total = self.totals.entry(labels).or_default();
         total.0 += 1;
         total.1 = total
             .1
-            .saturating_add(u64::try_from(cost).unwrap_or(u64::MAX));
+            .saturating_add(price.cost_micro(&usage.tokens, usage.batch));
         [
             Sample {
                 metric: MetricId::ModelCalls,

@@ -16,7 +16,9 @@ use crate::config::MetricsConfig;
 use crate::log_startup::test_support::{embedder, DIMS};
 use crate::metrics::alerts::state_path_for;
 use crate::metrics::recorder::Metrics;
-use crate::metrics::sink::{Labels, MemorySink, MetricId, MetricsSink, Provider, Sample};
+use crate::metrics::sink::{
+    Labels, MemorySink, MetricId, MetricsSink, ModelCatalog, Provider, Sample,
+};
 
 const HOUR: i64 = 3_600_000;
 const MIN_SAMPLES: usize = 3;
@@ -107,7 +109,10 @@ impl Staged {
 async fn a_staged_failure_raises_every_kind_of_alert_in_the_tool_and_a_healthy_run_clears_them() {
     // Arrange
     let staged = staged().await;
-    let local = Labels::Provider(Provider::Local);
+    let local = Labels::Model {
+        provider: Provider::Local,
+        model: ModelCatalog::default().intern("local-model").unwrap(),
+    };
     let healthy = || {
         vec![
             sample(MetricId::ProbeRecallAt10, 1.0, Labels::None),

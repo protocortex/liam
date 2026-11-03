@@ -14,8 +14,11 @@ use liam_daemon::consolidation::probes::ProbeReport;
 use liam_store::{Clock, QueryTimings};
 
 use super::alerts::{evaluate_run, Observation, RuleSet};
-use super::collect::{self, LatencyWindow};
-use super::sink::{Labels, MetricId, MetricsSink, RetrievalArm, Sample, Snapshot};
+use super::collect::{self, LatencyWindow, ModelMeter, Price};
+use super::sink::{
+    Labels, MetricId, MetricsSink, ModelCatalog, Provider, RetrievalArm, Sample, Snapshot,
+    TokenUsage, Usage,
+};
 use crate::tiering::AppliedMoves;
 
 /// Timings kept per window, the size `ask` already keeps for its own.
@@ -38,6 +41,13 @@ impl Tool {
 
 const ARM_METRICS: [MetricId; 2] = [MetricId::ArmLatencyP50Ms, MetricId::ArmLatencyP95Ms];
 
+/// The model ids a run has seen and the running totals of calls made to them.
+#[derive(Default)]
+struct Models {
+    catalog: ModelCatalog,
+    meter: ModelMeter,
+}
+
 struct Windows {
     tools: BTreeMap<Tool, LatencyWindow>,
     arms: BTreeMap<RetrievalArm, LatencyWindow>,
@@ -54,6 +64,7 @@ pub struct Metrics {
     clock: Arc<dyn Clock>,
     min_samples: usize,
     windows: Mutex<Windows>,
+    models: Mutex<Models>,
     rollbacks: AtomicU64,
     alerting: Option<Alerting>,
     /// Held while a run publishes its readings and alerts, and by a reader of
@@ -72,6 +83,7 @@ impl Metrics {
                 tools: BTreeMap::new(),
                 arms: BTreeMap::new(),
             }),
+            models: Mutex::new(Models::default()),
             rollbacks: AtomicU64::new(0),
             alerting: None,
             publication: tokio::sync::Mutex::new(()),
@@ -133,6 +145,42 @@ impl Metrics {
         if let Some(sample) = sample {
             self.sink.record(sample);
         }
+    }
+
+    /// One finished model call. The samples carry the provider and the model
+    /// id as labels and nothing else.
+    pub fn model_call(
+        &self,
+        provider: Provider,
+        model: &str,
+        tokens: TokenUsage,
+        batch: bool,
+        price: Price,
+    ) {
+        let at = self.clock.now();
+        let samples = {
+            // A panic while counting leaves a total one call short at worst.
+            let mut models = self.models.lock().unwrap_or_else(PoisonError::into_inner);
+            match models.catalog.intern(model) {
+                Ok(model) => models.meter.record(
+                    Usage {
+                        provider,
+                        model,
+                        tokens,
+                        batch,
+                    },
+                    price,
+                    at,
+                ),
+                Err(reason) => {
+                    tracing::warn!(%reason, "metrics: a model call is not counted");
+                    return;
+                }
+            }
+        };
+        samples
+            .into_iter()
+            .for_each(|sample| self.sink.record(sample));
     }
 
     fn windows(&self) -> std::sync::MutexGuard<'_, Windows> {

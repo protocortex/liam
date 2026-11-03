@@ -11,6 +11,7 @@ use super::*;
 use crate::extraction::client::ModelIdentity;
 use crate::summary::generate::SummaryCache;
 use crate::summary::hooks::SummaryHooks;
+use crate::summary::summariser::LocalSummariser;
 use crate::summary::test_support::{MemoryCache, ScriptedLlm};
 
 const NOTES: usize = 4;
@@ -54,14 +55,16 @@ fn hooks_over(
     ConsolidationHookSet {
         summary: Some(Arc::new(SummaryHooks {
             config,
-            llm: llm.clone(),
+            summariser: Arc::new(LocalSummariser::new(
+                llm.clone(),
+                ModelIdentity {
+                    model_id: "model".to_string(),
+                    model_sha256: String::new(),
+                },
+            )),
             permits: Arc::new(Semaphore::new(1)),
             cache: cache.clone() as Arc<dyn SummaryCache>,
             embedder: Arc::new(FixedEmbedder),
-            identity: ModelIdentity {
-                model_id: "model".to_string(),
-                model_sha256: String::new(),
-            },
             context_tokens: 8192,
         })),
         ..Default::default()
