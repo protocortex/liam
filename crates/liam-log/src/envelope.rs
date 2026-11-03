@@ -126,11 +126,11 @@ pub struct OpenedRecord {
 }
 
 /// The header fields every row binds as associated data, with the shape, the
-/// row's place, and the row itself.
+/// row's place, and the row itself. The schema version is left out: a decoded
+/// event is stamped with the newest version, which a later build would change.
 #[derive(Serialize)]
 struct Aad<'a> {
     event_id: &'a str,
-    schema_version: u32,
     source: &'a str,
     trust_score_bits: u64,
     observed_at: i64,
@@ -154,7 +154,6 @@ fn aad_bytes(
 ) -> Vec<u8> {
     let aad = Aad {
         event_id: &event.event_id,
-        schema_version: event.schema_version,
         source: &event.source,
         trust_score_bits: event.trust_score.to_bits(),
         observed_at: event.observed_at,
