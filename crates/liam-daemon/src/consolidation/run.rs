@@ -23,7 +23,7 @@ use super::manifest::{manifest_path_for, ResumeRefused, RunManifest, RunOutcome}
 use super::probe_set::{pick_probes, probe_set_path_for, ProbeSet};
 use super::probes::{compare, run_probes, Probe, ProbeError, ProbeReport};
 use super::shared_store::SharedStore;
-use super::tier_history::{self, history_path_for};
+use super::tier_history::{self, history_path_for, TierHistory};
 use crate::embedder_fingerprint::EmbedderFingerprint;
 
 const SNAPSHOT: &str = "snapshot";
@@ -360,7 +360,7 @@ impl Consolidator {
             source,
             run_id: manifest.run_id.clone(),
             probed_nodes: self.probed_nodes()?,
-            history: tier_history::load(&self.history_path())?,
+            history: self.tier_history(),
         };
         let result = self.parts.hooks.tier(&ctx).await.map(|report| {
             manifest.tier_plan_hash = Some(report.plan_hash);
@@ -372,6 +372,15 @@ impl Consolidator {
             report.partial
         });
         self.note_hook(TIER, configured, result, manifest)
+    }
+
+    /// An unreadable history is planned without, since a tier step never fails
+    /// the run.
+    fn tier_history(&self) -> TierHistory {
+        tier_history::load(&self.history_path()).unwrap_or_else(|error| {
+            tracing::warn!(%error, "consolidation: the tier history is unreadable, so the step plans without it");
+            TierHistory::default()
+        })
     }
 
     /// The nodes the baseline's probes expect to find; none when no probe set

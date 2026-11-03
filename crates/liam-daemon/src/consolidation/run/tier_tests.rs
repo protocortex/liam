@@ -203,3 +203,20 @@ async fn committed_runs_count_the_cooldown_down_and_a_moving_one_ends_the_streak
     assert_eq!(after_moving.consecutive_rollbacks, 0);
     assert_eq!(after_moving.cooldown[0].runs_left, COOLDOWN_RUNS - 2);
 }
+
+#[tokio::test]
+async fn an_unreadable_history_does_not_fail_the_run() {
+    // Arrange
+    let env = Env::new();
+    let shared = env.seeded().await;
+    std::fs::write(history_path_for(&env.database_path()), b"{not json").unwrap();
+    let tier = ScriptedTier::moving(&[]);
+    let run = env.consolidator_with(maintenance(), honest(), hooks_with(&tier));
+
+    // Act
+    let manifest = run.consolidate(&shared).await.unwrap();
+
+    // Assert
+    assert_eq!(manifest.outcome, Some(RunOutcome::Committed));
+    assert_eq!(tier.histories_seen(), vec![TierHistory::default()]);
+}
