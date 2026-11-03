@@ -747,7 +747,7 @@ async fn rebuild_without_an_embedder_reports_the_nodes_pending_instead_of_failin
 /// Puts a row in every table a rebuild empties but `nodes`, `edges`,
 /// `node_events` and `log_hash_index`, which `populate` fills, and names the
 /// tables it did.
-async fn seed_derived_tables(live: &Opened) -> [&'static str; 26] {
+async fn seed_derived_tables(live: &Opened) -> [&'static str; 27] {
     let g = &live.graph;
     let node_id = g
         .backend
@@ -808,6 +808,7 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 26] {
          VALUES ('', 1, 1, 1, 0)",
         "INSERT INTO node_keys (node_id, key_id, source) VALUES ('n', 'k', 'event-x')",
         "INSERT INTO derived_keys (row_kind, row_id, key_id) VALUES ('fact', 'f', 'k')",
+        "INSERT INTO lineage_removals (job_id, store, input, doomed) VALUES ('j', 'graph', '{}', '{}')",
     ] {
         g.backend.execute(sql, &[]).await.unwrap();
     }
@@ -838,6 +839,7 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 26] {
         "summary_tree_state",
         "node_keys",
         "derived_keys",
+        "lineage_removals",
     ]
 }
 

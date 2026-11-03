@@ -26,21 +26,22 @@ pub use error::{Error, MismatchSource, Result};
 pub use graph::{
     batch_key, child_hash, dequantize, hamming, quantize, recover_interrupted_restore,
     validate_scope, verify_snapshot, BackfillReport, Candidate, CatchUpReport, ContentEmbedder,
-    EmbedError, EventLog, FactPage, Graph, IndexedEntry, PoisonHook, QuantIndex, Quantized,
-    RebuildMode, RebuildReport, ReembedReport, SharedLog, Snapshot, SnapshotLog, SnapshotMeta,
-    BITS_PER_WORD, MAX_FACTS_PER_BATCH, MAX_SOURCES_PER_FACT, RUN_SOURCE_PREFIX,
+    EmbedError, EventLog, FactPage, Graph, IndexedEntry, LineageStore, PoisonHook, QuantIndex,
+    Quantized, RebuildMode, RebuildReport, ReembedReport, SharedLog, Snapshot, SnapshotLog,
+    SnapshotMeta, BITS_PER_WORD, GRAPH_STORE, MAX_FACTS_PER_BATCH, MAX_SOURCES_PER_FACT,
+    RUN_SOURCE_PREFIX,
 };
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{
     relation, ApplyOutcome, ArbitrationCaps, ArbitrationOutcome, Basis, Cardinality, Change,
     ChildKind, ClosureReport, ClusterMember, ClusterState, CountedFeedback, Derivation, EndFact,
     EndOutcome, EventRef, EventRole, ExplainedHit, ExtractorName, Fact, FeedbackEvent, Fingerprint,
-    GcReport, GraphConfig, Grounding, Hit, InferredHit, InferredText, ItemView, LineageKey,
-    LineageNode, MatchMode, NewEdge, NewFact, NewNode, NewSummary, NodeText, OriginClaim,
-    OriginVerdict, PredicateSpec, PutOutcome, Query, ReconcileReport, RecordedHit, RecordedText,
-    RetentionPolicy, RetentionRule, RetractOutcome, Retrieved, Summary, SummaryChild, SummaryEntry,
-    SummaryFailure, SummaryInput, SummaryInputs, Tier, TierMove, TreeState, UsageEntry,
-    UsageSnapshot, Vocabulary,
+    GcReport, GraphConfig, Grounding, Hit, InferredHit, InferredText, ItemView, LineageHits,
+    LineageKey, LineageNode, LineageTarget, MatchMode, NewEdge, NewFact, NewNode, NewSummary,
+    NodeText, OriginClaim, OriginVerdict, PredicateSpec, PurgeReport, PutOutcome, Query,
+    ReconcileReport, RecordedHit, RecordedText, Residual, RetentionPolicy, RetentionRule,
+    RetractOutcome, Retrieved, Summary, SummaryChild, SummaryEntry, SummaryFailure, SummaryInput,
+    SummaryInputs, Tier, TierMove, TreeState, UsageEntry, UsageSnapshot, Vocabulary,
 };
 pub use value::{Row, Value};
 

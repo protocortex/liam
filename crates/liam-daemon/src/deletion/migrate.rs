@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use liam_daemon::event_log;
+use liam_daemon::store_open::open_database;
 use liam_log::envelope::Sealer;
 use liam_log::migrate::{seal_log, MigrateReport, NoFault, NodeKeyHints};
 use liam_store::{DefaultGraph, GraphConfig};
@@ -27,11 +28,11 @@ pub async fn encrypt_log(
     let registry = event_log::open_key_registry(log_dir, &config.encryption)?
         .context("the key registry could not be opened")?;
     let lineage_nodes = lineage_nodes(config, database_path).await?;
-    let log_dir = log_dir.to_path_buf();
+    let sealed_dir = log_dir.to_path_buf();
     let sealer = Sealer::new(Arc::clone(&registry));
-    tokio::task::spawn_blocking(move || {
+    let report = tokio::task::spawn_blocking(move || {
         seal_log(
-            &log_dir,
+            &sealed_dir,
             &sealer,
             &registry,
             &mut NodeKeyHints::new(lineage_nodes),
@@ -40,7 +41,32 @@ pub async fn encrypt_log(
     })
     .await
     .context("the migration task failed")?
-    .context("the log could not be sealed")
+    .context("the log could not be sealed")?;
+    backfill_node_keys(config, database_path, log_dir).await?;
+    Ok(report)
+}
+
+/// Records which key group sealed each row, for a store that was built before
+/// the log was sealed. An absent store has nothing to fill.
+async fn backfill_node_keys(
+    config: &Config,
+    database_path: &Path,
+    log_dir: &Path,
+) -> anyhow::Result<()> {
+    if !database_path.exists() {
+        return Ok(());
+    }
+    let store = open_database(config, database_path).await?;
+    let writer = event_log::open_writer(log_dir, config.log.wal())?;
+    let keys = event_log::open_key_registry(log_dir, &config.encryption)?;
+    let log = event_log::shared_log(writer, log_dir, config.log.bloom()?, None, keys)?;
+    let store = store
+        .with_log(log)
+        .await
+        .context("the sealed log cannot be used with the database")?;
+    let sealed = store.backfill_node_keys().await?;
+    tracing::info!(sealed, "key groups recorded for the sealed log");
+    Ok(())
 }
 
 /// A node of every lineage the store knows, so tier, usage and feedback entries
