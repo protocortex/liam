@@ -23,6 +23,7 @@ use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::ChunkReader;
@@ -248,8 +249,17 @@ fn stamp(sequence: u64, event_count: usize) -> Vec<KeyValue> {
 }
 
 fn encode_parquet(batch: &RecordBatch, metadata: Vec<KeyValue>) -> Result<Vec<u8>, CompactError> {
+    encode_parquet_with(batch, metadata, Compression::UNCOMPRESSED)
+}
+
+fn encode_parquet_with(
+    batch: &RecordBatch,
+    metadata: Vec<KeyValue>,
+    compression: Compression,
+) -> Result<Vec<u8>, CompactError> {
     let properties = WriterProperties::builder()
         .set_key_value_metadata(Some(metadata))
+        .set_compression(compression)
         .build();
     let mut buffer = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), Some(properties))?;
@@ -266,6 +276,20 @@ pub(crate) fn segment_parquet_bytes(
     encode_parquet(&events_to_batch(events)?, stamp(sequence, events.len()))
 }
 
+/// The Parquet bytes of segment `sequence` compressed with zstd at `level`, for
+/// the archive.
+pub(crate) fn archived_parquet_bytes(
+    sequence: u64,
+    events: &[LogEvent],
+    level: i32,
+) -> Result<Vec<u8>, CompactError> {
+    encode_parquet_with(
+        &events_to_batch(events)?,
+        stamp(sequence, events.len()),
+        Compression::ZSTD(ZstdLevel::try_new(level)?),
+    )
+}
+
 /// Writes the events of one segment as a single Parquet object, replacing any
 /// earlier object for the same sequence.
 ///
@@ -276,7 +300,7 @@ pub(crate) async fn write_parquet(
     sequence: u64,
     events: &[LogEvent],
 ) -> Result<(), CompactError> {
-    let bytes = encode_parquet(&events_to_batch(events)?, stamp(sequence, events.len()))?;
+    let bytes = segment_parquet_bytes(sequence, events)?;
     store
         .put(&object_path(sequence), PutPayload::from(bytes))
         .await?;

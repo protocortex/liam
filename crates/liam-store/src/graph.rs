@@ -2506,6 +2506,7 @@ mod tests {
     use crate::DefaultGraph;
     use tempfile::TempDir;
 
+    mod archive;
     mod backfill;
     mod backwards_clock;
     mod catch_up;

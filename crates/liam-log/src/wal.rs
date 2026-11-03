@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
+use crate::archive::{read_manifest, ArchivedPartition};
 use crate::compactor::{parquet_name, read_event_count_from_file};
 use crate::event::{EventError, LogEvent};
 use crate::{LogOffset, LogWriter};
@@ -85,6 +86,8 @@ pub enum WalError {
     MissingSegment { sequence: u64 },
     #[error("parquet segment {sequence} could not be counted to find the log head: {reason}")]
     UncountableSegment { sequence: u64, reason: String },
+    #[error("the partition manifest cannot be read: {reason}")]
+    PartitionManifest { reason: String },
 }
 
 /// Source of the current time, injected so rotation tests never sleep.
@@ -232,9 +235,15 @@ impl<C: RotationClock> WalWriter<C> {
         let lock = lock_directory(dir)?;
         let log_id = load_or_create_log_id(dir, ops.as_mut())?;
         let highest_wal = segment_paths(dir)?.pop();
+        // An archived partition has left the directory but keeps its sequence.
         let highest_parquet = numbered_files(dir, PARQUET_EXTENSION)?
             .pop()
-            .map(|(sequence, _)| sequence);
+            .map(|(sequence, _)| sequence)
+            .max(
+                archived_partitions(dir)?
+                    .last()
+                    .map(|archived| archived.sequence),
+            );
         let segment = match highest_wal {
             // A sequence a Parquet file already uses is never handed out again.
             Some((sequence, path)) if highest_parquet.is_none_or(|parquet| parquet < sequence) => {
@@ -384,8 +393,9 @@ fn segment_head(segment: &OpenSegment) -> Option<LogOffset> {
 /// A segment that is missing or cannot be counted fails the open: reporting an
 /// earlier head would make a healthy store look ahead of its log.
 fn last_record_below(dir: &Path, open: u64) -> Result<Option<LogOffset>, WalError> {
+    let archived = archived_partitions(dir)?;
     for segment in (0..open).rev() {
-        let count = segment_record_count(dir, segment)?
+        let count = segment_record_count(dir, segment, &archived)?
             .ok_or(WalError::MissingSegment { sequence: segment })?;
         if let Some(index) = count.checked_sub(1) {
             return Ok(Some(LogOffset { segment, index }));
@@ -394,8 +404,19 @@ fn last_record_below(dir: &Path, open: u64) -> Result<Option<LogOffset>, WalErro
     Ok(None)
 }
 
-/// `None` when neither a WAL file nor a Parquet file exists for `sequence`.
-fn segment_record_count(dir: &Path, sequence: u64) -> Result<Option<u64>, WalError> {
+fn archived_partitions(dir: &Path) -> Result<Vec<ArchivedPartition>, WalError> {
+    read_manifest(dir).map_err(|error| WalError::PartitionManifest {
+        reason: error.to_string(),
+    })
+}
+
+/// `None` when no WAL file, Parquet file or archived partition exists for
+/// `sequence`.
+fn segment_record_count(
+    dir: &Path,
+    sequence: u64,
+    archived: &[ArchivedPartition],
+) -> Result<Option<u64>, WalError> {
     let wal = dir.join(segment_name(sequence));
     match fs::read(&wal) {
         Ok(bytes) => return Ok(Some(scan_segment(&wal, &bytes)?.events.len() as u64)),
@@ -404,7 +425,10 @@ fn segment_record_count(dir: &Path, sequence: u64) -> Result<Option<u64>, WalErr
     }
     let parquet = dir.join(parquet_name(sequence));
     if !parquet.exists() {
-        return Ok(None);
+        return Ok(archived
+            .iter()
+            .find(|partition| partition.sequence == sequence)
+            .map(|partition| partition.events));
     }
     read_event_count_from_file(&parquet)
         .map(Some)

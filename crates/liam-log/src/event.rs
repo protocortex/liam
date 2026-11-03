@@ -243,6 +243,22 @@ impl LogPayload {
             _ => None,
         }
     }
+
+    /// Whether this payload carries rows that a sealing log would seal, so a
+    /// plain one leaves readable content behind.
+    pub fn holds_rows(&self) -> bool {
+        match self {
+            LogPayload::NodeWrite(_)
+            | LogPayload::EdgeWrite(_)
+            | LogPayload::FactWrite { .. }
+            | LogPayload::DerivedArtifact(_)
+            | LogPayload::Feedback { .. }
+            | LogPayload::TierMove { .. } => true,
+            LogPayload::EpisodeBatch(effects) => !effects.is_empty(),
+            LogPayload::AccessBatch { entries, .. } => !entries.is_empty(),
+            _ => false,
+        }
+    }
 }
 
 /// The reads of one lineage in an `AccessBatch`.
