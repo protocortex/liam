@@ -66,6 +66,37 @@ dissolve_grace_runs     = 3       # runs a summary whose cluster is gone waits f
 dissolve_overlap        = 0.5     # share of its items a stored summary must hold to replace it
 max_basis_ids_rendered  = 8       # event ids a provenance line lists before it counts the rest
 
+# Moves items between the hot tier (vectors kept) and the cold tier (vectors
+# dropped, text, edges and a bit signature kept) by how useful they have been.
+# Off until enabled. Producer trust is read from [extraction.trust].
+[tiering]
+enabled                        = false   # false makes the tier step a no-op and counts nothing
+w1                             = 0.4     # weight of the recent hits term
+w2                             = 0.3     # weight of the recency term
+w3                             = 0.2     # weight of the answer contribution term, left out for an item with no verdicts
+w4                             = 0.1     # weight of the producer trust term
+tau_days                       = 30.0    # days over which the recency term falls to 1/e
+hits_cap                       = 20      # hits in the window at which the hits term reaches 1
+promote_threshold              = 0.5     # utility at or above which a cold item is promoted
+demote_threshold               = 0.15    # utility below which a hot item is demoted
+min_residency_days             = 7       # days a promoted item is protected from demotion
+min_item_age_days              = 14      # least age of an item for it to be demoted
+max_promotions_per_run         = 50      # most items one run promotes
+max_demotions_per_run          = 50      # most items one run demotes, halved for each rollback in a row
+window_days                    = 30      # days of usage that count, and of observation needed before any demotion
+usage_flush_secs               = 60      # seconds between flushes of the in-memory access counts to the log
+max_tracked_items              = 10000   # items the in-memory counts hold before the oldest is dropped
+feedback_per_producer_per_hour = 60      # verdicts one producer may give per hour
+feedback_item_cap              = 20      # most recent verdicts on one item that the score reads
+feedback_prior_correct         = 1.0     # pseudo-verdicts of "correct" the contribution rate starts from
+feedback_prior_incorrect       = 1.0     # pseudo-verdicts of "incorrect" the contribution rate starts from
+cooldown_runs                  = 3       # runs a lineage moved by a rolled back run is left alone
+cold_probe_pool                = 24      # cold items the probe contributes to one query
+cold_oversample                = 4       # candidates asked of the signature index per item wanted
+cold_max_hamming_ratio         = 0.35    # share of signature bits that may differ for a cold item to be a candidate
+cold_arm_weight                = 0.5     # factor on the cold probe's contribution to a fused score
+run_deadline_secs              = 600     # bounds the tier step of one run
+
 [embedder]
 provider  = "mock"                       # "mock" (dev) or "local" (in-process)
 model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"
