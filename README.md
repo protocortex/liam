@@ -271,7 +271,15 @@ file `version`:
 | `provider` | `embedder.provider` |
 | `model` | `embedder.model` |
 | `dims` | `embedding_dims` |
-| `prompt_scheme` | A number built into the binary: the version of the convention that turns text into model input. Scheme 1 puts the `query: ` prefix on Qwen3 search queries only; BGE-M3 and the mock embedder get no prefix. |
+| `prompt_scheme` | A number built into the binary: the version of the convention that turns text into model input. Scheme 2 wraps Qwen3 search queries as `Instruct: <task>\nQuery:<query>`, the format on the model card, and leaves stored text plain; BGE-M3 and the mock embedder get no wrapper. Scheme 1 used a `query: ` prefix instead. |
+
+The Qwen3 query text is `Instruct: Given a web search query, retrieve relevant
+passages that answer the query` and a newline, `Query:` and the question.
+Documents are embedded as they are. `liam eval retrieval` scores the same on
+this format as on the old `query: ` prefix (recall@10 0.975, nDCG@10 0.836, MRR
+0.817 either way), because the golden set is too easy to tell them apart. The
+format was adopted for matching what the model was trained on, and the scheme
+bump makes every store written under scheme 1 go through `liam rebuild` once.
 
 Every start of `liamd` and `liamd serve` compares the record with the
 configured values before the store opens. `liamd proxy` opens no store and
@@ -283,7 +291,7 @@ skips the check.
 - **No record, and a database that holds data:** a store from before
   fingerprints. It is taken to hold the configured provider, model and
   dimensions under prompt scheme 0, so it fails the check (the binary is on
-  scheme 1). `liam rebuild` clears this and needs an event log. A store that
+  scheme 2). `liam rebuild` clears this and needs an event log. A store that
   predates the log has none, so `liamd` copies its rows into a new log before
   it runs the check. The start is still refused, but the log now exists: run
   `liam rebuild --database PATH` and start again.
