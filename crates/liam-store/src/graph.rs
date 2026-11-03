@@ -14,6 +14,7 @@ use liam_log::event::{BasisRef, NodeRow};
 use liam_log::LogOffset;
 
 pub use self::backfill::BackfillReport;
+pub use self::deletion_log::DeletionRecord;
 pub use self::fact_read::{FactPage, MAX_SOURCES_PER_FACT};
 pub use self::fact_write::MAX_FACTS_PER_BATCH;
 pub use self::facts::batch_key;
@@ -49,6 +50,7 @@ use crate::value::{Row, Value};
 
 mod arbitration;
 mod backfill;
+mod deletion_log;
 mod fact_projection;
 mod fact_read;
 mod fact_write;
@@ -2508,6 +2510,7 @@ mod tests {
     mod backwards_clock;
     mod catch_up;
     mod cold_probe;
+    mod deletion_log;
     mod derivation;
     mod fact_arbitration;
     mod fact_batch;

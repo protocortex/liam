@@ -113,6 +113,22 @@ impl ProbeSet {
         nodes
     }
 
+    /// Drops the nodes in `ids` from what the probes expect, and a probe left
+    /// expecting nothing, with its baseline score, so a node a delete removed
+    /// is not counted as a loss. Returns how many probes were dropped.
+    pub fn remove_expected_ids(&mut self, ids: &HashSet<String>) -> usize {
+        for probe in &mut self.probes {
+            probe.relevant.retain(|id| !ids.contains(id.as_str()));
+        }
+        let before = self.probes.len();
+        self.probes.retain(|probe| !probe.relevant.is_empty());
+        let kept: HashSet<&str> = self.probes.iter().map(|p| p.name.as_str()).collect();
+        self.baseline
+            .scores
+            .retain(|name, _| kept.contains(name.as_str()));
+        before - self.probes.len()
+    }
+
     /// Splits the set by whether each probe can still be answered. A probe
     /// with a live node stays. A probe whose nodes are all in `swept`, the ones
     /// the run's own sweep removed, is dropped with its baseline score. A probe
@@ -186,6 +202,22 @@ impl ProbeSet {
         );
         Ok(sidecar.set)
     }
+}
+
+/// `ProbeSet::remove_expected_ids` on the set saved at `path`. A run that is
+/// not in progress has no set saved, which leaves nothing to forget.
+///
+/// # Errors
+///
+/// Fails when a saved set cannot be read or written back.
+pub fn forget_expected_ids(path: &Path, ids: &HashSet<String>) -> anyhow::Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut set = ProbeSet::load(path)?;
+    let dropped = set.remove_expected_ids(ids);
+    set.save(path)?;
+    Ok(dropped)
 }
 
 #[cfg(test)]
@@ -350,6 +382,89 @@ mod tests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    fn two_probe_set() -> ProbeSet {
+        let probe = |name: &str, ids: &[&str]| Probe {
+            name: name.into(),
+            query: name.into(),
+            relevant: ids.iter().map(|id| NodeId::from_raw(*id)).collect(),
+            embedding: None,
+        };
+        let score = ProbeScore {
+            recall: 1.0,
+            ndcg: 1.0,
+        };
+        let mut baseline = ProbeReport::default();
+        for name in ["a", "b"] {
+            baseline.scores.insert(name.into(), score);
+        }
+        ProbeSet {
+            probes: vec![probe("a", &["n1"]), probe("b", &["n2", "n3"])],
+            baseline,
+        }
+    }
+
+    fn ids(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_probe_left_expecting_nothing_is_dropped_with_its_baseline() {
+        // Arrange
+        let mut set = two_probe_set();
+
+        // Act
+        let dropped = set.remove_expected_ids(&ids(&["n1"]));
+
+        // Assert
+        assert_eq!(dropped, 1);
+        assert_eq!(set.probes.len(), 1);
+        assert_eq!(set.probes[0].name, "b");
+        assert_eq!(set.baseline.scores.keys().collect::<Vec<_>>(), ["b"]);
+    }
+
+    #[test]
+    fn a_probe_that_still_expects_a_node_keeps_it_and_its_baseline() {
+        // Arrange
+        let mut set = two_probe_set();
+
+        // Act
+        let dropped = set.remove_expected_ids(&ids(&["n2"]));
+
+        // Assert
+        assert_eq!(dropped, 0);
+        assert_eq!(set.probes[1].relevant, [NodeId::from_raw("n3")]);
+        assert_eq!(set.baseline.scores.len(), 2);
+    }
+
+    #[test]
+    fn forgetting_ids_rewrites_the_saved_set() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let path = probe_set_path_for(&dir.path().join("liam.db"));
+        two_probe_set().save(&path).unwrap();
+
+        // Act
+        let dropped = forget_expected_ids(&path, &ids(&["n1"])).unwrap();
+
+        // Assert
+        assert_eq!(dropped, 1);
+        assert_eq!(ProbeSet::load(&path).unwrap().probes.len(), 1);
+    }
+
+    #[test]
+    fn forgetting_ids_with_no_saved_set_does_nothing() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let path = probe_set_path_for(&dir.path().join("liam.db"));
+
+        // Act
+        let dropped = forget_expected_ids(&path, &ids(&["n1"])).unwrap();
+
+        // Assert
+        assert_eq!(dropped, 0);
+        assert!(!path.exists());
     }
 
     #[tokio::test]

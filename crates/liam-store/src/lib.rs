@@ -26,9 +26,9 @@ pub use error::{Error, MismatchSource, Result};
 pub use graph::{
     batch_key, child_hash, dequantize, hamming, quantize, recover_interrupted_restore,
     validate_scope, verify_snapshot, BackfillReport, Candidate, CatchUpReport, ContentEmbedder,
-    EmbedError, EventLog, FactPage, Graph, IndexedEntry, LineageStore, PoisonHook, QuantIndex,
-    Quantized, RebuildMode, RebuildReport, ReembedReport, ScrubReport, SharedLog, Snapshot,
-    SnapshotLog, SnapshotMeta, BITS_PER_WORD, GRAPH_STORE, MAX_FACTS_PER_BATCH,
+    DeletionRecord, EmbedError, EventLog, FactPage, Graph, IndexedEntry, LineageStore, PoisonHook,
+    QuantIndex, Quantized, RebuildMode, RebuildReport, ReembedReport, ScrubReport, SharedLog,
+    Snapshot, SnapshotLog, SnapshotMeta, BITS_PER_WORD, GRAPH_STORE, MAX_FACTS_PER_BATCH,
     MAX_SOURCES_PER_FACT, RUN_SOURCE_PREFIX,
 };
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
