@@ -4,7 +4,7 @@
 //! label, and every item can carry the provenance line that says where it came
 //! from.
 
-use liam_store::{Basis, EventRef, Retrieved};
+use liam_store::{Basis, EventRef, NodeId, Retrieved};
 
 use crate::ask::fmt_millis;
 
@@ -22,6 +22,11 @@ pub fn derivation_label(retrieved: &Retrieved) -> &'static str {
 pub fn bracket_head(kind: &str, handle: &str, label: &str, known_since_ms: Option<i64>) -> String {
     let head = format!("[{kind} {handle}] {label}");
     with_known_since(head, known_since_ms)
+}
+
+/// `handle: {handle}`, the name `feedback` accepts for a node-backed result.
+pub fn handle_text(node: &NodeId) -> String {
+    format!("handle: {}", node.handle())
 }
 
 /// `[{n}] ({kind}) {label} — known since {date}`, the head of an evidence block.

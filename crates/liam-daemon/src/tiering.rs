@@ -8,5 +8,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 mod planner;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod usage;
 mod utility;

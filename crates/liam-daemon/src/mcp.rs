@@ -8,6 +8,7 @@
 //! against the rmcp version you pin before bumping again.
 
 pub mod facts;
+pub mod feedback;
 pub mod producer;
 pub mod summaries;
 #[cfg(test)]
@@ -32,6 +33,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use self::facts::FactsArgs;
+use self::feedback::{Feedback, FeedbackArgs};
 use self::summaries::SummariesArgs;
 use crate::ask::{
     self, build_ask_prompt, clamp_ask_k, estimate_tokens, fallback_answer, fit_evidence_to_budget,
@@ -609,6 +611,9 @@ pub struct MemoryServer {
     vocabulary: Arc<Vocabulary>,
     /// Counts the results `recall` and `ask` return, when tiering is on.
     usage: Option<Arc<UsageRecorder>>,
+    /// The verdict budget and this connection's issued handles, when tiering
+    /// is on. A clone starts with no handles issued.
+    feedback: Option<Feedback>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -692,6 +697,7 @@ impl MemoryServer {
             shutdown: CancellationToken::new(),
             vocabulary: Arc::new(resolve_vocabulary(&ExtractionConfig::default())),
             usage: None,
+            feedback: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -724,6 +730,20 @@ impl MemoryServer {
     pub(crate) fn with_usage_recorder(mut self, recorder: Arc<UsageRecorder>) -> Self {
         self.usage = Some(recorder);
         self
+    }
+
+    /// Accepts verdicts through `feedback`, `per_hour` from each producer, on
+    /// up to `max_issued` results shown to a connection.
+    pub(crate) fn with_feedback(mut self, per_hour: u32, max_issued: usize) -> Self {
+        self.feedback = Some(Feedback::new(per_hour, max_issued));
+        self
+    }
+
+    /// Makes the results a client is shown ones it can give a verdict on.
+    fn issue_handles<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
+        if let Some(feedback) = &self.feedback {
+            feedback.issue(nodes);
+        }
     }
 
     /// Counts one hit on each node a client was given as a ranked result.
@@ -1251,6 +1271,7 @@ impl MemoryServer {
             return "no relevant memory".to_string();
         }
         self.record_usage(hits.iter().filter(|h| !h.expanded).map(|h| &h.hit.id));
+        self.issue_handles(hits.iter().map(|h| &h.hit.id));
         let docs: Vec<String> = hits
             .iter()
             .map(|h| h.hit.retrieved.as_text().to_string())
@@ -1446,6 +1467,14 @@ impl MemoryServer {
     }
 
     #[tool(
+        description = "Say whether a result recall or ask returned was correct, using its handle. \
+                       Verdicts decide which memories stay fast to search."
+    )]
+    pub(crate) async fn feedback(&self, Parameters(args): Parameters<FeedbackArgs>) -> String {
+        feedback::give(self, args).await
+    }
+
+    #[tool(
         description = "List the summaries LIAM has written over memory, or show one with what it \
          was built from. Summaries are inferred: model-written from recorded memory, never \
          recorded themselves, and each lists the events it rests on. Filter by level, scope or a \
@@ -1597,6 +1626,7 @@ impl MemoryServer {
             .unwrap_or_else(|_| (0..docs.len()).collect());
         let evidence: Vec<ask::Evidence> = order.iter().map(|&i| candidates[i].clone()).collect();
         if mode == Mode::Strict {
+            self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
             self.record_evidence_usage(&evidence);
             return ask::strict_answer(&evidence, self.max_basis_ids_rendered);
         }
@@ -1615,6 +1645,9 @@ impl MemoryServer {
                     .unwrap_or_else(|| estimate_tokens(s))
             },
         );
+
+        // Every reply from here on shows these results, with their handles.
+        self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
 
         // One deadline for the whole request: the permit acquire, the
         // sufficiency pre-pass, and synthesis below all race against this

@@ -41,7 +41,7 @@ use liam_store::{Derivation, NodeId, Retrieved};
 /// What a summary is called where evidence is listed.
 const SUMMARY_KIND: &str = "summary";
 
-use crate::render::{derivation_label, evidence_head, provenance_line};
+use crate::render::{derivation_label, evidence_head, handle_text, provenance_line};
 
 /// An owned, LLM-ready view of one retrieved row. The label fields are
 /// fence-neutralized, and `content()` cuts the typed text to the prompt cap.
@@ -237,6 +237,10 @@ fn render_evidence(evidence: &[Evidence], audience: Audience) -> String {
                 Audience::Model => format!("derivation: {}", derivation_label(&e.retrieved)),
                 Audience::Reader { max_ids } => provenance_line(&e.retrieved, max_ids),
             });
+            // The model has no use for a handle and it would cost prompt budget.
+            if let (Audience::Reader { .. }, Some(node)) = (audience, &e.node_id) {
+                body.push(handle_text(node));
+            }
             format!(
                 "{FENCE_OPEN} {n}>>>\n{}\n{}\n{FENCE_CLOSE} {n}>>>",
                 evidence_head(n, &e.kind, &e.label, e.valid_from_ms),
@@ -441,14 +445,20 @@ pub fn is_grounded(answer: &str, question: &str, evidence: &[Evidence]) -> bool 
 
 /// The model's answer as an `answer (inferred)` block whose provenance names the
 /// evidence it was built from, followed by a compact `Sources:` index mapping [n]
-/// to `kind/label — known since <date>` and each source's provenance line.
+/// to `kind/label — known since <date>` (and the handle of a stored node, which
+/// `feedback` takes) and each source's provenance line.
 pub fn format_answer(answer: &str, evidence: &[Evidence], max_ids: usize) -> String {
     let sources = evidence
         .iter()
         .enumerate()
         .map(|(i, e)| {
+            let handle = e
+                .node_id
+                .as_ref()
+                .map(|node| format!(" {}", handle_text(node)))
+                .unwrap_or_default();
             format!(
-                "[{}] {}/{} — known since {}\n{}",
+                "[{}] {}/{} — known since {}{handle}\n{}",
                 i + 1,
                 e.kind,
                 e.label,
@@ -849,6 +859,46 @@ mod tests {
         assert!(out.starts_with("answer (inferred):\nThe sky is blue."));
         assert!(out.contains("Sources:"));
         assert!(out.contains("[1]"));
+    }
+
+    #[test]
+    fn a_stored_node_shows_its_handle_on_its_source_line_and_a_summary_shows_none() {
+        // Arrange
+        let node = NodeId::from_raw("01M6FHXD6P4B6ZZZZZZZZZZZZZ");
+        let stored = Evidence {
+            node_id: Some(node.clone()),
+            ..evidence("fact", "Sky color", "The sky is blue.", 0)
+        };
+        let summary = evidence("summary", "level 1", "Skies are blue.", 0);
+
+        // Act
+        let out = format_answer("The sky is blue.", &[stored, summary], TEST_MAX_IDS);
+
+        // Assert
+        let sources: Vec<&str> = out.lines().filter(|line| line.starts_with('[')).collect();
+        assert_eq!(sources.len(), 2, "{out}");
+        assert!(
+            sources[0].ends_with("known since 1970-01-01 handle: 01M6FHXD6P4B6"),
+            "{out}"
+        );
+        assert!(!sources[1].contains("handle:"), "{out}");
+    }
+
+    #[test]
+    fn a_reader_block_shows_a_stored_nodes_handle_and_the_model_prompt_does_not() {
+        // Arrange
+        let stored = Evidence {
+            node_id: Some(NodeId::from_raw("01M6FHXD6P4B6ZZZZZZZZZZZZZ")),
+            ..evidence("fact", "Sky color", "The sky is blue.", 0)
+        };
+
+        // Act
+        let (_, prompt) = build_ask_prompt("What color is the sky?", std::slice::from_ref(&stored));
+        let shown = strict_answer(std::slice::from_ref(&stored), TEST_MAX_IDS);
+
+        // Assert
+        assert!(shown.contains("\nhandle: 01M6FHXD6P4B6"), "{shown}");
+        assert!(!prompt.contains("handle:"));
     }
 
     #[test]

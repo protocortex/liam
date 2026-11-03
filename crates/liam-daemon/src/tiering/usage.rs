@@ -362,8 +362,9 @@ impl UsageFlush {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use liam_store::{DefaultGraph, FixedClock, GraphConfig, NewNode};
+    use liam_store::{FixedClock, NewNode};
 
+    use super::super::test_support::logged_store;
     use super::*;
 
     const AT: Millis = Millis(5 * 86_400_000);
@@ -648,29 +649,7 @@ mod tests {
     async fn the_real_store_gets_one_entry_per_lineage_and_each_flush_adds_to_it() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let log_dir = dir.path().join("events");
-        let writer = liam_daemon::event_log::open_writer(
-            &log_dir,
-            crate::config::LogConfig::default().wal(),
-        )
-        .unwrap();
-        let log = liam_daemon::event_log::shared_log(
-            writer,
-            &log_dir,
-            liam_log::dedup::BloomConfig::default(),
-            None,
-        )
-        .unwrap();
-        let store = DefaultGraph::open_with_clock(
-            ":memory:",
-            GraphConfig::new(DIMS),
-            Arc::new(FixedClock::new(AT)),
-        )
-        .await
-        .unwrap()
-        .with_log(log)
-        .await
-        .unwrap();
+        let store = logged_store(dir.path(), Arc::new(FixedClock::new(AT)), DIMS).await;
         let first = store
             .insert(NewNode::now("fact", "ada", "ada's role").with_subject("ada"))
             .await
