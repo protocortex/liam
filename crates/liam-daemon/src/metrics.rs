@@ -4,6 +4,8 @@
 //! lineage key, so keeping metrics cannot defeat a delete.
 
 pub mod alerts;
+pub mod collect;
+pub mod memory;
 pub mod sink;
 
 use alerts::{Rule, RuleSet};
