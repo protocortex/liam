@@ -85,7 +85,9 @@ fn texts_by_scope(payload: &LogPayload) -> BTreeMap<Option<String>, String> {
         | LogPayload::DerivedArtifactClosed { .. }
         | LogPayload::AccessBatch { .. }
         | LogPayload::Feedback { .. }
-        | LogPayload::TierMove { .. } => Vec::new(),
+        | LogPayload::TierMove { .. }
+        // Rows are opened by the log reader before extraction sees them.
+        | LogPayload::Sealed(_) => Vec::new(),
     };
     let mut by_scope: BTreeMap<Option<String>, String> = BTreeMap::new();
     for row in rows.into_iter().filter(|row| !is_entity_page(row)) {

@@ -9,6 +9,7 @@
 pub mod compactor;
 pub mod crypto;
 pub mod dedup;
+pub mod envelope;
 pub mod event;
 pub mod filter_file;
 pub mod hash;
@@ -21,6 +22,13 @@ use uuid::Uuid;
 
 use crate::event::LogEvent;
 use crate::wal::WalError;
+
+/// An event's id, as the log stamps it.
+pub type EventId = String;
+/// The id of a key group in the key registry.
+pub type KeyId = String;
+/// The id of a delete job.
+pub type JobId = String;
 
 /// Where an appended record sits: the sequence number of its segment and its
 /// ordinal within that segment, so the position does not depend on record size.

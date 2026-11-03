@@ -149,6 +149,9 @@ struct Inner {
 /// guarantees that), so there is no file lock.
 pub struct KeyRegistry {
     inner: Mutex<Inner>,
+    /// Held across a seal and its append, and taken to mark a group, so no
+    /// append lands after the mark.
+    write_gate: Mutex<()>,
 }
 
 impl KeyRegistry {
@@ -169,7 +172,15 @@ impl KeyRegistry {
         inner.reconcile_destroyed()?;
         Ok(Self {
             inner: Mutex::new(inner),
+            write_gate: Mutex::new(()),
         })
+    }
+
+    /// Writers hold this from sealing a record until it is appended.
+    pub fn write_gate(&self) -> MutexGuard<'_, ()> {
+        self.write_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -214,6 +225,7 @@ impl KeyRegistry {
     /// Marks a group so no writer may use it and readers treat its rows as
     /// shredded. Idempotent.
     pub fn begin_destroy(&self, key_id: &str) -> Result<(), CryptoError> {
+        let _gate = self.write_gate();
         let mut inner = self.lock();
         match inner.state_of(key_id)? {
             KeyState::Active => inner.set_state(key_id, KeyState::Destroying),
@@ -242,6 +254,7 @@ impl KeyRegistry {
     /// destroyed anything. A group whose destroy reached the index, or whose
     /// bytes are already gone, cannot return.
     pub fn cancel_destroy(&self, key_id: &str) -> Result<(), CryptoError> {
+        let _gate = self.write_gate();
         let mut inner = self.lock();
         match inner.state_of(key_id)? {
             KeyState::Destroyed => Err(CryptoError::KeyDestroyed {

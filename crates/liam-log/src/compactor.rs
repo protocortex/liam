@@ -985,6 +985,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sealed_event_round_trips_through_parquet_under_schema_version_six() {
+        // Arrange
+        let keys = tempfile::tempdir().expect("temp dir");
+        let registry = Arc::new(
+            crate::crypto::KeyRegistry::open(
+                keys.path(),
+                Arc::new(crate::crypto::TestMaster::new(1)),
+            )
+            .expect("registry"),
+        );
+        let mut node = node_row("n1", "label");
+        node.subject = Some("alice".into());
+        let mut plain = event(1);
+        plain.payload = LogPayload::NodeWrite(node);
+        let sealed = crate::envelope::Sealer::new(registry)
+            .seal(&plain, &crate::envelope::KeyHints::default())
+            .expect("seal");
+
+        // Act
+        let batch = events_to_batch(std::slice::from_ref(&sealed)).expect("to batch");
+        let back = batch_to_events(&batch).expect("from batch");
+
+        // Assert
+        assert_eq!(back, vec![sealed.clone()]);
+        assert_eq!(back[0].encryption_key_id, sealed.encryption_key_id);
+        assert_eq!(
+            batch.schema().metadata().get(SCHEMA_VERSION_KEY),
+            Some(&"6".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn events_round_trip_through_parquet_exactly() {
         // Arrange
         let mut distinct = distinct_event();

@@ -152,7 +152,8 @@ pub fn content_hashes(event: &LogEvent) -> Vec<([u8; 32], String)> {
         | LogPayload::DerivedArtifactClosed { .. }
         | LogPayload::AccessBatch { .. }
         | LogPayload::Feedback { .. }
-        | LogPayload::TierMove { .. } => Vec::new(),
+        | LogPayload::TierMove { .. }
+        | LogPayload::Sealed(_) => Vec::new(),
     }
 }
 
