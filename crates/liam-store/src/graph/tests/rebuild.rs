@@ -747,7 +747,7 @@ async fn rebuild_without_an_embedder_reports_the_nodes_pending_instead_of_failin
 /// Puts a row in every table a rebuild empties but `nodes`, `edges`,
 /// `node_events` and `log_hash_index`, which `populate` fills, and names the
 /// tables it did.
-async fn seed_derived_tables(live: &Opened) -> [&'static str; 19] {
+async fn seed_derived_tables(live: &Opened) -> [&'static str; 24] {
     let g = &live.graph;
     let node_id = g
         .backend
@@ -767,6 +767,13 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 19] {
          VALUES (1, 1, 1, 1)",
         "INSERT INTO provenance_repair_state (id, last_repaired_at) VALUES (1, 5)",
         "INSERT INTO quant_backfill_state (id, completed_at, filled) VALUES (1, 5, 0)",
+        "INSERT OR REPLACE INTO lineage_backfill_state (id, completed_at, filled) VALUES (1, 5, 0)",
+        "INSERT INTO item_tier (lineage_key, tier, changed_at) VALUES ('n:1:x', 'cold', 5)",
+        "INSERT INTO item_usage_events (event_id, lineage_key, day, hits, last_access_at)
+         VALUES ('event-u', 'n:1:x', 1, 1, 5)",
+        "INSERT INTO usage_epochs (event_id, day) VALUES ('event-u', 1)",
+        "INSERT INTO item_feedback (event_id, lineage_key, producer, at, day, correct, counted)
+         VALUES ('event-f', 'n:1:x', 'p', 5, 0, 1, 1)",
         "INSERT OR REPLACE INTO derivation_backfill_state (id, completed_at, flagged)
          VALUES (1, 5, 0)",
         "INSERT INTO entity_mention_state
@@ -807,6 +814,11 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 19] {
         "cluster_state",
         "provenance_repair_state",
         "quant_backfill_state",
+        "lineage_backfill_state",
+        "item_tier",
+        "item_usage_events",
+        "usage_epochs",
+        "item_feedback",
         "derivation_backfill_state",
         "entity_mention_state",
         "log_quarantine",

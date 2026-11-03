@@ -377,6 +377,58 @@ CREATE TABLE IF NOT EXISTS quant_backfill_state (
   completed_at INTEGER NOT NULL,
   filled       INTEGER NOT NULL
 );
+
+-- Set once the one-time pass that gives an existing node its lineage has run.
+CREATE TABLE IF NOT EXISTS lineage_backfill_state (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  completed_at INTEGER NOT NULL,
+  filled       INTEGER NOT NULL
+);
+
+-- State keyed by a lineage, not a node, so a new version inherits it. A lineage
+-- with no row is hot. residency_until is NULL for a lineage no run promoted.
+CREATE TABLE IF NOT EXISTS item_tier (
+  lineage_key     TEXT    NOT NULL PRIMARY KEY,
+  tier            TEXT    NOT NULL CHECK (tier IN ('hot', 'cold')),
+  changed_at      INTEGER NOT NULL,
+  residency_until INTEGER,
+  last_event_id   TEXT
+);
+
+-- One row per logged usage batch and lineage, so a replay is idempotent by
+-- event. day is days since the epoch.
+CREATE TABLE IF NOT EXISTS item_usage_events (
+  event_id       TEXT    NOT NULL,
+  lineage_key    TEXT    NOT NULL,
+  day            INTEGER NOT NULL,
+  hits           INTEGER NOT NULL,
+  last_access_at INTEGER NOT NULL,
+  PRIMARY KEY (event_id, lineage_key)
+);
+
+CREATE INDEX IF NOT EXISTS item_usage_by_lineage ON item_usage_events (lineage_key);
+CREATE INDEX IF NOT EXISTS item_usage_by_day ON item_usage_events (day);
+
+-- One row per usage batch, even an empty one: the earliest is when usage
+-- started to be observed.
+CREATE TABLE IF NOT EXISTS usage_epochs (
+  event_id TEXT    NOT NULL PRIMARY KEY,
+  day      INTEGER NOT NULL
+);
+
+-- Every feedback event, with whether it counts: only the first of a producer on
+-- a lineage in a day does.
+CREATE TABLE IF NOT EXISTS item_feedback (
+  event_id    TEXT    NOT NULL PRIMARY KEY,
+  lineage_key TEXT    NOT NULL,
+  producer    TEXT    NOT NULL,
+  at          INTEGER NOT NULL,
+  day         INTEGER NOT NULL,
+  correct     INTEGER NOT NULL CHECK (correct IN (0, 1)),
+  counted     INTEGER NOT NULL CHECK (counted IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS item_feedback_by_lineage ON item_feedback (lineage_key, producer, day);
 ",
     )
 }
@@ -395,7 +447,7 @@ pub(crate) enum Clear {
 /// the assignments, otherwise its fingerprint would vouch for communities that
 /// are no longer there. The backend's vector table goes before all of them, as
 /// `Backend::vector_clear_sql` returns it.
-pub(crate) const DERIVED_TABLES: [(&str, Clear); 25] = [
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 30] = [
     // No foreign keys link the fact tables, so their order among themselves is free.
     ("fact_sources", Clear::Always),
     ("fact_suppressions", Clear::Always),
@@ -415,6 +467,11 @@ pub(crate) const DERIVED_TABLES: [(&str, Clear); 25] = [
     ("node_quant", Clear::Always),
     ("node_lineage", Clear::Always),
     ("quant_backfill_state", Clear::Always),
+    ("lineage_backfill_state", Clear::Always),
+    ("item_tier", Clear::Always),
+    ("item_usage_events", Clear::Always),
+    ("usage_epochs", Clear::Always),
+    ("item_feedback", Clear::Always),
     ("node_community", Clear::Always),
     ("cluster_state", Clear::Always),
     ("edges", Clear::Always),

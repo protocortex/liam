@@ -24,6 +24,10 @@ pub enum Error {
     #[error("signature width mismatch: expected {expected} words, got {got}")]
     SignatureWidth { expected: usize, got: usize },
 
+    /// A stored tier is neither `hot` nor `cold`. It is never read as a default.
+    #[error("unknown tier: {0}")]
+    UnknownTier(String),
+
     #[error("node not found: {0}")]
     NodeNotFound(String),
 

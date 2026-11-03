@@ -78,6 +78,7 @@ impl<B: Backend> Graph<B> {
         // The rest is not a log write, so writers need not wait for it.
         drop(held);
         self.backend.vector_sweep_orphans().await?;
+        self.prune_tier_state().await?;
         if policy.reclaim {
             self.backend
                 .execute("PRAGMA incremental_vacuum", &[])
