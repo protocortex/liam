@@ -72,10 +72,10 @@ async fn a_run_records_the_sizes_the_store_and_the_disk_hold() {
     let started = started_with_nodes(dir.path()).await;
     let clock = Arc::new(FixedClock::new(Millis(1_000)));
     let sink = Arc::new(MemorySink::new(clock.clone()));
-    let metrics = Metrics::new(sink.clone(), clock, 2);
 
     // Act
-    sources(dir.path(), started.store).record(&metrics).await;
+    let readings = sources(dir.path(), started.store).read().await;
+    readings.into_iter().for_each(|sample| sink.record(sample));
 
     // Assert
     let value = |metric| reading(&sink, metric).map(|reading| reading.value);
@@ -121,13 +121,16 @@ async fn with_extraction_on_a_run_records_both_backlogs_and_the_cache_hit_rate()
     let started = started_with_nodes(dir.path()).await;
     let clock = Arc::new(FixedClock::new(Millis(1_000)));
     let sink = Arc::new(MemorySink::new(clock.clone()));
-    let metrics = Metrics::new(sink.clone(), clock, 2);
     let mut sources = sources(dir.path(), started.store);
     sources.extraction = Some(Arc::new(CachedExtraction));
     let total = events_after(&log_dir_in(dir.path()), None).await.unwrap();
 
     // Act
-    sources.record(&metrics).await;
+    sources
+        .read()
+        .await
+        .into_iter()
+        .for_each(|sample| sink.record(sample));
 
     // Assert
     let value = |metric| reading(&sink, metric).map(|reading| reading.value);

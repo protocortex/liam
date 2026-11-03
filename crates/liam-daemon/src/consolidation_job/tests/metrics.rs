@@ -73,3 +73,65 @@ async fn a_rolled_back_run_adds_one_to_the_rollback_count() {
     assert_eq!(outcome, Some(RunOutcome::RolledBack));
     assert_eq!(value(&sink, MetricId::RollbackCount), Some(1.0));
 }
+
+#[tokio::test]
+async fn a_real_rollback_raises_the_rollback_alert_without_an_injected_sample() {
+    // Arrange
+    let mut harness = Harness::new();
+    harness.config.metrics.rollback_ceiling = 1.0;
+    let (store, _clock) = harness.store_at(Millis(100 * DAY)).await;
+    keep_one_fact(&store).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let metrics = crate::metrics::build(
+        &harness.config.metrics,
+        &database_in(&harness.root),
+        harness.config.deletion.deadline_days,
+    );
+    let job = harness.job_measured(
+        &server,
+        regresses(),
+        None,
+        ConsolidationHookSet::default(),
+        Some(metrics.clone()),
+    );
+
+    // Act
+    let outcome = job.tick().await;
+
+    // Assert
+    assert_eq!(outcome, Some(RunOutcome::RolledBack));
+    let alerts = metrics.snapshot().await.alerts;
+    assert!(
+        alerts
+            .iter()
+            .any(|alert| alert.metric == MetricId::RollbackCount),
+        "{alerts:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_committed_first_run_raises_no_alert() {
+    // Arrange
+    let harness = Harness::new();
+    let (store, _clock) = harness.store_at(Millis(1000)).await;
+    keep_one_fact(&store).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let metrics = crate::metrics::build(
+        &harness.config.metrics,
+        &database_in(&harness.root),
+        harness.config.deletion.deadline_days,
+    );
+    let job = harness.job_measured(
+        &server,
+        honest(),
+        None,
+        ConsolidationHookSet::default(),
+        Some(metrics.clone()),
+    );
+
+    // Act
+    job.tick().await;
+
+    // Assert
+    assert!(metrics.snapshot().await.alerts.is_empty());
+}

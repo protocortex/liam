@@ -438,10 +438,11 @@ impl ConsolidationJob {
             Ok(run) => {
                 report(&run.run_id, run.outcome);
                 if let Some(run_metrics) = &self.metrics {
+                    let readings = run_metrics.sources.read().await;
                     run_metrics
                         .metrics
-                        .run_finished(run.outcome, started.elapsed());
-                    run_metrics.sources.record(&run_metrics.metrics).await;
+                        .finish_run(run.outcome, started.elapsed(), readings)
+                        .await;
                 }
             }
             Err(error) => {

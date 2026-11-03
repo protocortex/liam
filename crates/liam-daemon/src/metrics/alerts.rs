@@ -203,7 +203,13 @@ pub fn evaluate_run(
     if restore_failed {
         return Ok(Vec::new());
     }
-    let LoadedState { mut state, .. } = AlertState::load(state_path);
+    let LoadedState {
+        mut state,
+        warnings,
+    } = AlertState::load(state_path);
+    if warnings > 0 {
+        tracing::warn!("the alert state was reset, so this run raises no relative alerts");
+    }
     let alerts = evaluate(&state, observations, rules, at);
     state.remember(observations, at);
     state.save(state_path)?;

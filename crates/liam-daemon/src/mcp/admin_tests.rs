@@ -197,7 +197,7 @@ async fn delete_wants_exactly_one_target() {
 }
 
 #[tokio::test]
-async fn the_tool_set_is_the_existing_tools_plus_delete_and_consolidate() {
+async fn the_tool_set_is_the_existing_tools_plus_delete_consolidate_and_metrics() {
     // Arrange
     let fixture = Fixture::new(&[ADMIN]).await;
 
@@ -218,9 +218,15 @@ async fn the_tool_set_is_the_existing_tools_plus_delete_and_consolidate() {
         "ask",
         "delete",
         "consolidate",
+        "metrics",
     ]
     .into();
     assert_eq!(names, expected);
+    let metrics = tools.iter().find(|tool| tool.name == "metrics").unwrap();
+    let schema = serde_json::to_string(&metrics.input_schema).unwrap();
+    for field in ["\"metric\"", "\"limit\""] {
+        assert!(schema.contains(field), "{field} missing from {schema}");
+    }
     let delete = tools.iter().find(|tool| tool.name == "delete").unwrap();
     let schema = serde_json::to_string(&delete.input_schema).unwrap();
     for field in [

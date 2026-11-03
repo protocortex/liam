@@ -17,8 +17,6 @@ mod eval;
 mod extraction;
 mod log_startup;
 mod mcp;
-// Collectors and the `metrics` tool use these in the changes that follow.
-#[allow(dead_code)]
 mod metrics;
 mod render;
 mod shutdown;
@@ -239,10 +237,13 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         ),
         None => server,
     };
-    let metrics = config
-        .metrics
-        .enabled
-        .then(|| metrics::build(&config.metrics));
+    let metrics = config.metrics.enabled.then(|| {
+        metrics::build(
+            &config.metrics,
+            &database_path,
+            config.deletion.deadline_days,
+        )
+    });
     let server = match &metrics {
         Some(metrics) => server.with_metrics(metrics.clone()),
         None => server,

@@ -158,3 +158,202 @@ fn a_probe_report_gives_the_mean_recall() {
     let recall = reading(&sink, MetricId::ProbeRecallAt10, Labels::None).unwrap();
     assert_eq!(recall.value, 0.5);
 }
+
+const HOUR: i64 = 3_600_000;
+const SAMPLES_ENOUGH: usize = 3;
+
+/// A recorder whose clock the test sets, judging under the default rules.
+fn judging(dir: &std::path::Path) -> (Arc<Metrics>, Arc<MemorySink>, Arc<FixedClock>) {
+    let clock = Arc::new(FixedClock::new(Millis(0)));
+    let sink = Arc::new(MemorySink::new(clock.clone()));
+    let config = crate::config::MetricsConfig {
+        min_samples: 1,
+        rollback_ceiling: 1.0,
+        extraction_backlog_ceiling: 100.0,
+        model_calls_per_hour: 10.0,
+        delta_pct: 20.0,
+        ..crate::config::MetricsConfig::default()
+    };
+    let metrics = Metrics::new(sink.clone(), clock.clone(), SAMPLES_ENOUGH).with_alerts(
+        crate::metrics::alerts::state_path_for(&dir.join("liam.db")),
+        crate::metrics::rules(&config, 30),
+    );
+    (Arc::new(metrics), sink, clock)
+}
+
+fn sample(metric: MetricId, value: f64, at: i64) -> Sample {
+    Sample {
+        metric,
+        value,
+        labels: Labels::None,
+        at: Millis(at),
+    }
+}
+
+async fn run(
+    metrics: &Metrics,
+    clock: &FixedClock,
+    at: i64,
+    outcome: RunOutcome,
+    readings: Vec<Sample>,
+) {
+    clock.set(Millis(at));
+    metrics.finish_run(Some(outcome), ms(1), readings).await;
+}
+
+fn alerting(sink: &MemorySink) -> Vec<MetricId> {
+    sink.snapshot()
+        .alerts
+        .iter()
+        .map(|alert| alert.metric)
+        .collect()
+}
+
+#[tokio::test]
+async fn each_kind_of_rule_raises_its_alert_on_a_staged_excursion() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    let (metrics, sink, clock) = judging(dir.path());
+    let healthy = vec![
+        sample(MetricId::ProbeRecallAt10, 1.0, 0),
+        sample(MetricId::DeletionBacklogAgeDays, 1.0, 0),
+        sample(MetricId::RulesExtractionBacklog, 5.0, 0),
+    ];
+    run(&metrics, &clock, 0, RunOutcome::Committed, healthy).await;
+    assert!(alerting(&sink).is_empty(), "the first run raises nothing");
+    let mut model_calls = Sample {
+        labels: Labels::Provider(crate::metrics::sink::Provider::Local),
+        ..sample(MetricId::ModelCalls, 0.0, 0)
+    };
+    metrics.sink.record(model_calls);
+    run(&metrics, &clock, HOUR, RunOutcome::Committed, vec![]).await;
+    model_calls.value = 50.0;
+
+    // Act
+    let excursion = vec![
+        sample(MetricId::ProbeRecallAt10, 0.5, 2 * HOUR),
+        sample(MetricId::DeletionBacklogAgeDays, 30.0, 2 * HOUR),
+        sample(MetricId::RulesExtractionBacklog, 100.0, 2 * HOUR),
+        model_calls,
+    ];
+    run(&metrics, &clock, 2 * HOUR, RunOutcome::Committed, excursion).await;
+
+    // Assert
+    let raised = alerting(&sink);
+    for metric in [
+        MetricId::ProbeRecallAt10,
+        MetricId::DeletionBacklogAgeDays,
+        MetricId::RulesExtractionBacklog,
+        MetricId::ModelCalls,
+    ] {
+        assert!(raised.contains(&metric), "{metric} missing from {raised:?}");
+    }
+    let age_alerts = raised
+        .iter()
+        .filter(|metric| **metric == MetricId::DeletionBacklogAgeDays)
+        .count();
+    assert_eq!(age_alerts, 2, "the warning and the deadline both fire");
+}
+
+#[tokio::test]
+async fn an_alert_clears_on_the_run_after_the_recovery() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    let (metrics, sink, clock) = judging(dir.path());
+    let backlog = |value| vec![sample(MetricId::ModelExtractionBacklog, value, 0)];
+    run(&metrics, &clock, 0, RunOutcome::Committed, backlog(1.0)).await;
+    run(
+        &metrics,
+        &clock,
+        HOUR,
+        RunOutcome::Committed,
+        backlog(500.0),
+    )
+    .await;
+    assert_eq!(alerting(&sink), [MetricId::ModelExtractionBacklog]);
+
+    // Act
+    run(
+        &metrics,
+        &clock,
+        2 * HOUR,
+        RunOutcome::Committed,
+        backlog(2.0),
+    )
+    .await;
+
+    // Assert
+    assert!(alerting(&sink).is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_restore_neither_judges_nor_remembers_nor_clears() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    let (metrics, sink, clock) = judging(dir.path());
+    let backlog = |value| vec![sample(MetricId::RulesExtractionBacklog, value, 0)];
+    run(&metrics, &clock, 0, RunOutcome::Committed, backlog(500.0)).await;
+    let state = crate::metrics::alerts::state_path_for(&dir.path().join("liam.db"));
+    let before = std::fs::read(&state).unwrap();
+
+    // Act
+    run(
+        &metrics,
+        &clock,
+        HOUR,
+        RunOutcome::RestoreFailed,
+        backlog(1.0),
+    )
+    .await;
+
+    // Assert
+    assert_eq!(std::fs::read(&state).unwrap(), before);
+    assert_eq!(alerting(&sink), [MetricId::RulesExtractionBacklog]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_never_sees_one_runs_readings_with_the_previous_runs_alerts() {
+    // Arrange
+    const ROUNDS: i64 = 200;
+    let dir = tempfile::tempdir().unwrap();
+    let (metrics, _sink, clock) = judging(dir.path());
+    let writer = {
+        let (metrics, clock) = (metrics.clone(), clock.clone());
+        tokio::spawn(async move {
+            for round in 1..=ROUNDS {
+                let backlog = sample(
+                    MetricId::RulesExtractionBacklog,
+                    100.0 + round as f64,
+                    round,
+                );
+                run(
+                    &metrics,
+                    &clock,
+                    round,
+                    RunOutcome::Committed,
+                    vec![backlog],
+                )
+                .await;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    // Act and Assert
+    while !writer.is_finished() {
+        let snapshot = metrics.snapshot().await;
+        let reading = snapshot
+            .readings
+            .iter()
+            .find(|reading| reading.metric == MetricId::RulesExtractionBacklog);
+        if let Some(reading) = reading {
+            let alert = snapshot
+                .alerts
+                .first()
+                .expect("every round is over the ceiling");
+            assert_eq!(alert.value, reading.value);
+        }
+        tokio::task::yield_now().await;
+    }
+    writer.await.unwrap();
+}

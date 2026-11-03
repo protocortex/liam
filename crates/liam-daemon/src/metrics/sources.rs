@@ -15,8 +15,7 @@ use liam_store::{Clock, ExtractorName};
 
 use super::collect;
 use super::memory::SystemMemory;
-use super::recorder::Metrics;
-use super::sink::MetricId;
+use super::sink::{MetricId, Sample};
 
 pub struct RunSources {
     pub store: Arc<SharedStore>,
@@ -50,25 +49,28 @@ impl RunSources {
         }
     }
 
-    /// Takes every reading and records it in `metrics`.
-    pub async fn record(&self, metrics: &Metrics) {
+    /// Takes every reading. The caller records them together, so a reader
+    /// never sees half of a run's numbers.
+    pub async fn read(&self) -> Vec<Sample> {
         let now = self.clock.now();
-        self.record_store(metrics).await;
-        self.record_files(metrics);
-        metrics.record(Some(collect::peak_rss(
+        let mut samples = Vec::new();
+        self.read_store(&mut samples).await;
+        self.read_files(&mut samples);
+        samples.push(collect::peak_rss(
             &mut *self.memory.lock().unwrap_or_else(PoisonError::into_inner),
             now,
-        )));
-        self.record_deletions(metrics);
+        ));
+        self.read_deletions(&mut samples);
         if let Some(extraction) = &self.extraction {
-            self.record_backlogs(metrics).await;
+            self.read_backlogs(&mut samples).await;
             if let Some(lookups) = extraction.cache_lookups() {
-                metrics.record(collect::cache_hit_rate(lookups.hits, lookups.misses, now));
+                samples.extend(collect::cache_hit_rate(lookups.hits, lookups.misses, now));
             }
         }
+        samples
     }
 
-    async fn record_store(&self, metrics: &Metrics) {
+    async fn read_store(&self, samples: &mut Vec<Sample>) {
         let now = self.clock.now();
         let store = match self.store.get().await {
             Ok(store) => store,
@@ -78,20 +80,18 @@ impl RunSources {
             }
         };
         match store.storage_bytes().await {
-            Ok(bytes) => collect::tier_bytes(bytes, now)
-                .into_iter()
-                .for_each(|sample| metrics.record(Some(sample))),
+            Ok(bytes) => samples.extend(collect::tier_bytes(bytes, now)),
             Err(error) => tracing::warn!(%error, "metrics: the tier sizes could not be read"),
         }
         let bloom = store.bloom_stats();
-        metrics.record(collect::bloom_false_positive_rate(
+        samples.extend(collect::bloom_false_positive_rate(
             bloom.confirmed_false,
             bloom.true_negatives,
             now,
         ));
     }
 
-    fn record_files(&self, metrics: &Metrics) {
+    fn read_files(&self, samples: &mut Vec<Sample>) {
         let now = self.clock.now();
         let dirs = [
             (MetricId::LogBytes, Some(self.log_dir.as_path())),
@@ -100,7 +100,7 @@ impl RunSources {
         for (metric, dir) in dirs {
             let Some(dir) = dir else { continue };
             match collect::directory_bytes(metric, dir, now) {
-                Ok(sample) => metrics.record(Some(sample)),
+                Ok(sample) => samples.push(sample),
                 Err(error) => {
                     tracing::warn!(%error, metric = metric.name(), "metrics: a directory size could not be read")
                 }
@@ -108,18 +108,16 @@ impl RunSources {
         }
     }
 
-    fn record_deletions(&self, metrics: &Metrics) {
+    fn read_deletions(&self, samples: &mut Vec<Sample>) {
         match crate::deletion::open_jobs(&self.database_path) {
-            Ok(jobs) => collect::deletion_backlog(&jobs, self.clock.now())
-                .into_iter()
-                .for_each(|sample| metrics.record(Some(sample))),
+            Ok(jobs) => samples.extend(collect::deletion_backlog(&jobs, self.clock.now())),
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "metrics: the delete jobs could not be read")
             }
         }
     }
 
-    async fn record_backlogs(&self, metrics: &Metrics) {
+    async fn read_backlogs(&self, samples: &mut Vec<Sample>) {
         let now = self.clock.now();
         let store = match self.store.get().await {
             Ok(store) => store,
@@ -137,7 +135,7 @@ impl RunSources {
                 }
             };
             match events_after(&self.log_dir, cursor).await {
-                Ok(count) => metrics.record(Some(collect::extraction_backlog(metric, count, now))),
+                Ok(count) => samples.push(collect::extraction_backlog(metric, count, now)),
                 Err(error) => {
                     tracing::warn!(%error, metric = metric.name(), "metrics: the log could not be counted")
                 }
