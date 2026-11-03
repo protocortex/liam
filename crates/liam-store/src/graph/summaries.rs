@@ -640,7 +640,9 @@ impl<B: Backend> Graph<B> {
             .backend
             .query(
                 &format!(
-                    "SELECT id, kind, label, content, valid_from, scope FROM nodes
+                    "SELECT id, kind, label, content, valid_from, scope,
+                            (SELECT source FROM node_keys WHERE node_id = nodes.id)
+                     FROM nodes
                      WHERE COALESCE(scope, '') = ?2 AND {live}{recorded}
                      ORDER BY rowid",
                     live = live_at("nodes", 1),
@@ -675,6 +677,10 @@ impl<B: Backend> Graph<B> {
                     _ => None,
                 },
                 origin_events,
+                sources: match row.0.get(6) {
+                    Some(Value::Text(source)) => vec![source.clone()],
+                    _ => Vec::new(),
+                },
                 vector,
             });
         }

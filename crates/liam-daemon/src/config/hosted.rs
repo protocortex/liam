@@ -2,9 +2,13 @@
 //! The `[hosted]` section: calls to hosted model providers. Off by default.
 //! Keys never live here; they come from a key file or the Keychain.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 #[cfg(test)]
 use serde::Serialize;
+
+use super::pins::{ModelPin, PIN_PROVIDERS};
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// Four MiB, far above a model answer and far below a memory problem.
@@ -22,6 +26,28 @@ pub struct HostedConfig {
     pub request_timeout_secs: u64,
     /// The most bytes of a response that are read.
     pub max_response_bytes: usize,
+    /// What may leave the machine. Nothing does by default.
+    pub privacy: PrivacyConfig,
+    /// The dated model id each provider is pinned to.
+    pub models: BTreeMap<String, String>,
+}
+
+/// `[hosted.privacy]`: the gate every item passes before it goes into a hosted
+/// prompt.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivacyConfig {
+    /// Scopes whose items may be sent. A scope covers its descendants:
+    /// `work` covers `work/liam`. The unscoped group is the empty string.
+    pub allowed_scopes: Vec<String>,
+    /// Producers whose items are never sent, in any scope.
+    pub local_only_sources: Vec<String>,
+    /// The region each provider processes requests in, as the operator
+    /// declares it.
+    pub provider_regions: BTreeMap<String, String>,
+    /// For a scope (and its descendants), the regions it may be sent to.
+    pub attested_regions: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for HostedConfig {
@@ -31,6 +57,8 @@ impl Default for HostedConfig {
             allowed_hosts: Vec::new(),
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            privacy: PrivacyConfig::default(),
+            models: BTreeMap::new(),
         }
     }
 }
@@ -54,6 +82,31 @@ impl HostedConfig {
                 is_bare_host(host),
                 "hosted.allowed_hosts entry {host:?} must be a lowercase host name with no \
                  scheme, port, path or user"
+            );
+        }
+        self.privacy.validate()?;
+        for (provider, model_id) in &self.models {
+            ModelPin::new(provider, model_id)?;
+        }
+        Ok(())
+    }
+
+    /// The pins, in provider order. `validate` has checked each one.
+    pub fn pins(&self) -> Vec<ModelPin> {
+        self.models
+            .iter()
+            .filter_map(|(provider, model_id)| ModelPin::new(provider, model_id).ok())
+            .collect()
+    }
+}
+
+impl PrivacyConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        for provider in self.provider_regions.keys() {
+            anyhow::ensure!(
+                PIN_PROVIDERS.contains(&provider.as_str()),
+                "hosted.privacy.provider_regions.{provider} is not a known provider; use one of {}",
+                PIN_PROVIDERS.join(", ")
             );
         }
         Ok(())
@@ -120,6 +173,36 @@ mod tests {
                 "{host}"
             );
         }
+    }
+
+    #[test]
+    fn an_alias_in_the_models_table_fails_the_load_and_a_dated_id_loads() {
+        // Act
+        let alias = load("[hosted.models]\nopenai = \"gpt-4o\"\n").unwrap_err();
+        let unknown = load("[hosted.models]\nmistral = \"m-20250101\"\n").unwrap_err();
+        let dated = load("[hosted.models]\nopenai = \"gpt-4o-2024-08-06\"\n").unwrap();
+
+        // Assert
+        assert!(format!("{alias:#}").contains("alias"));
+        assert!(format!("{unknown:#}").contains("not a known provider"));
+        assert_eq!(dated.hosted.pins().len(), 1);
+    }
+
+    #[test]
+    fn the_privacy_table_loads_and_names_only_known_providers() {
+        // Act
+        let loaded = load(
+            "[hosted.privacy]\nallowed_scopes = [\"work\"]\nlocal_only_sources = [\"client:diary\"]\n\
+             [hosted.privacy.provider_regions]\nanthropic = \"us\"\n\
+             [hosted.privacy.attested_regions]\nwork = [\"us\"]\n",
+        )
+        .unwrap();
+        let unknown = load("[hosted.privacy.provider_regions]\nmistral = \"eu\"\n").unwrap_err();
+
+        // Assert
+        assert_eq!(loaded.hosted.privacy.allowed_scopes, ["work"]);
+        assert_eq!(loaded.hosted.privacy.attested_regions["work"], ["us"]);
+        assert!(format!("{unknown:#}").contains("provider_regions.mistral"));
     }
 
     #[test]
