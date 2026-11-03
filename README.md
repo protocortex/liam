@@ -283,11 +283,10 @@ skips the check.
 - **No record, and a database that holds data:** a store from before
   fingerprints. It is taken to hold the configured provider, model and
   dimensions under prompt scheme 0, so it fails the check (the binary is on
-  scheme 1). `liam rebuild` clears this, but it needs an existing event log and
-  refuses without one. A store that predates the log has none, so the
-  fingerprint check currently blocks its start before the log migration can
-  run. This is tracked in
-  [#205](https://github.com/protocortex/liam/issues/205).
+  scheme 1). `liam rebuild` clears this and needs an event log. A store that
+  predates the log has none, so `liamd` copies its rows into a new log before
+  it runs the check. The start is still refused, but the log now exists: run
+  `liam rebuild --database PATH` and start again.
 - **Record matches:** the start goes on.
 - **Record differs in any field:** `liamd` exits before opening the store. The
   error names the recorded and the configured values and the rebuild command.

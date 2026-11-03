@@ -140,6 +140,12 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
          shuttles to it and opens no store",
     )?;
 
+    // A store that predates both the log and the fingerprint is refused below,
+    // and `liam rebuild` needs a log to clear that, so the log is made first.
+    if embedder_fingerprint::predates_fingerprints(&database_path)? {
+        log_startup::migrate_unlogged_rows(&config, &database_path, &log_dir).await?;
+    }
+
     // Verified before the store opens, which creates `node_vectors` at the
     // configured width, and recorded only once it has opened.
     let fingerprint = embedder_fingerprint::verify(

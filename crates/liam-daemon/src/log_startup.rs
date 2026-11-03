@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 
 use liam_daemon::config::Config;
 use liam_daemon::event_log;
-use liam_daemon::store_open::{open_database, open_store_on_log};
+use liam_daemon::store_open::{backfill_if_needed, open_database, open_store_on_log};
 
 use crate::shutdown::Shutdown;
 
@@ -39,11 +39,7 @@ pub async fn open_store_with_log(
     shutdown: &Shutdown,
 ) -> anyhow::Result<StartedStore> {
     tracing::info!(log_dir = %log_dir.display(), "opening the event log");
-    // Both checks come before the writer creates anything, so a mistyped
-    // directory is refused instead of becoming a log.
-    event_log::ensure_usable_as_log(log_dir)?;
-    let store = open_database(config, database_path).await?;
-    refuse_a_new_log_for_a_logged_database(&store, database_path, log_dir).await?;
+    let store = open_database_for_log(config, database_path, log_dir).await?;
 
     let (sink, closed_segments) = ChannelSink::channel();
     let writer = event_log::open_writer(log_dir, config.log.wal())?.with_sink(Box::new(sink));
@@ -73,6 +69,46 @@ pub async fn open_store_with_log(
         compactor,
         log,
     })
+}
+
+/// Copies the rows of a store that predates the log into it, before the
+/// embedder fingerprint is checked. Such a store has no fingerprint either, so
+/// the check refuses it, and `liam rebuild`, which the refusal names, needs a
+/// log to rebuild from. It touches no model: the copy only reads the store.
+pub async fn migrate_unlogged_rows(
+    config: &Config,
+    database_path: &Path,
+    log_dir: &Path,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        log_dir = %log_dir.display(),
+        "migrating a store that predates the event log before the embedder check"
+    );
+    let store = open_database_for_log(config, database_path, log_dir).await?;
+    let writer = event_log::open_writer(log_dir, config.log.wal())?;
+    let log = event_log::shared_log(writer, log_dir, config.log.bloom()?, None)?;
+    let store = store.with_log(log).await.with_context(|| {
+        format!(
+            "the event log in {} cannot be used with the database {}; the cause is below",
+            log_dir.display(),
+            database_path.display()
+        )
+    })?;
+    backfill_if_needed(&store).await
+}
+
+/// Opens the database once the log directory is known to be usable. Both checks
+/// come before a writer creates anything, so a mistyped directory is refused
+/// instead of becoming a log.
+async fn open_database_for_log(
+    config: &Config,
+    database_path: &Path,
+    log_dir: &Path,
+) -> anyhow::Result<DefaultGraph> {
+    event_log::ensure_usable_as_log(log_dir)?;
+    let store = open_database(config, database_path).await?;
+    refuse_a_new_log_for_a_logged_database(&store, database_path, log_dir).await?;
+    Ok(store)
 }
 
 /// A database already tied to a log belongs to that log, so a directory with
@@ -539,6 +575,48 @@ mod tests {
             .insert(NewNode::now("fact", "label", "third"))
             .await
             .expect("writes must be allowed once the backfill completed");
+    }
+
+    #[tokio::test]
+    async fn migrating_a_database_from_before_the_log_logs_its_rows_and_a_later_start_adds_none() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        seed_unlogged(&database_in(dir.path()), &["first", "second"]).await;
+
+        // Act
+        migrate_unlogged_rows(
+            &config_in(dir.path()),
+            &database_in(dir.path()),
+            &log_dir_in(dir.path()),
+        )
+        .await
+        .expect("the migration must succeed");
+        let graph = start(dir.path()).await.expect("start after the migration");
+
+        // Assert
+        let events = logged_events(&log_dir_in(dir.path())).await;
+        assert_eq!(node_writes(&events), 2);
+        assert_eq!(graph.needs_backfill().await.ok(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn migrating_refuses_a_log_directory_that_holds_something_else() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        seed_unlogged(&database_in(dir.path()), &["first"]).await;
+        std::fs::create_dir_all(log_dir_in(dir.path())).unwrap();
+        std::fs::write(log_dir_in(dir.path()).join("notes.txt"), b"x").unwrap();
+
+        // Act
+        let result = migrate_unlogged_rows(
+            &config_in(dir.path()),
+            &database_in(dir.path()),
+            &log_dir_in(dir.path()),
+        )
+        .await;
+
+        // Assert
+        assert!(result.is_err());
     }
 
     #[tokio::test]

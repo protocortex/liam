@@ -135,6 +135,12 @@ pub fn verify(
     )
 }
 
+/// Whether the database holds data but has no record, which is how a store
+/// from before fingerprints looks. Creates no file.
+pub fn predates_fingerprints(database_path: &Path) -> anyhow::Result<bool> {
+    Ok(!fingerprint_path_for(database_path).exists() && holds_data(database_path)?)
+}
+
 /// Writes `fingerprint` as the record for the database, replacing any other.
 /// `liam rebuild` calls it once it has re-embedded the store.
 pub fn record(database_path: &Path, fingerprint: &EmbedderFingerprint) -> anyhow::Result<()> {
@@ -338,6 +344,23 @@ mod tests {
         assert!(error.contains("prompt scheme 1"), "{error}");
         assert!(error.contains(&sidecar.display().to_string()), "{error}");
         assert!(!sidecar.exists(), "a refusal must write nothing");
+    }
+
+    #[test]
+    fn only_a_database_with_data_and_no_record_predates_fingerprints() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent.db");
+        let legacy = existing_database(dir.path());
+        let recorded = dir.path().join("recorded.db");
+        std::fs::write(&recorded, b"existing vectors").unwrap();
+        record(&recorded, &fingerprint("model-a", 768, 1)).unwrap();
+
+        // Act
+        let answers = [&absent, &legacy, &recorded].map(|db| predates_fingerprints(db).unwrap());
+
+        // Assert
+        assert_eq!(answers, [false, true, false]);
     }
 
     #[test]

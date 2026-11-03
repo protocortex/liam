@@ -161,3 +161,55 @@ async fn a_tilde_in_the_path_flags_expands_to_the_home_directory() {
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
     assert!(text(&output.stdout).contains(&home.path().join("liam.db").display().to_string()));
 }
+
+/// A store from before both the event log and the embedder fingerprint: rows,
+/// no log, no sidecar.
+async fn store_older_than_the_log(dir: &Path) {
+    let database = dir.join("liam.db");
+    std::fs::write(
+        dir.join("liam.toml"),
+        format!(
+            "embedding_dims = {DIMS}\ndatabase_path = {:?}\n",
+            database.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(DIMS))
+        .await
+        .unwrap()
+        .insert(NewNode::now("fact", "label", "alpha"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_store_older_than_the_log_is_cleared_by_a_refused_start_then_a_rebuild() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    store_older_than_the_log(dir.path()).await;
+    let config = dir.path().join("liam.toml");
+    let config = config.to_str().unwrap();
+
+    // Act: the start is refused by the fingerprint check
+    let start = Command::new(env!("CARGO_BIN_EXE_liamd"))
+        .args(["--config", config])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env_remove("LIAM_CONFIG")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run liamd");
+    let rebuild = liam(
+        dir.path(),
+        &["--config", config, "rebuild", "--database", "liam.db"],
+    );
+
+    // Assert: the refused start left a log behind, so the rebuild it names works
+    assert!(
+        text(&start.stderr).contains("embedder fingerprint"),
+        "{}",
+        text(&start.stderr)
+    );
+    assert_eq!(rebuild.status.code(), Some(0), "{}", text(&rebuild.stderr));
+    assert!(text(&rebuild.stdout).contains("nodes: 1"));
+}
