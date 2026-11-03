@@ -16,7 +16,7 @@ mod real;
 #[cfg(test)]
 mod rss;
 #[cfg(test)]
-mod tiers;
+pub(crate) mod tiers;
 
 /// A fact reduced to what the comparison cares about.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

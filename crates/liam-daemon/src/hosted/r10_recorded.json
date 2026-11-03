@@ -1,0 +1,17 @@
+{
+  "anthropic": {
+    "model_id": "claude-sonnet-4-5-20250929",
+    "missed": [],
+    "wrong_object": []
+  },
+  "openai": {
+    "model_id": "gpt-4o-2024-08-06",
+    "missed": [],
+    "wrong_object": [24, 114]
+  },
+  "gemini": {
+    "model_id": "gemini-2.0-flash-001",
+    "missed": [4, 14, 24, 34, 44],
+    "wrong_object": []
+  }
+}
