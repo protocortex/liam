@@ -95,6 +95,7 @@ fn extraction_part(
         permits: Arc::new(Semaphore::new(1)),
         free_ram: Arc::new(PlentyOfRam),
         gate: None,
+        batch: None,
         stopping: harness.shutdown.token(),
     }
 }

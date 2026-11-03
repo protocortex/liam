@@ -2,6 +2,7 @@
 //! Turning log events into subject/predicate/object facts.
 
 mod apply;
+pub mod batch_flow;
 pub mod cache;
 pub mod client;
 pub mod extractor;

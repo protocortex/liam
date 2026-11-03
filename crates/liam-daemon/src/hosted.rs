@@ -11,6 +11,7 @@ pub mod canceller;
 pub mod client;
 pub mod cost;
 pub mod dialect;
+pub mod extraction_batch;
 pub mod gemini;
 pub mod model;
 pub mod multipart;
@@ -31,11 +32,13 @@ use self::canceller::HostedCanceller;
 use self::client::HostedClient;
 use self::cost::CostRecorder;
 use self::dialect::Dialect;
+use self::extraction_batch::HostedBatchApi;
 use self::model::{hosted_identity, HostedModel};
 use self::secrets::{SecretSource, SecretString};
 use self::summariser::{HostedExtractorProvider, HostedSummariser};
 use self::transport::UreqTransport;
 use crate::config::{Config, ModelPin, Provider};
+use crate::deletion::send_ledger::{send_ledger_path_for, SendLedger};
 use crate::deletion::BatchCanceller;
 use crate::extraction::client::ModelIdentity;
 use crate::extraction::gate::ProviderGate;
@@ -45,6 +48,7 @@ use crate::extraction::sidecar::FreeRam;
 use crate::metrics::recorder::Metrics;
 use crate::metrics::sink::LogSink;
 use crate::summary::summariser::Summariser;
+use liam_daemon::models::resolve_config_path;
 use liam_store::SystemClock;
 
 const KEYCHAIN_SERVICE_PREFIX: &str = "liam-";
@@ -112,13 +116,19 @@ pub fn open_model(
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<Arc<HostedModel<UreqTransport>>> {
     let (client, pin, key) = connect(config, provider)?;
-    Ok(Arc::new(HostedModel::new(
+    let database = resolve_config_path("database_path", &config.database_path)?;
+    let model = HostedModel::new(
         client,
         dialect_for(provider)?,
         pin,
         key,
         CostRecorder::new(metrics, config.hosted.prices.clone()),
-    )))
+    )
+    .with_send_ledger(
+        SendLedger::new(send_ledger_path_for(&database)),
+        Arc::new(SystemClock),
+    );
+    Ok(Arc::new(model))
 }
 
 /// The batch client of `provider`, with its key read and its results counted
@@ -183,6 +193,10 @@ pub fn extraction_backend(
         .pin_for(provider)
         .with_context(|| format!("hosted.models.{} is not set", provider.name()))?;
     let identity = hosted_identity(&pin);
+    let batch_opener = {
+        let (config, metrics) = (config.clone(), metrics.clone());
+        move || open_batch(&config, provider, metrics.clone())
+    };
     let opener = {
         let config = config.clone();
         move || open_model(&config, provider, metrics.clone())
@@ -195,6 +209,7 @@ pub fn extraction_backend(
             config.hosted.privacy.clone(),
             provider,
         ))),
+        batch: Some(Arc::new(HostedBatchApi::new(provider, batch_opener))),
     })
 }
 

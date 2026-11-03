@@ -4,7 +4,9 @@
 //! summariser are thin views over it.
 
 use std::fmt;
+use std::sync::Arc;
 
+use liam_store::Clock;
 use sha2::{Digest, Sha256};
 
 use super::client::{HostedClient, HostedError};
@@ -13,6 +15,7 @@ use super::dialect::{ChatCall, ChatReply, Dialect};
 use super::secrets::SecretString;
 use super::transport::HttpTransport;
 use crate::config::{ModelPin, PinError};
+use crate::deletion::send_ledger::{SendLedger, SendRow};
 use crate::extraction::client::ModelIdentity;
 
 const HTTP_OK_RANGE: std::ops::Range<u16> = 200..300;
@@ -29,6 +32,8 @@ pub enum ModelCallError {
     /// The pinned model is gone or the provider answered with another one.
     Pin(PinError),
     Malformed(&'static str),
+    /// The send ledger could not be written, so nothing was sent.
+    Ledger,
 }
 
 impl fmt::Display for ModelCallError {
@@ -38,6 +43,10 @@ impl fmt::Display for ModelCallError {
             Self::Status(status) => write!(f, "the provider answered with HTTP status {status}"),
             Self::Pin(error) => write!(f, "{error}"),
             Self::Malformed(why) => write!(f, "the provider sent a malformed reply: {why}"),
+            Self::Ledger => write!(
+                f,
+                "the send ledger could not be written, so nothing was sent"
+            ),
         }
     }
 }
@@ -51,6 +60,7 @@ pub struct HostedModel<T: HttpTransport> {
     key: SecretString,
     identity: ModelIdentity,
     costs: CostRecorder,
+    sends: Option<(SendLedger, Arc<dyn Clock>)>,
 }
 
 impl<T: HttpTransport> HostedModel<T> {
@@ -69,7 +79,15 @@ impl<T: HttpTransport> HostedModel<T> {
             key,
             identity,
             costs,
+            sends: None,
         }
+    }
+
+    /// Records every call in `ledger` before it is sent, so a delete can tell
+    /// which providers hold text built from a deleted event.
+    pub fn with_send_ledger(mut self, ledger: SendLedger, clock: Arc<dyn Clock>) -> Self {
+        self.sends = Some((ledger, clock));
+        self
     }
 
     pub fn identity(&self) -> &ModelIdentity {
@@ -79,6 +97,7 @@ impl<T: HttpTransport> HostedModel<T> {
     /// Sends one request. The model is billed even when its answer is then
     /// refused for naming another model, so the cost is counted first.
     pub async fn complete(&self, call: &ChatCall<'_>) -> Result<ChatReply, ModelCallError> {
+        self.record_send(call)?;
         let url = self.dialect.url(&self.pin.model_id);
         let headers = self.dialect.headers(&self.key, call);
         let body = self.dialect.body(&self.pin.model_id, call);
@@ -106,6 +125,25 @@ impl<T: HttpTransport> HostedModel<T> {
         );
         self.pin.check(&reply.model).map_err(ModelCallError::Pin)?;
         Ok(reply)
+    }
+}
+
+impl<T: HttpTransport> HostedModel<T> {
+    fn record_send(&self, call: &ChatCall<'_>) -> Result<(), ModelCallError> {
+        let Some((ledger, clock)) = &self.sends else {
+            return Ok(());
+        };
+        ledger
+            .append(&SendRow {
+                provider: self.pin.provider.clone(),
+                cache_key: call.request_id.to_owned(),
+                source_event_ids: call.source_event_ids.to_vec(),
+                sent_at: clock.now().0,
+            })
+            .map_err(|error| {
+                tracing::error!(error = %format!("{error:#}"), "the send ledger could not be written");
+                ModelCallError::Ledger
+            })
     }
 }
 

@@ -172,6 +172,11 @@ impl CacheStore {
         found
     }
 
+    /// Whether `key` has an entry, without counting a lookup.
+    pub fn contains(&self, key: &str) -> bool {
+        self.lock().entries.contains_key(key)
+    }
+
     /// The lookups answered and missed since the cache opened.
     pub fn stats(&self) -> CacheLookups {
         CacheLookups {

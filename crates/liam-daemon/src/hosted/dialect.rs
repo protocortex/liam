@@ -21,6 +21,8 @@ pub struct ChatCall<'a> {
     /// An opaque id that ties a provider log line to a request without saying
     /// what it held.
     pub request_id: &'a str,
+    /// The events the prompt was built from, for the send ledger.
+    pub source_event_ids: &'a [String],
 }
 
 /// What a provider answered.

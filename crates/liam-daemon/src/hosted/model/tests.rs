@@ -24,6 +24,7 @@ fn call<'a>(schema: Option<&'a serde_json::Value>) -> ChatCall<'a> {
         seed: 7,
         schema,
         request_id: REQUEST_ID,
+        source_event_ids: &[],
     }
 }
 
@@ -316,4 +317,64 @@ fn the_request_id_is_a_fixed_length_digest_that_does_not_show_the_text() {
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     assert_eq!(id, opaque_request_id("system text", "private prompt text"));
     assert_ne!(id, opaque_request_id("system text", "other"));
+}
+
+#[tokio::test]
+async fn a_call_is_written_to_the_send_ledger_before_it_is_sent() {
+    use crate::deletion::send_ledger::SendLedger;
+    use liam_store::{FixedClock, Millis};
+
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    let ledger_path = dir.path().join("sends.jsonl");
+    let case = &cases()[0];
+    let transport = FakeTransport::answering(200, &case.ok);
+    let (model, _) = open(case, transport.clone(), ROOMY);
+    let model = model.with_send_ledger(
+        SendLedger::new(ledger_path.clone()),
+        std::sync::Arc::new(FixedClock::new(Millis(42))),
+    );
+    let events = vec!["e1".to_owned(), "e2".to_owned()];
+
+    // Act
+    model
+        .complete(&ChatCall {
+            source_event_ids: &events,
+            ..call(None)
+        })
+        .await
+        .unwrap();
+
+    // Assert
+    let rows = SendLedger::new(ledger_path).load().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].provider, "anthropic");
+    assert_eq!(rows[0].cache_key, REQUEST_ID);
+    assert_eq!(rows[0].source_event_ids, events);
+    assert_eq!(rows[0].sent_at, 42);
+    assert_eq!(transport.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn a_call_whose_ledger_row_cannot_be_written_is_not_sent() {
+    use crate::deletion::send_ledger::SendLedger;
+    use liam_store::{FixedClock, Millis};
+
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    let case = &cases()[0];
+    let transport = FakeTransport::answering(200, &case.ok);
+    let (model, _) = open(case, transport.clone(), ROOMY);
+    let model = model.with_send_ledger(
+        SendLedger::new(dir.path().join("missing-dir").join("sends.jsonl")),
+        std::sync::Arc::new(FixedClock::new(Millis(1))),
+    );
+
+    // Act
+    let error = model.complete(&call(None)).await.unwrap_err();
+
+    // Assert
+    assert_eq!(error, ModelCallError::Ledger);
+    assert!(transport.seen().is_empty());
+    assert!(error.to_string().contains("nothing was sent"));
 }
