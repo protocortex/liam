@@ -279,6 +279,10 @@ fn a_denial_is_logged_with_its_reason_and_never_with_the_item_text() {
 
     // Act
     tracing::subscriber::with_default(subscriber, || {
+        // Callsite interest is cached process-wide. A parallel test that hit
+        // the gate's log line with no subscriber installed can leave it cached
+        // as "never", which silently drops the event here.
+        tracing::callsite::rebuild_interest_cache();
         gate.filter_inputs(PROVIDER, &inputs);
     });
 
