@@ -25,7 +25,13 @@ pub struct Subjects {
 
 /// A store whose log is sealed, holding one note for alice and one for bob.
 pub async fn sealed_subjects(dir: &Path) -> Subjects {
+    sealed_subjects_with(dir, |_| {}).await
+}
+
+/// `sealed_subjects` over a config the caller has adjusted first.
+pub async fn sealed_subjects_with(dir: &Path, adjust: impl FnOnce(&mut Config)) -> Subjects {
     let mut config = config_in(dir);
+    adjust(&mut config);
     config.encryption = EncryptionConfig {
         master_key: Some(MasterKeySource::File),
         key_file: Some(dir.join("master.key").to_str().unwrap().to_owned()),
