@@ -56,12 +56,15 @@ use liam_model::{Embedder, Llm, Reranker};
 use log_startup::StartedStore;
 use mcp::MemoryServer;
 use shutdown::Shutdown;
+use tiering::usage::{UsageFlush, UsageFlusher, UsageRecorder};
 
 /// How long the maintenance loop gets to stop once the daemon is stopping, and
 /// then how long the compactor gets to finish what is queued. With the session
 /// drain they stay below the supervisor's grace period.
 const MAINTENANCE_STOP_DEADLINE: Duration = Duration::from_secs(2);
 const COMPACTOR_DRAIN_DEADLINE: Duration = Duration::from_secs(3);
+/// How long the last usage flush gets once the transports have drained.
+const USAGE_FLUSH_DEADLINE: Duration = Duration::from_secs(2);
 
 fn main() -> anyhow::Result<()> {
     // Parse BEFORE anything else touches the filesystem or the environment.
@@ -205,6 +208,14 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         )
     };
 
+    let usage = config
+        .tiering
+        .enabled
+        .then(|| Arc::new(UsageRecorder::new(config.tiering.max_tracked_items)));
+    let server = match &usage {
+        Some(recorder) => server.with_usage_recorder(recorder.clone()),
+        None => server,
+    };
     let server = server
         .with_shutdown(shutdown.token())
         .with_vocabulary(config::resolve_vocabulary(&config.extraction))
@@ -224,6 +235,13 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         .await
         .context("could not finish the consolidation rollback a crash interrupted")?;
     let maintenance = spawn_gc(&config, job, run_now);
+    let usage_flush = usage.map(|recorder| {
+        UsageFlush::start(UsageFlusher::new(
+            recorder,
+            server.shared_store(),
+            Duration::from_secs(config.tiering.usage_flush_secs),
+        ))
+    });
 
     let served = match mode {
         cli::Mode::Serve => serve_socket(&config, server, shutdown.token()).await,
@@ -239,7 +257,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         ),
         cli::Mode::Stdio => serve_stdio(server, shutdown.token()).await,
     };
-    stop_background_tasks(&shutdown, maintenance, compactor).await;
+    stop_background_tasks(&shutdown, usage_flush, maintenance, compactor).await;
     match (served, shutdown.failure()) {
         (Err(error), _) | (Ok(()), Some(error)) => Err(error),
         (Ok(()), None) => Ok(()),
@@ -261,15 +279,21 @@ async fn serve_stdio(server: MemoryServer, shutdown: CancellationToken) -> anyho
     Ok(())
 }
 
-/// Stops the maintenance loop, whose server handle is the last one that keeps
+/// Flushes the usage counts once the transports have drained, then stops the
+/// maintenance loop, whose server handle is the last one that keeps
 /// the store alive, then waits for the compactor, which finishes the segments
 /// already queued once the store and its log writer are gone. Both are bounded:
 /// an interrupted compaction is redone by the next start.
 async fn stop_background_tasks(
     shutdown: &Shutdown,
+    usage_flush: Option<UsageFlush>,
     maintenance: JoinHandle<()>,
     mut compactor: JoinHandle<()>,
 ) {
+    // The transports have drained by now, and the store is still open.
+    if let Some(usage_flush) = usage_flush {
+        usage_flush.stop(USAGE_FLUSH_DEADLINE).await;
+    }
     shutdown.token().cancel();
     if tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, maintenance)
         .await

@@ -10,6 +10,8 @@
 pub mod facts;
 pub mod producer;
 pub mod summaries;
+#[cfg(test)]
+mod usage_tests;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,7 +20,9 @@ use std::time::Duration;
 use liam_daemon::consolidation::shared_store::SharedStore;
 use liam_model::{Embedder, Llm, Reranker, TextKind};
 use liam_store::types::{EpisodeEdge, EpisodeRef};
-use liam_store::{relation, DefaultGraph, EventRef, EventRole, NewNode, Query, Vocabulary};
+use liam_store::{
+    relation, DefaultGraph, EventRef, EventRole, Millis, NewNode, NodeId, Query, Vocabulary,
+};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
@@ -40,6 +44,7 @@ use crate::config::{
 };
 use crate::render;
 use crate::synthesis;
+use crate::tiering::usage::UsageRecorder;
 use crate::tuning::{record_and_maybe_evaluate, AimdHandles, RollingWindow};
 
 /// Runs one store call under a read guard that lasts only for that call, and
@@ -602,6 +607,8 @@ pub struct MemoryServer {
     /// Tells `facts` which predicates hold one value, so it can mark competing
     /// claims. Shared across connections like the other process-wide state.
     vocabulary: Arc<Vocabulary>,
+    /// Counts the results `recall` and `ask` return, when tiering is on.
+    usage: Option<Arc<UsageRecorder>>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -684,6 +691,7 @@ impl MemoryServer {
             producer: OnceLock::new(),
             shutdown: CancellationToken::new(),
             vocabulary: Arc::new(resolve_vocabulary(&ExtractionConfig::default())),
+            usage: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -710,6 +718,29 @@ impl MemoryServer {
     pub(crate) fn with_vocabulary(mut self, vocabulary: Vocabulary) -> Self {
         self.vocabulary = Arc::new(vocabulary);
         self
+    }
+
+    /// Counts the results of `recall` and `ask` in `recorder`.
+    pub(crate) fn with_usage_recorder(mut self, recorder: Arc<UsageRecorder>) -> Self {
+        self.usage = Some(recorder);
+        self
+    }
+
+    /// Counts one hit on each node a client was given as a ranked result.
+    /// Neighbours pulled in beside a result are not credited.
+    fn record_usage<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
+        if let Some(recorder) = &self.usage {
+            recorder.record(nodes, Millis::now());
+        }
+    }
+
+    fn record_evidence_usage(&self, evidence: &[ask::Evidence]) {
+        self.record_usage(
+            evidence
+                .iter()
+                .filter(|e| !e.expanded)
+                .filter_map(|e| e.node_id.as_ref()),
+        );
     }
 
     pub(crate) fn shutdown_token(&self) -> CancellationToken {
@@ -1219,6 +1250,7 @@ impl MemoryServer {
         if hits.is_empty() {
             return "no relevant memory".to_string();
         }
+        self.record_usage(hits.iter().filter(|h| !h.expanded).map(|h| &h.hit.id));
         let docs: Vec<String> = hits
             .iter()
             .map(|h| h.hit.retrieved.as_text().to_string())
@@ -1565,6 +1597,7 @@ impl MemoryServer {
             .unwrap_or_else(|_| (0..docs.len()).collect());
         let evidence: Vec<ask::Evidence> = order.iter().map(|&i| candidates[i].clone()).collect();
         if mode == Mode::Strict {
+            self.record_evidence_usage(&evidence);
             return ask::strict_answer(&evidence, self.max_basis_ids_rendered);
         }
         // Trim ONCE, before the sufficiency pre-pass, and reuse this same
@@ -1623,6 +1656,9 @@ impl MemoryServer {
         {
             return ask::insufficient_answer(evidence, self.max_basis_ids_rendered);
         }
+        // From here the model sees the evidence, so it counts even if the
+        // answer then fails.
+        self.record_evidence_usage(evidence);
 
         self.synthesize_answer(&args.question, evidence, deadline)
             .await

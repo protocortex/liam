@@ -36,7 +36,7 @@ pub fn clamp_ask_k(k: Option<usize>) -> usize {
 const FENCE_OPEN: &str = "<<<EVIDENCE";
 const FENCE_CLOSE: &str = "<<<END EVIDENCE";
 
-use liam_store::{Derivation, Retrieved};
+use liam_store::{Derivation, NodeId, Retrieved};
 
 /// What a summary is called where evidence is listed.
 const SUMMARY_KIND: &str = "summary";
@@ -57,6 +57,10 @@ pub struct Evidence {
     /// Non-empty `hit.attributes` as fence-neutralized JSON text, or `None`
     /// when the node carries no attributes worth rendering.
     pub attributes: Option<String>,
+    /// The stored node this came from, `None` for a summary.
+    pub node_id: Option<NodeId>,
+    /// True for a node pulled in beside a hit and not ranked itself.
+    pub expanded: bool,
 }
 
 impl Evidence {
@@ -76,6 +80,8 @@ impl Evidence {
             valid_from_ms: h.valid_from.0,
             confidence: h.confidence,
             attributes,
+            node_id: Some(h.hit.id.clone()),
+            expanded: h.expanded,
         }
     }
 
@@ -95,6 +101,8 @@ impl Evidence {
             valid_from_ms: c.valid_from.0,
             confidence: c.confidence,
             attributes,
+            node_id: Some(c.id.clone()),
+            expanded: false,
         }
     }
 }
@@ -109,6 +117,8 @@ impl Evidence {
             valid_from_ms: summary.tx_from.0,
             confidence: 1.0,
             attributes: None,
+            node_id: None,
+            expanded: false,
         }
     }
 }
@@ -134,6 +144,8 @@ impl Evidence {
             valid_from_ms,
             confidence: 1.0,
             attributes: None,
+            node_id: None,
+            expanded: false,
         }
     }
 }
