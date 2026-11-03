@@ -7,6 +7,7 @@
 //! compacted Parquet segments outlive any change to the derived schema.
 
 pub mod compactor;
+pub mod crypto;
 pub mod dedup;
 pub mod event;
 pub mod filter_file;
