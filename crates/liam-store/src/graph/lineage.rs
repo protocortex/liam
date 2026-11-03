@@ -602,17 +602,28 @@ impl<B: Backend> Graph<B> {
         Ok(listed(nodes))
     }
 
+    /// What a purge of `target` is told to remove: the nodes its key groups sealed.
+    async fn input_for(&self, target: &LineageTarget) -> Result<PurgeInput> {
+        Ok(PurgeInput {
+            node_ids: self.nodes_of_keys(&target.key_ids).await?,
+            event_ids: sorted(&target.event_ids),
+            key_ids: sorted(&target.key_ids),
+        })
+    }
+
+    /// The sets of a job that has not purged yet, worked out from the tables.
+    async fn resolve_fresh(&self, target: &LineageTarget) -> Result<Doomed> {
+        let input = self.input_for(target).await?;
+        resolve(&mut Pool(&self.backend), &input).await
+    }
+
     /// The outbox row of the job, written if this is its first purge, so the
     /// sets are fixed before anything is deleted.
     async fn open_outbox(&self, target: &LineageTarget) -> Result<Outbox> {
         if let Some(outbox) = self.read_outbox(&target.job_id).await? {
             return Ok(outbox);
         }
-        let input = PurgeInput {
-            node_ids: self.nodes_of_keys(&target.key_ids).await?,
-            event_ids: sorted(&target.event_ids),
-            key_ids: sorted(&target.key_ids),
-        };
+        let input = self.input_for(target).await?;
         let doomed = resolve(&mut Pool(&self.backend), &input).await?;
         self.backend
             .execute(
@@ -630,16 +641,6 @@ impl<B: Backend> Graph<B> {
             doomed,
             done: false,
         })
-    }
-
-    /// The sets of a job that has not purged yet, worked out from the tables.
-    async fn resolve_fresh(&self, target: &LineageTarget) -> Result<Doomed> {
-        let input = PurgeInput {
-            node_ids: self.nodes_of_keys(&target.key_ids).await?,
-            event_ids: sorted(&target.event_ids),
-            key_ids: sorted(&target.key_ids),
-        };
-        resolve(&mut Pool(&self.backend), &input).await
     }
 
     async fn vectors_of(&self, node_ids: &[String]) -> Result<Vec<String>> {
