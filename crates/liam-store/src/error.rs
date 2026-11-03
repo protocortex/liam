@@ -118,6 +118,22 @@ pub enum Error {
     #[error("lineage store {store}: {reason}")]
     LineageStore { store: String, reason: String },
 
+    /// A step of the database scrub failed. Names the step, never the rows.
+    #[error("scrub step {step} failed: {reason}")]
+    ScrubStep { step: &'static str, reason: String },
+
+    /// The write-ahead log could not be emptied: a reader still holds frames,
+    /// or a frame is not yet in the database file. The scrub is run again.
+    #[error(
+        "the write-ahead log is not empty (busy: {busy}, {checkpointed} of {log_frames} frames \
+         checkpointed)"
+    )]
+    ScrubIncomplete {
+        busy: bool,
+        log_frames: i64,
+        checkpointed: i64,
+    },
+
     /// The dedup filter file could not be written.
     #[error("dedup filter file: {0}")]
     FilterFile(#[from] std::io::Error),

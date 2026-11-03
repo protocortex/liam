@@ -284,6 +284,16 @@ impl Backend for ReembedProbe {
         }
         self.inner.vector_sweep_orphans().await
     }
+    async fn wal_checkpoint(
+        &self,
+        mode: crate::backend::CheckpointMode,
+        wait: std::time::Duration,
+    ) -> Result<crate::backend::CheckpointResult> {
+        self.inner.wal_checkpoint(mode, wait).await
+    }
+    async fn set_secure_delete(&self, on: bool) -> Result<bool> {
+        self.inner.set_secure_delete(on).await
+    }
     async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
         self.inner.begin().await
     }

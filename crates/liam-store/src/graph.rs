@@ -26,6 +26,7 @@ pub use self::rebuild::{RebuildMode, RebuildReport};
 pub use self::reembed::{ContentEmbedder, EmbedError, ReembedReport};
 pub use self::replay::CatchUpReport;
 pub use self::rolled_back::RUN_SOURCE_PREFIX;
+pub use self::scrub::ScrubReport;
 pub use self::snapshot::{
     recover_interrupted_restore, verify_snapshot, Snapshot, SnapshotLog, SnapshotMeta,
 };
@@ -66,6 +67,7 @@ mod replay;
 mod rolled_back;
 mod row_keys;
 mod run_marker;
+mod scrub;
 mod snapshot;
 mod summaries;
 mod swept_by;
@@ -679,6 +681,9 @@ impl<B: Backend> Graph<B> {
         let mut ddl = schema(&config);
         ddl.push_str(&backend.vector_ddl(config.embedding_dims));
         backend.execute_batch(&ddl).await?;
+        if config.secure_delete {
+            backend.set_secure_delete(true).await?;
+        }
         // `schema()` above is entirely `CREATE TABLE IF NOT EXISTS`, so a
         // database that already existed before `producer` was added never ran
         // it and does not have the column. This guarded ALTER TABLE is what
@@ -2519,6 +2524,7 @@ mod tests {
     mod rebuild;
     mod reembed;
     mod run_marker;
+    mod scrub;
     mod sealed;
     mod snapshot;
     mod soak;
@@ -6716,6 +6722,16 @@ mod tests {
         async fn vector_sweep_orphans(&self) -> Result<u64> {
             self.0.vector_sweep_orphans().await
         }
+        async fn wal_checkpoint(
+            &self,
+            mode: crate::backend::CheckpointMode,
+            wait: std::time::Duration,
+        ) -> Result<crate::backend::CheckpointResult> {
+            self.0.wal_checkpoint(mode, wait).await
+        }
+        async fn set_secure_delete(&self, on: bool) -> Result<bool> {
+            self.0.set_secure_delete(on).await
+        }
         async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
             self.0.begin().await
         }
@@ -8242,10 +8258,38 @@ mod tests {
         /// that fails.
         fail_on_vector_delete: std::sync::atomic::AtomicUsize,
         vector_deletes: std::sync::atomic::AtomicUsize,
+        /// Fails every plain `query`, `execute`, `execute_batch` and
+        /// `wal_checkpoint` whose SQL starts with this text, and counts them.
+        fail_on_sql: std::sync::Mutex<Option<String>>,
+        sql_failures: std::sync::atomic::AtomicUsize,
         probe: TxProbe,
     }
 
     impl FailingBackend {
+        /// Fails statements that start with `prefix` until it is set to `None`.
+        fn set_fail_on_sql(&self, prefix: Option<&str>) {
+            *self.fail_on_sql.lock().unwrap() = prefix.map(str::to_owned);
+            self.sql_failures
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// How many statements the injector has failed.
+        fn sql_failures(&self) -> usize {
+            self.sql_failures.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn check_sql(&self, sql: &str) -> Result<()> {
+            let armed = self.fail_on_sql.lock().unwrap();
+            match armed.as_deref() {
+                Some(prefix) if sql.starts_with(prefix) => {
+                    self.sql_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(Error::Backend("injected sql failure".to_string()))
+                }
+                _ => Ok(()),
+            }
+        }
+
         fn set_fail_on_execute(&self, n: usize) {
             self.fail_on_execute
                 .store(n, std::sync::atomic::Ordering::SeqCst);
@@ -8279,16 +8323,21 @@ mod tests {
                 fail_on_row: std::sync::Mutex::new(None),
                 fail_on_vector_delete: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 vector_deletes: std::sync::atomic::AtomicUsize::new(0),
+                fail_on_sql: std::sync::Mutex::new(None),
+                sql_failures: std::sync::atomic::AtomicUsize::new(0),
                 probe: TxProbe::default(),
             })
         }
         async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+            self.check_sql(sql)?;
             self.inner.query(sql, params).await
         }
         async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+            self.check_sql(sql)?;
             self.inner.execute(sql, params).await
         }
         async fn execute_batch(&self, sql: &str) -> Result<()> {
+            self.check_sql(sql)?;
             self.inner.execute_batch(sql).await
         }
         async fn execute_atomic(&self, statements: &[(String, Vec<Value>)]) -> Result<()> {
@@ -8344,6 +8393,17 @@ mod tests {
         }
         async fn vector_sweep_orphans(&self) -> Result<u64> {
             self.inner.vector_sweep_orphans().await
+        }
+        async fn wal_checkpoint(
+            &self,
+            mode: crate::backend::CheckpointMode,
+            wait: std::time::Duration,
+        ) -> Result<crate::backend::CheckpointResult> {
+            self.check_sql("PRAGMA wal_checkpoint")?;
+            self.inner.wal_checkpoint(mode, wait).await
+        }
+        async fn set_secure_delete(&self, on: bool) -> Result<bool> {
+            self.inner.set_secure_delete(on).await
         }
         async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
             self.probe.before_begin().await;
@@ -8455,6 +8515,16 @@ mod tests {
         }
         async fn vector_sweep_orphans(&self) -> Result<u64> {
             self.inner.vector_sweep_orphans().await
+        }
+        async fn wal_checkpoint(
+            &self,
+            mode: crate::backend::CheckpointMode,
+            wait: std::time::Duration,
+        ) -> Result<crate::backend::CheckpointResult> {
+            self.inner.wal_checkpoint(mode, wait).await
+        }
+        async fn set_secure_delete(&self, on: bool) -> Result<bool> {
+            self.inner.set_secure_delete(on).await
         }
         async fn begin(&self) -> Result<Box<dyn crate::backend::BackendTx + '_>> {
             self.inner.begin().await

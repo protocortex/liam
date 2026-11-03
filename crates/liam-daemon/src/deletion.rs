@@ -11,6 +11,8 @@ mod memory;
 mod migrate;
 #[allow(dead_code)]
 mod registry;
+#[allow(dead_code)]
+mod scrub;
 #[cfg(test)]
 mod test_support;
 
