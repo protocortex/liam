@@ -164,6 +164,14 @@ impl<B: Backend> Graph<B> {
     /// signature.
     pub async fn lineage_nodes(&self, key: &LineageKey) -> Result<Vec<LineageNode>> {
         let with_vector = self.live_vector_ids().await?;
+        self.lineage_nodes_among(key, &with_vector).await
+    }
+
+    async fn lineage_nodes_among(
+        &self,
+        key: &LineageKey,
+        with_vector: &HashSet<String>,
+    ) -> Result<Vec<LineageNode>> {
         let rows = self
             .backend
             .query(
@@ -227,15 +235,12 @@ impl<B: Backend> Graph<B> {
                 &[Tier::Cold.as_str().into()],
             )
             .await?;
+        let with_vector = self.live_vector_ids().await?;
         let mut report = ReconcileReport::default();
         for row in &cold {
             let (key, changed_at) = (LineageKey::from_raw(row.get_string(0)?), row.get_i64(1)?);
-            for node in self
-                .lineage_nodes(&key)
-                .await?
-                .iter()
-                .filter(|n| n.has_vector)
-            {
+            let nodes = self.lineage_nodes_among(&key, &with_vector).await?;
+            for node in nodes.iter().filter(|n| n.has_vector) {
                 if node.tx_from.0 > changed_at {
                     report.skipped_late += 1;
                 } else if !node.has_signature {
