@@ -221,7 +221,7 @@ async fn raw_state<B: Backend>(g: &Graph<B>) -> String {
 
 async fn node_ids(g: &DefaultGraph) -> Vec<String> {
     g.backend
-        .query("SELECT id FROM nodes ORDER BY id", &[])
+        .query("SELECT id FROM nodes ORDER BY rowid", &[])
         .await
         .unwrap()
         .iter()
@@ -1418,8 +1418,7 @@ async fn backfill_carries_on_after_the_row_the_state_names() {
         }
     );
     let events = logged_events(&env).await;
-    let mut logged_ids: Vec<&str> = node_writes(&events).iter().map(|n| n.id.as_str()).collect();
-    logged_ids.sort_unstable();
+    let logged_ids: Vec<&str> = node_writes(&events).iter().map(|n| n.id.as_str()).collect();
     assert_eq!(logged_ids, &ids[3..]);
 }
 
