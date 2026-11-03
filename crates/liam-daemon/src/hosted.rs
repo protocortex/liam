@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use liam_log::crypto::SystemKeychain;
+use liam_log::crypto::KeychainItems;
 
 use self::client::HostedClient;
 use self::cost::CostRecorder;
@@ -38,6 +38,17 @@ use crate::metrics::recorder::Metrics;
 use crate::summary::summariser::Summariser;
 
 const KEYCHAIN_SERVICE_PREFIX: &str = "liam-";
+
+#[cfg(target_os = "macos")]
+fn keychain() -> Arc<dyn KeychainItems> {
+    Arc::new(liam_log::crypto::SystemKeychain)
+}
+
+/// Only macOS has a Keychain; elsewhere the key must come from a file.
+#[cfg(not(target_os = "macos"))]
+fn keychain() -> Arc<dyn KeychainItems> {
+    Arc::new(liam_log::crypto::MemoryKeychain::default())
+}
 
 fn dialect_for(provider: Provider) -> anyhow::Result<Box<dyn Dialect>> {
     Ok(match provider {
@@ -73,8 +84,13 @@ pub fn open_model(
         .pin_for(provider)
         .with_context(|| format!("hosted.models.{} is not set", provider.name()))?;
     let key = key_source(config, provider)
-        .read(&SystemKeychain)
-        .with_context(|| format!("could not read the {} key", provider.name()))?;
+        .read(keychain().as_ref())
+        .with_context(|| {
+            format!(
+                "could not read the {name} key; set hosted.key_files.{name} or, on macOS, add the Keychain item {KEYCHAIN_SERVICE_PREFIX}{name}",
+                name = provider.name()
+            )
+        })?;
     let hosted = &config.hosted;
     let transport = UreqTransport::new(Duration::from_secs(hosted.request_timeout_secs));
     Ok(Arc::new(HostedModel::new(
