@@ -48,6 +48,7 @@ fn target_of(event: &str, key: &str) -> LineageTarget {
         job_id: JOB.to_owned(),
         event_ids: vec![event.to_owned()],
         key_ids: vec![key.to_owned()],
+        ..LineageTarget::default()
     }
 }
 
@@ -821,4 +822,58 @@ async fn the_backfill_runs_only_for_a_store_with_no_key_group_recorded() {
     assert_eq!((filled, skipped), (1, 0));
     assert_eq!(g.key_of_node(&ingested.node_ids[0]).await.unwrap(), key);
     assert!(key.is_some());
+}
+
+#[tokio::test]
+async fn resolving_a_target_fixes_the_nodes_and_lineage_keys_its_groups_reach() {
+    // Arrange
+    let g = open().await;
+    let w = world(&g).await;
+    let lineage = g.lineage_of(&w.a1).await.unwrap().expect("a lineage");
+
+    // Act
+    let resolved = g.resolve_target(&alice()).await.unwrap();
+    let after_new_node = {
+        name_key(&g, "late", ALICE_KEY).await;
+        g.resolve_target(&alice()).await.unwrap()
+    };
+
+    // Assert
+    assert_eq!(resolved.node_ids.len(), 2);
+    assert_eq!(resolved.lineage_keys, vec![lineage.as_str().to_owned()]);
+    assert_eq!(
+        after_new_node, resolved,
+        "the outbox keeps the first answer"
+    );
+}
+
+#[tokio::test]
+async fn the_dedup_filter_needs_a_log_to_rebuild_or_compare() {
+    // Arrange
+    let g = open().await;
+
+    // Act
+    let rebuilt = g.rebuild_dedup_filter(None).await;
+    let compared = g.dedup_filter_matches_index().await;
+
+    // Assert
+    assert!(matches!(rebuilt, Err(Error::NoEventLog)), "{rebuilt:?}");
+    assert!(matches!(compared, Err(Error::NoEventLog)), "{compared:?}");
+}
+
+#[tokio::test]
+async fn a_purge_through_a_shared_handle_is_the_same_purge() {
+    // Arrange
+    let g = Arc::new(open().await);
+    world(&g).await;
+
+    // Act
+    let store: Arc<dyn LineageStore> = g.clone();
+    let report = store.purge(&alice()).await.unwrap();
+
+    // Assert
+    assert_eq!(store.name(), crate::GRAPH_STORE);
+    assert!(report.removed > 0);
+    assert!(store.verify(&alice()).await.unwrap().is_empty());
+    assert_eq!(store.find(&alice()).await.unwrap().total(), 0);
 }

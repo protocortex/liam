@@ -2,7 +2,7 @@
 //! The `feedback` tool: a producer's verdict on a result `recall` or `ask`
 //! gave it, which the utility score reads as how often the item was right.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -117,24 +117,45 @@ impl Throttle {
 /// The results this connection was shown, by full id, up to a bound. Cloning
 /// gives the new connection an empty set, because a handle is only good to the
 /// connection it was issued to.
-pub(super) struct IssuedHandles {
+pub(crate) struct IssuedHandles {
     capacity: usize,
     issued: Mutex<BoundedMap<NodeId, ()>>,
 }
 
 impl IssuedHandles {
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
             capacity,
             issued: Mutex::new(BoundedMap::new(capacity)),
         }
     }
 
-    pub(super) fn issue<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
+    pub(crate) fn issue<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
         let mut issued = self.issued.lock().unwrap_or_else(PoisonError::into_inner);
         for node in nodes {
             issued.insert(node.clone(), ());
         }
+    }
+
+    /// Drops the handles of `nodes` and returns how many were held.
+    pub(crate) fn forget(&self, nodes: &HashSet<String>) -> usize {
+        let mut issued = self.issued.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = issued_among(&issued, nodes);
+        for node in &held {
+            issued.remove(node);
+        }
+        held.len()
+    }
+
+    /// The ids among `nodes` that were issued, sorted.
+    pub(crate) fn holds(&self, nodes: &HashSet<String>) -> Vec<String> {
+        let issued = self.issued.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held: Vec<String> = issued_among(&issued, nodes)
+            .iter()
+            .map(|node| node.as_str().to_owned())
+            .collect();
+        held.sort();
+        held
     }
 
     /// The one issued node whose id starts with `handle`, in any letter case.
@@ -160,6 +181,14 @@ impl IssuedHandles {
             }),
         }
     }
+}
+
+fn issued_among(issued: &BoundedMap<NodeId, ()>, nodes: &HashSet<String>) -> Vec<NodeId> {
+    issued
+        .iter()
+        .filter(|(node, _)| nodes.contains(node.as_str()))
+        .map(|(node, _)| node.clone())
+        .collect()
 }
 
 impl Clone for IssuedHandles {

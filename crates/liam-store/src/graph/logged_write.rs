@@ -191,6 +191,10 @@ impl EventLog {
         self.bloom = bloom;
     }
 
+    pub(super) fn bloom(&self) -> &HashBloom {
+        &self.bloom
+    }
+
     #[cfg(test)]
     pub(super) fn poison(&mut self) {
         self.poisoned = true;

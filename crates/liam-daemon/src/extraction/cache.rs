@@ -191,22 +191,39 @@ impl CacheStore {
         Ok(())
     }
 
+    /// The keys of the entries that cite one of `event_ids`, sorted.
+    pub fn keys_citing(&self, event_ids: &HashSet<String>) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .lock()
+            .entries
+            .values()
+            .filter(|entry| cites(entry, event_ids))
+            .map(|entry| entry.key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// A store whose file replacement always fails, so a test can check that
+    /// the original survives.
+    #[cfg(test)]
+    pub(crate) fn open_with_refused_rename(path: PathBuf) -> io::Result<Self> {
+        let ops = FileOps {
+            rename: |_, _| Err(io::Error::other("rename refused")),
+            ..FileOps::REAL
+        };
+        Self::open_with(path, ops, MAX_ENTRIES)
+    }
+
     /// Drops every entry that cites one of `event_ids` and returns how many
     /// went.
-    // The lineage deletion that calls this arrives with the trust and deletion work.
-    #[allow(dead_code)]
     pub fn remove_by_event_ids(&self, event_ids: &HashSet<String>) -> io::Result<usize> {
         let mut state = self.lock();
         let before = state.entries.len();
         let kept: Vec<Entry> = state
             .entries
             .values()
-            .filter(|entry| {
-                !entry
-                    .source_event_ids
-                    .iter()
-                    .any(|id| event_ids.contains(id))
-            })
+            .filter(|entry| !cites(entry, event_ids))
             .cloned()
             .collect();
         let removed = before - kept.len();
@@ -275,6 +292,13 @@ impl CacheStore {
         // another holder cannot leave it half-written.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+fn cites(entry: &Entry, event_ids: &HashSet<String>) -> bool {
+    entry
+        .source_event_ids
+        .iter()
+        .any(|id| event_ids.contains(id))
 }
 
 /// The newest `limit` entries; the rest are the oldest and go first.

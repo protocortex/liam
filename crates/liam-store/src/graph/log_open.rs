@@ -4,7 +4,10 @@
 //! lacks, the dedup filter knows every hash the store has indexed, and a store
 //! whose backfill is owed is flagged so writes wait for it.
 
+use std::path::Path;
+
 use liam_log::dedup::{BloomConfig, HashBloom};
+use liam_log::filter_file::FilterLoad;
 use liam_log::LogOffset;
 use uuid::Uuid;
 
@@ -12,6 +15,7 @@ use super::backfill::Progress;
 use super::log_cursor::{self, Cursor};
 use super::logged_write::SharedLog;
 use super::rebuild::holds_rows;
+use super::Graph;
 use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::value::Row;
@@ -53,6 +57,43 @@ async fn backfill_pending<B: Backend>(backend: &B) -> Result<bool> {
     let saved = Progress::load(backend).await?;
     let complete = saved.as_ref().is_some_and(Progress::is_complete);
     Ok(!complete && holds_rows(backend).await?)
+}
+
+impl<B: Backend> Graph<B> {
+    /// Rebuilds the dedup filter from `log_hash_index`, which drops the hashes of
+    /// rows a purge removed, and rewrites the filter file at `saved_at`.
+    pub async fn rebuild_dedup_filter(&self, saved_at: Option<&Path>) -> Result<()> {
+        let log = self.log.as_ref().ok_or(Error::NoEventLog)?;
+        let mut log = log.lock().await;
+        let bloom = rebuild_bloom(&self.backend, log.bloom_config()).await?;
+        if let Some(path) = saved_at {
+            bloom.save(path, log.log_id(), log.head())?;
+        }
+        log.replace_bloom(bloom);
+        Ok(())
+    }
+
+    /// Whether the filter file at `path` is the one `log_hash_index` would build
+    /// now. A damaged or out of date file is not; one that was never written
+    /// holds no hashes, so it is.
+    pub async fn dedup_filter_file_matches_index(&self, path: &Path) -> Result<bool> {
+        if !path.exists() {
+            return Ok(true);
+        }
+        let log = self.log.as_ref().ok_or(Error::NoEventLog)?;
+        let log = log.lock().await;
+        let rebuilt = rebuild_bloom(&self.backend, log.bloom_config()).await?;
+        let loaded = HashBloom::load(path, log.bloom_config(), log.log_id(), log.head());
+        Ok(matches!(loaded, FilterLoad::Fresh(saved) if saved == rebuilt))
+    }
+
+    /// Whether the dedup filter is the one `log_hash_index` would build now.
+    pub async fn dedup_filter_matches_index(&self) -> Result<bool> {
+        let log = self.log.as_ref().ok_or(Error::NoEventLog)?;
+        let log = log.lock().await;
+        let rebuilt = rebuild_bloom(&self.backend, log.bloom_config()).await?;
+        Ok(log.bloom() == &rebuilt)
+    }
 }
 
 /// A cursor behind the head is fine: the records between are replayed.

@@ -2,7 +2,7 @@
 //! Counting the results `recall` and `ask` return, and writing the counts to
 //! the log in batches, off the request path.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -142,6 +142,14 @@ pub struct UsageRecorder {
     counts: Mutex<BoundedMap<NodeId, Counted>>,
 }
 
+fn counted_among(counts: &BoundedMap<NodeId, Counted>, nodes: &HashSet<String>) -> Vec<NodeId> {
+    counts
+        .iter()
+        .filter(|(node, _)| nodes.contains(node.as_str()))
+        .map(|(node, _)| node.clone())
+        .collect()
+}
+
 impl UsageRecorder {
     pub fn new(max_tracked_items: usize) -> Self {
         Self {
@@ -172,6 +180,26 @@ impl UsageRecorder {
                 ),
             }
         }
+    }
+
+    /// Drops the counts of `nodes` and returns how many nodes had one.
+    pub fn forget(&self, nodes: &HashSet<String>) -> usize {
+        let mut counts = self.counts();
+        let held = counted_among(&counts, nodes);
+        for id in &held {
+            counts.remove(id);
+        }
+        held.len()
+    }
+
+    /// The ids among `nodes` that have a count waiting for a flush, sorted.
+    pub fn holds(&self, nodes: &HashSet<String>) -> Vec<String> {
+        let mut held: Vec<String> = counted_among(&self.counts(), nodes)
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        held.sort();
+        held
     }
 
     /// Nodes whose counts were displaced by newer ones.
