@@ -32,6 +32,7 @@ pub use self::summaries::child_hash;
 pub use self::tiers::{
     dequantize, hamming, quantize, IndexedEntry, QuantIndex, Quantized, BITS_PER_WORD,
 };
+use self::tiers::{ColdArm, ColdQuery};
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};
@@ -531,18 +532,23 @@ fn rank_order(a_score: f64, a_rowid: i64, b_score: f64, b_rowid: i64) -> std::cm
     b_score.total_cmp(&a_score).then(a_rowid.cmp(&b_rowid))
 }
 
-/// Turns lexical and vector search rank lists into one fused RRF score per
-/// candidate id, using `1 / (rrf_k + rank + 1)` summed across every list a
-/// candidate appears in.
-fn rrf_fuse(lexical: &[NodeId], vector: &[NodeId], rrf_k: f64) -> HashMap<String, f64> {
+/// Turns the lexical, vector and cold rank lists into one fused RRF score per
+/// candidate id, using `weight / (rrf_k + rank + 1)` summed across every list a
+/// candidate appears in. The first two lists weigh 1; `cold_weight` scales the
+/// third, so a store with no cold items scores exactly as it did without it.
+fn rrf_fuse(
+    lexical: &[NodeId],
+    vector: &[NodeId],
+    cold: &[NodeId],
+    rrf_k: f64,
+    cold_weight: f64,
+) -> HashMap<String, f64> {
     let mut rrf: HashMap<String, f64> = HashMap::new();
-    for (i, id) in lexical.iter().chain(vector.iter()).enumerate() {
-        let rank = if i < lexical.len() {
-            i
-        } else {
-            i - lexical.len()
-        };
-        *rrf.entry(id.as_str().to_string()).or_insert(0.0) += 1.0 / (rrf_k + rank as f64 + 1.0);
+    for (list, weight) in [(lexical, 1.0), (vector, 1.0), (cold, cold_weight)] {
+        for (rank, id) in list.iter().enumerate() {
+            *rrf.entry(id.as_str().to_string()).or_insert(0.0) +=
+                weight / (rrf_k + rank as f64 + 1.0);
+        }
     }
     rrf
 }
@@ -558,6 +564,30 @@ fn rank_seeds(rrf: &HashMap<String, f64>, rowids: &HashMap<String, i64>, k: usiz
     seeds.into_iter().map(|(id, _)| id.to_string()).collect()
 }
 
+/// The place each arm of a query gave an id, by id.
+#[derive(Default)]
+struct Ranks {
+    lexical: HashMap<String, usize>,
+    vector: HashMap<String, usize>,
+    cold: HashMap<String, usize>,
+}
+
+impl Ranks {
+    fn of(lexical: &[NodeId], vector: &[NodeId], cold: &[NodeId]) -> Self {
+        let rank = |list: &[NodeId]| {
+            list.iter()
+                .enumerate()
+                .map(|(i, id)| (id.as_str().to_string(), i))
+                .collect()
+        };
+        Self {
+            lexical: rank(lexical),
+            vector: rank(vector),
+            cold: rank(cold),
+        }
+    }
+}
+
 /// Scores hydrated candidate rows by RRF base score, confidence, time decay,
 /// and expansion weighting, then returns the top `k` by score descending.
 /// Pure and DB-free: every input is already-fetched data, so callers can
@@ -566,8 +596,7 @@ fn rank_seeds(rrf: &HashMap<String, f64>, rowids: &HashMap<String, i64>, k: usiz
 fn score_and_rank(
     rows: Vec<Candidate>,
     candidates: &HashMap<String, (f64, bool)>,
-    lex_rank: &HashMap<String, usize>,
-    vec_rank: &HashMap<String, usize>,
+    ranks: &Ranks,
     now: Millis,
     half_life: Option<Millis>,
     expansion_weight: f64,
@@ -594,8 +623,9 @@ fn score_and_rank(
                     attributes: c.attributes,
                     score,
                 },
-                lexical_rank: lex_rank.get(c.id.as_str()).copied(),
-                vector_rank: vec_rank.get(c.id.as_str()).copied(),
+                lexical_rank: ranks.lexical.get(c.id.as_str()).copied(),
+                vector_rank: ranks.vector.get(c.id.as_str()).copied(),
+                cold_rank: ranks.cold.get(c.id.as_str()).copied(),
                 rrf: base,
                 confidence: c.confidence,
                 decay,
@@ -621,6 +651,7 @@ pub struct Graph<B: Backend> {
     embedder: Option<Arc<dyn ContentEmbedder>>,
     /// The binary signature of every live node that has one.
     quant: QuantIndex,
+    cold_arm: ColdArm,
     /// Orders each update of `quant` after the commit it reports, and a reload
     /// of it after the tables it reads.
     quant_gate: tiers::IndexGate,
@@ -683,6 +714,7 @@ impl<B: Backend> Graph<B> {
             log: None,
             embedder: None,
             quant: QuantIndex::default(),
+            cold_arm: ColdArm::of(&config),
             quant_gate: tiers::IndexGate::default(),
         };
         // Lineage first: it is what the index reload joins the tiers through.
@@ -1054,18 +1086,22 @@ impl<B: Backend> Graph<B> {
             None => Vec::new(),
         };
 
-        let lex_rank: HashMap<String, usize> = lexical
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.as_str().to_string(), i))
-            .collect();
-        let vec_rank: HashMap<String, usize> = vector
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.as_str().to_string(), i))
-            .collect();
+        let cold = match q.embedding.as_deref() {
+            Some(embedding) => {
+                let arm = ColdQuery {
+                    pool,
+                    kind,
+                    scope,
+                    as_of: now,
+                    include_inferred: q.include_inferred,
+                };
+                self.cold_probe(embedding, arm).await?
+            }
+            None => Vec::new(),
+        };
 
-        let rrf = rrf_fuse(&lexical, &vector, self.rrf_k);
+        let ranks = Ranks::of(&lexical, &vector, &cold);
+        let rrf = rrf_fuse(&lexical, &vector, &cold, self.rrf_k, self.cold_arm.weight);
 
         // Seeds: top of the fused list. Expand their neighbours, down-weighted.
         let rowids = self.rowids_of(rrf.keys().map(String::as_str)).await?;
@@ -1132,8 +1168,7 @@ impl<B: Backend> Graph<B> {
         let out = score_and_rank(
             rows,
             &candidates,
-            &lex_rank,
-            &vec_rank,
+            &ranks,
             now,
             q.half_life,
             self.expansion_weight,
@@ -2460,6 +2495,7 @@ mod tests {
     mod backfill;
     mod backwards_clock;
     mod catch_up;
+    mod cold_probe;
     mod derivation;
     mod fact_arbitration;
     mod fact_batch;
@@ -3539,8 +3575,7 @@ mod tests {
         let out = score_and_rank(
             vec![row],
             &candidates,
-            &HashMap::new(),
-            &HashMap::new(),
+            &Ranks::default(),
             now,
             None,
             3.0,
@@ -3566,8 +3601,7 @@ mod tests {
         let out = score_and_rank(
             vec![row],
             &candidates,
-            &HashMap::new(),
-            &HashMap::new(),
+            &Ranks::default(),
             now,
             None,
             3.0,
@@ -3593,8 +3627,7 @@ mod tests {
         let out = score_and_rank(
             vec![row],
             &candidates,
-            &HashMap::new(),
-            &HashMap::new(),
+            &Ranks::default(),
             now,
             None,
             4.0,
@@ -3627,8 +3660,11 @@ mod tests {
         let out = score_and_rank(
             vec![present, absent],
             &candidates,
-            &lex_rank,
-            &vec_rank,
+            &Ranks {
+                lexical: lex_rank,
+                vector: vec_rank,
+                cold: HashMap::new(),
+            },
             now,
             None,
             1.0,
@@ -3660,17 +3696,7 @@ mod tests {
         candidates.insert("mid".to_string(), (1.0, false));
 
         // Act
-        let out = score_and_rank(
-            rows,
-            &candidates,
-            &HashMap::new(),
-            &HashMap::new(),
-            now,
-            None,
-            1.0,
-            0.1,
-            2,
-        );
+        let out = score_and_rank(rows, &candidates, &Ranks::default(), now, None, 1.0, 0.1, 2);
 
         // Assert
         let ids: Vec<&str> = out.iter().map(|h| h.hit.id.as_str()).collect();
@@ -3690,8 +3716,7 @@ mod tests {
         let out = score_and_rank(
             vec![row],
             &candidates,
-            &HashMap::new(),
-            &HashMap::new(),
+            &Ranks::default(),
             now,
             None,
             1.0,

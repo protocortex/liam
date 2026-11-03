@@ -4,6 +4,7 @@
 //! binary forms. Quantizing is model-free, so it lives here; deciding what to
 //! move between tiers does not.
 
+mod cold;
 mod lineage;
 mod logged;
 mod quantize;
@@ -11,6 +12,7 @@ mod state;
 
 use std::sync::Arc;
 
+pub(super) use cold::{ColdArm, ColdQuery};
 pub(super) use lineage::assign_lineage;
 use quantize::{bytes_to_words, words_to_bytes, QUANT_VERSION};
 pub use quantize::{

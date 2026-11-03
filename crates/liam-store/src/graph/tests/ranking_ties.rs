@@ -118,8 +118,7 @@ fn rank(rows: Vec<Candidate>, k: usize) -> Vec<ExplainedHit> {
     score_and_rank(
         rows,
         &candidates,
-        &HashMap::new(),
-        &HashMap::new(),
+        &Ranks::default(),
         Millis(0),
         None,
         0.5,
@@ -165,8 +164,7 @@ fn score_and_rank_puts_a_higher_score_before_a_lower_rowid() {
     let out = score_and_rank(
         rows,
         &candidates,
-        &HashMap::new(),
-        &HashMap::new(),
+        &Ranks::default(),
         Millis(0),
         None,
         0.5,
@@ -192,8 +190,7 @@ fn score_and_rank_orders_a_nan_score_the_same_way_every_time() {
         let out = score_and_rank(
             rows,
             &candidates,
-            &HashMap::new(),
-            &HashMap::new(),
+            &Ranks::default(),
             Millis(0),
             None,
             0.5,

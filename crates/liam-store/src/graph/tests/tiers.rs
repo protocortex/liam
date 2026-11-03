@@ -21,7 +21,7 @@ fn key(text: &str) -> LineageKey {
     LineageKey::from_raw(text)
 }
 
-fn cold_at(lineage: &LineageKey, at: i64) -> TierMove {
+pub(super) fn cold_at(lineage: &LineageKey, at: i64) -> TierMove {
     TierMove {
         lineage_key: lineage.clone(),
         to: Tier::Cold,
@@ -43,19 +43,19 @@ fn hot_at(lineage: &LineageKey, at: i64, residency_until: Option<i64>) -> TierMo
 
 /// A node with a subject, so the lineage of every one written with the same
 /// producer and scope is the same.
-fn subject_node(label: &str, pattern: u8) -> NewNode {
+pub(super) fn subject_node(label: &str, pattern: u8) -> NewNode {
     node(label, pattern)
         .with_subject("ada")
         .with_producer("agent-a")
 }
 
-async fn lineage_of_node<B: Backend>(g: &Graph<B>, id: &NodeId) -> LineageKey {
+pub(super) async fn lineage_of_node<B: Backend>(g: &Graph<B>, id: &NodeId) -> LineageKey {
     g.lineage_of(id).await.unwrap().expect("a lineage")
 }
 
 /// Marks a node as a cold one holds it: its int8 form is gone and its vector
 /// with it.
-async fn drop_embeddings<B: Backend>(g: &Graph<B>, id: &NodeId) {
+pub(super) async fn drop_embeddings<B: Backend>(g: &Graph<B>, id: &NodeId) {
     g.backend
         .execute(
             "UPDATE node_quant SET i8 = NULL WHERE node_id = ?1",
