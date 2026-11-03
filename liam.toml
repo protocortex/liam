@@ -100,6 +100,44 @@ cold_max_hamming_ratio         = 0.35    # share of signature bits that may diff
 cold_arm_weight                = 0.5     # factor on the cold probe's contribution to a fused score
 run_deadline_secs              = 600     # bounds the tier step of one run
 
+# Seals new log events so a subject can be deleted by destroying its keys.
+# Unset keeps a plaintext log. See "Deleting a subject" in the README before
+# turning it on: the data keys are wrapped by this master key, and losing the
+# master key or the key registry loses all log content.
+[encryption]
+# master_key = "file"           # "keychain" (macOS login keychain) or "file"
+# key_file   = "~/.liam/master.key"   # for master_key = "file"; owner-readable only
+
+# How `liamd delete` treats the data it destroys.
+[deletion]
+deadline_days = 30      # days a delete job has before it is reported as overdue
+secure_delete = true    # zero the database pages a delete frees
+
+# Producers that may call the `consolidate` and `delete` tools. A producer name
+# is what a client claims, not an authenticated identity, so this guards against
+# mistakes and not against abuse. Empty refuses everyone.
+[admin]
+producers = []
+
+# Moves closed log partitions to another directory, compressed. Nothing is
+# deleted. A partition that is archived and then lost makes a rebuild fail.
+[archive]
+enabled    = false      # false moves nothing
+after_days = 90         # archive a closed partition once its newest event is this old
+# dir      = "/mnt/liam-archive"   # required when enabled; must exist
+zstd_level = 3          # 1 to 22; sealed bodies barely compress, so higher mostly costs time
+
+# What the daemon measures about itself and when it raises an alert. The
+# thresholds are starting values, not measured on real data.
+[metrics]
+enabled                    = true      # false keeps no metrics and exposes no readings
+sink                       = "memory"  # "memory", or "log" to also log each active alert
+min_samples                = 5         # samples a metric needs before a relative or rate rule alerts
+delta_pct                  = 20.0      # percent a recall, latency, ece or Bloom rate may move between runs
+rollback_ceiling           = 1.0       # rollbacks at which an alert is raised
+extraction_backlog_ceiling = 10000.0   # events past an extraction cursor at which an alert is raised
+model_calls_per_hour       = 1000.0    # model calls an hour at which an alert is raised
+
 [embedder]
 provider  = "mock"                       # "mock" (dev) or "local" (in-process)
 model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"

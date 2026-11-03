@@ -14,8 +14,19 @@ LIAM's own licensing terms are in this repository's LICENSE file.
 LIAM links llama.cpp and its ggml tensor library directly into the binary.
 They are vendored C++ sources built by the `llama-cpp-sys-2` crate, not a
 system library and not downloaded at runtime. Both llama.cpp and ggml are
-MIT licensed. This is the only bundled native (non-Rust) code in LIAM, and
-the entry most readers checking this file are looking for.
+MIT licensed. It is the largest bundled native (non-Rust) code in LIAM, and
+the entry most readers checking this file are looking for. The `zstd-sys`
+crate also compiles the zstd C library (BSD-3-Clause) into the binary, for the
+log archive; see "zstd" below.
+
+## zstd
+
+The log archive compresses closed log partitions with zstd. The `zstd-sys`
+crate builds the zstd C library from the sources it vendors, and the `parquet`
+crate enables it through its `zstd` feature. The library is BSD-3-Clause
+licensed (zstd is offered under BSD or GPLv2; LIAM uses it under BSD). It is in
+every build, because the archive reader must open an archived partition even
+when `[archive]` is off.
 
 ## Components fetched at install
 
@@ -42,68 +53,74 @@ stack and a CA bundle in every default build for a download only
 Every crate below was confirmed present in the resolved dependency tree for
 `cargo build --workspace` and for `cargo build -p liam-daemon --features
 local,llama`, and every license name comes straight from that crate's
-`license` field in `cargo metadata`, not from assumption. 371 Rust crates
+`license` field in `cargo metadata`, not from assumption. 421 Rust crates
 ship in total.
 
-### MIT OR Apache-2.0 (203 crates)
+### MIT OR Apache-2.0 (234 crates)
 
-accelerate-src, ahash, aligned, allocator-api2, anstream, anstyle,
-anstyle-parse, anstyle-query, anyhow, arrayvec, as-slice, async-trait,
-atomic-waker, autocfg, base64, base64ct, bit_field, bitflags, bitstream-io,
-candle-core, candle-metal-kernels, candle-nn, cc, cexpr, cfg-if, chacha20,
-chrono, clap, clap_builder, clap_derive, clap_lex, cmake, colorchoice,
-core-foundation, core-foundation-sys, crc32fast, crossbeam-deque,
-crossbeam-epoch, crossbeam-utils, dary_heap, der, deranged, derive_builder,
-derive_builder_core, derive_builder_macro, dirs, dirs-sys, displaydoc,
-dyn-clone, either, enum-as-inner, enumflags2, enumflags2_derive, equivalent,
-errno, fastrand, fdeflate, find-msvc-tools, find_cuda_helper, fixedbitset,
-flate2, fnv, form_urlencoded, futures, futures-channel, futures-core,
-futures-executor, futures-io, futures-macro, futures-sink, futures-task,
-futures-util, getrandom, gif, glob, half, hashbrown, heck, home, http,
-httparse, hyper-tls, ident_case, idna, idna_adapter, image, image-webp,
-indexmap, ipnet, is_terminal_polyfill, itertools, itoa, jobserver,
-lazy_static, lazycell, leiden-rs, libc, llama-cpp-2, llama-cpp-sys-2,
-lock_api, log, matrixmultiply, memmap2, mime, minimal-lexical, monostate,
-monostate-impl, native-tls, ndarray, no_std_io2, num-bigint, num-complex,
-num-conv, num-derive, num-integer, num-rational, num-traits, num_cpus,
+accelerate-src, aead, aes, aes-gcm, ahash, aligned, allocator-api2,
+anstream, anstyle, anstyle-parse, anstyle-query, anyhow, arrayvec, as-slice,
+async-trait, atomic-waker, autocfg, base64, base64ct, bit_field, bitflags,
+bitstream-io, block-buffer, candle-core, candle-metal-kernels, candle-nn,
+cc, cexpr, cfg-if, chacha20, chrono, cipher, clap, clap_builder,
+clap_derive, clap_lex, cmake, cmov, cobs, colorchoice, core-foundation,
+core-foundation-sys, cpubits, cpufeatures, crc32fast, crossbeam-deque,
+crossbeam-epoch, crossbeam-utils, crypto-common, ctr, ctutils, dary_heap,
+der, deranged, derive_builder, derive_builder_core, derive_builder_macro,
+digest, dirs, dirs-sys, displaydoc, dyn-clone, either, enum-as-inner,
+enumflags2, enumflags2_derive, equivalent, errno, fastbloom, fastrand,
+fdeflate, find-msvc-tools, find_cuda_helper, fixedbitset, flate2, fnv,
+form_urlencoded, futures, futures-channel, futures-core, futures-executor,
+futures-io, futures-macro, futures-sink, futures-task, futures-util,
+getrandom, ghash, gif, glob, half, hashbrown, heck, hmac, home, http,
+httparse, humantime, hybrid-array, hyper-tls, iana-time-zone, ident_case,
+idna, idna_adapter, image, image-webp, indexmap, inout, ipnet,
+is_terminal_polyfill, itertools, itoa, jobserver, lazy_static, lazycell,
+leiden-rs, libc, llama-cpp-2, llama-cpp-sys-2, lock_api, log,
+matrixmultiply, memmap2, mime, minimal-lexical, monostate, monostate-impl,
+native-tls, ndarray, no_std_io2, num-bigint, num-complex, num-conv,
+num-derive, num-integer, num-rational, num-traits, num_cpus, object_store,
 once_cell, ort, ort-sys, parking_lot, parking_lot_core, paste, pastey,
 peeking_take_while, pem-rfc7468, percent-encoding, pin-project-lite,
-pkg-config, png, portable-atomic, powerfmt, ppv-lite86, prettyplease,
-proc-macro2, profiling, profiling-procmacros, qoi, quick-error, quote, rand,
-rand_chacha, rand_core, rand_distr, rawpointer, rayon, rayon-cond,
-rayon-core, ref-cast, ref-cast-impl, regex, regex-automata, regex-syntax,
-reqwest, rustc-hash, rustls-pki-types, rustversion, scopeguard,
-security-framework, security-framework-sys, seq-macro, serde, serde_core,
-serde_derive, serde_derive_internals, serde_json, serde_spanned,
-serde_urlencoded, shlex, signal-hook-registry, smallvec, socket2, socks,
+pkg-config, png, polyval, portable-atomic, postcard, powerfmt, ppv-lite86,
+prettyplease, proc-macro2, profiling, profiling-procmacros, qoi,
+quick-error, quote, rand, rand_chacha, rand_core, rand_distr, raunch,
+rawpointer, rayon, rayon-cond, rayon-core, ref-cast, ref-cast-impl, regex,
+regex-automata, regex-syntax, reqwest, rustc-hash, rustc_version,
+rustls-pki-types, rustversion, scopeguard, security-framework,
+security-framework-sys, semver, seq-macro, serde, serde_core, serde_derive,
+serde_derive_internals, serde_json, serde_spanned, serde_urlencoded, sha2,
+shlex, signal-hook-registry, siphasher, smallvec, socket2, socks,
 stable_deref_trait, static_assertions, syn, system-configuration,
 system-configuration-sys, tempfile, thiserror, thiserror-impl, thread_local,
 time, time-core, toml, toml_datetime, toml_parser, toml_writer, typed-path,
-unicode-normalization-alignments, unicode-segmentation, unicode-width,
-unicode_categories, ureq, ureq-proto, url, utf8-zero, utf8_iter, utf8parse,
-version_check, weezl, zeroize.
+typenum, unicode-normalization-alignments, unicode-segmentation,
+unicode-width, unicode_categories, universal-hash, ureq, ureq-proto, url,
+utf8-zero, utf8_iter, utf8parse, uuid, version_check, weezl, zeroize.
 
-### MIT (91 crates)
+### MIT (95 crates)
 
 aligned-vec, arg_enum_proc_macro, av-scenechange, bitvec, block2, built,
-bytes, castaway, color_quant, compact_str, console, darling, darling_core,
-darling_macro, dyn-stack, dyn-stack-macros, equator, equator-macro, fax,
-float8, funty, gemm, gemm-c32, gemm-c64, gemm-common, gemm-f16, gemm-f32,
-gemm-f64, h2, http-body, http-body-util, hyper, hyper-util, indicatif,
-libm, libsql, libsql-ffi, libsql-sys, loop9, matchers, maybe-rayon, mio,
-new_debug_unreachable, nom, noop_proc_macro, nu-ansi-term, objc2,
-objc2-encode, objc2-foundation, onig, onig_sys, pulp, pulp-wasm-simd-flag,
-radium, raw-cpuid, reborrow, rgb, schemars, schemars_derive, sharded-slab,
-simd-adler32, simd_helpers, slab, strsim, synstructure, sysctl, tap, tiff,
-tokio, tokio-macros, tokio-native-tls, tokio-util, tower, tower-http,
-tower-layer, tower-service, tracing, tracing-attributes, tracing-core,
-tracing-log, tracing-subscriber, try-lock, ulid, unit-prefix, want, which,
-winnow, wyz, y4m, zip, zmij.
+bytes, castaway, cfg_aliases, color_quant, compact_str, console, darling,
+darling_core, darling_macro, dyn-stack, dyn-stack-macros, equator,
+equator-macro, fax, float8, funty, gemm, gemm-c32, gemm-c64, gemm-common,
+gemm-f16, gemm-f32, gemm-f64, h2, http-body, http-body-util, hyper,
+hyper-util, indicatif, libm, libsql, libsql-ffi, libsql-sys, loop9,
+matchers, maybe-rayon, mio, new_debug_unreachable, nix, nom,
+noop_proc_macro, nu-ansi-term, objc2, objc2-encode, objc2-foundation, onig,
+onig_sys, pulp, pulp-wasm-simd-flag, radium, raw-cpuid, reborrow, rgb,
+schemars, schemars_derive, sharded-slab, simd-adler32, simd_helpers, slab,
+strsim, synstructure, sysctl, sysinfo, tap, tiff, tokio, tokio-macros,
+tokio-native-tls, tokio-util, tower, tower-http, tower-layer, tower-service,
+tracing, tracing-attributes, tracing-core, tracing-log, tracing-subscriber,
+try-lock, twox-hash, ulid, unit-prefix, want, which, winnow, wyz, y4m, zip,
+zmij.
 
-### Apache-2.0 (11 crates)
+### Apache-2.0 (19 crates)
 
-clang-sys, esaxx-rs, fastembed, hf-hub, lzma-rust2, rmcp, rmcp-macros,
-safetensors, spm_precompiled, sync_wrapper, tokenizers.
+arrow-buffer, arrow-cmp, arrow-data, arrow-ipc, arrow-schema, arrow-select,
+clang-sys, esaxx-rs, fastembed, flatbuffers, hf-hub, lzma-rust2, parquet,
+rmcp, rmcp-macros, safetensors, spm_precompiled, sync_wrapper, tokenizers.
 
 ### Unicode-3.0 (18 crates)
 
@@ -112,14 +129,16 @@ icu_properties, icu_properties_data, icu_provider, litemap, potential_utf,
 tinystr, writeable, yoke, yoke-derive, zerofrom, zerofrom-derive, zerotrie,
 zerovec, zerovec-derive.
 
-### Other permissive licenses (48 crates)
+### Other permissive licenses (55 crates)
 
 - MIT OR Apache-2.0 OR Zlib: bytemuck, bytemuck_derive, dispatch2,
   macro_rules_attribute, macro_rules_attribute-proc_macro, miniz_oxide,
-  objc2-core-foundation, objc2-metal, zune-core, zune-inflate, zune-jpeg.
+  objc2-core-foundation, objc2-io-kit, objc2-metal, tinyvec, zune-core,
+  zune-inflate, zune-jpeg.
 - MIT OR Unlicense: aho-corasick, byteorder, byteorder-lite, gryf,
   gryf-derive, memchr, same-file, walkdir.
-- BSD-3-Clause: avif-serialize, bindgen, exr, lebe, ravif, subtle.
+- BSD-3-Clause: avif-serialize, bindgen, exr, lebe, ravif, subtle, zstd,
+  zstd-safe, zstd-sys.
 - ISC: hmac-sha256, libloading, rustls-webpki, untrusted.
 - BSD-2-Clause: av1-grain, rav1e, v_frame.
 - Apache-2.0 OR BSD-2-Clause OR MIT: zerocopy, zerocopy-derive.
@@ -133,8 +152,10 @@ zerovec, zerovec-derive.
 - Apache-2.0 OR CC0-1.0: imgref.
 - Apache-2.0 OR ISC OR MIT: rustls.
 - (Apache-2.0 OR MIT) AND BSD-3-Clause, both apply: encoding_rs.
-- (MIT OR Apache-2.0) AND Unicode-3.0, both apply: unicode-ident.
+- (MIT OR Apache-2.0) AND Unicode-3.0, both apply: unicode-ident,
+  unicode-normalization.
 - Apache-2.0 AND ISC, both apply: ring.
+- Apache-2.0 AND MIT, both apply: arrow-array.
 
 ## Named coverage
 
