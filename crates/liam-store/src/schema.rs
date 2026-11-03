@@ -355,7 +355,8 @@ CREATE TABLE IF NOT EXISTS summary_tree_state (
 /// Which key group seals each logged row, read from the plain row headers of a
 /// sealed record. No foreign keys: a row whose key was destroyed is not in
 /// `nodes`, and a hard-deleted node keeps its entry so the group still resolves
-/// to it. Both tables are derived from the log.
+/// to it. Both tables are derived from the log. `lineage_removals` is the
+/// outbox of the purge that deletes the rows of a key group.
 fn key_tables() -> String {
     String::from(
         "
@@ -375,6 +376,19 @@ CREATE TABLE IF NOT EXISTS derived_keys (
 );
 
 CREATE INDEX IF NOT EXISTS derived_keys_by_key ON derived_keys (key_id);
+
+-- One row per delete job and lineage store: what the purge is to remove, kept
+-- before the first delete so a rerun after a crash removes the same rows, and
+-- what the verify reads once the rows that named them are gone. done_at stays
+-- NULL until the purge has committed.
+CREATE TABLE IF NOT EXISTS lineage_removals (
+  job_id  TEXT    NOT NULL,
+  store   TEXT    NOT NULL,
+  input   TEXT    NOT NULL,
+  doomed  TEXT    NOT NULL,
+  done_at INTEGER,
+  PRIMARY KEY (job_id, store)
+);
 ",
     )
 }
@@ -478,10 +492,13 @@ pub(crate) enum Clear {
 /// the assignments, otherwise its fingerprint would vouch for communities that
 /// are no longer there. The backend's vector table goes before all of them, as
 /// `Backend::vector_clear_sql` returns it.
-pub(crate) const DERIVED_TABLES: [(&str, Clear); 32] = [
+pub(crate) const DERIVED_TABLES: [(&str, Clear); 33] = [
     // No foreign keys, so their place in the order is free.
     ("node_keys", Clear::Always),
     ("derived_keys", Clear::Always),
+    // A rebuild from the same log replays every `LineageRemoval`, so the job's
+    // record of it stays valid; another log never ran these jobs.
+    ("lineage_removals", Clear::OnAdoption),
     // No foreign keys link the fact tables, so their order among themselves is free.
     ("fact_sources", Clear::Always),
     ("fact_suppressions", Clear::Always),

@@ -674,6 +674,7 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
             | Step::Tier { .. }
             | Step::Fact(_)
             | Step::SummaryClose { .. }
+            | Step::Purge(_)
             | Step::SummaryEmbedding { .. } => None,
         })
         .collect()

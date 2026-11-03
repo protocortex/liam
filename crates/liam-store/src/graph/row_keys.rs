@@ -11,9 +11,9 @@ use crate::error::Result;
 use crate::value::Value;
 
 /// The `row_kind` of a sealed fact write in `derived_keys`.
-const DERIVED_FACT: &str = "fact";
+pub(super) const DERIVED_FACT: &str = "fact";
 /// The `row_kind` of a sealed derived artifact in `derived_keys`.
-const DERIVED_ARTIFACT: &str = "artifact";
+pub(super) const DERIVED_ARTIFACT: &str = "artifact";
 
 const NODE_KEY_SQL: &str = "SELECT key_id FROM node_keys WHERE node_id = ?1";
 

@@ -1191,6 +1191,42 @@ pub enum RetractOutcome {
     RestoreBlocked,
 }
 
+/// The rows a delete job removes from a lineage store, named by the logged
+/// events that carried them and the key groups that sealed them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineageTarget {
+    pub job_id: String,
+    pub event_ids: Vec<String>,
+    pub key_ids: Vec<String>,
+}
+
+/// How many rows of each table a purge would remove.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineageHits {
+    pub rows: BTreeMap<String, usize>,
+}
+
+impl LineageHits {
+    pub fn total(&self) -> usize {
+        self.rows.values().sum()
+    }
+}
+
+/// What a purge removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgeReport {
+    pub removed: usize,
+}
+
+/// A row that still refers to a deleted id after a purge. Names the table and
+/// the row id, never the row's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Residual {
+    pub store: String,
+    pub kind: String,
+    pub id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

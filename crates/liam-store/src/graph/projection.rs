@@ -11,6 +11,7 @@ use liam_log::event::{
 
 use super::backfill::BACKFILL_SOURCE;
 use super::fact_projection::{apply_fact_step, fact_steps, FactStep};
+use super::lineage::{purge_in_tx, PurgeInput, GRAPH_STORE};
 use super::logged_plan::Table;
 use super::summaries::{apply_artifact, close_if_open, store_embedding};
 use super::tiers::{
@@ -89,6 +90,9 @@ pub(super) enum Step {
         id: String,
         at: i64,
     },
+    /// Deletes what a destroyed key group left in the derived tables. Removing
+    /// rows that are already gone changes nothing, so a replay can run it again.
+    Purge(PurgeInput),
     /// Stores a summary's vector. A live write adds it after `Summary`; the log
     /// does not carry vectors, so `steps_for` never yields it and a replay
     /// leaves the summary to the re-embed pass.
@@ -121,6 +125,18 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
             id: artifact_id.clone(),
             at: *at,
         }],
+        // A removal from a store of another kind is that store's to replay.
+        LogPayload::LineageRemoval {
+            store,
+            event_ids,
+            key_ids,
+            node_ids,
+            ..
+        } if store == GRAPH_STORE => vec![Step::Purge(PurgeInput {
+            node_ids: node_ids.clone(),
+            event_ids: event_ids.clone(),
+            key_ids: key_ids.clone(),
+        })],
         LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
         | LogPayload::Quarantined { .. }
@@ -133,7 +149,7 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
         // The opening reader turns a sealed record into its plain rows before
         // anything projects it.
         | LogPayload::Sealed(_)
-        // Records of a delete. Replay only moves the cursor past them.
+        // Records of a delete that change no row. Replay only moves the cursor past them.
         | LogPayload::KeyDestroyed { .. }
         | LogPayload::DeletionRecorded { .. }
         | LogPayload::LineageRemoval { .. }
@@ -340,6 +356,7 @@ pub(super) async fn apply_steps(
             Step::Fact(step) => apply_fact_step(tx, step).await?,
             Step::Summary(artifact) => apply_artifact(tx, artifact).await?,
             Step::SummaryClose { id, at } => close_if_open(tx, id, *at).await?,
+            Step::Purge(input) => drop(purge_in_tx(tx, input, vector_delete).await?),
             Step::SummaryEmbedding {
                 id,
                 embedding,

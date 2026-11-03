@@ -126,6 +126,17 @@ mod tests {
                 sealed.payload
             );
         }
+        let store = liam_daemon::store_open::open_database(&config, &database_in(dir.path()))
+            .await
+            .unwrap();
+        for id in &ids {
+            let key = store.key_of_node(id).await.unwrap();
+            assert!(
+                key.is_some(),
+                "{id:?} must name the key group that seals it"
+            );
+        }
+        drop(store);
         let restarted = start(&config, dir.path()).await;
         for id in &ids {
             let node = restarted.store.get(id, Millis::now()).await.unwrap();

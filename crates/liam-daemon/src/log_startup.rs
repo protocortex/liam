@@ -68,6 +68,10 @@ pub async fn open_store_with_log(
         keys.clone(),
     )?;
     let store = open_store_on_log(store, database_path, log_dir, log.clone(), embedder).await?;
+    if keys.is_some() {
+        let sealed = store.backfill_node_keys_if_empty().await?;
+        tracing::debug!(sealed, "key groups checked against the sealed log");
+    }
     let compactor = compactor_for(log_dir)?.spawn(closed_segments);
     Ok(StartedStore {
         store,
