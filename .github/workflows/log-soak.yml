@@ -32,8 +32,9 @@ jobs:
         run: |
           set -euo pipefail
           # `cargo test` exits 0 when a filter matches nothing, so require
-          # that the one soak test actually ran and passed.
+          # that both soak tests, plain and sealed, actually ran and passed.
           cargo test --release -p liam-store -- --ignored --exact \
             graph::tests::soak::soak_full_rebuild_loses_no_record \
+            graph::tests::soak::soak_full_sealed_rebuild_loses_no_record \
             --nocapture 2>&1 | tee soak.log
-          grep -q ' 1 passed' soak.log
+          grep -q ' 2 passed' soak.log

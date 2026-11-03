@@ -4,8 +4,11 @@
 //! `cargo test`; the full run is `#[ignore]`d and gated by the scheduled soak
 //! workflow and the release workflow.
 
+use liam_log::crypto::KeyRegistry;
+use liam_log::event::LogPayload;
+
 use super::rebuild::{all_rows_multiset, oracle_multiset};
-use super::support::{count, fact_at, Env, ONE_SEGMENT};
+use super::support::{count, fact_at, key_registry, Env, ONE_SEGMENT};
 use super::*;
 use crate::types::{EpisodeEdge, EpisodeRef, GcReport};
 use crate::DefaultBackend;
@@ -103,16 +106,25 @@ async fn write_round(source: &DefaultGraph, round: usize) -> Written {
     written
 }
 
+/// A log over the soak's directory: plain, or sealing with `registry`.
+fn soak_log(env: &Env, registry: Option<&Arc<KeyRegistry>>) -> SharedLog {
+    match registry {
+        Some(registry) => env.sealing_log(registry),
+        None => env.log(ONE_SEGMENT),
+    }
+}
+
 /// Ingests at least `rows` rows through the real log-first path, rebuilds the
 /// log into a fresh store, and asserts the sorted multisets of content hashes
 /// are identical for the live rows and for all rows, closed ones included, so
-/// neither a lost record nor a changed superseded row can hide.
-async fn ingest_and_rebuild(rows: usize) {
+/// neither a lost record nor a changed superseded row can hide. With a
+/// `registry` the log seals what it appends and the rebuild opens it again.
+async fn ingest_and_rebuild(rows: usize, registry: Option<&Arc<KeyRegistry>>) {
     // Arrange
     let env = Env::new();
     let clock = Arc::new(FixedClock::new(Millis(CLOCK_START)));
     let (source, log) = env
-        .open::<DefaultBackend>("source.db", Arc::clone(&clock))
+        .open_over::<DefaultBackend>(soak_log(&env, registry), "source.db", Arc::clone(&clock))
         .await;
     let retention = RetentionPolicy::keep(EPHEMERAL_KIND, EPHEMERAL_MAX_AGE).without_reclaim();
 
@@ -135,9 +147,15 @@ async fn ingest_and_rebuild(rows: usize) {
     let stored = count(&source, "nodes").await + count(&source, "edges").await;
     drop(source);
     drop(log);
+    let sealed_records = env
+        .records()
+        .await
+        .iter()
+        .filter(|record| matches!(record.event.payload, LogPayload::Sealed(_)))
+        .count();
 
     let (fresh, fresh_log) = env
-        .open_over::<DefaultBackend>(env.log(ONE_SEGMENT), "fresh.db", Arc::clone(&clock))
+        .open_over::<DefaultBackend>(soak_log(&env, registry), "fresh.db", Arc::clone(&clock))
         .await;
     let (rebuilt, report) = fresh
         .rebuild_from_log(fresh_log, RebuildMode::RequireEmpty)
@@ -150,6 +168,11 @@ async fn ingest_and_rebuild(rows: usize) {
         written.rows, written.appends, removed.nodes_removed, removed.edges_removed
     );
     assert!(!live_before.is_empty(), "the soak ingested no live rows");
+    assert_eq!(
+        sealed_records > 0,
+        registry.is_some(),
+        "{sealed_records} sealed records in the log"
+    );
     assert!(removed.nodes_removed > 0, "gc removed no nodes");
     assert!(
         removed.edges_removed >= removed.nodes_removed,
@@ -184,11 +207,24 @@ async fn sweep(source: &DefaultGraph, retention: &RetentionPolicy, total: &mut G
 
 #[tokio::test]
 async fn soak_smoke_rebuild_loses_no_record() {
-    ingest_and_rebuild(SMOKE_ROWS).await;
+    ingest_and_rebuild(SMOKE_ROWS, None).await;
+}
+
+#[tokio::test]
+async fn soak_smoke_sealed_rebuild_loses_no_record() {
+    let (_keys, registry) = key_registry();
+    ingest_and_rebuild(SMOKE_ROWS, Some(&registry)).await;
 }
 
 #[tokio::test]
 #[ignore = "full-scale soak: run by the scheduled soak workflow and the release gate"]
 async fn soak_full_rebuild_loses_no_record() {
-    ingest_and_rebuild(FULL_SOAK_ROWS).await;
+    ingest_and_rebuild(FULL_SOAK_ROWS, None).await;
+}
+
+#[tokio::test]
+#[ignore = "full-scale soak: run by the scheduled soak workflow"]
+async fn soak_full_sealed_rebuild_loses_no_record() {
+    let (_keys, registry) = key_registry();
+    ingest_and_rebuild(FULL_SOAK_ROWS, Some(&registry)).await;
 }
