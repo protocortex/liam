@@ -584,6 +584,7 @@ fn a_point_from_an_input_takes_its_id_vector_and_valid_time() {
         valid_from: Millis(42),
         scope: None,
         origin_events: Vec::new(),
+        sources: Vec::new(),
         vector: axis(2),
     };
 

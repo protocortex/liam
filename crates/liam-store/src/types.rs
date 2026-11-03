@@ -513,6 +513,15 @@ pub struct TreeState {
     pub unattached_count: u32,
 }
 
+/// True when `scope` is `parent` or a descendant of it: `work/liam` is within
+/// `work`, `work` is not within `work/liam`, and `workshop` is not within `work`.
+pub fn scope_is_within(scope: &str, parent: &str) -> bool {
+    scope == parent
+        || scope
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// A live recorded or extracted node, as the tree builder reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SummaryInput {
@@ -523,6 +532,9 @@ pub struct SummaryInput {
     pub valid_from: Millis,
     pub scope: Option<String>,
     pub origin_events: Vec<EventRef>,
+    /// The producer that wrote the node, empty when the log is not sealed and
+    /// so keeps no producer per node.
+    pub sources: Vec<String>,
     pub vector: Vec<f32>,
 }
 
@@ -1258,6 +1270,26 @@ pub struct Residual {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_scope_is_within_itself_and_its_descendants_only() {
+        for (scope, parent, within) in [
+            ("work", "work", true),
+            ("work/liam", "work", true),
+            ("work/liam/deep", "work", true),
+            ("work", "work/liam", false),
+            ("workshop", "work", false),
+            ("home", "work", false),
+            ("", "", true),
+            ("work", "", false),
+        ] {
+            assert_eq!(
+                scope_is_within(scope, parent),
+                within,
+                "{scope} in {parent}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

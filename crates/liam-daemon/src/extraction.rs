@@ -5,6 +5,9 @@ mod apply;
 pub mod cache;
 pub mod client;
 pub mod extractor;
+// Nothing sends items to a hosted provider until the adapters land.
+#[allow(dead_code)]
+pub mod gate;
 pub mod grounding;
 pub mod hooks;
 mod http;

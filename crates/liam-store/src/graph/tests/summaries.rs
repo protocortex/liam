@@ -551,6 +551,46 @@ async fn the_inputs_are_the_recorded_nodes_of_one_scope_that_have_a_vector() {
 }
 
 #[tokio::test]
+async fn an_input_carries_the_producer_its_node_was_sealed_for_and_none_without_one() {
+    // Arrange
+    let g = open().await;
+    let sealed = g
+        .insert(fact("sealed").with_embedding(vector()))
+        .await
+        .unwrap();
+    g.insert(fact("plain").with_embedding(vector()))
+        .await
+        .unwrap();
+    g.backend
+        .execute(
+            "INSERT INTO node_keys (node_id, key_id, source) VALUES (?1, 'key-1', 'client:mcp')",
+            &[sealed.as_str().into()],
+        )
+        .await
+        .unwrap();
+
+    // Act
+    let inputs = g.summary_inputs("").await.unwrap();
+
+    // Assert
+    let sources = |id: &NodeId| {
+        inputs
+            .items
+            .iter()
+            .find(|item| &item.id == id)
+            .map(|item| item.sources.clone())
+    };
+    assert_eq!(sources(&sealed), Some(vec!["client:mcp".to_owned()]));
+    let plain_sources: Vec<_> = inputs
+        .items
+        .iter()
+        .filter(|item| item.id != sealed)
+        .map(|item| item.sources.clone())
+        .collect();
+    assert_eq!(plain_sources, [Vec::<String>::new()]);
+}
+
+#[tokio::test]
 async fn the_scopes_are_those_of_recorded_nodes_and_open_summaries_and_not_of_entity_pages() {
     // Arrange
     let g = open().await;

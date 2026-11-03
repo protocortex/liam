@@ -193,6 +193,7 @@ mod tests {
             allowed_hosts: vec![HOST.to_owned()],
             request_timeout_secs: TIMEOUT_SECS,
             max_response_bytes: MAX,
+            ..HostedConfig::default()
         };
         HostedClient::new(fake.clone(), &config)
     }

@@ -21,6 +21,7 @@ mod encryption;
 mod extraction;
 mod hosted;
 mod metrics;
+mod pins;
 mod summary;
 mod tiering;
 
@@ -34,8 +35,9 @@ pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
     MAX_RUN_DEADLINE_SECS,
 };
-pub use hosted::HostedConfig;
+pub use hosted::{HostedConfig, PrivacyConfig};
 pub use metrics::{MetricsConfig, SinkKind};
+pub use pins::{ModelPin, PinError};
 pub use summary::{
     SummaryConfig, DEFAULT_MAX_BASIS_IDS_RENDERED, DEFAULT_MIN_SUMMARY_SIMILARITY,
     MAX_SUMMARY_DEPTH,

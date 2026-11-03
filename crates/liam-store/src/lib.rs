@@ -33,15 +33,16 @@ pub use graph::{
 };
 pub use ids::{EdgeId, FactId, Millis, NodeId, BEGINNING, FOREVER, HANDLE_LEN};
 pub use types::{
-    relation, ApplyOutcome, ArbitrationCaps, ArbitrationOutcome, Basis, Cardinality, Change,
-    ChildKind, ClosureReport, ClusterMember, ClusterState, CountedFeedback, Derivation, EndFact,
-    EndOutcome, EventRef, EventRole, ExplainedHit, ExtractorName, Fact, FeedbackEvent, Fingerprint,
-    GcReport, GraphConfig, Grounding, Hit, InferredHit, InferredText, ItemView, LineageHits,
-    LineageKey, LineageNode, LineageTarget, MatchMode, NewEdge, NewFact, NewNode, NewSummary,
-    NodeText, OriginClaim, OriginVerdict, PredicateSpec, ProducerUsage, PurgeReport, PutOutcome,
-    Query, ReconcileReport, RecordedHit, RecordedText, Residual, RetentionPolicy, RetentionRule,
-    RetractOutcome, Retrieved, Summary, SummaryChild, SummaryEntry, SummaryFailure, SummaryInput,
-    SummaryInputs, Tier, TierMove, TreeState, UsageEntry, UsageSnapshot, Vocabulary,
+    relation, scope_is_within, ApplyOutcome, ArbitrationCaps, ArbitrationOutcome, Basis,
+    Cardinality, Change, ChildKind, ClosureReport, ClusterMember, ClusterState, CountedFeedback,
+    Derivation, EndFact, EndOutcome, EventRef, EventRole, ExplainedHit, ExtractorName, Fact,
+    FeedbackEvent, Fingerprint, GcReport, GraphConfig, Grounding, Hit, InferredHit, InferredText,
+    ItemView, LineageHits, LineageKey, LineageNode, LineageTarget, MatchMode, NewEdge, NewFact,
+    NewNode, NewSummary, NodeText, OriginClaim, OriginVerdict, PredicateSpec, ProducerUsage,
+    PurgeReport, PutOutcome, Query, ReconcileReport, RecordedHit, RecordedText, Residual,
+    RetentionPolicy, RetentionRule, RetractOutcome, Retrieved, Summary, SummaryChild, SummaryEntry,
+    SummaryFailure, SummaryInput, SummaryInputs, Tier, TierMove, TreeState, UsageEntry,
+    UsageSnapshot, Vocabulary,
 };
 pub use value::{Row, Value};
 
