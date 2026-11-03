@@ -868,3 +868,238 @@ async fn a_second_consolidate_while_a_run_holds_the_lock_is_busy_and_leaves_the_
         "the lock was still usable: {after}"
     );
 }
+
+const ARCHIVE_NOW: i64 = 100 * DAY;
+/// Digits in the file name of a log segment.
+const SEQUENCE_DIGITS: usize = 20;
+
+/// The Parquet file of the first segment, whatever the directory.
+fn first_parquet(dir: &Path) -> PathBuf {
+    let stem = format!("{:0width$}", 0, width = SEQUENCE_DIGITS);
+    dir.join(format!("{stem}.parquet"))
+}
+
+/// Three events ingested 50 days before `ARCHIVE_NOW`, one to a segment, with the
+/// two closed segments compacted to Parquet.
+async fn old_partitions(log_dir: &Path) {
+    use liam_log::compactor::Compactor;
+    use liam_log::event::{
+        LogEvent, LogPayload, TombstoneTable, TombstoneTarget, CURRENT_SCHEMA_VERSION,
+    };
+    use liam_log::wal::{WalConfig, WalWriter};
+    use liam_log::LogWriter;
+
+    let mut writer = WalWriter::open_with_system_clock(
+        log_dir,
+        WalConfig {
+            segment_max_bytes: 1,
+            rotate_interval_secs: u64::MAX,
+        },
+    )
+    .unwrap();
+    for index in 0..3 {
+        let event = LogEvent {
+            event_id: format!("event-{index}"),
+            content_hash: [index; 32],
+            source: "test".into(),
+            trust_score: 1.0,
+            observed_at: 0,
+            ingested_at: ARCHIVE_NOW - 50 * DAY,
+            encryption_key_id: None,
+            schema_version: CURRENT_SCHEMA_VERSION,
+            payload: LogPayload::Tombstone(vec![TombstoneTarget {
+                table: TombstoneTable::Nodes,
+                id: format!("node-{index}"),
+            }]),
+        };
+        writer.append(&event).unwrap();
+    }
+    drop(writer);
+    let compactor = Compactor::local(log_dir).unwrap();
+    let mut wals: Vec<_> = std::fs::read_dir(log_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "wal"))
+        .collect();
+    wals.sort();
+    // The last segment is the open one.
+    wals.pop();
+    for wal in wals {
+        compactor.compact_segment(&wal).await.unwrap();
+    }
+}
+
+/// A job whose log is `log_dir` and whose config archives to `archive`, when given.
+fn archiving_job(
+    harness: &Harness,
+    server: &MemoryServer,
+    log_dir: &Path,
+    archive: Option<&Path>,
+) -> ConsolidationJob {
+    let mut config = harness.config.clone();
+    if let Some(dir) = archive {
+        config.archive.enabled = true;
+        config.archive.after_days = 30;
+        config.archive.dir = Some(dir.to_str().unwrap().to_owned());
+    }
+    ConsolidationJob::with_parts(
+        JobSetup {
+            keys: None,
+            config: &config,
+            database_path: &database_in(&harness.root),
+            log_dir,
+            log: harness.log.clone(),
+            embedder: embedder(),
+            server,
+            shutdown: &harness.shutdown,
+        },
+        honest(),
+        None,
+        ConsolidationHookSet::default(),
+    )
+    .unwrap()
+}
+
+async fn archiving_fixture(
+    enabled: bool,
+) -> (
+    Harness,
+    MemoryServer,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    ConsolidationJob,
+) {
+    let harness = Harness::new();
+    let (store, _clock) = harness.store_at(Millis(DAY)).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let log = tempfile::tempdir().unwrap();
+    let archive = tempfile::tempdir().unwrap();
+    old_partitions(log.path()).await;
+    let job = archiving_job(
+        &harness,
+        &server,
+        log.path(),
+        enabled.then_some(archive.path()),
+    );
+    (harness, server, log, archive, job)
+}
+
+#[tokio::test]
+async fn with_the_archive_off_nothing_moves_and_no_manifest_is_written() {
+    // Arrange
+    let (_harness, _server, log, _archive, job) = archiving_fixture(false).await;
+
+    // Act
+    let report = job
+        .archive_at(ARCHIVE_NOW)
+        .await
+        .expect("off is not an error");
+
+    // Assert
+    assert_eq!(report, ArchiveReport::default());
+    assert!(!log.path().join(liam_log::archive::MANIFEST_FILE).exists());
+}
+
+#[tokio::test]
+async fn the_archive_moves_old_closed_partitions_when_it_is_on() {
+    // Arrange
+    let (_harness, _server, log, archive, job) = archiving_fixture(true).await;
+
+    // Act
+    let report = job.archive_at(ARCHIVE_NOW).await.expect("archive");
+
+    // Assert
+    assert_eq!(report.archived, vec![0, 1, 2]);
+    assert!(first_parquet(archive.path()).exists());
+    assert!(!first_parquet(log.path()).exists());
+}
+
+#[tokio::test]
+async fn a_missing_archive_directory_fails_the_run_and_moves_nothing() {
+    // Arrange
+    let (harness, server, log, archive, _job) = archiving_fixture(true).await;
+    let gone = archive.path().join("gone");
+    let job = archiving_job(&harness, &server, log.path(), Some(&gone));
+
+    // Act
+    let result = job.archive_at(ARCHIVE_NOW).await;
+
+    // Assert
+    let Err(RunNowError::Failed(error)) = result else {
+        panic!("{result:?}");
+    };
+    assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
+    assert!(first_parquet(log.path()).exists());
+}
+
+#[tokio::test]
+async fn an_archive_run_finds_the_lock_held_by_a_consolidation_and_is_busy() {
+    // Arrange
+    let (_harness, _server, _log, _archive, job) = archiving_fixture(true).await;
+    let running = job.running.try_lock().expect("the lock is free");
+
+    // Act
+    let result = job.archive_now().await;
+    drop(running);
+
+    // Assert
+    assert!(matches!(result, Err(RunNowError::Busy)), "{result:?}");
+}
+
+/// Stops an archive run at its first step until the test lets it go.
+struct Gate {
+    first: std::sync::atomic::AtomicBool,
+    reached: std::sync::mpsc::Sender<()>,
+    go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl liam_log::archive::ArchiveFault for Gate {
+    fn reached(
+        &self,
+        _step: liam_log::archive::ArchiveStep,
+        _sequence: u64,
+    ) -> std::io::Result<()> {
+        if self.first.swap(false, Ordering::SeqCst) {
+            let _ = self.reached.send(());
+            let _ = self.go.lock().unwrap().recv();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn consolidate_is_busy_while_an_archive_run_is_in_progress() {
+    // Arrange
+    let (harness, server, log, archive, _job) = archiving_fixture(true).await;
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (go_tx, go) = std::sync::mpsc::channel();
+    let mut job = archiving_job(&harness, &server, log.path(), Some(archive.path()));
+    job.archive.as_mut().unwrap().fault = Arc::new(Gate {
+        first: AtomicBool::new(true),
+        reached: reached_tx,
+        go: std::sync::Mutex::new(go),
+    });
+    let job = Arc::new(job);
+    let admin = server
+        .with_admin(crate::config::AdminConfig {
+            producers: vec![ADMIN.to_owned()],
+        })
+        .with_consolidator(Arc::clone(&job));
+    admin.set_producer(ADMIN);
+    let archiving = tokio::spawn({
+        let job = Arc::clone(&job);
+        async move { job.archive_at_locked(ARCHIVE_NOW).await }
+    });
+    tokio::task::spawn_blocking(move || reached.recv().unwrap())
+        .await
+        .unwrap();
+
+    // Act
+    let refused = admin.consolidate().await;
+    go_tx.send(()).unwrap();
+    let archived = archiving.await.unwrap();
+
+    // Assert
+    assert!(refused.contains("already in progress"), "{refused}");
+    assert!(archived.is_ok(), "{archived:?}");
+}

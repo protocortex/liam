@@ -2,7 +2,7 @@
 //! The daemon's side of the consolidation job: the maintenance steps it runs
 //! inside a snapshot, the reopen after a rollback, and the scheduled tick.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -20,8 +20,9 @@ use liam_daemon::consolidation::settings::{identity, run_settings};
 use liam_daemon::consolidation::shared_store::SharedStore;
 use liam_daemon::models::StoreEmbedder;
 use liam_daemon::store_open::LogReopener;
+use liam_log::archive::{archive_partitions, ArchiveFault, ArchivePolicy, ArchiveReport, NoFault};
 use liam_model::Embedder;
-use liam_store::{DefaultGraph, RetentionPolicy, SharedLog, SystemClock};
+use liam_store::{Clock, DefaultGraph, RetentionPolicy, SharedLog, SystemClock};
 use tokio_util::sync::CancellationToken;
 
 use crate::extraction::client::ModelIdentity;
@@ -143,19 +144,50 @@ fn summary_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn SummaryHo
     })))
 }
 
-/// Why a run asked for by hand did not produce a manifest.
+/// Why a run asked for by hand did not finish.
 #[derive(Debug)]
 pub enum RunNowError {
-    /// Another run holds the in-process lock.
+    /// Another consolidation or archive run holds the in-process lock.
     Busy,
     Failed(anyhow::Error),
 }
 
+/// Where and how old closed partitions of the log move.
+struct ArchiveRun {
+    log_dir: PathBuf,
+    dir: PathBuf,
+    policy: ArchivePolicy,
+    fault: Arc<dyn ArchiveFault>,
+}
+
+impl ArchiveRun {
+    /// `None` unless `[archive]` is enabled. A relative `dir` is taken from the
+    /// database's directory, as the log directory is.
+    fn from_config(config: &Config, database_path: &Path, log_dir: &Path) -> Option<Self> {
+        let archive = &config.archive;
+        let dir = PathBuf::from(archive.dir.as_deref().filter(|_| archive.enabled)?);
+        let dir = match database_path.parent() {
+            Some(parent) if dir.is_relative() => parent.join(dir),
+            _ => dir,
+        };
+        Some(Self {
+            log_dir: log_dir.to_path_buf(),
+            dir,
+            policy: ArchivePolicy {
+                after_days: archive.after_days,
+                zstd_level: archive.zstd_level,
+            },
+            fault: Arc::new(NoFault),
+        })
+    }
+}
+
 /// The consolidation job as the daemon runs it, on a schedule and at start.
 pub struct ConsolidationJob {
-    /// Held for the length of a run, so a scheduled tick and a run asked for by
-    /// hand never overlap.
+    /// Held for the length of a consolidation or archive run, so a scheduled
+    /// tick and a run asked for by hand never overlap.
     running: tokio::sync::Mutex<()>,
+    archive: Option<ArchiveRun>,
     consolidator: Consolidator,
     store: Arc<SharedStore>,
     shutdown: Shutdown,
@@ -222,6 +254,7 @@ impl ConsolidationJob {
         );
         Ok(Self {
             running: tokio::sync::Mutex::new(()),
+            archive: ArchiveRun::from_config(config, database_path, log_dir),
             consolidator,
             store: server.shared_store(),
             shutdown: shutdown.clone(),
@@ -278,16 +311,62 @@ impl ConsolidationJob {
 
     /// One scheduled run. A failure is logged and left for the next tick, which
     /// resumes the run from the step it stopped at. A tick that meets a run in
-    /// progress is skipped.
+    /// progress is skipped. The archive runs after the consolidation.
     pub async fn tick(&self) -> Option<RunOutcome> {
         if self.shutdown.token().is_cancelled() {
             return None;
         }
-        let Ok(_running) = self.running.try_lock() else {
-            tracing::info!("a consolidation run is in progress, so this tick is skipped");
-            return None;
+        let outcome = {
+            let Ok(_running) = self.running.try_lock() else {
+                tracing::info!("a run is in progress, so this tick is skipped");
+                return None;
+            };
+            self.consolidate().await.ok().and_then(|run| run.outcome)
         };
-        self.consolidate().await.ok().and_then(|run| run.outcome)
+        match self.archive_now().await {
+            Ok(_) | Err(RunNowError::Busy) => {}
+            Err(RunNowError::Failed(error)) => {
+                tracing::error!(error = %format!("{error:#}"), "the archive run did not finish");
+            }
+        }
+        outcome
+    }
+
+    /// One archive run now: the closed partitions old enough move to the
+    /// archive directory. Nothing moves when `[archive]` is off.
+    ///
+    /// # Errors
+    ///
+    /// `Busy` when a consolidation or archive run holds the lock.
+    pub async fn archive_now(&self) -> Result<ArchiveReport, RunNowError> {
+        let _running = self.running.try_lock().map_err(|_| RunNowError::Busy)?;
+        self.archive_at(SystemClock.now().0).await
+    }
+
+    /// `archive_at` under the lock, at the time given.
+    #[cfg(test)]
+    async fn archive_at_locked(&self, now_ms: i64) -> Result<ArchiveReport, RunNowError> {
+        let _running = self.running.try_lock().map_err(|_| RunNowError::Busy)?;
+        self.archive_at(now_ms).await
+    }
+
+    /// The archive run, for a caller that holds the lock.
+    async fn archive_at(&self, now_ms: i64) -> Result<ArchiveReport, RunNowError> {
+        let Some(run) = &self.archive else {
+            return Ok(ArchiveReport::default());
+        };
+        let (log_dir, dir, policy) = (run.log_dir.clone(), run.dir.clone(), run.policy);
+        let fault = Arc::clone(&run.fault);
+        let report = tokio::task::spawn_blocking(move || {
+            archive_partitions(&log_dir, &dir, policy, now_ms, fault.as_ref())
+        })
+        .await
+        .map_err(|error| RunNowError::Failed(error.into()))?
+        .map_err(|error| RunNowError::Failed(error.into()))?;
+        if !report.archived.is_empty() || !report.finished.is_empty() {
+            tracing::info!(archived = ?report.archived, finished = ?report.finished, "log partitions archived");
+        }
+        Ok(report)
     }
 
     /// One run now, for the `consolidate` tool.

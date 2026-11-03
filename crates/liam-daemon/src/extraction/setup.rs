@@ -300,4 +300,68 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(matches!(records[0], Err(ReaderError::KeyMissing { .. })));
     }
+
+    #[tokio::test]
+    async fn the_extraction_reader_stops_at_an_archived_partition_that_went_missing() {
+        use futures_util::StreamExt;
+        use liam_log::archive::{archive_partitions, ArchivePolicy, NoFault};
+        use liam_log::compactor::Compactor;
+        use liam_log::reader::ReaderError;
+        use liam_log::wal::{WalConfig, WalWriter};
+        use liam_log::LogWriter;
+
+        // Arrange: segment 0 is compacted, archived, and then lost
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, events) = sealed_log(&dir, false);
+        // One more append on a writer that rotates at once closes segment 0.
+        let mut writer = WalWriter::open_with_system_clock(
+            dir.path(),
+            WalConfig {
+                segment_max_bytes: 1,
+                rotate_interval_secs: u64::MAX,
+            },
+        )
+        .unwrap();
+        let filler = liam_log::event::LogEvent {
+            event_id: "filler".into(),
+            encryption_key_id: None,
+            payload: liam_log::event::LogPayload::Tombstone(Vec::new()),
+            ..events[0].clone()
+        };
+        writer.append(&filler).unwrap();
+        drop(writer);
+        let first_wal = dir.path().join(format!("{:020}.wal", 0));
+        Compactor::local(dir.path())
+            .unwrap()
+            .compact_segment(&first_wal)
+            .await
+            .unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let policy = ArchivePolicy {
+            after_days: 0,
+            zstd_level: 3,
+        };
+        archive_partitions(dir.path(), archive.path(), policy, i64::MAX, &NoFault).unwrap();
+        for entry in std::fs::read_dir(archive.path()).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let files = DaemonFiles {
+            database_path: &dir.path().join("liam.db"),
+            log_dir: dir.path(),
+            keys: Some(registry),
+            permits: Arc::new(Semaphore::new(1)),
+            stopping: CancellationToken::new(),
+        };
+        let hooks = build(&ExtractionConfig::default(), files).unwrap();
+
+        // Act
+        let records: Vec<_> = hooks.reader.scan(None).collect().await;
+
+        // Assert
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0],
+            Err(ReaderError::PartitionUnreachable { .. })
+        ));
+    }
 }
