@@ -3,6 +3,8 @@
 //! delete destroys keys; this module holds the commands that act on them.
 
 mod command;
+#[cfg(test)]
+mod exit_criteria;
 mod files;
 mod job;
 mod memory;
