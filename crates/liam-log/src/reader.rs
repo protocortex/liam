@@ -10,6 +10,7 @@
 //! later without changing the writer or the on-disk format.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -21,7 +22,8 @@ use futures_util::stream;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 
-use crate::compactor::{read_event_count, read_parquet, CompactError};
+use crate::archive::{read_manifest, ArchiveError};
+use crate::compactor::{decode_parquet, read_event_count, read_parquet, CompactError};
 use crate::envelope::RowKeyRef;
 use crate::event::LogEvent;
 use crate::wal::{
@@ -85,6 +87,8 @@ pub enum ReaderError {
     },
     #[error("segment {sequence} is missing from the log")]
     MissingSegment { sequence: u64 },
+    #[error("the archive of the log cannot be read: {0}")]
+    Archive(#[from] ArchiveError),
     #[error(
         "segment {sequence} holds {wal_events} events in its wal but its parquet is stamped with {parquet_events}"
     )]
@@ -170,6 +174,8 @@ struct SegmentFiles {
     /// The writer may still append to the WAL, so a torn tail there is an
     /// interrupted append rather than damage.
     open: bool,
+    /// Where the partition manifest says the archived copy is.
+    archived: Option<PathBuf>,
 }
 
 /// The stream state behind `SequentialScanReader::scan`. The directory is
@@ -259,7 +265,29 @@ impl SequentialScanReader {
                 Err(source) => return self.fall_back_to_twin(files, source).await,
             }
         }
-        self.read_twin(sequence).await
+        self.read_partition(files).await
+    }
+
+    /// A closed partition from the log directory, or from the archive when the
+    /// directory no longer has it.
+    async fn read_partition(&self, files: &SegmentFiles) -> Result<Vec<LogEvent>, ReaderError> {
+        let sequence = files.sequence;
+        let Some(archived) = &files.archived else {
+            return self.read_twin(sequence).await;
+        };
+        if files.parquet {
+            match self.read_twin(sequence).await {
+                Err(ReaderError::Parquet {
+                    source: CompactError::Store(object_store::Error::NotFound { .. }),
+                    ..
+                }) => {}
+                other => return other,
+            }
+        }
+        let archived = archived.clone();
+        tokio::task::spawn_blocking(move || read_archived(sequence, &archived))
+            .await
+            .map_err(io::Error::other)?
     }
 
     async fn read_twin(&self, sequence: u64) -> Result<Vec<LogEvent>, ReaderError> {
@@ -318,6 +346,22 @@ impl SequentialScanReader {
     }
 }
 
+/// An archived partition. A file the manifest names but the disk lacks is an
+/// unreachable archive, which fails the scan instead of skipping events.
+fn read_archived(sequence: u64, path: &Path) -> Result<Vec<LogEvent>, ReaderError> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ReaderError::PartitionUnreachable {
+                first_segment: sequence,
+                last_segment: sequence,
+            })
+        }
+        Err(error) => return Err(error.into()),
+    };
+    decode_parquet(file, sequence).map_err(|source| ReaderError::Parquet { sequence, source })
+}
+
 /// The segments from `from` through `through`, after checking that none of
 /// them is missing.
 fn list_segments(
@@ -337,6 +381,7 @@ fn list_segments(
             wal: Some(wal),
             parquet: false,
             open: open.contains(&sequence),
+            archived: None,
         };
         segments.insert(sequence, files);
     }
@@ -348,8 +393,21 @@ fn list_segments(
                 wal: None,
                 parquet: false,
                 open: false,
+                archived: None,
             })
             .parquet = true;
+    }
+    for partition in read_manifest(dir)? {
+        segments
+            .entry(partition.sequence)
+            .or_insert(SegmentFiles {
+                sequence: partition.sequence,
+                wal: None,
+                parquet: false,
+                open: false,
+                archived: None,
+            })
+            .archived = Some(partition.path);
     }
 
     let start = from.map_or(0, |from| from.segment);

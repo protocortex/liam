@@ -23,7 +23,7 @@ impl DeleteTarget {
     /// destroying keys cannot reach.
     pub fn covers_plain(&self, event: &LogEvent) -> bool {
         match self {
-            Self::Event { event_id } => &event.event_id == event_id && holds_rows(&event.payload),
+            Self::Event { event_id } => &event.event_id == event_id && event.payload.holds_rows(),
             Self::Subject { .. } => node_rows(&event.payload)
                 .iter()
                 .any(|node| self.covers_node(node)),
@@ -77,21 +77,6 @@ pub fn node_rows(payload: &LogPayload) -> Vec<&NodeRow> {
             })
             .collect(),
         _ => Vec::new(),
-    }
-}
-
-/// Whether a payload carries rows that a sealing log would seal.
-fn holds_rows(payload: &LogPayload) -> bool {
-    match payload {
-        LogPayload::NodeWrite(_)
-        | LogPayload::EdgeWrite(_)
-        | LogPayload::FactWrite { .. }
-        | LogPayload::DerivedArtifact(_)
-        | LogPayload::Feedback { .. }
-        | LogPayload::TierMove { .. } => true,
-        LogPayload::EpisodeBatch(effects) => !effects.is_empty(),
-        LogPayload::AccessBatch { entries, .. } => !entries.is_empty(),
-        _ => false,
     }
 }
 
