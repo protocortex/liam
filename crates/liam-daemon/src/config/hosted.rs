@@ -33,6 +33,10 @@ pub struct HostedConfig {
     pub models: BTreeMap<String, String>,
     /// What each pinned model costs.
     pub prices: PricesConfig,
+    /// A provider's key file, an absolute path to a file only the owner can
+    /// read. A provider without one is read from the Keychain, under the
+    /// service `liam-<provider>`.
+    pub key_files: BTreeMap<String, String>,
 }
 
 /// `[hosted.prices]`: a versioned price table, so a recorded cost can be tied
@@ -75,6 +79,7 @@ impl Default for HostedConfig {
             privacy: PrivacyConfig::default(),
             models: BTreeMap::new(),
             prices: PricesConfig::default(),
+            key_files: BTreeMap::new(),
         }
     }
 }
@@ -103,6 +108,13 @@ impl HostedConfig {
         self.privacy.validate()?;
         for (provider, model_id) in &self.models {
             ModelPin::new(provider, model_id)?;
+        }
+        for provider in self.key_files.keys() {
+            anyhow::ensure!(
+                PIN_PROVIDERS.contains(&provider.as_str()),
+                "hosted.key_files.{provider} is not a known provider; use one of {}",
+                PIN_PROVIDERS.join(", ")
+            );
         }
         anyhow::ensure!(
             self.prices.models.is_empty() || !self.prices.version.trim().is_empty(),
@@ -314,13 +326,17 @@ mod tests {
     }
 
     #[test]
-    fn a_price_table_needs_a_version() {
+    fn a_price_table_needs_a_version_and_a_key_file_needs_a_known_provider() {
         // Act
         let unversioned =
             load("[hosted.prices.models.\"gpt-4o-2024-08-06\"]\ninput_micro_per_mtok = 1\n")
                 .unwrap_err();
+        let stranger = load("[hosted.key_files]\nmistral = \"/keys/m\"\n").unwrap_err();
+        let known = load("[hosted.key_files]\nopenai = \"/keys/o\"\n").unwrap();
 
         // Assert
         assert!(format!("{unversioned:#}").contains("hosted.prices.version"));
+        assert!(format!("{stranger:#}").contains("hosted.key_files.mistral"));
+        assert_eq!(known.hosted.key_files["openai"], "/keys/o");
     }
 }

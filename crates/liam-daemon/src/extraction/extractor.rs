@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 use super::apply::{apply_answer, ApplyContext, ApplyError};
 use super::cache::{cache_key, CacheStore, CachedExtractor, KeyParts};
 use super::client::{ExtractError, ExtractRequest, JsonExtractor, ModelIdentity};
+use super::gate::ProviderGate;
 use super::inputs::ExtractionInput;
 use super::prompt::{build_prompt, fact_json_schema, prompt_fingerprint, prompt_template};
 use super::prompt::{PromptEvent, PROMPT_VERSION};
@@ -82,6 +83,9 @@ pub struct ExtractionDeps<'a> {
     pub stopping: &'a CancellationToken,
     /// The last offset of the scanned window, where a fully done run ends.
     pub window_end: LogOffset,
+    /// Set for a hosted provider. Inputs it denies are never put in a prompt,
+    /// whether or not a cached answer exists.
+    pub gate: Option<&'a ProviderGate>,
 }
 
 /// What a run did. The caller moves the cursor to `completed_offset`.
@@ -98,6 +102,9 @@ pub struct ExtractionReport {
     pub ended_no_match: usize,
     pub ended_outranked: usize,
     pub events_truncated: usize,
+    /// Events the privacy gate kept out of a hosted prompt. They count as
+    /// passed, so the cursor moves on; a local run would still read them.
+    pub events_withheld: usize,
     pub sidecar_lost: bool,
     pub deadline_hit: bool,
     /// The daemon began stopping before the run finished.
@@ -112,6 +119,8 @@ enum Status {
     Done,
     /// Skipped for good after repeated failures; counts as passed.
     Quarantined,
+    /// Kept out of a hosted prompt by the privacy gate; counts as passed.
+    Withheld,
     Failed,
 }
 
@@ -195,6 +204,34 @@ fn split(piece: &[usize]) -> Option<(Vec<usize>, Vec<usize>)> {
     })
 }
 
+/// Every input starts pending, except those the gate keeps out of a hosted prompt.
+fn initial_status(
+    inputs: &[ExtractionInput],
+    gate: Option<&ProviderGate>,
+    report: &mut ExtractionReport,
+) -> Vec<Status> {
+    let Some(gate) = gate else {
+        return vec![Status::Pending; inputs.len()];
+    };
+    let (allowed, _) = gate.filter_inputs(inputs);
+    let allowed: HashSet<&str> = allowed
+        .iter()
+        .map(|input| input.event_id.as_str())
+        .collect();
+    let status: Vec<Status> = inputs
+        .iter()
+        .map(|input| {
+            if allowed.contains(input.event_id.as_str()) {
+                Status::Pending
+            } else {
+                Status::Withheld
+            }
+        })
+        .collect();
+    report.events_withheld = status.iter().filter(|s| **s == Status::Withheld).count();
+    status
+}
+
 fn is_parseable(response: &str) -> bool {
     parse_response(response, usize::MAX, &[]).is_ok()
 }
@@ -213,8 +250,9 @@ impl<'a> Run<'a> {
         }
         let predicates = declared_predicates(deps.config);
         let schema = fact_json_schema(&predicates);
+        let status = initial_status(&inputs, deps.gate, &mut report);
         Self {
-            status: vec![Status::Pending; inputs.len()],
+            status,
             inputs: Arc::new(inputs),
             vocabulary: resolve_vocabulary(deps.config),
             schema_hash: prompt_fingerprint(&prompt_template(), &schema),
@@ -276,7 +314,10 @@ impl<'a> Run<'a> {
     fn plan_batches(&self) -> Vec<Batch> {
         let mut by_scope: BTreeMap<&Option<String>, Vec<usize>> = BTreeMap::new();
         for (position, input) in self.inputs.iter().enumerate() {
-            if self.status[position] != Status::Quarantined {
+            if !matches!(
+                self.status[position],
+                Status::Quarantined | Status::Withheld
+            ) {
                 by_scope.entry(&input.scope).or_default().push(position);
             }
         }
@@ -584,10 +625,12 @@ impl<'a> Run<'a> {
         }
         let mut lowest = self.deps.window_end;
         for positions in by_scope.values() {
-            let Some(unfinished) = positions
-                .iter()
-                .position(|&p| !matches!(self.status[p], Status::Done | Status::Quarantined))
-            else {
+            let Some(unfinished) = positions.iter().position(|&p| {
+                !matches!(
+                    self.status[p],
+                    Status::Done | Status::Quarantined | Status::Withheld
+                )
+            }) else {
                 continue;
             };
             let before = unfinished.checked_sub(1)?;

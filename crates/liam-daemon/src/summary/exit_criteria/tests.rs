@@ -556,6 +556,7 @@ async fn summarize(store: &DefaultGraph) {
                 model_sha256: String::new(),
             },
         )),
+        gate: None,
         permits: Arc::new(Semaphore::new(1)),
         cache: Arc::new(MemoryCache::default()),
         embedder: Arc::new(FirstAxisEmbedder),

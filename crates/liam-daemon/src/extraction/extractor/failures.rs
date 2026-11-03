@@ -44,6 +44,9 @@ impl Run<'_> {
     /// failures to clear.
     pub(super) async fn skip_quarantined(&mut self) -> Result<()> {
         for position in 0..self.inputs.len() {
+            if self.status[position] == Status::Withheld {
+                continue;
+            }
             let key = self.event_key(position);
             if self.deps.store.batch_failures(&key).await? == 0 {
                 continue;

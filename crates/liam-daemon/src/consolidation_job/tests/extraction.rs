@@ -94,6 +94,7 @@ fn extraction_part(
         cache: Arc::new(CacheStore::open(cache_path(&database_in(&harness.root))).unwrap()),
         permits: Arc::new(Semaphore::new(1)),
         free_ram: Arc::new(PlentyOfRam),
+        gate: None,
         stopping: harness.shutdown.token(),
     }
 }

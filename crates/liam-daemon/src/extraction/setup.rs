@@ -13,10 +13,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::cache::{cache_path, CacheStore};
+use super::extractor::ExtractorProvider;
+use super::gate::ProviderGate;
 use super::hooks::ExtractionHooks;
 use super::identity::{GgufFile, IdentitySource};
 use super::provider::{pidfile_path, SidecarProvider, SystemStarter};
-use super::sidecar::{SidecarGuard, SystemRam};
+use super::sidecar::{FreeRam, SidecarGuard, SystemRam};
 use crate::config::ExtractionConfig;
 
 /// What the daemon knows that the configuration does not say.
@@ -46,8 +48,18 @@ pub fn sweep_stale_sidecar(config: &ExtractionConfig, database_path: &Path) {
     );
 }
 
-/// The extraction part for `config`. The model file is not read here: the
-/// first model pass hashes it, so a start with extraction on stays quick.
+/// What answers the model half of extraction, local or hosted.
+pub struct Backend {
+    pub provider: Arc<dyn ExtractorProvider>,
+    pub identity: Arc<dyn IdentitySource>,
+    pub free_ram: Arc<dyn FreeRam + Sync>,
+    /// Set for a hosted backend.
+    pub gate: Option<Arc<ProviderGate>>,
+}
+
+/// The extraction part for `config`, over the local model. The model file is
+/// not read here: the first model pass hashes it, so a start with extraction
+/// on stays quick.
 ///
 /// # Errors
 ///
@@ -59,6 +71,25 @@ pub fn build(config: &ExtractionConfig, files: DaemonFiles<'_>) -> anyhow::Resul
     let starter = SystemStarter {
         pidfile: pidfile_path(files.database_path),
     };
+    let backend = Backend {
+        provider: Arc::new(SidecarProvider::new(Arc::new(starter), identity.clone())),
+        identity,
+        free_ram: Arc::new(SystemRam),
+        gate: None,
+    };
+    build_with(config, files, backend)
+}
+
+/// The extraction part for `config`, answered by `backend`.
+///
+/// # Errors
+///
+/// Fails when the response cache or the event log cannot be opened.
+pub fn build_with(
+    config: &ExtractionConfig,
+    files: DaemonFiles<'_>,
+    backend: Backend,
+) -> anyhow::Result<ExtractionHooks> {
     let cache = CacheStore::open(cache_path(files.database_path))
         .context("could not open the extraction response cache")?;
     let reader = event_log::log_reader(files.log_dir, files.keys.as_ref())
@@ -66,11 +97,12 @@ pub fn build(config: &ExtractionConfig, files: DaemonFiles<'_>) -> anyhow::Resul
     Ok(ExtractionHooks {
         config: config.clone(),
         reader,
-        provider: Arc::new(SidecarProvider::new(Arc::new(starter), identity.clone())),
-        identity,
+        provider: backend.provider,
+        identity: backend.identity,
         cache: Arc::new(cache),
         permits: files.permits,
-        free_ram: Arc::new(SystemRam),
+        free_ram: backend.free_ram,
+        gate: backend.gate,
         stopping: files.stopping,
     })
 }
@@ -165,19 +197,10 @@ mod tests {
         assert!(!pidfile.exists());
     }
 
-    /// Writes the two sealed events and hands back the still-open writer, so a
-    /// test that needs more appends never reopens the log. Reopening races any
-    /// concurrently spawned child process: until it execs, the child holds a
-    /// copy of the released lock descriptor, so the lock reads as held.
     fn sealed_log(
         dir: &TempDir,
         shred_second: bool,
-        wal: liam_log::wal::WalConfig,
-    ) -> (
-        Arc<KeyRegistry>,
-        Vec<liam_log::event::LogEvent>,
-        liam_log::wal::WalWriter<liam_log::wal::SystemClock>,
-    ) {
+    ) -> (Arc<KeyRegistry>, Vec<liam_log::event::LogEvent>) {
         use liam_log::envelope::{KeyHints, Sealer};
         use liam_log::event::{LogEvent, LogPayload, NodeRow, CURRENT_SCHEMA_VERSION};
         use liam_log::wal::WalWriter;
@@ -223,7 +246,11 @@ mod tests {
             .iter()
             .map(|event| sealer.seal(event, &KeyHints::default()).unwrap())
             .collect();
-        let mut writer = WalWriter::open_with_system_clock(dir.path(), wal).unwrap();
+        let mut writer = WalWriter::open_with_system_clock(
+            dir.path(),
+            crate::config::LogConfig::default().wal(),
+        )
+        .unwrap();
         for event in &events {
             writer.append(event).unwrap();
         }
@@ -233,7 +260,7 @@ mod tests {
             };
             registry.destroy(&record.rows[0].key_id).unwrap();
         }
-        (registry, events, writer)
+        (registry, events)
     }
 
     #[tokio::test]
@@ -243,8 +270,7 @@ mod tests {
 
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let (registry, _events, _writer) =
-            sealed_log(&dir, true, crate::config::LogConfig::default().wal());
+        let (registry, _events) = sealed_log(&dir, true);
         let files = DaemonFiles {
             database_path: &dir.path().join("liam.db"),
             log_dir: dir.path(),
@@ -272,7 +298,7 @@ mod tests {
 
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let _log = sealed_log(&dir, false, crate::config::LogConfig::default().wal());
+        sealed_log(&dir, false);
         let elsewhere = tempfile::tempdir().unwrap();
         let lost = event_log::open_key_registry(
             elsewhere.path(),
@@ -313,19 +339,21 @@ mod tests {
         use liam_log::archive::{archive_partitions, ArchivePolicy, NoFault};
         use liam_log::compactor::Compactor;
         use liam_log::reader::ReaderError;
-        use liam_log::wal::WalConfig;
+        use liam_log::wal::{WalConfig, WalWriter};
         use liam_log::LogWriter;
 
         // Arrange: segment 0 is compacted, archived, and then lost
         let dir = tempfile::tempdir().unwrap();
-        let (registry, events, mut writer) = sealed_log(
-            &dir,
-            false,
+        let (registry, events) = sealed_log(&dir, false);
+        // One more append on a writer that rotates at once closes segment 0.
+        let mut writer = WalWriter::open_with_system_clock(
+            dir.path(),
             WalConfig {
                 segment_max_bytes: 1,
                 rotate_interval_secs: u64::MAX,
             },
-        );
+        )
+        .unwrap();
         let filler = liam_log::event::LogEvent {
             event_id: "filler".into(),
             encryption_key_id: None,

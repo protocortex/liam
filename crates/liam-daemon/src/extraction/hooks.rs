@@ -31,6 +31,7 @@ use super::cache::CacheStore;
 use super::client::ModelIdentity;
 use super::extractor::ExtractionReport as ModelRun;
 use super::extractor::{extract_events, ExtractionDeps, ExtractorProvider};
+use super::gate::ProviderGate;
 use super::identity::IdentitySource;
 use super::inputs::events_to_inputs;
 use super::prompt::PROMPT_VERSION;
@@ -53,6 +54,8 @@ pub struct ExtractionHooks {
     /// The daemon's generation permits, shared with the other model users.
     pub permits: Arc<Semaphore>,
     pub free_ram: Arc<dyn FreeRam + Sync>,
+    /// Set for a hosted provider: what it may be sent.
+    pub gate: Option<Arc<ProviderGate>>,
     /// Cancelled when the daemon is stopping.
     pub stopping: CancellationToken,
 }
@@ -195,6 +198,7 @@ impl ExtractionHooks {
             deadline: Instant::now() + Duration::from_secs(deadline_secs),
             stopping: &self.stopping,
             window_end: window.end,
+            gate: self.gate.as_deref(),
         };
         // The loop stops between batches when the daemon is stopping; dropping
         // it mid write would leave the event log poisoned.

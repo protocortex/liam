@@ -62,6 +62,7 @@ fn hooks_over(
                     model_sha256: String::new(),
                 },
             )),
+            gate: None,
             permits: Arc::new(Semaphore::new(1)),
             cache: cache.clone() as Arc<dyn SummaryCache>,
             embedder: Arc::new(FixedEmbedder),
