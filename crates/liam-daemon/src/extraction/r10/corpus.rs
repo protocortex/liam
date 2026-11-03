@@ -11,13 +11,13 @@ use rand_chacha::ChaCha8Rng;
 use super::{normalize_tuple, Tuple};
 use crate::extraction::response::Polarity;
 
-pub(super) const EVENT_COUNT: usize = 300;
-pub(super) const CORPUS_SEED: u64 = 0x10C0_DE10;
+pub(crate) const EVENT_COUNT: usize = 300;
+pub(crate) const CORPUS_SEED: u64 = 0x10C0_DE10;
 /// Events per template group; the templates repeat in this order.
-pub(super) const CYCLE_LEN: usize = 10;
+pub(crate) const CYCLE_LEN: usize = 10;
 pub(super) const CYCLES: usize = EVENT_COUNT / CYCLE_LEN;
 /// Where the role change sits in a cycle.
-pub(super) const ROLE_CHANGE_POSITION: usize = 4;
+pub(crate) const ROLE_CHANGE_POSITION: usize = 4;
 /// Gap between consecutive events' observation times.
 pub(super) const EVENT_GAP: Millis = Millis(3_600_000);
 /// 2023-06-01 00:00:00 UTC.
@@ -25,7 +25,7 @@ pub(super) const FIRST_OBSERVED: Millis = Millis(1_685_577_600_000);
 
 pub(super) const LIVES_IN: &str = "lives_in";
 pub(super) const WORKS_AT: &str = "works_at";
-pub(super) const HAS_TITLE: &str = "has_title";
+pub(crate) const HAS_TITLE: &str = "has_title";
 pub(super) const REFERENCES_DATE: &str = "references_date";
 pub(super) const REFERENCES_URL: &str = "references_url";
 pub(super) const REFERENCES_ID: &str = "references_id";
@@ -101,7 +101,7 @@ pub(crate) struct ExpectedFact {
 }
 
 impl ExpectedFact {
-    pub(super) fn tuple(&self) -> Tuple {
+    pub(crate) fn tuple(&self) -> Tuple {
         normalize_tuple(&self.subject, self.predicate, &self.object, self.polarity)
     }
 }

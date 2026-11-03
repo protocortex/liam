@@ -16,6 +16,8 @@ pub mod gemini;
 pub mod model;
 pub mod multipart;
 pub mod openai;
+#[cfg(test)]
+mod r10;
 pub mod secrets;
 pub mod summariser;
 pub mod transport;

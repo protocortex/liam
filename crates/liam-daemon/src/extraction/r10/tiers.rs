@@ -27,6 +27,7 @@ use super::corpus::{
 };
 use super::{normalize_tuple, score, score_by_predicate, Score, Tuple};
 use crate::config::ExtractionConfig;
+use crate::extraction::batch_flow::BatchFlow;
 use crate::extraction::cache::{cache_path, CacheStore};
 use crate::extraction::client::{ExtractError, JsonExtractor, MockExtractor, ModelIdentity};
 use crate::extraction::extractor::{
@@ -83,11 +84,11 @@ const FLOORS: [Floor; 3] = [
     },
 ];
 
-pub(super) fn corpus() -> Vec<LabelledEvent> {
+pub(crate) fn corpus() -> Vec<LabelledEvent> {
     generate(&mut ChaCha8Rng::seed_from_u64(CORPUS_SEED))
 }
 
-pub(super) fn model_labels(events: &[LabelledEvent]) -> Vec<Tuple> {
+pub(crate) fn model_labels(events: &[LabelledEvent]) -> Vec<Tuple> {
     events
         .iter()
         .flat_map(|event| event.facts.iter().map(ExpectedFact::tuple))
@@ -194,7 +195,7 @@ fn a_degraded_predictor_fails_the_gate() {
     assert_eq!(missed, [REFERENCES_URL, REFERENCES_ID]);
 }
 
-pub(super) struct PlentyOfRam;
+pub(crate) struct PlentyOfRam;
 
 impl FreeRam for PlentyOfRam {
     fn free_mb(&self) -> u64 {
@@ -285,7 +286,7 @@ fn script(
         .collect()
 }
 
-pub(super) fn input(event: &LabelledEvent) -> ExtractionInput {
+pub(crate) fn input(event: &LabelledEvent) -> ExtractionInput {
     ExtractionInput {
         event_id: event.id.clone(),
         offset: LogOffset {
@@ -300,11 +301,11 @@ pub(super) fn input(event: &LabelledEvent) -> ExtractionInput {
     }
 }
 
-pub(super) struct Plumbing {
+pub(crate) struct Plumbing {
     _dir: TempDir,
     store: DefaultGraph,
     config: ExtractionConfig,
-    pub(super) report: ExtractionReport,
+    pub(crate) report: ExtractionReport,
     read_at: Millis,
 }
 
@@ -325,39 +326,57 @@ async fn run_plumbing(events: &[LabelledEvent], faults: &BTreeMap<usize, Fault>)
 }
 
 /// Runs the whole corpus through `provider` against a real store.
-pub(super) async fn run_pipeline(
+pub(crate) async fn run_pipeline(
     events: &[LabelledEvent],
     provider: &dyn ExtractorProvider,
     model: &ModelIdentity,
     config: ExtractionConfig,
     free_ram: &(dyn FreeRam + Sync),
 ) -> Plumbing {
+    run_pipeline_batched(events, provider, model, config, free_ram, 1, |_, _| None).await
+}
+
+/// Runs the whole corpus `runs` times over one store and cache, as a daemon
+/// that comes back to collect would. The report is the last run's.
+pub(crate) async fn run_pipeline_batched(
+    events: &[LabelledEvent],
+    provider: &dyn ExtractorProvider,
+    model: &ModelIdentity,
+    config: ExtractionConfig,
+    free_ram: &(dyn FreeRam + Sync),
+    runs: usize,
+    flow_for: impl Fn(Arc<CacheStore>, &std::path::Path) -> Option<BatchFlow>,
+) -> Plumbing {
     let dir = TempDir::new().expect("tempdir");
     let database = dir.path().join("liam.db");
     let store = DefaultGraph::open(database.to_str().unwrap(), GraphConfig::new(EMBEDDING_DIMS))
         .await
         .expect("open store");
-    let deps = ExtractionDeps {
-        provider,
-        identity: model,
-        cache: Arc::new(CacheStore::open(cache_path(&database)).expect("open cache")),
-        store: &store,
-        config: &config,
-        permits: &Semaphore::new(1),
-        free_ram,
-        write_source: WRITE_SOURCE,
-        deadline: Instant::now() + RUN_BUDGET,
-        stopping: &CancellationToken::new(),
-        window_end: LogOffset {
-            segment: 0,
-            index: EVENT_COUNT as u64,
-        },
-        gate: None,
-        batch: None,
-    };
+    let cache = Arc::new(CacheStore::open(cache_path(&database)).expect("open cache"));
+    let flow = flow_for(Arc::clone(&cache), dir.path());
     let inputs: Vec<ExtractionInput> = events.iter().map(input).collect();
-
-    let report = extract_events(&inputs, deps).await.expect("a finished run");
+    let mut report = ExtractionReport::default();
+    for _ in 0..runs {
+        let deps = ExtractionDeps {
+            provider,
+            identity: model,
+            cache: Arc::clone(&cache),
+            store: &store,
+            config: &config,
+            permits: &Semaphore::new(1),
+            free_ram,
+            write_source: WRITE_SOURCE,
+            deadline: Instant::now() + RUN_BUDGET,
+            stopping: &CancellationToken::new(),
+            window_end: LogOffset {
+                segment: 0,
+                index: EVENT_COUNT as u64,
+            },
+            gate: None,
+            batch: flow.as_ref(),
+        };
+        report = extract_events(&inputs, deps).await.expect("a finished run");
+    }
 
     let read_at = Millis(FIRST_OBSERVED.0 + EVENT_GAP.0 * (EVENT_COUNT as i64 + 1));
     Plumbing {
@@ -395,7 +414,7 @@ impl Plumbing {
     /// Rebuilds what the pipeline extracted from what the store holds: a
     /// fact that starts at an event's time was asserted by it, and one that
     /// stops there without a replacement was ended by it.
-    pub(super) async fn extracted(&self, events: &[LabelledEvent]) -> Vec<Tuple> {
+    pub(crate) async fn extracted(&self, events: &[LabelledEvent]) -> Vec<Tuple> {
         let mut tuples = Vec::new();
         for event in events {
             let at = event.observed_at;
