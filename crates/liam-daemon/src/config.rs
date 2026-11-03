@@ -12,6 +12,7 @@ use liam_store::{Millis, RetentionPolicy};
 use serde::Deserialize;
 
 mod admin;
+mod archive;
 mod consolidation;
 mod deletion;
 mod encryption;
@@ -20,6 +21,7 @@ mod summary;
 mod tiering;
 
 pub use admin::AdminConfig;
+pub use archive::ArchiveConfig;
 pub(crate) use consolidation::default_snapshot_dir;
 pub use consolidation::ConsolidationConfig;
 pub use deletion::DeletionConfig;
@@ -89,6 +91,8 @@ pub struct Config {
     pub deletion: DeletionConfig,
     /// Who may call the admin tools.
     pub admin: AdminConfig,
+    /// Moving old closed log partitions to another directory. Off by default.
+    pub archive: ArchiveConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -208,6 +212,7 @@ impl Default for Config {
             encryption: EncryptionConfig::default(),
             deletion: DeletionConfig::default(),
             admin: AdminConfig::default(),
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -420,6 +425,7 @@ impl Config {
         let mut config: Self = toml::from_str(&text)?;
         config.extraction.expand_paths(home)?;
         config.encryption.expand_paths(home)?;
+        config.archive.expand_paths(home)?;
         config.log.validate()?;
         config.producers.validate()?;
         config.extraction.validate()?;
@@ -429,6 +435,7 @@ impl Config {
         config.encryption.validate()?;
         config.deletion.validate()?;
         config.admin.validate()?;
+        config.archive.validate()?;
         Ok(config)
     }
 
