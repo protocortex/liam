@@ -8,6 +8,22 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Added
 
+- Two producers writing the same `subject` in one scope now each keep a live fact instead of
+  the later write replacing the earlier one. Entity pages stay one shared page per subject and
+  scope. A scope filter such as `work` also matches `work/...` descendants on read, and a
+  `same_as` relation, set through `relate`, makes `recall` and `ask` follow links between
+  entities across scopes.
+- An append-only event log (new `liam-log` crate) that the store rebuilds from: `liam rebuild`,
+  snapshots and restore, per-key-group encryption, and archive of old partitions.
+- Consolidation runs (`liam consolidate`) that extract bitemporal facts with a local model server
+  and a rules pass, link near-duplicate nodes, and roll back a failed run. `facts` reads them
+  back by valid and transaction time.
+- Summary trees, with `strict` and `infer` reading modes, labelled provenance on every item, and
+  a `summaries` tool.
+- Utility-based tiering, with a `feedback` tool and result handles, and a cold search arm for
+  demoted memories.
+- `liam eval retrieval`, a BGE-M3 embedder option, and a pinned embedder fingerprint.
+
 - `remember` accepts an optional `episode` field, so a client can write several related facts,
   the entities they mention, and the edges between them in one call. Everything in the episode
   lands together, or none of it does. Leaving `episode` out keeps `remember` working exactly as
