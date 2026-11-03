@@ -38,7 +38,9 @@ pub struct LatencyWindow {
 }
 
 impl LatencyWindow {
+    /// Keeps at least one timing, whatever `capacity` says.
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             capacity,
             timings: VecDeque::with_capacity(capacity),
