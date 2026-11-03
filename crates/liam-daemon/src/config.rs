@@ -19,6 +19,7 @@ mod deletion;
 mod docs;
 mod encryption;
 mod extraction;
+mod hosted;
 mod metrics;
 mod summary;
 mod tiering;
@@ -33,6 +34,7 @@ pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
     MAX_RUN_DEADLINE_SECS,
 };
+pub use hosted::HostedConfig;
 pub use metrics::{MetricsConfig, SinkKind};
 pub use summary::{
     SummaryConfig, DEFAULT_MAX_BASIS_IDS_RENDERED, DEFAULT_MIN_SUMMARY_SIMILARITY,
@@ -99,6 +101,8 @@ pub struct Config {
     pub archive: ArchiveConfig,
     /// Metrics, their alert thresholds and where an alert is reported.
     pub metrics: MetricsConfig,
+    /// Calls to hosted model providers. Off by default.
+    pub hosted: HostedConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -220,6 +224,7 @@ impl Default for Config {
             admin: AdminConfig::default(),
             archive: ArchiveConfig::default(),
             metrics: MetricsConfig::default(),
+            hosted: HostedConfig::default(),
         }
     }
 }
@@ -444,6 +449,7 @@ impl Config {
         config.admin.validate()?;
         config.archive.validate()?;
         config.metrics.validate()?;
+        config.hosted.validate()?;
         Ok(config)
     }
 
