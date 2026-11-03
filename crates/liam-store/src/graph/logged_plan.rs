@@ -161,9 +161,10 @@ impl Plan {
         self
     }
 
-    /// A usage batch. Like the other state records it covers no content, so it
-    /// is never taken for a duplicate of an earlier one.
-    pub(super) fn usage(day: i64, entries: &[UsageEntry], now: Millis) -> Self {
+    /// A usage batch of one producer, written under that producer as its source
+    /// (`USAGE_SOURCE` when it is empty). Like the other state records it covers
+    /// no content, so it is never taken for a duplicate of an earlier one.
+    pub(super) fn usage(day: i64, producer: &str, entries: &[UsageEntry], now: Millis) -> Self {
         let entries = entries
             .iter()
             .map(|entry| UsageRow {
@@ -173,13 +174,12 @@ impl Plan {
             })
             .collect();
         let payload = LogPayload::AccessBatch { day, entries };
-        Self::new(event(
-            [0; 32],
-            (USAGE_SOURCE, STORE_TRUST),
-            now.0,
-            now,
-            payload,
-        ))
+        let source = if producer.is_empty() {
+            USAGE_SOURCE
+        } else {
+            producer
+        };
+        Self::new(event([0; 32], (source, STORE_TRUST), now.0, now, payload))
     }
 
     pub(super) fn feedback(

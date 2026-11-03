@@ -167,7 +167,7 @@ mod tests {
         manifest.tier_moved_lineages = vec!["e:alice".to_owned()];
         manifest.save(&manifest_path).unwrap();
         let recorder = Arc::new(UsageRecorder::new(CAPACITY));
-        recorder.record([&subjects.alice], Millis(1));
+        recorder.record("p", [&subjects.alice], Millis(1));
         let states: Vec<Arc<dyn NodeState>> = vec![recorder];
         let registry = LineageRegistry::new()
             .with(Arc::clone(&subjects.store))

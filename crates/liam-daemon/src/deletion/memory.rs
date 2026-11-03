@@ -128,7 +128,7 @@ mod tests {
         // Arrange
         let (doomed, kept) = (NodeId::new(), NodeId::new());
         let recorder = Arc::new(UsageRecorder::new(CAPACITY));
-        recorder.record([&doomed, &kept], Millis(1));
+        recorder.record("p", [&doomed, &kept], Millis(1));
         let handles = Arc::new(IssuedHandles::new(CAPACITY));
         handles.issue([&doomed, &kept]);
         let states: Vec<Arc<dyn NodeState>> = vec![recorder.clone(), handles.clone()];

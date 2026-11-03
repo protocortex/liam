@@ -11,8 +11,8 @@ use crate::graph::logged_write::commit_or_abandon;
 use crate::graph::Graph;
 use crate::ids::{Millis, NodeId, FOREVER};
 use crate::types::{
-    CountedFeedback, FeedbackEvent, ItemView, LineageKey, LineageNode, NodeText, ReconcileReport,
-    Tier, TierMove, UsageEntry, UsageSnapshot,
+    CountedFeedback, FeedbackEvent, ItemView, LineageKey, LineageNode, NodeText, ProducerUsage,
+    ReconcileReport, Tier, TierMove, UsageEntry, UsageSnapshot,
 };
 use crate::value::{Row, Value};
 
@@ -32,8 +32,8 @@ const DROP_INT8_SQL: &str = "UPDATE node_quant SET i8 = NULL WHERE i8 IS NOT NUL
 const USAGE_EPOCH_SQL: &str = "INSERT OR IGNORE INTO usage_epochs (event_id, day) VALUES (?1, ?2)";
 
 const USAGE_ENTRY_SQL: &str = "INSERT OR IGNORE INTO item_usage_events
-       (event_id, lineage_key, day, hits, last_access_at)
-     VALUES (?1, ?2, ?3, ?4, ?5)";
+       (event_id, lineage_key, producer, day, hits, last_access_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 
 /// A producer's first verdict on a lineage in a day counts; later ones that day
 /// are kept and do not.
@@ -436,6 +436,7 @@ pub(in crate::graph) async fn apply_usage_in(
         let params = [
             event_id.into(),
             entry.lineage_key.as_str().into(),
+            entry.producer.as_str().into(),
             day.into(),
             i64::from(entry.hits).into(),
             entry.last_access_at.into(),
@@ -555,6 +556,25 @@ async fn read_snapshot(
             .push((row.get_i64(1)?, row.get_i64(2)?));
     }
 
+    let producer_rows = tx
+        .query(
+            "SELECT lineage_key, producer, day, SUM(hits) FROM item_usage_events WHERE day >= ?1
+             GROUP BY lineage_key, producer, day ORDER BY lineage_key, producer, day",
+            &[first_day.into()],
+        )
+        .await?;
+    let producer_usage = producer_rows
+        .iter()
+        .map(|row| {
+            Ok(ProducerUsage {
+                lineage_key: LineageKey::from_raw(row.get_string(0)?),
+                producer: row.get_string(1)?,
+                day: row.get_i64(2)?,
+                hits: row.get_i64(3)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let mut last_access = BTreeMap::new();
     let access_rows = tx
         .query(
@@ -615,6 +635,7 @@ async fn read_snapshot(
         .collect();
     Ok(UsageSnapshot {
         now,
+        producer_usage,
         observation_since,
         items,
     })

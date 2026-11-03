@@ -346,6 +346,7 @@ pub async fn observed(fixture: &Fixture, used: &[&LineageKey]) {
     let entries: Vec<UsageEntry> = used
         .iter()
         .map(|lineage| UsageEntry {
+            producer: String::new(),
             lineage_key: (*lineage).clone(),
             hits: HITS_CAP,
             last_access_at: later,
@@ -362,6 +363,7 @@ pub fn hooks(fixture: &Fixture, config: TieringConfig, embedder: Arc<dyn Embedde
     TierHooks {
         config,
         extraction: ExtractionConfig::default(),
+        unknown_producer: "unknown".to_owned(),
         embedder,
         permits: Arc::new(Semaphore::new(1)),
         free_ram: Arc::new(FixedRam::plenty()),

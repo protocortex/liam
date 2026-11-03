@@ -11,9 +11,10 @@
 //! makes it true, so calling it on an already-correct database is a no-op and
 //! the order they run in does not matter.
 //!
-//! Two exist. `add_column_if_missing` handles a column, through `ALTER TABLE`.
+//! Three exist. `add_column_if_missing` handles a column, through `ALTER TABLE`.
 //! `ensure_cascade` handles a CONSTRAINT, which `ALTER TABLE` cannot change at
-//! all, so it rebuilds the table.
+//! all, so it rebuilds the table. `ensure_usage_key` does the same for a primary
+//! key.
 
 use std::collections::HashSet;
 
@@ -86,6 +87,39 @@ pub async fn add_backfill_node_rowid_cursor<B: Backend>(backend: &B) -> Result<(
         )
         .await?;
     Ok(())
+}
+
+/// Gives `item_usage_events` the producer in its key. A key cannot be altered in
+/// place, so a table that lacks the `producer` column is rebuilt with it; its
+/// rows keep the producer `''`, which counts as one legacy producer. A table
+/// that has the column is left alone, so this is safe on every open.
+pub async fn ensure_usage_key<B: Backend>(backend: &B) -> Result<()> {
+    if column_exists(backend, "item_usage_events", "producer").await? {
+        return Ok(());
+    }
+    backend
+        .execute_batch(
+            "BEGIN;
+             DROP TABLE IF EXISTS item_usage_events_key_rebuild;
+             CREATE TABLE item_usage_events_key_rebuild (
+               event_id       TEXT    NOT NULL,
+               lineage_key    TEXT    NOT NULL,
+               producer       TEXT    NOT NULL DEFAULT '',
+               day            INTEGER NOT NULL,
+               hits           INTEGER NOT NULL,
+               last_access_at INTEGER NOT NULL,
+               PRIMARY KEY (event_id, lineage_key, producer)
+             );
+             INSERT INTO item_usage_events_key_rebuild
+               (event_id, lineage_key, day, hits, last_access_at)
+               SELECT event_id, lineage_key, day, hits, last_access_at FROM item_usage_events;
+             DROP TABLE item_usage_events;
+             ALTER TABLE item_usage_events_key_rebuild RENAME TO item_usage_events;
+             CREATE INDEX IF NOT EXISTS item_usage_by_lineage ON item_usage_events (lineage_key);
+             CREATE INDEX IF NOT EXISTS item_usage_by_day ON item_usage_events (day);
+             COMMIT;",
+        )
+        .await
 }
 
 /// Tables whose `REFERENCES nodes(id)` must cascade. Fixed literals, never

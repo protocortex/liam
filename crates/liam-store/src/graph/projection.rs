@@ -12,7 +12,7 @@ use liam_log::event::{
 use super::backfill::BACKFILL_SOURCE;
 use super::fact_projection::{apply_fact_step, fact_steps, FactStep};
 use super::lineage::{purge_in_tx, PurgeInput, GRAPH_STORE};
-use super::logged_plan::Table;
+use super::logged_plan::{Table, USAGE_SOURCE};
 use super::summaries::{apply_artifact, close_if_open, store_embedding};
 use super::tiers::{
     apply_feedback_in, apply_tier_in, apply_usage_in, assign_lineage, insert_quant, replace_quant,
@@ -157,6 +157,16 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
     }
 }
 
+/// The producer a usage batch credits: its source, or none for a batch the
+/// store wrote on its own or an earlier build wrote.
+fn usage_producer(source: &str) -> String {
+    if source == USAGE_SOURCE {
+        String::new()
+    } else {
+        source.to_owned()
+    }
+}
+
 /// The statements of a usage batch, a verdict or a tier move. Each row they
 /// write is keyed by the id of the event, so a replay that meets the event again
 /// writes nothing twice.
@@ -170,6 +180,7 @@ pub(super) fn state_steps(event: &LogEvent) -> Vec<Step> {
                 .iter()
                 .map(|row| UsageEntry {
                     lineage_key: LineageKey::from_raw(row.lineage_key.as_str()),
+                    producer: usage_producer(&event.source),
                     hits: row.hits,
                     last_access_at: Millis(row.last_access_at),
                 })
