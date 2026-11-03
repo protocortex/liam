@@ -43,6 +43,19 @@ impl SharedStore {
         })
     }
 
+    /// The slot's `Arc`, for a caller that must build something owning a handle
+    /// (a lineage registry). A rollback waits for the guard, so clone the `Arc`
+    /// only for as long as the guard lives and drop the clone first.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a rollback could not reopen the store, so the slot is empty.
+    pub async fn get_handle(&self) -> anyhow::Result<RwLockReadGuard<'_, Arc<DefaultGraph>>> {
+        RwLockReadGuard::try_map(self.slot.read().await, Option::as_ref).map_err(|_| {
+            anyhow::anyhow!("the store is unavailable: a rollback could not reopen it")
+        })
+    }
+
     /// Checks, under the write guard, that the slot's handle is the only one, so
     /// a restore can take the store out of it.
     ///

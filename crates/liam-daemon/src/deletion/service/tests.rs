@@ -763,10 +763,30 @@ async fn a_dry_run_names_what_a_delete_would_destroy_and_changes_nothing() {
     let all = service.dry_run(&tree(true)).await.unwrap();
 
     // Assert
-    assert_eq!(exact.key_ids.len(), 1);
-    assert_eq!(all.key_ids.len(), 3);
+    assert_eq!(exact.found.key_ids.len(), 1);
+    assert_eq!(all.found.key_ids.len(), 3);
     assert_eq!(env.payloads().await.len(), before);
     assert!(env.jobs().load().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_dry_run_counts_the_rows_each_store_would_remove() {
+    // Arrange
+    let env = Env::new().await;
+    let service = env.service();
+
+    // Act
+    let preview = service.dry_run(&alice()).await.unwrap();
+
+    // Assert
+    let graph = preview
+        .hits
+        .iter()
+        .find(|(name, _)| name == "graph")
+        .map(|(_, hits)| hits.total())
+        .expect("the database is listed");
+    assert!(graph > 0, "{preview:?}");
+    assert_eq!(preview.hits.len(), STORES);
 }
 
 #[tokio::test]

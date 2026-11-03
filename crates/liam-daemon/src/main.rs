@@ -79,15 +79,16 @@ fn main() -> anyhow::Result<()> {
 
     let config = Config::load(config_path.as_ref())?;
     // Before the runtime starts; skipped for the proxy, which loads no model.
-    if mode != cli::Mode::Proxy {
+    if mode.loads_models() {
         export_fastembed_cache_dir(&config)?;
     }
+    let is_proxy = mode == cli::Mode::Proxy;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let result = runtime.block_on(run(mode, config));
 
-    if mode == cli::Mode::Proxy {
+    if is_proxy {
         // The proxy's stdin reader sits in a blocking read that cannot be
         // cancelled, and dropping a runtime WAITS for blocking tasks that
         // have already started. So when the daemon closes the session first,
@@ -117,6 +118,10 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
 
     if mode == cli::Mode::EncryptLog {
         return deletion::encrypt_log(&config).await;
+    }
+
+    if let cli::Mode::Delete(action) = mode {
+        return deletion::delete_command(&config, action, &mut std::io::stdout()).await;
     }
 
     serve_with_store(mode, config).await
@@ -250,14 +255,27 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         .start(config.gc.run_on_start)
         .await
         .context("could not finish the consolidation rollback a crash interrupted")?;
-    // After the crash recovery above and before anything is served, written or
-    // consolidated, so no reader or writer meets a half-deleted subject. The
-    // slot stays locked for the whole resume, and the service gives its handle
-    // back when it ends, which a later rollback needs.
     let node_states: Vec<Arc<dyn deletion::NodeState>> = usage
         .iter()
         .map(|recorder| recorder.clone() as Arc<dyn deletion::NodeState>)
         .collect();
+    let server = server
+        .with_admin(config.admin.clone())
+        .with_consolidator(job.clone());
+    let server = match &keys {
+        Some(keys) => server.with_delete_preview(Arc::new(deletion::DeletePreview::new(
+            &config,
+            &database_path,
+            liam_daemon::event_log::log_reader(&log_dir, Some(keys))?,
+            Arc::clone(keys),
+            node_states.clone(),
+        )?)),
+        None => server,
+    };
+    // After the crash recovery above and before anything is served, written or
+    // consolidated, so no reader or writer meets a half-deleted subject. The
+    // slot stays locked for the whole resume, and the service gives its handle
+    // back when it ends, which a later rollback needs.
     let shared = server.shared_store();
     let slot = shared.exclusive().await;
     let resumed = slot.as_ref().cloned().context("the store is unavailable")?;
@@ -295,6 +313,10 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         ),
         cli::Mode::EncryptLog => unreachable!(
             "encrypt-log returns in run() before any store setup; \
+             reaching serve_with_store means that guard was removed"
+        ),
+        cli::Mode::Delete(_) => unreachable!(
+            "delete returns in run() before any store setup; \
              reaching serve_with_store means that guard was removed"
         ),
         cli::Mode::Stdio => serve_stdio(server, shutdown.token()).await,

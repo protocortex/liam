@@ -848,6 +848,24 @@ async fn resolving_a_target_fixes_the_nodes_and_lineage_keys_its_groups_reach() 
 }
 
 #[tokio::test]
+async fn previewing_a_target_answers_as_resolving_does_and_writes_nothing() {
+    // Arrange
+    let g = open().await;
+    world(&g).await;
+    let outboxes = "SELECT COUNT(*) FROM lineage_removals";
+    let before = rows(&g, outboxes, &[]).await[0].get_i64(0).unwrap();
+
+    // Act
+    let previewed = g.preview_target(&alice()).await.unwrap();
+    let after = rows(&g, outboxes, &[]).await[0].get_i64(0).unwrap();
+    let resolved = g.resolve_target(&alice()).await.unwrap();
+
+    // Assert
+    assert_eq!(previewed, resolved);
+    assert_eq!(after, before, "a preview leaves no outbox row");
+}
+
+#[tokio::test]
 async fn the_dedup_filter_needs_a_log_to_rebuild_or_compare() {
     // Arrange
     let g = open().await;

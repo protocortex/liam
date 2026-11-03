@@ -62,17 +62,7 @@ impl LineageRegistry {
         self.stores.len()
     }
 
-    // The operator command lists these in the change that adds it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn names(&self) -> Vec<String> {
-        self.stores
-            .iter()
-            .map(|store| store.name().to_owned())
-            .collect()
-    }
-
     /// What each store would remove, by store name.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn find_all(
         &self,
         target: &LineageTarget,
@@ -205,7 +195,7 @@ mod tests {
         let stores = |residuals: &[liam_store::Residual]| -> BTreeSet<String> {
             residuals.iter().map(|r| r.store.clone()).collect()
         };
-        let every_store: BTreeSet<String> = registry.names().into_iter().collect();
+        let every_store: BTreeSet<String> = found.iter().map(|(name, _)| name.clone()).collect();
         assert!(stores(&before).contains("graph"));
         let after_database_names = stores(&after_database);
         let expected: BTreeSet<String> = every_store

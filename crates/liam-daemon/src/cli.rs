@@ -22,9 +22,11 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use liam_daemon::config::resolve_config_source;
+
+use crate::deletion::{DeleteAction, DeleteTarget};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,12 +53,77 @@ enum Command {
     /// Seal the plaintext events of the log in place. Needs `[encryption]` and
     /// a stopped daemon.
     EncryptLog,
+    /// Count what a delete would destroy and run it, or finish, cancel or list
+    /// delete jobs. Needs a stopped daemon, except for `--status`.
+    Delete(DeleteCommand),
+}
+
+/// The flags of `liamd delete`: exactly one of the five that choose what to do.
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("action")
+        .required(true)
+        .args(["subject", "event_id", "resume", "cancel", "status"])
+))]
+pub struct DeleteCommand {
+    /// Delete everything held about this subject.
+    #[arg(long)]
+    subject: Option<String>,
+    /// Only the subject in this scope.
+    #[arg(long, conflicts_with_all = ["event_id", "resume", "cancel", "status"])]
+    scope: Option<String>,
+    /// Also the subject in every scope below `--scope`.
+    #[arg(long, conflicts_with_all = ["event_id", "resume", "cancel", "status"])]
+    include_children: bool,
+    /// Delete one logged event instead of a subject.
+    #[arg(long, value_name = "EVENT_ID")]
+    event_id: Option<String>,
+    /// Start the job. Without it only the counts are printed.
+    #[arg(long, conflicts_with_all = ["resume", "cancel", "status"])]
+    yes: bool,
+    /// Finish job ID, or every open job when no ID is given.
+    #[arg(long, value_name = "ID", num_args = 0..=1)]
+    resume: Option<Option<String>>,
+    /// Cancel job ID, which must not have destroyed a key yet.
+    #[arg(long, value_name = "ID")]
+    cancel: Option<String>,
+    /// List the delete jobs by id and state.
+    #[arg(long)]
+    status: bool,
+}
+
+impl DeleteCommand {
+    fn action(&self) -> DeleteAction {
+        if let Some(subject) = &self.subject {
+            return DeleteAction::Request {
+                target: DeleteTarget::Subject {
+                    subject: subject.clone(),
+                    scope: self.scope.clone(),
+                    include_children: self.include_children,
+                },
+                yes: self.yes,
+            };
+        }
+        if let Some(event_id) = &self.event_id {
+            return DeleteAction::Request {
+                target: DeleteTarget::Event {
+                    event_id: event_id.clone(),
+                },
+                yes: self.yes,
+            };
+        }
+        match (&self.resume, &self.cancel) {
+            (Some(id), _) => DeleteAction::Resume(id.clone()),
+            (None, Some(id)) => DeleteAction::Cancel(id.clone()),
+            (None, None) => DeleteAction::Status,
+        }
+    }
 }
 
 /// What this process should do. `Stdio` is the no-subcommand default, kept
 /// first and kept the default so existing MCP client configs that just run
 /// `liamd` behave exactly as they did before modes existed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// One client, one process, MCP over this process's stdin and stdout.
     Stdio,
@@ -67,16 +134,27 @@ pub enum Mode {
     Proxy,
     /// Seals the plaintext events of the log in place, then exits.
     EncryptLog,
+    /// Deletes, or manages delete jobs, then exits.
+    Delete(DeleteAction),
+}
+
+impl Mode {
+    /// Whether this mode loads the embedder and reranker. The proxy forwards
+    /// bytes, and a delete only reads the log and destroys keys.
+    pub fn loads_models(&self) -> bool {
+        !matches!(self, Self::Proxy | Self::Delete(_))
+    }
 }
 
 impl Cli {
     /// Which mode the parsed arguments select.
     pub fn mode(&self) -> Mode {
-        match self.command {
+        match &self.command {
             None => Mode::Stdio,
             Some(Command::Serve) => Mode::Serve,
             Some(Command::Proxy) => Mode::Proxy,
             Some(Command::EncryptLog) => Mode::EncryptLog,
+            Some(Command::Delete(command)) => Mode::Delete(command.action()),
         }
     }
 
@@ -121,6 +199,110 @@ mod tests {
     #[test]
     fn encrypt_log_selects_the_migration() {
         assert_eq!(parse(&["liamd", "encrypt-log"]).mode(), Mode::EncryptLog);
+    }
+
+    fn delete_action(args: &[&str]) -> DeleteAction {
+        match parse(args).mode() {
+            Mode::Delete(action) => action,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_with_a_subject_counts_unless_yes_is_given() {
+        // Arrange
+        let target = DeleteTarget::Subject {
+            subject: "alice".into(),
+            scope: Some("work".into()),
+            include_children: true,
+        };
+
+        // Act
+        let count = delete_action(&[
+            "liamd",
+            "delete",
+            "--subject",
+            "alice",
+            "--scope",
+            "work",
+            "--include-children",
+        ]);
+        let run = delete_action(&[
+            "liamd",
+            "delete",
+            "--subject",
+            "alice",
+            "--scope",
+            "work",
+            "--include-children",
+            "--yes",
+        ]);
+
+        // Assert
+        assert_eq!(
+            count,
+            DeleteAction::Request {
+                target: target.clone(),
+                yes: false
+            }
+        );
+        assert_eq!(run, DeleteAction::Request { target, yes: true });
+    }
+
+    #[test]
+    fn delete_resume_takes_an_optional_job_id() {
+        assert_eq!(
+            delete_action(&["liamd", "delete", "--resume"]),
+            DeleteAction::Resume(None)
+        );
+        assert_eq!(
+            delete_action(&["liamd", "delete", "--resume", "job-1"]),
+            DeleteAction::Resume(Some("job-1".into()))
+        );
+    }
+
+    #[test]
+    fn delete_cancel_status_and_event_select_their_actions() {
+        assert_eq!(
+            delete_action(&["liamd", "delete", "--cancel", "job-1"]),
+            DeleteAction::Cancel("job-1".into())
+        );
+        assert_eq!(
+            delete_action(&["liamd", "delete", "--status"]),
+            DeleteAction::Status
+        );
+        assert_eq!(
+            delete_action(&["liamd", "delete", "--event-id", "e1", "--yes"]),
+            DeleteAction::Request {
+                target: DeleteTarget::Event {
+                    event_id: "e1".into()
+                },
+                yes: true
+            }
+        );
+    }
+
+    #[test]
+    fn delete_wants_exactly_one_action_and_scope_only_with_a_subject() {
+        for args in [
+            &["liamd", "delete"][..],
+            &["liamd", "delete", "--status", "--resume"],
+            &["liamd", "delete", "--subject", "a", "--event-id", "e"],
+            &["liamd", "delete", "--scope", "work", "--event-id", "e"],
+            &["liamd", "delete", "--status", "--yes"],
+        ] {
+            let error = Cli::try_parse_from(args).expect_err("must be a usage error");
+            assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_proxy_and_delete_skip_the_models() {
+        assert!(!Mode::Proxy.loads_models());
+        assert!(!Mode::Delete(DeleteAction::Status).loads_models());
+        for mode in [Mode::Stdio, Mode::Serve, Mode::EncryptLog] {
+            assert!(mode.loads_models(), "{mode:?}");
+        }
     }
 
     #[test]

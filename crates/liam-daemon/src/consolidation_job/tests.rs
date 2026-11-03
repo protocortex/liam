@@ -813,3 +813,58 @@ async fn the_maintenance_step_is_done_when_the_daemon_keeps_running() {
 mod extraction;
 mod summary;
 mod tiering;
+
+const ADMIN: &str = "ops";
+
+/// A server the admin may call `consolidate` on, over a store with one live fact.
+async fn admin_server(harness: &Harness) -> (MemoryServer, Arc<ConsolidationJob>) {
+    let (store, _clock) = harness.store_at(Millis(100 * DAY)).await;
+    keep_one_fact(&store).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let job = Arc::new(harness.job(&server, honest()));
+    let admin = server
+        .with_admin(crate::config::AdminConfig {
+            producers: vec![ADMIN.to_owned()],
+        })
+        .with_consolidator(Arc::clone(&job));
+    admin.set_producer(ADMIN);
+    (admin, job)
+}
+
+#[tokio::test]
+async fn the_consolidate_tool_runs_one_run_and_reports_how_it_ended() {
+    // Arrange
+    let harness = Harness::new();
+    let (admin, _job) = admin_server(&harness).await;
+
+    // Act
+    let report = admin.consolidate().await;
+
+    // Assert
+    assert!(report.contains("committed"), "{report}");
+    assert!(report.contains("steps completed"), "{report}");
+}
+
+#[tokio::test]
+async fn a_second_consolidate_while_a_run_holds_the_lock_is_busy_and_leaves_the_lock_alone() {
+    // Arrange
+    let harness = Harness::new();
+    let (admin, job) = admin_server(&harness).await;
+    let running = job.running.try_lock().expect("the lock is free");
+
+    // Act
+    let refused = admin.consolidate().await;
+    let tick = job.tick().await;
+    let run_started = harness.manifest_path().exists();
+    drop(running);
+    let after = admin.consolidate().await;
+
+    // Assert
+    assert!(refused.contains("already in progress"), "{refused}");
+    assert_eq!(tick, None, "a scheduled tick yields to the run in progress");
+    assert!(!run_started, "neither call started a run");
+    assert!(
+        after.contains("committed"),
+        "the lock was still usable: {after}"
+    );
+}
