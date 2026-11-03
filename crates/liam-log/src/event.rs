@@ -16,12 +16,12 @@ use legacy::{LegacyEvent, LegacyPayload};
 
 /// Schema version this build writes and the newest it can read. Version 2 adds
 /// the fact payloads, version 4 the derived artifacts and version 5 the usage,
-/// feedback and tier payloads and version 6 the sealed payload, which an older
-/// build cannot replay. Version 3 adds the derivation and basis of a node row, which
+/// feedback and tier payloads, version 6 the sealed payload and version 7 the
+/// quarantined payload, which an older build cannot replay. Version 3 adds the derivation and basis of a node row, which
 /// changes its layout, so frames of versions before it are read through
 /// [`legacy`]. Every frame comes back stamped with this version, since what
 /// is returned is the current representation of the event.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// The first version whose node rows carry a derivation and a basis.
 pub(crate) const NODE_DERIVATION_SCHEMA_VERSION: u32 = 3;
@@ -196,6 +196,27 @@ pub enum LogPayload {
     },
     /// Rows of another payload, each sealed under its own key group.
     Sealed(SealedRecord),
+    /// Cancels the event `target_event_id` like `Voided`, and records that the
+    /// store refused it at `at` for `reason`, so a replay can restore the
+    /// refusal. It goes last so the payloads before it keep their positions.
+    Quarantined {
+        target_event_id: String,
+        reason: String,
+        at: i64,
+    },
+}
+
+impl LogPayload {
+    /// The event this payload cancels, if it is a `Voided` or a `Quarantined`.
+    pub fn voided_target(&self) -> Option<&str> {
+        match self {
+            LogPayload::Voided { target_event_id }
+            | LogPayload::Quarantined {
+                target_event_id, ..
+            } => Some(target_event_id),
+            _ => None,
+        }
+    }
 }
 
 /// The reads of one lineage in an `AccessBatch`.
@@ -893,6 +914,58 @@ mod tests {
     }
 
     #[test]
+    fn a_voided_frame_from_before_quarantined_existed_is_still_read() {
+        // Arrange: the frame a version 6 build wrote for a void
+        let frame = from_hex("06076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f0005076576656e742d30");
+        let expected = event_with(LogPayload::Voided {
+            target_event_id: "event-0".into(),
+        });
+
+        // Act
+        let decoded = LogEvent::decode(&frame);
+
+        // Assert
+        assert_eq!(decoded, Ok(expected));
+    }
+
+    #[test]
+    fn v7_quarantined_wire_format_is_pinned() {
+        // Arrange
+        let event = event_with(LogPayload::Quarantined {
+            target_event_id: "event-0".into(),
+            reason: "refused".into(),
+            at: 1_000,
+        });
+        let frame = from_hex("07076576656e742d310707070707070707070707070707070707070707070707070707070707070707076167656e742d61cdccccccccccec3fd00fa01f000e076576656e742d300772656675736564d00f");
+
+        // Act
+        let decoded = LogEvent::decode(&frame);
+        let encoded = event.encode().expect("encode event");
+
+        // Assert
+        assert_eq!(decoded, Ok(event));
+        assert_eq!(encoded, frame);
+    }
+
+    #[test]
+    fn a_void_and_a_quarantine_both_name_the_event_they_cancel() {
+        // Arrange
+        let void = LogPayload::Voided {
+            target_event_id: "event-0".into(),
+        };
+        let quarantine = LogPayload::Quarantined {
+            target_event_id: "event-1".into(),
+            reason: "refused".into(),
+            at: 1,
+        };
+
+        // Act and Assert
+        assert_eq!(void.voided_target(), Some("event-0"));
+        assert_eq!(quarantine.voided_target(), Some("event-1"));
+        assert_eq!(LogPayload::Tombstone(Vec::new()).voided_target(), None);
+    }
+
+    #[test]
     fn v2_fact_payloads_wire_format_is_pinned() {
         // Arrange
         let golden = [
@@ -1207,6 +1280,11 @@ mod tests {
                 shape: crate::envelope::SealedShape::Node,
                 rows: Vec::new(),
             }),
+            LogPayload::Quarantined {
+                target_event_id: String::new(),
+                reason: String::new(),
+                at: 0,
+            },
         ];
 
         for (index, payload) in payloads.iter().enumerate() {
@@ -1219,8 +1297,8 @@ mod tests {
     }
 
     #[test]
-    fn this_build_writes_schema_version_six() {
+    fn this_build_writes_schema_version_seven() {
         // Assert
-        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 7);
     }
 }

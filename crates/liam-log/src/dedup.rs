@@ -12,7 +12,7 @@ use std::convert::Infallible;
 use async_trait::async_trait;
 use fastbloom::BloomFilter;
 
-use crate::event::{LogEvent, LogPayload};
+use crate::event::LogEvent;
 use crate::hash::content_hashes;
 
 /// A 100k-hash filter takes about 120 KB, so an empty store costs almost nothing.
@@ -252,7 +252,7 @@ pub struct Rebuilt {
 /// had a live carrier is logged as a `DuplicateOf` and registers nothing, so a
 /// later write of the same hash only exists because every earlier carrier was
 /// dead or voided, and the later write is the one the live index points at.
-/// A `Voided` event removes only its own target, so a retry of a voided write
+/// A `Voided` or `Quarantined` event removes only its own target, so a retry of a voided write
 /// survives however often the void repeats. Entries come out in the log
 /// order of the surviving carrier.
 ///
@@ -272,8 +272,8 @@ pub fn rebuild_from_log(
         if !seen.insert(event.event_id.clone()) {
             continue;
         }
-        if let LogPayload::Voided { target_event_id } = event.payload {
-            voided.insert(target_event_id);
+        if let Some(target) = event.payload.voided_target() {
+            voided.insert(target.to_owned());
             continue;
         }
         if voided.contains(&event.event_id) {
@@ -345,7 +345,7 @@ impl Carriers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{EdgeRow, NodeRow, RowEffect, TombstoneTable, TombstoneTarget};
+    use crate::event::{EdgeRow, LogPayload, NodeRow, RowEffect, TombstoneTable, TombstoneTarget};
     use crate::fixtures::{
         edge_row, filter_with, log_event, node_row, sample_hash, sample_hashes, small_config,
         EVENT_HASH_SENTINEL,
