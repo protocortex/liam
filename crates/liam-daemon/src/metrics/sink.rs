@@ -40,6 +40,39 @@ pub enum MetricId {
 }
 
 impl MetricId {
+    /// Every metric, in declaration order.
+    pub const ALL: [Self; 24] = [
+        Self::ProbeRecallAt10,
+        Self::ArmLatencyP50Ms,
+        Self::ArmLatencyP95Ms,
+        Self::RecallLatencyP50Ms,
+        Self::RecallLatencyP95Ms,
+        Self::AskLatencyP50Ms,
+        Self::AskLatencyP95Ms,
+        Self::TierBytes,
+        Self::LogBytes,
+        Self::ArchiveBytes,
+        Self::PeakRssBytes,
+        Self::ConsolidationSeconds,
+        Self::RollbackCount,
+        Self::ItemsPromoted,
+        Self::ItemsReembedded,
+        Self::BloomFalsePositiveRate,
+        Self::Ece,
+        Self::RulesExtractionBacklog,
+        Self::ModelExtractionBacklog,
+        Self::ModelCalls,
+        Self::ModelCostMicroDollars,
+        Self::CacheHitRate,
+        Self::DeletionBacklogCount,
+        Self::DeletionBacklogAgeDays,
+    ];
+
+    /// The metric called `name`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|metric| metric.name() == name)
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::ProbeRecallAt10 => "probe_recall_at_10",
@@ -89,6 +122,7 @@ pub enum RetrievalArm {
     ColdProbe,
 }
 
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Provider {
     Local,
@@ -103,14 +137,18 @@ pub enum Provider {
 pub struct ModelId(u16);
 
 /// The model ids a run has seen, each interned once.
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 #[derive(Debug, Default)]
 pub struct ModelCatalog {
     names: Vec<String>,
 }
 
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 const MAX_MODEL_NAME_CHARS: usize = 64;
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 const MAX_MODELS: usize = 64;
 
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 impl ModelCatalog {
     /// The id of `name`, added when new.
     ///
@@ -144,6 +182,7 @@ impl ModelCatalog {
     }
 }
 
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 /// What a model call used, as an adapter reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
@@ -154,6 +193,7 @@ pub struct Usage {
 }
 
 /// The only dimensions a sample may carry.
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Labels {
     None,

@@ -129,6 +129,7 @@ pub fn deletion_backlog(jobs: &[DeleteJob], now: Millis) -> Vec<Sample> {
     samples
 }
 
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 /// The price of a model's tokens, in millionths of a dollar per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Price {
@@ -136,8 +137,10 @@ pub struct Price {
     pub output_micro_per_mtok: u64,
 }
 
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 const TOKENS_PER_MTOK: u64 = 1_000_000;
 
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 /// Running totals of calls and cost per provider and model. The alert rules
 /// read growth between runs, so a sample carries the total, not one call.
 #[derive(Debug, Default)]
@@ -145,6 +148,7 @@ pub struct ModelMeter {
     totals: BTreeMap<Labels, (u64, u64)>,
 }
 
+#[allow(dead_code, reason = "the hosted adapters report model usage")]
 impl ModelMeter {
     pub fn record(&mut self, usage: Usage, price: Price, at: Millis) -> [Sample; 2] {
         let labels = Labels::Model {

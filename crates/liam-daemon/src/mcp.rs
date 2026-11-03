@@ -14,6 +14,7 @@ mod consolidate;
 mod delete;
 pub mod facts;
 pub mod feedback;
+mod metrics;
 pub mod producer;
 pub mod summaries;
 #[cfg(test)]
@@ -40,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 use self::delete::DeleteArgs;
 use self::facts::FactsArgs;
 use self::feedback::{Feedback, FeedbackArgs};
+use self::metrics::MetricsArgs;
 use self::summaries::SummariesArgs;
 use crate::ask::{
     self, build_ask_prompt, clamp_ask_k, estimate_tokens, fallback_answer, fit_evidence_to_budget,
@@ -1561,6 +1563,14 @@ impl MemoryServer {
     )]
     pub(crate) async fn consolidate(&self) -> String {
         consolidate::run(self).await
+    }
+
+    #[tool(
+        description = "Show the latest reading of each metric LIAM keeps about itself, and the \
+                       alerts that are active. Pass metric to see one, limit to cap the readings."
+    )]
+    pub(crate) async fn metrics(&self, Parameters(args): Parameters<MetricsArgs>) -> String {
+        metrics::read(self, args).await
     }
 
     /// Acquires one slot from `generation_permits`, racing the shared request

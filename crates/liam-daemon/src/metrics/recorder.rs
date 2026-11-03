@@ -4,6 +4,7 @@
 //! the read path stays read-only.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -12,8 +13,9 @@ use liam_daemon::consolidation::manifest::RunOutcome;
 use liam_daemon::consolidation::probes::ProbeReport;
 use liam_store::{Clock, QueryTimings};
 
+use super::alerts::{evaluate_run, Observation, RuleSet};
 use super::collect::{self, LatencyWindow};
-use super::sink::{Labels, MetricId, MetricsSink, RetrievalArm, Sample};
+use super::sink::{Labels, MetricId, MetricsSink, RetrievalArm, Sample, Snapshot};
 use crate::tiering::AppliedMoves;
 
 /// Timings kept per window, the size `ask` already keeps for its own.
@@ -41,12 +43,23 @@ struct Windows {
     arms: BTreeMap<RetrievalArm, LatencyWindow>,
 }
 
+/// Where the alert state is kept between runs, and what raises an alert.
+struct Alerting {
+    state_path: PathBuf,
+    rules: RuleSet,
+}
+
 pub struct Metrics {
     sink: Arc<dyn MetricsSink>,
     clock: Arc<dyn Clock>,
     min_samples: usize,
     windows: Mutex<Windows>,
     rollbacks: AtomicU64,
+    alerting: Option<Alerting>,
+    /// Held while a run publishes its readings and alerts, and by a reader of
+    /// the snapshot, so a reader never sees one run's readings with the
+    /// previous run's alerts.
+    publication: tokio::sync::Mutex<()>,
 }
 
 impl Metrics {
@@ -60,11 +73,60 @@ impl Metrics {
                 arms: BTreeMap::new(),
             }),
             rollbacks: AtomicU64::new(0),
+            alerting: None,
+            publication: tokio::sync::Mutex::new(()),
         }
     }
 
-    pub fn sink(&self) -> &Arc<dyn MetricsSink> {
-        &self.sink
+    /// Judges each run against the previous one under `rules`, keeping the
+    /// previous values in `state_path`.
+    pub fn with_alerts(mut self, state_path: PathBuf, rules: RuleSet) -> Self {
+        self.alerting = Some(Alerting { state_path, rules });
+        self
+    }
+
+    /// The readings and active alerts as they stood between two runs' publications.
+    pub async fn snapshot(&self) -> Snapshot {
+        let _published = self.publication.lock().await;
+        self.sink.snapshot()
+    }
+
+    /// Publishes a finished run: its outcome, the readings taken at its end,
+    /// and the alerts they raise. A failed restore keeps the alerts as they
+    /// were, because the numbers of such a run are not judged.
+    pub async fn finish_run(
+        &self,
+        outcome: Option<RunOutcome>,
+        elapsed: Duration,
+        readings: Vec<Sample>,
+    ) {
+        let _publishing = self.publication.lock().await;
+        self.run_finished(outcome, elapsed);
+        readings
+            .into_iter()
+            .for_each(|sample| self.sink.record(sample));
+        self.raise_alerts(outcome == Some(RunOutcome::RestoreFailed));
+    }
+
+    fn raise_alerts(&self, restore_failed: bool) {
+        let Some(alerting) = &self.alerting else {
+            return;
+        };
+        let observations = observations_of(&self.sink.snapshot());
+        let at = self.clock.now();
+        match evaluate_run(
+            &alerting.state_path,
+            &observations,
+            &alerting.rules,
+            at,
+            restore_failed,
+        ) {
+            Ok(_) if restore_failed => {}
+            Ok(alerts) => self.sink.set_alerts(alerts),
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "metrics: the alerts could not be judged");
+            }
+        }
     }
 
     pub fn record(&self, sample: Option<Sample>) {
@@ -136,7 +198,7 @@ impl Metrics {
     }
 
     /// The end of a consolidation run. The rollback count only grows.
-    pub fn run_finished(&self, outcome: Option<RunOutcome>, elapsed: Duration) {
+    fn run_finished(&self, outcome: Option<RunOutcome>, elapsed: Duration) {
         let now = self.clock.now();
         if matches!(
             outcome,
@@ -183,6 +245,27 @@ impl Metrics {
             started: std::time::Instant::now(),
         }
     }
+}
+
+/// One observation per metric. Where a metric has a reading per label, the
+/// largest value stands for it and the busiest reading gives the sample count.
+fn observations_of(snapshot: &Snapshot) -> Vec<Observation> {
+    let mut by_metric: BTreeMap<MetricId, Observation> = BTreeMap::new();
+    for reading in &snapshot.readings {
+        let samples = u32::try_from(reading.samples).unwrap_or(u32::MAX);
+        by_metric
+            .entry(reading.metric)
+            .and_modify(|seen| {
+                seen.value = seen.value.max(reading.value);
+                seen.samples = seen.samples.max(samples);
+            })
+            .or_insert(Observation {
+                metric: reading.metric,
+                value: reading.value,
+                samples,
+            });
+    }
+    by_metric.into_values().collect()
 }
 
 fn millis(elapsed: Duration) -> f64 {

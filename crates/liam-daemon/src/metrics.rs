@@ -10,6 +10,7 @@ pub mod recorder;
 pub mod sink;
 pub mod sources;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use alerts::{Rule, RuleSet};
@@ -19,14 +20,19 @@ use sink::{LogSink, MemorySink, MetricId, MetricsSink};
 
 use crate::config::{MetricsConfig, SinkKind};
 
-/// The recorder over the sink `config` names.
-pub fn build(config: &MetricsConfig) -> Arc<Metrics> {
+/// The recorder over the sink `config` names, judging each run against the
+/// previous one with the state kept beside `database_path`.
+pub fn build(config: &MetricsConfig, database_path: &Path, deadline_days: u32) -> Arc<Metrics> {
     let clock = Arc::new(SystemClock);
     let sink: Arc<dyn MetricsSink> = match config.sink {
         SinkKind::Memory => Arc::new(MemorySink::new(clock.clone())),
         SinkKind::Log => Arc::new(LogSink::new(clock.clone())),
     };
-    Arc::new(Metrics::new(sink, clock, config.min_samples as usize))
+    let metrics = Metrics::new(sink, clock, config.min_samples as usize).with_alerts(
+        alerts::state_path_for(database_path),
+        rules(config, deadline_days),
+    );
+    Arc::new(metrics)
 }
 
 /// The share of a delete's deadline after which the backlog is warned about.

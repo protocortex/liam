@@ -67,6 +67,7 @@ fn tree_members_rss(system: &mut System, root: Pid) -> Vec<u64> {
 }
 
 /// Resident bytes of `root` plus every process descended from it.
+#[cfg(test)]
 pub(crate) fn tree_rss_bytes(system: &mut System, root: Pid) -> u64 {
     tree_members_rss(system, root).iter().sum()
 }
