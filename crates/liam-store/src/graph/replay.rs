@@ -458,7 +458,8 @@ pub(super) fn row_effects(payload: LogPayload) -> Vec<RowEffect> {
         | LogPayload::DerivedArtifactClosed { .. }
         | LogPayload::AccessBatch { .. }
         | LogPayload::Feedback { .. }
-        | LogPayload::TierMove { .. } => Vec::new(),
+        | LogPayload::TierMove { .. }
+        | LogPayload::Sealed(_) => Vec::new(),
     }
 }
 

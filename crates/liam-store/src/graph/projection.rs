@@ -128,7 +128,10 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
         // their rows are keyed by its id; see `state_steps`.
         | LogPayload::AccessBatch { .. }
         | LogPayload::Feedback { .. }
-        | LogPayload::TierMove { .. } => Vec::new(),
+        | LogPayload::TierMove { .. }
+        // The opening reader turns a sealed record into its plain rows before
+        // anything projects it.
+        | LogPayload::Sealed(_) => Vec::new(),
     }
 }
 

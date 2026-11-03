@@ -8,17 +8,20 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::envelope::SealedRecord;
+
 mod legacy;
 
 use legacy::{LegacyEvent, LegacyPayload};
 
 /// Schema version this build writes and the newest it can read. Version 2 adds
 /// the fact payloads, version 4 the derived artifacts and version 5 the usage,
-/// feedback and tier payloads, which an older build cannot replay. Version 3 adds the derivation and basis of a node row, which
+/// feedback and tier payloads and version 6 the sealed payload, which an older
+/// build cannot replay. Version 3 adds the derivation and basis of a node row, which
 /// changes its layout, so frames of versions before it are read through
 /// [`legacy`]. Every frame comes back stamped with this version, since what
 /// is returned is the current representation of the event.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// The first version whose node rows carry a derivation and a basis.
 pub(crate) const NODE_DERIVATION_SCHEMA_VERSION: u32 = 3;
@@ -191,6 +194,8 @@ pub enum LogPayload {
         changed_at: i64,
         residency_until: Option<i64>,
     },
+    /// Rows of another payload, each sealed under its own key group.
+    Sealed(SealedRecord),
 }
 
 /// The reads of one lineage in an `AccessBatch`.
@@ -266,7 +271,7 @@ pub struct LogEvent {
     pub trust_score: f64,
     pub observed_at: i64,
     pub ingested_at: i64,
-    /// Reserved for the encryption work; always `None` for now.
+    /// The key group of the first sealed row, `None` for a plain event.
     pub encryption_key_id: Option<String>,
     #[serde(skip)]
     pub schema_version: u32,
@@ -1120,15 +1125,102 @@ mod tests {
 
         for (payload, hex) in tier_payloads().into_iter().zip(golden) {
             let event = event_with(payload);
-            let encoded = event.encode().expect("encode event");
+            let mut encoded = event.encode().expect("encode event");
             let expected_bytes = from_hex(hex);
 
             // Act
             let decoded = LogEvent::decode(&expected_bytes);
 
-            // Assert
+            // Assert: a current frame differs from a v5 one only in its prefix.
+            assert_eq!(encoded[0], CURRENT_SCHEMA_VERSION as u8);
+            encoded[0] = expected_bytes[0];
             assert_eq!(encoded, expected_bytes, "encoding drifted for {event:?}");
             assert_eq!(decoded, Ok(event));
         }
+    }
+
+    #[test]
+    fn payload_variant_indexes_are_pinned_so_only_appending_is_legal() {
+        // Arrange
+        let artifact = DerivedArtifact {
+            artifact_id: "a".into(),
+            kind: ARTIFACT_KIND_SUMMARY.into(),
+            level: 1,
+            scope: String::new(),
+            text: String::new(),
+            child_ids: Vec::new(),
+            source_event_ids: Vec::new(),
+            events_fed: 0,
+            derivation: String::new(),
+            model_id: String::new(),
+            prompt_version: String::new(),
+            closes: Vec::new(),
+            valid_min: 0,
+            valid_max: 0,
+            at: 0,
+        };
+        let payloads = [
+            LogPayload::NodeWrite(node_row()),
+            LogPayload::EdgeWrite(edge_row()),
+            LogPayload::EpisodeBatch(Vec::new()),
+            LogPayload::Tombstone(Vec::new()),
+            LogPayload::DuplicateOf {
+                first_event_id: String::new(),
+            },
+            LogPayload::Voided {
+                target_event_id: String::new(),
+            },
+            LogPayload::FactWrite {
+                at: 0,
+                closed_version_ids: Vec::new(),
+                inserted: Vec::new(),
+                source_links: Vec::new(),
+                suppressions: Vec::new(),
+            },
+            LogPayload::RunRolledBack {
+                run_id: String::new(),
+            },
+            LogPayload::DerivedArtifact(artifact),
+            LogPayload::DerivedArtifactClosed {
+                artifact_id: String::new(),
+                at: 0,
+            },
+            LogPayload::AccessBatch {
+                day: 0,
+                entries: Vec::new(),
+            },
+            LogPayload::Feedback {
+                lineage_key: String::new(),
+                correct: true,
+                producer: String::new(),
+                at: 0,
+            },
+            LogPayload::TierMove {
+                lineage_key: String::new(),
+                to: TierName::Hot,
+                run_id: String::new(),
+                reason: String::new(),
+                changed_at: 0,
+                residency_until: None,
+            },
+            LogPayload::Sealed(SealedRecord {
+                shape: crate::envelope::SealedShape::Node,
+                rows: Vec::new(),
+            }),
+        ];
+
+        for (index, payload) in payloads.iter().enumerate() {
+            // Act
+            let bytes = postcard::to_stdvec(payload).expect("encode payload");
+
+            // Assert
+            assert_eq!(usize::from(bytes[0]), index, "{payload:?}");
+        }
+    }
+
+    #[test]
+    fn this_build_writes_schema_version_six() {
+        // Assert
+        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
     }
 }
