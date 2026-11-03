@@ -3,6 +3,8 @@
 //! recorded nodes. Off until enabled.
 
 use serde::Deserialize;
+#[cfg(test)]
+use serde::Serialize;
 
 /// The deepest summary tree the builder plans.
 pub const MAX_SUMMARY_DEPTH: u8 = 3;
@@ -35,6 +37,7 @@ const MAX_TIME_WINDOW_HOURS: u64 = 24 * 365 * 10;
 const MAX_RECLUSTER_INTERVAL_DAYS: u64 = 365 * 10;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct SummaryConfig {
     /// False makes the whole hook a no-op.
@@ -304,50 +307,90 @@ mod tests {
         }
     }
 
+    const README_SECTION_HEADING: &str = "## Summaries";
+    const SECTION_MARK: &str = "## ";
+
+    /// Every key of the section, read off the serialized default so a new field
+    /// cannot be left out of the check.
+    fn summary_keys() -> Vec<String> {
+        let value = serde_json::to_value(SummaryConfig::default()).unwrap();
+        value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// Whether `line` sets `key`, live or commented out.
+    fn assigns(line: &str, key: &str) -> bool {
+        line.trim_start()
+            .trim_start_matches('#')
+            .trim_start()
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    }
+
+    fn read_root(file: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(file);
+        std::fs::read_to_string(path).unwrap()
+    }
+
     #[test]
-    fn the_shipped_liam_toml_documents_every_key_and_carries_the_code_defaults() {
+    fn the_shipped_liam_toml_carries_the_code_defaults() {
         // Arrange
         let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../liam.toml"));
-        let text = std::fs::read_to_string(path).unwrap();
 
         // Act
         let config = Config::load(path).expect("shipped liam.toml must parse");
 
         // Assert
+        assert_eq!(config.summary, SummaryConfig::default());
+    }
+
+    #[test]
+    fn liam_toml_documents_every_summary_key() {
+        // Arrange
+        let text = read_root("liam.toml");
         let documented: Vec<&str> = text
             .lines()
             .skip_while(|line| !line.starts_with("[summary]"))
             .skip(1)
             .take_while(|line| !line.starts_with('['))
             .collect();
-        for key in [
-            "enabled",
-            "knn",
-            "min_similarity",
-            "time_window_hours",
-            "min_cluster_size",
-            "max_cluster_size",
-            "max_depth",
-            "recluster_change_ratio",
-            "recluster_interval_days",
-            "min_attach_similarity",
-            "max_unattached",
-            "max_summaries_per_run",
-            "run_deadline_secs",
-            "min_grounded_share",
-            "max_summary_failures",
-            "min_summary_similarity",
-            "dissolve_grace_runs",
-            "dissolve_overlap",
-            "max_basis_ids_rendered",
-        ] {
-            assert!(
-                documented
-                    .iter()
-                    .any(|line| line.trim_start_matches('#').trim_start().starts_with(key)),
-                "liam.toml must document summary.{key}"
-            );
-        }
-        assert_eq!(config.summary, SummaryConfig::default());
+
+        // Act
+        let missing: Vec<String> = summary_keys()
+            .into_iter()
+            .filter(|key| !documented.iter().any(|line| assigns(line, key)))
+            .collect();
+
+        // Assert
+        assert!(missing.is_empty(), "liam.toml must document {missing:?}");
+    }
+
+    #[test]
+    fn the_readme_summaries_section_documents_every_summary_key() {
+        // Arrange
+        let text = read_root("README.md");
+        let section: Vec<&str> = text
+            .lines()
+            .skip_while(|line| *line != README_SECTION_HEADING)
+            .skip(1)
+            .take_while(|line| !line.starts_with(SECTION_MARK))
+            .collect();
+        assert!(
+            !section.is_empty(),
+            "README.md needs a {README_SECTION_HEADING} section"
+        );
+
+        // Act
+        let missing: Vec<String> = summary_keys()
+            .into_iter()
+            .filter(|key| {
+                let row = format!("| `{key}` |");
+                !section.iter().any(|line| line.starts_with(&row))
+            })
+            .collect();
+
+        // Assert
+        assert!(missing.is_empty(), "README.md must document {missing:?}");
     }
 }
