@@ -12,7 +12,11 @@ mod migrate;
 #[allow(dead_code)]
 mod registry;
 #[allow(dead_code)]
+mod scan;
+#[allow(dead_code)]
 mod scrub;
+#[allow(dead_code)]
+mod target;
 #[cfg(test)]
 mod test_support;
 
