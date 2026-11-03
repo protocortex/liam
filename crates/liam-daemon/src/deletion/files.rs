@@ -31,14 +31,14 @@ const MANIFEST_ENTRY: &str = "manifest_tier_moved_lineages";
 const COOLDOWN_ENTRY: &str = "tier_history_cooldown";
 const ZERO_BLOCK: [u8; 8192] = [0; 8192];
 
-fn failed(store: &str, reason: impl std::fmt::Display) -> Error {
+pub(super) fn failed(store: &str, reason: impl std::fmt::Display) -> Error {
     Error::LineageStore {
         store: store.to_owned(),
         reason: reason.to_string(),
     }
 }
 
-fn residual(store: &str, kind: &str, id: impl Into<String>) -> Residual {
+pub(super) fn residual(store: &str, kind: &str, id: impl Into<String>) -> Residual {
     Residual {
         store: store.to_owned(),
         kind: kind.to_owned(),
@@ -46,7 +46,7 @@ fn residual(store: &str, kind: &str, id: impl Into<String>) -> Residual {
     }
 }
 
-fn hits(kind: &str, count: usize) -> LineageHits {
+pub(super) fn hits(kind: &str, count: usize) -> LineageHits {
     let mut found = LineageHits::default();
     if count > 0 {
         found.rows.insert(kind.to_owned(), count);

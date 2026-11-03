@@ -11,8 +11,12 @@ use liam_daemon::consolidation::manifest::manifest_path_for;
 use liam_daemon::consolidation::tier_history::history_path_for;
 use liam_store::{DefaultGraph, LineageHits, LineageStore, LineageTarget, PurgeReport, Residual};
 
+use super::batch_lineage::{BatchLineage, NoProviderDelete};
+use super::batch_store::{batch_store_path_for, BatchStore};
 use super::files::{BloomLineage, CacheStoreLineage, SnapshotLineage, StateFileLineage};
+use super::job::{job_file_path_for, JobStore};
 use super::memory::{InMemoryLineage, NodeState};
+use super::send_ledger::{send_ledger_path_for, SendLedger};
 use crate::extraction::cache::{cache_path, CacheStore};
 
 #[derive(Default)]
@@ -48,6 +52,17 @@ impl LineageRegistry {
             let cache = CacheStore::open(cache_file.clone())
                 .with_context(|| format!("could not open the cache {}", cache_file.display()))?;
             registry = registry.with(CacheStoreLineage::new(Arc::new(cache)));
+        }
+        let batches = BatchStore::new(batch_store_path_for(database_path));
+        let ledger = SendLedger::new(send_ledger_path_for(database_path));
+        // A database that never sent to a provider has neither file.
+        if batches.exists() || ledger.exists() {
+            registry = registry.with(BatchLineage::new(
+                batches,
+                ledger,
+                JobStore::new(job_file_path_for(database_path)),
+                Arc::new(NoProviderDelete),
+            ));
         }
         Ok(registry
             .with(SnapshotLineage::new(snapshot_dir.to_path_buf()))

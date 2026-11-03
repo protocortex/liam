@@ -2,6 +2,8 @@
 //! Deleting what a client asked to forget. The log holds sealed rows, so a
 //! delete destroys keys; this module holds the commands that act on them.
 
+mod batch_lineage;
+mod batch_store;
 mod command;
 #[cfg(test)]
 mod exit_criteria;
@@ -13,6 +15,7 @@ mod preview;
 mod registry;
 mod scan;
 mod scrub;
+mod send_ledger;
 mod service;
 mod target;
 #[cfg(test)]

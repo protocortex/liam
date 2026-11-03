@@ -22,6 +22,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::deletion::job::MILLIS_PER_DAY;
+use crate::deletion::send_ledger::{send_ledger_path_for, SendLedger, SendRow};
 use crate::deletion::test_support::{sealed_subjects, Subjects};
 use crate::log_startup::test_support::{database_in, log_dir_in};
 
@@ -1009,4 +1010,36 @@ async fn an_open_job_with_no_key_registry_cannot_be_resumed() {
 
     // Assert
     assert!(format!("{error:#}").contains("key registry"), "{error:#}");
+}
+
+#[tokio::test]
+async fn a_delete_notices_the_provider_copy_of_a_synchronous_send_and_then_drops_its_row() {
+    // Arrange
+    let env = Env::new().await;
+    let ledger = SendLedger::new(send_ledger_path_for(&env.database()));
+    let alice_events = env.subjects.target.event_ids.clone();
+    ledger
+        .append(&SendRow {
+            provider: "anthropic".to_owned(),
+            cache_key: "k-alice".to_owned(),
+            source_event_ids: alice_events,
+            sent_at: START,
+        })
+        .unwrap();
+    let service = env.service();
+
+    // Act
+    let outcome = delete_alice(&service).await.unwrap();
+
+    // Assert
+    let job = env.only_job();
+    assert_eq!(outcome, RunOutcome::Done);
+    assert_eq!(job.state, JobState::Done);
+    assert_eq!(job.notices.len(), 1, "{:?}", job.notices);
+    assert!(
+        job.notices[0].starts_with("anthropic "),
+        "{:?}",
+        job.notices
+    );
+    assert!(ledger.load().unwrap().is_empty());
 }

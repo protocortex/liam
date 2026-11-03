@@ -129,6 +129,9 @@ async fn finish(service: &DeleteService, id: &str, out: &mut impl Write) -> anyh
     match service.run(id).await {
         Ok(RunOutcome::Done) => {
             writeln!(out, "delete job {id} is done")?;
+            if let Some(job) = service.jobs()?.iter().find(|job| job.id == id) {
+                write_notices(job, out)?;
+            }
             Ok(())
         }
         Ok(RunOutcome::ScrubPending) => {
@@ -178,6 +181,14 @@ fn write_status(jobs: &[DeleteJob], now: i64, out: &mut impl Write) -> anyhow::R
         if let Some(failure) = &job.failure {
             writeln!(out, "  failed at {:?}: {}", failure.at, failure.reason)?;
         }
+        write_notices(job, out)?;
+    }
+    Ok(())
+}
+
+fn write_notices(job: &DeleteJob, out: &mut impl Write) -> anyhow::Result<()> {
+    for notice in &job.notices {
+        writeln!(out, "  notice: {notice}")?;
     }
     Ok(())
 }
