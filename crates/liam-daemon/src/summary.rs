@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Summaries of clusters of recorded nodes, built level by level into a tree.
 
+#[cfg(test)]
+mod exit_criteria;
 pub mod file_cache;
 pub mod generate;
 pub mod hooks;
