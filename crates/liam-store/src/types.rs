@@ -46,6 +46,19 @@ pub struct GraphConfig {
     /// private in-memory database, not a tuning knob a config value should
     /// ever be allowed to override.
     pub read_pool_size: usize,
+    /// Multiplier on the cold arm's share of a fused score (0..=1), so a cold
+    /// hit at the top of its list stays below a hot hit at the top of its own.
+    pub cold_arm_weight: f64,
+    /// The farthest a cold item may be from the query, as a share of the
+    /// signature's bits, and still be a candidate. It keeps an unrelated cold
+    /// item out of the fusion.
+    pub cold_max_hamming_ratio: f64,
+    /// How many times the arm's pool the signature index is asked for, because
+    /// the index knows nothing of kind, scope or time and some candidates fail
+    /// those filters.
+    pub cold_oversample: usize,
+    /// The most cold items the arm contributes to one query.
+    pub cold_probe_pool: usize,
 }
 
 impl GraphConfig {
@@ -55,7 +68,25 @@ impl GraphConfig {
             rrf_k: 60.0,
             expansion_weight: 0.5,
             read_pool_size: 4,
+            cold_arm_weight: 0.5,
+            cold_max_hamming_ratio: 0.35,
+            cold_oversample: 4,
+            cold_probe_pool: 24,
         }
+    }
+    /// Sets the cold arm's knobs together, since none means anything alone.
+    pub fn with_cold_arm(
+        mut self,
+        weight: f64,
+        max_hamming_ratio: f64,
+        oversample: usize,
+        pool: usize,
+    ) -> Self {
+        self.cold_arm_weight = weight;
+        self.cold_max_hamming_ratio = max_hamming_ratio;
+        self.cold_oversample = oversample;
+        self.cold_probe_pool = pool;
+        self
     }
     /// Sets the RRF constant. A negative value is clamped to zero and a
     /// non-finite one is ignored, so fused scores stay finite and comparable.
@@ -785,6 +816,8 @@ pub struct ExplainedHit {
     pub hit: Hit,
     pub lexical_rank: Option<usize>,
     pub vector_rank: Option<usize>,
+    /// Rank in the cold arm, which finds demoted items by their signature.
+    pub cold_rank: Option<usize>,
     pub rrf: f64,
     pub confidence: f64,
     pub decay: f64,
