@@ -1319,7 +1319,7 @@ impl MemoryServer {
     }
 
     #[tool(description = "List memory clusters found by community detection, largest first.")]
-    async fn clusters(&self, Parameters(args): Parameters<ClustersArgs>) -> String {
+    pub(crate) async fn clusters(&self, Parameters(args): Parameters<ClustersArgs>) -> String {
         if let Err(refusal) = require_strict("clusters", args.mode) {
             return refusal;
         }
@@ -1342,7 +1342,7 @@ impl MemoryServer {
     #[tool(
         description = "Show an entity's compiled page and the mentions behind it, most recent first."
     )]
-    async fn timeline(&self, Parameters(args): Parameters<TimelineArgs>) -> String {
+    pub(crate) async fn timeline(&self, Parameters(args): Parameters<TimelineArgs>) -> String {
         if let Err(refusal) = require_strict("timeline", args.mode) {
             return refusal;
         }
