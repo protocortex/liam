@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+#[cfg(test)]
+use serde::Serialize;
 
 /// A probe whose recall falls by this much fails the run.
 const DEFAULT_PROBE_RECALL_MARGIN: f64 = 0.02;
@@ -20,6 +22,7 @@ const MAX_PROBE_COUNT: usize = 1_000;
 const SNAPSHOT_DIR_SUFFIX: &str = ".snapshots";
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct ConsolidationConfig {
     /// Recall drop, in absolute terms, at which a probe fails the run.
@@ -236,5 +239,56 @@ mod tests {
             );
         }
         assert_eq!(config.consolidation, ConsolidationConfig::default());
+    }
+
+    /// Every key of the section, read off the serialized default so a new
+    /// field cannot be left out of the check.
+    fn consolidation_keys() -> Vec<String> {
+        let value = serde_json::to_value(ConsolidationConfig::default()).unwrap();
+        value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    fn missing_from_readme(text: &str) -> Vec<String> {
+        consolidation_keys()
+            .into_iter()
+            .map(|key| format!("consolidation.{key}"))
+            .filter(|name| {
+                let row = format!("| `{name}` |");
+                !text.lines().any(|line| line.starts_with(&row))
+            })
+            .collect()
+    }
+
+    fn read_readme() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md");
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn the_readme_documents_every_consolidation_key() {
+        // Arrange
+        let text = read_readme();
+
+        // Act
+        let missing = missing_from_readme(&text);
+
+        // Assert
+        assert!(missing.is_empty(), "README.md must document {missing:?}");
+    }
+
+    #[test]
+    fn a_readme_with_a_row_removed_fails_the_check() {
+        // Arrange
+        let text: String = read_readme()
+            .lines()
+            .filter(|line| !line.starts_with("| `consolidation.probe_count` |"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Act
+        let missing = missing_from_readme(&text);
+
+        // Assert
+        assert_eq!(missing, vec!["consolidation.probe_count".to_string()]);
     }
 }
