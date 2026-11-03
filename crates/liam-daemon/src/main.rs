@@ -10,6 +10,7 @@ mod ask;
 mod cli;
 mod clusters;
 mod consolidation_job;
+mod deletion;
 /// Grounding eval for `ask`; test-only, see the module docs to run it.
 #[cfg(test)]
 mod eval;
@@ -112,6 +113,10 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
     if mode == cli::Mode::Proxy {
         let socket_path = resolve_config_path("socket_path", &config.socket_path)?;
         return transport::proxy::run(&socket_path).await;
+    }
+
+    if mode == cli::Mode::EncryptLog {
+        return deletion::encrypt_log(&config).await;
     }
 
     serve_with_store(mode, config).await
@@ -264,6 +269,10 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         // proxy that serves its own stdio session.
         cli::Mode::Proxy => unreachable!(
             "proxy mode returns in run() before any store setup; \
+             reaching serve_with_store means that guard was removed"
+        ),
+        cli::Mode::EncryptLog => unreachable!(
+            "encrypt-log returns in run() before any store setup; \
              reaching serve_with_store means that guard was removed"
         ),
         cli::Mode::Stdio => serve_stdio(server, shutdown.token()).await,

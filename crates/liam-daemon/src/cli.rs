@@ -48,6 +48,9 @@ enum Command {
     Serve,
     /// Forward this process's stdio to a running daemon's socket.
     Proxy,
+    /// Seal the plaintext events of the log in place. Needs `[encryption]` and
+    /// a stopped daemon.
+    EncryptLog,
 }
 
 /// What this process should do. `Stdio` is the no-subcommand default, kept
@@ -62,6 +65,8 @@ pub enum Mode {
     /// A shuttle between this process's stdio and the daemon's socket.
     /// Opens no store and loads no model.
     Proxy,
+    /// Seals the plaintext events of the log in place, then exits.
+    EncryptLog,
 }
 
 impl Cli {
@@ -71,6 +76,7 @@ impl Cli {
             None => Mode::Stdio,
             Some(Command::Serve) => Mode::Serve,
             Some(Command::Proxy) => Mode::Proxy,
+            Some(Command::EncryptLog) => Mode::EncryptLog,
         }
     }
 
@@ -110,6 +116,11 @@ mod tests {
     #[test]
     fn proxy_selects_the_shuttle() {
         assert_eq!(parse(&["liamd", "proxy"]).mode(), Mode::Proxy);
+    }
+
+    #[test]
+    fn encrypt_log_selects_the_migration() {
+        assert_eq!(parse(&["liamd", "encrypt-log"]).mode(), Mode::EncryptLog);
     }
 
     #[test]

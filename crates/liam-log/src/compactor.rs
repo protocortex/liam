@@ -25,6 +25,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::ChunkReader;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
@@ -257,6 +258,14 @@ fn encode_parquet(batch: &RecordBatch, metadata: Vec<KeyValue>) -> Result<Vec<u8
     Ok(buffer)
 }
 
+/// The Parquet bytes of segment `sequence`, as `write_parquet` stores them.
+pub(crate) fn segment_parquet_bytes(
+    sequence: u64,
+    events: &[LogEvent],
+) -> Result<Vec<u8>, CompactError> {
+    encode_parquet(&events_to_batch(events)?, stamp(sequence, events.len()))
+}
+
 /// Writes the events of one segment as a single Parquet object, replacing any
 /// earlier object for the same sequence.
 ///
@@ -281,7 +290,16 @@ pub(crate) async fn read_parquet(
     sequence: u64,
 ) -> Result<Vec<LogEvent>, CompactError> {
     let bytes = store.get(&object_path(sequence)).await?.bytes().await?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+    decode_parquet(bytes, sequence)
+}
+
+/// The events of Parquet `bytes` written for segment `sequence`, refusing
+/// stamps that disagree with it.
+pub(crate) fn decode_parquet<R: ChunkReader + 'static>(
+    source: R,
+    sequence: u64,
+) -> Result<Vec<LogEvent>, CompactError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(source)?;
     let metadata = builder.schema().metadata().clone();
     ensure_supported_version(&metadata)?;
     ensure_stamp(&metadata, WAL_SEGMENT_SEQUENCE_KEY, sequence)?;

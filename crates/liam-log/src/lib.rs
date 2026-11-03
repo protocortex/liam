@@ -13,6 +13,7 @@ pub mod envelope;
 pub mod event;
 pub mod filter_file;
 pub mod hash;
+pub mod migrate;
 pub mod reader;
 pub mod wal;
 

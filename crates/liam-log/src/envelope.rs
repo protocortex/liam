@@ -8,7 +8,7 @@
 //! unreadable while the rest of the record, and the header, stay intact, which
 //! is how a delete reaches into an episode that holds several subjects.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::future;
@@ -522,6 +522,47 @@ impl<'a> Keys<'a> {
             self.material.insert(key_id.to_owned(), material);
         }
         Ok(&self.material[key_id])
+    }
+}
+
+/// The sources of the edges `payload` writes whose source is not a node of the
+/// same payload. Their key groups come from the hints.
+pub fn outside_edge_sources(payload: &LogPayload) -> HashSet<String> {
+    match payload {
+        LogPayload::EdgeWrite(edge) => HashSet::from([edge.src.clone()]),
+        LogPayload::EpisodeBatch(effects) => {
+            let inside: HashSet<&str> = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    RowEffect::Node(node) => Some(node.id.as_str()),
+                    RowEffect::Edge(_) => None,
+                })
+                .collect();
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    RowEffect::Edge(edge) if !inside.contains(edge.src.as_str()) => {
+                        Some(edge.src.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => HashSet::new(),
+    }
+}
+
+/// The lineage keys an access, feedback or tier payload names. Their key
+/// groups come from the hints.
+pub fn named_lineages(payload: &LogPayload) -> HashSet<String> {
+    match payload {
+        LogPayload::AccessBatch { entries, .. } => {
+            entries.iter().map(|row| row.lineage_key.clone()).collect()
+        }
+        LogPayload::Feedback { lineage_key, .. } | LogPayload::TierMove { lineage_key, .. } => {
+            HashSet::from([lineage_key.clone()])
+        }
+        _ => HashSet::new(),
     }
 }
 

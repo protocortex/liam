@@ -153,6 +153,26 @@ pub(in crate::graph) async fn assign_lineage(tx: &mut dyn BackendTx, node_id: &s
 const BACKFILL_CHUNK: usize = 200;
 
 impl<B: Backend> Graph<B> {
+    /// A node of every lineage, by lineage key, for the migration that seals an
+    /// old log and needs the key group each lineage-keyed entry belongs to.
+    pub async fn one_node_per_lineage(&self) -> Result<Vec<(LineageKey, NodeId)>> {
+        let rows = self
+            .backend
+            .query(
+                "SELECT lineage_key, MIN(node_id) FROM node_lineage GROUP BY lineage_key",
+                &[],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    LineageKey::from_raw(row.get_string(0)?),
+                    NodeId::from_raw(row.get_string(1)?),
+                ))
+            })
+            .collect()
+    }
+
     /// The lineage of `node_id`, `None` when there is no such node. A node with
     /// no stored key, which the backfill at open leaves none of, gets the key it
     /// would be written with if it replaced nothing.
