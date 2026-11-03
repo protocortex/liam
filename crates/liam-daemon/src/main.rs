@@ -17,6 +17,9 @@ mod eval;
 mod extraction;
 mod log_startup;
 mod mcp;
+// Collectors and the `metrics` tool use these in the changes that follow.
+#[allow(dead_code)]
+mod metrics;
 mod render;
 mod shutdown;
 mod summary;

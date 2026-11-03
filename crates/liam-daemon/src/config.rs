@@ -17,6 +17,7 @@ mod consolidation;
 mod deletion;
 mod encryption;
 mod extraction;
+mod metrics;
 mod summary;
 mod tiering;
 
@@ -30,6 +31,7 @@ pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
     MAX_RUN_DEADLINE_SECS,
 };
+pub use metrics::{MetricsConfig, SinkKind};
 pub use summary::{
     SummaryConfig, DEFAULT_MAX_BASIS_IDS_RENDERED, DEFAULT_MIN_SUMMARY_SIMILARITY,
     MAX_SUMMARY_DEPTH,
@@ -93,6 +95,8 @@ pub struct Config {
     pub admin: AdminConfig,
     /// Moving old closed log partitions to another directory. Off by default.
     pub archive: ArchiveConfig,
+    /// Metrics, their alert thresholds and where an alert is reported.
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -213,6 +217,7 @@ impl Default for Config {
             deletion: DeletionConfig::default(),
             admin: AdminConfig::default(),
             archive: ArchiveConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -436,6 +441,7 @@ impl Config {
         config.deletion.validate()?;
         config.admin.validate()?;
         config.archive.validate()?;
+        config.metrics.validate()?;
         Ok(config)
     }
 
