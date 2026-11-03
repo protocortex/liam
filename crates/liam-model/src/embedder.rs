@@ -59,17 +59,18 @@ impl Embedder for MockEmbedder {
     }
 }
 
-/// The query marker this project has always put on search queries for the
-/// Qwen3 embedder; documents are embedded as plain text. Whether it matches
-/// the model's documented query format is an open question.
+/// The task line of the Qwen3 query format, which the model card asks callers
+/// to write for their own retrieval task. Documents get no instruction.
 #[cfg(any(test, feature = "local"))]
-const QWEN3_QUERY_PREFIX: &str = "query: ";
+const QWEN3_QUERY_TASK: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
 
-/// The exact string handed to the Qwen3 model for `text` in its `kind` role.
+/// The exact string handed to the Qwen3 model for `text` in its `kind` role:
+/// `Instruct: <task>\nQuery:<query>` for a query, plain text for a document.
 #[cfg(any(test, feature = "local"))]
 fn qwen3_input(text: &str, kind: TextKind) -> String {
     match kind {
-        TextKind::Query => format!("{QWEN3_QUERY_PREFIX}{text}"),
+        TextKind::Query => format!("Instruct: {QWEN3_QUERY_TASK}\nQuery:{text}"),
         TextKind::Document => text.to_string(),
     }
 }
@@ -457,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_input_prefixes_a_query_with_the_query_marker() {
+    fn qwen3_input_wraps_a_query_in_the_instruct_format() {
         // Arrange
         let text = "where do I live";
 
@@ -465,7 +466,11 @@ mod tests {
         let input = qwen3_input(text, TextKind::Query);
 
         // Assert
-        assert_eq!(input, "query: where do I live");
+        assert_eq!(
+            input,
+            "Instruct: Given a web search query, retrieve relevant passages that answer \
+             the query\nQuery:where do I live"
+        );
     }
 
     #[test]

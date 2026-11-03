@@ -385,6 +385,7 @@ fn split_rows(
         | LogPayload::Tombstone(_)
         | LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
+        | LogPayload::Quarantined { .. }
         | LogPayload::RunRolledBack { .. }
         | LogPayload::DerivedArtifactClosed { .. }
         | LogPayload::Sealed(_)

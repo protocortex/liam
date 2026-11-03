@@ -146,6 +146,7 @@ pub fn content_hashes(event: &LogEvent) -> Vec<([u8; 32], String)> {
         LogPayload::Tombstone(_)
         | LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
+        | LogPayload::Quarantined { .. }
         | LogPayload::FactWrite { .. }
         | LogPayload::RunRolledBack { .. }
         | LogPayload::DerivedArtifact(_)

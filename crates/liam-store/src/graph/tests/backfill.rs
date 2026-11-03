@@ -232,8 +232,10 @@ async fn node_ids(g: &DefaultGraph) -> Vec<String> {
 // `stored_nodes` and `stored_edges` read the rows with their own column mapping
 // on purpose: they are what the backfill's events are compared with, so a
 // mix-up in `rebuild::stored_node` cannot hide by being on both sides.
+/// In the order a backfill walks the nodes, which is by rowid: ids are random
+/// within a millisecond, so ordering by id would not match it.
 async fn stored_nodes(g: &DefaultGraph) -> Vec<NodeRow> {
-    let sql = format!("SELECT {NODE_COLUMNS} FROM nodes ORDER BY id");
+    let sql = format!("SELECT {NODE_COLUMNS} FROM nodes ORDER BY rowid");
     let rows = g.backend.query(&sql, &[]).await.unwrap();
     rows.iter()
         .map(|row| NodeRow {

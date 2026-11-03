@@ -515,7 +515,8 @@ pub(crate) const DERIVED_TABLES: [(&str, Clear); 32] = [
     ("provenance_repair_state", Clear::Always),
     // Replayed pages come back as recorded, so the pass has to run again.
     ("derivation_backfill_state", Clear::Always),
-    // The operator's refusal reasons, which the log cannot recreate.
+    // The operator's refusal reasons. A replay restores those a `Quarantined`
+    // record carries, but not those an older build logged as a plain void.
     ("log_quarantine", Clear::OnAdoption),
     ("entity_mention_state", Clear::OnAdoption),
     // Failure counts for batches of the old log's events, which the new log lacks.

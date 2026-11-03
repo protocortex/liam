@@ -123,6 +123,7 @@ pub(super) fn steps_for(payload: &LogPayload) -> Vec<Step> {
         }],
         LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
+        | LogPayload::Quarantined { .. }
         | LogPayload::RunRolledBack { .. }
         // These payloads are applied as the event that carries them, because
         // their rows are keyed by its id; see `state_steps`.

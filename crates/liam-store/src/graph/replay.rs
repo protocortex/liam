@@ -2,7 +2,7 @@
 //! Replay of the event log into the projection: the records past the log
 //! cursor are applied once each, in log order.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -30,21 +30,23 @@ const QUARANTINE_SQL: &str = "INSERT INTO log_quarantine (event_id, segment, seg
      VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(event_id) DO NOTHING";
 
 /// What one `catch_up` did. The four record counts describe log records only:
-/// those that carry no rows to project (`Voided`, `DuplicateOf`) only move the
-/// cursor and are in no count, including the `Voided` records a quarantine
-/// appends, and a cancelled event is counted once, as voided.
+/// those that carry no rows to project (`Voided`, `Quarantined`, `DuplicateOf`)
+/// only move the cursor and are in no count, including the `Quarantined`
+/// records a quarantine appends, and a cancelled event is counted once, as
+/// voided or as quarantined.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CatchUpReport {
     /// Events whose rows were projected, tombstones included.
     pub applied: usize,
     /// Events whose rows the store already held.
     pub already_applied: usize,
-    /// Events a later `Voided` record cancelled. A void does not say why it
-    /// was written, so an event a quarantine voided before a snapshot was taken
-    /// is counted here after a restore and its `log_quarantine` row is not
-    /// recreated.
+    /// Events a later `Voided` record cancelled, or a rolled-back run did. An
+    /// event a quarantine cancelled before this build wrote `Quarantined`
+    /// records is counted here too, as its void carries no reason.
     pub skipped_voided: usize,
-    /// Events the projection refused, recorded in `log_quarantine`.
+    /// Events the projection refused, recorded in `log_quarantine`, whether it
+    /// refused them in this replay or a `Quarantined` record in the log says an
+    /// earlier one did.
     pub quarantined: usize,
     /// Replayed nodes from events written before derivations were logged that
     /// the replay marked inferred because they are entity pages.
@@ -146,13 +148,19 @@ impl<B: Backend> Graph<B> {
         while let Some(record) = records.next().await {
             let record = record?;
             let event_id = &record.event.event_id;
-            let outcome = if ahead.voided.contains(event_id)
-                || ahead.rolled_back.skips(&record.event)
-            {
+            let outcome = if let Some(quarantine) = ahead.quarantined.get(event_id) {
+                tracing::info!(
+                    event = %event_id,
+                    "replay: quarantined event skipped, restoring its log_quarantine row"
+                );
+                self.record_quarantine(held.log_id, &record, &quarantine.reason, quarantine.at)
+                    .await?;
+                Outcome::Quarantined
+            } else if ahead.voided.contains(event_id) || ahead.rolled_back.skips(&record.event) {
                 log_cursor::advance(&self.backend, held.log_id, record.offset).await?;
                 tracing::info!(
                     event = %event_id,
-                    "replay: voided or rolled-back event skipped; if a quarantine voided it, its log_quarantine row is not recreated, as the log keeps no reason"
+                    "replay: voided or rolled-back event skipped; a quarantine an older build wrote carries no reason, so its log_quarantine row is not recreated"
                 );
                 Outcome::Voided
             } else {
@@ -268,18 +276,26 @@ impl<B: Backend> Graph<B> {
         commit_or_abandon(tx, passed).await
     }
 
-    /// Appends a `Voided` for the refused event, so a rebuild from the log
-    /// skips it as this store does, then records the refusal and moves the
-    /// cursor onto the event in one transaction. Returns the void's offset.
+    /// Appends a `Quarantined` for the refused event, so a rebuild from the log
+    /// skips it as this store does and restores the reason, then records the
+    /// refusal and moves the cursor onto the event in one transaction. Returns
+    /// the record's offset.
     async fn quarantine_record(
         &self,
         held: &mut HeldLog,
         record: &LogRecord,
         reason: &str,
     ) -> Result<LogOffset> {
-        let LogRecord { offset, event, .. } = record;
-        let target_event_id = event.event_id.clone();
-        let void = follow_up(event, LogPayload::Voided { target_event_id });
+        let event = &record.event;
+        let at = self.clock.now().0;
+        let void = follow_up(
+            event,
+            LogPayload::Quarantined {
+                target_event_id: event.event_id.clone(),
+                reason: reason.to_owned(),
+                at,
+            },
+        );
         let void_offset = match held.append(void).await {
             Ok(void_offset) => void_offset,
             Err(error) => {
@@ -289,7 +305,21 @@ impl<B: Backend> Graph<B> {
             }
         };
         held.reconcile(&[]);
+        self.record_quarantine(held.log_id, record, reason, at)
+            .await?;
+        Ok(void_offset)
+    }
 
+    /// Writes the `log_quarantine` row for `record`'s event and moves the cursor
+    /// onto it in one transaction. A row already there is kept.
+    async fn record_quarantine(
+        &self,
+        log_id: Uuid,
+        record: &LogRecord,
+        reason: &str,
+        at: i64,
+    ) -> Result<()> {
+        let LogRecord { offset, event, .. } = record;
         let mut tx = self.backend.begin().await?;
         let (segment, index) = log_cursor::offset_to_values(*offset)?;
         let recorded = async {
@@ -298,14 +328,13 @@ impl<B: Backend> Graph<B> {
                 segment,
                 index,
                 reason.into(),
-                self.clock.now().0.into(),
+                at.into(),
             ];
             tx.execute(QUARANTINE_SQL, &params).await?;
-            log_cursor::advance_in_tx(&mut *tx, held.log_id, *offset).await
+            log_cursor::advance_in_tx(&mut *tx, log_id, *offset).await
         }
         .await;
-        commit_or_abandon(tx, recorded).await?;
-        Ok(void_offset)
+        commit_or_abandon(tx, recorded).await
     }
 }
 
@@ -354,8 +383,10 @@ async fn replay_projection(
 /// What a replay range holds besides the events to apply.
 #[derive(Default)]
 pub(super) struct Ahead {
-    /// The ids of the events a `Voided` record cancels.
+    /// The ids of the events a `Voided` or `Quarantined` record cancels.
     pub(super) voided: HashSet<String>,
+    /// Why the store refused the events a `Quarantined` record cancels.
+    pub(super) quarantined: HashMap<String, Quarantine>,
     /// The rows named by the tombstones that ran, so a voided one is left out.
     pub(super) removed: Removed,
     /// The runs a `RunRolledBack` record cancels.
@@ -385,6 +416,12 @@ fn without_dangling_edges(payload: LogPayload, shredded: &HashSet<String>) -> Lo
         }
         other => other,
     }
+}
+
+/// A refusal a `Quarantined` record carries.
+pub(super) struct Quarantine {
+    reason: String,
+    at: i64,
 }
 
 /// Rows named by a tombstone. Ids are never reused, so once the tombstone has
@@ -422,6 +459,7 @@ impl Removed {
 
 pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
     let mut voided = HashSet::new();
+    let mut quarantined = HashMap::new();
     let mut tombstones = Vec::new();
     let mut markers = Vec::new();
     let mut fact_writes = Vec::new();
@@ -440,6 +478,14 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
         match event.payload {
             LogPayload::Voided { target_event_id } => {
                 voided.insert(target_event_id);
+            }
+            LogPayload::Quarantined {
+                target_event_id,
+                reason,
+                at,
+            } => {
+                voided.insert(target_event_id.clone());
+                quarantined.insert(target_event_id, Quarantine { reason, at });
             }
             LogPayload::Tombstone(targets) => tombstones.push((event.event_id, targets)),
             LogPayload::RunRolledBack { run_id } => markers.push((event.event_id, run_id)),
@@ -460,6 +506,7 @@ pub(super) async fn scan_ahead(mut records: LogStream) -> Result<Ahead> {
     let rolled_back = RolledBack::new(runs, &fact_writes, &voided);
     Ok(Ahead {
         voided,
+        quarantined,
         removed,
         rolled_back,
         shredded_nodes,
@@ -521,6 +568,7 @@ pub(super) fn row_effects(payload: LogPayload) -> Vec<RowEffect> {
         LogPayload::Tombstone(_)
         | LogPayload::DuplicateOf { .. }
         | LogPayload::Voided { .. }
+        | LogPayload::Quarantined { .. }
         | LogPayload::FactWrite { .. }
         | LogPayload::RunRolledBack { .. }
         | LogPayload::DerivedArtifact(_)
