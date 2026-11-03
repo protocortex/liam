@@ -183,11 +183,13 @@ fn collect_files(dir: &Path, found: &mut Vec<PathBuf>) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     for entry in entries {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_files(&path, found)?;
-        } else {
-            found.push(path);
+        let entry = entry?;
+        // A link is never followed: its target may lie outside the directory.
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            collect_files(&entry.path(), found)?;
+        } else if kind.is_file() {
+            found.push(entry.path());
         }
     }
     Ok(())
@@ -214,7 +216,7 @@ fn remove_empty_dirs(dir: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             remove_empty_dirs(&path);
             // Fails while the directory still holds a file, which is the point.
             let _ = fs::remove_dir(&path);
@@ -481,6 +483,28 @@ mod tests {
                 "run-2/snapshot.db"
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn a_link_out_of_the_snapshot_directory_is_not_followed() {
+        // Arrange
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("keep.txt"), b"keep").unwrap();
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("keep.txt"),
+            dir.path().join("file-link"),
+        )
+        .unwrap();
+        let store = SnapshotLineage::new(dir.path().to_path_buf());
+
+        // Act
+        let report = store.purge(&target(&[], &[])).await.unwrap();
+
+        // Assert
+        assert_eq!(report.removed, 0);
+        assert_eq!(fs::read(outside.path().join("keep.txt")).unwrap(), b"keep");
     }
 
     #[tokio::test]
