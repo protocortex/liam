@@ -328,4 +328,132 @@ mod tests {
             assert!(result.is_ok(), "{line}: {result:?}");
         }
     }
+
+    const README_SECTION_HEADING: &str = "## Tiering";
+    const SECTION_MARK: &str = "## ";
+
+    /// Every key of the section, read off the serialized default so a new field
+    /// cannot be left out of the check.
+    fn tiering_keys() -> Vec<String> {
+        let value = serde_json::to_value(TieringConfig::default()).unwrap();
+        value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// Whether `line` sets `key`, live or commented out.
+    fn assigns(line: &str, key: &str) -> bool {
+        line.trim_start()
+            .trim_start_matches('#')
+            .trim_start()
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    }
+
+    fn read_root(file: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(file);
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// The lines of the `[tiering]` table of a `liam.toml`.
+    fn toml_section(text: &str) -> Vec<&str> {
+        text.lines()
+            .skip_while(|line| !line.starts_with("[tiering]"))
+            .skip(1)
+            .take_while(|line| !line.starts_with('['))
+            .collect()
+    }
+
+    /// The lines between the README's tiering heading and the next heading of
+    /// the same level.
+    fn readme_section(text: &str) -> Vec<&str> {
+        text.lines()
+            .skip_while(|line| *line != README_SECTION_HEADING)
+            .skip(1)
+            .take_while(|line| !line.starts_with(SECTION_MARK))
+            .collect()
+    }
+
+    fn missing_from_toml(section: &[&str]) -> Vec<String> {
+        tiering_keys()
+            .into_iter()
+            .filter(|key| !section.iter().any(|line| assigns(line, key)))
+            .collect()
+    }
+
+    fn missing_from_readme(section: &[&str]) -> Vec<String> {
+        tiering_keys()
+            .into_iter()
+            .filter(|key| {
+                let row = format!("| `{key}` |");
+                !section.iter().any(|line| line.starts_with(&row))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_shipped_liam_toml_carries_the_code_defaults() {
+        // Arrange
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../liam.toml"));
+
+        // Act
+        let config = Config::load(path).expect("shipped liam.toml must parse");
+
+        // Assert
+        assert_eq!(config.tiering, TieringConfig::default());
+    }
+
+    #[test]
+    fn liam_toml_documents_every_tiering_key() {
+        // Arrange
+        let text = read_root("liam.toml");
+
+        // Act
+        let missing = missing_from_toml(&toml_section(&text));
+
+        // Assert
+        assert!(missing.is_empty(), "liam.toml must document {missing:?}");
+    }
+
+    #[test]
+    fn the_readme_tiering_section_documents_every_tiering_key() {
+        // Arrange
+        let text = read_root("README.md");
+        let section = readme_section(&text);
+        assert!(
+            !section.is_empty(),
+            "README.md needs a {README_SECTION_HEADING} section"
+        );
+
+        // Act
+        let missing = missing_from_readme(&section);
+
+        // Assert
+        assert!(missing.is_empty(), "README.md must document {missing:?}");
+    }
+
+    #[test]
+    fn a_section_with_a_key_removed_fails_the_check() {
+        // Arrange
+        let toml = read_root("liam.toml");
+        let readme = read_root("README.md");
+        let toml_lines: Vec<&str> = toml_section(&toml)
+            .into_iter()
+            .filter(|line| !assigns(line, "cooldown_runs"))
+            .collect();
+        let readme_lines: Vec<&str> = readme_section(&readme)
+            .into_iter()
+            .filter(|line| !line.starts_with("| `cooldown_runs` |"))
+            .collect();
+
+        // Act
+        let (from_toml, from_readme) = (
+            missing_from_toml(&toml_lines),
+            missing_from_readme(&readme_lines),
+        );
+
+        // Assert
+        assert_eq!(from_toml, vec!["cooldown_runs".to_string()]);
+        assert_eq!(from_readme, vec!["cooldown_runs".to_string()]);
+    }
 }
