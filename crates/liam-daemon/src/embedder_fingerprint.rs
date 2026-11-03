@@ -24,8 +24,10 @@ use crate::config::Config;
 /// Version of the convention that turns text into model input (prefixes and
 /// the like). Bump it whenever that convention changes for a model, since the
 /// model and dimensions stay the same while old and new vectors diverge.
-/// Scheme 1: only queries get the model's query prefix, stored text does not.
-pub const PROMPT_SCHEME: u32 = 1;
+/// Scheme 1: Qwen3 queries got a `query: ` prefix, stored text nothing.
+/// Scheme 2: Qwen3 queries use the model's `Instruct: <task>\nQuery:<query>`
+/// format, stored text nothing.
+pub const PROMPT_SCHEME: u32 = 2;
 
 /// The scheme every store written before fingerprints existed was embedded
 /// under. It stays 0 however far `PROMPT_SCHEME` moves.
@@ -361,6 +363,24 @@ mod tests {
 
         // Assert
         assert_eq!(answers, [false, true, false]);
+    }
+
+    #[test]
+    fn a_store_recorded_under_the_query_prefix_scheme_is_refused_by_this_build() {
+        // Arrange: a store whose queries were embedded with the `query: ` prefix
+        let dir = tempfile::tempdir().unwrap();
+        let database = existing_database(dir.path());
+        let prefix_scheme = fingerprint("model-a", 768, 1);
+        record(&database, &prefix_scheme).unwrap();
+
+        // Act
+        let error = verify(&database, &fingerprint("model-a", 768, PROMPT_SCHEME))
+            .expect_err("scheme 1 vectors must be rebuilt under the current scheme")
+            .to_string();
+
+        // Assert
+        assert!(error.contains("prompt scheme 1"), "{error}");
+        assert!(error.contains("liam rebuild"), "{error}");
     }
 
     #[test]
