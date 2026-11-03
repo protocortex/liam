@@ -13,6 +13,7 @@ use liam_daemon::consolidation::hooks::{
     ConsolidationHookSet, ExtractionHook, SummaryHook, TierHook,
 };
 use liam_daemon::consolidation::manifest::{RunManifest, RunOutcome};
+use liam_daemon::consolidation::probes::{Probe, ProbeError, ProbeReport};
 use liam_daemon::consolidation::run::{
     Consolidator, Maintenance, Parts, ProbeRunner, StoreProbes, StoreReopener,
 };
@@ -31,6 +32,8 @@ use liam_log::crypto::KeyRegistry;
 use crate::extraction::setup::{self as extraction_setup, sweep_stale_sidecar, DaemonFiles};
 use crate::extraction::sidecar::SystemRam;
 use crate::mcp::MemoryServer;
+use crate::metrics::recorder::Metrics;
+use crate::metrics::sources::RunSources;
 use crate::shutdown::Shutdown;
 use crate::summary::file_cache::{summary_cache_path, FileSummaryCache};
 use crate::summary::hooks::SummaryHooks;
@@ -77,6 +80,8 @@ pub struct JobSetup<'a> {
     pub embedder: Arc<dyn Embedder>,
     pub server: &'a MemoryServer,
     pub shutdown: &'a Shutdown,
+    /// Where the run reports its measurements, when metrics are on.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// The hook parts a run calls: extraction, summaries and tiering, each when the config
@@ -102,6 +107,7 @@ fn tiering_hook(setup: &JobSetup<'_>) -> Option<Arc<dyn TierHook>> {
             permits: setup.server.generation_permits_handle(),
             free_ram: Arc::new(SystemRam),
             clock: Arc::new(SystemClock),
+            metrics: setup.metrics.clone(),
         }) as Arc<dyn TierHook>
     })
 }
@@ -194,6 +200,28 @@ pub struct ConsolidationJob {
     shutdown: Shutdown,
     skip_resynthesis_once: Arc<AtomicBool>,
     autotuning: bool,
+    metrics: Option<RunMetrics>,
+}
+
+/// Where a run reports to, and what it reads at its end.
+struct RunMetrics {
+    metrics: Arc<Metrics>,
+    sources: RunSources,
+}
+
+/// Scores probes with `inner` and reports each score to the metrics.
+struct MeteredProbes {
+    inner: Arc<dyn ProbeRunner>,
+    metrics: Arc<Metrics>,
+}
+
+#[async_trait]
+impl ProbeRunner for MeteredProbes {
+    async fn run(&self, store: &DefaultGraph, probes: &[Probe]) -> Result<ProbeReport, ProbeError> {
+        let report = self.inner.run(store, probes).await?;
+        self.metrics.probe_report(&report);
+        Ok(report)
+    }
 }
 
 impl ConsolidationJob {
@@ -223,6 +251,7 @@ impl ConsolidationJob {
             embedder,
             server,
             shutdown,
+            metrics,
         } = setup;
         let skip_resynthesis_once = Arc::new(AtomicBool::new(false));
         let maintenance = DaemonMaintenance {
@@ -240,6 +269,26 @@ impl ConsolidationJob {
                 embedder: embedder.clone(),
             })
         });
+        let extraction = hooks.extraction.clone();
+        let probes: Arc<dyn ProbeRunner> = match &metrics {
+            Some(metrics) => Arc::new(MeteredProbes {
+                inner: probes,
+                metrics: Arc::clone(metrics),
+            }),
+            None => probes,
+        };
+        let archive = ArchiveRun::from_config(config, database_path, log_dir);
+        let metrics = metrics.map(|metrics| RunMetrics {
+            sources: RunSources::new(
+                server.shared_store(),
+                database_path.to_path_buf(),
+                log_dir.to_path_buf(),
+                archive.as_ref().map(|run| run.dir.clone()),
+                extraction,
+                Arc::new(SystemClock),
+            ),
+            metrics,
+        });
         let parts = Parts {
             embedder: Arc::new(StoreEmbedder(embedder.clone())),
             hooks,
@@ -255,12 +304,13 @@ impl ConsolidationJob {
         );
         Ok(Self {
             running: tokio::sync::Mutex::new(()),
-            archive: ArchiveRun::from_config(config, database_path, log_dir),
+            archive,
             consolidator,
             store: server.shared_store(),
             shutdown: shutdown.clone(),
             skip_resynthesis_once,
             autotuning: config.llm.max_concurrent_generations == 0,
+            metrics,
         })
     }
 
@@ -382,9 +432,18 @@ impl ConsolidationJob {
     }
 
     async fn consolidate(&self) -> anyhow::Result<RunManifest> {
+        let started = std::time::Instant::now();
         let run = self.consolidator.consolidate(&self.store).await;
         match &run {
-            Ok(run) => report(&run.run_id, run.outcome),
+            Ok(run) => {
+                report(&run.run_id, run.outcome);
+                if let Some(run_metrics) = &self.metrics {
+                    run_metrics
+                        .metrics
+                        .run_finished(run.outcome, started.elapsed());
+                    run_metrics.sources.record(&run_metrics.metrics).await;
+                }
+            }
             Err(error) => {
                 tracing::error!(error = %format!("{error:#}"), "the consolidation run did not finish");
                 // A rollback that could not reopen the store leaves nothing to serve.

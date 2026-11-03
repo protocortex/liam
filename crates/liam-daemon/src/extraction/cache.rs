@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use liam_daemon::consolidation::hooks::CacheLookups;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -128,17 +129,6 @@ pub struct CacheStore {
     misses: AtomicU64,
 }
 
-/// How many lookups the cache answered and how many it could not.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the metrics collection once it is wired")
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
-}
-
 impl CacheStore {
     /// Loads the file at `path`, or starts empty when there is none.
     pub fn open(path: PathBuf) -> io::Result<Self> {
@@ -183,12 +173,8 @@ impl CacheStore {
     }
 
     /// The lookups answered and missed since the cache opened.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the metrics collection once it is wired")
-    )]
-    pub fn stats(&self) -> CacheStats {
-        CacheStats {
+    pub fn stats(&self) -> CacheLookups {
+        CacheLookups {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
         }
@@ -638,7 +624,7 @@ mod tests {
         store.get("absent");
 
         // Assert
-        assert_eq!(store.stats(), CacheStats { hits: 2, misses: 1 });
+        assert_eq!(store.stats(), CacheLookups { hits: 2, misses: 1 });
     }
 
     #[test]

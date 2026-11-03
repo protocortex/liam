@@ -67,11 +67,16 @@ impl LatencyWindow {
         sorted.get(rank.max(1) - 1).copied()
     }
 
-    /// The p50 and p95 samples, none for an empty window.
-    pub fn samples(&self, metrics: [MetricId; 2], at: Millis) -> Vec<Sample> {
+    /// The p50 and p95 samples under `labels`, none for an empty window.
+    pub fn samples(&self, metrics: [MetricId; 2], labels: Labels, at: Millis) -> Vec<Sample> {
         [(metrics[0], P50), (metrics[1], P95)]
             .into_iter()
-            .filter_map(|(metric, percent)| Some(sample(metric, self.percentile(percent)?, at)))
+            .filter_map(|(metric, percent)| {
+                Some(Sample {
+                    labels,
+                    ..sample(metric, self.percentile(percent)?, at)
+                })
+            })
             .collect()
     }
 }
@@ -103,9 +108,9 @@ pub fn ece(pairs: &[(f64, bool)], min_pairs: usize, at: Millis) -> Option<Sample
     Some(sample(MetricId::Ece, error, at))
 }
 
-/// Events the log holds that an extractor has not read yet.
-pub fn extraction_backlog(metric: MetricId, log_events: u64, read: u64, at: Millis) -> Sample {
-    sample(metric, log_events.saturating_sub(read) as f64, at)
+/// Events the log holds past an extractor's cursor.
+pub fn extraction_backlog(metric: MetricId, unread: u64, at: Millis) -> Sample {
+    sample(metric, unread as f64, at)
 }
 
 /// How many delete jobs are open and how old the oldest is. A failed job is

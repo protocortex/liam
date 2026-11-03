@@ -239,6 +239,14 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         ),
         None => server,
     };
+    let metrics = config
+        .metrics
+        .enabled
+        .then(|| metrics::build(&config.metrics));
+    let server = match &metrics {
+        Some(metrics) => server.with_metrics(metrics.clone()),
+        None => server,
+    };
     let server = server
         .with_shutdown(shutdown.token())
         .with_vocabulary(config::resolve_vocabulary(&config.extraction))
@@ -253,6 +261,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         embedder: job_embedder,
         server: &server,
         shutdown: &shutdown,
+        metrics: metrics.clone(),
     })?);
     let run_now = job
         .start(config.gc.run_on_start)

@@ -19,8 +19,9 @@ use tracing::info;
 use super::apply::{apply_moves, ApplyDeps, TierReport as AppliedMoves};
 use super::caps::apply_caps;
 use super::planner::{plan, ExemptSet, PinnedSet, RollbackState};
-use super::utility::TierParams;
+use super::utility::{utility, TierParams};
 use crate::extraction::sidecar::FreeRam;
+use crate::metrics::recorder::Metrics;
 
 pub struct TierHooks {
     pub config: TieringConfig,
@@ -33,6 +34,7 @@ pub struct TierHooks {
     pub permits: Arc<Semaphore>,
     pub free_ram: Arc<dyn FreeRam + Send + Sync>,
     pub clock: Arc<dyn Clock>,
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 #[async_trait]
@@ -53,6 +55,7 @@ impl TierHook for TierHooks {
         let params = TierParams::new(&self.config, &self.extraction)
             .with_unknown_producer(&self.unknown_producer);
         apply_caps(&mut snapshot, &params);
+        let calibration = calibration_pairs(&snapshot.items, &params, now);
         let tier_plan = plan(
             &snapshot,
             &params,
@@ -81,6 +84,9 @@ impl TierHook for TierHooks {
 
         info!(run_id = %ctx.run_id, "tier step: pruning");
         prune(store, now, self.config.window_days).await?;
+        if let Some(metrics) = &self.metrics {
+            metrics.tier_report(&applied, &calibration);
+        }
         Ok(report_of(applied))
     }
 }
@@ -132,6 +138,23 @@ async fn prune(
         .await?;
     store.prune_tier_state().await?;
     Ok(())
+}
+
+/// Each verdict of each item paired with the utility the item scored.
+fn calibration_pairs(
+    items: &[liam_store::ItemView],
+    params: &TierParams,
+    now: liam_store::Millis,
+) -> Vec<(f64, bool)> {
+    items
+        .iter()
+        .flat_map(|item| {
+            let score = utility(item, params, now).value;
+            item.feedback
+                .iter()
+                .map(move |verdict| (score, verdict.correct))
+        })
+        .collect()
 }
 
 fn report_of(applied: AppliedMoves) -> TierReport {

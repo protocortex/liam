@@ -76,6 +76,7 @@ fn tier_hooks(clock: &Arc<FixedClock>) -> ConsolidationHookSet {
             permits: Arc::new(Semaphore::new(1)),
             free_ram: Arc::new(SystemRam),
             clock: clock.clone(),
+            metrics: None,
         })),
         ..Default::default()
     }
@@ -188,6 +189,7 @@ async fn with_tiering_off_the_tier_step_is_skipped() {
         embedder: embedder(),
         server: &server,
         shutdown: &harness.shutdown,
+        metrics: None,
     })
     .unwrap();
 

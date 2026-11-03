@@ -51,7 +51,7 @@ fn the_nearest_rank_percentiles_of_ten_timings_are_the_fifth_and_the_tenth() {
     let window = window_of((1..=10).rev());
 
     // Act
-    let samples = window.samples(P_METRICS, AT);
+    let samples = window.samples(P_METRICS, Labels::None, AT);
 
     // Assert
     assert_eq!(value_of(&samples, MetricId::AskLatencyP50Ms), Some(5.0));
@@ -64,7 +64,7 @@ fn an_empty_window_reports_no_value() {
     let window = LatencyWindow::new(50);
 
     // Act
-    let samples = window.samples(P_METRICS, AT);
+    let samples = window.samples(P_METRICS, Labels::None, AT);
 
     // Assert
     assert!(samples.is_empty());
@@ -76,7 +76,7 @@ fn one_timing_is_every_percentile_so_the_alert_rule_must_wait_for_more() {
     let window = window_of([7]);
 
     // Act
-    let samples = window.samples(P_METRICS, AT);
+    let samples = window.samples(P_METRICS, Labels::None, AT);
 
     // Assert
     assert_eq!(value_of(&samples, MetricId::AskLatencyP50Ms), Some(7.0));
@@ -120,22 +120,15 @@ fn ece_waits_for_enough_pairs() {
 }
 
 #[test]
-fn the_backlog_is_the_events_after_the_cursor() {
+fn the_backlog_sample_carries_the_unread_count_under_its_own_metric() {
     // Act
-    let first = extraction_backlog(MetricId::RulesExtractionBacklog, 12, 5, AT);
-    let second = extraction_backlog(MetricId::ModelExtractionBacklog, 12, 9, AT);
+    let sample = extraction_backlog(MetricId::ModelExtractionBacklog, 7, AT);
 
     // Assert
-    assert_eq!((first.value, second.value), (7.0, 3.0));
-}
-
-#[test]
-fn a_cursor_past_the_head_is_no_backlog() {
-    // Act
-    let sample = extraction_backlog(MetricId::RulesExtractionBacklog, 3, 9, AT);
-
-    // Assert
-    assert_eq!(sample.value, 0.0);
+    assert_eq!(
+        (sample.metric, sample.value),
+        (MetricId::ModelExtractionBacklog, 7.0)
+    );
 }
 
 #[test]
