@@ -4,8 +4,6 @@
 //! redirects and inside its limits are tested without a socket.
 
 pub mod anthropic;
-// Only cancel is used so far; the extraction loop takes submit, poll and collect.
-#[allow(dead_code)]
 pub mod batch;
 pub mod canceller;
 pub mod client;

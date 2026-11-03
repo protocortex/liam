@@ -15,7 +15,6 @@ mod deletion;
 #[cfg(test)]
 mod eval;
 mod extraction;
-// Nothing calls the hosted client until the adapters land.
 #[cfg(feature = "hosted")]
 mod hosted;
 mod log_startup;
