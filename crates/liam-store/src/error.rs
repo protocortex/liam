@@ -15,6 +15,15 @@ pub enum Error {
     #[error("embedding dimension mismatch: expected {expected}, got {got}")]
     Dimension { expected: usize, got: usize },
 
+    /// An embedding has a component that is NaN or infinite, so it has no
+    /// signature to keep.
+    #[error("embedding component {index} is not a finite number")]
+    NonFiniteEmbedding { index: usize },
+
+    /// A binary signature has a different width than the one it is compared to.
+    #[error("signature width mismatch: expected {expected} words, got {got}")]
+    SignatureWidth { expected: usize, got: usize },
+
     #[error("node not found: {0}")]
     NodeNotFound(String),
 

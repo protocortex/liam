@@ -83,6 +83,8 @@ impl Table {
                 concat!("DELETE FROM edges WHERE ", edges_of_node!()),
                 "DELETE FROM node_community WHERE node_id = ?1",
                 "DELETE FROM node_events WHERE node_id = ?1",
+                "DELETE FROM node_quant WHERE node_id = ?1",
+                "DELETE FROM node_lineage WHERE node_id = ?1",
                 "DELETE FROM nodes WHERE id = ?1",
             ],
             Table::Edges => &["DELETE FROM edges WHERE id = ?1"],
@@ -136,6 +138,12 @@ impl Plan {
             steps,
             dedup: None,
         }
+    }
+
+    /// Adds statements that belong to the write but not to its log record.
+    pub(super) fn with_steps(mut self, extra: impl IntoIterator<Item = Step>) -> Self {
+        self.steps.extend(extra);
+        self
     }
 
     fn deduplicated(mut self, table: Table, refusal_if_absent: Option<Error>) -> Self {
@@ -500,10 +508,11 @@ impl<B: Backend> Graph<B> {
     /// Projects one node. The vector write stays with the caller because it
     /// takes the write lock the transaction holds.
     pub(super) async fn project_insert(&self, id: &NodeId, node: &NewNode) -> Result<NodeId> {
+        let quant = self.quant_step(id, node.embedding.as_deref())?;
         let outcome = self
             .project(|_, now| {
                 let row = resolve_node_row(id, node, now);
-                ready(row.map(|row| Plan::node_write(row, now)))
+                ready(row.map(|row| Plan::node_write(row, now).with_steps(quant)))
             })
             .await?;
         Ok(outcome.node_id(id))
@@ -515,10 +524,14 @@ impl<B: Backend> Graph<B> {
         collision: Collision,
     ) -> Result<NodeId> {
         let id = NodeId::new();
+        let quant = self.quant_step(&id, node.embedding.as_deref())?;
         let outcome = self
             .project(|tx, now| {
                 let row = resolve_node_row(&id, node, now);
-                Box::pin(async move { plan_upsert(tx, row?, collision, now).await })
+                Box::pin(async move {
+                    let plan = plan_upsert(tx, row?, collision, now).await?;
+                    Ok(plan.with_steps(quant))
+                })
             })
             .await?;
         Ok(outcome.node_id(&id))
@@ -526,11 +539,15 @@ impl<B: Backend> Graph<B> {
 
     pub(super) async fn project_supersede(&self, old: &NodeId, node: &NewNode) -> Result<NodeId> {
         let id = NodeId::new();
+        let quant = self.quant_step(&id, node.embedding.as_deref())?;
         let outcome = self
             .project(|tx, now| {
                 let row = resolve_node_row(&id, node, now);
                 let old = old.clone();
-                Box::pin(async move { plan_supersede(tx, row?, &old, now).await })
+                Box::pin(async move {
+                    let plan = plan_supersede(tx, row?, &old, now).await?;
+                    Ok(plan.with_steps(quant))
+                })
             })
             .await?;
         Ok(outcome.node_id(&id))
@@ -590,13 +607,33 @@ impl<B: Backend> Graph<B> {
             return Ok(Vec::new());
         }
         let edge_ids: Vec<EdgeId> = edges.iter().map(|_| EdgeId::new()).collect();
+        let quants = self.episode_quant_steps(ids, nodes);
         self.project(|tx, now| {
             let staged = episode_nodes(ids, nodes, now);
             let rows = episode_edge_rows(edges, &edge_ids, ids, now);
-            Box::pin(async move { plan_episode(tx, staged?, rows?, now).await })
+            Box::pin(async move {
+                let plan = plan_episode(tx, staged?, rows?, now).await?;
+                Ok(plan.with_steps(quants))
+            })
         })
         .await?;
         Ok(edge_ids)
+    }
+
+    /// The signature statements of an episode's embedded nodes. A node whose
+    /// embedding cannot be used is written without one, as its vector is: the
+    /// episode's rows are the call's result and a bad vector is only logged.
+    fn episode_quant_steps(&self, ids: &[NodeId], nodes: &[NewNode]) -> Vec<Step> {
+        ids.iter()
+            .zip(nodes)
+            .filter_map(|(id, node)| {
+                self.quant_step(id, node.embedding.as_deref())
+                    .unwrap_or_else(|error| {
+                        tracing::error!(?id, %error, "episode node written without a signature");
+                        None
+                    })
+            })
+            .collect()
     }
 
     /// A logged store keeps the `supersedes` relation for its own version

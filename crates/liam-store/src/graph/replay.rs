@@ -105,6 +105,11 @@ impl<B: Backend> Graph<B> {
     /// Adds the re-embed pass to a replay's report. The replay has already
     /// committed, so a failed listing must not hide its report.
     pub(super) async fn reembedded(&self, mut report: CatchUpReport) -> CatchUpReport {
+        // A replay closes and removes nodes without going through the writes
+        // that keep the signature index current.
+        if let Err(error) = self.reload_quant_index().await {
+            tracing::error!(%error, "signature index not reloaded after the replay");
+        }
         match self.reembed_missing().await {
             Ok(reembedded) => report.reembedded = reembedded,
             Err(error) => {
@@ -492,6 +497,8 @@ fn written_rows(steps: &[Step]) -> Vec<WrittenRow<'_>> {
             Step::Close { .. }
             | Step::NodeEvent { .. }
             | Step::Remove(_)
+            | Step::Lineage { .. }
+            | Step::Quant { .. }
             | Step::Fact(_)
             | Step::SummaryClose { .. }
             | Step::SummaryEmbedding { .. } => None,

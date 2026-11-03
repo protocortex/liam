@@ -29,6 +29,9 @@ pub use self::snapshot::{
     recover_interrupted_restore, verify_snapshot, Snapshot, SnapshotLog, SnapshotMeta,
 };
 pub use self::summaries::child_hash;
+pub use self::tiers::{
+    dequantize, hamming, quantize, IndexedEntry, QuantIndex, Quantized, BITS_PER_WORD,
+};
 use crate::backend::Backend;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{Error, Result};
@@ -62,6 +65,7 @@ mod run_marker;
 mod snapshot;
 mod summaries;
 mod swept_by;
+mod tiers;
 
 /// How many candidates an ambiguous handle reports back. Bounded so a
 /// one-character handle answers with something a caller can act on instead of
@@ -615,6 +619,11 @@ pub struct Graph<B: Backend> {
     expansion_weight: f64,
     log: Option<SharedLog>,
     embedder: Option<Arc<dyn ContentEmbedder>>,
+    /// The binary signature of every live node that has one.
+    quant: QuantIndex,
+    /// Orders each update of `quant` after the commit it reports, and a reload
+    /// of it after the tables it reads.
+    quant_gate: tiers::IndexGate,
 }
 
 impl<B: Backend> Graph<B> {
@@ -665,7 +674,7 @@ impl<B: Backend> Graph<B> {
         // trim-then-compare rules. Logs (does not rewrite) anything still
         // invalid after the trim.
         crate::migrate::normalize_scope_column(&backend).await?;
-        Ok(Self {
+        let graph = Self {
             backend,
             clock,
             dims: config.embedding_dims,
@@ -673,7 +682,11 @@ impl<B: Backend> Graph<B> {
             expansion_weight: config.expansion_weight,
             log: None,
             embedder: None,
-        })
+            quant: QuantIndex::default(),
+            quant_gate: tiers::IndexGate::default(),
+        };
+        graph.reload_quant_index().await?;
+        Ok(graph)
     }
 
     /// Routes `insert`, `upsert_by`, `supersede`, `relate`, `link`,
@@ -732,8 +745,11 @@ impl<B: Backend> Graph<B> {
         Ok(())
     }
 
+    /// The signature is stored first, so a vector never exists without one even
+    /// when the node was written by an earlier call, as a duplicate's is.
     async fn put_vector(&self, id: &NodeId, embedding: &[f32]) -> Result<()> {
         self.check_dims(embedding)?;
+        self.ensure_quant(id, embedding).await?;
         self.backend.vector_upsert(id.as_str(), embedding).await
     }
 
@@ -2452,6 +2468,7 @@ mod tests {
     mod log_write;
     mod log_write_faults;
     mod node_events;
+    mod quant;
     mod ranking_ties;
     mod rebuild;
     mod reembed;

@@ -228,7 +228,9 @@ impl<B: Backend> Graph<B> {
         steps: &[Step],
     ) -> Result<()> {
         let applied = apply_steps(&mut *tx, steps, self.backend.vector_delete_sql()).await;
-        commit_or_abandon(tx, applied).await
+        commit_or_abandon(tx, applied).await?;
+        self.sync_quant(steps).await;
+        Ok(())
     }
 
     /// The logged path: poison check, log lock, `begin`, then plan, deduplicate,
@@ -300,6 +302,7 @@ impl<B: Backend> Graph<B> {
             Ok(()) => {
                 held.reconcile(&carried);
                 tracing::debug!(%event_id, "projection committed");
+                self.sync_quant(steps).await;
                 Ok(())
             }
             Err(error) => {

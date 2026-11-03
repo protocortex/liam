@@ -124,6 +124,9 @@ impl<B: Backend> Graph<B> {
         };
         let embedding = embedder.embed(&content).await.map_err(|e| e.to_string())?;
         self.check_dims(&embedding).map_err(|e| e.to_string())?;
+        self.ensure_quant(id, &embedding)
+            .await
+            .map_err(|e| e.to_string())?;
         let stored = self
             .backend
             .vector_insert_if_absent(id.as_str(), &embedding)

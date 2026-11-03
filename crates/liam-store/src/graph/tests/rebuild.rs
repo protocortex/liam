@@ -747,7 +747,7 @@ async fn rebuild_without_an_embedder_reports_the_nodes_pending_instead_of_failin
 /// Puts a row in every table a rebuild empties but `nodes`, `edges`,
 /// `node_events` and `log_hash_index`, which `populate` fills, and names the
 /// tables it did.
-async fn seed_derived_tables(live: &Opened) -> [&'static str; 18] {
+async fn seed_derived_tables(live: &Opened) -> [&'static str; 19] {
     let g = &live.graph;
     let node_id = g
         .backend
@@ -766,6 +766,7 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 18] {
         "INSERT INTO cluster_state (edge_count, max_tx_from, computed_at, last_cold_start_at)
          VALUES (1, 1, 1, 1)",
         "INSERT INTO provenance_repair_state (id, last_repaired_at) VALUES (1, 5)",
+        "INSERT INTO quant_backfill_state (id, completed_at, filled) VALUES (1, 5, 0)",
         "INSERT OR REPLACE INTO derivation_backfill_state (id, completed_at, flagged)
          VALUES (1, 5, 0)",
         "INSERT INTO entity_mention_state
@@ -805,6 +806,7 @@ async fn seed_derived_tables(live: &Opened) -> [&'static str; 18] {
         "node_community",
         "cluster_state",
         "provenance_repair_state",
+        "quant_backfill_state",
         "derivation_backfill_state",
         "entity_mention_state",
         "log_quarantine",
@@ -835,7 +837,14 @@ async fn reset_empties_every_derived_table_by_its_rule_and_keeps_the_log_id() {
             .await
             .unwrap();
         let mut seeded = seed_derived_tables(&live).await.to_vec();
-        seeded.extend(["nodes", "edges", "log_hash_index", "node_events"]);
+        seeded.extend([
+            "nodes",
+            "edges",
+            "log_hash_index",
+            "node_events",
+            "node_quant",
+            "node_lineage",
+        ]);
         let mut listed: Vec<_> = DERIVED_TABLES.iter().map(|(table, _)| *table).collect();
         seeded.sort_unstable();
         listed.sort_unstable();

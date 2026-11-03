@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
@@ -72,6 +72,24 @@ impl GraphConfig {
     pub fn with_read_pool_size(mut self, read_pool_size: usize) -> Self {
         self.read_pool_size = read_pool_size;
         self
+    }
+}
+
+/// Names the line of versions one item's tier, usage and feedback follow. A new
+/// version of a node keeps the key of the one it replaced, and two live nodes
+/// that no write would make versions of each other never share one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LineageKey(String);
+
+impl LineageKey {
+    /// A key read back from the store or the log. It is not checked, because
+    /// only the store makes new ones.
+    pub fn from_raw(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
