@@ -107,6 +107,9 @@ tokio = { version = "1", features = ["test-util"] }
 #   cargo tree -e no-dev -p liam-daemon -f "{p} {f}" | grep "rmcp v"
 # which must NOT list `client` (plain `cargo tree` will, and should).
 rmcp = { version = "3", features = ["client", "transport-async-rw"] }
+# One test edits a closed database file to look like a store from before the
+# tier signatures existed. Same build as the store's own, so nothing new links.
+libsql = { version = "0.10", default-features = false, features = ["core"] }
 
 [features]
 default = []

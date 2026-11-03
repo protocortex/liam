@@ -8,26 +8,48 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use liam_daemon::config::{ExtractionConfig, TieringConfig};
+use liam_daemon::consolidation::hooks::TierCtx;
+use liam_daemon::consolidation::tier_history::TierHistory;
 use liam_log::dedup::BloomConfig;
 use liam_model::{Embedder, ModelError, TextKind};
-use liam_store::{DefaultGraph, FixedClock, GraphConfig, NodeId, OriginClaim, OriginVerdict};
+use liam_store::{
+    DefaultGraph, FixedClock, GraphConfig, LineageKey, Millis, NewNode, NodeId, OriginClaim,
+    OriginVerdict, SharedLog, Tier, TierMove, UsageEntry,
+};
+use tokio::sync::Semaphore;
 
+use super::hooks::TierHooks;
 use super::verify::TierVerifier;
 use crate::config::LogConfig;
 use crate::extraction::sidecar::FreeRam;
 
 /// An in-memory store on an event log under `dir`, read through `clock`.
 pub async fn logged_store(dir: &Path, clock: Arc<FixedClock>, dims: usize) -> DefaultGraph {
+    logged_store_with_log(dir, clock, dims).await.0
+}
+
+/// An event log under `dir`.
+pub fn shared_test_log(dir: &Path) -> SharedLog {
     let log_dir = dir.join("events");
     let writer = liam_daemon::event_log::open_writer(&log_dir, LogConfig::default().wal()).unwrap();
-    let log =
-        liam_daemon::event_log::shared_log(writer, &log_dir, BloomConfig::default(), None).unwrap();
-    DefaultGraph::open_with_clock(":memory:", GraphConfig::new(dims), clock)
+    liam_daemon::event_log::shared_log(writer, &log_dir, BloomConfig::default(), None).unwrap()
+}
+
+/// Like `logged_store`, and the log handle beside it, for tests that rebuild.
+pub async fn logged_store_with_log(
+    dir: &Path,
+    clock: Arc<FixedClock>,
+    dims: usize,
+) -> (DefaultGraph, SharedLog) {
+    let log = shared_test_log(dir);
+    let store = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(dims), clock)
         .await
         .unwrap()
-        .with_log(log)
+        .with_log(log.clone())
         .await
-        .unwrap()
+        .unwrap();
+    (store, log)
 }
 
 /// A vector whose component `j` is positive when bit `j` of `pattern` is set,
@@ -210,4 +232,173 @@ impl FreeRam for FixedRam {
     fn free_mb(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
     }
+}
+
+// ---- a store observed for 45 days, and a hook over it ----
+
+pub const DIMS: usize = 8;
+pub const DAY_MS: i64 = 86_400_000;
+pub const START: Millis = Millis(10 * DAY_MS);
+pub const WINDOW_DAYS: u32 = 30;
+pub const HITS_CAP: u32 = 2;
+pub const SOURCE: &str = "consolidation:run-1";
+pub const RUN: &str = "run-1";
+
+pub struct Fixture {
+    pub store: Arc<DefaultGraph>,
+    pub log: SharedLog,
+    pub clock: Arc<FixedClock>,
+    _dir: tempfile::TempDir,
+}
+
+impl Fixture {
+    /// A fixture over a store and log the test opened itself under `dir`.
+    pub fn over(
+        store: Arc<DefaultGraph>,
+        log: SharedLog,
+        clock: Arc<FixedClock>,
+        dir: tempfile::TempDir,
+    ) -> Self {
+        Self {
+            store,
+            log,
+            clock,
+            _dir: dir,
+        }
+    }
+}
+
+/// A store whose counting began at `START`, read 45 days later: long enough for
+/// every item to be judged.
+pub async fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FixedClock::new(START));
+    let (store, log) = logged_store_with_log(dir.path(), clock.clone(), DIMS).await;
+    Fixture {
+        store: Arc::new(store),
+        log,
+        clock,
+        _dir: dir,
+    }
+}
+
+pub fn config() -> TieringConfig {
+    TieringConfig {
+        enabled: true,
+        w1: 1.0,
+        w2: 0.0,
+        w3: 0.0,
+        w4: 0.0,
+        hits_cap: HITS_CAP,
+        window_days: WINDOW_DAYS,
+        max_demotions_per_run: 10,
+        max_promotions_per_run: 10,
+        ..TieringConfig::default()
+    }
+}
+
+pub fn text_of(label: &str) -> String {
+    format!("text of {label}")
+}
+
+pub async fn add(fixture: &Fixture, label: &str, pattern: u8) -> (NodeId, LineageKey) {
+    let id = fixture
+        .store
+        .insert(
+            NewNode::now("fact", label, text_of(label))
+                .with_subject(label)
+                .with_producer("agent-a")
+                .with_embedding(signed(pattern, DIMS)),
+        )
+        .await
+        .unwrap();
+    let lineage = fixture.store.lineage_of(&id).await.unwrap().unwrap();
+    (id, lineage)
+}
+
+pub async fn demote(fixture: &Fixture, lineage: &LineageKey) {
+    let change = TierMove {
+        lineage_key: lineage.clone(),
+        to: Tier::Cold,
+        run_id: "earlier".to_string(),
+        reason: "test".to_string(),
+        changed_at: START,
+        residency_until: None,
+    };
+    fixture
+        .store
+        .demote_lineage(&change, "consolidation:earlier")
+        .await
+        .unwrap();
+}
+
+/// Starts counting at `START`, then moves the clock 45 days on, where the items
+/// in `used` have been hit enough to count fully.
+pub async fn observed(fixture: &Fixture, used: &[&LineageKey]) {
+    fixture
+        .store
+        .put_usage_logged(START.day_number(), &[])
+        .await
+        .unwrap();
+    let later = Millis(START.0 + 45 * DAY_MS);
+    fixture.clock.set(later);
+    let entries: Vec<UsageEntry> = used
+        .iter()
+        .map(|lineage| UsageEntry {
+            lineage_key: (*lineage).clone(),
+            hits: HITS_CAP,
+            last_access_at: later,
+        })
+        .collect();
+    fixture
+        .store
+        .put_usage_logged(later.day_number(), &entries)
+        .await
+        .unwrap();
+}
+
+pub fn hooks(fixture: &Fixture, config: TieringConfig, embedder: Arc<dyn Embedder>) -> TierHooks {
+    TierHooks {
+        config,
+        extraction: ExtractionConfig::default(),
+        embedder,
+        permits: Arc::new(Semaphore::new(1)),
+        free_ram: Arc::new(FixedRam::plenty()),
+        clock: fixture.clock.clone(),
+    }
+}
+
+pub fn ctx<'a>(fixture: &'a Fixture, probed: &[&NodeId], history: TierHistory) -> TierCtx<'a> {
+    TierCtx {
+        store: &fixture.store,
+        source: SOURCE.to_string(),
+        run_id: RUN.to_string(),
+        probed_nodes: probed.iter().map(|id| (*id).clone()).collect(),
+        history,
+    }
+}
+
+pub fn scripted(labels: &[&str]) -> Arc<ScriptedEmbedder> {
+    Arc::new(scripted_owned(labels))
+}
+
+pub fn scripted_owned(labels: &[&str]) -> ScriptedEmbedder {
+    let vectors: Vec<(String, Vec<f32>)> = labels
+        .iter()
+        .map(|label| (text_of(label), signed(0b0101_0101, DIMS)))
+        .collect();
+    let named: Vec<(&str, Vec<f32>)> = vectors
+        .iter()
+        .map(|(text, vector)| (text.as_str(), vector.clone()))
+        .collect();
+    ScriptedEmbedder::new(DIMS, &named)
+}
+
+pub async fn tier_of(fixture: &Fixture, lineage: &LineageKey) -> Tier {
+    fixture.store.tier_of(lineage).await.unwrap()
+}
+
+pub async fn holds_vector(fixture: &Fixture, lineage: &LineageKey) -> bool {
+    let texts = fixture.store.lineage_texts(lineage).await.unwrap();
+    texts.iter().all(|text| text.has_vector)
 }

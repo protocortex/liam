@@ -4,6 +4,8 @@
 //! of usage and decide, and applying the decision is a separate step.
 
 mod apply;
+#[cfg(test)]
+mod exit_criteria;
 pub(crate) mod hooks;
 mod planner;
 #[cfg(test)]

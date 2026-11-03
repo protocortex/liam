@@ -2463,6 +2463,7 @@ dependencies = [
  "liam-model",
  "liam-store",
  "libc",
+ "libsql",
  "rand_chacha",
  "raunch",
  "regex",
