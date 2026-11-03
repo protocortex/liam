@@ -71,6 +71,23 @@ pub async fn add_column_if_missing<B: Backend>(
     }
 }
 
+/// Gives `log_backfill_state` the `last_rowid` column the nodes phase of the
+/// log backfill resumes from, and drops a node cursor an older build saved as
+/// an id. The walk then starts the nodes again: a row the log already holds is
+/// skipped, so nothing is logged twice, and the rows still to log follow
+/// insertion order.
+pub async fn add_backfill_node_rowid_cursor<B: Backend>(backend: &B) -> Result<()> {
+    add_column_if_missing(backend, "log_backfill_state", "last_rowid", "INTEGER").await?;
+    backend
+        .execute(
+            "UPDATE log_backfill_state SET last_id = NULL
+             WHERE phase = 'nodes' AND last_id IS NOT NULL",
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
 /// Tables whose `REFERENCES nodes(id)` must cascade. Fixed literals, never
 /// caller input, which is what makes interpolating them into SQL below safe.
 const CASCADING_TABLES: [&str; 2] = ["edges", "node_community"];
