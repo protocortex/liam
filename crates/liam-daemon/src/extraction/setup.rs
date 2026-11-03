@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use super::batch_flow::{BatchApi, BatchFlow};
 use super::cache::{cache_path, CacheStore};
 use super::extractor::ExtractorProvider;
 use super::gate::ProviderGate;
@@ -20,6 +21,9 @@ use super::identity::{GgufFile, IdentitySource};
 use super::provider::{pidfile_path, SidecarProvider, SystemStarter};
 use super::sidecar::{FreeRam, SidecarGuard, SystemRam};
 use crate::config::ExtractionConfig;
+use crate::deletion::batch_store::{batch_store_path_for, BatchStore};
+use crate::deletion::send_ledger::{send_ledger_path_for, SendLedger};
+use liam_store::SystemClock;
 
 /// What the daemon knows that the configuration does not say.
 pub struct DaemonFiles<'a> {
@@ -55,6 +59,8 @@ pub struct Backend {
     pub free_ram: Arc<dyn FreeRam + Sync>,
     /// Set for a hosted backend.
     pub gate: Option<Arc<ProviderGate>>,
+    /// Set for a hosted backend that answers in batches.
+    pub batch: Option<Arc<dyn BatchApi>>,
 }
 
 /// The extraction part for `config`, over the local model. The model file is
@@ -76,6 +82,7 @@ pub fn build(config: &ExtractionConfig, files: DaemonFiles<'_>) -> anyhow::Resul
         identity,
         free_ram: Arc::new(SystemRam),
         gate: None,
+        batch: None,
     };
     build_with(config, files, backend)
 }
@@ -94,15 +101,26 @@ pub fn build_with(
         .context("could not open the extraction response cache")?;
     let reader = event_log::log_reader(files.log_dir, files.keys.as_ref())
         .context("could not open the event log for extraction")?;
+    let cache = Arc::new(cache);
+    let batch = backend.batch.map(|api| {
+        Arc::new(BatchFlow::new(
+            api,
+            BatchStore::new(batch_store_path_for(files.database_path)),
+            SendLedger::new(send_ledger_path_for(files.database_path)),
+            Arc::clone(&cache),
+            Arc::new(SystemClock),
+        ))
+    });
     Ok(ExtractionHooks {
         config: config.clone(),
         reader,
         provider: backend.provider,
         identity: backend.identity,
-        cache: Arc::new(cache),
+        cache,
         permits: files.permits,
         free_ram: backend.free_ram,
         gate: backend.gate,
+        batch,
         stopping: files.stopping,
     })
 }

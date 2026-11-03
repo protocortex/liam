@@ -38,6 +38,24 @@ pub enum BatchState {
     Cancelled,
 }
 
+/// Why a request in the `Failed` state failed, which decides whether the
+/// failure counts against the events in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryFailure {
+    /// The provider answered, and the answer did not validate.
+    Invalid,
+    /// The provider refused the request or answered as another model, or the
+    /// request expired twice. Nothing about the events is to blame.
+    Refused,
+}
+
+/// The first time a request is sent.
+pub const FIRST_ATTEMPT: u32 = 1;
+
+fn first_attempt() -> u32 {
+    FIRST_ATTEMPT
+}
+
 impl BatchState {
     /// A request in a live state is the provider's to answer, so it is not sent
     /// again.
@@ -59,6 +77,13 @@ pub struct BatchEntry {
     pub submitted_at: i64,
     pub input_hash: String,
     pub source_event_ids: Vec<String>,
+    /// How many times the request has been sent, the first send being 1. A
+    /// request that expires is sent once more.
+    #[serde(default = "first_attempt")]
+    pub attempts: u32,
+    /// Set while the state is `Failed`.
+    #[serde(default)]
+    pub failure: Option<EntryFailure>,
 }
 
 impl BatchEntry {
@@ -155,6 +180,8 @@ pub(crate) mod tests {
             submitted_at: 1,
             input_hash: "hash".to_owned(),
             source_event_ids: events.iter().map(|id| (*id).to_owned()).collect(),
+            attempts: FIRST_ATTEMPT,
+            failure: None,
         }
     }
 

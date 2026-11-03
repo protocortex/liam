@@ -53,6 +53,8 @@ impl BatchRequest {
             seed: self.seed,
             schema: self.schema.as_ref(),
             request_id: &self.cache_key,
+            // The send ledger rows of a batch are written by its sender.
+            source_event_ids: &[],
         }
     }
 }

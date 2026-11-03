@@ -19,24 +19,24 @@ use super::*;
 use crate::config::ExtractionConfig;
 
 const CLIENT: &str = "claude-code";
-const MODEL_SHA: &str = "abc123";
-const EMBEDDING_DIMS: usize = 8;
-const READ_LIMIT: usize = 10;
+pub(super) const MODEL_SHA: &str = "abc123";
+pub(super) const EMBEDDING_DIMS: usize = 8;
+pub(super) const READ_LIMIT: usize = 10;
 const POISON: &str = "POISON";
 /// A source whose configured trust the store refuses.
 const BAD_SOURCE: &str = "bad-source";
 const UNTRUSTWORTHY_SCORE: f64 = 2.0;
 const HOUR: i64 = 3_600_000;
-const OBSERVED: i64 = 1_685_577_600_000;
-const READ_AT: i64 = OBSERVED + 1000 * HOUR;
-const WINDOW_END: LogOffset = LogOffset {
+pub(super) const OBSERVED: i64 = 1_685_577_600_000;
+pub(super) const READ_AT: i64 = OBSERVED + 1000 * HOUR;
+pub(super) const WINDOW_END: LogOffset = LogOffset {
     segment: 0,
     index: 100,
 };
-const WRITE_SOURCE: &str = "consolidation:test-run";
+pub(super) const WRITE_SOURCE: &str = "consolidation:test-run";
 const ABANDON_AFTER: Duration = Duration::from_secs(60);
 const RUN_BUDGET: Duration = Duration::from_secs(60);
-const FAR_FUTURE: Duration = Duration::from_secs(3600);
+pub(super) const FAR_FUTURE: Duration = Duration::from_secs(3600);
 
 enum Reply {
     Text(String),
@@ -49,7 +49,7 @@ enum Reply {
 type Handler = Box<dyn Fn(&ExtractRequest, usize) -> Reply + Send + Sync>;
 
 /// Answers each request from a handler that sees the request and the call number.
-struct Script {
+pub(super) struct Script {
     identity: ModelIdentity,
     handler: Handler,
     calls: AtomicUsize,
@@ -92,11 +92,11 @@ impl Script {
     }
 
     /// Reads "<Name> works at <Org>." from each event of the prompt.
-    fn honest() -> Arc<Self> {
+    pub(super) fn honest() -> Arc<Self> {
         Self::new(|request, _| Reply::Text(facts_for(&request.prompt)))
     }
 
-    fn calls(&self) -> usize {
+    pub(super) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
 
@@ -142,7 +142,7 @@ fn prompt_texts(prompt: &str) -> Vec<&str> {
         .collect()
 }
 
-fn facts_for(prompt: &str) -> String {
+pub(super) fn facts_for(prompt: &str) -> String {
     let facts: Vec<_> = prompt_texts(prompt)
         .iter()
         .enumerate()
@@ -158,7 +158,7 @@ fn facts_for(prompt: &str) -> String {
     json!({ "facts": facts }).to_string()
 }
 
-struct Provider {
+pub(super) struct Provider {
     script: Arc<Script>,
     alive: Arc<AtomicBool>,
     opens: AtomicUsize,
@@ -166,7 +166,7 @@ struct Provider {
 }
 
 impl Provider {
-    fn new(script: &Arc<Script>) -> Self {
+    pub(super) fn new(script: &Arc<Script>) -> Self {
         Self {
             script: Arc::clone(script),
             alive: Arc::new(AtomicBool::new(true)),
@@ -175,7 +175,7 @@ impl Provider {
         }
     }
 
-    fn opens(&self) -> usize {
+    pub(super) fn opens(&self) -> usize {
         self.opens.load(Ordering::SeqCst)
     }
 }
@@ -196,7 +196,7 @@ impl ExtractorProvider for Provider {
     }
 }
 
-struct FakeRam(AtomicU64);
+pub(super) struct FakeRam(pub(super) AtomicU64);
 
 impl FreeRam for FakeRam {
     fn free_mb(&self) -> u64 {
@@ -292,6 +292,7 @@ impl Fixture {
             stopping: &self.stopping,
             window_end: WINDOW_END,
             gate: self.gate.as_ref(),
+            batch: None,
         };
         extract_events(inputs, deps).await.expect("a finished run")
     }
@@ -340,14 +341,14 @@ impl Fixture {
     }
 }
 
-fn offset(n: u64) -> LogOffset {
+pub(super) fn offset(n: u64) -> LogOffset {
     LogOffset {
         segment: 0,
         index: n,
     }
 }
 
-fn input(n: u64, scope: Option<&str>) -> ExtractionInput {
+pub(super) fn input(n: u64, scope: Option<&str>) -> ExtractionInput {
     let observed = OBSERVED + i64::try_from(n).unwrap() * HOUR;
     ExtractionInput {
         event_id: format!("e{n}"),
@@ -368,7 +369,7 @@ fn poison(n: u64) -> ExtractionInput {
     }
 }
 
-fn inputs(count: u64) -> Vec<ExtractionInput> {
+pub(super) fn inputs(count: u64) -> Vec<ExtractionInput> {
     (0..count).map(|n| input(n, None)).collect()
 }
 

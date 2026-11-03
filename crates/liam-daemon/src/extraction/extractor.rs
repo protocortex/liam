@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::apply::{apply_answer, ApplyContext, ApplyError};
+use super::batch_flow::{is_crash, BatchFlow, Standing};
 use super::cache::{cache_key, CacheStore, CachedExtractor, KeyParts};
 use super::client::{ExtractError, ExtractRequest, JsonExtractor, ModelIdentity};
 use super::gate::ProviderGate;
@@ -86,6 +87,9 @@ pub struct ExtractionDeps<'a> {
     /// Set for a hosted provider. Inputs it denies are never put in a prompt,
     /// whether or not a cached answer exists.
     pub gate: Option<&'a ProviderGate>,
+    /// Set for a provider that answers in batches. A request the cache cannot
+    /// answer is queued for a batch instead of asked for now.
+    pub batch: Option<&'a BatchFlow>,
 }
 
 /// What a run did. The caller moves the cursor to `completed_offset`.
@@ -105,6 +109,12 @@ pub struct ExtractionReport {
     /// Events the privacy gate kept out of a hosted prompt. They count as
     /// passed, so the cursor moves on; a local run would still read them.
     pub events_withheld: usize,
+    /// Events whose request is with a provider, so the cursor stops before
+    /// them.
+    pub events_in_batch: usize,
+    pub requests_submitted: usize,
+    /// Requests an earlier send may already have put with the provider.
+    pub possible_duplicate_sends: usize,
     pub sidecar_lost: bool,
     pub deadline_hit: bool,
     /// The daemon began stopping before the run finished.
@@ -121,6 +131,8 @@ enum Status {
     Quarantined,
     /// Kept out of a hosted prompt by the privacy gate; counts as passed.
     Withheld,
+    /// Its request is with a provider; not done until the answer is in.
+    InBatch,
     Failed,
 }
 
@@ -139,6 +151,8 @@ enum BatchEnd {
 
 enum Attempt {
     Done,
+    /// The request is queued or with a provider; nothing to do until it answers.
+    Pending,
     /// The answer or the facts are bad, which asking again repeats.
     Content(String),
     /// The call outlasted its limit while the model was still answering health checks.
@@ -184,6 +198,11 @@ struct Run<'a> {
     /// The model itself answered a call this run. A cached answer does not
     /// count, since it may come from a faster day.
     model_answered: bool,
+    /// What the batch table holds for each request key, read once the ended
+    /// batches are collected.
+    standings: BTreeMap<String, Standing>,
+    /// Requests the cache and the table cannot answer, sent at the run's end.
+    queued: Vec<(String, ExtractRequest)>,
 }
 
 /// Batches `inputs` per scope, extracts each batch, and writes the facts.
@@ -232,7 +251,7 @@ fn initial_status(
     status
 }
 
-fn is_parseable(response: &str) -> bool {
+pub(super) fn is_parseable(response: &str) -> bool {
     parse_response(response, usize::MAX, &[]).is_ok()
 }
 
@@ -264,11 +283,14 @@ impl<'a> Run<'a> {
             suspects: Vec::new(),
             attempted: HashSet::new(),
             model_answered: false,
+            standings: BTreeMap::new(),
+            queued: Vec::new(),
             deps,
         }
     }
 
     async fn execute(&mut self) -> Result<()> {
+        self.collect_batches().await?;
         self.skip_quarantined().await?;
         let batches = self.plan_batches();
         info!(
@@ -298,7 +320,13 @@ impl<'a> Run<'a> {
                 BatchEnd::Halted => break,
             }
         }
+        self.submit_queued().await?;
         self.settle_suspects().await?;
+        self.report.events_in_batch = self
+            .status
+            .iter()
+            .filter(|status| **status == Status::InBatch)
+            .count();
         self.report.completed_offset = self.completed_offset();
         info!(
             written = self.report.facts_written,
@@ -384,6 +412,10 @@ impl<'a> Run<'a> {
                     self.clear_failures(&piece).await?;
                     continue;
                 }
+                Attempt::Pending => {
+                    self.mark(&piece, Status::InBatch);
+                    continue;
+                }
                 Attempt::Halted => return Ok(BatchEnd::Halted),
                 Attempt::Transport => return Ok(BatchEnd::Failed),
                 Attempt::Content(reason) => reason,
@@ -428,10 +460,15 @@ impl<'a> Run<'a> {
                 debug!(events = batch.len(), "answered from the response cache");
                 text
             }
-            None => match self.generate(&request, piece).await? {
-                Generation::Text(text) => text,
-                Generation::Stop(stop) => return Ok(stop),
-            },
+            None => {
+                if let Some(deferred) = self.defer_to_batch(&key, &request)? {
+                    return Ok(deferred);
+                }
+                match self.generate(&request, piece).await? {
+                    Generation::Text(text) => text,
+                    Generation::Stop(stop) => return Ok(stop),
+                }
+            }
         };
         self.report.model = Some(self.deps.identity.clone());
         let parsed = match parse_response(&response, batch.len(), &self.predicates) {
@@ -467,6 +504,79 @@ impl<'a> Run<'a> {
             }
             Err(ApplyError::Store(error)) => Err(error.into()),
         }
+    }
+
+    /// Collects the batches the provider has finished and reads the table, so
+    /// the run can tell a request in flight from one still to send.
+    async fn collect_batches(&mut self) -> Result<()> {
+        let Some(flow) = self.deps.batch else {
+            return Ok(());
+        };
+        match flow.collect_ended(self.deps.identity).await {
+            Ok(collected) => debug!(cached = collected.cached, "hosted batches collected"),
+            Err(error) if is_crash(&error) => return Err(error),
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "hosted batches could not be collected")
+            }
+        }
+        self.standings = flow.standings()?;
+        Ok(())
+    }
+
+    /// For a provider that answers in batches, decides what a cache miss
+    /// means: wait for the answer in flight, count a bad answer, or queue the
+    /// request. `None` when the provider is asked directly.
+    fn defer_to_batch(&mut self, key: &str, request: &ExtractRequest) -> Result<Option<Attempt>> {
+        let Some(flow) = self.deps.batch else {
+            return Ok(None);
+        };
+        let standing = self.standings.get(key).cloned().unwrap_or(Standing::Unsent);
+        Ok(Some(match standing {
+            Standing::Pending => Attempt::Pending,
+            Standing::Invalid => {
+                flow.discard(key)?;
+                self.standings.remove(key);
+                Attempt::Content("the hosted answer could not be read".to_owned())
+            }
+            Standing::Refused => {
+                flow.discard(key)?;
+                self.standings.remove(key);
+                warn!("the provider gave no usable answer, so the scope waits for the next run");
+                Attempt::Transport
+            }
+            Standing::Unsent => {
+                self.standings.insert(key.to_owned(), Standing::Pending);
+                self.queued.push((key.to_owned(), request.clone()));
+                Attempt::Pending
+            }
+        }))
+    }
+
+    /// Sends the queued requests as one batch. A send that fails leaves them
+    /// for the next run.
+    async fn submit_queued(&mut self) -> Result<()> {
+        let Some(flow) = self.deps.batch else {
+            return Ok(());
+        };
+        if self.queued.is_empty() {
+            return Ok(());
+        }
+        if self.deps.stopping.is_cancelled() {
+            self.report.stopped = true;
+            return Ok(());
+        }
+        match flow.submit(std::mem::take(&mut self.queued)).await {
+            Ok(sent) => {
+                self.report.requests_submitted += sent.requests;
+                self.report.possible_duplicate_sends += sent.possible_duplicates;
+            }
+            Err(error) if is_crash(&error) => return Err(error),
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "a hosted batch could not be submitted, the requests wait for the next run");
+                self.report.batches_failed += 1;
+            }
+        }
+        Ok(())
     }
 
     fn request(&self, batch: &[&ExtractionInput]) -> ExtractRequest {
@@ -644,5 +754,7 @@ mod failures;
 #[cfg(test)]
 pub(crate) use failures::tracking_id;
 
+#[cfg(test)]
+mod batch_tests;
 #[cfg(test)]
 mod tests;

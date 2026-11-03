@@ -45,6 +45,7 @@ impl<T: HttpTransport + 'static> Summariser for HostedSummariser<T> {
                 seed: SUMMARY_SEED,
                 schema: None,
                 request_id: &request_id,
+                source_event_ids: &req.source_event_ids,
             })
             .await?;
         Ok(SummaryResponse {
@@ -76,6 +77,7 @@ impl<T: HttpTransport + 'static> JsonExtractor for HostedExtractor<T> {
                 seed: req.seed,
                 schema: Some(&req.schema),
                 request_id: &request_id,
+                source_event_ids: &req.source_event_ids,
             })
             .await
             .map_err(extract_error)?;
@@ -111,7 +113,7 @@ fn extract_error(error: ModelCallError) -> ExtractError {
         ModelCallError::Hosted(HostedError::NotHttps | HostedError::HostNotAllowed { .. }) => {
             ExtractError::InvalidRequest("the request is not allowed by [hosted]")
         }
-        ModelCallError::Hosted(HostedError::Transport { .. }) => {
+        ModelCallError::Hosted(HostedError::Transport { .. }) | ModelCallError::Ledger => {
             ExtractError::Io(io::ErrorKind::Other)
         }
     }

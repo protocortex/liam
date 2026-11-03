@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::apply::{apply_rules, ApplyContext};
+use super::batch_flow::BatchFlow;
 use super::cache::CacheStore;
 use super::client::ModelIdentity;
 use super::extractor::ExtractionReport as ModelRun;
@@ -56,6 +57,8 @@ pub struct ExtractionHooks {
     pub free_ram: Arc<dyn FreeRam + Sync>,
     /// Set for a hosted provider: what it may be sent.
     pub gate: Option<Arc<ProviderGate>>,
+    /// Set for a provider that answers in batches.
+    pub batch: Option<Arc<BatchFlow>>,
     /// Cancelled when the daemon is stopping.
     pub stopping: CancellationToken,
 }
@@ -199,6 +202,7 @@ impl ExtractionHooks {
             stopping: &self.stopping,
             window_end: window.end,
             gate: self.gate.as_deref(),
+            batch: self.batch.as_deref(),
         };
         // The loop stops between batches when the daemon is stopping; dropping
         // it mid write would leave the event log poisoned.
@@ -258,6 +262,7 @@ async fn advance(
 /// was lost, or the deadline came first.
 fn is_partial(run: &ModelRun) -> bool {
     run.batches_failed > 0
+        || run.events_in_batch > 0
         || run.batches_quarantined > 0
         || run.sidecar_lost
         || run.deadline_hit
