@@ -22,6 +22,13 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// The provider named `name` in `[hosted.models]`, or `local`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Local, Self::Anthropic, Self::OpenAi, Self::Gemini]
+            .into_iter()
+            .find(|provider| provider.name() == name)
+    }
+
     /// The provider's name in `[hosted.models]`, or `local`.
     pub const fn name(self) -> &'static str {
         match self {

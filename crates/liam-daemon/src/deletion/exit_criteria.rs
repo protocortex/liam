@@ -336,6 +336,7 @@ fn registry_of(fixture: &Fixture) -> LineageRegistry {
         &fixture.snapshot_dir(),
         std::sync::Arc::clone(&fixture.subjects.store),
         states,
+        std::sync::Arc::new(super::batch_lineage::NoProviderDelete),
     )
     .unwrap()
 }

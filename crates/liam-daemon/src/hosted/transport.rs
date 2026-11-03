@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The wire under the policy layer: one JSON POST. The `ureq` implementation is
-//! the only code that opens a socket.
+//! The wire under the policy layer: one request and its response. The `ureq`
+//! implementation is the only code that opens a socket.
 
 use std::fmt;
 use std::time::Duration;
@@ -9,11 +9,21 @@ use async_trait::async_trait;
 
 use super::secrets::SecretString;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Post,
+    Delete,
+}
+
 /// One request. Its `Debug` shows no URL, header or body, because a URL can
 /// carry a key and a body carries the prompt.
 pub struct HttpRequest {
+    pub method: Method,
     pub url: String,
     pub headers: Vec<(String, SecretString)>,
+    /// Sent as the content type when the request has a body.
+    pub content_type: Option<String>,
     pub body: Vec<u8>,
     /// The most bytes of the response to read; one more is read so the policy
     /// layer can tell a response over the limit from one at it.
@@ -23,6 +33,7 @@ pub struct HttpRequest {
 impl fmt::Debug for HttpRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpRequest")
+            .field("method", &self.method)
             .field("headers", &self.headers.len())
             .field("body_bytes", &self.body.len())
             .finish_non_exhaustive()
@@ -50,7 +61,7 @@ impl std::error::Error for TransportError {}
 
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
-    async fn post_json(&self, request: HttpRequest) -> Result<HttpResponse, TransportError>;
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError>;
 }
 
 /// `ureq` over rustls. It follows no redirect, treats every status as a
@@ -79,22 +90,42 @@ impl UreqTransport {
 
 #[async_trait]
 impl HttpTransport for UreqTransport {
-    async fn post_json(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
         let agent = self.agent.clone();
-        tokio::task::spawn_blocking(move || send(&agent, &request))
+        tokio::task::spawn_blocking(move || call(&agent, &request))
             .await
             .map_err(|_| TransportError("the request task stopped".to_owned()))?
     }
 }
 
-fn send(agent: &ureq::Agent, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
-    let mut call = agent
-        .post(&request.url)
-        .header("content-type", "application/json");
-    for (name, value) in &request.headers {
-        call = call.header(name, value.expose());
+fn call(agent: &ureq::Agent, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+    let mut response = match request.method {
+        Method::Get => {
+            let mut call = agent.get(&request.url);
+            for (name, value) in &request.headers {
+                call = call.header(name, value.expose());
+            }
+            call.call()
+        }
+        Method::Delete => {
+            let mut call = agent.delete(&request.url);
+            for (name, value) in &request.headers {
+                call = call.header(name, value.expose());
+            }
+            call.call()
+        }
+        Method::Post => {
+            let mut call = agent.post(&request.url);
+            if let Some(content_type) = &request.content_type {
+                call = call.header("content-type", content_type);
+            }
+            for (name, value) in &request.headers {
+                call = call.header(name, value.expose());
+            }
+            call.send(&request.body[..])
+        }
     }
-    let mut response = call.send(&request.body[..]).map_err(classify)?;
+    .map_err(classify)?;
     let status = response.status().as_u16();
     let limit = u64::try_from(request.max_response_bytes)
         .unwrap_or(u64::MAX)
@@ -143,14 +174,16 @@ mod tests {
         // Arrange
         let transport = UreqTransport::new(TIMEOUT);
         let request = HttpRequest {
+            method: Method::Post,
             url: "https://127.0.0.1:1/v1?key=url-secret".into(),
             headers: vec![("x-api-key".into(), SecretString::new("header-secret"))],
+            content_type: None,
             body: b"prompt-secret".to_vec(),
             max_response_bytes: 10,
         };
 
         // Act
-        let error = transport.post_json(request).await.unwrap_err();
+        let error = transport.send(request).await.unwrap_err();
 
         // Assert
         let text = error.to_string();
@@ -163,8 +196,10 @@ mod tests {
     fn a_request_shows_no_url_header_or_body_when_printed() {
         // Arrange
         let request = HttpRequest {
+            method: Method::Post,
             url: "https://api.example.com/v1?key=url-secret".into(),
             headers: vec![("x-api-key".into(), SecretString::new("header-secret"))],
+            content_type: None,
             body: b"prompt-secret".to_vec(),
             max_response_bytes: 10,
         };

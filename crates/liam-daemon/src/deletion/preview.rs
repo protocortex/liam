@@ -11,6 +11,7 @@ use liam_daemon::models::resolve_snapshot_dir;
 use liam_log::crypto::KeyRegistry;
 use liam_log::reader::LogReader;
 
+use super::batch_lineage::NoProviderDelete;
 use super::memory::NodeState;
 use super::registry::LineageRegistry;
 use super::service::{preview, DeleteError, Preview};
@@ -58,6 +59,7 @@ impl DeletePreview {
             &self.snapshot_dir,
             Arc::clone(&store),
             self.states.clone(),
+            Arc::new(NoProviderDelete),
         )?;
         preview(&store, self.reader.as_ref(), &self.keys, &registry, target).await
     }

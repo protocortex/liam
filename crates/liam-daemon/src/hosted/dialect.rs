@@ -35,6 +35,8 @@ pub struct ChatReply {
 pub trait Dialect: Send + Sync {
     fn provider(&self) -> Provider;
     fn url(&self, model: &str) -> String;
+    /// The headers that carry the key, and nothing about a request.
+    fn auth_headers(&self, key: &SecretString) -> Vec<(String, SecretString)>;
     fn headers(&self, key: &SecretString, call: &ChatCall<'_>) -> Vec<(String, SecretString)>;
     fn body(&self, model: &str, call: &ChatCall<'_>) -> Value;
     /// Reads the reply, or says which part was missing.

@@ -31,6 +31,8 @@ use liam_store::{DefaultGraph, SystemClock};
 
 use crate::config::Config;
 use crate::{resolve_config_path, resolve_log_dir, storelock};
+#[cfg(feature = "hosted")]
+pub(crate) use batch_lineage::{BatchCanceller, ProviderCopies};
 pub use command::{run as delete_command, DeleteAction};
 pub(crate) use job::job_file_path_for;
 pub(crate) use job::DeleteJob;

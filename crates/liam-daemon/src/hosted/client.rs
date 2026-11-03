@@ -6,13 +6,15 @@
 use std::fmt;
 use std::time::Duration;
 
+use super::multipart::Encoded;
 use super::secrets::SecretString;
-use super::transport::{HttpRequest, HttpResponse, HttpTransport};
+use super::transport::{HttpRequest, HttpResponse, HttpTransport, Method};
 use crate::config::HostedConfig;
 
 const HTTPS_PREFIX: &str = "https://";
 /// Where a URL's authority ends.
 const AUTHORITY_END: [char; 4] = ['/', '?', '#', '\\'];
+const JSON_CONTENT_TYPE: &str = "application/json";
 const REDIRECT_STATUSES: std::ops::Range<u16> = 300..400;
 
 /// Why a request was refused or did not complete. No variant carries a URL
@@ -81,14 +83,63 @@ impl<T: HttpTransport> HostedClient<T> {
         headers: Vec<(String, SecretString)>,
         body: Vec<u8>,
     ) -> Result<HttpResponse, HostedError> {
+        let content_type = Some(JSON_CONTENT_TYPE.to_owned());
+        self.send(Method::Post, url, headers, content_type, body)
+            .await
+    }
+
+    /// Posts a multipart form under the same policy as [`Self::post_json`].
+    pub async fn post_form(
+        &self,
+        url: &str,
+        headers: Vec<(String, SecretString)>,
+        form: Encoded,
+    ) -> Result<HttpResponse, HostedError> {
+        self.send(
+            Method::Post,
+            url,
+            headers,
+            Some(form.content_type),
+            form.body,
+        )
+        .await
+    }
+
+    pub async fn get(
+        &self,
+        url: &str,
+        headers: Vec<(String, SecretString)>,
+    ) -> Result<HttpResponse, HostedError> {
+        self.send(Method::Get, url, headers, None, Vec::new()).await
+    }
+
+    pub async fn delete(
+        &self,
+        url: &str,
+        headers: Vec<(String, SecretString)>,
+    ) -> Result<HttpResponse, HostedError> {
+        self.send(Method::Delete, url, headers, None, Vec::new())
+            .await
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        url: &str,
+        headers: Vec<(String, SecretString)>,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    ) -> Result<HttpResponse, HostedError> {
         let host = self.check_url(url)?;
         let request = HttpRequest {
+            method,
             url: url.to_owned(),
             headers,
+            content_type,
             body,
             max_response_bytes: self.max_response_bytes,
         };
-        let response = tokio::time::timeout(self.timeout, self.transport.post_json(request))
+        let response = tokio::time::timeout(self.timeout, self.transport.send(request))
             .await
             .map_err(|_| HostedError::Timeout {
                 secs: self.timeout.as_secs(),
@@ -178,7 +229,7 @@ mod tests {
 
     #[async_trait]
     impl HttpTransport for Fake {
-        async fn post_json(&self, _: HttpRequest) -> Result<HttpResponse, TransportError> {
+        async fn send(&self, _: HttpRequest) -> Result<HttpResponse, TransportError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.never {
                 std::future::pending::<()>().await;
