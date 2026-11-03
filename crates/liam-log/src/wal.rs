@@ -414,7 +414,7 @@ fn segment_record_count(dir: &Path, sequence: u64) -> Result<Option<u64>, WalErr
         })
 }
 
-fn encode_frame(length: u32, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_frame(length: u32, payload: &[u8]) -> Vec<u8> {
     let length_bytes = length.to_le_bytes();
     let mut frame = Vec::with_capacity(HEADER_BYTES + payload.len());
     frame.extend_from_slice(&length_bytes);
@@ -425,7 +425,7 @@ fn encode_frame(length: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// The length prefix value for a payload, rejecting one the prefix cannot hold.
-fn record_length(len: usize) -> Result<u32, WalError> {
+pub(crate) fn record_length(len: usize) -> Result<u32, WalError> {
     u32::try_from(len).map_err(|_| WalError::RecordTooLarge(len))
 }
 

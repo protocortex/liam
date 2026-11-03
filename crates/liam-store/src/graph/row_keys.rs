@@ -3,10 +3,8 @@
 //! points at before the log seals it, and a logged or replayed sealed record
 //! leaves its rows' groups behind in `node_keys` and `derived_keys`.
 
-use std::collections::HashSet;
-
-use liam_log::envelope::{KeyHints, RowKeyRef, RowKind};
-use liam_log::event::{LogEvent, LogPayload, RowEffect};
+use liam_log::envelope::{named_lineages, outside_edge_sources, KeyHints, RowKeyRef, RowKind};
+use liam_log::event::LogEvent;
 
 use crate::backend::BackendTx;
 use crate::error::Result;
@@ -50,43 +48,6 @@ pub(super) async fn key_hints(tx: &mut dyn BackendTx, event: &LogEvent) -> Resul
 async fn first_string(tx: &mut dyn BackendTx, sql: &str, param: &str) -> Result<Option<String>> {
     let rows = tx.query(sql, &[Value::from(param)]).await?;
     rows.first().map(|row| row.get_string(0)).transpose()
-}
-
-fn outside_edge_sources(payload: &LogPayload) -> HashSet<String> {
-    match payload {
-        LogPayload::EdgeWrite(edge) => HashSet::from([edge.src.clone()]),
-        LogPayload::EpisodeBatch(effects) => {
-            let inside: HashSet<&str> = effects
-                .iter()
-                .filter_map(|effect| match effect {
-                    RowEffect::Node(node) => Some(node.id.as_str()),
-                    RowEffect::Edge(_) => None,
-                })
-                .collect();
-            effects
-                .iter()
-                .filter_map(|effect| match effect {
-                    RowEffect::Edge(edge) if !inside.contains(edge.src.as_str()) => {
-                        Some(edge.src.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        }
-        _ => HashSet::new(),
-    }
-}
-
-fn named_lineages(payload: &LogPayload) -> HashSet<String> {
-    match payload {
-        LogPayload::AccessBatch { entries, .. } => {
-            entries.iter().map(|row| row.lineage_key.clone()).collect()
-        }
-        LogPayload::Feedback { lineage_key, .. } | LogPayload::TierMove { lineage_key, .. } => {
-            HashSet::from([lineage_key.clone()])
-        }
-        _ => HashSet::new(),
-    }
 }
 
 /// Records the group of each row a sealed record held, openable or not.
