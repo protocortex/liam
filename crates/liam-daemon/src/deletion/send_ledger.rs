@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 /// Appended to the database path to name the ledger file.
 const LEDGER_FILE_SUFFIX: &str = ".hosted-sends.jsonl";
 const LINE_END: u8 = b'\n';
-#[allow(dead_code)] // Used by `append`.
 const OWNER_ONLY: u32 = 0o600;
 
 /// Where the send ledger of the database at `database_path` lives.
@@ -94,7 +93,6 @@ impl SendLedger {
     }
 
     /// Adds `row` and syncs it, so a send is on record before the next step.
-    #[allow(dead_code)] // The hosted extraction loop records its sends here.
     pub fn append(&self, row: &SendRow) -> anyhow::Result<()> {
         let mut line = serde_json::to_vec(row)?;
         line.push(LINE_END);
