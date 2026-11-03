@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use liam_log::crypto::KeyRegistry;
 use liam_log::reader::LogReader;
-use liam_store::{Clock, DefaultGraph, DeletionRecord, LineageTarget};
+use liam_store::{Clock, DefaultGraph, DeletionRecord, LineageHits, LineageTarget};
 
 use super::job::{job_file_path_for, DeadlineAlert, DeleteJob, Failure, JobState, JobStore};
 use super::memory::NodeState;
@@ -112,7 +112,7 @@ impl fmt::Display for DeleteJobPending {
         write!(
             f,
             "delete jobs {} did not finish, and serving would expose a half-deleted subject; \
-             resolve them before starting",
+             resolve them with `liamd delete --resume` before starting",
             self.job_ids.join(", ")
         )
     }
@@ -417,40 +417,23 @@ impl DeleteService {
         Ok(Next::Continue)
     }
 
-    /// What deleting `target` would destroy, from the log as it stands. Nothing
-    /// is changed.
-    pub async fn dry_run(&self, target: &DeleteTarget) -> Result<Found, DeleteError> {
-        let found = self.find(target).await?;
-        self.ensure_known(&found.key_ids)?;
-        Ok(found)
-    }
-
-    async fn find(&self, target: &DeleteTarget) -> Result<Found, DeleteError> {
-        let groups = match target {
-            DeleteTarget::Subject {
-                subject,
-                scope,
-                include_children,
-            } => {
-                // No group is not an early answer: plain rows of the subject
-                // have none, and the scan is what finds them.
-                self.deps
-                    .store
-                    .key_groups_of_subject(subject, scope.as_deref(), *include_children)
-                    .await
-                    .map_err(|error| DeleteError::Step(error.into()))?
-            }
-            DeleteTarget::Event { .. } => Vec::new(),
-        };
-        scan(self.deps.reader.as_ref(), target, &groups)
-            .await
-            .map_err(scan_failure)
+    /// What deleting `target` would destroy, from the log and the stores as they
+    /// stand. Nothing is changed.
+    pub async fn dry_run(&self, target: &DeleteTarget) -> Result<Preview, DeleteError> {
+        preview(
+            &self.deps.store,
+            self.deps.reader.as_ref(),
+            &self.deps.keys,
+            &self.deps.registry,
+            target,
+        )
+        .await
     }
 
     /// Scans the log, checks the registry knows every key, and fixes the
     /// nodes the stores outside the database will delete by.
     async fn start(&self, job: &mut DeleteJob) -> Result<Next, DeleteError> {
-        let found = self.find(&job.target).await?;
+        let found = find(&self.deps.store, self.deps.reader.as_ref(), &job.target).await?;
         self.ensure_known(&found.key_ids)?;
         job.event_ids = found.event_ids;
         job.key_ids = found.key_ids;
@@ -500,19 +483,8 @@ impl DeleteService {
         self.move_to(job, JobState::KeyDestroyed)
     }
 
-    /// A key the registry does not know is damage, not a delete, so the job
-    /// stops rather than call it destroyed. A destroyed key is known, which is
-    /// what lets a resume pass the destroy.
     fn ensure_known(&self, key_ids: &[String]) -> Result<(), DeleteError> {
-        match key_ids
-            .iter()
-            .find(|key| self.deps.keys.state(key).is_none())
-        {
-            Some(key) => Err(DeleteError::Step(anyhow::anyhow!(
-                "key {key} is not in the key registry, so the job cannot destroy it"
-            ))),
-            None => Ok(()),
-        }
+        ensure_known(&self.deps.keys, key_ids)
     }
 
     /// The target every store is given: resolved once, from the outbox that
@@ -563,6 +535,98 @@ impl DeleteService {
         self.crash_at(CrashPoint::BeforeDone)?;
         self.move_to(job, JobState::Done)?;
         Ok(Next::Stop(RunOutcome::Done))
+    }
+}
+
+/// What a delete of a target would do.
+#[derive(Debug)]
+pub struct Preview {
+    pub found: Found,
+    /// The rows each store would remove, in the order the stores are purged.
+    pub hits: Vec<(String, LineageHits)>,
+}
+
+impl fmt::Display for Preview {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let found = &self.found;
+        write!(
+            f,
+            "{} events, {} nodes and {} key groups\nkey groups: {}",
+            found.event_ids.len(),
+            found.node_ids.len(),
+            found.key_ids.len(),
+            found.key_ids.join(", ")
+        )?;
+        for (store, hits) in &self.hits {
+            write!(f, "\nstore {store}: {} rows", hits.total())?;
+            for (table, rows) in &hits.rows {
+                write!(f, ", {table} {rows}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The job id a preview asks the stores about. A real job id is a ULID, so no
+/// outbox row carries this one.
+const PREVIEW_JOB: &str = "preview";
+
+/// Reads the log and the stores for `target` and changes nothing.
+pub async fn preview(
+    store: &DefaultGraph,
+    reader: &dyn LogReader,
+    keys: &KeyRegistry,
+    registry: &LineageRegistry,
+    target: &DeleteTarget,
+) -> Result<Preview, DeleteError> {
+    let found = find(store, reader, target).await?;
+    ensure_known(keys, &found.key_ids)?;
+    let asked = LineageTarget {
+        job_id: PREVIEW_JOB.to_owned(),
+        event_ids: found.event_ids.clone(),
+        key_ids: found.key_ids.clone(),
+        ..LineageTarget::default()
+    };
+    let resolved = store
+        .preview_target(&asked)
+        .await
+        .map_err(|error| DeleteError::Step(error.into()))?;
+    let hits = registry.find_all(&resolved).await?;
+    Ok(Preview { found, hits })
+}
+
+async fn find(
+    store: &DefaultGraph,
+    reader: &dyn LogReader,
+    target: &DeleteTarget,
+) -> Result<Found, DeleteError> {
+    let groups = match target {
+        DeleteTarget::Subject {
+            subject,
+            scope,
+            include_children,
+        } => {
+            // No group is not an early answer: plain rows of the subject have
+            // none, and the scan is what finds them.
+            store
+                .key_groups_of_subject(subject, scope.as_deref(), *include_children)
+                .await
+                .map_err(|error| DeleteError::Step(error.into()))?
+        }
+        DeleteTarget::Event { .. } => Vec::new(),
+    };
+    scan(reader, target, &groups).await.map_err(scan_failure)
+}
+
+/// A key the registry does not know is damage, not a delete, so the job stops
+/// rather than call it destroyed. A destroyed key is known, which is what lets
+/// a resume pass the destroy.
+fn ensure_known(keys: &KeyRegistry, key_ids: &[String]) -> Result<(), DeleteError> {
+    match key_ids.iter().find(|key| keys.state(key).is_none()) {
+        Some(key) => Err(DeleteError::Step(anyhow::anyhow!(
+            "key {key} is not in the key registry, so the job cannot destroy it"
+        ))),
+        None => Ok(()),
     }
 }
 

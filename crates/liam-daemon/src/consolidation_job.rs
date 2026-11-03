@@ -12,7 +12,7 @@ use liam_daemon::config::Config;
 use liam_daemon::consolidation::hooks::{
     ConsolidationHookSet, ExtractionHook, SummaryHook, TierHook,
 };
-use liam_daemon::consolidation::manifest::RunOutcome;
+use liam_daemon::consolidation::manifest::{RunManifest, RunOutcome};
 use liam_daemon::consolidation::run::{
     Consolidator, Maintenance, Parts, ProbeRunner, StoreProbes, StoreReopener,
 };
@@ -143,8 +143,19 @@ fn summary_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn SummaryHo
     })))
 }
 
+/// Why a run asked for by hand did not produce a manifest.
+#[derive(Debug)]
+pub enum RunNowError {
+    /// Another run holds the in-process lock.
+    Busy,
+    Failed(anyhow::Error),
+}
+
 /// The consolidation job as the daemon runs it, on a schedule and at start.
 pub struct ConsolidationJob {
+    /// Held for the length of a run, so a scheduled tick and a run asked for by
+    /// hand never overlap.
+    running: tokio::sync::Mutex<()>,
     consolidator: Consolidator,
     store: Arc<SharedStore>,
     shutdown: Shutdown,
@@ -210,6 +221,7 @@ impl ConsolidationJob {
             parts,
         );
         Ok(Self {
+            running: tokio::sync::Mutex::new(()),
             consolidator,
             store: server.shared_store(),
             shutdown: shutdown.clone(),
@@ -265,25 +277,43 @@ impl ConsolidationJob {
     }
 
     /// One scheduled run. A failure is logged and left for the next tick, which
-    /// resumes the run from the step it stopped at.
+    /// resumes the run from the step it stopped at. A tick that meets a run in
+    /// progress is skipped.
     pub async fn tick(&self) -> Option<RunOutcome> {
         if self.shutdown.token().is_cancelled() {
             return None;
         }
-        match self.consolidator.consolidate(&self.store).await {
-            Ok(run) => {
-                report(&run.run_id, run.outcome);
-                run.outcome
-            }
+        let Ok(_running) = self.running.try_lock() else {
+            tracing::info!("a consolidation run is in progress, so this tick is skipped");
+            return None;
+        };
+        self.consolidate().await.ok().and_then(|run| run.outcome)
+    }
+
+    /// One run now, for the `consolidate` tool.
+    ///
+    /// # Errors
+    ///
+    /// `Busy` when a run is in progress, and `Failed` when the run did not
+    /// finish; the next call resumes it.
+    pub async fn run_now(&self) -> Result<RunManifest, RunNowError> {
+        let _running = self.running.try_lock().map_err(|_| RunNowError::Busy)?;
+        self.consolidate().await.map_err(RunNowError::Failed)
+    }
+
+    async fn consolidate(&self) -> anyhow::Result<RunManifest> {
+        let run = self.consolidator.consolidate(&self.store).await;
+        match &run {
+            Ok(run) => report(&run.run_id, run.outcome),
             Err(error) => {
                 tracing::error!(error = %format!("{error:#}"), "the consolidation run did not finish");
                 // A rollback that could not reopen the store leaves nothing to serve.
                 if self.store.get().await.is_err() {
                     self.shutdown.store_lost();
                 }
-                None
             }
         }
+        run
     }
 }
 

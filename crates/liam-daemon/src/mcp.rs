@@ -7,6 +7,11 @@
 //! from 2.x through rmcp 3.1.2, the version pinned in `Cargo.toml`; re-confirm
 //! against the rmcp version you pin before bumping again.
 
+mod admin;
+#[cfg(test)]
+mod admin_tests;
+mod consolidate;
+mod delete;
 pub mod facts;
 pub mod feedback;
 pub mod producer;
@@ -32,6 +37,7 @@ use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use self::delete::DeleteArgs;
 use self::facts::FactsArgs;
 use self::feedback::{Feedback, FeedbackArgs};
 use self::summaries::SummariesArgs;
@@ -41,9 +47,11 @@ use crate::ask::{
 };
 use crate::clusters::{narrow_groups, render_clusters};
 use crate::config::{
-    resolve_vocabulary, ExtractionConfig, DEFAULT_MAX_BASIS_IDS_RENDERED,
+    resolve_vocabulary, AdminConfig, ExtractionConfig, DEFAULT_MAX_BASIS_IDS_RENDERED,
     DEFAULT_MIN_SUMMARY_SIMILARITY,
 };
+use crate::consolidation_job::ConsolidationJob;
+use crate::deletion::DeletePreview;
 use crate::render;
 use crate::synthesis;
 use crate::tiering::usage::UsageRecorder;
@@ -614,6 +622,12 @@ pub struct MemoryServer {
     /// The verdict budget and this connection's issued handles, when tiering
     /// is on. A clone starts with no handles issued.
     feedback: Option<Feedback>,
+    /// Which producers may call `delete` and `consolidate`. Empty refuses all.
+    admin: Arc<AdminConfig>,
+    /// What `delete` asks, when the log is sealed.
+    delete_preview: Option<Arc<DeletePreview>>,
+    /// What `consolidate` runs.
+    consolidator: Option<Arc<ConsolidationJob>>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
@@ -698,6 +712,9 @@ impl MemoryServer {
             vocabulary: Arc::new(resolve_vocabulary(&ExtractionConfig::default())),
             usage: None,
             feedback: None,
+            admin: Arc::new(AdminConfig::default()),
+            delete_preview: None,
+            consolidator: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -736,6 +753,24 @@ impl MemoryServer {
     /// up to `max_issued` results shown to a connection.
     pub(crate) fn with_feedback(mut self, per_hour: u32, max_issued: usize) -> Self {
         self.feedback = Some(Feedback::new(per_hour, max_issued));
+        self
+    }
+
+    /// Lets the producers `admin` lists call `delete` and `consolidate`.
+    pub(crate) fn with_admin(mut self, admin: AdminConfig) -> Self {
+        self.admin = Arc::new(admin);
+        self
+    }
+
+    /// Answers `delete` from `preview`.
+    pub(crate) fn with_delete_preview(mut self, preview: Arc<DeletePreview>) -> Self {
+        self.delete_preview = Some(preview);
+        self
+    }
+
+    /// Runs `consolidate` on `job`.
+    pub(crate) fn with_consolidator(mut self, job: Arc<ConsolidationJob>) -> Self {
+        self.consolidator = Some(job);
         self
     }
 
@@ -1482,6 +1517,23 @@ impl MemoryServer {
     )]
     pub(crate) async fn summaries(&self, Parameters(args): Parameters<SummariesArgs>) -> String {
         summaries::read(self, args).await
+    }
+
+    #[tool(
+        description = "Count what deleting a subject or one event would destroy, per store, \
+                       without changing anything. Deleting happens with `liamd delete`, with the \
+                       daemon stopped. Only producers listed under [admin] may call it."
+    )]
+    pub(crate) async fn delete(&self, Parameters(args): Parameters<DeleteArgs>) -> String {
+        delete::read(self, args).await
+    }
+
+    #[tool(
+        description = "Run one consolidation now and report how it ended. Only producers listed \
+                       under [admin] may call it."
+    )]
+    pub(crate) async fn consolidate(&self) -> String {
+        consolidate::run(self).await
     }
 
     /// Acquires one slot from `generation_permits`, racing the shared request

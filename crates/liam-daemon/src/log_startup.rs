@@ -81,6 +81,32 @@ pub async fn open_store_with_log(
     })
 }
 
+/// The store over the log for a command that only deletes: no model is loaded
+/// and the log is not replayed, because a replay would embed what it restores.
+/// What the database has not applied yet is skipped by a later replay once its
+/// key is destroyed.
+pub async fn open_store_for_delete(
+    config: &Config,
+    database_path: &Path,
+    log_dir: &Path,
+) -> anyhow::Result<(DefaultGraph, Option<Arc<KeyRegistry>>)> {
+    let store = open_database_for_log(config, database_path, log_dir).await?;
+    let keys = event_log::open_key_registry(log_dir, &config.encryption)?;
+    let writer = event_log::open_writer(log_dir, config.log.wal())?;
+    let log = event_log::shared_log(writer, log_dir, config.log.bloom()?, None, keys.clone())?;
+    let store = store.with_log(log).await.with_context(|| {
+        format!(
+            "the event log in {} cannot be used with the database {}",
+            log_dir.display(),
+            database_path.display()
+        )
+    })?;
+    if keys.is_some() {
+        store.backfill_node_keys_if_empty().await?;
+    }
+    Ok((store, keys))
+}
+
 /// Copies the rows of a store that predates the log into it, before the
 /// embedder fingerprint is checked. Such a store has no fingerprint either, so
 /// the check refuses it, and `liam rebuild`, which the refusal names, needs a

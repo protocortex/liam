@@ -727,6 +727,18 @@ impl<B: Backend> Graph<B> {
         })
     }
 
+    /// What `resolve_target` would answer for `target` now, without fixing it in
+    /// the outbox, for a preview that must change nothing.
+    pub async fn preview_target(&self, target: &LineageTarget) -> Result<LineageTarget> {
+        let input = self.input_for(target).await?;
+        let doomed = resolve(&mut Pool(&self.backend), &input).await?;
+        Ok(LineageTarget {
+            node_ids: input.node_ids,
+            lineage_keys: doomed.lineages,
+            ..target.clone()
+        })
+    }
+
     /// The key group that sealed `node_id`, `None` when none is recorded.
     pub async fn key_of_node(&self, node_id: &NodeId) -> Result<Option<String>> {
         let rows = self

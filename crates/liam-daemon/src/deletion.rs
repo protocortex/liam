@@ -2,20 +2,19 @@
 //! Deleting what a client asked to forget. The log holds sealed rows, so a
 //! delete destroys keys; this module holds the commands that act on them.
 
+mod command;
 mod files;
 mod job;
 mod memory;
 mod migrate;
+mod preview;
 mod registry;
 mod scan;
 mod scrub;
-// `liamd delete` calls `request`, `cancel` and `dry_run` in the change that adds
-// it; until then only the tests do, and what they use stays alive through here.
-#[allow(dead_code)]
 mod service;
 mod target;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -27,9 +26,15 @@ use liam_store::{DefaultGraph, SystemClock};
 
 use crate::config::Config;
 use crate::{resolve_config_path, resolve_log_dir, storelock};
-use job::{job_file_path_for, DeadlineAlert, JobStore};
+pub use command::{run as delete_command, DeleteAction};
+pub(crate) use job::job_file_path_for;
+use job::{DeadlineAlert, JobStore};
 pub use memory::NodeState;
+pub use preview::DeletePreview;
+pub use scan::ScanError;
+pub use service::DeleteError;
 use service::{DeleteJobPending, DeleteService, StoreParts};
+pub use target::DeleteTarget;
 
 /// `liamd encrypt-log`: seals the plaintext events of the log in place. Takes
 /// the store lock, so it refuses to run beside a daemon.
@@ -249,6 +254,10 @@ mod tests {
         let error = result.expect_err("the start must be refused");
         let pending = error.downcast_ref::<DeleteJobPending>().expect("typed");
         assert_eq!(pending.job_ids, ["job-failed"]);
+        assert!(
+            pending.to_string().contains("liamd delete --resume"),
+            "{pending}"
+        );
     }
 
     #[tokio::test]
