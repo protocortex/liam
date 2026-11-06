@@ -741,25 +741,60 @@ const WARM_UP_TEXT: &str = "warm-up";
 pub enum EvalModel {
     Qwen3,
     BgeM3,
+    Onnx(&'static liam_model::OnnxModelSpec),
 }
 
 impl EvalModel {
-    pub const ALL: [EvalModel; 2] = [EvalModel::Qwen3, EvalModel::BgeM3];
+    /// Every model, the two dedicated loaders first, then the ONNX table.
+    pub fn all() -> impl Iterator<Item = EvalModel> {
+        [EvalModel::Qwen3, EvalModel::BgeM3]
+            .into_iter()
+            .chain(liam_model::ONNX_MODELS.iter().map(EvalModel::Onnx))
+    }
 
     /// The Hugging Face id the model loads under.
     pub fn id(self) -> &'static str {
         match self {
             EvalModel::Qwen3 => liam_model::QWEN3_EMBEDDING_MODEL_ID,
             EvalModel::BgeM3 => liam_model::BGE_M3_MODEL_ID,
+            EvalModel::Onnx(spec) => spec.id,
         }
     }
 
-    /// The embedding width to run at. BGE-M3 has one fixed width; Qwen3 runs
-    /// at the configured one (Matryoshka truncation).
+    /// The embedding width to run at. Qwen3 and Matryoshka ONNX models run at
+    /// the configured one (truncation); every other model has one fixed width.
     pub fn dims(self, configured: usize) -> usize {
         match self {
             EvalModel::Qwen3 => configured,
             EvalModel::BgeM3 => liam_model::BGE_M3_DIMS,
+            EvalModel::Onnx(spec) if spec.matryoshka => configured,
+            EvalModel::Onnx(spec) => spec.native_dims,
+        }
+    }
+
+    /// The width to run at when the caller asked for `requested`, or the
+    /// `configured` one when it did not. Refuses a request a fixed width model
+    /// would silently ignore.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `requested` differs from the width the model is fixed at.
+    pub fn resolve_dims(
+        self,
+        configured: usize,
+        requested: Option<usize>,
+    ) -> std::result::Result<usize, String> {
+        let Some(requested) = requested else {
+            return Ok(self.dims(configured));
+        };
+        let actual = self.dims(requested);
+        if actual == requested {
+            Ok(requested)
+        } else {
+            Err(format!(
+                "{} has a fixed output width of {actual}; it cannot run at {requested}",
+                self.id()
+            ))
         }
     }
 }
@@ -769,11 +804,10 @@ impl std::str::FromStr for EvalModel {
 
     /// Hugging Face ids are case-insensitive, so the match is too.
     fn from_str(id: &str) -> std::result::Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
+        Self::all()
             .find(|model| model.id().eq_ignore_ascii_case(id))
             .ok_or_else(|| {
-                let supported: Vec<&str> = Self::ALL.iter().map(|m| m.id()).collect();
+                let supported: Vec<&str> = Self::all().map(|m| m.id()).collect();
                 format!(
                     "unknown embedding model {id:?}; supported models: {}",
                     supported.join(", ")
@@ -2208,7 +2242,7 @@ mod tests {
 
     #[test]
     fn eval_model_round_trips_through_its_canonical_id() {
-        for model in EvalModel::ALL {
+        for model in EvalModel::all() {
             // Act
             let parsed: EvalModel = model.id().parse().expect("a canonical id parses");
 
@@ -2240,6 +2274,39 @@ mod tests {
         assert_eq!(EvalModel::BgeM3.dims(configured), liam_model::BGE_M3_DIMS);
     }
 
+    fn onnx(id: &str) -> EvalModel {
+        EvalModel::Onnx(liam_model::onnx_model_spec(id).expect("a listed model"))
+    }
+
+    #[test]
+    fn onnx_models_parse_and_run_at_native_or_configured_width() {
+        // Arrange
+        let nomic = onnx("nomic-ai/nomic-embed-text-v1.5");
+        let bge_small = onnx("BAAI/bge-small-en-v1.5");
+
+        // Act / Assert
+        assert_eq!("baai/bge-small-en-v1.5".parse::<EvalModel>(), Ok(bge_small));
+        assert_eq!(nomic.dims(256), 256);
+        assert_eq!(bge_small.dims(768), 384);
+    }
+
+    #[test]
+    fn a_requested_width_is_refused_when_the_model_is_fixed_at_another() {
+        // Arrange
+        let bge_small = onnx("BAAI/bge-small-en-v1.5");
+
+        // Act
+        let err = bge_small.resolve_dims(768, Some(256)).unwrap_err();
+
+        // Assert
+        assert!(err.contains("384") && err.contains("256"), "{err}");
+        assert_eq!(bge_small.resolve_dims(768, Some(384)), Ok(384));
+        assert_eq!(bge_small.resolve_dims(768, None), Ok(384));
+        assert_eq!(EvalModel::Qwen3.resolve_dims(768, Some(256)), Ok(256));
+        assert_eq!(EvalModel::Qwen3.resolve_dims(768, None), Ok(768));
+        assert!(EvalModel::BgeM3.resolve_dims(768, Some(512)).is_err());
+    }
+
     #[test]
     fn eval_config_selects_the_local_provider_model_and_width_for_each_model() {
         // Arrange
@@ -2248,7 +2315,7 @@ mod tests {
         base.embedder.model = "other".to_string();
         base.embedding_dims = 768;
 
-        for model in EvalModel::ALL {
+        for model in EvalModel::all() {
             // Act
             let config = eval_config(model, &base);
 

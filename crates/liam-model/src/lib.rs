@@ -11,6 +11,7 @@ mod blocking;
 pub mod embedder;
 pub mod error;
 pub mod llm;
+mod onnx;
 pub mod reranker;
 
 #[cfg(feature = "llama")]
@@ -20,12 +21,15 @@ pub use bge::{BGE_M3_DIMS, BGE_M3_MODEL_ID};
 pub use embedder::{Embedder, MockEmbedder, TextKind, QWEN3_EMBEDDING_MODEL_ID};
 pub use error::{ModelError, Result};
 pub use llm::{Llm, MockLlm};
+pub use onnx::{onnx_model_spec, OnnxModelSpec, ONNX_MODELS};
 pub use reranker::{IdentityReranker, Reranker};
 
 #[cfg(feature = "local")]
 pub use bge::BgeM3Embedder;
 #[cfg(feature = "local")]
 pub use embedder::FastEmbedEmbedder;
+#[cfg(feature = "local")]
+pub use onnx::OnnxEmbedder;
 #[cfg(feature = "local")]
 pub use reranker::FastEmbedReranker;
 

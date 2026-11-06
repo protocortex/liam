@@ -106,10 +106,16 @@ enum EvalCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 struct RetrievalArgs {
-    /// The embedding model to evaluate: Qwen/Qwen3-Embedding-0.6B or
-    /// BAAI/bge-m3.
+    /// The embedding model to evaluate: Qwen/Qwen3-Embedding-0.6B,
+    /// BAAI/bge-m3 or one of the ONNX models listed in the error for an
+    /// unknown id.
     #[arg(long, value_name = "ID")]
     model: EvalModel,
+
+    /// Run at this output width instead of `embedding_dims` from the config.
+    /// Only Qwen3 and Matryoshka models can run narrower than their own width.
+    #[arg(long, value_name = "N")]
+    dims: Option<usize>,
 
     /// Print the report as JSON instead of text. Latencies are milliseconds.
     #[arg(long)]
@@ -173,6 +179,7 @@ fn main() -> anyhow::Result<()> {
             command: EvalCommand::Retrieval(args),
         }) => {
             tracing::debug!(model = args.model.id(), "eval retrieval: starting");
+            let config = eval_config_for(&args, &config)?;
             let runtime = tokio::runtime::Runtime::new()?;
             let report = runtime.block_on(run_retrieval_eval(args.model, &config))?;
             print!("{}", render_eval_report(&report, args.json)?);
@@ -236,6 +243,16 @@ fn consolidate_exit_code(outcome: Option<RunOutcome>) -> i32 {
 
 /// The report as `liam eval retrieval` prints it: the harness's text table, or
 /// its serde shape as pretty JSON.
+/// `config` with the output width the eval run asked for.
+fn eval_config_for(args: &RetrievalArgs, config: &Config) -> anyhow::Result<Config> {
+    let mut config = config.clone();
+    config.embedding_dims = args
+        .model
+        .resolve_dims(config.embedding_dims, args.dims)
+        .map_err(anyhow::Error::msg)?;
+    Ok(config)
+}
+
 fn render_eval_report(report: &EvalReport, json: bool) -> anyhow::Result<String> {
     if !json {
         return Ok(report.render());
@@ -678,6 +695,33 @@ mod tests {
         // Assert
         assert_eq!(args.model, EvalModel::BgeM3);
         assert!(!args.json);
+        assert_eq!(args.dims, None);
+    }
+
+    #[test]
+    fn eval_refuses_a_width_the_model_is_fixed_away_from() {
+        // Arrange
+        let cli = parse(&[
+            "liam",
+            "eval",
+            "retrieval",
+            "--model",
+            "BAAI/bge-m3",
+            "--dims",
+            "256",
+        ]);
+        let Command::Eval(EvalArgs {
+            command: EvalCommand::Retrieval(args),
+        }) = cli.command
+        else {
+            panic!("expected the eval retrieval subcommand");
+        };
+
+        // Act
+        let error = eval_config_for(&args, &Config::default()).unwrap_err();
+
+        // Assert
+        assert!(error.to_string().contains("1024"), "{error}");
     }
 
     #[test]

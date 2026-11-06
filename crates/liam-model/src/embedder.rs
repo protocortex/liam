@@ -106,7 +106,7 @@ pub(crate) const EMBED_MAX_INPUT_TOKENS: usize = 8192;
 /// below build and run without the `local` feature or any downloaded
 /// weights).
 #[cfg(any(test, feature = "local"))]
-fn mrl_truncate(full: &[f32], dims: usize) -> Vec<f32> {
+pub(crate) fn mrl_truncate(full: &[f32], dims: usize) -> Vec<f32> {
     if dims >= full.len() {
         return full.to_vec();
     }
@@ -126,7 +126,7 @@ fn mrl_truncate(full: &[f32], dims: usize) -> Vec<f32> {
 /// width (Matryoshka only shrinks). Pure and gated the same as `mrl_truncate`,
 /// so both bounds are unit tested without a real model.
 #[cfg(any(test, feature = "local"))]
-fn validate_dims(model_id: &str, dims: usize, native_dims: usize) -> Result<()> {
+pub(crate) fn validate_dims(model_id: &str, dims: usize, native_dims: usize) -> Result<()> {
     if dims == 0 {
         return Err(crate::error::ModelError::Embed(format!(
             "embedding_dims must be greater than 0, got 0 for {model_id}"
@@ -151,8 +151,8 @@ fn parse_qwen3_config(model_id: &str, bytes: &[u8]) -> Result<fastembed::Qwen3Co
     serde_json::from_slice(bytes).map_err(|e| {
         crate::error::ModelError::Embed(format!(
             "{model_id}'s config.json does not parse as a Qwen3 embedding config ({e}); \
-             sharded and Qwen3-VL checkpoints are not supported by this loader, and the \
-             only non-Qwen3 model id supported is {}",
+             sharded and Qwen3-VL checkpoints are not supported by this loader; the \
+             other supported model ids are {} and the ONNX models in `ONNX_MODELS`",
             crate::BGE_M3_MODEL_ID
         ))
     })

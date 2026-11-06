@@ -36,6 +36,9 @@ All notable changes to LIAM are recorded here. The format follows
 - Utility-based tiering, with a `feedback` tool and result handles, and a cold search arm for
   demoted memories.
 - `liam eval retrieval`, a BGE-M3 embedder option, and a pinned embedder fingerprint.
+- Seven small ONNX embedders as `embedder.model` options (bge-small, MiniLM L6 and L12, Arctic
+  xs and s, nomic v1.5, multilingual e5 small) and `liam eval retrieval --dims`. The default
+  embedder is unchanged.
 
 - `remember` accepts an optional `episode` field, so a client can write several related facts,
   the entities they mention, and the edges between them in one call. Everything in the episode
