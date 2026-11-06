@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
 # Download the published netinstall archive again and check it the way a user
 # and the Homebrew tap read it. Run after the release job, on any OS with curl,
 # tar and sha256sum or shasum.
