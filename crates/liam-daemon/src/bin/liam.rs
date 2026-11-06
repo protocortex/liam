@@ -35,7 +35,9 @@ use liam_daemon::embedder_fingerprint::{self, EmbedderFingerprint};
 use liam_daemon::event_log;
 use liam_daemon::fetch;
 use liam_daemon::models::{self, StoreEmbedder};
-use liam_daemon::retrieval_eval::{run_retrieval_eval, EvalModel, EvalReport};
+use liam_daemon::retrieval_eval::{
+    run_embedder_bench, run_retrieval_eval, BenchReport, EvalModel, EvalReport,
+};
 use liam_daemon::storelock::StoreLock;
 use liam_daemon::telemetry;
 
@@ -102,6 +104,10 @@ enum EvalCommand {
     /// Score retrieval quality, embedder latency and throughput for one
     /// embedding model. Downloads the model on first use.
     Retrieval(RetrievalArgs),
+    /// Score one embedding model alone on the larger embedder benchmark:
+    /// retrieval quality, load time, query latency and batch throughput.
+    /// Downloads the model on first use.
+    Embedder(RetrievalArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -185,6 +191,16 @@ fn main() -> anyhow::Result<()> {
             print!("{}", render_eval_report(&report, args.json)?);
             Ok(())
         }
+        Command::Eval(EvalArgs {
+            command: EvalCommand::Embedder(args),
+        }) => {
+            tracing::debug!(model = args.model.id(), "eval embedder: starting");
+            let config = eval_config_for(&args, &config)?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let report = runtime.block_on(run_embedder_bench(args.model, &config))?;
+            print!("{}", render_bench_report(&report, args.json)?);
+            Ok(())
+        }
     }
 }
 
@@ -251,6 +267,16 @@ fn eval_config_for(args: &RetrievalArgs, config: &Config) -> anyhow::Result<Conf
         .resolve_dims(config.embedding_dims, args.dims)
         .map_err(anyhow::Error::msg)?;
     Ok(config)
+}
+
+/// The embedder benchmark as `liam eval embedder` prints it: text or pretty JSON.
+fn render_bench_report(report: &BenchReport, json: bool) -> anyhow::Result<String> {
+    if !json {
+        return Ok(report.render());
+    }
+    let mut text = serde_json::to_string_pretty(report).context("serializing the report")?;
+    text.push('\n');
+    Ok(text)
 }
 
 fn render_eval_report(report: &EvalReport, json: bool) -> anyhow::Result<String> {
@@ -699,22 +725,48 @@ mod tests {
     }
 
     #[test]
+    fn eval_embedder_takes_a_model_and_a_width() {
+        // Arrange / Act
+        let cli = parse(&[
+            "liam",
+            "eval",
+            "embedder",
+            "--model",
+            "Qwen/Qwen3-Embedding-0.6B",
+            "--dims",
+            "256",
+        ]);
+
+        // Assert
+        let Command::Eval(EvalArgs {
+            command: EvalCommand::Embedder(args),
+        }) = cli.command
+        else {
+            panic!("expected the eval embedder subcommand");
+        };
+        assert_eq!(args.model, EvalModel::Qwen3);
+        assert_eq!(args.dims, Some(256));
+        let config = eval_config_for(&args, &Config::default()).unwrap();
+        assert_eq!(config.embedding_dims, 256);
+    }
+
+    #[test]
     fn eval_refuses_a_width_the_model_is_fixed_away_from() {
         // Arrange
         let cli = parse(&[
             "liam",
             "eval",
-            "retrieval",
+            "embedder",
             "--model",
             "BAAI/bge-m3",
             "--dims",
             "256",
         ]);
         let Command::Eval(EvalArgs {
-            command: EvalCommand::Retrieval(args),
+            command: EvalCommand::Embedder(args),
         }) = cli.command
         else {
-            panic!("expected the eval retrieval subcommand");
+            panic!("expected the eval embedder subcommand");
         };
 
         // Act

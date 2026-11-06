@@ -1,0 +1,301 @@
+id	text
+a001	ledger-core sets the Postgres pool maximum to 40 connections through the env var LEDGER_DB_POOL_MAX, sized for six replicas against a 300 connection server limit.
+a002	ingest-gateway sets the Postgres pool maximum to 25 connections through the env var INGEST_DB_POOL_MAX because its queries are short and mostly inserts.
+a003	notifier sets the Postgres pool maximum to 10 connections through the env var NOTIFIER_DB_POOL_MAX since it only polls the outbox table.
+a004	recon-jobs opens at most 8 Postgres connections per worker process via RECON_DB_POOL_MAX, because long reconciliation reads hold connections for minutes.
+a005	ledger-core runs every Postgres session with statement_timeout set to 5 seconds, applied in the connection customizer of the pool setup code.
+a006	ingest-gateway uses a Postgres statement_timeout of 2 seconds so slow inserts fail fast and are retried by the sender.
+a007	notifier sets Postgres statement_timeout to 3 seconds on its outbox polling queries.
+a008	recon-jobs raises Postgres statement_timeout to 120 seconds for its nightly reconciliation queries, set with SET LOCAL inside each transaction.
+a009	ledger-core serves its HTTP API on port 8080 inside the container.
+a010	ingest-gateway terminates TLS and serves its public HTTP API on port 8443 inside the container.
+a011	notifier exposes its internal HTTP API on port 9090 inside the container, reachable only from the cluster network.
+a012	rate-limiter serves its gRPC decision API on port 7070 inside the container.
+a013	The exchange rate cache in Redis uses a TTL of 300 seconds under key prefix fx:rate:, so rates are never older than five minutes.
+a014	The customer profile cache in Redis has a TTL of 60 seconds under key prefix cust:profile: to keep billing address edits visible quickly.
+a015	Rendered invoice PDFs are cached in Redis for 3600 seconds under key prefix inv:pdf: and invalidated when the invoice is amended.
+a016	The tax rate table cache in Redis lives for 86400 seconds under key prefix tax:table:, refreshed by a daily job.
+a017	rate-limiter allows the free tier 60 requests per minute per API key, enforced with a token bucket.
+a018	rate-limiter allows the pro tier 600 requests per minute per API key, with a burst allowance of 100 tokens.
+a019	rate-limiter allows the enterprise tier 6000 requests per minute per API key, and customers may ask support for higher limits.
+a020	The webhook receiver endpoint in ingest-gateway is limited to 30 requests per minute per source IP, regardless of API key tier.
+a021	The invoice_render queue retries a failed job up to 5 times with exponential backoff starting at 10 seconds before dead lettering it.
+a022	The email_send queue retries a failed job up to 8 times, because SMTP providers often fail transiently, before moving it to the dead letter table.
+a023	The recon_export queue retries a failed job only 3 times, since each attempt re-reads a large ledger snapshot and is expensive.
+a024	The webhook_delivery queue retries up to 12 times over about 24 hours with exponential backoff, matching the retry promise in the public docs.
+a025	ledger-core reads the Postgres connection string from the env var LEDGER_DATABASE_URL, which in deployment is injected from a Kubernetes secret.
+a026	ingest-gateway reads the PEM public key used to verify JWTs from the env var INGEST_JWT_PUBLIC_KEY.
+a027	notifier reads the SMTP connection URL, including credentials, from the env var NOTIFIER_SMTP_URL.
+a028	rate-limiter reads its Redis address from the env var RATE_LIMITER_REDIS_URL and refuses to start without it.
+a029	The invoices table has a composite index on (customer_id, issued_at DESC) created in migration 0042, used by the customer invoice list endpoint.
+a030	The ledger_entries table has a composite index on (account_id, posted_at) created in migration 0017 for balance range queries.
+a031	The payments table has a unique index on external_ref, created in migration 0058, to make payment ingestion idempotent.
+a032	The audit_log table uses a BRIN index on created_at, created in migration 0063, because the table is append only and very large.
+a033	The CI job cargo-test for the Rust workspace has a timeout of 20 minutes in the GitHub Actions workflow.
+a034	The CI job web-console-e2e, which runs Playwright, has a timeout of 30 minutes in the GitHub Actions workflow.
+a035	The CI job recon-pytest for the Python data jobs has a timeout of 10 minutes in the GitHub Actions workflow.
+a036	The CI job docker-build that builds all service images has a timeout of 25 minutes in the GitHub Actions workflow.
+a037	In production, ledger-core runs 6 replicas, set in deploy/helm/ledger-core/values-prod.yaml.
+a038	In production, ingest-gateway runs 10 replicas, set in deploy/helm/ingest-gateway/values-prod.yaml, because it takes the bulk of inbound traffic.
+a039	In production, notifier runs 3 replicas, set in deploy/helm/notifier/values-prod.yaml.
+a040	In production, rate-limiter runs 4 replicas, set in deploy/helm/rate-limiter/values-prod.yaml, with a pod anti-affinity rule across zones.
+a041	Access tokens issued by the Quillbook auth service expire after 15 minutes.
+a042	Refresh tokens expire after 14 days and are rotated on every use.
+a043	Service-to-service tokens between backend crates expire after 5 minutes and are minted by the internal signer.
+a044	Password reset links expire after 30 minutes and can be used only once.
+a045	The invoice_render queue has a visibility timeout of 90 seconds, longer than the p99 render time of 40 seconds.
+a046	The email_send queue has a visibility timeout of 30 seconds.
+a047	The recon_export queue has a visibility timeout of 600 seconds because exports stream large files.
+a048	The webhook_delivery queue has a visibility timeout of 15 seconds, matching the 10 second HTTP client timeout plus margin.
+a049	POST /v1/invoices in ledger-core accepts bodies up to 256 KiB, enforced by a DefaultBodyLimit layer.
+a050	POST /v1/ingest/batch in ingest-gateway accepts bodies up to 8 MiB.
+a051	POST /v1/webhooks/receive accepts bodies up to 64 KiB.
+a052	The CSV upload endpoint /v1/imports accepts files up to 50 MiB and streams them to object storage.
+a053	We chose sqlx over Diesel for ledger-core because compile-time checked queries run against a live schema and the team prefers writing plain SQL.
+a054	Money amounts are stored as BIGINT minor units plus a three letter currency column rather than NUMERIC, to avoid rounding bugs and speed up sums.
+a055	Migrations are forward only and we never write down migrations, because down scripts are rarely tested and drift from reality; rollbacks ship as a new corrective migration.
+a056	Destructive column drops are split across two releases: first stop reading and writing the column, then drop it later, so old pods still running during a rollout do not fail.
+a057	Adding an index on a large table must use CREATE INDEX CONCURRENTLY, which cannot run in a transaction, so the migration file starts with the sqlx no-transaction marker comment.
+a058	Migration files live in crates/ledger-core/migrations and are named with a four digit sequence prefix such as 0042_add_invoice_customer_index.sql.
+a059	The function run_pending_migrations in crates/ledger-core/src/db/migrate.rs applies migrations at startup only when QUILLBOOK_AUTO_MIGRATE is true, which is off in production.
+a060	In production, migrations run as a separate Kubernetes Job named ledger-migrate before the rollout, not from the application pods.
+a061	Bug: a deadlock when posting ledger entries happened because two transactions locked the debit and credit accounts in opposite order; the fix is to lock account rows ordered by account id.
+a062	Bug: the sqlx offline cache in the .sqlx directory went stale after a migration and CI failed with a missing query error; run cargo sqlx prepare --workspace and commit the result.
+a063	Bug: invoice timestamps were shifted by hours because the column was TIMESTAMP without time zone; migration 0051 changed it to TIMESTAMPTZ and all code now uses UTC.
+a064	Ledger entries are immutable and corrections are written as reversing entries, to keep an auditable history; a database trigger named forbid_ledger_update enforces it.
+a065	recon-jobs uses psycopg 3 with the DSN in RECON_REPLICA_URL so that its long reads go to the read replica and never touch the primary.
+a066	Gotcha: the read replica lags up to 2 seconds, so ledger-core reads that follow a write must use the primary pool, obtained with the method Db::primary.
+a067	The struct LedgerRepo in crates/ledger-core/src/db/ledger_repo.rs wraps all SQL for posting and reading ledger entries.
+a068	Test databases are created per test by the helper fn spawn_test_db in crates/ledger-core/tests/common/mod.rs, which clones a template database for speed.
+a069	Preference: SQL migrations use uppercase keywords and snake_case identifiers, with one logical change per statement.
+a070	Daily invoice sequence rollover takes pg_advisory_lock with key 7411 so that only one instance runs it, because multiple replicas would otherwise roll over twice.
+a071	We use axum for the ledger-core and ingest-gateway HTTP servers because it integrates with tower middleware and tokio, which the team already uses.
+a072	API errors follow RFC 7807 problem details, serialized by the ApiError type in crates/ledger-core/src/http/error.rs with content type application/problem+json.
+a073	The middleware function require_auth in crates/ingest-gateway/src/http/auth.rs validates the bearer JWT and inserts a Principal into request extensions.
+a074	Gotcha: JWT validation failed intermittently because the validator used zero leeway; setting leeway to 30 seconds on the Validation struct fixed clock skew between pods.
+a075	API keys are stored as argon2 hashes, and only the first 8 characters, the key prefix, are kept in plain text for lookup.
+a076	Bug: web-console login looped forever because the refresh cookie used SameSite=Strict, which browsers drop on the cross-site redirect from the identity provider; we switched to Lax.
+a077	Clients send the Idempotency-Key header; the middleware idempotency_layer records it in table idempotency_keys with a 24 hour expiry and replays the stored response.
+a078	Public API versioning lives in the URL path (/v1/), not in a header, so that curl examples in the docs stay simple.
+a079	Allowed CORS origins come from the env var QUILLBOOK_CORS_ORIGINS, a comma separated list; wildcard origins are rejected at startup.
+a080	Bug: ingest-gateway returned 502 under load because ledger-core closes idle keep-alive connections after 5 seconds while the gateway pool idle timeout was 90 seconds; we set the pool idle timeout to 4 seconds.
+a081	The TypeScript API client in web-console is generated from openapi/quillbook.yaml by running pnpm gen:api, with output in src/api/generated.
+a082	Preference: handlers return Result<Json<T>, ApiError> and never call unwrap or expect in request paths.
+a083	The web-console keeps the access token in memory only, never in localStorage, to limit XSS exposure; refresh happens through an httpOnly cookie.
+a084	List endpoints use opaque cursors produced by encode_cursor in crates/ledger-core/src/http/pagination.rs, not page numbers, with a default page size of 50 and a maximum of 200.
+a085	Webhook payloads are signed with HMAC-SHA256 in the header X-Quillbook-Signature; the signing code is the function sign_webhook in crates/notifier/src/webhook/sign.rs.
+a086	Gotcha: in axum the Json body extractor must be the last argument of a handler, otherwise compilation fails with an obscure Handler trait bound error.
+a087	We do not use mutual TLS between services; services check signed service tokens instead, because the service mesh already encrypts in-cluster traffic.
+a088	The rate limiter uses a token bucket written as a Redis Lua script in crates/rate-limiter/src/bucket.lua, so the check and the decrement are atomic.
+a089	The struct TokenBucketConfig in crates/rate-limiter/src/config.rs holds capacity and refill_per_sec for each pricing tier.
+a090	Bug: a cache stampede hit the exchange rate provider every five minutes when the key expired; fixed with a single-flight lock key and 10 percent random jitter on the TTL.
+a091	The rate-limiter returns the headers X-RateLimit-Remaining and Retry-After; clients must honor Retry-After when they receive a 429 response.
+a092	If Redis is unreachable the rate-limiter fails open and logs a warning, because blocking all invoicing traffic is worse than briefly missing limits.
+a093	The function cache_key in crates/ledger-core/src/cache/keys.rs builds every Redis key and prefixes it with the environment name, so staging and production never collide on a shared cluster.
+a094	Gotcha: after a Redis failover the redis crate ConnectionManager reconnected silently and Lua calls failed with NOSCRIPT; the code now retries once after SCRIPT LOAD.
+a095	web-console uses TanStack Query with a staleTime of 30 seconds for invoice lists.
+a096	Customer data caching uses write-through invalidation, deleting the key in the same function that updates the row, because relying on TTL alone showed stale addresses on invoices.
+a097	Preference: never put personal customer data in cache keys; use the numeric customer id only.
+a098	Rate limiting is skipped for internal callers that carry a valid service token, decided by the function is_internal_principal.
+a099	The job queue is built on Postgres with SELECT FOR UPDATE SKIP LOCKED instead of a separate broker, giving one fewer piece of infrastructure and letting jobs be enqueued inside the business transaction.
+a100	The Postgres table job_queue holds pending jobs, and the worker loop is the function run_worker in crates/notifier/src/worker.rs.
+a101	Bug: duplicate emails were sent because a job outlived its visibility timeout and a second worker picked it up; the fix is a heartbeat that extends the lease every 10 seconds.
+a102	Jobs that exhaust their retries land in table job_dead_letter and can be requeued with the command quillbook-admin jobs requeue --queue NAME --id JOB_ID.
+a103	recon-jobs runs nightly at 02:30 UTC as a Kubernetes CronJob named recon-nightly with concurrencyPolicy set to Forbid.
+a104	Gotcha: the CronJob recon-nightly skipped runs around daylight saving changes until the schedule was pinned with timeZone: UTC.
+a105	Job handlers must be idempotent, because queue delivery is at least once; each handler receives a job_id that is used as the dedupe key in the target table.
+a106	The Python module recon_jobs/tasks/match_payments.py contains the function match_payments_to_invoices, which pairs bank statement lines with open invoices.
+a107	Bug: a recon-jobs worker ran out of memory because pandas read the entire ledger export at once; it now reads in chunks of 50000 rows using the chunksize argument.
+a108	Worker concurrency in notifier is set by the env var NOTIFIER_WORKER_CONCURRENCY, which defaults to 16.
+a109	Job payloads are JSON with a schema_version field, and handlers must ignore unknown fields so payloads can evolve safely.
+a110	The scheduler function schedule_with_jitter adds up to 30 seconds of random delay to scheduled jobs to avoid a thundering herd at the top of the minute.
+a111	Retry delay is computed by the function next_delay in crates/notifier/src/retry.rs as base times 2 to the power of attempt, capped at 1 hour, with full jitter.
+a112	We deploy with Helm charts and Argo CD, where a git push to the deploy repository triggers the sync, so every production change is auditable in git.
+a113	Docker images for Rust services are built with cargo-chef in a multi-stage Dockerfile to cache dependency compilation, cutting CI builds from 14 minutes to 4.
+a114	Final service images use gcr.io/distroless/cc-debian12 as the base image and run as the non-root user 65532.
+a115	Gotcha: musl builds of ledger-core had slow memory allocation, so we build for the gnu target and use jemalloc through the tikv-jemallocator crate.
+a116	GitHub Actions uses Swatinem/rust-cache keyed on the Cargo.lock hash, and the cache is saved only on main to keep the storage quota small.
+a117	Bug: the CI e2e job flaked on slow browser downloads; the Playwright browser directory ~/.cache/ms-playwright is now cached between runs.
+a118	Staging deploys automatically on every merge to main, while production deploys require a manual approval on the GitHub environment named production.
+a119	Preference: commit messages follow Conventional Commits, and PR titles are checked by the workflow pr-title.yml.
+a120	The command make ci-local runs the same fmt, clippy, test and lint steps as CI; run it before pushing.
+a121	Terraform for cloud infrastructure lives in infra/terraform, with a separate state file per environment stored in an S3 bucket with DynamoDB locking.
+a122	The staging database is restored from a scrubbed production snapshot every Sunday, with emails hashed by scripts/scrub_snapshot.py, to test migrations on realistic data volume without exposing customer data.
+a123	Kubernetes readiness probes for Rust services hit /readyz, which checks the DB pool and Redis, while liveness probes hit /healthz, which checks nothing external.
+a124	Gotcha: rollouts dropped requests because pods got SIGTERM before the load balancer deregistered them; we added a preStop sleep of 15 seconds and graceful shutdown in axum.
+a125	Secrets are synced by External Secrets Operator from AWS Secrets Manager; developers never commit .env files, only .env.example.
+a126	The Rust toolchain is pinned to 1.82.0 in rust-toolchain.toml, and clippy runs with -D warnings in CI.
+a127	The web-console is built with Vite and served as static files from a CDN, with hashed asset filenames for immutable caching.
+a128	Preference: Python code in recon-jobs is formatted with ruff format and type checked with mypy in strict mode.
+a129	Preference: web-console uses pnpm, not npm or yarn; the lockfile is pnpm-lock.yaml.
+a130	The workflow .github/workflows/release.yml tags images with the git SHA and, on version tags, with the semantic version.
+a131	The Grafana dashboard folder for Quillbook infrastructure is named Quillbook Platform and is owned by the platform team.
+a132	The staging cluster uses spot instances for its worker nodes to save cost.
+a133	Dependabot opens dependency update pull requests every Monday morning for the Cargo and npm ecosystems.
+a134	The on-call handover page lives in the Platform wiki space and is updated every Friday afternoon.
+a135	The legacy table invoice_notes_old is scheduled for removal after Q1 and should not receive any new code.
+a136	The ingest-gateway README shows a local curl example that sets the header x-debug-trace to 1.
+a137	The load test scenario file perf/k6/ingest_burst.js ramps up to 500 virtual users.
+a138	Service logs are emitted as JSON, with the field service set to the crate name.
+a139	The shared cargo target directory on CI runners is cleaned weekly by a scheduled cleanup workflow.
+a140	The production Postgres major version is 15, with an upgrade to 16 planned for next year.
+a141	The notifier crate once supported SMS through a vendor, which was removed in 2024 and left behind an unused feature flag named sms-legacy.
+a142	Terraform modules are labeled with the cost center billing-platform.
+a143	The public status page is hosted outside the main cluster so that it stays up during outages.
+a144	The Node version for web-console builds is 20 LTS, declared in the .nvmrc file.
+a145	The VPN is required to reach the staging Grafana but not the staging API.
+a146	Bug: invoice numbers had gaps after rollbacks because the sequence advanced inside rolled back transactions; numbers are now allocated from a table invoice_counters using a row lock, which is gapless.
+a147	The function enqueue_in_tx in crates/notifier/src/enqueue.rs inserts a job inside the caller's open transaction, so the job exists only if the business change commits.
+a148	The cache Redis cluster uses maxmemory-policy allkeys-lru, but the rate limiter runs on a separate Redis instance with noeviction so that token buckets are never silently dropped.
+a149	Gotcha: the tower_http TimeoutLayer answers 408 Request Timeout by default, so ledger-core maps timeouts to 504 Gateway Timeout in the function map_timeout_response to match client retry rules.
+a150	Preference: use the tracing crate with #[instrument] on service functions, never println!, and include request_id in spans.
+b001	Invoice line totals are rounded with RoundingMode::HalfEven in ledger-core::money::round_line, because banker's rounding avoids a systematic upward bias across thousands of lines.
+b002	Tax amounts are rounded with RoundingMode::HalfUp in ledger-core::money::round_tax, since the statutory VAT rules of every supported jurisdiction specify half up.
+b003	Currency conversion in ledger-core::fx::convert_minor truncates with RoundingMode::Down, so a converted amount never exceeds the value implied by the quoted rate.
+b004	Late fee interest in ledger-core::interest::accrue_late_fee rounds with RoundingMode::Up to the next minor unit, so the customer is never undercharged by a fraction.
+b005	Money is stored as i64 minor units inside the Money struct next to a Currency enum; floats are banned everywhere in ledger-core to avoid binary rounding errors.
+b006	Currency codes follow ISO 4217 and Currency::minor_unit_exponent() returns the decimals: JPY has exponent 0 and KWD has exponent 3, so never assume two decimals.
+b007	JournalEntry::validate_balanced checks that total debits equal total credits per currency before posting; an unbalanced entry returns LedgerError::Unbalanced and nothing is written.
+b008	Posted journal entries are immutable. Corrections go through reverse_entry, which creates a mirror entry with debits and credits swapped and links it through the reverses_id column.
+b009	Account balances are never stored as a column; they are derived by summing postings, with a materialized table balance_snapshot refreshed nightly for read speed.
+b010	Each ledger Account is bound to exactly one currency at creation; posting code rejects a line in a different currency with LedgerError::CurrencyMismatch.
+b011	Bug: invoice totals were off by one cent because discounts were applied per line after rounding. The fix applies the discount to the unrounded Decimal and rounds once at the end of the line.
+b012	Gotcha: Money::from_str accepts "1,234.50" with thousands separators but breaks on comma decimal locales, so always send amounts from the API as strings in canonical dot form.
+b013	Decision: invoice numbers come from a Postgres sequence per tenant, not a UUID, because auditors require ascending numbering without gaps. The sequence is wrapped by next_invoice_number.
+b014	The function ledger-core::money::split_evenly distributes remainder cents to the first N lines using the largest remainder method, so splits always sum exactly to the original total.
+b015	Decision: the fx rate is snapshotted onto each journal entry in the column fx_rate_micros at posting time, so later rate changes never alter historical balances.
+b016	The default invoice currency for a tenant is read from tenants.base_currency; a missing value falls back to USD in ledger-core::tenant::default_currency.
+b017	Credit notes are stored as negative quantity invoice lines instead of a separate entity, a decision made so the same tax and rounding code path handles both.
+b018	Intermediate precision for tax math is 28 digits using the rust_decimal crate; values are narrowed to i64 minor units only at the end by to_minor_units.
+b019	The maximum allowed Money amount is 9_000_000_000_000_000 minor units, leaving headroom below i64::MAX; Money::checked_add returns None on overflow.
+b020	Rounding mode is a field on the TaxRule struct, so jurisdictions with unusual rules, such as Swiss cash rounding to five rappen, can override the default without code changes.
+b021	Period close writes a row to period_lock; posting into a locked period fails with LedgerError::PeriodClosed unless the entry is flagged as an adjustment by a user with the controller role.
+b022	The ledger-core README includes a glossary that maps the words posting, entry and journal to their Rust types.
+b023	Money module docs live in crates/ledger-core/src/money/mod.rs and include doctests showing Money::from_minor(1999, Currency::EUR).
+b024	Opening balances for migrated customers are loaded with the one time command cargo run -p ledger-core --bin import_opening.
+b025	CI fails the ledger-core crate if line coverage from cargo-llvm-cov drops below 90 percent; this is the strictest gate because the crate holds all money logic.
+b026	The ingest-gateway coverage gate is 80 percent line coverage via cargo-llvm-cov, lower than the ledger crate since much of the code is thin HTTP glue.
+b027	The web-console Vitest coverage threshold is 75 percent statements, configured in vitest.config.ts under test.coverage.thresholds.
+b028	recon-jobs uses pytest-cov and requires 85 percent coverage, set with --cov-fail-under=85 in the addopts of pyproject.toml.
+b029	Property tests in ledger-core use proptest; the default case count is 256 and the nightly workflow raises it with PROPTEST_CASES=2000.
+b030	ingest-gateway integration tests need the Postgres container from docker compose up -d pg-test, which listens on port 5433 to avoid clashing with the dev database.
+b031	rate-limiter tests call tokio::time::pause so token refill can be moved forward with tokio::time::advance instead of sleeping in real time.
+b032	notifier tests mock the outbound SMTP and webhook endpoints with the wiremock crate; no test may open a real network socket.
+b033	Snapshot tests for invoice PDFs use the insta crate; review changes with cargo insta review and never accept snapshots blindly.
+b034	Flaky test root cause: ledger-core tests shared one database schema and ran in parallel. The fix creates a unique schema for every test in fixtures::TestDb::new.
+b035	web-console component tests use React Testing Library with user-event; prefer getByRole queries over getByTestId so tests follow accessibility semantics.
+b036	End to end tests for web-console run with Playwright against a mocked API using pnpm e2e, and traces are uploaded only when a test fails.
+b037	recon-jobs tests marked with @pytest.mark.slow are skipped by default; run them with pytest -m slow before cutting a release.
+b038	Decision: CI uses cargo-nextest instead of cargo test because it runs each test in its own process and cut total wall time roughly in half.
+b039	Decision: ledger-core tests never mock the database and run against real Postgres, because a mock and production divergence once let a broken migration reach production.
+b040	The Python fixture ledger_db in recon-jobs/tests/conftest.py loads a small CSV of journal entries into SQLite for fast unit tests.
+b041	Bug: Vitest tests passed locally but failed in CI because the time zone differed. The fix sets TZ=UTC in the globalSetup of vitest.config.ts.
+b042	The test data generator crates/ledger-core/tests/support/factories.rs names fake customers after Greek letters.
+b043	Mutation testing with cargo-mutants was tried once on ledger-core::money and produced a long report that nobody maintained.
+b044	The fuzz target fuzz_parse_money in crates/ledger-core/fuzz/ exercises Money::from_str; run it with cargo fuzz run fuzz_parse_money.
+b045	Mock Service Worker handlers for web-console live in src/mocks/handlers.ts and are shared by Vitest and Storybook.
+b046	OpenTelemetry trace sampling for ledger-core is 1.0, so every posting is traced, because posting volume is low and audit investigations need complete traces.
+b047	ingest-gateway uses parent based sampling with ratio 0.05, since it handles the highest request volume and tracing everything would be too costly.
+b048	notifier samples 0.20 of traces, raised from 0.05 after delivery retry bugs proved hard to diagnose with sparse data.
+b049	web-console browser tracing samples 0.01 of page loads through the OpenTelemetry web SDK to limit telemetry volume.
+b050	The histogram ledger_posting_duration_seconds records the time to post a journal entry, with buckets running from 5 ms to 5 s.
+b051	The counter gateway_ingest_requests_total is labeled by status_class (2xx, 4xx, 5xx) for the ingest-gateway HTTP endpoint.
+b052	The counter rate_limiter_rejections_total is labeled by tenant_tier and increments each time a request is denied with HTTP 429.
+b053	The counter notifier_delivery_failures_total is labeled by channel (email, webhook, sms) and drives the delivery failure alert.
+b054	The gauge recon_job_last_success_timestamp is set at the end of each recon-jobs run; the stale job alert fires when it is older than 26 hours.
+b055	Audit logs are retained for 7 years in write once object storage to satisfy financial record keeping rules.
+b056	Application logs are kept for 30 days in Loki before they are deleted.
+b057	HTTP access logs are retained for 90 days to support abuse investigations.
+b058	Debug level logs are kept for only 7 days because they can contain verbose payload fragments.
+b059	Logging uses the tracing crate with tracing-subscriber JSON output; every span carries tenant_id and request_id fields added by the middleware RequestContextLayer.
+b060	Rule: never log full invoice bodies or bank account numbers; log only the invoice id and the last four digits, enforced by the Redacted<T> wrapper type.
+b061	Decision: logs are JSON in production but pretty printed in development, switched by QUILLBOOK_LOG_FORMAT=json or pretty, since humans read local output and Loki parses production output.
+b062	Bug: trace ids were missing in notifier logs because tasks were started with tokio::spawn without a span. Use tokio::spawn(fut.in_current_span()) instead.
+b063	The Grafana dashboard JSON for ledger metrics is ops/grafana/ledger-overview.json and is provisioned automatically on deploy.
+b064	Metric labels must never have high cardinality values such as invoice_id; Prometheus memory blew up once when customer_id was added to a histogram.
+b065	Alert: if the p99 of ledger_posting_duration_seconds stays above 750 ms for 10 minutes, the engineer on call is paged.
+b066	Python recon-jobs logs through structlog configured in recon_jobs/logging_setup.py, emitting the same JSON field names as the Rust services.
+b067	web-console errors are reported to Sentry by initErrorReporting in src/observability/sentry.ts, and source maps are uploaded during the CI build.
+b068	The runbook for observability alerts is kept in the team wiki under the title Pager playbook.
+b069	The Grafana theme for Quillbook dashboards uses the dark palette with teal accents.
+b070	Trace context propagates between services through the W3C traceparent header, and ingest-gateway forwards it on every internal call.
+b071	The invoice form validates with react-hook-form and the zod schema in src/forms/invoiceSchema.ts; line amounts are strings parsed to minor units on submit.
+b072	The customer form uses the zod schema in src/forms/customerSchema.ts, which requires a valid ISO 3166 country code and a VAT number format check.
+b073	The payment form validates against src/forms/paymentSchema.ts, which forbids amounts above the open invoice balance.
+b074	The tenant settings form uses src/forms/settingsSchema.ts, where the base currency field becomes immutable once the first invoice is posted.
+b075	Server data in web-console is managed with TanStack Query, while UI state that never leaves the browser lives in Zustand stores under src/state/.
+b076	Decision: we chose Zustand over Redux Toolkit because the console shares very little state between screens and the Redux boilerplate was not worth it.
+b077	The build tool is Vite; the dev server runs on port 5173 and proxies /api to the local ingest-gateway on port 8080.
+b078	Production bundle budget: the main chunk must stay under 250 KB gzipped, and the CI step pnpm size-limit fails otherwise.
+b079	Money in the UI is formatted by formatMoney in src/lib/formatMoney.ts, which uses Intl.NumberFormat with the tenant locale.
+b080	Bug: React Query refetched the invoice list in a loop because the query key held a new filter object on every render. The fix memoizes the filter object.
+b081	Gotcha: the watch function of react-hook-form rerenders the whole form; use useWatch on single fields inside row components to keep large invoices responsive.
+b082	Decision: the console uses react-router v6 data routers with loaders for invoice pages, so data fetching starts before the component renders.
+b083	The env var VITE_API_BASE_URL sets the API origin at build time; it is baked into the bundle, so changing it requires a rebuild.
+b084	The component library is Radix UI primitives styled with Tailwind; shared components are in src/components/ui/.
+b085	Optimistic updates are used when marking invoices as paid, through useMarkPaidMutation, with a rollback in onError.
+b086	Gotcha: TypeScript strict mode is on and noUncheckedIndexedAccess makes array index access possibly undefined, so handle the missing case.
+b087	Storybook stories sit next to components as *.stories.tsx files; start it with pnpm storybook on port 6006.
+b088	Console favicon and logo SVG files live in public/brand/.
+b089	The console login page shows a rotating set of tips about keyboard shortcuts.
+b090	The invoice table uses TanStack Table with server side pagination and a default page size of 50.
+b091	The JWT signing key is rotated every 30 days; the previous key stays valid for 24 hours through the JWKS overlap window.
+b092	The Postgres application password is rotated every 90 days through the Vault database secrets engine.
+b093	The webhook HMAC signing secret is rotated every 180 days, and both the old and new secrets are accepted during a 7 day grace period.
+b094	The S3 access keys used by recon-jobs are rotated every 14 days by a scheduled GitHub Actions workflow.
+b095	Secrets are loaded from HashiCorp Vault at startup through the shared crate secret-loader; no secrets are placed in environment files committed to the repo.
+b096	Local development secrets go in .env.local, which is listed in .gitignore; the template .env.example contains only placeholder values.
+b097	Decision: webhook signatures use HMAC with SHA256 and are compared in constant time through the subtle crate, to prevent timing attacks.
+b098	Passwords for console users are hashed with argon2id using memory 64 MiB, 3 iterations and parallelism 1.
+b099	Bug: API keys leaked into logs because the Debug derive on ApiKeyConfig printed the secret. The fix wraps the field in Secret<String> from the secrecy crate.
+b100	Access tokens expire after 15 minutes and refresh tokens after 14 days, with rotation on every use.
+b101	cargo-deny runs in CI with deny.toml to block crates with known advisories and disallowed licenses such as GPL.
+b102	pip-audit runs in the recon-jobs CI job and fails on any known vulnerability that has a fixed version available.
+b103	The console sets a strict Content-Security-Policy through the Vite plugin in vite.config.ts; inline scripts are forbidden unless they carry a nonce.
+b104	Decision: access control has the roles viewer, accountant, controller and admin; only controller can post into a closed period.
+b105	Gotcha: the CORS allowlist is read from QUILLBOOK_CORS_ORIGINS as a comma separated list, and a trailing slash on an origin makes the match fail.
+b106	The gitleaks git hook scans staged changes for secrets and blocks any commit that matches.
+b107	The quarterly penetration test report from the security team is stored in the compliance drive, not in the repo.
+b108	Employees must use hardware security keys for the GitHub organization.
+b109	bank_statement_recon matches ledger entries to bank lines with zero tolerance on amount; any difference of even one minor unit is flagged as an exception.
+b110	card_settlement_recon allows a tolerance of 2 minor units per transaction because card processors round their fees differently.
+b111	fx_revaluation_job accepts rate differences of up to 5 basis points before it flags a revaluation exception.
+b112	payout_recon matches payouts within a date window of 1 business day to allow for weekend settlement delays.
+b113	The recon jobs run in the Airflow DAG recon_daily, scheduled at 02:30 UTC after the bank files have arrived.
+b114	Decision: use Polars instead of pandas for large statement files, because memory use was about 4 times lower and group by operations were faster.
+b115	Amounts in recon-jobs are Python Decimal values parsed from strings, never float, and quantize(Decimal("0.01")) is applied only at output.
+b116	Bug: duplicate bank lines were matched twice because there was no idempotency key. The fix hashes account, date, amount and reference into line_fingerprint.
+b117	Reconciliation exceptions are written to the table recon_exception with status open until an accountant resolves them.
+b118	The Python version for recon-jobs is 3.12, managed with uv, and dependencies are locked in uv.lock.
+b119	The module recon_jobs/matching/greedy.py implements the greedy one to one matcher, while recon_jobs/matching/subset_sum.py handles many to one matches.
+b120	Bank statement files arrive by SFTP in the S3 bucket quillbook-recon-inbox in MT940 and CAMT.053 formats, and are parsed by modules in recon_jobs/parsers/.
+b121	Gotcha: CAMT.053 files contain both a booking date and a value date; the job matches on value date because the ledger posts on value date.
+b122	Backfill command: python -m recon_jobs.cli backfill --from 2026-01-01 --to 2026-01-31 --job bank_statement_recon.
+b123	The retry policy for recon DAG tasks is 3 attempts with exponential backoff starting at 5 minutes.
+b124	Decision: reconciliation jobs are idempotent and write results with INSERT ... ON CONFLICT DO UPDATE, so reruns are always safe.
+b125	The finance team receives a daily recon summary email at 08:00 local time, formatted as plain text.
+b126	Old CSV exports from the legacy system are archived in the cold storage bucket and are not processed.
+b127	Feature branches are named feat/<ticket>-short-slug, for example feat/QB-412-credit-note-pdf.
+b128	Bug fix branches use fix/<ticket>-short-slug and must include a regression test.
+b129	Release branches are named release/vX.Y and only receive cherry picked fixes after the cut.
+b130	Production hotfix branches use hotfix/<ticket> and are branched from the latest release tag, not from main.
+b131	Rust code is formatted with cargo fmt --all and linted with cargo clippy --all-targets -- -D warnings before every push.
+b132	TypeScript code is linted with pnpm lint, which runs ESLint with --max-warnings 0, and is formatted by Prettier.
+b133	Python code in recon-jobs is formatted and linted with ruff, using ruff format and ruff check with line length 100.
+b134	SQL migrations are linted with sqlfluff using the postgres dialect, configured in .sqlfluff.
+b135	Commit messages follow Conventional Commits with scopes matching crate or package names, for example feat(ledger-core): add reverse_entry.
+b136	Decision: squash merge is the only allowed merge strategy, so the main history stays linear and each PR maps to exactly one commit.
+b137	The user prefers small PRs under 400 changed lines, split by concern, and wants refactors kept separate from behavior changes.
+b138	The user prefers explanations in plain short sentences and does not want emojis in commit messages or code comments.
+b139	The user's editor is Neovim with rust-analyzer; the repo includes an .editorconfig with 4 space indent for Rust and Python and 2 spaces for TypeScript.
+b140	The Rust toolchain is pinned in rust-toolchain.toml to stable 1.82 with the components rustfmt and clippy.
+b141	The Node version is pinned in .nvmrc to 20 LTS and pnpm is the package manager; never run npm install in web-console.
+b142	The task runner is just: just check runs format, lint and unit tests for all languages, and just dev starts the local stack.
+b143	The local stack runs from docker-compose.dev.yml with Postgres on port 5432, Vault in dev mode and a MinIO instance.
+b144	Git hooks are managed with lefthook; the hooks in lefthook.yml run formatting and gitleaks only on staged files.
+b145	The PR template at .github/pull_request_template.md requires a test plan and a rollback note for any migration.
+b146	User preference: when unsure, the agent should ask a clarifying question instead of guessing, but never more than two questions at a time.
+b147	Gotcha: after a rebase with a Cargo.lock conflict, take the Cargo.lock from main and rerun cargo update -p for the changed crate instead of hand editing.
+b148	CODEOWNERS assigns crates/ledger-core to the finance-platform team, so any change there needs their review.
+b149	The team stand up is at 10:00 in the Lisbon time zone.
+b150	Release notes are drafted in a Notion page before being copied to the changelog.

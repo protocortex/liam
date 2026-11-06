@@ -1,0 +1,341 @@
+qid	category	question	relevant_ids
+qa001	paraphrase	How do we make sure a client that retries a request cannot create the same resource twice?	a077
+qa002	paraphrase	Why did users get stuck in a login redirect loop after coming back from the single sign-on provider?	a076
+qa003	paraphrase	What is our approach when the fast key-value store is down and throttling cannot be checked?	a092
+qa004	paraphrase	Our nightly batch skipped some days around the clock change, and what fixed it?	a104
+qa005	paraphrase	Some invoices displayed times shifted by several hours; what was the underlying problem?	a063
+qa006	paraphrase	Two transactions blocked each other when booking a double-entry posting; how was that resolved?	a061
+qa007	paraphrase	Why was the edge service occasionally answering bad gateway when traffic spiked?	a080
+qa008	paraphrase	How should task handlers be written so that a redelivered message does no harm?	a105
+qa009	paraphrase	What happens to tasks that use up all their attempts, and how do I put them back?	a102
+qa010	paraphrase	Why were customers receiving the same notification message twice?	a101
+qa011	paraphrase	What should I run before pushing to catch what the pipeline would catch?	a120
+qa012	paraphrase	Where do we keep our cloud provisioning definitions and how is their state stored?	a121
+qa013	paraphrase	How can I stop pods from losing in-flight requests while they are being replaced during a rollout?	a124
+qa014	paraphrase	Why do builds of our Rust container images take much less time now?	a113
+qa015	paraphrase	Which base container image do we ship and which user does the process run as?	a114
+qa016	paraphrase	How do developers get credentials locally and in the cluster without committing them?	a125
+qa017	paraphrase	CI started failing because compile-time checked SQL could not find a query after a schema change; what do I do?	a062
+qa018	paraphrase	How do we avoid blocking writes while building a new lookup structure on a huge table?	a057
+qa019	paraphrase	What is the policy for fixing wrong accounting records once they are saved?	a064
+qa020	paraphrase	What did we do about a burst of identical lookups right when a popular entry timed out?	a090
+qa021	paraphrase	How are list endpoints paged, and what are the size bounds?	a084
+qa022	paraphrase	How does a client learn it must slow down, and which response header says for how long?	a091
+qa023	paraphrase	Which logging habit do we follow instead of print statements?	a150
+qa024	paraphrase	What is the rule about error handling inside request handlers?	a082
+qa025	paraphrase	How are the browser origins that may call our API configured?	a079
+qa026	paraphrase	What kind of identifiers must never appear inside keys of the key-value store?	a097
+qa027	paraphrase	Why does a request handler fail to compile when the body parameter is not at the end?	a086
+qa028	paraphrase	How do I cope with clock differences between pods when checking signed login tokens?	a074
+qa029	paraphrase	How are secrets that API consumers hold stored at rest, and what part stays readable for lookup?	a075
+qa030	paraphrase	What makes sure there are no gaps in our invoice numbering?	a146
+qa031	paraphrase	Why can I not see my just-written row when I read from the secondary database?	a066
+qa032	paraphrase	Which tool pushes changes to the cluster after a commit to the deploy repo?	a112
+qa033	paraphrase	When do changes go live automatically and when is a human sign-off needed?	a118
+qa034	paraphrase	What convention applies to the titles of code review submissions?	a119
+qa035	paraphrase	How did we stop the data processing worker from running out of RAM on huge exports?	a107
+qa036	paraphrase	Which style and typing tools are applied to the batch-processing Python code?	a128
+qa037	paraphrase	Which package manager does the browser front end use?	a129
+qa038	paraphrase	How does the browser app keep the session credential safe from script injection?	a083
+qa039	paraphrase	How do we let message bodies evolve over time without breaking consumers?	a109
+qa040	paraphrase	How do we configure the throttling store so its counters are never evicted under memory pressure?	a148
+qa041	paraphrase	How can I test against a clean database quickly without rebuilding the schema every time?	a068
+qa042	paraphrase	How do health checks differ between deciding to send traffic and deciding to restart a pod?	a123
+qa043	paraphrase	How should removal of a no-longer-used field in the schema be sequenced across deploys?	a056
+qa044	paraphrase	How are the container images labeled when released?	a130
+qa045	paraphrase	Why did clients see a request timeout status where they expected a gateway failure?	a149
+qa046	paraphrase	How do production schema changes get applied relative to the application rollout?	a060
+qa047	paraphrase	What is the style convention for the SQL files we write for schema changes?	a069
+qa048	paraphrase	How does the static front end get delivered to end users?	a127
+qa049	paraphrase	How do we ensure only one replica advances the invoice counter each day?	a070
+qa050	paraphrase	How do we speed up dependency compilation in GitHub workflows?	a116
+qa051	symbol	Which function applies pending schema changes when the Rust service boots?	a059
+qa052	symbol	Which struct wraps all SQL for posting and reading ledger entries?	a067
+qa053	symbol	Which helper creates a throwaway database for each integration test?	a068
+qa054	symbol	Which middleware validates the bearer token on the ingest side and attaches the caller identity?	a073
+qa055	symbol	Where is the problem-details error type defined for the HTTP layer?	a072
+qa056	symbol	What command regenerates the TypeScript API client?	a081
+qa057	symbol	Which function signs outgoing webhook payloads?	a085
+qa058	symbol	Which file contains the atomic bucket logic script for the throttler?	a088
+qa059	symbol	Which struct holds the capacity and refill rate for each pricing tier?	a089
+qa060	symbol	Which function builds Redis keys with the environment prefix?	a093
+qa061	symbol	Which function inserts a job inside the caller's open transaction?	a147
+qa062	symbol	What command puts a dead lettered job back on its queue?	a102
+qa063	symbol	Which function is the main worker loop in the notifier crate?	a100
+qa064	symbol	Which function computes the delay before a job is retried?	a111
+qa065	symbol	Which scheduler function spreads out start times with random delay?	a110
+qa066	symbol	Which Python function pairs bank statement lines with open invoices?	a106
+qa067	symbol	What command runs the same checks as the CI pipeline locally?	a120
+qa068	symbol	What command refreshes the offline query metadata that sqlx needs in CI?	a062
+qa069	symbol	Which database trigger prevents updates to posted ledger rows?	a064
+qa070	symbol	Which method returns the pool that must be used right after a write?	a066
+qa071	symbol	Which directory holds the Terraform code?	a121
+qa072	symbol	Which script anonymizes the production snapshot used for staging?	a122
+qa073	symbol	Which function decides that a caller is internal and skips throttling?	a098
+qa074	symbol	Which file pins the Rust compiler version?	a126
+qa075	symbol	Which function converts the default timeout response into a gateway timeout?	a149
+qa076	config	How many Postgres connections may the notifier open at most?	a003
+qa077	config	What is the maximum Postgres pool size for ingest-gateway?	a002
+qa078	config	How long may a nightly reconciliation query run before Postgres cancels it?	a008
+qa079	config	Which port does the rate-limiter listen on for decisions?	a012
+qa080	config	How many seconds do exchange rates stay in the Redis cache?	a013
+qa081	config	What is the TTL for cached rendered invoice PDFs?	a015
+qa082	config	How many requests per minute does a pro tier API key get?	a018
+qa083	config	What is the per-IP request cap on the webhook receiver endpoint?	a020
+qa084	config	How many delivery attempts does the webhook_delivery queue make?	a024
+qa085	config	How many times is a failed recon_export job retried?	a023
+qa086	config	Which env var holds the public key ingest-gateway uses to verify JWTs?	a026
+qa087	config	Which env var gives the rate-limiter its Redis address?	a028
+qa088	config	Which migration created the unique index on payments external_ref?	a031
+qa089	config	What is the timeout of the web-console-e2e CI job?	a034
+qa090	config	How many production replicas does ingest-gateway run?	a038
+qa091	config	How long does a refresh token stay valid?	a042
+qa092	config	What is the visibility timeout of the recon_export queue?	a047
+qa093	config	What is the maximum request body for POST /v1/ingest/batch?	a050
+qa094	config	What statement timeout does ledger-core apply to Postgres sessions?	a005
+qa095	config	Which port does the notifier internal HTTP API use?	a011
+qa096	config	What is the TTL of the tax rate table cache?	a016
+qa097	config	What request rate is allowed for a free tier API key?	a017
+qa098	config	How many retries does the email_send queue allow?	a022
+qa099	config	Which env var carries the notifier SMTP connection URL?	a027
+qa100	config	What is the timeout of the recon-pytest CI job?	a035
+qa101	config	How many production replicas does the notifier have?	a039
+qa102	config	How long is a password reset link valid?	a044
+qa103	config	What is the visibility timeout of the webhook_delivery queue?	a048
+qa104	config	What is the size limit for CSV uploads to /v1/imports?	a052
+qa105	config	How many connections does the ledger-core Postgres pool allow?	a001
+qa106	rationale	Why did we pick sqlx instead of Diesel for ledger-core?	a053
+qa107	rationale	Why are money amounts stored as integer minor units instead of NUMERIC?	a054
+qa108	rationale	Why do we never write down migrations?	a055
+qa109	rationale	Why must column drops be split across two releases?	a056
+qa110	rationale	Why is the job queue built on Postgres rather than a separate broker?	a099
+qa111	rationale	Why did we choose axum for the HTTP servers?	a071
+qa112	rationale	Why does the rate-limiter fail open when Redis is unreachable?	a092
+qa113	rationale	Why does the rate limiter run on its own Redis instance with noeviction?	a148
+qa114	rationale	Why is the API version in the URL path and not in a header?	a078
+qa115	rationale	Why do we not use mutual TLS between services?	a087
+qa116	rationale	Why does web-console keep the access token only in memory?	a083
+qa117	rationale	Why is customer data cache invalidated on write instead of waiting for expiry?	a096
+qa118	rationale	Why are ledger corrections written as reversing entries?	a064
+qa119	rationale	Why do Rust service images use cargo-chef?	a113
+qa120	rationale	Why do we build for the gnu target with jemalloc rather than musl?	a115
+qa121	rationale	Why do we deploy through Argo CD with a push to a deploy repository?	a112
+qa122	rationale	Why is the staging database restored from a scrubbed production snapshot?	a122
+qa123	rationale	Why does ingest-gateway run 10 replicas in production?	a038
+qa124	rationale	Why is the notifier Postgres pool limited to 10 connections?	a003
+qa125	rationale	Why does recon-jobs read from the replica DSN?	a065
+qa126	rationale	Why does the daily invoice sequence rollover take an advisory lock?	a070
+qa127	rationale	Why is the recon_export queue retried only 3 times?	a023
+qa128	rationale	Why does the webhook_delivery queue retry as many as 12 times?	a024
+qa129	rationale	Why did the refresh cookie change from SameSite Strict to Lax?	a076
+qa130	rationale	Why must job handlers be idempotent?	a105
+qa131	confusable	Which index on ledger_entries supports balance range lookups by account and posting time?	a030
+qa132	confusable	What kind of index does the audit_log table use on created_at, and why?	a032
+qa133	confusable	Which index on the invoices table serves the customer invoice list?	a029
+qa134	confusable	How long do service-to-service tokens between backend crates last?	a043
+qa135	confusable	How long do access tokens from the Quillbook auth service last?	a041
+qa136	confusable	Which port does ledger-core serve its HTTP API on?	a009
+qa137	confusable	Which port does ingest-gateway serve its public HTTP API on?	a010
+qa138	confusable	What is the TTL of the customer profile cache in Redis?	a014
+qa139	confusable	What request limit applies to the enterprise tier per API key?	a019
+qa140	confusable	How long can the cargo-test CI job run?	a033
+qa141	confusable	How long can the docker-build CI job run?	a036
+qa142	confusable	How many production replicas does rate-limiter run?	a040
+qa143	confusable	How many production replicas does ledger-core run?	a037
+qa144	confusable	What statement timeout does notifier use for outbox polling?	a007
+qa145	confusable	What statement timeout does ingest-gateway use in Postgres?	a006
+qa146	confusable	How many retries does the invoice_render queue get?	a021
+qa147	confusable	What is the visibility timeout of the invoice_render queue?	a045
+qa148	confusable	What is the visibility timeout of the email_send queue?	a046
+qa149	confusable	How many Postgres connections does a recon-jobs worker process open?	a004
+qa150	confusable	Which env var holds the ledger-core Postgres connection string?	a025
+qa151	confusable	What is the body size limit for POST /v1/invoices?	a049
+qa152	confusable	What is the body size limit for POST /v1/webhooks/receive?	a051
+qa153	confusable	Which Redis key prefix is used for cached invoice PDFs?	a015
+qa154	confusable	Which Redis key prefix is used for tax rate tables?	a016
+qa155	confusable	Which tier has a burst allowance of 100 tokens?	a018
+qa156	multi	What are the retry count and the visibility timeout of the invoice_render queue?	a021,a045
+qa157	multi	For the webhook_delivery queue, how many attempts are made and how long is a job leased while in flight?	a024,a048
+qa158	multi	What pool size and statement timeout does ingest-gateway use for Postgres?	a002,a006
+qa159	multi	How is the throttling check made atomic, and what happens if Redis goes down?	a088,a092
+qa160	multi	What are the lowest and highest per-key request limits across pricing tiers?	a017,a019
+qa161	multi	What is the safe procedure to remove a column, and how are migrations run in production?	a056,a060
+qa162	multi	Where do migration files go, and what must an index migration on a big table do differently?	a058,a057
+qa163	multi	How are webhooks signed, and how many times does the queue retry delivering them?	a085,a024
+qa164	multi	What prevents duplicate emails, and where do jobs that exhaust retries end up?	a101,a102
+qa165	multi	Who triggers staging versus production deploys, and which tool syncs the cluster?	a118,a112
+qa166	multi	Which probes do Rust pods use, and what avoids dropped requests during rollout?	a123,a124
+qa167	multi	How long may a ledger-core query run, and how many connections can its pool open?	a005,a001
+qa168	multi	What are the access token and refresh token lifetimes?	a041,a042
+qa169	multi	How long is the customer profile cached, and how does a data edit refresh it?	a014,a096
+qa170	multi	Which Rust compiler version is pinned, and which command mirrors CI locally?	a126,a120
+qb001	paraphrase	How do we keep binary floating point errors out of the code that handles cash amounts?	b005
+qb002	paraphrase	Why can't I assume every currency has two digits after the decimal point?	b006
+qb003	paraphrase	What happens when someone tries to record a transaction whose two sides do not add up?	b007
+qb004	paraphrase	How do I undo something already recorded in the books, given that it can't be edited anymore?	b008
+qb005	paraphrase	Where does the figure for how much an account holds come from, if it is not a column?	b009
+qb006	paraphrase	What error appears if a line is denominated differently from the account it hits?	b010
+qb007	paraphrase	Why were totals one cent off when a price reduction was applied to each row?	b011
+qb008	paraphrase	Which numbering approach do we use for billing documents so the series has no holes?	b013
+qb009	paraphrase	When dividing a total into equal parts, who gets the leftover pennies?	b014
+qb010	paraphrase	How do we keep history stable when currency exchange values move later?	b015
+qb011	paraphrase	What money type does a customer account fall back to when none is configured?	b016
+qb012	paraphrase	How are refunds that reduce what a customer owes modeled in the data?	b017
+qb013	paraphrase	What numeric precision is used for intermediate calculations of levies on sales?	b018
+qb014	paraphrase	What is the upper bound on a monetary amount before arithmetic refuses to continue?	b019
+qb015	paraphrase	Can a local rule for odd cash rounding be configured without changing any code?	b020
+qb016	paraphrase	What stops people from booking entries into a month that has been finalized?	b021
+qb017	paraphrase	Why did our pipeline time drop by about half after we swapped the runner for Rust tests?	b038
+qb018	paraphrase	Why don't the Rust ledger tests stub out the datastore?	b039
+qb019	paraphrase	Which frontend tests failed only on the build server because of the clock region setting?	b041
+qb020	paraphrase	How do I run the randomized input tester that stresses amount parsing?	b044
+qb021	paraphrase	Where are the fake network handlers shared between unit tests and the component gallery?	b045
+qb022	paraphrase	What caused intermittent failures when the Rust database tests ran concurrently?	b034
+qb023	paraphrase	How should I locate elements in UI component tests?	b035
+qb024	paraphrase	How do I approve changes to the rendered document reference outputs?	b033
+qb025	paraphrase	Why do correlation ids vanish from the logs of the messaging service?	b062
+qb026	paraphrase	What kinds of data must never be written to our logs?	b060
+qb027	paraphrase	Why can't we use customer identifiers as dimensions on time series metrics?	b064
+qb028	paraphrase	When should the person on duty be woken up about slow postings?	b065
+qb029	paraphrase	How do services pass request correlation information to each other?	b070
+qb030	paraphrase	How are exceptions from the browser app collected for us to look at?	b067
+qb031	paraphrase	Why does local log output look different from production, and how do I switch it?	b061
+qb032	paraphrase	How do we avoid needless rerenders of a big form with many rows?	b081
+qb033	paraphrase	Why did the list screen keep re-requesting its data endlessly?	b080
+qb034	paraphrase	Which libraries hold remote data versus purely local view state in the console?	b075
+qb035	paraphrase	Is it fine to change the backend address after the frontend has already been built?	b083
+qb036	paraphrase	What is the size cap for the shipped JavaScript and how is it enforced?	b078
+qb037	paraphrase	How are amounts shown to users in their own number style?	b079
+qb038	paraphrase	Why might an array lookup give a possibly missing value in the TypeScript code?	b086
+qb039	paraphrase	How do we make flagging a bill as settled feel instant before the server answers?	b085
+qb040	paraphrase	How can a leaked credential end up in debug output of a config struct?	b099
+qb041	paraphrase	Why does an allowed origin with a slash at the end get rejected by the server?	b105
+qb042	paraphrase	How are the passwords of end users stored?	b098
+qb043	paraphrase	What tool prevents us from accidentally committing credentials?	b106
+qb044	paraphrase	What stops dependency licenses we cannot accept from sneaking into Rust builds?	b101
+qb045	paraphrase	What happened with repeated bank lines in nightly matching, and how was it solved?	b116
+qb046	paraphrase	Which dataframe library did we adopt for big files, and why?	b114
+qb047	paraphrase	Why would rerunning the nightly matching not create duplicate rows?	b124
+qb048	paraphrase	Which date from the bank file do we use when pairing items with our books?	b121
+qb049	paraphrase	How do I recompute matching for a past month?	b122
+qb050	paraphrase	Which merge approach keeps the main line of history straight?	b136
+qb051	symbol	Which function checks that debits and credits match before a posting is stored?	b007
+qb052	symbol	What is the name of the function that mirrors a posted entry to correct it?	b008
+qb053	symbol	Which function in the money module handles rounding of tax values?	b002
+qb054	symbol	Where is the function that rounds individual invoice line amounts?	b001
+qb055	symbol	What function generates the next billing document number for a tenant?	b013
+qb056	symbol	Which file defines the validation schema for the payment form?	b073
+qb057	symbol	What hook performs the optimistic update when an invoice is marked paid?	b085
+qb058	symbol	Which file holds the helper that formats money for display in the UI?	b079
+qb059	symbol	What command runs the fuzzer for the amount parser?	b044
+qb060	symbol	What command do I run to review changed PDF snapshots?	b033
+qb061	symbol	Which command starts the Postgres test container for gateway integration tests?	b030
+qb062	symbol	What command executes the slow Python tests?	b037
+qb063	symbol	Which function initializes error reporting in the web app?	b067
+qb064	symbol	Which wrapper type masks invoice and bank account details when logging?	b060
+qb065	symbol	Which module contains the greedy matcher for reconciliation?	b119
+qb066	symbol	Where is the structured logging setup for the Python jobs?	b066
+qb067	symbol	Which command backfills a date range for a reconciliation job?	b122
+qb068	symbol	Which Airflow DAG runs the daily reconciliation?	b113
+qb069	symbol	Where is the dashboard definition for ledger metrics stored?	b063
+qb070	symbol	Which middleware layer attaches tenant and request ids to spans?	b059
+qb071	symbol	What file pins the Rust compiler version?	b140
+qb072	symbol	Which task runner command runs formatting, linting and tests across all languages?	b142
+qb073	symbol	Which function splits an amount evenly and spreads the remainder?	b014
+qb074	symbol	What method narrows high precision decimals to integer minor units?	b018
+qb075	symbol	Which file names the team that must review changes to the ledger crate?	b148
+qb076	config	What is the line coverage gate for the ledger-core crate?	b025
+qb077	config	What coverage percentage must recon-jobs reach?	b028
+qb078	config	What coverage threshold does Vitest enforce for the web console?	b027
+qb079	config	What coverage percent does the ingest-gateway crate need?	b026
+qb080	config	What trace sampling ratio does the notifier use?	b048
+qb081	config	What fraction of browser page loads are traced?	b049
+qb082	config	What sampling ratio applies to ingest-gateway traces?	b047
+qb083	config	How long do we keep audit logs?	b055
+qb084	config	What is the retention for debug level logs?	b058
+qb085	config	For how many days are HTTP access logs kept?	b057
+qb086	config	How often is the JWT signing key rotated?	b091
+qb087	config	How frequently does the webhook HMAC secret change, and what grace window applies?	b093
+qb088	config	How often are the S3 keys for reconciliation rotated?	b094
+qb089	config	How often is the database password rotated?	b092
+qb090	config	What amount tolerance does card settlement matching allow?	b110
+qb091	config	What tolerance in basis points triggers an FX revaluation exception?	b111
+qb092	config	What is the date window for matching payouts?	b112
+qb093	config	How strict is the bank statement matching on amounts?	b109
+qb094	config	How many property test cases run by default in ledger-core?	b029
+qb095	config	Which port does the integration test Postgres listen on?	b030
+qb096	config	What port does the Vite dev server use?	b077
+qb097	config	What is the main bundle size limit?	b078
+qb098	config	How long are access tokens valid?	b100
+qb099	config	What parameters are used for argon2id password hashing?	b098
+qb100	config	What Python version does recon-jobs use?	b118
+qb101	config	How many retry attempts and what backoff do the recon DAG tasks use?	b123
+qb102	config	At what time is the daily reconciliation DAG scheduled?	b113
+qb103	config	At what latency and duration does the posting alert page someone?	b065
+qb104	config	What is the pinned Rust toolchain version?	b140
+qb105	config	What is the default page size in the invoice table?	b090
+qb106	rationale	Why is banker's rounding used for invoice line totals?	b001
+qb107	rationale	Why does tax rounding use half up?	b002
+qb108	rationale	Why does currency conversion truncate downward?	b003
+qb109	rationale	Why is late fee interest rounded upward?	b004
+qb110	rationale	Why are exchange rates stored on each journal entry?	b015
+qb111	rationale	Why are invoice numbers taken from a sequence rather than UUIDs?	b013
+qb112	rationale	Why are credit notes modeled as negative lines?	b017
+qb113	rationale	Why did we pick cargo-nextest for CI?	b038
+qb114	rationale	Why do ledger tests hit a real database?	b039
+qb115	rationale	Why was the notifier sampling ratio raised?	b048
+qb116	rationale	Why does ledger-core trace every posting?	b046
+qb117	rationale	Why does ingest-gateway only sample a small share of traces?	b047
+qb118	rationale	Why are logs JSON in production?	b061
+qb119	rationale	Why was Zustand chosen over Redux Toolkit?	b076
+qb120	rationale	Why do invoice pages use data router loaders?	b082
+qb121	rationale	Why do we compare webhook signatures in constant time?	b097
+qb122	rationale	Why do we prefer Polars over pandas for large files?	b114
+qb123	rationale	Why are reconciliation jobs written to be idempotent?	b124
+qb124	rationale	Why is squash merge the only allowed strategy?	b136
+qb125	rationale	Why does debug logging have such a short retention?	b058
+qb126	rationale	Why does card settlement reconciliation allow a tolerance?	b110
+qb127	rationale	Why is the ledger-core coverage threshold the highest?	b025
+qb128	rationale	Why is the ingest-gateway coverage gate lower than the ledger one?	b026
+qb129	rationale	Why is the rounding mode a field on the tax rule?	b020
+qb130	rationale	Why do we match bank lines on value date?	b121
+qb131	confusable	What coverage threshold applies to the cargo-llvm-cov check on the gateway crate?	b026
+qb132	confusable	What is the rounding mode for converting amounts between currencies?	b003
+qb133	confusable	Which rounding mode applies to VAT amounts?	b002
+qb134	confusable	Which rounding mode is used on each invoice line?	b001
+qb135	confusable	Which rounding is used when accruing overdue interest?	b004
+qb136	confusable	Which metric counts failed deliveries by channel?	b053
+qb137	confusable	Which metric counts requests denied with 429 by tenant tier?	b052
+qb138	confusable	Which metric tracks ingest requests by status class?	b051
+qb139	confusable	Which metric measures how long posting an entry takes?	b050
+qb140	confusable	Which schema validates the customer form?	b072
+qb141	confusable	Which schema file backs the tenant settings form?	b074
+qb142	confusable	Which form schema prevents paying more than the open balance?	b073
+qb143	confusable	Which schema file validates the invoice form?	b071
+qb144	confusable	Which branch naming applies to urgent production fixes?	b130
+qb145	confusable	What branch pattern is used for ordinary bug fixes?	b128
+qb146	confusable	How should a new feature branch be named?	b127
+qb147	confusable	How do I name a branch for a release line?	b129
+qb148	confusable	What command formats and lints the Python reconciliation code?	b133
+qb149	confusable	Which tool lints the SQL migrations?	b134
+qb150	confusable	How is the TypeScript code linted?	b132
+qb151	confusable	How do I fake the passage of time in the tests of the throttling crate?	b031
+qb152	confusable	How are outbound HTTP and mail calls faked in the tests of the notifications crate?	b032
+qb153	confusable	Which log retention applies to application logs?	b056
+qb154	confusable	What fixture loads journal entries into SQLite for Python unit tests?	b040
+qb155	confusable	Which invariant forbids mixing currencies on one account?	b010
+qb156	multi	What rounding modes apply to invoice lines and to tax amounts?	b001,b002
+qb157	multi	How are amounts represented and parsed in Rust and in Python so floats never creep in?	b005,b115
+qb158	multi	What are the coverage gates for the web console and for recon-jobs?	b027,b028
+qb159	multi	Which metrics relate to rejected requests and to failed notification deliveries?	b052,b053
+qb160	multi	What rotation periods apply to the JWT signing key and the webhook secret?	b091,b093
+qb161	multi	Which tools stop secrets and vulnerable or badly licensed dependencies from entering the repo?	b106,b101,b102
+qb162	multi	How are Rust code formatting and TypeScript linting done before a push?	b131,b132
+qb163	multi	Which branch naming applies to regular bug fixes and to release lines?	b128,b129
+qb164	multi	How do posted entries get corrected, and what blocks posting into a closed month?	b008,b021
+qb165	multi	Which matching tolerances apply to card settlements and to FX revaluation?	b110,b111
+qb166	multi	How do I start the gateway integration test database, and how many property cases run nightly?	b030,b029
+qb167	multi	Which header propagates trace context, and which fields does each log span carry?	b070,b059
+qb168	multi	Which libraries manage server state in the console, and which dev server proxies the API?	b075,b077
+qb169	multi	How is the local dev environment started, and which services does its compose file contain?	b142,b143
+qb170	multi	What editor setup does the user have, and what size of PR do they prefer?	b139,b137
