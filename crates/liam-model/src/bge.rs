@@ -55,7 +55,7 @@ fn validate_bge_m3_dims(dims: usize) -> Result<()> {
 /// fastembed fetches BGE-M3 through `HF_HOME` when it is set, ahead of the
 /// configured cache directory.
 #[cfg(any(test, feature = "local"))]
-fn hf_home_overriding<'a>(hf_home: Option<&'a str>, cache_dir: &str) -> Option<&'a str> {
+pub(crate) fn hf_home_overriding<'a>(hf_home: Option<&'a str>, cache_dir: &str) -> Option<&'a str> {
     hf_home.filter(|home| !home.is_empty() && *home != cache_dir)
 }
 

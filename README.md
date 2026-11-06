@@ -194,7 +194,7 @@ unknown key fails loudly.
 | `gc.full_synthesis_mention_threshold` | `8` | Live-mention count at or above which the next resynthesis uses the full-tier token budget. |
 | `gc.full_synthesis_max_new_tokens` | `512` | Output token budget for a full-tier resynthesis. |
 | `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. Part of the embedder fingerprint. |
-| `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`. Part of the embedder fingerprint. |
+| `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`: `Qwen/Qwen3-Embedding-0.6B`, `BAAI/bge-m3`, or a small ONNX model (`BAAI/bge-small-en-v1.5`, `sentence-transformers/all-MiniLM-L6-v2`, `sentence-transformers/all-MiniLM-L12-v2`, `Snowflake/snowflake-arctic-embed-xs`, `Snowflake/snowflake-arctic-embed-s`, `nomic-ai/nomic-embed-text-v1.5`, `intfloat/multilingual-e5-small`). The small models need `embedding_dims` equal to their width (384; nomic accepts up to 768). See `docs/specs/2026-11-06-embedder-speed-evaluation.md`. Part of the embedder fingerprint. |
 | `embedder.cache_dir` | `~/.liam/models` | Files for both the reranker and the embedder, each under its own `models--Org--Name` subdirectory. |
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
 | `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
@@ -302,7 +302,7 @@ file `version`:
 | `provider` | `embedder.provider` |
 | `model` | `embedder.model` |
 | `dims` | `embedding_dims` |
-| `prompt_scheme` | A number built into the binary: the version of the convention that turns text into model input. Scheme 2 wraps Qwen3 search queries as `Instruct: <task>\nQuery:<query>`, the format on the model card, and leaves stored text plain; BGE-M3 and the mock embedder get no wrapper. Scheme 1 used a `query: ` prefix instead. |
+| `prompt_scheme` | A number built into the binary: the version of the convention that turns text into model input. Scheme 2 wraps Qwen3 search queries as `Instruct: <task>\nQuery:<query>`, the format on the model card, and leaves stored text plain; BGE-M3 and the mock embedder get no wrapper, and each small ONNX model gets the prefix on its model card. Scheme 1 used a `query: ` prefix instead. |
 
 The Qwen3 query text is `Instruct: Given a web search query, retrieve relevant
 passages that answer the query` and a newline, `Query:` and the question.
