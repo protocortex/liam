@@ -440,6 +440,7 @@ mod tests {
         for configured in [
             fingerprint("model-b", 768, 0),
             fingerprint("model-a", 1024, 0),
+            fingerprint("model-a", 384, 0),
             fingerprint("model-a", 768, 1),
             other_provider,
         ] {

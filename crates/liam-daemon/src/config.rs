@@ -208,7 +208,7 @@ impl Default for Config {
         Self {
             database_path: "~/.liam/liam.db".into(),
             log_filter: "info,liam=debug".into(),
-            embedding_dims: 768,
+            embedding_dims: DEFAULT_EMBEDDING_DIMS,
             gc: GcConfig::default(),
             embedder: EmbedderConfig::default(),
             llm: LlmConfig::default(),
@@ -376,6 +376,10 @@ pub(crate) fn default_log_dir(database: &Path) -> PathBuf {
     name.push(".log");
     database.with_file_name(name)
 }
+
+/// Default vector width: Qwen3-Embedding-0.6B truncated to 384 dims (MRL). See
+/// `docs/specs/2026-11-06-embedder-speed-evaluation.md`.
+pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 /// The config file read when neither `--config` nor `LIAM_CONFIG` says
 /// otherwise.
