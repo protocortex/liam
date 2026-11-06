@@ -97,10 +97,22 @@ jobs:
       # having for `liam` specifically: it is what the install script runs to
       # fetch weights, so a `liam` that cannot start turns into an install
       # that fails after the user has already downloaded the tarball.
+      #
+      # Each binary must also report the tag's version. v0.1.1 shipped binaries
+      # that print 0.1.0 because Cargo.toml was not bumped before the tag, and
+      # the Homebrew formula test asserts the version, so a mismatch is caught
+      # here rather than after the release is public.
       - name: Verify the binaries run
         run: |
-          ./target/release/liamd --version
-          ./target/release/liam --version
+          set -euo pipefail
+          for bin in liamd liam; do
+            out="$(./target/release/$bin --version)"
+            echo "$out"
+            case "$out" in
+              *" ${GITHUB_REF_NAME#v}") ;;
+              *) echo "$bin reports '$out', not ${GITHUB_REF_NAME#v}. Bump the crate version and tag again." >&2; exit 1 ;;
+            esac
+          done
 
       # `liam fetch-models` downloads the pinned llama-server archive at install
       # time. If the upstream release were deleted or its bytes changed, the
