@@ -198,3 +198,32 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+
+  # Tells the Homebrew tap (protocortex/homebrew-tap) that the release is
+  # published, so its bump workflow can open a PR moving the formula to this
+  # tag. Runs only after `release` has uploaded the asset and its .sha256.
+  #
+  # Needs the repository secret HOMEBREW_TAP_DISPATCH_TOKEN: a fine-grained
+  # personal access token whose only repository is protocortex/homebrew-tap,
+  # with Contents: Read and write (what the repository dispatch API requires).
+  # Without it this job fails with a clear message; the release is already
+  # published by then, and the tap also polls daily as a fallback.
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Notify the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "secret HOMEBREW_TAP_DISPATCH_TOKEN is not set; see the comment above this job" >&2
+            exit 1
+          fi
+          gh api repos/protocortex/homebrew-tap/dispatches \
+            -f event_type=liam-release \
+            -f "client_payload[tag]=${TAG}"

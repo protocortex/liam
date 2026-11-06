@@ -74,6 +74,20 @@ runtime) pulls a large dependency tree and is opt-in:
 cargo build -p liam-daemon --features local
 ```
 
+## Install with Homebrew
+
+On Apple Silicon macOS:
+
+```sh
+brew tap protocortex/tap
+brew install liam              # the latest tagged release
+brew install --HEAD liam       # builds main from source with cargo; slow
+```
+
+The formula does not download models. Its caveats say how to fetch them with
+`liam fetch-models` and how to point an MCP client at `liamd proxy`. The tap
+lives in [protocortex/homebrew-tap](https://github.com/protocortex/homebrew-tap).
+
 ## Run
 
 ```sh
@@ -1104,7 +1118,6 @@ real-model tests are gated and run on demand, not in the default test run.
 - Hosted deployment: HTTP transport, OAuth and per-tenant scoping. Not
   planned yet.
 - Agent Client Protocol support. Not planned yet.
-- A Homebrew formula for the tagged releases.
 
 ## License
 
