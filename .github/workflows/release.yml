@@ -176,6 +176,11 @@ jobs:
           cd dist
           shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
           cat "${NAME}.tar.gz.sha256"
+          # SHA256SUMS is the file the Homebrew tap reads to write the formula
+          # checksum, in `sha256sum` format with the archive name as published.
+          # The per-archive .sha256 file stays for older tooling.
+          shasum -a 256 "${NAME}.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
 
       # install.sh reads these by name out of its own directory, so a rename
       # or a dropped `cp` above turns into a failure the user hits after
@@ -198,6 +203,34 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/SHA256SUMS
+
+  # Downloads the published archive again and checks it against SHA256SUMS and
+  # the per-archive .sha256 file (scripts/verify-release.sh). A bad upload fails
+  # the run here, before anything downstream trusts the checksum. There is no
+  # attestation check, because this workflow does not produce one.
+  verify:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Verify the published archive
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/verify-release.sh "$TAG" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Tells the Homebrew tap (protocortex/homebrew-tap) that the release is
   # published, so its bump workflow can open a PR moving the formula to this
