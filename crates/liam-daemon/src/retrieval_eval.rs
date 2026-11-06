@@ -149,9 +149,11 @@ use crate::models;
 #[cfg(any(test, feature = "local"))]
 use crate::models::LOCAL_PROVIDER;
 
+mod embedder_bench;
 mod golden_set;
 #[cfg(test)]
 mod scale_probe;
+pub use embedder_bench::{run_embedder_bench, BenchReport};
 use golden_set::{CORPUS, QUESTIONS};
 
 /// The unique ids among the first `k` entries of `retrieved`. WHY a shared
