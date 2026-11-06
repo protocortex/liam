@@ -4,14 +4,89 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Finishes the Homebrew tap step of a published release, or shows what it
+  # would change. Neither builds or publishes anything. A real run needs the
+  # default branch, a dry run works from any ref.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published release tag to move the Homebrew tap to, for example v0.1.2.'
+        required: true
+        type: string
+      dry_run:
+        description: 'Plan and show the formula change. Open nothing.'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# One release at a time, and a running release is never cancelled. Dry runs
+# have a group of their own, so they never replace a pending release.
+concurrency:
+  group: ${{ inputs.dry_run && 'release-dry-run' || 'release' }}
+  cancel-in-progress: false
+
 jobs:
+  # Decides what this run does. A tag push builds and publishes, then moves the
+  # tap. A manual run only moves the tap, for a release that is already
+  # published.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      stable: ${{ steps.plan.outputs.stable }}
+      dry_run: ${{ steps.plan.outputs.dry_run }}
+    steps:
+      - name: Plan
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_REF: refs/heads/${{ github.event.repository.default_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then
+            tag="$REF_NAME" publish=true dry_run=false
+          else
+            tag="$INPUT_TAG" publish=false dry_run="${INPUT_DRY_RUN:-false}"
+          fi
+          # `stable` is a plain vX.Y.Z. A pre-release tag still builds and
+          # publishes, but the Homebrew formula does not follow it.
+          stable=false
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then stable=true; fi
+          if [ "$publish" = false ]; then
+            if [ "$stable" != true ]; then
+              echo "::error::'${tag}' is not a release tag vX.Y.Z" >&2
+              exit 1
+            fi
+            if [ "$dry_run" != true ] && [ "$REF" != "$DEFAULT_REF" ]; then
+              echo "::error::a real run needs ${DEFAULT_REF}, not ${REF}. Use dry_run from other refs." >&2
+              exit 1
+            fi
+          fi
+          {
+            echo "tag=${tag}"
+            echo "version=${tag#v}"
+            echo "publish=${publish}"
+            echo "stable=${stable}"
+            echo "dry_run=${dry_run}"
+          } >>"$GITHUB_OUTPUT"
+          echo "Release ${tag}: publish=${publish}, tap=${stable}, dry_run=${dry_run}" >>"$GITHUB_STEP_SUMMARY"
+
   # Gate: a tag must not publish if the event log loses a record at scale. The
   # same tests run weekly in log-soak.yml; here it blocks the release job.
   soak:
+    needs: plan
+    if: ${{ needs.plan.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -40,7 +115,7 @@ jobs:
   # previously also built x86_64-unknown-linux-gnu and published it, which
   # shipped an artifact for an unsupported platform.
   release:
-    needs: soak
+    needs: [plan, soak]
     runs-on: macos-latest
     timeout-minutes: 45
     # Publishing the release asset is the only step that writes.
@@ -222,7 +297,13 @@ jobs:
   # the run here, before anything downstream trusts the checksum. There is no
   # attestation check, because this workflow does not produce one.
   verify:
-    needs: release
+    needs: [plan, release]
+    # After a publish, or for a manual run that moves the tap. Not on a dry run.
+    if: >-
+      ${{ !cancelled()
+      && needs.plan.result == 'success'
+      && ((needs.plan.outputs.publish == 'true' && needs.release.result == 'success')
+          || (needs.plan.outputs.publish != 'true' && needs.plan.outputs.dry_run != 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -241,34 +322,119 @@ jobs:
           persist-credentials: false
       - name: Verify the published archive
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: scripts/verify-release.sh "$TAG" | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # Tells the Homebrew tap (protocortex/homebrew-tap) that the release is
-  # published, so its bump workflow can open a PR moving the formula to this
-  # tag. Runs only after `release` has uploaded the asset and its .sha256.
-  #
-  # Needs the repository secret HOMEBREW_TAP_DISPATCH_TOKEN: a fine-grained
-  # personal access token whose only repository is protocortex/homebrew-tap,
-  # with Contents: Read and write (what the repository dispatch API requires).
-  # Without it this job fails with a clear message; the release is already
-  # published by then, and the tap also polls daily as a fallback.
-  homebrew:
-    needs: release
+  # Writes the formula for this release with the tap's own bump script. This
+  # job has no secrets and no write permission, because it runs code from
+  # another repository. It returns the finished formula as text. A dry run
+  # without a published SHA256SUMS reads stand-in checksums.
+  formulas:
+    needs: [plan, verify]
+    if: >-
+      ${{ !cancelled()
+      && needs.plan.result == 'success'
+      && needs.plan.outputs.stable == 'true'
+      && (needs.verify.result == 'success' || needs.plan.outputs.dry_run == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions: {}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      liam: ${{ steps.write.outputs.liam }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      DRY_RUN: ${{ needs.plan.outputs.dry_run }}
     steps:
-      - name: Notify the tap
-        env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
-          TAG: ${{ github.ref_name }}
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: protocortex/homebrew-tap
+          path: tap
+          persist-credentials: false
+
+      - name: Write the formula
+        id: write
         run: |
           set -euo pipefail
-          if [ -z "$GH_TOKEN" ]; then
-            echo "secret HOMEBREW_TAP_DISPATCH_TOKEN is not set; see the comment above this job" >&2
-            exit 1
+          if [ "$DRY_RUN" = true ] \
+            && ! curl -fsSL -o /dev/null "https://github.com/protocortex/liam/releases/download/${TAG}/SHA256SUMS"; then
+            asset="liam-${TAG}-aarch64-apple-darwin-netinstall.tar.gz"
+            mkdir "$RUNNER_TEMP/sums"
+            printf '%s  %s\n' "$(printf '%s' "$asset" | sha256sum | cut -d' ' -f1)" "$asset" >"$RUNNER_TEMP/sums/SHA256SUMS"
+            export DOWNLOAD_BASE="file://$RUNNER_TEMP/sums"
+            echo "::notice::${TAG} has no SHA256SUMS, so this dry run uses a placeholder checksum."
           fi
-          gh api repos/protocortex/homebrew-tap/dispatches \
-            -f event_type=liam-release \
-            -f "client_payload[tag]=${TAG}"
+          (cd tap && .github/scripts/bump-formula.sh "$VERSION" Formula/liam.rb)
+          echo "liam=$(base64 -w0 <tap/Formula/liam.rb)" >>"$GITHUB_OUTPUT"
+
+  # Opens the release/vX.Y.Z pull request in the tap with that formula, waits
+  # for its checks, merges it, and waits for the tap to publish its release.
+  # This job holds the token, so it runs nothing from the tap checkout: it only
+  # reads the formula, and scripts/release-tap.sh refuses any change except the
+  # stable url and the sha256 in SHA256SUMS. A dry run needs no token.
+  downstream:
+    needs: [plan, formulas]
+    if: ${{ !cancelled() && needs.formulas.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Only files are read from this checkout. No code from it runs here.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: protocortex/homebrew-tap
+          path: tap
+          persist-credentials: false
+
+      - name: Write the formula
+        env:
+          LIAM_RB: ${{ needs.formulas.outputs.liam }}
+        run: base64 -d <<<"$LIAM_RB" > tap/Formula/liam.rb
+
+      # The GitHub App secrets are organization secrets, shared by all
+      # repositories. The token is limited to the tap and to what the script
+      # needs: contents and pull requests to open and merge the release pull
+      # request, actions to read the checks run.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        if: ${{ needs.plan.outputs.dry_run != 'true' }}
+        id: app
+        with:
+          client-id: ${{ secrets.BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: protocortex
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: read
+
+      - name: Move the tap
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: scripts/release-tap.sh "$VERSION" tap
