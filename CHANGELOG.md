@@ -16,6 +16,10 @@ All notable changes to LIAM are recorded here. The format follows
 - The event schema is now version 7.
 - The embedder prompt scheme is now 2, which wraps Qwen3 search queries in the model's
   instruction format. A store written under scheme 1 needs the same `liam rebuild` once.
+- The default `embedding_dims` is now 384 (Qwen3-Embedding-0.6B truncated by MRL; nDCG@10 0.933
+  against 0.953 at 768 in `docs/specs/2026-11-06-embedder-speed-evaluation.md`). A store created
+  at 768 is refused at 384 by the embedder fingerprint check: run `liam rebuild --database PATH`,
+  or set `embedding_dims = 768` to keep the old width.
 - Do not delete `<database>.embedder.json` to get past the refusal. The old vectors would stay
   mixed with the new ones.
 

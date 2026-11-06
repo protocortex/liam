@@ -199,7 +199,7 @@ unknown key fails loudly.
 |---|---|---|
 | `database_path` | `liam.db` | The libSQL file. |
 | `log_filter` | `info,liam=debug` | tracing filter. `RUST_LOG` overrides it. |
-| `embedding_dims` | `768` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see The embedder fingerprint). |
+| `embedding_dims` | `384` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see The embedder fingerprint). |
 | `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. |
 | `gc.interval_hours` | `6` | Sweep interval. |
 | `gc.reclaim` | `true` | Run incremental vacuum after a sweep. |

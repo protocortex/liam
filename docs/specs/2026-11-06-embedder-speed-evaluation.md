@@ -265,3 +265,27 @@ were not independently checked.
   difference (candle against ONNX Runtime). A candle run of a small model was not
   made, nor was Qwen3 run in ONNX.
 - No public benchmark slice.
+
+## Addendum 2026-11-06: Qwen3 per category at 384 and 768
+
+The default width became 384, and the tables above gave per-category nDCG@10 only
+at 768. This run fills the gap with `liam eval embedder --model
+Qwen/Qwen3-Embedding-0.6B --dims N --json`, one run per width (quality is
+deterministic), same 340 questions, release build with `--features local`, same
+machine (Apple M1 Pro, 16 GiB).
+
+Machine load: the 1 minute load average was 41 when the runs started (right after
+a release build) and 6.5 when they ended. Only ranking metrics are reported here,
+and those do not depend on load.
+
+| Width | overall | paraphrase | multi | config | symbol | rationale | confusable |
+|---|---|---|---|---|---|---|---|
+| 768 | 0.953 | 0.881 | 0.935 | 0.994 | 0.993 | 0.985 | 0.985 |
+| 384 | 0.933 | 0.826 | 0.934 | 0.994 | 0.978 | 0.985 | 0.975 |
+| Change | -0.020 | -0.055 | -0.001 | 0.000 | -0.015 | 0.000 | -0.010 |
+
+The 768 row matches the table above, so the run reproduces the earlier one. Nearly
+all of the loss at 384 is in paraphrase (-0.055); multi, config and rationale are
+unchanged. paraphrase recall@10 at 384 is 0.94. At 384 Qwen3 is still above the
+best small model's paraphrase score (0.775, bge-small). The same caveats apply: no
+confidence intervals, and one author pair wrote the set.
