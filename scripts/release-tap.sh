@@ -60,17 +60,33 @@ else
 fi
 if [ "$changed" = true ]; then
   diff="$(git -C "$tap_dir" diff -U0 -- "$formula")"
-  removed="$(grep -E '^-[^-]' <<<"$diff" || true)"
-  added="$(grep -E '^\+[^+]' <<<"$diff" || true)"
-  want_url="+  url \"${url_base}/${asset}\""
-  [[ "$(sed -n 1p <<<"$added")" = "$want_url" ]] || fail "the new url line is not ${want_url#+}"
-  [[ "$(sed -n 2p <<<"$added")" =~ ^\+\ \ sha256\ \"[0-9a-f]{64}\"$ && "$(wc -l <<<"$added")" -eq 2 ]] \
-    || fail "the change adds more than a url and a sha256 line"
-  if [ -n "$sha" ] && [[ "$(sed -n 2p <<<"$added")" != "+  sha256 \"${sha}\"" ]]; then
-    fail "the sha256 in the formula is not the one in SHA256SUMS (${sha})"
+  # One or two lines changed: the url, the sha256, or both. A formula already at
+  # this version changes only the sha256, which is the case of a dry run that
+  # reads a placeholder checksum.
+  mapfile -t added < <(grep -E '^\+[^+]' <<<"$diff" || true)
+  mapfile -t removed < <(grep -E '^-[^-]' <<<"$diff" || true)
+  if [[ "${#added[@]}" -lt 1 || "${#added[@]}" -gt 2 || "${#added[@]}" -ne "${#removed[@]}" ]]; then
+    fail "the change touches ${#added[@]} added and ${#removed[@]} removed lines, not the stable url and sha256"
   fi
-  [[ "$(wc -l <<<"$removed")" -eq 2 && "$(sed -n 1p <<<"$removed")" == '-  url "https://github.com/protocortex/liam/releases/download/'* \
-    && "$(sed -n 2p <<<"$removed")" == '-  sha256 "'* ]] || fail "the change removes more than the old url and sha256 lines"
+  want_url="+  url \"${url_base}/${asset}\""
+  for line in "${added[@]}"; do
+    if [[ "$line" = "$want_url" ]]; then continue; fi
+    [[ "$line" =~ ^\+\ \ sha256\ \"[0-9a-f]{64}\"$ ]] || fail "unexpected added line: ${line}"
+    if [ -n "$sha" ] && [[ "$line" != "+  sha256 \"${sha}\"" ]]; then
+      fail "the sha256 in the formula is not the one in SHA256SUMS (${sha})"
+    fi
+  done
+  for line in "${removed[@]}"; do
+    [[ "$line" == '-  url "https://github.com/protocortex/liam/releases/download/'* || "$line" == '-  sha256 "'* ]] \
+      || fail "unexpected removed line: ${line}"
+  done
+  # Whatever the diff looks like, the file must now hold the release's url and,
+  # when SHA256SUMS is known, its checksum, each once.
+  file="${tap_dir}/${formula}"
+  [[ "$(grep -cxF "  url \"${url_base}/${asset}\"" "$file")" -eq 1 ]] || fail "${formula} does not hold the url of ${tag} exactly once"
+  if [ -n "$sha" ]; then
+    [[ "$(grep -cxF "  sha256 \"${sha}\"" "$file")" -eq 1 ]] || fail "${formula} does not hold the checksum of ${tag} exactly once"
+  fi
   say "Formula change for ${tag} (${tap} on ${branch}):"
   say '~~~diff'
   say "$diff"
