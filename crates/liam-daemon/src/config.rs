@@ -981,10 +981,9 @@ mod tests {
     }
 
     #[test]
-    fn the_readme_log_rows_carry_the_code_defaults() {
+    fn the_configuration_page_log_rows_carry_the_code_defaults() {
         // Arrange
-        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
-        let text = std::fs::read_to_string(path).expect("read README.md");
+        let text = crate::config::docs::read_root(crate::config::docs::CONFIGURATION_PAGE);
         let defaults = LogConfig::default();
 
         // Act
@@ -993,7 +992,12 @@ mod tests {
             let line = text
                 .lines()
                 .find(|line| line.starts_with(&prefix))
-                .unwrap_or_else(|| panic!("README must have a row for log.{key}"));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} must have a row for log.{key}",
+                        crate::config::docs::CONFIGURATION_PAGE
+                    )
+                });
             line[prefix.len()..]
                 .split('|')
                 .next()

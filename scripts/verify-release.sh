@@ -48,7 +48,14 @@ other="$(cut -d' ' -f1 <"${dir}/${asset}.sha256")"
 [[ "$other" = "$lines" ]] || fail "${asset}.sha256 says ${other}, but SHA256SUMS says ${lines}"
 
 listing="$(tar -tzf "${dir}/${asset}")"
-for entry in ./liamd ./liam ./install.sh ./liam.toml ./dev.protocortex.liamd.plist; do
+entries=(./liamd ./liam ./install.sh ./liam.toml ./dev.protocortex.liamd.plist)
+# Releases cut before the docs shipped have no docs folder to check.
+PRE_DOCS_TAGS=" v0.1.0 v0.1.1 "
+if [[ "$PRE_DOCS_TAGS" != *" ${tag} "* ]]; then
+  entries+=(./docs/README.md ./docs/getting-started/install.md
+    ./docs/reference/configuration.md ./docs/development/workspace.md)
+fi
+for entry in "${entries[@]}"; do
   grep -Fxq "$entry" <<<"$listing" || fail "${asset} is missing ${entry}"
 done
 echo "${asset}: checksum ${actual} matches SHA256SUMS and ${asset}.sha256, and the archive is complete."

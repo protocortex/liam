@@ -89,6 +89,7 @@ pub(crate) fn default_snapshot_dir(database: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::docs::{read_root, CONFIGURATION_PAGE};
     use crate::config::Config;
 
     fn load(toml: &str) -> anyhow::Result<Config> {
@@ -248,7 +249,7 @@ mod tests {
         value.as_object().unwrap().keys().cloned().collect()
     }
 
-    fn missing_from_readme(text: &str) -> Vec<String> {
+    fn missing_from_page(text: &str) -> Vec<String> {
         consolidation_keys()
             .into_iter()
             .map(|key| format!("consolidation.{key}"))
@@ -259,34 +260,32 @@ mod tests {
             .collect()
     }
 
-    fn read_readme() -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md");
-        std::fs::read_to_string(path).unwrap()
-    }
-
     #[test]
-    fn the_readme_documents_every_consolidation_key() {
+    fn the_configuration_page_documents_every_consolidation_key() {
         // Arrange
-        let text = read_readme();
+        let text = read_root(CONFIGURATION_PAGE);
 
         // Act
-        let missing = missing_from_readme(&text);
+        let missing = missing_from_page(&text);
 
         // Assert
-        assert!(missing.is_empty(), "README.md must document {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "{CONFIGURATION_PAGE} must document {missing:?}"
+        );
     }
 
     #[test]
-    fn a_readme_with_a_row_removed_fails_the_check() {
+    fn a_page_with_a_row_removed_fails_the_check() {
         // Arrange
-        let text: String = read_readme()
+        let text: String = read_root(CONFIGURATION_PAGE)
             .lines()
             .filter(|line| !line.starts_with("| `consolidation.probe_count` |"))
             .collect::<Vec<_>>()
             .join("\n");
 
         // Act
-        let missing = missing_from_readme(&text);
+        let missing = missing_from_page(&text);
 
         // Assert
         assert_eq!(missing, vec!["consolidation.probe_count".to_string()]);

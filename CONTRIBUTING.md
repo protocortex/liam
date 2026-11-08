@@ -3,12 +3,12 @@
 This project follows the standard protocortex contribution rules. Start here:
 
 - **[.github/CONTRIBUTING-RULES.md](.github/CONTRIBUTING-RULES.md)**: DCO, CLA, commit conventions, PR process, and the code style baseline (SPDX headers, dependency policy, commit signing). These rules are shared across all protocortex repos.
-- **[README](README.md)**: project description, build instructions, test commands, and tooling setup.
+- **[README](README.md)**: project description and a quickstart. Build and test commands are in [Build and test](docs/development/build-and-test.md).
 - **[SECURITY.md](SECURITY.md)**: vulnerability disclosure process.
 
 ## Project-Specific Notes
 
-No project-specific notes beyond the baseline rules. See the [README](README.md) for build and test commands.
+No project-specific notes beyond the baseline rules. See [Build and test](docs/development/build-and-test.md) for build and test commands.
 
 ## Project-Specific Code Style
 
@@ -16,7 +16,7 @@ No project-specific code style rules beyond the baseline. See [.github/CONTRIBUT
 
 ## Project-Specific Tests
 
-See the [README](README.md) for test commands and coverage expectations.
+See [Build and test](docs/development/build-and-test.md) for test commands and coverage expectations.
 
 ## Git hooks
 
