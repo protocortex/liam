@@ -14,11 +14,11 @@ documented in the pages linked here:
 | `ask` | Answers a question from memory, synthesized and cited. | [Reading modes and provenance](../concepts/reading-modes.md) |
 | `clusters` | Lists memory clusters, largest first. | [Reading modes and provenance](../concepts/reading-modes.md) |
 | `summaries` | Lists or shows the summaries LIAM wrote. | [Summaries](../concepts/summaries.md) |
-| `facts` | Lists the facts held about a subject. | [Reading facts](../../README.md#reading-facts-the-facts-tool) |
+| `facts` | Lists the facts held about a subject. | [Reading facts](../concepts/extraction.md#reading-facts-the-facts-tool) |
 | `feedback` | Says whether a `recall` or `ask` result was right. | [Tiering](../concepts/tiering.md) |
 | `relate` | Links two memories by handle. | below |
-| `metrics` | Shows LIAM's own metrics and active alerts. | [Metrics and alerts](../../README.md#metrics-and-alerts) |
-| `delete` | Previews what a deletion would destroy. Admin only. | [Deleting a subject](../../README.md#deleting-a-subject) |
+| `metrics` | Shows LIAM's own metrics and active alerts. | [Metrics and alerts](../operations/metrics-and-alerts.md) |
+| `delete` | Previews what a deletion would destroy. Admin only. | [Deleting a subject](../operations/deleting-a-subject.md) |
 | `consolidate` | Runs one consolidation now. Admin only. | [Consolidation](../concepts/consolidation.md) |
 
 `remember` records a fact.
