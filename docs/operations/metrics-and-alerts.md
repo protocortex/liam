@@ -1,4 +1,4 @@
-## Metrics and alerts
+# Metrics and alerts
 
 [Back to the docs index](../README.md)
 
