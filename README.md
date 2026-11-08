@@ -57,7 +57,7 @@ carries more since. See [Status and roadmap](docs/development/status-and-roadmap
 
 Apache-2.0. See [LICENSE](LICENSE).
 
-Dependencies stay to the same standard: everything in the tree is permissive (MIT, Apache-2.0,
-BSD, ISC, Zlib, and similar) apart from MPL-2.0, which is weak, file-level copyleft.
+Dependencies are permissive too: everything in the tree is MIT, Apache-2.0,
+BSD, ISC, Zlib or similar, apart from MPL-2.0, which is weak, file-level copyleft.
 `cargo deny check licenses` enforces that with an allowlist, so a new GPL, LGPL, or AGPL
 dependency fails CI rather than arriving unnoticed.

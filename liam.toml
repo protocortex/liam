@@ -102,7 +102,7 @@ cold_arm_weight                = 0.5     # factor on the cold probe's contributi
 run_deadline_secs              = 600     # bounds the tier step of one run
 
 # Seals new log events so a subject can be deleted by destroying its keys.
-# Unset keeps a plaintext log. See "Deleting a subject" in the README before
+# Unset keeps a plaintext log. See docs/operations/deleting-a-subject.md before
 # turning it on: the data keys are wrapped by this master key, and losing the
 # master key or the key registry loses all log content.
 [encryption]
@@ -141,8 +141,8 @@ model_calls_per_hour       = 1000.0    # model calls an hour at which an alert i
 
 # Calls to hosted model providers (Anthropic, OpenAI, Gemini), for extraction
 # and summaries. Off, and nothing leaves the machine, until every part below is
-# set. Needs a build with `--features hosted`. Read "Hosted providers" in the
-# README before turning it on.
+# set. Needs a build with `--features hosted`. Read
+# docs/concepts/hosted-providers.md before turning it on.
 [hosted]
 enabled              = false     # false makes no hosted call
 allowed_hosts        = []        # the only hosts a request may go to, for example ["api.anthropic.com"]
