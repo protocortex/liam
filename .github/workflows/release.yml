@@ -262,7 +262,7 @@ jobs:
           # adr, plans and specs folders are history and stay out.
           mkdir -p dist/staging/docs
           cp docs/README.md dist/staging/docs/
-          cp -R docs/getting-started docs/reference docs/development dist/staging/docs/
+          cp -R docs/getting-started docs/reference docs/concepts docs/development dist/staging/docs/
           cp packaging/dev.protocortex.liamd.plist dist/staging/
           tar -czf "dist/${NAME}.tar.gz" -C dist/staging .
           cd dist

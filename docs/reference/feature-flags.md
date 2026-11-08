@@ -15,7 +15,7 @@ Leiden community detection is unconditional; there is no feature to disable it.
 - `llama`: llama.cpp text generation, which is what `ask` needs. Metal comes
   from the macOS target, not from this flag.
 - `hosted`: calls to Anthropic, OpenAI and Gemini over HTTPS (see
-  [Hosted providers](../../README.md#hosted-providers)). Off by default, which keeps TLS out of the default build.
+  [Hosted providers](../concepts/hosted-providers.md)). Off by default, which keeps TLS out of the default build.
 - `cuda`: NVIDIA support. Needs the CUDA toolkit at build time, so it is
   opt-in; Apple GPU support is automatic and needs nothing.
 
