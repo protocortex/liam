@@ -53,7 +53,7 @@ entries=(./liamd ./liam ./install.sh ./liam.toml ./dev.protocortex.liamd.plist)
 PRE_DOCS_TAGS=" v0.1.0 v0.1.1 "
 if [[ "$PRE_DOCS_TAGS" != *" ${tag} "* ]]; then
   entries+=(./docs/README.md ./docs/getting-started/install.md
-    ./docs/reference/configuration.md ./docs/development/workspace.md)
+    ./docs/reference/configuration.md ./docs/concepts/event-log.md ./docs/development/workspace.md)
 fi
 for entry in "${entries[@]}"; do
   grep -Fxq "$entry" <<<"$listing" || fail "${asset} is missing ${entry}"

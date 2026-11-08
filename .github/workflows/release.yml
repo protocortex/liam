@@ -284,7 +284,7 @@ jobs:
           listing="$(tar -tzf "dist/${NAME}.tar.gz")"
           for entry in ./liamd ./liam ./install.sh ./liam.toml ./dev.protocortex.liamd.plist \
               ./docs/README.md ./docs/getting-started/install.md \
-              ./docs/reference/configuration.md ./docs/development/workspace.md; do
+              ./docs/reference/configuration.md ./docs/concepts/event-log.md ./docs/development/workspace.md; do
             echo "${listing}" | grep -Fxq "${entry}" || {
               echo "release artifact is missing ${entry}" >&2
               exit 1
