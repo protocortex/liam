@@ -9,8 +9,10 @@ below.
 
 1. [Getting started](#getting-started)
 2. [Reference](#reference)
-3. [Development](#development)
-4. [Design history](#design-history)
+3. [Concepts](#concepts)
+4. [Operations](#operations)
+5. [Development](#development)
+6. [Design history](#design-history)
 
 ## Getting started
 
@@ -26,6 +28,25 @@ below.
 | [Tools](reference/tools.md) | The twelve MCP tools, with the field tables for `remember`, `recall`, `timeline` and `relate`. |
 | [Configuration](reference/configuration.md) | Every `liam.toml` key, its default and its meaning. |
 | [Feature flags](reference/feature-flags.md) | The Cargo features of `liam-store` and `liam-daemon`. |
+
+## Concepts
+
+| Page | What it covers |
+|---|---|
+| [Why LIAM](concepts/why.md) | Why an agent memory needs history and contradiction, and how retrieval blends its signals. |
+| [The event log](concepts/event-log.md) | The write-ahead log the database is built from, rebuilds, quarantined events and upgrades. |
+| [The embedder fingerprint](concepts/embedder-fingerprint.md) | How a store records which embedder wrote its vectors, and how to change it. |
+| [Reading modes and provenance](concepts/reading-modes.md) | Strict and infer reads, and the provenance line on every item. |
+| [Summaries](concepts/summaries.md) | Model-written summary trees, their keys, and what the exit criteria prove. |
+| [Tiering](concepts/tiering.md) | Hot and cold memories, the utility score, and the tiering keys. |
+| [Consolidation](concepts/consolidation.md) | The maintenance run, its steps, rollback and exit codes. |
+| [Hosted providers](concepts/hosted-providers.md) | Sending extraction and summary requests to Anthropic, OpenAI or Gemini, and the privacy gate. |
+
+## Operations
+
+| Page | What it covers |
+|---|---|
+| [Garbage collection](operations/garbage-collection.md) | How a sweep is logged and what it blocks. |
 
 ## Development
 

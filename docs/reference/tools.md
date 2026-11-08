@@ -7,19 +7,19 @@ review and admin.
 
 Point a client at `liamd` and it exposes twelve tools. This page has the field
 tables for `remember`, `recall`, `timeline` and `relate`. The other eight are
-documented in the README sections linked here:
+documented in the pages linked here:
 
 | Tool | What it does | Documented under |
 |---|---|---|
-| `ask` | Answers a question from memory, synthesized and cited. | [Reading modes and provenance](../../README.md#reading-modes-and-provenance) |
-| `clusters` | Lists memory clusters, largest first. | [Reading modes and provenance](../../README.md#reading-modes-and-provenance) |
-| `summaries` | Lists or shows the summaries LIAM wrote. | [Summaries](../../README.md#summaries) |
+| `ask` | Answers a question from memory, synthesized and cited. | [Reading modes and provenance](../concepts/reading-modes.md) |
+| `clusters` | Lists memory clusters, largest first. | [Reading modes and provenance](../concepts/reading-modes.md) |
+| `summaries` | Lists or shows the summaries LIAM wrote. | [Summaries](../concepts/summaries.md) |
 | `facts` | Lists the facts held about a subject. | [Reading facts](../../README.md#reading-facts-the-facts-tool) |
-| `feedback` | Says whether a `recall` or `ask` result was right. | [Tiering](../../README.md#tiering) |
+| `feedback` | Says whether a `recall` or `ask` result was right. | [Tiering](../concepts/tiering.md) |
 | `relate` | Links two memories by handle. | below |
 | `metrics` | Shows LIAM's own metrics and active alerts. | [Metrics and alerts](../../README.md#metrics-and-alerts) |
 | `delete` | Previews what a deletion would destroy. Admin only. | [Deleting a subject](../../README.md#deleting-a-subject) |
-| `consolidate` | Runs one consolidation now. Admin only. | [Consolidation](../../README.md#consolidation) |
+| `consolidate` | Runs one consolidation now. Admin only. | [Consolidation](../concepts/consolidation.md) |
 
 `remember` records a fact.
 

@@ -57,12 +57,28 @@ fn keys_of(value: &Value) -> Vec<String> {
 
 /// The documentation pages the config tests read, relative to the repository root.
 pub(super) const CONFIGURATION_PAGE: &str = "docs/reference/configuration.md";
+pub(super) const TIERING_PAGE: &str = "docs/concepts/tiering.md";
+pub(super) const SUMMARIES_PAGE: &str = "docs/concepts/summaries.md";
+
+/// A page's title heading. Everything after it belongs to the page.
+pub(super) const PAGE_TITLE_MARK: &str = "# ";
 
 pub(super) fn read_root(file: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(file);
     std::fs::read_to_string(path).unwrap()
+}
+
+/// The lines of a docs page that follow its `# Title` heading, up to the next
+/// heading of the same level. Empty when the page does not carry that title.
+pub(super) fn page_body(text: &str, title_heading: &str) -> Vec<String> {
+    text.lines()
+        .skip_while(|line| *line != title_heading)
+        .skip(1)
+        .take_while(|line| !line.starts_with(PAGE_TITLE_MARK))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The lines of the `[section]` table, up to the next table.

@@ -10,7 +10,7 @@ unknown key fails loudly.
 |---|---|---|
 | `database_path` | `liam.db` | The libSQL file. |
 | `log_filter` | `info,liam=debug` | tracing filter. `RUST_LOG` overrides it. |
-| `embedding_dims` | `384` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see [The embedder fingerprint](../../README.md#the-embedder-fingerprint)). |
+| `embedding_dims` | `384` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see [The embedder fingerprint](../concepts/embedder-fingerprint.md)). |
 | `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. |
 | `gc.interval_hours` | `6` | Sweep interval. |
 | `gc.reclaim` | `true` | Run incremental vacuum after a sweep. |
@@ -52,7 +52,7 @@ unknown key fails loudly.
 | `hosted.allowed_hosts` | empty | The only hosts a request may go to, each lowercase with no scheme, port or path. Required when `hosted.enabled` is true. |
 | `hosted.request_timeout_secs` | `60` | How long one request may take, answer included. At least `1`. |
 | `hosted.max_response_bytes` | `4194304` | The most bytes of a response that are read. A larger one is an error. At least `1`. |
-| `hosted.privacy` | empty | The gate every item passes before it goes into a hosted prompt. See [Hosted providers](../../README.md#hosted-providers). |
+| `hosted.privacy` | empty | The gate every item passes before it goes into a hosted prompt. See [Hosted providers](../concepts/hosted-providers.md). |
 | `hosted.privacy.allowed_scopes` | empty | Scopes whose items may be sent. A scope covers its descendants, and `""` is the unscoped group. Empty sends nothing. |
 | `hosted.privacy.local_only_sources` | empty | Producers whose items are never sent, in any scope. |
 | `hosted.privacy.provider_regions` | empty | The region each provider processes requests in, as you declare it. |
