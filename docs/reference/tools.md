@@ -7,7 +7,7 @@ review and admin.
 
 Point a client at `liamd` and it exposes twelve tools. This page has the field
 tables for `remember`, `recall`, `timeline` and `relate`. The other eight are
-documented in the README sections linked here:
+documented in the pages linked here:
 
 | Tool | What it does | Documented under |
 |---|---|---|

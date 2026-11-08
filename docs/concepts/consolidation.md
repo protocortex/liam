@@ -1,4 +1,4 @@
-## Consolidation
+# Consolidation
 
 [Back to the docs index](../README.md)
 

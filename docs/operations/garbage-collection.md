@@ -1,4 +1,4 @@
-## Garbage collection
+# Garbage collection
 
 [Back to the docs index](../README.md)
 

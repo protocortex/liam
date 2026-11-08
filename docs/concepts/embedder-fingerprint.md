@@ -1,4 +1,4 @@
-## The embedder fingerprint
+# The embedder fingerprint
 
 [Back to the docs index](../README.md)
 
