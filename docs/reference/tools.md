@@ -5,8 +5,9 @@
 `remember` and `recall` are the core pair, and ten more tools cover reading,
 review and admin.
 
-Point a client at `liamd` and it exposes twelve tools. This page covers the
-first three. The rest have their own pages:
+Point a client at `liamd` and it exposes twelve tools. This page has the field
+tables for `remember`, `recall`, `timeline` and `relate`. The other eight are
+documented in the README sections linked here:
 
 | Tool | What it does | Documented under |
 |---|---|---|

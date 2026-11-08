@@ -1,4 +1,4 @@
-## Evaluating retrieval
+# Evaluating retrieval
 
 [Back to the docs index](../README.md)
 
