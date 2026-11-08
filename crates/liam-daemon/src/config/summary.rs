@@ -313,9 +313,8 @@ mod tests {
         }
     }
 
-    use crate::config::docs::{page_body, read_root, SUMMARIES_PAGE};
-
-    const PAGE_HEADING: &str = "# Summaries";
+    const README_SECTION_HEADING: &str = "## Summaries";
+    const SECTION_MARK: &str = "## ";
 
     /// Every key of the section, read off the serialized default so a new field
     /// cannot be left out of the check.
@@ -331,6 +330,13 @@ mod tests {
             .trim_start()
             .strip_prefix(key)
             .is_some_and(|rest| rest.trim_start().starts_with('='))
+    }
+
+    fn read_root(file: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(file);
+        std::fs::read_to_string(path).unwrap()
     }
 
     #[test]
@@ -367,13 +373,18 @@ mod tests {
     }
 
     #[test]
-    fn the_summaries_page_documents_every_summary_key() {
+    fn the_readme_summaries_section_documents_every_summary_key() {
         // Arrange
-        let text = read_root(SUMMARIES_PAGE);
-        let section = page_body(&text, PAGE_HEADING);
+        let text = read_root("README.md");
+        let section: Vec<&str> = text
+            .lines()
+            .skip_while(|line| *line != README_SECTION_HEADING)
+            .skip(1)
+            .take_while(|line| !line.starts_with(SECTION_MARK))
+            .collect();
         assert!(
             !section.is_empty(),
-            "{SUMMARIES_PAGE} needs a {PAGE_HEADING} title"
+            "README.md needs a {README_SECTION_HEADING} section"
         );
 
         // Act
@@ -386,9 +397,6 @@ mod tests {
             .collect();
 
         // Assert
-        assert!(
-            missing.is_empty(),
-            "{SUMMARIES_PAGE} must document {missing:?}"
-        );
+        assert!(missing.is_empty(), "README.md must document {missing:?}");
     }
 }
