@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The shipped `liam.toml` and the README name every key of the sections that
+//! The shipped `liam.toml` and the configuration page name every key of the sections that
 //! guard deletion, archive, metrics and hosted calls, so a key added in code
 //! cannot ship undocumented.
 
@@ -55,7 +55,10 @@ fn keys_of(value: &Value) -> Vec<String> {
         .collect()
 }
 
-fn read_root(file: &str) -> String {
+/// The documentation pages the config tests read, relative to the repository root.
+pub(super) const CONFIGURATION_PAGE: &str = "docs/reference/configuration.md";
+
+pub(super) fn read_root(file: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(file);
@@ -98,7 +101,7 @@ fn missing_from_toml(text: &str) -> Vec<String> {
     missing
 }
 
-fn missing_from_readme(text: &str) -> Vec<String> {
+fn missing_from_page(text: &str) -> Vec<String> {
     let mut missing = Vec::new();
     for (section, value) in sections() {
         let mut named: Vec<String> = keys_of(&value)
@@ -132,15 +135,18 @@ fn liam_toml_documents_every_key_of_the_new_sections() {
 }
 
 #[test]
-fn the_readme_configuration_table_documents_every_key_of_the_new_sections() {
+fn the_configuration_page_documents_every_key_of_the_new_sections() {
     // Arrange
-    let text = read_root("README.md");
+    let text = read_root(CONFIGURATION_PAGE);
 
     // Act
-    let missing = missing_from_readme(&text);
+    let missing = missing_from_page(&text);
 
     // Assert
-    assert!(missing.is_empty(), "README.md must document {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "{CONFIGURATION_PAGE} must document {missing:?}"
+    );
 }
 
 #[test]
@@ -151,18 +157,18 @@ fn a_file_with_a_key_removed_fails_the_check() {
         .filter(|line| !assigns(line, "deadline_days"))
         .map(|line| format!("{line}\n"))
         .collect();
-    let readme: String = read_root("README.md")
+    let page: String = read_root(CONFIGURATION_PAGE)
         .lines()
         .filter(|line| !line.starts_with("| `archive.after_days` |"))
         .map(|line| format!("{line}\n"))
         .collect();
 
     // Act
-    let (from_toml, from_readme) = (missing_from_toml(&toml), missing_from_readme(&readme));
+    let (from_toml, from_page) = (missing_from_toml(&toml), missing_from_page(&page));
 
     // Assert
     assert_eq!(from_toml, vec!["deletion.deadline_days".to_string()]);
-    assert_eq!(from_readme, vec!["archive.after_days".to_string()]);
+    assert_eq!(from_page, vec!["archive.after_days".to_string()]);
 }
 
 #[test]
@@ -221,21 +227,18 @@ fn a_hosted_key_missing_from_either_file_fails_the_check() {
         .filter(|line| !assigns(line, "allowed_hosts"))
         .map(|line| format!("{line}\n"))
         .collect();
-    let readme: String = read_root("README.md")
+    let page: String = read_root(CONFIGURATION_PAGE)
         .lines()
         .filter(|line| !line.starts_with("| `hosted.privacy.allowed_scopes` |"))
         .map(|line| format!("{line}\n"))
         .collect();
 
     // Act
-    let (from_toml, from_readme) = (missing_from_toml(&toml), missing_from_readme(&readme));
+    let (from_toml, from_page) = (missing_from_toml(&toml), missing_from_page(&page));
 
     // Assert
     assert_eq!(from_toml, vec!["hosted.allowed_hosts".to_string()]);
-    assert_eq!(
-        from_readme,
-        vec!["hosted.privacy.allowed_scopes".to_string()]
-    );
+    assert_eq!(from_page, vec!["hosted.privacy.allowed_scopes".to_string()]);
 }
 
 #[test]

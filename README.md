@@ -40,255 +40,23 @@ list and reranked for precision.
 
 ## Workspace
 
-Four crates, each usable on its own.
-
-| Crate | Role |
-|---|---|
-| `liam-store` | The core. Bitemporal graph, hybrid retrieval, GC, clustering. Backend-generic over libSQL or SQLite. No ML. |
-| `liam-log` | The append-only event log: write-ahead segments, Parquet compaction, encryption and archive. The store rebuilds from it. |
-| `liam-model` | In-process embedding and reranking via `fastembed`, behind the `local` feature. Mock and identity defaults keep dev builds light. |
-| `liam-daemon` | The MCP server (binary `liamd`). Wires store and model, serves `remember` and `recall` over stdio, runs GC in the background. |
-
-```
-agent ──MCP──▶ liamd ──embed/rerank──▶ liam-model
-                 │
-                 └── store/retrieve ──▶ liam-store ──▶ libSQL/SQLite file
-```
-
-The store is the reusable part. The daemon is one consumer; a `liam` CLI or a web
-graph view would be others.
+Moved to [Workspace](docs/development/workspace.md).
 
 ## Build and test
 
-Rust stable, edition 2021.
-
-```sh
-cargo build --workspace          # mock embedder, no ML deps
-cargo test  --workspace          # libSQL backend, in-memory
-```
-
-The base build stays light. The in-process model stack (fastembed, candle, ONNX
-runtime) pulls a large dependency tree and is opt-in:
-
-```sh
-cargo build -p liam-daemon --features local
-```
+Moved to [Build and test](docs/development/build-and-test.md).
 
 ## Install with Homebrew
 
-On Apple Silicon macOS:
-
-```sh
-brew tap protocortex/tap
-brew install liam              # the latest tagged release
-brew install --HEAD liam       # builds main from source with cargo; slow
-```
-
-The formula does not download models. Its caveats say how to fetch them with
-`liam fetch-models` and how to point an MCP client at `liamd proxy`. The tap
-lives in [protocortex/homebrew-tap](https://github.com/protocortex/homebrew-tap).
+Moved to [Install](docs/getting-started/install.md).
 
 ## Run
 
-```sh
-cargo run -p liam-daemon         # builds and runs the `liamd` binary
-```
-
-`liamd` has three modes. Running it with no subcommand is the original one, so
-existing MCP client configs keep working unchanged.
-
-| Command | What it does | Opens the store |
-|---|---|---|
-| `liamd` | Serves MCP over this process's stdio. One client, one process. | yes |
-| `liamd serve` | The shared daemon: serves many clients over a Unix socket. | yes |
-| `liamd proxy` | Forwards stdio to a running daemon's socket. | no |
-
-`--config PATH` overrides `LIAM_CONFIG` for any of them.
-
-### One daemon, many agents
-
-Running `liamd` per client gives each one its own process, and only one of them
-can hold the database: the others fail to start on the store lock. Use the daemon
-instead when more than one agent needs the same memory.
-
-Start it once:
-
-```sh
-liamd serve
-```
-
-Then point every MCP client at the proxy rather than at `liamd` directly:
-
-```json
-{ "command": "liamd", "args": ["proxy"] }
-```
-
-Each client keeps its own identity through the proxy, because the proxy forwards
-bytes untouched and the daemon reads the name from the client's own MCP
-handshake. Map those names to stable producer ids in `[producers.clients]`, and
-every fact records who wrote it.
-
-On macOS, launchd can own the socket and start the daemon on the first
-connection, so nothing has to run `liamd serve` by hand. See
-`packaging/dev.protocortex.liamd.plist` for the job and its install steps.
-
-### The socket
-
-`socket_path` defaults to `~/.liam/liamd.sock` and is created owner-only (0600).
-It carries full tool access with no further authentication, so anyone who can
-reach the file can act as any client; owner-only is what makes "can reach it"
-mean "is already you". `liamd serve` refuses to start if another daemon is
-already listening, and replaces the socket only when it is stale.
-
-Point a client at `liamd` and it exposes twelve tools. This section covers the
-first three. The rest have their own sections:
-
-| Tool | What it does | Documented under |
-|---|---|---|
-| `ask` | Answers a question from memory, synthesized and cited. | Reading modes and provenance |
-| `clusters` | Lists memory clusters, largest first. | Reading modes and provenance |
-| `summaries` | Lists or shows the summaries LIAM wrote. | Summaries |
-| `facts` | Lists the facts held about a subject. | Reading facts |
-| `feedback` | Says whether a `recall` or `ask` result was right. | Tiering |
-| `relate` | Links two memories by handle. | below |
-| `metrics` | Shows LIAM's own metrics and active alerts. | Metrics and alerts |
-| `delete` | Previews what a deletion would destroy. Admin only. | Deleting a subject |
-| `consolidate` | Runs one consolidation now. Admin only. | Consolidation |
-
-`remember` records a fact.
-
-| Field | Required | Notes |
-|---|---|---|
-| `kind` | yes | Opaque label: `decision`, `fact`, `symbol`, `episode`. |
-| `label` | yes | Short title. |
-| `content` | yes | The text to embed and store. |
-| `scope` | no | Partition by project or agent. Trimmed; ASCII letters, digits, `-`, `_`, `/`; up to 200 characters; no leading/trailing `/` or empty segment (`//`). |
-| `subject` | no | Identity. A new value with the same subject supersedes the old. |
-
-`recall` retrieves and reranks.
-
-| Field | Required | Notes |
-|---|---|---|
-| `query` | yes | Text; embedded for the vector channel too. |
-| `kind` | no | Restrict to one kind. |
-| `scope` | no | Restrict to one partition. Same format as `remember`'s `scope`. |
-| `k` | no | How many hits to return (default 8). |
-
-`timeline` shows an entity's compiled page and the mentions behind it, most
-recent first.
-
-| Field | Required | Notes |
-|---|---|---|
-| `entity` | yes | Handle or unambiguous prefix, as shown by `recall`. |
-| `limit` | no | How many mentions to show (default 50, max 200). A capped result ends with an "(more mentions exist)" trailer instead of claiming an exact total. |
-
-`relate` records a relationship between two memories.
-
-| Field | Required | Notes |
-|---|---|---|
-| `from` | yes | Handle of the source memory, as shown by `recall`. A full id works too. |
-| `to` | yes | Handle of the target memory. |
-| `type` | yes | Relation type, for example `mentions`. Lower-cased on write. `supersedes` is reserved for version history and refused. |
-
-By default the embedder is a mock, so retrieval leans on full-text and graph
-signals. Set `provider = "local"` and build with `--features local` for real
-embeddings.
-
-### Try it with a real embedder
-
-From your clone of this repo, build with the `local` feature, switch the
-config to the `local` provider, then start the daemon as documented above:
-
-```sh
-cargo build -p liam-daemon --features local
-```
-
-Set `embedder.provider = "local"` in `liam.toml` (see the Configuration table
-below for the rest of the keys). Run `liamd` as shown above, then call
-`recall` from your MCP client. The vector channel now carries real semantic
-similarity instead of the mock embedder's hash-derived placeholder, so
-results ranked mainly by meaning (not just shared words) start showing up
-alongside the full-text and graph signals `recall` always blends in.
+Moved to [Running LIAM](docs/getting-started/running.md) and [Tools](docs/reference/tools.md).
 
 ## Configuration
 
-The daemon reads `liam.toml` from the working directory. Override the path with
-`LIAM_CONFIG=/path/to/file`. A missing file or key falls back to the default; an
-unknown key fails loudly.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `database_path` | `liam.db` | The libSQL file. |
-| `log_filter` | `info,liam=debug` | tracing filter. `RUST_LOG` overrides it. |
-| `embedding_dims` | `384` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see The embedder fingerprint). |
-| `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. |
-| `gc.interval_hours` | `6` | Sweep interval. |
-| `gc.reclaim` | `true` | Run incremental vacuum after a sweep. |
-| `gc.run_on_start` | `false` | Sweep once at boot. |
-| `gc.max_resynth_per_tick` | `5` | Ceiling on entities re-synthesized per maintenance tick. |
-| `gc.full_synthesis_mention_threshold` | `8` | Live-mention count at or above which the next resynthesis uses the full-tier token budget. |
-| `gc.full_synthesis_max_new_tokens` | `512` | Output token budget for a full-tier resynthesis. |
-| `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. Part of the embedder fingerprint. |
-| `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`: `Qwen/Qwen3-Embedding-0.6B`, `BAAI/bge-m3`, or a small ONNX model (`BAAI/bge-small-en-v1.5`, `sentence-transformers/all-MiniLM-L6-v2`, `sentence-transformers/all-MiniLM-L12-v2`, `Snowflake/snowflake-arctic-embed-xs`, `Snowflake/snowflake-arctic-embed-s`, `nomic-ai/nomic-embed-text-v1.5`, `intfloat/multilingual-e5-small`). The small models need `embedding_dims` equal to their width (384; nomic accepts up to 768). See `docs/specs/2026-11-06-embedder-speed-evaluation.md`. Part of the embedder fingerprint. |
-| `embedder.cache_dir` | `~/.liam/models` | Files for both the reranker and the embedder, each under its own `models--Org--Name` subdirectory. |
-| `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
-| `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
-| `read_pool_size` | `4` | Read connections. Ignored for an in-memory database. |
-| `log.dir` | `<database stem>.log` beside the database | The event log directory. `~` is expanded, and a relative path is taken from the database's directory. Must not be empty. An existing directory must be empty or already a log. |
-| `log.wal_segment_max_bytes` | `8388608` | The open WAL segment is closed by the first write after it reaches this size, then compacted to Parquet. Must be at least 1. |
-| `log.wal_rotate_interval_secs` | `300` | The open WAL segment is closed by the first write after it reaches this age, then compacted to Parquet. Must be at least 1. |
-| `log.bloom_fpr` | `0.01` | False positive rate of the dedup filter. At least `1e-9` and below `1`. |
-| `consolidation.probe_recall_margin` | `0.02` | A probe whose recall drops by at least this much fails the run, which is then rolled back. Above `0` and at most `1`. |
-| `consolidation.dedup_similarity_threshold` | `0.95` | Cosine similarity at or above which two nodes are linked as near-duplicates. Above `0` and at most `1`. |
-| `consolidation.probe_count` | `20` | Most probes drawn from the store to gate a run. From `1` to `1000`. |
-| `consolidation.snapshot_dir` | `<database stem>.snapshots` beside the database | Where runs keep their snapshots. `~` is expanded, and a relative path is taken from the database's directory. Must not be empty. |
-| `encryption.master_key` | unset | Seals new log events when set: `keychain` (the macOS login keychain) or `file`. Unset keeps a plaintext log. |
-| `encryption.key_file` | unset | The master key file for `master_key = "file"`. `~` is expanded. Only its owner may read it. |
-| `deletion.deadline_days` | `30` | Days a delete job has before it is reported as overdue. At least `1`. |
-| `deletion.secure_delete` | `true` | Zero the database pages a delete frees. |
-| `admin.producers` | empty | Producers that may call the `delete` and `consolidate` tools. Empty refuses everyone. |
-| `archive.enabled` | `false` | Move old closed log partitions to `archive.dir`. |
-| `archive.after_days` | `90` | Archive a closed partition once its newest event is this many days old. At least `1`. |
-| `archive.dir` | unset | Where archived partitions go. Required when `archive.enabled` is true, and must exist. |
-| `archive.zstd_level` | `3` | The zstd level of an archived copy, from `1` to `22`. |
-| `metrics.enabled` | `true` | Keep metrics and raise alerts. `false` exposes no readings. |
-| `metrics.sink` | `memory` | `memory`, or `log` to also log each active alert at error level. |
-| `metrics.min_samples` | `5` | Samples a metric needs before a relative or rate rule can alert. At least `1`. |
-| `metrics.delta_pct` | `20.0` | Percent a recall, latency, `ece` or Bloom rate may move between runs before an alert. |
-| `metrics.rollback_ceiling` | `1.0` | Rollbacks at which an alert is raised. |
-| `metrics.extraction_backlog_ceiling` | `10000.0` | Events past an extraction cursor at which an alert is raised. |
-| `metrics.model_calls_per_hour` | `1000.0` | Model calls an hour at which an alert is raised. |
-| `hosted.enabled` | `false` | Allow calls to hosted model providers. Needs a build with `--features hosted`. |
-| `hosted.allowed_hosts` | empty | The only hosts a request may go to, each lowercase with no scheme, port or path. Required when `hosted.enabled` is true. |
-| `hosted.request_timeout_secs` | `60` | How long one request may take, answer included. At least `1`. |
-| `hosted.max_response_bytes` | `4194304` | The most bytes of a response that are read. A larger one is an error. At least `1`. |
-| `hosted.privacy` | empty | The gate every item passes before it goes into a hosted prompt. See Hosted providers. |
-| `hosted.privacy.allowed_scopes` | empty | Scopes whose items may be sent. A scope covers its descendants, and `""` is the unscoped group. Empty sends nothing. |
-| `hosted.privacy.local_only_sources` | empty | Producers whose items are never sent, in any scope. |
-| `hosted.privacy.provider_regions` | empty | The region each provider processes requests in, as you declare it. |
-| `hosted.privacy.attested_regions` | empty | For a scope and its descendants, the regions it may be sent to. |
-| `hosted.models` | empty | The dated model id each provider is pinned to. An alias is refused. |
-| `hosted.prices` | empty | What each pinned model costs. |
-| `hosted.prices.version` | empty | Names the price table, so a recorded cost can be tied to its rates. |
-| `hosted.prices.models` | empty | Rates by pinned model id, in millionths of a dollar per million tokens: input, output, cached input, batch input and batch output. |
-| `hosted.key_files` | empty | A provider's key file, an absolute path only its owner can read. Without one the key is read from the Keychain item `liam-<provider>` (macOS). |
-| `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
-| `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
-
-`[producers.clients]` is a plain table, and the ids are what land in the
-`producer` column:
-
-```toml
-[producers.clients]
-claude-code = "claude"
-ai-notetaker = "notetaker"
-```
-
-Logs go to stderr. Stdout carries the MCP JSON-RPC stream, so it stays clean.
-
-The store runs in WAL mode, so libSQL keeps `liam.db-wal` and `liam.db-shm` next
-to the database. Anything that copies or backs up the store by path needs all
-three: the `.db` file alone can be missing recently committed data.
+Moved to [Configuration](docs/reference/configuration.md).
 
 ## The event log
 
@@ -384,40 +152,7 @@ restore the previous `liam.toml` settings.
 
 ### Evaluating retrieval
 
-```sh
-liam eval retrieval --model <ID> [--json]
-```
-
-It scores one embedding model on a fixed golden set and measures the embedder's
-speed. Build `liam` with `--features local`; without it the command fails with
-an error saying so. The model is downloaded into `embedder.cache_dir` on first
-use. BGE-M3 is cached under `HF_HOME` instead when that variable is set.
-
-| Flag | Meaning |
-|---|---|
-| `--model <ID>` | Required. `Qwen/Qwen3-Embedding-0.6B` or `BAAI/bge-m3`. The match ignores case. Any other id is refused with the list of supported ones. |
-| `--json` | Print the report as JSON instead of text. Latencies are in milliseconds. |
-| `--config <PATH>` | The config to read, as for the other `liam` commands (`LIAM_CONFIG` also works). |
-
-The run uses the in-process `local` embedder whatever `embedder.provider` says.
-Qwen3 runs at `embedding_dims`; BGE-M3 always runs at its fixed 1024.
-
-The golden set is 80 hand-written questions, ten in each of eight categories
-(`Lexical`, `VectorSemantic`, `GraphExpansion`, `KindFilter`, `ScopeFilter`,
-`Decay`, `Confidence`, `AsOf`), over a synthetic corpus about one fictional
-company. LIAM has no real usage logs yet, so the set stands in for them. It is
-small, and most categories are decided by full-text search, so only
-`VectorSemantic` separates embedders. Treat differences of a few thousandths as
-noise.
-
-The text report has a header line (model, dimensions, facts, questions), a
-per-category table (precision and recall at 4 and 8, recall@10, nDCG@10, MRR),
-an `overall` line, and an `embedder:` line with the call count, item count, mean
-latency and throughput in items per second. The JSON report carries the same
-figures plus a row per question. The ranking metrics are deterministic: two
-runs of the same model give the same values. Only the timings vary with the
-machine. The measured comparison of the two models is in
-[`docs/specs/2026-10-23-m-l2-d42-embedder-evaluation.md`](docs/specs/2026-10-23-m-l2-d42-embedder-evaluation.md).
+Moved to [Evaluating retrieval](docs/development/evaluating-retrieval.md).
 
 ### Upgrading a database that predates the log
 
@@ -1058,87 +793,19 @@ run yet, so `r10_results.toml` has no rows.
 
 ## Feature flags
 
-`liam-store`:
-
-- `backend-libsql` (default): libSQL with native vector search (`F32_BLOB`,
-  `vector_distance_cos`).
-Leiden community detection is unconditional; there is no feature to disable it.
-
-`liam-daemon`:
-
-- `local`: load fastembed in-process (Qwen3 embedder, cross-encoder reranker).
-  Off by default, which keeps the dev build small.
-- `llama`: llama.cpp text generation, which is what `ask` needs. Metal comes
-  from the macOS target, not from this flag.
-- `hosted`: calls to Anthropic, OpenAI and Gemini over HTTPS (see Hosted
-  providers). Off by default, which keeps TLS out of the default build.
-- `cuda`: NVIDIA support. Needs the CUDA toolkit at build time, so it is
-  opt-in; Apple GPU support is automatic and needs nothing.
-
-A release build sets `local,llama`. Without them the daemon refuses to start
-against a config naming those providers, rather than falling back to mocks
-that would return random vectors and invented answers.
+Moved to [Feature flags](docs/reference/feature-flags.md).
 
 ## Packaging
 
-Models run inside the binary, so shipping means getting weights onto the
-machine before the first query. Releases take the fetch-on-install route: the
-tarball carries `liamd`, `liam`, a config, and `install.sh`, and weighs a few
-megabytes.
-
-```sh
-tar -xzf liam-vX.Y.Z-aarch64-apple-darwin-netinstall.tar.gz -C liam
-cd liam && ./install.sh
-```
-
-`install.sh` copies both binaries to `~/.local/bin`, writes `~/.liam/liam.toml`
-if you do not already have one, runs `liam fetch-models`, and registers the
-launchd agent. Use `--prefix`, `--skip-models`, or `--no-launchd` to change
-that. Running it again is safe.
-
-`liam fetch-models` downloads **and loads** each model. Loading is the point: a
-truncated file downloads happily and only fails when something tries to use it,
-which would otherwise be a user's first `recall`, long after the install.
-
-Both models land under `embedder.cache_dir`, each in its own `models--Org--Name`
-subdirectory. That makes a bundle-in-release option possible (ship the weights
-in the tarball, pointed at by that same directory), though fetch-on-install is
-still the route the current release workflow takes.
+Moved to [Install](docs/getting-started/install.md).
 
 ## Status
 
-LIAM is pre-1.0. The last release is v0.1.1 (macOS on Apple Silicon); `main`
-carries more since. It re-extracts the memory core of the retired v0 (the
-archived `liam-archive` repo, a larger code-intelligence engine), rebuilt
-smaller with RRF fusion and a full bitemporal model.
-
-What is built:
-
-- Storage and retrieval: the bitemporal graph, hybrid search with a cold arm,
-  entity pages, scope hierarchy, producer-scoped collisions and `same_as`
-  links.
-- The event log, with rebuild, snapshots and restore, and consolidation runs
-  that extract facts and link near-duplicates.
-- Summary trees with strict and infer reading modes, and utility-based
-  tiering.
-- Deletion and log archive, with metrics and alerts, and a producer trust cap
-  on usage.
-- Hosted providers behind the `hosted` feature: pinned models, a default-deny
-  privacy gate, batch submit and collect, cost metrics, and cancel on delete.
-  The provider request shapes are unchecked against live accounts.
-
-What is checked: the workspace builds, `cargo test --workspace` is green, the
-`local` build compiles against fastembed v5, and the community-detection
-wrapper in `cluster.rs` is covered by tests against `leiden-rs` 0.8.1. The
-real-model tests are gated and run on demand, not in the default test run.
+Moved to [Status and roadmap](docs/development/status-and-roadmap.md).
 
 ## Roadmap
 
-- Check the hosted adapters against live accounts and record the live R10
-  results.
-- Hosted deployment: HTTP transport, OAuth and per-tenant scoping. Not
-  planned yet.
-- Agent Client Protocol support. Not planned yet.
+Moved to [Status and roadmap](docs/development/status-and-roadmap.md).
 
 ## License
 

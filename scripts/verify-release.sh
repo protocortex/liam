@@ -48,7 +48,7 @@ other="$(cut -d' ' -f1 <"${dir}/${asset}.sha256")"
 [[ "$other" = "$lines" ]] || fail "${asset}.sha256 says ${other}, but SHA256SUMS says ${lines}"
 
 listing="$(tar -tzf "${dir}/${asset}")"
-for entry in ./liamd ./liam ./install.sh ./liam.toml ./dev.protocortex.liamd.plist; do
+for entry in ./liamd ./liam ./install.sh ./liam.toml ./dev.protocortex.liamd.plist ./docs/README.md; do
   grep -Fxq "$entry" <<<"$listing" || fail "${asset} is missing ${entry}"
 done
 echo "${asset}: checksum ${actual} matches SHA256SUMS and ${asset}.sha256, and the archive is complete."

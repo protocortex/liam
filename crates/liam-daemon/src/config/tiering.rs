@@ -372,8 +372,9 @@ mod tests {
         }
     }
 
-    const README_SECTION_HEADING: &str = "## Tiering";
-    const SECTION_MARK: &str = "## ";
+    use crate::config::docs::{page_body, read_root, TIERING_PAGE};
+
+    const PAGE_HEADING: &str = "# Tiering";
 
     /// Every key of the section, read off the serialized default so a new field
     /// cannot be left out of the check.
@@ -391,13 +392,6 @@ mod tests {
             .is_some_and(|rest| rest.trim_start().starts_with('='))
     }
 
-    fn read_root(file: &str) -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(file);
-        std::fs::read_to_string(path).unwrap()
-    }
-
     /// The lines of the `[tiering]` table of a `liam.toml`.
     fn toml_section(text: &str) -> Vec<&str> {
         text.lines()
@@ -407,14 +401,9 @@ mod tests {
             .collect()
     }
 
-    /// The lines between the README's tiering heading and the next heading of
-    /// the same level.
-    fn readme_section(text: &str) -> Vec<&str> {
-        text.lines()
-            .skip_while(|line| *line != README_SECTION_HEADING)
-            .skip(1)
-            .take_while(|line| !line.starts_with(SECTION_MARK))
-            .collect()
+    /// The lines of the tiering page under its title.
+    fn page_section(text: &str) -> Vec<String> {
+        page_body(text, PAGE_HEADING)
     }
 
     fn missing_from_toml(section: &[&str]) -> Vec<String> {
@@ -424,7 +413,7 @@ mod tests {
             .collect()
     }
 
-    fn missing_from_readme(section: &[&str]) -> Vec<String> {
+    fn missing_from_page(section: &[String]) -> Vec<String> {
         tiering_keys()
             .into_iter()
             .filter(|key| {
@@ -459,44 +448,47 @@ mod tests {
     }
 
     #[test]
-    fn the_readme_tiering_section_documents_every_tiering_key() {
+    fn the_tiering_page_documents_every_tiering_key() {
         // Arrange
-        let text = read_root("README.md");
-        let section = readme_section(&text);
+        let text = read_root(TIERING_PAGE);
+        let section = page_section(&text);
         assert!(
             !section.is_empty(),
-            "README.md needs a {README_SECTION_HEADING} section"
+            "{TIERING_PAGE} needs a {PAGE_HEADING} title"
         );
 
         // Act
-        let missing = missing_from_readme(&section);
+        let missing = missing_from_page(&section);
 
         // Assert
-        assert!(missing.is_empty(), "README.md must document {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "{TIERING_PAGE} must document {missing:?}"
+        );
     }
 
     #[test]
     fn a_section_with_a_key_removed_fails_the_check() {
         // Arrange
         let toml = read_root("liam.toml");
-        let readme = read_root("README.md");
+        let page = read_root(TIERING_PAGE);
         let toml_lines: Vec<&str> = toml_section(&toml)
             .into_iter()
             .filter(|line| !assigns(line, "cooldown_runs"))
             .collect();
-        let readme_lines: Vec<&str> = readme_section(&readme)
+        let page_lines: Vec<String> = page_section(&page)
             .into_iter()
             .filter(|line| !line.starts_with("| `cooldown_runs` |"))
             .collect();
 
         // Act
-        let (from_toml, from_readme) = (
+        let (from_toml, from_page) = (
             missing_from_toml(&toml_lines),
-            missing_from_readme(&readme_lines),
+            missing_from_page(&page_lines),
         );
 
         // Assert
         assert_eq!(from_toml, vec!["cooldown_runs".to_string()]);
-        assert_eq!(from_readme, vec!["cooldown_runs".to_string()]);
+        assert_eq!(from_page, vec!["cooldown_runs".to_string()]);
     }
 }

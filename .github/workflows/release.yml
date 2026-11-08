@@ -236,7 +236,7 @@ jobs:
             exit 1
           fi
 
-      # "netinstall" in the README's Packaging sense: binaries, config, and
+      # "netinstall" in the Packaging sense of docs/getting-started/install.md: binaries, config, and
       # docs, with the weights fetched at install time by `liam fetch-models`
       # rather than shipped here. That is what install.sh does, and it is why
       # this artifact stays a few megabytes.
@@ -258,6 +258,11 @@ jobs:
           install -m 0755 target/release/liam dist/staging/liam
           install -m 0755 packaging/install.sh dist/staging/install.sh
           cp README.md LICENSE THIRD-PARTY-NOTICES.md dist/staging/
+          # The README links into docs/, so ship the guide pages with it. The
+          # adr, plans and specs folders are history and stay out.
+          mkdir -p dist/staging/docs
+          cp docs/README.md dist/staging/docs/
+          cp -R docs/getting-started docs/reference docs/development dist/staging/docs/
           cp packaging/dev.protocortex.liamd.plist dist/staging/
           tar -czf "dist/${NAME}.tar.gz" -C dist/staging .
           cd dist
@@ -277,7 +282,7 @@ jobs:
           set -euo pipefail
           NAME="liam-${GITHUB_REF_NAME}-aarch64-apple-darwin-netinstall"
           listing="$(tar -tzf "dist/${NAME}.tar.gz")"
-          for entry in ./liamd ./liam ./install.sh ./liam.toml ./dev.protocortex.liamd.plist; do
+          for entry in ./liamd ./liam ./install.sh ./liam.toml ./dev.protocortex.liamd.plist ./docs/README.md; do
             echo "${listing}" | grep -Fxq "${entry}" || {
               echo "release artifact is missing ${entry}" >&2
               exit 1
