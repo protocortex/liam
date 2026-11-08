@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Every `[extraction]` key must be documented in the shipped `liam.toml` and in
-//! the README, and the notices must name the server the extraction fetches.
+//! the extraction page, and the notices must name the server the extraction fetches.
 
 use super::ExtractionConfig;
+use crate::config::docs::{EXTRACTION_PAGE, PAGE_TITLE_MARK};
+
+/// The title heading of the extraction page.
+const EXTRACTION_HEADING: &str = "# Extraction";
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
@@ -41,13 +45,12 @@ fn defines_key(line: &str, key: &str) -> bool {
         .is_some_and(|rest| rest.trim_start().starts_with('='))
 }
 
-/// The README text from the `## Extraction` heading to the next `##` heading.
-fn readme_extraction_section(readme: &str) -> String {
-    readme
-        .lines()
-        .skip_while(|line| *line != "## Extraction")
+/// The page text from the `# Extraction` title to the next title-level heading.
+fn extraction_page_section(page: &str) -> String {
+    page.lines()
+        .skip_while(|line| *line != EXTRACTION_HEADING)
         .skip(1)
-        .take_while(|line| !line.starts_with("## "))
+        .take_while(|line| !line.starts_with(PAGE_TITLE_MARK))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -74,17 +77,23 @@ fn every_extraction_key_is_in_the_shipped_liam_toml() {
 }
 
 #[test]
-fn every_extraction_key_is_in_the_readme_extraction_section() {
+fn every_extraction_key_is_in_the_extraction_page() {
     // Arrange
-    let section = readme_extraction_section(&read("README.md"));
-    assert!(!section.is_empty(), "README has no ## Extraction section");
+    let section = extraction_page_section(&read(EXTRACTION_PAGE));
+    assert!(
+        !section.is_empty(),
+        "{EXTRACTION_PAGE} has no {EXTRACTION_HEADING} title"
+    );
 
     for (key, _) in default_keys() {
         // Act
         let documented = section.contains(&format!("`{key}`"));
 
         // Assert
-        assert!(documented, "README does not document extraction.{key}");
+        assert!(
+            documented,
+            "{EXTRACTION_PAGE} does not document extraction.{key}"
+        );
     }
 }
 

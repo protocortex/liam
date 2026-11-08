@@ -39,6 +39,7 @@ below.
 | [Reading modes and provenance](concepts/reading-modes.md) | Strict and infer reads, and the provenance line on every item. |
 | [Summaries](concepts/summaries.md) | Model-written summary trees, their keys, and what the exit criteria prove. |
 | [Tiering](concepts/tiering.md) | Hot and cold memories, the utility score, and the tiering keys. |
+| [Extraction](concepts/extraction.md) | Facts derived from the log, trust and arbitration, predicates and the model server. |
 | [Consolidation](concepts/consolidation.md) | The maintenance run, its steps, rollback and exit codes. |
 | [Hosted providers](concepts/hosted-providers.md) | Sending extraction and summary requests to Anthropic, OpenAI or Gemini, and the privacy gate. |
 
@@ -47,6 +48,8 @@ below.
 | Page | What it covers |
 |---|---|
 | [Garbage collection](operations/garbage-collection.md) | How a sweep is logged and what it blocks. |
+| [Deleting a subject](operations/deleting-a-subject.md) | Encryption, `liamd delete`, its limits, and the log archive. |
+| [Metrics and alerts](operations/metrics-and-alerts.md) | The `metrics` tool, every metric, and the alert rules. |
 
 ## Development
 

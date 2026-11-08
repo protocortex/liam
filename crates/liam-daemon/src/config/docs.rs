@@ -59,6 +59,7 @@ fn keys_of(value: &Value) -> Vec<String> {
 pub(super) const CONFIGURATION_PAGE: &str = "docs/reference/configuration.md";
 pub(super) const TIERING_PAGE: &str = "docs/concepts/tiering.md";
 pub(super) const SUMMARIES_PAGE: &str = "docs/concepts/summaries.md";
+pub(super) const EXTRACTION_PAGE: &str = "docs/concepts/extraction.md";
 
 /// A page's title heading. Everything after it belongs to the page.
 pub(super) const PAGE_TITLE_MARK: &str = "# ";
