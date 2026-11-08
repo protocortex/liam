@@ -59,7 +59,7 @@ intervals use a `FOREVER` sentinel, so every currency check is positive.
 ## Surface
 
 ```rust
-let graph = DefaultGraph::open("graph.db", GraphConfig::new(768)).await?;
+let graph = DefaultGraph::open("graph.db", GraphConfig::new(384)).await?;
 
 let id = graph.insert(NewNode::now("decision", "Use libSQL", "single file")).await?;
 let other = graph.insert(NewNode::now("decision", "Pin libSQL", "version")).await?;

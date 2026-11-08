@@ -2,8 +2,8 @@
 
 Layered Intelligent Agent Memory. Local-first and bitemporal, for AI agents. It
 runs as one process, stores to a single file, and speaks the Model Context
-Protocol (MCP) so an agent reads and writes long-term memory with two tools:
-`remember` and `recall`.
+Protocol (MCP) so an agent reads and writes long-term memory. `remember` and `recall` are the
+core pair, and ten more tools cover reading, review and admin.
 
 ## Why
 
@@ -140,7 +140,20 @@ reach the file can act as any client; owner-only is what makes "can reach it"
 mean "is already you". `liamd serve` refuses to start if another daemon is
 already listening, and replaces the socket only when it is stale.
 
-Point a client at `liamd` and it exposes two tools.
+Point a client at `liamd` and it exposes twelve tools. This section covers the
+first three. The rest have their own sections:
+
+| Tool | What it does | Documented under |
+|---|---|---|
+| `ask` | Answers a question from memory, synthesized and cited. | Reading modes and provenance |
+| `clusters` | Lists memory clusters, largest first. | Reading modes and provenance |
+| `summaries` | Lists or shows the summaries LIAM wrote. | Summaries |
+| `facts` | Lists the facts held about a subject. | Reading facts |
+| `feedback` | Says whether a `recall` or `ask` result was right. | Tiering |
+| `relate` | Links two memories by handle. | below |
+| `metrics` | Shows LIAM's own metrics and active alerts. | Metrics and alerts |
+| `delete` | Previews what a deletion would destroy. Admin only. | Deleting a subject |
+| `consolidate` | Runs one consolidation now. Admin only. | Consolidation |
 
 `remember` records a fact.
 
@@ -168,6 +181,14 @@ recent first.
 |---|---|---|
 | `entity` | yes | Handle or unambiguous prefix, as shown by `recall`. |
 | `limit` | no | How many mentions to show (default 50, max 200). A capped result ends with an "(more mentions exist)" trailer instead of claiming an exact total. |
+
+`relate` records a relationship between two memories.
+
+| Field | Required | Notes |
+|---|---|---|
+| `from` | yes | Handle of the source memory, as shown by `recall`. A full id works too. |
+| `to` | yes | Handle of the target memory. |
+| `type` | yes | Relation type, for example `mentions`. Lower-cased on write. `supersedes` is reserved for version history and refused. |
 
 By default the embedder is a mock, so retrieval leans on full-text and graph
 signals. Set `provider = "local"` and build with `--features local` for real
