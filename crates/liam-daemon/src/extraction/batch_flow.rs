@@ -33,7 +33,6 @@ const MAX_ATTEMPTS: u32 = 2;
 
 /// Where a batch is at the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(feature = "hosted"), allow(dead_code))]
 pub enum RemoteState {
     InProgress,
     Ended,
@@ -46,7 +45,6 @@ pub enum RemoteState {
 
 /// What the provider holds for one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(feature = "hosted"), allow(dead_code))]
 pub enum RemoteResult {
     Answer(String),
     /// The provider refused the request or answered as another model than the

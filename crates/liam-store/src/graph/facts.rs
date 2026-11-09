@@ -250,7 +250,7 @@ impl<B: Backend> Graph<B> {
     }
 }
 
-#[cfg(all(test, feature = "backend-libsql"))]
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 

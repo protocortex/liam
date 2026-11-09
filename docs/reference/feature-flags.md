@@ -2,11 +2,9 @@
 
 [Back to the docs index](../README.md)
 
-`liam-store`:
-
-- `backend-libsql` (default): libSQL with native vector search (`F32_BLOB`,
-  `vector_distance_cos`).
-Leiden community detection is unconditional; there is no feature to disable it.
+libSQL storage, Leiden community detection and the hosted-provider code are
+always built; there is no feature to turn them off. Hosted calls stay off at
+runtime until `[hosted]` is configured.
 
 `liam-daemon`:
 
@@ -14,8 +12,6 @@ Leiden community detection is unconditional; there is no feature to disable it.
   Off by default, which keeps the dev build small.
 - `llama`: llama.cpp text generation, which is what `ask` needs. Metal comes
   from the macOS target, not from this flag.
-- `hosted`: calls to Anthropic, OpenAI and Gemini over HTTPS (see
-  [Hosted providers](../concepts/hosted-providers.md)). Off by default, which keeps TLS out of the default build.
 - `cuda`: NVIDIA support. Needs the CUDA toolkit at build time, so it is
   opt-in; Apple GPU support is automatic and needs nothing.
 

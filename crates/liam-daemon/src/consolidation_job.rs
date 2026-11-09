@@ -135,7 +135,6 @@ fn extraction_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn Extrac
     Ok(Some(Arc::new(hooks)))
 }
 
-#[cfg(feature = "hosted")]
 fn hosted_extraction(setup: &JobSetup<'_>, provider: Provider) -> anyhow::Result<Backend> {
     let metrics = setup
         .metrics
@@ -144,12 +143,6 @@ fn hosted_extraction(setup: &JobSetup<'_>, provider: Provider) -> anyhow::Result
     crate::hosted::extraction_backend(setup.config, provider, metrics)
 }
 
-#[cfg(not(feature = "hosted"))]
-fn hosted_extraction(_: &JobSetup<'_>, _: Provider) -> anyhow::Result<Backend> {
-    Err(no_hosted_support("extraction.provider"))
-}
-
-#[cfg(feature = "hosted")]
 fn hosted_summariser(
     setup: &JobSetup<'_>,
     provider: Provider,
@@ -159,16 +152,6 @@ fn hosted_summariser(
         .clone()
         .context("hosted summaries need the metrics recorder")?;
     crate::hosted::summariser(setup.config, provider, metrics)
-}
-
-#[cfg(not(feature = "hosted"))]
-fn hosted_summariser(_: &JobSetup<'_>, _: Provider) -> anyhow::Result<Arc<dyn Summariser>> {
-    Err(no_hosted_support("summary.provider"))
-}
-
-#[cfg(not(feature = "hosted"))]
-fn no_hosted_support(key: &str) -> anyhow::Error {
-    anyhow::anyhow!("{key} names a hosted provider, but this build has no hosted support; rebuild with the hosted feature")
 }
 
 fn summary_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn SummaryHook>>> {

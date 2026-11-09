@@ -46,10 +46,8 @@ pub enum ExtractError {
     InvalidRequest(&'static str),
     BadEnvelope,
     /// A hosted provider answered with a model other than the pinned one.
-    #[cfg(feature = "hosted")]
     ModelMismatch,
     /// A hosted provider no longer has the pinned model.
-    #[cfg(feature = "hosted")]
     ModelRetired,
 }
 
@@ -82,11 +80,9 @@ impl fmt::Display for ExtractError {
             Self::Malformed(why) => write!(f, "the sidecar sent a malformed response: {why}"),
             Self::InvalidRequest(why) => write!(f, "the request is invalid: {why}"),
             Self::BadEnvelope => write!(f, "the sidecar's response has no completion text"),
-            #[cfg(feature = "hosted")]
             Self::ModelMismatch => {
                 write!(f, "the provider answered with a model that is not the pin")
             }
-            #[cfg(feature = "hosted")]
             Self::ModelRetired => write!(f, "the provider no longer has the pinned model"),
         }
     }

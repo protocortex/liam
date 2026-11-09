@@ -839,7 +839,7 @@ fn the_live_tier_repeat_count_and_margin_are_named_constants() {
 /// The live tier: asks the real provider, `LIVE_REPEATS` times, and compares
 /// the median F1 with the recorded row. Run with the key file named by
 /// `LIAM_R10_KEY_FILE` and the pin by `LIAM_R10_MODEL`, for example
-/// `LIAM_R10_PROVIDER=anthropic cargo test --features hosted -- --ignored r10_live`.
+/// `LIAM_R10_PROVIDER=anthropic cargo test -p liam-daemon -- --ignored r10_live`.
 /// Advisory: it prints what it found and never fails on the score.
 #[tokio::test]
 #[ignore = "calls a real provider and needs a key"]

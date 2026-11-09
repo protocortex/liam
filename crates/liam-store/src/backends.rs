@@ -16,12 +16,7 @@
 //! model crates rather than the store.
 //!
 //! Adding a second backend later means adding its module and a `cfg` here,
-//! plus the feature that selects it. The trait is already shaped for it.
+//! plus whatever selects it. The trait is already shaped for it.
 
-#[cfg(not(feature = "backend-libsql"))]
-compile_error!("enable the `backend-libsql` feature (it is on by default)");
-
-#[cfg(feature = "backend-libsql")]
 mod libsql;
-#[cfg(feature = "backend-libsql")]
 pub use libsql::LibsqlBackend as DefaultBackend;

@@ -15,7 +15,6 @@ mod deletion;
 #[cfg(test)]
 mod eval;
 mod extraction;
-#[cfg(feature = "hosted")]
 mod hosted;
 mod log_startup;
 mod mcp;

@@ -466,7 +466,7 @@ async fn column_exists<B: Backend>(backend: &B, table: &str, column: &str) -> Re
     Ok(false)
 }
 
-#[cfg(all(test, feature = "backend-libsql"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::DefaultBackend;

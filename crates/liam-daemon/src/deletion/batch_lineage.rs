@@ -22,7 +22,6 @@ const SEND_ROW: &str = "send_row";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderCopies {
     /// The provider's delete endpoint removed them.
-    #[cfg_attr(not(feature = "hosted"), allow(dead_code))]
     Deleted,
     /// The provider has no delete endpoint, so its copy ages out under its own
     /// retention terms.
@@ -48,20 +47,14 @@ impl BatchCanceller for NoProviderDelete {
     }
 }
 
-/// The canceller a delete under `config` uses: the hosted providers when the
-/// build has them and `[hosted]` is on, otherwise none.
-#[cfg(feature = "hosted")]
+/// The canceller a delete under `config` uses: the hosted providers when
+/// `[hosted]` is on, otherwise none.
 pub(super) fn canceller_for(config: &crate::config::Config) -> Arc<dyn BatchCanceller> {
     if config.hosted.enabled {
         crate::hosted::canceller(config)
     } else {
         Arc::new(NoProviderDelete)
     }
-}
-
-#[cfg(not(feature = "hosted"))]
-pub(super) fn canceller_for(_config: &crate::config::Config) -> Arc<dyn BatchCanceller> {
-    Arc::new(NoProviderDelete)
 }
 
 /// The batch table and the send ledger as one lineage store.

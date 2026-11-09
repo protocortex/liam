@@ -543,7 +543,7 @@ pub(crate) const DERIVED_TABLES: [(&str, Clear); 33] = [
     ("extraction_attempts", Clear::OnAdoption),
 ];
 
-#[cfg(all(test, feature = "backend-libsql"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::Backend;

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! A [`Fetcher`] that runs the system `curl`.
 //!
-//! A TLS client in the daemon's dependency tree would pull `rustls` and a
-//! certificate bundle into every build for a download that happens once.
-//! macOS ships `curl`, which is the only platform the fetch supports.
+//! Using the system `curl` avoids a second TLS client and its certificate
+//! handling for a download that happens once. macOS ships `curl`, which is the
+//! only platform the fetch supports.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};

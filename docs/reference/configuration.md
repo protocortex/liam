@@ -48,7 +48,7 @@ unknown key fails loudly.
 | `metrics.rollback_ceiling` | `1.0` | Rollbacks at which an alert is raised. |
 | `metrics.extraction_backlog_ceiling` | `10000.0` | Events past an extraction cursor at which an alert is raised. |
 | `metrics.model_calls_per_hour` | `1000.0` | Model calls an hour at which an alert is raised. |
-| `hosted.enabled` | `false` | Allow calls to hosted model providers. Needs a build with `--features hosted`. |
+| `hosted.enabled` | `false` | Allow calls to hosted model providers. |
 | `hosted.allowed_hosts` | empty | The only hosts a request may go to, each lowercase with no scheme, port or path. Required when `hosted.enabled` is true. |
 | `hosted.request_timeout_secs` | `60` | How long one request may take, answer included. At least `1`. |
 | `hosted.max_response_bytes` | `4194304` | The most bytes of a response that are read. A larger one is an error. At least `1`. |
