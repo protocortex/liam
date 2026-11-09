@@ -134,7 +134,7 @@ pub const LOCAL_PROVIDER: &str = "local";
 pub const MOCK_PROVIDER: &str = "mock";
 
 /// The `llm.provider` value that selects in-process llama.cpp.
-const LLAMA_PROVIDER: &str = "llama-cpp";
+pub const LLAMA_PROVIDER: &str = "llama-cpp";
 
 /// Points fastembed's cache at the configured directory when the embedder is
 /// local, and returns that directory.

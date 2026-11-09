@@ -57,7 +57,7 @@ env:
   # caches totalling 13.7 GB against GitHub's 10 GB per-repo limit, so GitHub
   # was evicting them LRU and jobs paid cold restores anyway. The cause was
   # every pull request branch saving its own copy of every job's cache: four
-  # separate 568 MB entries existed for `build-local-Linux-x64` alone.
+  # separate 568 MB entries existed for one Linux job alone.
   #
   # With this, main publishes one cache per job and pull requests restore from
   # it read-only. Total drops to roughly 3 GB, which fits, so restores actually
@@ -72,13 +72,14 @@ env:
   CACHE_SAVE_IF: ${{ github.ref == 'refs/heads/main' }}
 
 # Job timeouts are about 3x the slowest successful run over the last 100 runs
-# (lint 37s, test 104s, build-local 109s, coverage 237s, macos 365s, deny 16s),
-# with a 5 minute floor and extra room for a cold cache. They make a hung
+# (measured on the first cold run after the model stack became part of every
+# build, 2026-11-09: lint 3m39s, test 7m34s, coverage 9m11s, macos 8m33s, deny
+# 12s), with a 5 minute floor and extra room for a cold cache. They make a hung
 # runner fail fast instead of holding the job for GitHub's 360 minute default.
 jobs:
   lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -100,7 +101,7 @@ jobs:
   # expensive one.
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -138,7 +139,7 @@ jobs:
   # Ratchet it up over time; never lower it without a documented reason.
   coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       FLOOR: "95"
     steps:
@@ -153,6 +154,9 @@ jobs:
           # Found missing during Step 9 adversarial review: without it this job
           # would fail every run, silently swallowed by continue-on-error.
           components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ env.CACHE_SAVE_IF }}
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-llvm-cov
@@ -170,7 +174,7 @@ jobs:
   # and the release-shaped build in one job that shares one target directory.
   macos:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       # The runner image now ships Homebrew OpenSSL 4, which llama.cpp's CMake
       # finds but cannot link, so a cold build fails. The vendored server's
