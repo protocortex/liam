@@ -70,8 +70,7 @@ All notable changes to LIAM are recorded here. The format follows
   archived partitions.
 - Sealing of new log events when `encryption.master_key` is set. Unset keeps a plaintext log.
 - Hosted model providers (Anthropic, OpenAI and Gemini) for extraction and summaries. They are
-  off by default: they need a build with `--features hosted`, `hosted.enabled = true`, and an
-  allow-list of hosts.
+  off by default: they need `hosted.enabled = true` and an allow-list of hosts.
 
 ### Changed
 
