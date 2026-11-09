@@ -55,18 +55,18 @@ already listening, and replaces the socket only when it is stale.
 The tools a client sees, with their fields, are listed in
 [Tools](../reference/tools.md).
 
-By default the embedder is a mock, so retrieval leans on full-text and graph
-signals. Set `provider = "local"` and build with `--features local` for real
-embeddings.
+The shipped `liam.toml` uses the local embedder and reranker. With
+`provider = "mock"` the embedder is a hash-derived placeholder, so retrieval
+leans on full-text and graph signals; that is for tests and dev.
 
 ## Try it with a real embedder
 
-From your clone of this repo, build with the `local` feature, switch the
-config to the `local` provider, then start the daemon as described under
+From your clone of this repo, build, switch the config to the `local`
+provider if it is not already, then start the daemon as described under
 [One daemon, many agents](#one-daemon-many-agents):
 
 ```sh
-cargo build -p liam-daemon --features local
+cargo build -p liam-daemon
 ```
 
 Set `embedder.provider = "local"` in `liam.toml` (see the [Configuration table](../reference/configuration.md)

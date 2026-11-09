@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! BGE-M3 dense embedder (feature `local`).
+//! BGE-M3 dense embedder.
 //!
 //! Loads BAAI/bge-m3 through fastembed's ONNX `TextEmbedding` path, which is
 //! independent of the Qwen3 candle loader in `embedder.rs`. Per the model card,
@@ -9,13 +9,9 @@
 //! (`text_embedding/output.rs`) itself, so this module only owns the loading,
 //! the input convention and the fixed width.
 
-#[cfg(feature = "local")]
 use crate::blocking::with_model_blocking;
-#[cfg(any(test, feature = "local"))]
 use crate::error::{ModelError, Result};
-#[cfg(any(test, feature = "local"))]
 use crate::TextKind;
-#[cfg(feature = "local")]
 use async_trait::async_trait;
 
 /// The Hugging Face id config selects this embedder with.
@@ -27,20 +23,17 @@ pub const BGE_M3_DIMS: usize = 1024;
 
 /// Inputs per ONNX run. fastembed's default of 256 pads the whole batch to its
 /// longest input, which wastes memory on one long text; a small batch bounds it.
-#[cfg(feature = "local")]
 const EMBED_BATCH_SIZE: usize = 8;
 
 /// The exact string handed to the model for `text`. BGE-M3 dense retrieval
 /// uses no instruction on either side; matching on `kind` keeps a future
 /// `TextKind` variant from silently inheriting that.
-#[cfg(any(test, feature = "local"))]
 fn bge_m3_input(text: &str, kind: TextKind) -> &str {
     match kind {
         TextKind::Query | TextKind::Document => text,
     }
 }
 
-#[cfg(any(test, feature = "local"))]
 fn validate_bge_m3_dims(dims: usize) -> Result<()> {
     if dims != BGE_M3_DIMS {
         return Err(ModelError::Embed(format!(
@@ -54,19 +47,16 @@ fn validate_bge_m3_dims(dims: usize) -> Result<()> {
 /// The `HF_HOME` value when it points somewhere other than `cache_dir`.
 /// fastembed fetches BGE-M3 through `HF_HOME` when it is set, ahead of the
 /// configured cache directory.
-#[cfg(any(test, feature = "local"))]
 pub(crate) fn hf_home_overriding<'a>(hf_home: Option<&'a str>, cache_dir: &str) -> Option<&'a str> {
     hf_home.filter(|home| !home.is_empty() && *home != cache_dir)
 }
 
 /// In-process BGE-M3 dense embedder. The sync ONNX call runs on a blocking
 /// thread so the async runtime stays free.
-#[cfg(feature = "local")]
 pub struct BgeM3Embedder {
     model: std::sync::Arc<std::sync::Mutex<fastembed::TextEmbedding>>,
 }
 
-#[cfg(feature = "local")]
 impl BgeM3Embedder {
     /// Load BGE-M3 into `cache_dir`. `dims` must be `BGE_M3_DIMS`, the model's own width.
     pub fn load(dims: usize, cache_dir: &str) -> Result<Self> {
@@ -91,7 +81,6 @@ impl BgeM3Embedder {
     }
 }
 
-#[cfg(feature = "local")]
 #[async_trait]
 impl crate::Embedder for BgeM3Embedder {
     fn dims(&self) -> usize {
@@ -141,8 +130,7 @@ mod tests {
     }
 
     /// Downloads about 2 GB of weights: run explicitly with
-    /// `cargo test -p liam-model --features local -- --ignored bge_m3`.
-    #[cfg(feature = "local")]
+    /// `cargo test -p liam-model -- --ignored bge_m3`.
     #[tokio::test]
     #[ignore = "downloads BGE-M3 weights; see the doc comment for the run command"]
     async fn bge_m3_loads_and_embeds_unit_vectors_of_its_native_width() {
@@ -168,7 +156,6 @@ mod tests {
 
     /// Same download as the test above. Unit norm alone would also hold for
     /// mean pooling, so this checks the vectors carry meaning.
-    #[cfg(feature = "local")]
     #[tokio::test]
     #[ignore = "downloads BGE-M3 weights; see the doc comment for the run command"]
     async fn bge_m3_scores_a_related_pair_above_an_unrelated_pair() {
@@ -200,7 +187,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "local")]
     #[test]
     fn load_rejects_a_non_native_width_before_touching_the_cache() {
         // Arrange

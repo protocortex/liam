@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Runs a sync model call on a blocking thread (feature `local`).
+//! Runs a sync model call on a blocking thread.
 
 use std::sync::{Arc, Mutex};
 

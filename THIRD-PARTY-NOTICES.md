@@ -2,8 +2,7 @@
 
 This file lists third-party code that ships as part of LIAM binaries: the
 vendored native code compiled in, and every Rust crate in the dependency tree
-for the default build plus the `local` and `llama` features (the shipped
-optional surface). It names each dependency and the license it is under. It
+for the shipped build. It names each dependency and the license it is under. It
 does not reproduce full license texts; see "Full license texts" below for
 where to find those.
 
@@ -66,8 +65,7 @@ stack and a CA bundle in every default build for a download only
 ## Rust dependencies, by license
 
 Every crate below was confirmed present in the resolved dependency tree for
-`cargo build --workspace` and for `cargo build -p liam-daemon --features
-local,llama`, and every license name comes straight from that crate's
+`cargo build --workspace`, and every license name comes straight from that crate's
 `license` field in `cargo metadata`, not from assumption. 421 Rust crates
 ship in total.
 
@@ -208,14 +206,11 @@ Generated on 2026-08-11. To refresh after a dependency change, run:
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# every crate that ships in the default build
+# every crate that ships
 cargo tree -e no-dev --prefix none | sort -u
 
-# and the shipped optional surface
-cargo tree -e no-dev --prefix none -p liam-daemon --features local,llama | sort -u
-
 # license fields straight from the resolved metadata
-cargo metadata --format-version 1 --filter-platform aarch64-apple-darwin --features local,llama \
+cargo metadata --format-version 1 --filter-platform aarch64-apple-darwin\
   | python3 -c 'import json,sys;d=json.load(sys.stdin);[print(f"{p[\"name\"]}\t{p.get(\"license\") or p.get(\"license_file\")}") for p in sorted(d["packages"],key=lambda p:p["name"])]'
 ```
 

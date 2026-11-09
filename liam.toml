@@ -183,12 +183,12 @@ version = ""
 # anthropic = "/Users/you/.liam/anthropic.key"
 
 [embedder]
-provider  = "mock"                       # "mock" (dev) or "local" (in-process)
+provider  = "local"                      # "local" (in-process) or "mock" (tests and dev)
 model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"
 cache_dir = "~/.liam/models"       # both reranker and embedder files land here
 
 [llm]
-provider        = "mock"                            # "mock" (dev) or "llama-cpp" (in-process llama.cpp)
+provider        = "llama-cpp"                       # "llama-cpp" (in-process llama.cpp) or "mock" (tests and dev)
 model           = "Qwen/Qwen2.5-1.5B-Instruct-GGUF" # weights repo (quant files only)
 gguf_file       = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
 # Architecture is auto-detected from the GGUF metadata: qwen2, qwen3, gemma/2/3,

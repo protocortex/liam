@@ -5,13 +5,11 @@
 Rust stable, edition 2021.
 
 ```sh
-cargo build --workspace          # mock embedder, no ML deps
+cargo build --workspace
 cargo test  --workspace          # libSQL backend, in-memory
 ```
 
-The base build stays light. The in-process model stack (fastembed, candle, ONNX
-runtime) pulls a large dependency tree and is opt-in:
-
-```sh
-cargo build -p liam-daemon --features local
-```
+Every build includes the in-process model stack (fastembed, candle, ONNX
+runtime, llama.cpp). Tests use the mock embedder, reranker and LLM
+(`provider = "mock"`), so they download no model. The tests that load real
+models are `#[ignore]`d and run only when you ask for them.

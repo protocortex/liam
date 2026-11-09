@@ -2,8 +2,7 @@
 //! liam-daemon: serves liam memory to agents over MCP.
 //!
 //! A thin shell wiring `liam-store` (retrieval) and `liam-model`
-//! (embedding, reranking). The embedder is Mock by default; the `local` feature
-//! plus `provider = "local"` loads fastembed in-process (Qwen3 embedder,
+//! (embedding, reranking). `provider = "local"` loads fastembed in-process (Qwen3 embedder,
 //! cross-encoder reranker), no server.
 
 mod ask;

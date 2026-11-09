@@ -16,7 +16,7 @@
 //!   `#[tokio::test]`, so it runs under plain `cargo test -p liam-daemon` and
 //!   the existing CI `test` job, with no model download.
 //! - **Real-embedder, `#[ignore]`d:** `run_retrieval_eval` loads the actual
-//!   local embedder (needs `--features local`; other builds return an error)
+//!   local embedder
 //!   and scores `VectorSemantic` too. `evaluate_embedder` is the same run
 //!   over any `Embedder`, which the mock-embedder test uses. Downloads model
 //!   weights on first run and is slow, like `eval.rs`'s own gated tier, so
@@ -24,7 +24,7 @@
 //!   `cargo test -p liam-daemon`:
 //!
 //!   ```text
-//!   cargo test -p liam-daemon --features local -- --ignored --nocapture retrieval
+//!   cargo test -p liam-daemon -- --ignored --nocapture retrieval
 //!   ```
 //!
 //!   Env override: `LIAM_RETRIEVAL_EVAL_MODEL`, mirroring `eval.rs`'s
@@ -144,9 +144,7 @@ use liam_store::{DefaultGraph, ExplainedHit, Millis, NewEdge, NodeId, Query, Res
 use serde::Serialize;
 
 use crate::config::Config;
-#[cfg(feature = "local")]
 use crate::models;
-#[cfg(any(test, feature = "local"))]
 use crate::models::LOCAL_PROVIDER;
 
 mod embedder_bench;
@@ -826,35 +824,23 @@ impl std::str::FromStr for EvalModel {
 ///
 /// # Errors
 ///
-/// Fails when the model cannot be loaded, including in a build without the
-/// `local` feature, which has no real embedder to load.
+/// Fails when the model cannot be loaded.
 pub async fn run_retrieval_eval(model: EvalModel, config: &Config) -> anyhow::Result<EvalReport> {
     let embedder = load_embedder(model, config)?;
     evaluate_embedder(embedder.as_ref(), model.id()).await
 }
 
-#[cfg(feature = "local")]
 fn load_embedder(model: EvalModel, config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
     models::build_embedder(&eval_config(model, config))
 }
 
 /// `config` rewritten to load `model` in-process at the width it runs at.
-#[cfg(any(test, feature = "local"))]
 fn eval_config(model: EvalModel, config: &Config) -> Config {
     let mut config = config.clone();
     config.embedder.provider = LOCAL_PROVIDER.to_string();
     config.embedder.model = model.id().to_string();
     config.embedding_dims = model.dims(config.embedding_dims);
     config
-}
-
-#[cfg(not(feature = "local"))]
-fn load_embedder(model: EvalModel, _config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
-    anyhow::bail!(
-        "cannot load embedder {}: this build has no local models. \
-         Rebuild with `--features local`.",
-        model.id()
-    )
 }
 
 /// Inserts every `CORPUS` fact into `store` and returns label to id.
@@ -2211,18 +2197,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "local"))]
-    #[tokio::test]
-    async fn run_retrieval_eval_without_the_local_feature_explains_how_to_fix_it() {
-        // Act
-        let err = run_retrieval_eval(EvalModel::Qwen3, &Config::default())
-            .await
-            .expect_err("no real embedder in this build");
-
-        // Assert
-        assert!(err.to_string().contains("--features local"), "{err}");
-    }
-
     #[test]
     fn eval_model_parses_each_supported_id_case_insensitively() {
         // Arrange
@@ -2511,7 +2485,7 @@ mod tests {
 
 /// Real-embedder tier: `#[ignore]`d since it downloads model weights on first
 /// run (see the module doc's "Two tiers" section for the run command).
-#[cfg(all(test, feature = "local"))]
+#[cfg(test)]
 mod real_embedder_run {
     use super::*;
 

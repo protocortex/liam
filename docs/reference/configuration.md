@@ -18,7 +18,7 @@ unknown key fails loudly.
 | `gc.max_resynth_per_tick` | `5` | Ceiling on entities re-synthesized per maintenance tick. |
 | `gc.full_synthesis_mention_threshold` | `8` | Live-mention count at or above which the next resynthesis uses the full-tier token budget. |
 | `gc.full_synthesis_max_new_tokens` | `512` | Output token budget for a full-tier resynthesis. |
-| `embedder.provider` | `mock` | `mock` for dev, or `local` for in-process fastembed. Part of the embedder fingerprint. |
+| `embedder.provider` | `mock` | `local` for in-process fastembed, or `mock` for tests and dev. The shipped `liam.toml` sets `local`; the built-in default is `mock`. Part of the embedder fingerprint. |
 | `embedder.model` | `Qwen/Qwen3-Embedding-0.6B` | Hugging Face model id for `local`: `Qwen/Qwen3-Embedding-0.6B`, `BAAI/bge-m3`, or a small ONNX model (`BAAI/bge-small-en-v1.5`, `sentence-transformers/all-MiniLM-L6-v2`, `sentence-transformers/all-MiniLM-L12-v2`, `Snowflake/snowflake-arctic-embed-xs`, `Snowflake/snowflake-arctic-embed-s`, `nomic-ai/nomic-embed-text-v1.5`, `intfloat/multilingual-e5-small`). The small models need `embedding_dims` equal to their width (384; nomic accepts up to 768). See [`docs/specs/2026-11-06-embedder-speed-evaluation.md`](../specs/2026-11-06-embedder-speed-evaluation.md). Part of the embedder fingerprint. |
 | `embedder.cache_dir` | `~/.liam/models` | Files for both the reranker and the embedder, each under its own `models--Org--Name` subdirectory. |
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |

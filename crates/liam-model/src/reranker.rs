@@ -5,7 +5,6 @@
 
 use async_trait::async_trait;
 
-#[cfg(feature = "local")]
 use crate::blocking::with_model_blocking;
 use crate::error::Result;
 
@@ -39,17 +38,15 @@ impl Reranker for IdentityReranker {
     }
 }
 
-/// In-process cross-encoder reranker over fastembed-rs (feature `local`).
+/// In-process cross-encoder reranker over fastembed-rs.
 ///
 /// VERSION CHECK: confirm against fastembed v5: `TextRerank::try_new(..)` and
 /// `rerank(query, docs, return_documents, batch) -> Vec<RerankResult>` with
 /// `index` and `score` fields.
-#[cfg(feature = "local")]
 pub struct FastEmbedReranker {
     model: std::sync::Arc<std::sync::Mutex<fastembed::TextRerank>>,
 }
 
-#[cfg(feature = "local")]
 impl FastEmbedReranker {
     /// Load the default cross-encoder reranker (a BGE reranker).
     pub fn load() -> Result<Self> {
@@ -61,7 +58,6 @@ impl FastEmbedReranker {
     }
 }
 
-#[cfg(feature = "local")]
 #[async_trait]
 impl Reranker for FastEmbedReranker {
     async fn scores(&self, query: &str, docs: &[String]) -> Result<Vec<f32>> {

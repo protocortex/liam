@@ -2,19 +2,21 @@
 
 [Back to the docs index](../README.md)
 
-libSQL storage, Leiden community detection and the hosted-provider code are
-always built; there is no feature to turn them off. Hosted calls stay off at
-runtime until `[hosted]` is configured.
+LIAM has few build flags, because every part of the product is needed. The
+local embedder and reranker (fastembed), llama.cpp generation, libSQL storage,
+Leiden community detection and the hosted-provider code are part of every
+build. Hosted calls stay off at runtime until `[hosted]` is configured, and the
+privacy gate and host allowlist decide what may leave the machine, not the
+build. See [Hosted providers](../concepts/hosted-providers.md).
 
-`liam-daemon`:
+The flags that remain:
 
-- `local`: load fastembed in-process (Qwen3 embedder, cross-encoder reranker).
-  Off by default, which keeps the dev build small.
-- `llama`: llama.cpp text generation, which is what `ask` needs. Metal comes
-  from the macOS target, not from this flag.
-- `cuda`: NVIDIA support. Needs the CUDA toolkit at build time, so it is
-  opt-in; Apple GPU support is automatic and needs nothing.
+- `cuda` (`liam-daemon`, `liam-model`): NVIDIA support. It needs the CUDA
+  toolkit and `nvcc` at build time, which many machines lack, so it is opt-in.
+  Apple GPU support is automatic and needs nothing.
+- `test-support` (`liam-store`, `liam-log`): constructors and fixtures that
+  tests in other crates use. They stay out of a release build so production code
+  cannot mint a recorded value it did not read from the store or the log.
 
-A release build sets `local,llama`. Without them the daemon refuses to start
-against a config naming those providers, rather than falling back to mocks
-that would return random vectors and invented answers.
+The mock embedder, reranker and LLM are not build flags. They are runtime
+choices (`provider = "mock"`) that tests and dev use.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Small ONNX sentence encoders (feature `local`).
+//! Small ONNX sentence encoders.
 //!
 //! Each model in `ONNX_MODELS` loads through fastembed's ONNX `TextEmbedding`
 //! path, the same one BGE-M3 uses. fastembed owns the pooling and the L2
@@ -7,18 +7,13 @@
 //! query and document prefixes, the input token cap, and the output width.
 //! Adding a model is one row in the table plus its fastembed variant.
 
-#[cfg(feature = "local")]
 use crate::blocking::with_model_blocking;
-#[cfg(any(test, feature = "local"))]
 use crate::error::{ModelError, Result};
-#[cfg(any(test, feature = "local"))]
 use crate::TextKind;
-#[cfg(feature = "local")]
 use async_trait::async_trait;
 
 /// Inputs per ONNX run. fastembed's default of 256 pads the whole batch to its
 /// longest input; a small batch bounds that.
-#[cfg(feature = "local")]
 const EMBED_BATCH_SIZE: usize = 16;
 
 /// The retrieval query instruction of the BGE and Arctic model cards. Passages
@@ -42,7 +37,6 @@ pub struct OnnxModelSpec {
     /// Written before stored text. Empty when the model takes none.
     pub document_prefix: &'static str,
     /// The fastembed variant that loads it.
-    #[cfg(feature = "local")]
     pub model: fastembed::EmbeddingModel,
 }
 
@@ -55,7 +49,6 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 256,
         query_prefix: "",
         document_prefix: "",
-        #[cfg(feature = "local")]
         model: fastembed::EmbeddingModel::AllMiniLML6V2,
     },
     OnnxModelSpec {
@@ -65,7 +58,6 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 128,
         query_prefix: "",
         document_prefix: "",
-        #[cfg(feature = "local")]
         model: fastembed::EmbeddingModel::AllMiniLML12V2,
     },
     OnnxModelSpec {
@@ -75,7 +67,6 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 512,
         query_prefix: BGE_STYLE_QUERY_PREFIX,
         document_prefix: "",
-        #[cfg(feature = "local")]
         model: fastembed::EmbeddingModel::BGESmallENV15,
     },
     OnnxModelSpec {
@@ -85,7 +76,6 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 512,
         query_prefix: BGE_STYLE_QUERY_PREFIX,
         document_prefix: "",
-        #[cfg(feature = "local")]
         model: fastembed::EmbeddingModel::SnowflakeArcticEmbedXS,
     },
     OnnxModelSpec {
@@ -95,7 +85,6 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 512,
         query_prefix: BGE_STYLE_QUERY_PREFIX,
         document_prefix: "",
-        #[cfg(feature = "local")]
         model: fastembed::EmbeddingModel::SnowflakeArcticEmbedS,
     },
     OnnxModelSpec {
@@ -105,7 +94,6 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 8192,
         query_prefix: "search_query: ",
         document_prefix: "search_document: ",
-        #[cfg(feature = "local")]
         model: fastembed::EmbeddingModel::NomicEmbedTextV15,
     },
     OnnxModelSpec {
@@ -115,7 +103,6 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 512,
         query_prefix: "query: ",
         document_prefix: "passage: ",
-        #[cfg(feature = "local")]
         model: fastembed::EmbeddingModel::MultilingualE5Small,
     },
 ];
@@ -129,7 +116,6 @@ pub fn onnx_model_spec(model: &str) -> Option<&'static OnnxModelSpec> {
 }
 
 /// The exact string handed to the model for `text` in its `kind` role.
-#[cfg(any(test, feature = "local"))]
 fn onnx_input(spec: &OnnxModelSpec, text: &str, kind: TextKind) -> String {
     let prefix = match kind {
         TextKind::Query => spec.query_prefix,
@@ -140,7 +126,6 @@ fn onnx_input(spec: &OnnxModelSpec, text: &str, kind: TextKind) -> String {
 
 /// The output width `dims` may take: any width up to the native one for a
 /// Matryoshka model, only the native one for the rest.
-#[cfg(any(test, feature = "local"))]
 fn validate_onnx_dims(spec: &OnnxModelSpec, dims: usize) -> Result<()> {
     if spec.matryoshka {
         return crate::embedder::validate_dims(spec.id, dims, spec.native_dims);
@@ -157,14 +142,12 @@ fn validate_onnx_dims(spec: &OnnxModelSpec, dims: usize) -> Result<()> {
 
 /// In-process ONNX embedder for one `OnnxModelSpec`. The sync ONNX call runs on
 /// a blocking thread so the async runtime stays free.
-#[cfg(feature = "local")]
 pub struct OnnxEmbedder {
     model: std::sync::Arc<std::sync::Mutex<fastembed::TextEmbedding>>,
     spec: &'static OnnxModelSpec,
     dims: usize,
 }
 
-#[cfg(feature = "local")]
 impl OnnxEmbedder {
     /// Load `spec` into `cache_dir`, producing vectors `dims` wide.
     pub fn load(spec: &'static OnnxModelSpec, dims: usize, cache_dir: &str) -> Result<Self> {
@@ -192,7 +175,6 @@ impl OnnxEmbedder {
     }
 }
 
-#[cfg(feature = "local")]
 #[async_trait]
 impl crate::Embedder for OnnxEmbedder {
     fn dims(&self) -> usize {
@@ -312,8 +294,7 @@ mod tests {
     }
 
     /// Downloads about 130 MB: run explicitly with
-    /// `cargo test -p liam-model --features local -- --ignored onnx`.
-    #[cfg(feature = "local")]
+    /// `cargo test -p liam-model -- --ignored onnx`.
     #[tokio::test]
     #[ignore = "downloads BGE-small weights; see the doc comment for the run command"]
     async fn onnx_small_model_scores_a_related_pair_above_an_unrelated_pair() {
@@ -342,7 +323,6 @@ mod tests {
         assert!(cosine(&vectors[0], &vectors[1]) > cosine(&vectors[0], &vectors[2]));
     }
 
-    #[cfg(feature = "local")]
     #[test]
     fn load_rejects_a_non_native_width_before_touching_the_cache() {
         // Arrange

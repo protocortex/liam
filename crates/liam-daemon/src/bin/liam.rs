@@ -1711,16 +1711,6 @@ mod tests {
         assert_eq!(stored[0].get_i64(0).unwrap(), 2);
     }
 
-    #[cfg(not(feature = "local"))]
-    #[test]
-    fn a_local_embedder_this_build_lacks_is_an_error_not_a_mock() {
-        let mut config = config();
-        config.embedder.provider = "local".to_string();
-
-        assert!(store_embedder(&config).is_err());
-        assert!(store_embedder(&Config::default()).is_ok());
-    }
-
     #[tokio::test]
     async fn rebuild_refuses_a_missing_config_file_before_it_touches_anything() {
         // Arrange: a config path that does not exist, so the built-in mock

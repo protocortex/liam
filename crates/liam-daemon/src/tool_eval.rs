@@ -15,11 +15,11 @@
 //!   `cargo test -p liam-daemon --bin liamd tool_eval`.
 //! - **Real-tier, gated + `#[ignore]`d:** the actual local embedder
 //!   (`FastEmbedEmbedder`, Qwen3) AND the actual local reranker
-//!   (`FastEmbedReranker`, a BGE cross-encoder) behind `#[cfg(feature =
-//!   "local")]`, downloading weights on first run:
+//!   (`FastEmbedReranker`, a BGE cross-encoder) and `#[ignore]`d,
+//!   downloading weights on first run:
 //!
 //!   ```text
-//!   cargo test --release -p liam-daemon --bin liamd --features local -- --ignored --nocapture reranking
+//!   cargo test --release -p liam-daemon --bin liamd -- --ignored --nocapture reranking
 //!   ```
 //!
 //!   Env override: `LIAM_TOOL_EVAL_MODEL`, mirroring `eval.rs`'s
@@ -28,7 +28,7 @@
 //!
 //! # Real-tier baseline (2026-08-31, Apple M1 Pro, macOS 15.7.5,
 //! # Qwen/Qwen3-Embedding-0.6B, 768 dims, default BGE reranker via fastembed,
-//! # `cargo test --release -p liam-daemon --bin liamd --features local --
+//! # `cargo test --release -p liam-daemon --bin liamd --
 //! # --ignored --nocapture reranking`)
 //!
 //! `reranking_promotes_the_correct_target_over_a_surface_decoy`: under
@@ -42,7 +42,7 @@
 //!
 //! `semantic_paraphrase_recovers_the_remembered_fact` (2026-08-31, same
 //! machine/model as above,
-//! `cargo test --release -p liam-daemon --bin liamd --features local --
+//! `cargo test --release -p liam-daemon --bin liamd --
 //! --ignored --nocapture semantic_paraphrase`): recalling under
 //! `IdentityReranker` with the paraphrase query "Will they fix it for free
 //! if liquid gets inside accidentally?" against the sole seeded fact
@@ -149,13 +149,12 @@ fn labels_in_order(recall_text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Real-tier: gated behind `feature = "local"` and `#[ignore]`d, since it
+/// Real-tier: `#[ignore]`d, since it
 /// downloads model weights on first run and takes real time (see the module
 /// doc's "Two tiers" section for the exact run command). A sibling of `mod
 /// tests`, not nested inside it, specifically so it can `use super::*;` and
 /// reuse `build_server`/`seed`/`labels_in_order` the same way `mod tests`
 /// does, mirroring `retrieval_eval.rs`'s own `mod real_embedder_run`.
-#[cfg(feature = "local")]
 mod real_tier {
     use std::collections::HashSet;
 

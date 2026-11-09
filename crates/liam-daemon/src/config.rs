@@ -145,7 +145,7 @@ pub struct GcConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbedderConfig {
-    /// "mock" (dev) or "local" (in-process fastembed; needs the `local` feature).
+    /// "mock" (tests and dev) or "local" (in-process fastembed).
     pub provider: String,
     /// Hugging Face model id for the local provider.
     pub model: String,
@@ -157,8 +157,8 @@ pub struct EmbedderConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
-    /// "mock" (dev) or "llama-cpp" (in-process llama.cpp; needs the `llama`
-    /// feature). "local" was the retired candle provider.
+    /// "mock" (tests and dev) or "llama-cpp" (in-process llama.cpp).
+    /// "local" was the retired candle provider.
     pub provider: String,
     /// Hugging Face model id (GGUF repo) for the local provider.
     pub model: String,

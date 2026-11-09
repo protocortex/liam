@@ -6,7 +6,6 @@
 //! rerank after retrieving without the store ever depending on a model runtime.
 
 mod bge;
-#[cfg(feature = "local")]
 mod blocking;
 pub mod embedder;
 pub mod error;
@@ -14,7 +13,6 @@ pub mod llm;
 mod onnx;
 pub mod reranker;
 
-#[cfg(feature = "llama")]
 pub mod llama;
 
 pub use bge::{BGE_M3_DIMS, BGE_M3_MODEL_ID};
@@ -24,14 +22,9 @@ pub use llm::{Llm, MockLlm};
 pub use onnx::{onnx_model_spec, OnnxModelSpec, ONNX_MODELS};
 pub use reranker::{IdentityReranker, Reranker};
 
-#[cfg(feature = "local")]
 pub use bge::BgeM3Embedder;
-#[cfg(feature = "local")]
 pub use embedder::FastEmbedEmbedder;
-#[cfg(feature = "local")]
 pub use onnx::OnnxEmbedder;
-#[cfg(feature = "local")]
 pub use reranker::FastEmbedReranker;
 
-#[cfg(feature = "llama")]
 pub use llama::LlamaCppLlm;
