@@ -12,6 +12,15 @@ All notable changes to LIAM are recorded here. The format follows
   includes the local models, llama.cpp and the hosted-provider code, so `cargo install` and
   `cargo build` need no `--features`. Hosted calls stay off until `[hosted]` is configured.
   `cuda` and the two `test-support` flags remain.
+- The default `embedder.model` is now `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0 on llama.cpp, on Metal
+  on macOS). In the benchmark in `docs/specs/2026-11-09-llama-embedder-benchmark.md` it answers a
+  query 8 times faster than candle on the CPU (23 ms against 183 ms median, the behaviour of
+  v0.1.1) and the embedder uses 59 percent less memory (1072 MB against 2596 MB peak). Against
+  candle on Metal, which `auto` picks on current main, it is 3 times faster (23 ms against 72 ms)
+  and uses 53 percent less embedder memory (1072 MB against 2299 MB). Retrieval quality is equal
+  (nDCG@10 0.934 against 0.933). A store created with `provider = "mock"` is not affected.
+  `liam fetch-models` now downloads the 0.6 GB GGUF and no longer the safetensors unless the candle
+  id is configured. The reranker is unchanged.
 - The shipped `liam.toml` now uses the local embedder and the llama-cpp LLM. `provider = "mock"`
   is still accepted for tests and dev, and an unknown provider name is now an error.
 
@@ -22,6 +31,9 @@ All notable changes to LIAM are recorded here. The format follows
   `liamd` first copies their rows into a new one, then refuses the start and names the rebuild
   command. The copy and the rebuild both read every row, so a large store takes a while: the
   rebuild re-embeds every live node with the configured embedder.
+- A store built with the old default embedder is refused at start with a message that names
+  `liam rebuild --database PATH`. Run it with `liamd` stopped, or set
+  `embedder.model = "Qwen/Qwen3-Embedding-0.6B"` to keep the old candle model.
 - The event schema is now version 7.
 - The embedder prompt scheme is now 2, which wraps Qwen3 search queries in the model's
   instruction format. A store written under scheme 1 needs the same `liam rebuild` once.

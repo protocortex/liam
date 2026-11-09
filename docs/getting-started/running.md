@@ -55,7 +55,8 @@ already listening, and replaces the socket only when it is stale.
 The tools a client sees, with their fields, are listed in
 [Tools](../reference/tools.md).
 
-The shipped `liam.toml` uses the local embedder and reranker. With
+The shipped `liam.toml` uses the local embedder (Qwen3-Embedding-0.6B as a Q8_0 GGUF on llama.cpp,
+on the Apple GPU when there is one) and reranker. With
 `provider = "mock"` the embedder is a hash-derived placeholder, so retrieval
 leans on full-text and graph signals; that is for tests and dev.
 
@@ -69,7 +70,7 @@ provider if it is not already, then start the daemon as described under
 cargo build -p liam-daemon
 ```
 
-Set `embedder.provider = "local"` in `liam.toml` (see the [Configuration table](../reference/configuration.md)
+Set `embedder.provider = "local"` in `liam.toml`; the first start downloads the model, or run `liam fetch-models` first (see the [Configuration table](../reference/configuration.md)
 for the rest of the keys). Run `liamd` as shown above, then call
 `recall` from your MCP client. The vector channel now carries real semantic
 similarity instead of the mock embedder's hash-derived placeholder, so

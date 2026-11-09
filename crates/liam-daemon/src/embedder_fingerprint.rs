@@ -20,6 +20,7 @@ use liam_log::wal::{write_atomically, OsFileOps};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::models::MOCK_PROVIDER;
 
 /// Version of the convention that turns text into model input (prefixes and
 /// the like). Bump it whenever that convention changes for a model, since the
@@ -47,6 +48,19 @@ pub struct EmbedderFingerprint {
     pub model: String,
     pub dims: usize,
     pub prompt_scheme: u32,
+}
+
+impl EmbedderFingerprint {
+    /// Whether vectors recorded under `self` serve `current`. Mock vectors do not depend on a
+    /// model, so two mock fingerprints compare on dims and prompt scheme only.
+    fn is_compatible_with(&self, current: &Self) -> bool {
+        let both_mock = self.provider == MOCK_PROVIDER && current.provider == MOCK_PROVIDER;
+        if both_mock {
+            self.dims == current.dims && self.prompt_scheme == current.prompt_scheme
+        } else {
+            self == current
+        }
+    }
 }
 
 /// The id a model is recorded under. A GGUF id has two spellings for the same
@@ -136,7 +150,7 @@ pub fn verify(
             path.display()
         ),
     };
-    if &recorded == current {
+    if recorded.is_compatible_with(current) {
         return Ok(assumed);
     }
     anyhow::bail!(
@@ -576,6 +590,41 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(json["version"], 1);
         assert!(!dir.path().join("liam.db.embedder.json.tmp").exists());
+    }
+
+    #[test]
+    fn an_old_mock_record_is_accepted_under_the_new_default_model_and_a_local_one_is_refused() {
+        // Arrange
+        let old_default = liam_model::QWEN3_EMBEDDING_MODEL_ID;
+        let new_default = liam_model::DEFAULT_EMBEDDER_MODEL_ID;
+        let mock_with = |model: &str| EmbedderFingerprint {
+            provider: MOCK_PROVIDER.to_string(),
+            ..fingerprint(model, 384, PROMPT_SCHEME)
+        };
+        let mock_dir = tempfile::tempdir().unwrap();
+        let mock_db = mock_dir.path().join("liam.db");
+        start(&mock_db, &mock_with(old_default)).unwrap();
+        std::fs::write(&mock_db, b"existing vectors").unwrap();
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_db = local_dir.path().join("liam.db");
+        start(&local_db, &fingerprint(old_default, 384, PROMPT_SCHEME)).unwrap();
+        std::fs::write(&local_db, b"existing vectors").unwrap();
+
+        // Act
+        let mock = verify(&mock_db, &mock_with(new_default));
+        let mock_dims = verify(
+            &mock_db,
+            &EmbedderFingerprint {
+                dims: 768,
+                ..mock_with(new_default)
+            },
+        );
+        let local = verify(&local_db, &fingerprint(new_default, 384, PROMPT_SCHEME));
+
+        // Assert
+        assert!(mock.is_ok());
+        assert!(mock_dims.is_err());
+        assert!(local.unwrap_err().to_string().contains("liam rebuild"));
     }
 
     #[test]

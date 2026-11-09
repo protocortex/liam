@@ -43,6 +43,11 @@ skips the check.
   with a message distinct from the mismatch one. The file is never overwritten,
   because that could hide a change of embedder.
 
+The default `embedder.model` is `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0 on llama.cpp). A store built
+with the earlier default, `Qwen/Qwen3-Embedding-0.6B` (candle), is refused at start. Run `liam rebuild`,
+or set `embedder.model = "Qwen/Qwen3-Embedding-0.6B"` to keep the old model. Both spellings of the
+GGUF id (`...-GGUF` and `...-GGUF:Q8_0`) record as one model.
+
 To change `embedder.provider`, `embedder.model` or `embedding_dims`, stop
 `liamd`, edit `liam.toml`, and run:
 

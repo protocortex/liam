@@ -327,7 +327,7 @@ impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
             provider: "mock".into(),
-            model: liam_model::QWEN3_EMBEDDING_MODEL_ID.into(),
+            model: liam_model::DEFAULT_EMBEDDER_MODEL_ID.into(),
             cache_dir: "~/.liam/models".into(),
             device: "auto".into(),
         }
@@ -608,6 +608,21 @@ mod tests {
             Some(liam_model::llm::DevicePreference::Auto)
         );
         assert!(c.llm.warmup, "warmup should be on by default");
+    }
+
+    #[test]
+    fn embedder_model_defaults_to_the_llama_cpp_q8_gguf_and_candle_stays_selectable() {
+        // Arrange
+        let path = write_temp_toml("[embedder]\nmodel = \"Qwen/Qwen3-Embedding-0.6B\"\n");
+
+        // Act
+        let candle = Config::load(&path).unwrap();
+
+        // Assert
+        let default = Config::default().embedder.model;
+        assert_eq!(default, liam_model::DEFAULT_EMBEDDER_MODEL_ID);
+        assert!(liam_model::gguf_embedder_spec(&default).is_some_and(|spec| spec.is_default));
+        assert_eq!(candle.embedder.model, liam_model::QWEN3_EMBEDDING_MODEL_ID);
     }
 
     #[test]

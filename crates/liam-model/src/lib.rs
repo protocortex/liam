@@ -32,5 +32,5 @@ pub use reranker::FastEmbedReranker;
 pub use llama::LlamaCppLlm;
 pub use llama_embedder::{
     gguf_embedder_spec, gguf_path_from_hub, verify_gguf_file, GgufEmbedderSpec, LlamaEmbedder,
-    GGUF_EMBEDDERS,
+    DEFAULT_EMBEDDER_MODEL_ID, GGUF_EMBEDDERS,
 };
