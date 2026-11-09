@@ -1,0 +1,100 @@
+{
+  "facts": [
+    {
+      "subject": "Iris Pinto",
+      "predicate": "lives_in",
+      "object": "Lisbon",
+      "polarity": "ended",
+      "valid_from": null,
+      "valid_until": null,
+      "confidence": 1.0,
+      "events": [
+        1
+      ]
+    },
+    {
+      "subject": "Iris Pinto",
+      "predicate": "lives_in",
+      "object": "Lisbon",
+      "polarity": "asserted",
+      "valid_from": null,
+      "valid_until": null,
+      "confidence": 1.0,
+      "events": [
+        0
+      ]
+    },
+    {
+      "subject": "Elena Costa",
+      "predicate": "works_at",
+      "object": "Stark Works",
+      "polarity": "asserted",
+      "valid_from": null,
+      "valid_until": null,
+      "confidence": 1.0,
+      "events": [
+        2
+      ]
+    },
+    {
+      "subject": "Elena Costa",
+      "predicate": "works_at",
+      "object": "Stark Works",
+      "polarity": "ended",
+      "valid_from": null,
+      "valid_until": null,
+      "confidence": 1.0,
+      "events": [
+        3
+      ]
+    },
+    {
+      "subject": "Bruno Nunes",
+      "predicate": "has_title",
+      "object": "Security Architect",
+      "polarity": "asserted",
+      "valid_from": null,
+      "valid_until": null,
+      "confidence": 1.0,
+      "events": [
+        4
+      ]
+    },
+    {
+      "subject": "Elena Souza",
+      "predicate": "references_url",
+      "object": "https://docs.example.com/plan/557",
+      "polarity": "asserted",
+      "valid_from": null,
+      "valid_until": null,
+      "confidence": 1.0,
+      "events": [
+        6
+      ]
+    },
+    {
+      "subject": "Elena Souza",
+      "predicate": "references_url",
+      "object": "https://docs.example.com/plan/557",
+      "polarity": "asserted",
+      "valid_from": null,
+      "valid_until": null,
+      "confidence": 1.0,
+      "events": [
+        5
+      ]
+    },
+    {
+      "subject": "Elena Souza",
+      "predicate": "references_url",
+      "object": "https://docs.example.com/plan/557",
+      "polarity": "asserted",
+      "valid_from": null,
+      "valid_until": null,
+      "confidence": 1.0,
+      "events": [
+        7
+      ]
+    }
+  ]
+}

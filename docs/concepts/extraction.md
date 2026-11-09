@@ -88,6 +88,10 @@ on subject, scope and producer so a producer never closes another's fact. The
 `facts` table has no producer column and arbitrates by trust instead. `nodes`
 keeps the ADR-0006 rules.
 
+The store keys facts on the subject exactly as written, so the parser trims and
+lower-cases every subject the model returns, as the `facts` tool does for its
+query. Without that, a fact stored as `Iris Pinto` is never found by `iris pinto`.
+
 ## Predicates
 
 The vocabulary is closed. Built in:
