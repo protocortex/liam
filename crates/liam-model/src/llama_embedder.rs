@@ -24,7 +24,7 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::token::LlamaToken;
 
 use crate::blocking::with_model_blocking;
@@ -301,11 +301,8 @@ impl Inner {
     /// input is cut to the same token cap as the candle embedder, keeping the
     /// end token.
     fn tokenize(&self, text: &str) -> Result<Vec<LlamaToken>> {
-        let mut tokens = self
-            .model
-            .str_to_token(text, AddBos::Always)
-            .map_err(|e| ModelError::Embed(format!("tokenize: {e}")))?;
-        let eos = self.model.token_eos();
+        let mut tokens = self.model.vocab().tokenize(text.as_bytes(), true, true);
+        let eos = self.model.vocab().eos();
         if tokens.len() > EMBED_MAX_INPUT_TOKENS {
             tokens.truncate(EMBED_MAX_INPUT_TOKENS - 1);
             tokens.push(eos);

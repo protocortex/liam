@@ -38,7 +38,7 @@ anyhow = "1"
 
 # llama.cpp bindings for the Llm trait. `encoding_rs`
 # because `token_to_piece` streams bytes through a decoder of that crate's type.
-llama-cpp-2 = { version = "0.1.154", default-features = false, features = ["common"] }
+llama-cpp-2 = { version = "0.1.161", default-features = false, features = ["common"] }
 encoding_rs = { version = "0.8" }
 # sysctl for the performance core count the llama.cpp embedder sizes its threads by.
 libc = "0.2"
