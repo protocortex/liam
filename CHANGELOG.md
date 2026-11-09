@@ -6,6 +6,15 @@ All notable changes to LIAM are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The `local`, `llama`, `hosted` and `backend-libsql` build flags are removed. Every build now
+  includes the local models, llama.cpp and the hosted-provider code, so `cargo install` and
+  `cargo build` need no `--features`. Hosted calls stay off until `[hosted]` is configured.
+  `cuda` and the two `test-support` flags remain.
+- The shipped `liam.toml` now uses the local embedder and the llama-cpp LLM. `provider = "mock"`
+  is still accepted for tests and dev, and an unknown provider name is now an error.
+
 ### Upgrading
 
 - An existing store is refused at its first start on this version until you run `liam rebuild

@@ -155,7 +155,7 @@ pub fn strip_reasoning(s: &str) -> &str {
 }
 
 /// Which compute backend to run generation on. Parsed from config, so it lives
-/// outside the `local` feature and is testable without a model.
+/// without a model and is testable without a model.
 ///
 /// `Auto` takes the fastest backend COMPILED INTO this binary and falls back to
 /// CPU when the hardware or driver is missing at runtime. What is compiled in is

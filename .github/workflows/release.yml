@@ -133,32 +133,11 @@ jobs:
         with:
           lookup-only: true
 
-      # `local,llama` is not a nicety here, it is what makes the artifact
-      # usable. `local` supplies the real embedder and reranker; `llama`
-      # supplies generation. Built with only one of them the daemon either
-      # refuses to start, when the config names the missing provider (the
-      # `#[cfg(not(feature = ...))]` bails in crates/liam-daemon/src/main.rs),
-      # or silently serves random embeddings and fabricated answers when the
-      # config still says "mock". This workflow used to build `--features
-      # local` alone and hit exactly that.
-      #
-      # Note this combination is compiled NOWHERE in ci.yml: the `test` job
-      # builds `--features local`, `build-llama` builds `--features llama`,
-      # and only `cargo deny` resolves the pair. A break in the combined build
-      # therefore surfaces here first, during a tagged release.
-      #
       # llama-cpp-sys-2 compiles llama.cpp from C++ via CMake. This is slow on a
-      # cold cache, so expect a slow run rather than treating it as stuck.
-      #
-      # An earlier version of this comment said rust-cache does not cache that
-      # CMake build. It does: measured 2026-08-22 at 9 seconds warm against 121
-      # seconds cold, because llama-cpp-sys-2 is a dependency and rust-cache
-      # keeps dependency build artifacts. A release still tends to run cold,
-      # since it builds a feature combination and a profile that ordinary CI
-      # does not, so its cache key rarely matches one CI just populated.
-      #
-      # Metal is enabled by target inside that build script, so it needs no
-      # cargo feature.
+      # cold cache, so expect a slow run rather than treating it as stuck. A
+      # release builds a profile that ordinary CI does not, so its cache key
+      # rarely matches one CI just populated. Metal is enabled by target inside
+      # that build script.
       # Builds both binaries the package declares: `liamd`, the daemon, and
       # `liam`, the CLI that fetches models at install time.
       - name: Build release binaries
@@ -166,7 +145,7 @@ jobs:
           # Homebrew OpenSSL 4 on the runner breaks llama.cpp's CMake; its
           # HTTPS support is unused.
           CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: "ON"
-        run: cargo build --release -p liam-daemon --features local,llama
+        run: cargo build --release -p liam-daemon
 
       # Cheapest possible proof that each binary links and starts. Worth
       # having for `liam` specifically: it is what the install script runs to
@@ -202,33 +181,15 @@ jobs:
             fetch::tests::real_server_asset_matches_its_pin 2>&1 | tee pin.log
           grep -q ' 1 passed' pin.log
 
-      # The repo's liam.toml is the DEV config: both providers are "mock" so a
-      # default `cargo build` stays light. Shipping it beside a real binary is
-      # the failure this workflow used to have, and it is silent: the daemon
-      # starts, `recall` returns noise from random vectors, and `ask`
-      # fabricates. Deriving the shipped config from that same file keeps one
-      # source of truth, and the assertions below fail the release rather than
-      # let a bad substitution through.
+      # The repo's liam.toml names the real providers, so the release ships it
+      # as is. The assertions below fail the release if a mock provider ever
+      # lands in it, because that is silent: the daemon starts, `recall`
+      # returns noise from random vectors, and `ask` fabricates.
       - name: Stage the release config
         run: |
           set -euo pipefail
           mkdir -p dist/staging
-          python3 - <<'PY'
-          import re, pathlib
-          src = pathlib.Path("liam.toml").read_text()
-          # Rewrite `provider` inside [embedder] and [llm] only, leaving every
-          # other section, and all inline comments, untouched.
-          want = {"embedder": "local", "llm": "llama-cpp"}
-          section, out = None, []
-          for line in src.splitlines(keepends=True):
-              header = re.match(r"\s*\[([^\]]+)\]", line)
-              if header:
-                  section = header.group(1)
-              elif section in want and re.match(r"\s*provider\s*=", line):
-                  line = re.sub(r'"mock"', '"%s"' % want[section], line, count=1)
-              out.append(line)
-          pathlib.Path("dist/staging/liam.toml").write_text("".join(out))
-          PY
+          cp liam.toml dist/staging/liam.toml
           grep -Eq '^provider[[:space:]]*=[[:space:]]*"local"' dist/staging/liam.toml
           grep -Eq '^provider[[:space:]]*=[[:space:]]*"llama-cpp"' dist/staging/liam.toml
           if grep -Eq '^provider[[:space:]]*=[[:space:]]*"mock"' dist/staging/liam.toml; then

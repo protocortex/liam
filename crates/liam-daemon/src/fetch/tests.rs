@@ -583,6 +583,34 @@ fn plan_for(config: &Config, os: &str, arch: &str) -> anyhow::Result<FetchPlan> 
 }
 
 #[test]
+fn an_unknown_provider_is_refused_instead_of_planning_nothing() {
+    // Arrange
+    let mut config = Config::default();
+    config.embedder.provider = "loca".to_string();
+
+    // Act
+    let err = plan_for(&config, "macos", "aarch64")
+        .unwrap_err()
+        .to_string();
+
+    // Assert
+    assert!(err.contains("embedder.provider"), "{err}");
+    assert!(err.contains("\"loca\""), "{err}");
+
+    // Arrange
+    let mut config = Config::default();
+    config.llm.provider = "llama".to_string();
+
+    // Act
+    let err = plan_for(&config, "macos", "aarch64")
+        .unwrap_err()
+        .to_string();
+
+    // Assert
+    assert!(err.contains("llm.provider"), "{err}");
+}
+
+#[test]
 fn only_extraction_enabled_plans_the_extraction_files_with_mock_providers() {
     // Arrange
     let config = config_with(extraction(true, true));

@@ -130,6 +130,12 @@ impl ContentEmbedder for StoreEmbedder {
 /// The `embedder.provider` value that selects the in-process models.
 pub const LOCAL_PROVIDER: &str = "local";
 
+/// The provider value that selects the mock embedder or LLM, for tests and dev.
+pub const MOCK_PROVIDER: &str = "mock";
+
+/// The `llm.provider` value that selects in-process llama.cpp.
+pub const LLAMA_PROVIDER: &str = "llama-cpp";
+
 /// Points fastembed's cache at the configured directory when the embedder is
 /// local, and returns that directory.
 ///
@@ -148,15 +154,22 @@ pub fn export_fastembed_cache_dir(config: &Config) -> anyhow::Result<Option<Path
     Ok(Some(cache_dir))
 }
 
-/// Choose the embedder from config. The mock keeps the base build runnable; the
-/// `local` provider (with the `local` feature) loads fastembed in-process.
+/// Choose the embedder from config. `mock` is for tests and dev; the `local`
+/// provider loads fastembed in-process. Any other name is an error, so a typo
+/// cannot quietly select the mock.
 ///
 /// Callers must run `export_fastembed_cache_dir` first.
 pub fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
     if config.embedder.provider == LOCAL_PROVIDER {
         return build_local_embedder(config);
     }
-    Ok(Arc::new(MockEmbedder::new(config.embedding_dims)))
+    if config.embedder.provider == MOCK_PROVIDER {
+        return Ok(Arc::new(MockEmbedder::new(config.embedding_dims)));
+    }
+    anyhow::bail!(
+        "embedder.provider = {:?} is not one of {LOCAL_PROVIDER:?}, {MOCK_PROVIDER:?}",
+        config.embedder.provider
+    )
 }
 
 /// The embedder from `build_embedder` and the reranker the same config asks for:
@@ -175,12 +188,10 @@ pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<d
 /// in `liam_model::ONNX_MODELS` loads through the ONNX embedder; every other
 /// id goes to the Qwen3 loader. Hugging Face ids are case-insensitive, so the
 /// match is too.
-#[cfg(any(test, feature = "local"))]
 fn is_bge_m3(model: &str) -> bool {
     model.eq_ignore_ascii_case(liam_model::BGE_M3_MODEL_ID)
 }
 
-#[cfg(feature = "local")]
 fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
     use liam_model::{BgeM3Embedder, FastEmbedEmbedder, OnnxEmbedder};
     let home = std::env::var("HOME").unwrap_or_default();
@@ -206,50 +217,29 @@ fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
     )?))
 }
 
-#[cfg(feature = "local")]
 fn build_local_reranker() -> anyhow::Result<Arc<dyn Reranker>> {
     Ok(Arc::new(liam_model::FastEmbedReranker::load()?))
 }
 
-/// Refuses to start rather than substituting the mock embedder.
-///
-/// Silently downgrading here is the worst possible outcome: mock embeddings
-/// are random, so the vector channel returns noise and `recall` quality
-/// collapses with nothing to show for it. The old warning went to stderr,
-/// which an MCP client never surfaces, so a user would have seen only bad
-/// answers. Failing at startup with the actual fix is what makes a
-/// misconfigured install obvious in the one second it takes to notice.
-#[cfg(not(feature = "local"))]
-fn build_local_embedder(_config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
-    anyhow::bail!(
-        "embedder.provider = \"local\" needs a binary built with the `local` feature, \
-         and this one was not. Either install a release build (they ship with it), \
-         rebuild with `--features local`, or set embedder.provider = \"mock\" if you \
-         actually want the dev embedder. Mock embeddings are random, so recall would \
-         be meaningless."
-    )
-}
-
-/// Never reached: `build_models` builds the embedder first, and that refuses.
-#[cfg(not(feature = "local"))]
-fn build_local_reranker() -> anyhow::Result<Arc<dyn Reranker>> {
-    anyhow::bail!("embedder.provider = \"local\" needs a binary built with the `local` feature")
-}
-
-/// Choose the LLM from config. Mock keeps the base build runnable; `llama-cpp`
-/// (with the `llama` feature) loads llama.cpp in-process. `local` named the
+/// Choose the LLM from config. Mock is for tests and dev; `llama-cpp`
+/// loads llama.cpp in-process. `local` named the
 /// retired candle provider: an operator who still has it in their liam.toml
 /// gets an actionable error instead of a silent downgrade to mock.
 pub fn build_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
-    let llm: Arc<dyn Llm> = if config.llm.provider == "llama-cpp" {
+    let llm: Arc<dyn Llm> = if config.llm.provider == LLAMA_PROVIDER {
         build_llama_llm(config)?
     } else if config.llm.provider == "local" {
         anyhow::bail!(
             "llm.provider = \"local\" was removed: the candle provider is gone, \
              generation now runs on llama.cpp, set llm.provider = \"llama-cpp\" in your liam.toml"
         );
-    } else {
+    } else if config.llm.provider == MOCK_PROVIDER {
         Arc::new(MockLlm)
+    } else {
+        anyhow::bail!(
+            "llm.provider = {:?} is not one of {LLAMA_PROVIDER:?}, {MOCK_PROVIDER:?}",
+            config.llm.provider
+        );
     };
 
     // An operator debugging latency needs to see which backend actually
@@ -275,7 +265,6 @@ pub fn build_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     Ok(llm)
 }
 
-#[cfg(feature = "llama")]
 fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     use liam_model::LlamaCppLlm;
     // Reject an unknown device rather than quietly running 5x slower on CPU.
@@ -300,24 +289,6 @@ fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
         config.llm.context_tokens as u32,
         device,
     )?))
-}
-
-/// Refuses to start rather than substituting the mock LLM.
-///
-/// `ask` synthesizes an answer from retrieved evidence, so a mock LLM makes
-/// it produce confident nonsense. The old warning went to stderr, invisible
-/// to an MCP client, which meant a user asking a question got a fabricated
-/// answer with no indication anything was wrong. That is the single worst
-/// failure mode this daemon has, so it is now fatal at startup.
-#[cfg(not(feature = "llama"))]
-fn build_llama_llm(_config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
-    anyhow::bail!(
-        "llm.provider = \"llama-cpp\" needs a binary built with the `llama` feature, \
-         and this one was not. Either install a release build (they ship with it), \
-         rebuild with `--features llama`, or set llm.provider = \"mock\" if you \
-         actually want the dev model. The mock LLM invents answers, so `ask` would \
-         be worse than useless."
-    )
 }
 
 /// Whether a resolved backend label is a macOS startup error. Pure and
@@ -384,7 +355,6 @@ mod tests {
 
     /// A BGE-M3 id must reach the BGE-M3 loader: its dims check fails before any
     /// download, whereas the Qwen3 loader would start fetching weights first.
-    #[cfg(feature = "local")]
     #[test]
     fn the_bge_m3_model_id_is_routed_to_the_bge_m3_loader() {
         // Arrange
@@ -408,7 +378,6 @@ mod tests {
 
     /// An ONNX model id must reach the ONNX loader: its dims check fails before
     /// any download, whereas the Qwen3 loader would start fetching weights.
-    #[cfg(feature = "local")]
     #[test]
     fn an_onnx_model_id_is_routed_to_the_onnx_loader() {
         // Arrange
@@ -538,45 +507,29 @@ mod tests {
         );
     }
 
-    /// A build without `local` must refuse `embedder.provider = "local"`
-    /// rather than quietly swapping in the mock. Mock embeddings are random,
-    /// so the substitution used to destroy recall quality while logging only
-    /// to stderr, where an MCP client never sees it.
-    #[cfg(not(feature = "local"))]
     #[test]
-    fn local_embedder_without_the_feature_fails_instead_of_using_mock() {
+    fn an_unknown_embedder_provider_is_an_error_not_a_mock() {
         let mut config = Config::default();
-        config.embedder.provider = "local".to_string();
+        config.embedder.provider = "loca".to_string();
 
-        let error = build_models(&config)
-            .err()
-            .expect("a local embedder without the feature must not fall back to mock");
-        let message = error.to_string();
+        let message = build_embedder(&config).err().unwrap().to_string();
+
         assert!(
-            message.contains("--features local") || message.contains("`local` feature"),
-            "error should name the feature: {message}"
-        );
-        assert!(
-            message.contains("mock"),
-            "error should say what the alternative is: {message}"
+            message.contains("loca") && message.contains("local"),
+            "{message}"
         );
     }
 
-    /// Same rule for generation, and it matters more: a mock LLM makes `ask`
-    /// return confident fiction.
-    #[cfg(not(feature = "llama"))]
     #[test]
-    fn llama_provider_without_the_feature_fails_instead_of_using_mock() {
+    fn an_unknown_llm_provider_is_an_error_not_a_mock() {
         let mut config = Config::default();
-        config.llm.provider = "llama-cpp".to_string();
+        config.llm.provider = "llama".to_string();
 
-        let error = build_llm(&config)
-            .err()
-            .expect("llama-cpp without the feature must not fall back to mock");
-        let message = error.to_string();
+        let message = build_llm(&config).err().unwrap().to_string();
+
         assert!(
-            message.contains("`llama` feature") || message.contains("--features llama"),
-            "error should name the feature: {message}"
+            message.contains("llama-cpp") && message.contains("mock"),
+            "{message}"
         );
     }
 

@@ -27,6 +27,7 @@ use tracing::debug;
 
 use crate::config::{Config, ExtractionConfig};
 use crate::models;
+use crate::models::{LLAMA_PROVIDER, LOCAL_PROVIDER, MOCK_PROVIDER};
 
 pub use curl::CurlFetcher;
 
@@ -141,6 +142,7 @@ impl FetchPlan {
     /// Decides from the config, and fails before any download when the packaged
     /// server would have to be installed on a host it does not run on.
     pub fn for_host(config: &Config, home: &str, os: &str, arch: &str) -> anyhow::Result<Self> {
+        check_providers(config)?;
         let extraction = extraction_targets(&config.extraction, home)?;
         if let Some(ExtractionTargets {
             server: Target::Install(_),
@@ -150,8 +152,8 @@ impl FetchPlan {
             check_platform(os, arch)?;
         }
         Ok(Self {
-            embedder: config.embedder.provider == "local",
-            llm: config.llm.provider == "llama-cpp",
+            embedder: config.embedder.provider == LOCAL_PROVIDER,
+            llm: config.llm.provider == LLAMA_PROVIDER,
             extraction,
         })
     }
@@ -159,6 +161,25 @@ impl FetchPlan {
     pub fn is_empty(&self) -> bool {
         !self.embedder && !self.llm && self.extraction.is_none()
     }
+}
+
+/// Refuses a provider name the daemon would refuse, so a typo is reported here
+/// instead of reading as "nothing to fetch".
+fn check_providers(config: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(
+            config.embedder.provider.as_str(),
+            LOCAL_PROVIDER | MOCK_PROVIDER
+        ),
+        "embedder.provider = {:?} is not one of {LOCAL_PROVIDER:?}, {MOCK_PROVIDER:?}",
+        config.embedder.provider
+    );
+    anyhow::ensure!(
+        matches!(config.llm.provider.as_str(), LLAMA_PROVIDER | MOCK_PROVIDER),
+        "llm.provider = {:?} is not one of {LLAMA_PROVIDER:?}, {MOCK_PROVIDER:?}",
+        config.llm.provider
+    );
+    Ok(())
 }
 
 /// `None` when extraction needs no files. A path that is not the default

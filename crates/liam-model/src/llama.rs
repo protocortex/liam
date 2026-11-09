@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `Llm` over llama.cpp, behind the `llama` feature.
+//! `Llm` over llama.cpp.
 //!
 //! The backend is process-global: llama.cpp allows exactly one
 //! `LlamaBackend::init()` per process, so `shared_backend` initializes it once

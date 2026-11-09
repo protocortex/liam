@@ -7,8 +7,7 @@ liam eval retrieval --model <ID> [--json]
 ```
 
 It scores one embedding model on a fixed golden set and measures the embedder's
-speed. Build `liam` with `--features local`; without it the command fails with
-an error saying so. The model is downloaded into `embedder.cache_dir` on first
+speed. The model is downloaded into `embedder.cache_dir` on first
 use. BGE-M3 is cached under `HF_HOME` instead when that variable is set.
 
 | Flag | Meaning |

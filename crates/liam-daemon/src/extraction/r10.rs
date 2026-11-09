@@ -11,7 +11,7 @@ use super::response::Polarity;
 #[cfg(test)]
 mod baseline;
 pub(crate) mod corpus;
-#[cfg(all(test, feature = "llama"))]
+#[cfg(test)]
 mod real;
 #[cfg(test)]
 mod rss;

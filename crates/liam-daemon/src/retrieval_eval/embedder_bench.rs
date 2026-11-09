@@ -243,8 +243,7 @@ fn rank(query: &[f32], facts: &[BenchFact], vectors: &[Vec<f32>]) -> Vec<String>
 ///
 /// # Errors
 ///
-/// Fails when the model cannot be loaded, including in a build without the
-/// `local` feature, or on an embedder error.
+/// Fails when the model cannot be loaded, or on an embedder error.
 pub async fn run_embedder_bench(
     model: super::EvalModel,
     config: &Config,

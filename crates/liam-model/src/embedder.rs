@@ -4,7 +4,6 @@
 
 use async_trait::async_trait;
 
-#[cfg(feature = "local")]
 use crate::blocking::with_model_blocking;
 use crate::error::Result;
 
@@ -61,13 +60,11 @@ impl Embedder for MockEmbedder {
 
 /// The task line of the Qwen3 query format, which the model card asks callers
 /// to write for their own retrieval task. Documents get no instruction.
-#[cfg(any(test, feature = "local"))]
 const QWEN3_QUERY_TASK: &str =
     "Given a web search query, retrieve relevant passages that answer the query";
 
 /// The exact string handed to the Qwen3 model for `text` in its `kind` role:
 /// `Instruct: <task>\nQuery:<query>` for a query, plain text for a document.
-#[cfg(any(test, feature = "local"))]
 fn qwen3_input(text: &str, kind: TextKind) -> String {
     match kind {
         TextKind::Query => format!("Instruct: {QWEN3_QUERY_TASK}\nQuery:{text}"),
@@ -82,7 +79,6 @@ fn qwen3_input(text: &str, kind: TextKind) -> String {
 /// episode item, well under Qwen3-Embedding's 32,768-token native context,
 /// so it bounds worst-case latency without silently cutting off normal
 /// content. It is also BGE-M3's maximum input length.
-#[cfg(feature = "local")]
 pub(crate) const EMBED_MAX_INPUT_TOKENS: usize = 8192;
 
 /// Shrink an already-normalized embedding to its first `dims` entries and
@@ -103,9 +99,8 @@ pub(crate) const EMBED_MAX_INPUT_TOKENS: usize = 8192;
 ///
 /// Pure (no model, no candle, no fastembed): compiled whenever `local` is
 /// enabled (its real caller) or under `cfg(test)` (so its own unit tests
-/// below build and run without the `local` feature or any downloaded
+/// below build and run without any downloaded
 /// weights).
-#[cfg(any(test, feature = "local"))]
 pub(crate) fn mrl_truncate(full: &[f32], dims: usize) -> Vec<f32> {
     if dims >= full.len() {
         return full.to_vec();
@@ -125,7 +120,6 @@ pub(crate) fn mrl_truncate(full: &[f32], dims: usize) -> Vec<f32> {
 /// truncate to and nothing to renormalize) or larger than the model's native
 /// width (Matryoshka only shrinks). Pure and gated the same as `mrl_truncate`,
 /// so both bounds are unit tested without a real model.
-#[cfg(any(test, feature = "local"))]
 pub(crate) fn validate_dims(model_id: &str, dims: usize, native_dims: usize) -> Result<()> {
     if dims == 0 {
         return Err(crate::error::ModelError::Embed(format!(
@@ -146,7 +140,6 @@ pub(crate) fn validate_dims(model_id: &str, dims: usize, native_dims: usize) -> 
 /// Qwen3-VL checkpoints nest their fields under `text_config` instead of at
 /// the top level, so they fail this parse rather than being silently
 /// mis-loaded; see `load`'s scope note on why they are not ported.
-#[cfg(feature = "local")]
 fn parse_qwen3_config(model_id: &str, bytes: &[u8]) -> Result<fastembed::Qwen3Config> {
     serde_json::from_slice(bytes).map_err(|e| {
         crate::error::ModelError::Embed(format!(
@@ -160,7 +153,6 @@ fn parse_qwen3_config(model_id: &str, bytes: &[u8]) -> Result<fastembed::Qwen3Co
 
 /// The weight-fetch failure message: named so its wording is pinned by a
 /// test, unlike this file's usual inline `ModelError::Embed` formatting.
-#[cfg(feature = "local")]
 fn weight_fetch_error(model_id: &str, cause: &str) -> crate::error::ModelError {
     crate::error::ModelError::Embed(format!(
         "failed to fetch model.safetensors for {model_id}: {cause}; if {model_id} is a \
@@ -168,18 +160,16 @@ fn weight_fetch_error(model_id: &str, cause: &str) -> crate::error::ModelError {
     ))
 }
 
-/// In-process embedder over fastembed-rs (feature `local`). Runs a Qwen3
+/// In-process embedder over fastembed-rs. Runs a Qwen3
 /// embedding model with candle; no server, offline once the model is cached.
 /// The sync fastembed call runs on a blocking thread so the async runtime stays
 /// free. `dims` is the output embedding width after Matryoshka truncation
 /// (see `mrl_truncate`); it must not exceed the model's native hidden size.
-#[cfg(feature = "local")]
 pub struct FastEmbedEmbedder {
     model: std::sync::Arc<std::sync::Mutex<fastembed::Qwen3TextEmbedding>>,
     dims: usize,
 }
 
-#[cfg(feature = "local")]
 impl FastEmbedEmbedder {
     /// Load a model by Hugging Face id (e.g. "Qwen/Qwen3-Embedding-0.6B") into
     /// `cache_dir`, truncating its output to `dims` via Matryoshka (see
@@ -256,7 +246,6 @@ impl FastEmbedEmbedder {
     }
 }
 
-#[cfg(feature = "local")]
 #[async_trait]
 impl Embedder for FastEmbedEmbedder {
     fn dims(&self) -> usize {
@@ -283,7 +272,6 @@ impl Embedder for FastEmbedEmbedder {
 #[cfg(test)]
 mod tests {
     use super::{mrl_truncate, qwen3_input, validate_dims, Embedder, MockEmbedder, TextKind};
-    #[cfg(feature = "local")]
     use super::{parse_qwen3_config, weight_fetch_error};
 
     #[test]
@@ -376,7 +364,6 @@ mod tests {
     /// `fastembed::Qwen3Config` requires without a `#[serde(default)]` or
     /// `Option` type, so this parses on its own and also nests under
     /// `text_config` to build a VL-shaped fixture below.
-    #[cfg(feature = "local")]
     const VALID_QWEN3_CONFIG_JSON: &str = r#"{
         "attention_bias": false,
         "attention_dropout": 0.0,
@@ -393,7 +380,6 @@ mod tests {
         "vocab_size": 151936
     }"#;
 
-    #[cfg(feature = "local")]
     #[test]
     fn parse_qwen3_config_parses_a_well_formed_config() {
         // Arrange / Act
@@ -404,7 +390,6 @@ mod tests {
         assert_eq!(cfg.hidden_size, 1024);
     }
 
-    #[cfg(feature = "local")]
     #[test]
     fn parse_qwen3_config_rejects_unsupported_shapes_naming_the_model() {
         // Arrange: malformed JSON, and a VL-shaped config nesting every field
@@ -445,7 +430,6 @@ mod tests {
         assert!(vl_err.contains("missing field"), "message: {vl_err}");
     }
 
-    #[cfg(feature = "local")]
     #[test]
     fn weight_fetch_error_names_the_model_the_cause_and_the_limitation() {
         // Arrange / Act
@@ -536,8 +520,7 @@ mod tests {
     /// means this can only pass if `with_cache_dir` genuinely took effect,
     /// since the old bare `from_hf` call would leave it empty. Gated and
     /// ignored the same way as `tool_eval.rs`'s and `retrieval_eval.rs`'s own
-    /// real-tier tests: `cargo test -p liam-model --features local -- --ignored`.
-    #[cfg(feature = "local")]
+    /// real-tier tests: `cargo test -p liam-model -- --ignored`.
     #[tokio::test]
     #[ignore = "downloads embedder weights; see module doc for the run command"]
     async fn load_downloads_weights_into_the_configured_cache_dir() {
@@ -581,7 +564,6 @@ mod tests {
         assert_eq!(vector.len(), native_dims);
     }
 
-    #[cfg(feature = "local")]
     fn file_exists_under(dir: &std::path::Path, name: &str) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;

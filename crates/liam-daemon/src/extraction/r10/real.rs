@@ -4,7 +4,7 @@
 //! result to the committed baseline. It is `#[ignore]`d because it needs the
 //! files `liam fetch-models` installs and takes minutes:
 //!
-//! `cargo test -p liam-daemon --features llama real_model -- --ignored --nocapture`
+//! `cargo test -p liam-daemon real_model -- --ignored --nocapture`
 //!
 //! A run prints the numbers to put in `baseline.json` when the prompt or the
 //! model changes.

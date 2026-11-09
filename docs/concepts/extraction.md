@@ -165,7 +165,7 @@ To measure it, run `liam fetch-models`, then, on a machine with enough free
 memory:
 
 ```sh
-cargo test -p liam-daemon --features llama real_model -- --ignored --nocapture
+cargo test -p liam-daemon real_model -- --ignored --nocapture
 ```
 
 The run prints a JSON object with `measured`. Copy it into `baseline.json`, set

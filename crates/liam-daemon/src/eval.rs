@@ -8,12 +8,11 @@
 //! measurement.
 //!
 //! The scorers below are pure and always compiled, so the harness logic itself is
-//! unit-tested in the base build. The model run is a `#[ignore]`d test behind the
-//! `llama` feature, because it downloads weights (~1 GB on first run) and takes
-//! minutes:
+//! unit-tested in the default test run. The model run is an `#[ignore]`d test,
+//! because it downloads weights (~1 GB on first run) and takes minutes:
 //!
 //! ```text
-//! cargo test --release -p liam-daemon --features llama -- --ignored --nocapture grounding
+//! cargo test --release -p liam-daemon -- --ignored --nocapture grounding
 //! ```
 //!
 //! `--release` is not optional for candle, historical: an unoptimized candle
@@ -319,7 +318,6 @@ fn failures(answer: &str, expect: &Expect) -> Vec<String> {
     out
 }
 
-#[cfg(feature = "llama")]
 mod run {
     use std::sync::Arc;
     use std::time::Instant;
@@ -399,7 +397,7 @@ mod run {
     /// zero, the fallback path hides the raw text, and the cause (a reasoning
     /// preamble, a copied template, an empty answer) is invisible. Run it when
     /// bringing up a new architecture:
-    /// `cargo test --release -p liam-daemon --features llama -- --ignored --nocapture raw_completion`
+    /// `cargo test --release -p liam-daemon -- --ignored --nocapture raw_completion`
     #[tokio::test]
     #[ignore = "downloads model weights; diagnostic, prints instead of asserting"]
     async fn raw_completion_smoke() {
