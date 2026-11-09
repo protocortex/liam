@@ -363,8 +363,8 @@ impl Llm for LlamaCppLlm {
             .map(|_| ())
     }
 
-    /// `None` on a tokenize failure rather than a wrong count, so the caller
-    /// falls back to its own estimate instead of trusting a made-up number.
+    /// Always `Some`: the vocab tokenizer cannot fail. The `Option` is the
+    /// trait's contract, where `None` means "fall back to an estimate".
     fn count_tokens(&self, text: &str) -> Option<usize> {
         Some(
             self.model
