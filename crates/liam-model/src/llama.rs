@@ -36,6 +36,7 @@ use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::error::{ModelError, Result};
+use crate::hardware::{resolve_device, Engine, ResolvedDevice, SystemFacts};
 use crate::llm::{strip_reasoning, CancelFlag, DevicePreference, Llm};
 
 /// Cap on generated tokens so a model with no natural stop token cannot hang a
@@ -75,11 +76,13 @@ impl LlamaCppLlm {
     /// to say so explicitly; nothing here probes for a GPU and picks CPU on
     /// its own.
     pub fn load(gguf_path: &str, context_tokens: u32, device: DevicePreference) -> Result<Self> {
+        let resolved =
+            resolve_device(Engine::LlamaLlm, device, &SystemFacts).map_err(ModelError::Llm)?;
         let backend = shared_backend()?;
         // With no GPU compiled in, 1000 layers is ignored and the model
         // stays on CPU regardless; 0 is what makes an explicit CPU request
         // actually run on CPU even when Metal or CUDA IS compiled in.
-        let n_gpu_layers = if device == DevicePreference::Cpu {
+        let n_gpu_layers = if resolved.device == ResolvedDevice::Cpu {
             0
         } else {
             1000
@@ -390,6 +393,23 @@ mod tests {
         // cargo feature, so a macOS build must report it even though no
         // `llama-metal` feature exists to key on.
         assert_eq!(backend, "llama.cpp/metal");
+    }
+
+    #[test]
+    fn the_llm_loader_refuses_cuda_and_metal_off_macos_before_touching_the_file() {
+        // Act
+        let cuda = LlamaCppLlm::load("missing.gguf", 512, DevicePreference::Cuda);
+
+        // Assert
+        assert!(cuda
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("not built into llama.cpp"));
+        if !cfg!(target_os = "macos") {
+            let metal = LlamaCppLlm::load("missing.gguf", 512, DevicePreference::Metal);
+            assert!(metal.err().unwrap().to_string().contains("macOS"));
+        }
     }
 
     #[test]

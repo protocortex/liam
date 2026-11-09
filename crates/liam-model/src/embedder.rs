@@ -182,44 +182,49 @@ pub struct FastEmbedEmbedder {
 /// Metal path returns the same vectors as its CPU path (cosine 1.0000) and
 /// answers a query about 2.5 times faster. Elsewhere `Auto` is the CPU.
 fn candle_device(preference: DevicePreference) -> Result<(candle_core::Device, &'static str)> {
-    let unavailable = |name: &str| {
-        crate::error::ModelError::Embed(format!(
-            "embedder.device = \"{name}\" is not available in this build of the candle embedder"
-        ))
-    };
-    match preference {
-        DevicePreference::Auto => Ok(candle_device(DevicePreference::Metal).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "no Metal device for the candle embedder, using the CPU");
-            (candle_core::Device::Cpu, "candle/cpu")
-        })),
-        DevicePreference::Cpu => Ok((candle_core::Device::Cpu, "candle/cpu")),
-        DevicePreference::Metal => {
+    use crate::hardware::{resolve_device, Engine, ResolvedDevice, SystemFacts};
+    let resolved = resolve_device(Engine::Candle, preference, &SystemFacts)
+        .map_err(crate::error::ModelError::Embed)?;
+    if let Some(note) = &resolved.note {
+        tracing::warn!(
+            note,
+            "no Metal device for the candle embedder, using the CPU"
+        );
+    }
+    match resolved.device {
+        ResolvedDevice::Cpu => Ok((candle_core::Device::Cpu, "candle/cpu")),
+        ResolvedDevice::Metal => {
             #[cfg(target_os = "macos")]
             {
-                let device = candle_core::Device::new_metal(0).map_err(|e| {
-                    crate::error::ModelError::Embed(format!("candle metal device: {e}"))
-                })?;
+                let device =
+                    candle_core::Device::new_metal(0).map_err(|e| device_error("metal", e))?;
                 Ok((device, "candle/metal"))
             }
             #[cfg(not(target_os = "macos"))]
             {
-                Err(unavailable("metal"))
+                Err(device_error("metal", NOT_IN_BUILD))
             }
         }
-        DevicePreference::Cuda => {
+        ResolvedDevice::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                let device = candle_core::Device::new_cuda(0).map_err(|e| {
-                    crate::error::ModelError::Embed(format!("candle cuda device: {e}"))
-                })?;
+                let device =
+                    candle_core::Device::new_cuda(0).map_err(|e| device_error("cuda", e))?;
                 Ok((device, "candle/cuda"))
             }
             #[cfg(not(feature = "cuda"))]
             {
-                Err(unavailable("cuda"))
+                Err(device_error("cuda", NOT_IN_BUILD))
             }
         }
     }
+}
+
+/// What a guard arm says: the resolver never returns a device this build lacks.
+const NOT_IN_BUILD: &str = "not in this build";
+
+fn device_error(what: &str, e: impl std::fmt::Display) -> crate::error::ModelError {
+    crate::error::ModelError::Embed(format!("candle {what} device: {e}"))
 }
 
 impl FastEmbedEmbedder {

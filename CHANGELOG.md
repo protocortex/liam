@@ -46,6 +46,9 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Added
 
+- `liam devices` (and `--json`) prints the platform, the performance and efficiency cores, whether
+  Metal opens, the compute backends this build has, the devices llama.cpp reports, and what `auto`
+  resolves to for `embedder.device` and `llm.device`. See `docs/reference/devices.md`.
 - Two producers writing the same `subject` in one scope now each keep a live fact instead of
   the later write replacing the earlier one. Entity pages stay one shared page per subject and
   scope. A scope filter such as `work` also matches `work/...` descendants on read, and a

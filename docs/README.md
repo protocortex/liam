@@ -27,6 +27,7 @@ below.
 |---|---|
 | [Tools](reference/tools.md) | The twelve MCP tools, with the field tables for `remember`, `recall`, `timeline` and `relate`. |
 | [Configuration](reference/configuration.md) | Every `liam.toml` key, its default and its meaning. |
+| [Devices](reference/devices.md) | The `liam devices` command: cores, compute backends, and what `auto` resolves to. |
 | [Feature flags](reference/feature-flags.md) | The Cargo features of `liam-store` and `liam-daemon`. |
 
 ## Concepts

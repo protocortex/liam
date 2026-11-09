@@ -32,6 +32,7 @@ use crate::embedder::{
     mrl_truncate, qwen3_input, validate_dims, Embedder, TextKind, EMBED_MAX_INPUT_TOKENS,
 };
 use crate::error::{ModelError, Result};
+use crate::hardware::{resolve_device, Engine, ResolvedDevice, SystemFacts};
 use crate::llama::{runtime_backend, shared_backend};
 use crate::llm::DevicePreference;
 
@@ -167,33 +168,13 @@ pub(crate) fn plan_chunks(
     chunks
 }
 
-/// The sysctl naming the performance cores of an Apple Silicon chip.
-#[cfg(target_os = "macos")]
-const PERFORMANCE_CORES_SYSCTL: &std::ffi::CStr = c"hw.perflevel0.logicalcpu";
-
 /// Threads for the matrix math. On Apple Silicon only the performance cores:
 /// measured on an M1 Pro, 8 threads (its performance cores) answered a query in
 /// 37 ms where 10 threads (adding the efficiency cores) took 62 ms, because the
 /// slowest core gates every parallel step. Elsewhere, every available core.
 fn compute_threads() -> i32 {
-    #[cfg(target_os = "macos")]
-    {
-        let mut count: i32 = 0;
-        let mut size = std::mem::size_of::<i32>();
-        // SAFETY: `count` and `size` are valid for the sysctl to write, and
-        // `size` is the byte length of `count`.
-        let status = unsafe {
-            libc::sysctlbyname(
-                PERFORMANCE_CORES_SYSCTL.as_ptr(),
-                (&raw mut count).cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status == 0 && count > 0 {
-            return count;
-        }
+    if let Some(count) = crate::hardware::performance_cores().and_then(|n| i32::try_from(n).ok()) {
+        return count;
     }
     std::thread::available_parallelism().map_or(1, |n| n.get() as i32)
 }
@@ -230,18 +211,10 @@ impl LlamaEmbedder {
             ModelError::Embed(format!("{model_id} is not a known GGUF embedding model"))
         })?;
         validate_dims(model_id, dims, spec.native_dims)?;
-        if device == DevicePreference::Cuda {
-            return Err(ModelError::Embed(
-                "embedder.device = \"cuda\" is not built into the llama.cpp embedder".into(),
-            ));
-        }
-        if device == DevicePreference::Metal && !cfg!(target_os = "macos") {
-            return Err(ModelError::Embed(
-                "embedder.device = \"metal\" is only available on macOS".into(),
-            ));
-        }
+        let resolved = resolve_device(Engine::LlamaEmbedder, device, &SystemFacts)
+            .map_err(ModelError::Embed)?;
         let backend = shared_backend().map_err(|e| ModelError::Embed(e.to_string()))?;
-        let offload = device != DevicePreference::Cpu;
+        let offload = resolved.device != ResolvedDevice::Cpu;
         let layers = if offload { ALL_GPU_LAYERS } else { 0 };
         let params = LlamaModelParams::default().with_n_gpu_layers(layers);
         let model = LlamaModel::load_from_file(&backend, gguf_path, &params)
