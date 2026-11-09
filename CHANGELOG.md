@@ -14,8 +14,11 @@ All notable changes to LIAM are recorded here. The format follows
   `cuda` and the two `test-support` flags remain.
 - The default `embedder.model` is now `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0 on llama.cpp, on Metal
   on macOS). In the benchmark in `docs/specs/2026-11-09-llama-embedder-benchmark.md` it answers a
-  query 8 times faster (23 ms against 183 ms median) and the embedder uses about half the memory
-  (1072 MB against 2596 MB peak) with equal retrieval quality (nDCG@10 0.934 against 0.933).
+  query 8 times faster than candle on the CPU (23 ms against 183 ms median, the behaviour of
+  v0.1.1) and the embedder uses 59 percent less memory (1072 MB against 2596 MB peak). Against
+  candle on Metal, which `auto` picks on current main, it is 3 times faster (23 ms against 72 ms)
+  and uses 53 percent less embedder memory (1072 MB against 2299 MB). Retrieval quality is equal
+  (nDCG@10 0.934 against 0.933). A store created with `provider = "mock"` is not affected.
   `liam fetch-models` now downloads the 0.6 GB GGUF and no longer the safetensors unless the candle
   id is configured. The reranker is unchanged.
 - The shipped `liam.toml` now uses the local embedder and the llama-cpp LLM. `provider = "mock"`

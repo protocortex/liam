@@ -188,6 +188,11 @@ the release build, `embedder.device = auto` (Metal) and a mock LLM.
 | old, candle | 4.27 s | 4.07 s | 3.84 s | 2966, 2830, 2440 MB |
 | new, llama.cpp Q8_0 | 1.68 s | 1.71 s | 1.70 s | 2631, 2636, 2638 MB |
 
+The old candle start-up rows ran with `embedder.device = auto`, which resolves to
+Metal. The 2596 MB figure in the table above is candle on the CPU, and candle on
+Metal peaked at 2299 MB there, so the embedder memory saving of Q8_0 on Metal
+is 59 percent against candle on the CPU and 53 percent against candle on Metal.
+
 The daemon figure is the whole process: the reranker, the store and the
 model mapping are in it, so the saving of the embedder alone (1072 MB against
 2596 MB in the table above) does not show as a halving at process level. The old
