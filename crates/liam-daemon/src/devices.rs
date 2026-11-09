@@ -8,7 +8,9 @@
 
 use std::fmt::Write as _;
 
-use liam_model::hardware::{BackendDevice, CoreCounts};
+use liam_model::hardware::{
+    resolve_device, BackendDevice, CoreCounts, Engine, HardwareFacts, SystemFacts,
+};
 use liam_model::llm::DevicePreference;
 use serde::Serialize;
 
@@ -23,18 +25,28 @@ const NOT_REPORTED: &str = "not reported";
 const MACOS: &str = "macos";
 
 /// What the machine and the binary can say about themselves.
-pub trait HardwareProbe {
+pub trait HardwareProbe: HardwareFacts {
     fn os(&self) -> String;
     fn arch(&self) -> String;
     fn cores(&self) -> CoreCounts;
-    fn metal_usable(&self) -> bool;
-    fn cuda_built(&self) -> bool;
     /// `None` when llama.cpp does not report its devices.
     fn llama_devices(&self) -> Option<Vec<BackendDevice>>;
 }
 
 /// The probe of the running machine.
 pub struct SystemProbe;
+
+impl HardwareFacts for SystemProbe {
+    fn is_macos(&self) -> bool {
+        SystemFacts.is_macos()
+    }
+    fn metal_usable(&self) -> bool {
+        SystemFacts.metal_usable()
+    }
+    fn cuda_built(&self) -> bool {
+        SystemFacts.cuda_built()
+    }
+}
 
 impl HardwareProbe for SystemProbe {
     fn os(&self) -> String {
@@ -45,12 +57,6 @@ impl HardwareProbe for SystemProbe {
     }
     fn cores(&self) -> CoreCounts {
         liam_model::hardware::core_counts()
-    }
-    fn metal_usable(&self) -> bool {
-        liam_model::hardware::metal_usable()
-    }
-    fn cuda_built(&self) -> bool {
-        liam_model::hardware::CUDA_BUILT
     }
     fn llama_devices(&self) -> Option<Vec<BackendDevice>> {
         liam_model::hardware::llama_backend_devices()
@@ -101,26 +107,17 @@ fn built_backends(probe: &dyn HardwareProbe) -> Vec<String> {
     built
 }
 
-/// The device `auto` picks: Metal on macOS when a Metal device opens, else the CPU.
-fn auto_device(probe: &dyn HardwareProbe) -> &'static str {
-    if probe.os() == MACOS && probe.metal_usable() {
-        BACKEND_METAL
-    } else {
-        BACKEND_CPU
-    }
-}
-
-/// Resolve one `device` value for an engine that accepts the given devices.
+/// Resolve one `device` value with the same function the loaders call.
 fn resolve(
     probe: &dyn HardwareProbe,
     configured: &str,
-    engine: &str,
-    cuda_allowed: bool,
+    engine: Engine,
+    engine_name: &str,
 ) -> Resolution {
     let make = |resolved: &str, note: Option<String>| Resolution {
         configured: configured.to_owned(),
         resolved: resolved.to_owned(),
-        engine: engine.to_owned(),
+        engine: engine_name.to_owned(),
         note,
     };
     match DevicePreference::parse(configured) {
@@ -128,23 +125,10 @@ fn resolve(
             "invalid",
             Some("not one of auto, metal, cuda, cpu".to_owned()),
         ),
-        Some(DevicePreference::Auto) => {
-            let device = auto_device(probe);
-            let note = (probe.os() == MACOS && device == BACKEND_CPU)
-                .then(|| "no Metal device opened, so auto falls back to the CPU".to_owned());
-            make(device, note)
-        }
-        Some(DevicePreference::Cpu) => make(BACKEND_CPU, None),
-        Some(DevicePreference::Metal) if probe.os() != MACOS => make(
-            "unavailable",
-            Some("metal is only available on macOS".to_owned()),
-        ),
-        Some(DevicePreference::Metal) => make(BACKEND_METAL, None),
-        Some(DevicePreference::Cuda) if !(cuda_allowed && probe.cuda_built()) => make(
-            "unavailable",
-            Some("this binary was not built with CUDA support for this engine".to_owned()),
-        ),
-        Some(DevicePreference::Cuda) => make(BACKEND_CUDA, None),
+        Some(preference) => match resolve_device(engine, preference, probe) {
+            Ok(resolution) => make(resolution.device.as_str(), resolution.note),
+            Err(refusal) => make("unavailable", Some(refusal)),
+        },
     }
 }
 
@@ -157,16 +141,16 @@ fn not_used(configured: &str, provider: &str) -> Resolution {
     }
 }
 
-/// The engine an embedder model id loads on, and whether it can use CUDA.
-fn embedder_engine(model: &str) -> (&'static str, bool) {
+/// The engine an embedder model id loads on. `None` for models that ignore the device.
+fn embedder_engine(model: &str) -> Option<(Engine, &'static str)> {
     if liam_model::gguf_embedder_spec(model).is_some() {
-        ("llama.cpp", false)
+        Some((Engine::LlamaEmbedder, "llama.cpp"))
     } else if liam_model::onnx_model_spec(model).is_some()
         || model.eq_ignore_ascii_case(liam_model::BGE_M3_MODEL_ID)
     {
-        ("onnx", false)
+        None
     } else {
-        ("candle", true)
+        Some((Engine::Candle, "candle"))
     }
 }
 
@@ -175,16 +159,15 @@ fn resolve_embedder(probe: &dyn HardwareProbe, config: &Config) -> Resolution {
     if config.embedder.provider != LOCAL_PROVIDER {
         return not_used(configured, &config.embedder.provider);
     }
-    let (engine, cuda_allowed) = embedder_engine(&config.embedder.model);
-    if engine == "onnx" {
-        return Resolution {
+    match embedder_engine(&config.embedder.model) {
+        Some((engine, name)) => resolve(probe, configured, engine, name),
+        None => Resolution {
             configured: configured.clone(),
             resolved: BACKEND_CPU.to_owned(),
-            engine: engine.to_owned(),
+            engine: "onnx".to_owned(),
             note: Some("this model ignores embedder.device".to_owned()),
-        };
+        },
     }
-    resolve(probe, configured, engine, cuda_allowed)
 }
 
 fn resolve_llm(probe: &dyn HardwareProbe, config: &Config) -> Resolution {
@@ -192,7 +175,7 @@ fn resolve_llm(probe: &dyn HardwareProbe, config: &Config) -> Resolution {
     if config.llm.provider != LLAMA_PROVIDER {
         return not_used(configured, &config.llm.provider);
     }
-    resolve(probe, configured, "llama.cpp", true)
+    resolve(probe, configured, Engine::LlamaLlm, "llama.cpp")
 }
 
 /// Gather everything `liam devices` prints.
@@ -314,6 +297,18 @@ mod tests {
         }
     }
 
+    impl HardwareFacts for Fake {
+        fn is_macos(&self) -> bool {
+            self.os == MACOS
+        }
+        fn metal_usable(&self) -> bool {
+            self.metal
+        }
+        fn cuda_built(&self) -> bool {
+            self.cuda
+        }
+    }
+
     impl HardwareProbe for Fake {
         fn os(&self) -> String {
             self.os.into()
@@ -327,12 +322,6 @@ mod tests {
                 efficiency: self.split.then_some(2),
                 logical: 10,
             }
-        }
-        fn metal_usable(&self) -> bool {
-            self.metal
-        }
-        fn cuda_built(&self) -> bool {
-            self.cuda
         }
         fn llama_devices(&self) -> Option<Vec<BackendDevice>> {
             self.devices.clone()
@@ -432,6 +421,32 @@ mod tests {
             report(&cuda_build, &candle_cuda).built_backends,
             ["cuda", "cpu"]
         );
+    }
+
+    #[test]
+    fn the_llm_report_matches_what_the_llama_cpp_loader_refuses() {
+        // Arrange
+        let mut cuda = config(
+            LOCAL_PROVIDER,
+            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            "auto",
+        );
+        cuda.llm.device = "cuda".into();
+        let mut metal = cuda.clone();
+        metal.llm.device = "metal".into();
+        let cuda_build = Fake {
+            cuda: true,
+            ..linux()
+        };
+
+        // Act
+        let cuda = report(&cuda_build, &cuda).llm;
+        let metal = report(&linux(), &metal).llm;
+
+        // Assert
+        assert_eq!(cuda.resolved, "unavailable");
+        assert!(cuda.note.unwrap().contains("not built into llama.cpp"));
+        assert_eq!(metal.resolved, "unavailable");
     }
 
     #[test]

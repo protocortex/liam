@@ -28,6 +28,10 @@ writes anything.
 | `embedder.device` | What the configured value resolves to for the configured embedder model, and the engine that runs it: `llama.cpp` for the GGUF models, `candle` for `Qwen/Qwen3-Embedding-0.6B`, `onnx` for BGE-M3 and the small ONNX models. |
 | `llm.device` | The same for the LLM. |
 
+A missing config file gives the built-in defaults, which are mock providers, so
+both device lines show `not used`. An invalid config makes the command exit with
+the load error.
+
 ## How `auto` resolves
 
 `auto` is Metal on macOS when a Metal device opens, and the CPU everywhere else.

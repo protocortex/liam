@@ -32,6 +32,7 @@ use crate::embedder::{
     mrl_truncate, qwen3_input, validate_dims, Embedder, TextKind, EMBED_MAX_INPUT_TOKENS,
 };
 use crate::error::{ModelError, Result};
+use crate::hardware::{resolve_device, Engine, ResolvedDevice, SystemFacts};
 use crate::llama::{runtime_backend, shared_backend};
 use crate::llm::DevicePreference;
 
@@ -210,18 +211,10 @@ impl LlamaEmbedder {
             ModelError::Embed(format!("{model_id} is not a known GGUF embedding model"))
         })?;
         validate_dims(model_id, dims, spec.native_dims)?;
-        if device == DevicePreference::Cuda {
-            return Err(ModelError::Embed(
-                "embedder.device = \"cuda\" is not built into the llama.cpp embedder".into(),
-            ));
-        }
-        if device == DevicePreference::Metal && !cfg!(target_os = "macos") {
-            return Err(ModelError::Embed(
-                "embedder.device = \"metal\" is only available on macOS".into(),
-            ));
-        }
+        let resolved = resolve_device(Engine::LlamaEmbedder, device, &SystemFacts)
+            .map_err(ModelError::Embed)?;
         let backend = shared_backend().map_err(|e| ModelError::Embed(e.to_string()))?;
-        let offload = device != DevicePreference::Cpu;
+        let offload = resolved.device != ResolvedDevice::Cpu;
         let layers = if offload { ALL_GPU_LAYERS } else { 0 };
         let params = LlamaModelParams::default().with_n_gpu_layers(layers);
         let model = LlamaModel::load_from_file(&backend, gguf_path, &params)
