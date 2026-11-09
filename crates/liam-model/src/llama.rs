@@ -32,7 +32,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::error::{ModelError, Result};
@@ -172,10 +172,7 @@ impl LlamaCppLlm {
         cancel: &CancelFlag,
     ) -> Result<String> {
         let prompt = self.render_prompt(system, user)?;
-        let tokens = self
-            .model
-            .str_to_token(&prompt, AddBos::Always)
-            .map_err(|e| ModelError::Llm(format!("tokenize: {e}")))?;
+        let tokens = self.model.vocab().tokenize(prompt.as_bytes(), true, true);
 
         // Thread pinning to P-cores and a Q8_0 KV cache were both measured
         // against these defaults on Metal (P-core pinning cost 3 percent,
@@ -218,15 +215,15 @@ impl LlamaCppLlm {
             }
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
-            if self.model.is_eog_token(token) {
+            if self.model.vocab().is_eog(token) {
                 break;
             }
-            out.push_str(
-                &self
-                    .model
-                    .token_to_piece(token, &mut decoder, true, None)
-                    .map_err(|e| ModelError::Llm(format!("detokenize: {e}")))?,
-            );
+            let piece = self.model.vocab().token_to_piece(token, true, None);
+            // decode_to_string never grows the string, so reserve first.
+            if let Some(room) = decoder.max_utf8_buffer_length(piece.len()) {
+                out.reserve(room);
+            }
+            let _ = decoder.decode_to_string(&piece, &mut out, false);
             batch.clear();
             batch
                 .add(token, prompt_len + step, &[0], true)
@@ -369,16 +366,34 @@ impl Llm for LlamaCppLlm {
     /// `None` on a tokenize failure rather than a wrong count, so the caller
     /// falls back to its own estimate instead of trusting a made-up number.
     fn count_tokens(&self, text: &str) -> Option<usize> {
-        self.model
-            .str_to_token(text, AddBos::Never)
-            .ok()
-            .map(|tokens| tokens.len())
+        Some(
+            self.model
+                .vocab()
+                .tokenize(text.as_bytes(), false, true)
+                .len(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs the extraction GGUF from `liam fetch-models`"]
+    async fn the_real_model_generates_text_and_counts_tokens() {
+        let home = std::env::var("HOME").expect("HOME");
+        let path = format!("{home}/.liam/models/extraction.gguf");
+        let llm = LlamaCppLlm::load(&path, 2048, DevicePreference::Auto).expect("load");
+
+        let out = llm
+            .generate("Answer in one word.", "What colour is the sky?", 16)
+            .await
+            .expect("generate");
+
+        assert!(!out.trim().is_empty());
+        assert!(llm.count_tokens("hello world").is_some_and(|n| n > 0));
+    }
 
     #[test]
     #[cfg(target_os = "macos")]
