@@ -152,6 +152,11 @@ pub struct EmbedderConfig {
     /// Where both models' files live, each under its own `models--Org--Name`
     /// subdirectory (reranker via `FASTEMBED_CACHE_DIR`, embedder via `with_cache_dir`).
     pub cache_dir: String,
+    /// Compute device for the local embedder: "auto" (default), "cpu", "metal"
+    /// or "cuda". `auto` is Metal for llama.cpp GGUF models on macOS and the CPU
+    /// for candle. Not part of the embedder fingerprint: the device changes
+    /// speed, not what the vectors mean.
+    pub device: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -324,6 +329,7 @@ impl Default for EmbedderConfig {
             provider: "mock".into(),
             model: liam_model::QWEN3_EMBEDDING_MODEL_ID.into(),
             cache_dir: "~/.liam/models".into(),
+            device: "auto".into(),
         }
     }
 }
@@ -602,6 +608,19 @@ mod tests {
             Some(liam_model::llm::DevicePreference::Auto)
         );
         assert!(c.llm.warmup, "warmup should be on by default");
+    }
+
+    #[test]
+    fn embedder_device_defaults_to_auto_and_reads_from_toml() {
+        // Arrange
+        let path = write_temp_toml("[embedder]\ndevice = \"metal\"\n");
+
+        // Act
+        let loaded = Config::load(&path).unwrap();
+
+        // Assert
+        assert_eq!(Config::default().embedder.device, "auto");
+        assert_eq!(loaded.embedder.device, "metal");
     }
 
     #[test]

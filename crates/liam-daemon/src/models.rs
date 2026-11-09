@@ -192,8 +192,20 @@ fn is_bge_m3(model: &str) -> bool {
     model.eq_ignore_ascii_case(liam_model::BGE_M3_MODEL_ID)
 }
 
+/// The device `embedder.device` names. An unknown value is an error, so a typo
+/// cannot quietly pick the slowest backend.
+pub fn embedder_device(config: &Config) -> anyhow::Result<DevicePreference> {
+    DevicePreference::parse(&config.embedder.device).ok_or_else(|| {
+        anyhow::anyhow!(
+            "embedder.device = {:?} is not one of auto, metal, cuda, cpu",
+            config.embedder.device
+        )
+    })
+}
+
 fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
-    use liam_model::{BgeM3Embedder, FastEmbedEmbedder, OnnxEmbedder};
+    use liam_model::{BgeM3Embedder, FastEmbedEmbedder, LlamaEmbedder, OnnxEmbedder};
+    let device = embedder_device(config)?;
     let home = std::env::var("HOME").unwrap_or_default();
     let cache_dir =
         resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
@@ -210,10 +222,19 @@ fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
             &cache_dir,
         )?));
     }
+    if liam_model::gguf_embedder_spec(&config.embedder.model).is_some() {
+        return Ok(Arc::new(LlamaEmbedder::load_from_hub(
+            &config.embedder.model,
+            config.embedding_dims,
+            &cache_dir,
+            device,
+        )?));
+    }
     Ok(Arc::new(FastEmbedEmbedder::load(
         &config.embedder.model,
         config.embedding_dims,
         &cache_dir,
+        device,
     )?))
 }
 
@@ -341,6 +362,29 @@ mod tests {
         assert_eq!(
             resolve_path_with_home("llm.cache_dir", "~/.liam/models", "/home/alice").unwrap(),
             "/home/alice/.liam/models"
+        );
+    }
+
+    #[test]
+    fn embedder_device_accepts_the_known_names_and_rejects_typos() {
+        // Arrange
+        let mut config = Config::default();
+
+        // Act / Assert
+        for (text, want) in [
+            ("auto", DevicePreference::Auto),
+            ("cpu", DevicePreference::Cpu),
+            ("metal", DevicePreference::Metal),
+            ("cuda", DevicePreference::Cuda),
+        ] {
+            config.embedder.device = text.into();
+            assert_eq!(embedder_device(&config).unwrap(), want);
+        }
+        config.embedder.device = "metl".into();
+        let error = embedder_device(&config).unwrap_err().to_string();
+        assert!(
+            error.contains("embedder.device") && error.contains("metl"),
+            "{error}"
         );
     }
 

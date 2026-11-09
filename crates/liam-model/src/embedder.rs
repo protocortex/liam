@@ -6,6 +6,7 @@ use async_trait::async_trait;
 
 use crate::blocking::with_model_blocking;
 use crate::error::Result;
+use crate::llm::DevicePreference;
 
 /// The default Qwen3 embedding model id.
 pub const QWEN3_EMBEDDING_MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
@@ -22,6 +23,11 @@ pub enum TextKind {
 #[async_trait]
 pub trait Embedder: Send + Sync {
     fn dims(&self) -> usize;
+    /// The engine and device that run the model, for example `candle/cpu` or
+    /// `llama.cpp/metal`. Reported by the benchmark.
+    fn backend(&self) -> &str {
+        "unspecified"
+    }
     async fn embed(&self, text: &str, kind: TextKind) -> Result<Vec<f32>>;
     /// Batch by default calls `embed`; adapters may override for efficiency.
     async fn embed_batch(&self, texts: &[String], kind: TextKind) -> Result<Vec<Vec<f32>>> {
@@ -65,7 +71,7 @@ const QWEN3_QUERY_TASK: &str =
 
 /// The exact string handed to the Qwen3 model for `text` in its `kind` role:
 /// `Instruct: <task>\nQuery:<query>` for a query, plain text for a document.
-fn qwen3_input(text: &str, kind: TextKind) -> String {
+pub(crate) fn qwen3_input(text: &str, kind: TextKind) -> String {
     match kind {
         TextKind::Query => format!("Instruct: {QWEN3_QUERY_TASK}\nQuery:{text}"),
         TextKind::Document => text.to_string(),
@@ -168,6 +174,49 @@ fn weight_fetch_error(model_id: &str, cause: &str) -> crate::error::ModelError {
 pub struct FastEmbedEmbedder {
     model: std::sync::Arc<std::sync::Mutex<fastembed::Qwen3TextEmbedding>>,
     dims: usize,
+    label: &'static str,
+}
+
+/// The candle device for a preference. `Auto` stays on the CPU: on Apple
+/// Silicon candle's Metal path is opt-in until it is measured to be both
+/// correct and faster (see the embedder benchmark spec).
+fn candle_device(preference: DevicePreference) -> Result<(candle_core::Device, &'static str)> {
+    let unavailable = |name: &str| {
+        crate::error::ModelError::Embed(format!(
+            "embedder.device = \"{name}\" is not available in this build of the candle embedder"
+        ))
+    };
+    match preference {
+        DevicePreference::Auto | DevicePreference::Cpu => {
+            Ok((candle_core::Device::Cpu, "candle/cpu"))
+        }
+        DevicePreference::Metal => {
+            #[cfg(target_os = "macos")]
+            {
+                let device = candle_core::Device::new_metal(0).map_err(|e| {
+                    crate::error::ModelError::Embed(format!("candle metal device: {e}"))
+                })?;
+                Ok((device, "candle/metal"))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(unavailable("metal"))
+            }
+        }
+        DevicePreference::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                let device = candle_core::Device::new_cuda(0).map_err(|e| {
+                    crate::error::ModelError::Embed(format!("candle cuda device: {e}"))
+                })?;
+                Ok((device, "candle/cuda"))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Err(unavailable("cuda"))
+            }
+        }
+    }
 }
 
 impl FastEmbedEmbedder {
@@ -183,8 +232,13 @@ impl FastEmbedEmbedder {
     /// `with_cache_dir`, only a single unsharded `model.safetensors` and a
     /// plain (non-VL) `Qwen3Config` supported; see `parse_qwen3_config` and
     /// `weight_fetch_error` for the two rejected shapes.
-    pub fn load(model_id: &str, dims: usize, cache_dir: &str) -> Result<Self> {
-        let device = candle_core::Device::Cpu;
+    pub fn load(
+        model_id: &str,
+        dims: usize,
+        cache_dir: &str,
+        preference: DevicePreference,
+    ) -> Result<Self> {
+        let (device, label) = candle_device(preference)?;
         let api = hf_hub::api::sync::ApiBuilder::new()
             .with_cache_dir(std::path::PathBuf::from(cache_dir))
             .build()
@@ -242,6 +296,7 @@ impl FastEmbedEmbedder {
         Ok(Self {
             model: std::sync::Arc::new(std::sync::Mutex::new(model)),
             dims,
+            label,
         })
     }
 }
@@ -250,6 +305,9 @@ impl FastEmbedEmbedder {
 impl Embedder for FastEmbedEmbedder {
     fn dims(&self) -> usize {
         self.dims
+    }
+    fn backend(&self) -> &str {
+        self.label
     }
     async fn embed(&self, text: &str, kind: TextKind) -> Result<Vec<f32>> {
         let model = self.model.clone();
@@ -271,8 +329,20 @@ impl Embedder for FastEmbedEmbedder {
 
 #[cfg(test)]
 mod tests {
+    use super::DevicePreference;
     use super::{mrl_truncate, qwen3_input, validate_dims, Embedder, MockEmbedder, TextKind};
     use super::{parse_qwen3_config, weight_fetch_error};
+
+    #[test]
+    fn candle_auto_stays_on_the_cpu_and_cpu_is_cpu() {
+        // Arrange / Act
+        let (auto, auto_label) = super::candle_device(DevicePreference::Auto).unwrap();
+        let (cpu, cpu_label) = super::candle_device(DevicePreference::Cpu).unwrap();
+
+        // Assert
+        assert!(auto.is_cpu() && cpu.is_cpu());
+        assert_eq!((auto_label, cpu_label), ("candle/cpu", "candle/cpu"));
+    }
 
     #[test]
     fn mrl_truncate_shrinks_and_renormalizes() {
@@ -545,9 +615,13 @@ mod tests {
         let native_dims = 1024;
 
         // Act
-        let embedder =
-            super::FastEmbedEmbedder::load(model_id, native_dims, cache_dir.0.to_str().unwrap())
-                .expect("load real embedder into a fresh cache dir");
+        let embedder = super::FastEmbedEmbedder::load(
+            model_id,
+            native_dims,
+            cache_dir.0.to_str().unwrap(),
+            DevicePreference::Cpu,
+        )
+        .expect("load real embedder into a fresh cache dir");
 
         // Assert: the fetched files landed somewhere under the fresh cache dir.
         for file in ["config.json", "model.safetensors", "tokenizer.json"] {

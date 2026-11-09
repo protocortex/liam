@@ -9,6 +9,7 @@ mod bge;
 mod blocking;
 pub mod embedder;
 pub mod error;
+mod llama_embedder;
 pub mod llm;
 mod onnx;
 pub mod reranker;
@@ -28,3 +29,6 @@ pub use onnx::OnnxEmbedder;
 pub use reranker::FastEmbedReranker;
 
 pub use llama::LlamaCppLlm;
+pub use llama_embedder::{
+    gguf_embedder_spec, gguf_path_from_hub, GgufEmbedderSpec, LlamaEmbedder, GGUF_EMBEDDERS,
+};

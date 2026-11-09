@@ -126,6 +126,17 @@ struct RetrievalArgs {
     /// Print the report as JSON instead of text. Latencies are milliseconds.
     #[arg(long)]
     json: bool,
+
+    /// Run on this device instead of `embedder.device` from the config:
+    /// auto, cpu, metal or cuda. Applies to the Qwen3 (candle) and GGUF
+    /// (llama.cpp) models; the others ignore it.
+    #[arg(long, value_name = "DEVICE")]
+    device: Option<String>,
+
+    /// Write the fact vectors then the question vectors to this file as JSON,
+    /// so two runs can be compared. `eval embedder` only.
+    #[arg(long, value_name = "PATH")]
+    vectors_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -198,6 +209,11 @@ fn main() -> anyhow::Result<()> {
             let config = eval_config_for(&args, &config)?;
             let runtime = tokio::runtime::Runtime::new()?;
             let report = runtime.block_on(run_embedder_bench(args.model, &config))?;
+            if let Some(path) = &args.vectors_out {
+                let json = serde_json::to_vec(&report.vectors).context("serializing vectors")?;
+                std::fs::write(path, json)
+                    .with_context(|| format!("writing {}", path.display()))?;
+            }
             print!("{}", render_bench_report(&report, args.json)?);
             Ok(())
         }
@@ -266,6 +282,10 @@ fn eval_config_for(args: &RetrievalArgs, config: &Config) -> anyhow::Result<Conf
         .model
         .resolve_dims(config.embedding_dims, args.dims)
         .map_err(anyhow::Error::msg)?;
+    if let Some(device) = &args.device {
+        config.embedder.device = device.clone();
+    }
+    models::embedder_device(&config)?;
     Ok(config)
 }
 
@@ -644,6 +664,16 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
         // Pulls the reranker too, which is a second download the daemon
         // needs and nobody would think to ask for by name.
         let (_embedder, _reranker) = models::build_models(config)?;
+        if let Some(spec) = liam_model::gguf_embedder_spec(&config.embedder.model) {
+            let cache_dir = models::resolve_path_with_home(
+                "embedder.cache_dir",
+                &config.embedder.cache_dir,
+                &home,
+            )?;
+            let path = liam_model::gguf_path_from_hub(spec, &cache_dir)?;
+            fetch::verify_gguf_embedder(spec, &path)?;
+            println!("  sha256 verified: {}", spec.sha256);
+        }
         println!("embedder: ready, with its reranker");
     }
 

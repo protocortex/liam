@@ -159,6 +159,10 @@ fn latency_stats(calls: &[Duration]) -> Option<LatencyStats> {
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchReport {
     pub model_id: String,
+    /// The engine and device that ran the model, as the embedder reports it.
+    pub backend: String,
+    /// The `embedder.device` value the run asked for.
+    pub device: String,
     pub dims: usize,
     pub vector_bytes: usize,
     pub facts: usize,
@@ -170,6 +174,12 @@ pub struct BenchReport {
     pub batch_items: usize,
     pub batch_ms: f64,
     pub batch_items_per_sec: f64,
+    /// Peak resident memory of the process so far, in MiB. It includes the
+    /// loaded model and everything the run touched.
+    pub peak_rss_mb: f64,
+    /// Every fact vector then every question vector, for comparing runs.
+    #[serde(skip)]
+    pub vectors: Vec<Vec<f32>>,
 }
 
 impl BenchReport {
@@ -181,8 +191,17 @@ impl BenchReport {
         // `write!` into a `String` never fails.
         let _ = writeln!(
             out,
-            "model: {} ({} dims, {} B per vector), {} facts, {} questions, load {:.0} ms",
-            self.model_id, self.dims, self.vector_bytes, self.facts, self.questions, self.load_ms
+            "model: {} on {} (device {}), {} dims, {} B per vector, {} facts, {} questions, \
+             load {:.0} ms, peak RSS {:.0} MiB",
+            self.model_id,
+            self.backend,
+            self.device,
+            self.dims,
+            self.vector_bytes,
+            self.facts,
+            self.questions,
+            self.load_ms,
+            self.peak_rss_mb
         );
         let line = |name: &str, m: &BenchMetrics| {
             format!(
@@ -250,7 +269,30 @@ pub async fn run_embedder_bench(
 ) -> anyhow::Result<BenchReport> {
     let started = Instant::now();
     let embedder = super::load_embedder(model, config)?;
-    bench_embedder(embedder.as_ref(), model.id(), started.elapsed()).await
+    let mut report = bench_embedder(embedder.as_ref(), model.id(), started.elapsed()).await?;
+    report.device = config.embedder.device.clone();
+    Ok(report)
+}
+
+/// Bytes in a MiB.
+const BYTES_PER_MIB: f64 = 1_048_576.0;
+
+/// The most resident memory this process has used, in MiB. `ru_maxrss` is in
+/// bytes on macOS and in KiB on Linux.
+fn peak_rss_mb() -> f64 {
+    // SAFETY: `getrusage` writes into the zeroed struct we own.
+    let max_rss = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return 0.0;
+        }
+        usage.ru_maxrss as f64
+    };
+    if cfg!(target_os = "macos") {
+        max_rss / BYTES_PER_MIB
+    } else {
+        max_rss / 1024.0
+    }
 }
 
 /// Runs the benchmark over any `Embedder`. `load` is how long loading took.
@@ -281,6 +323,7 @@ pub async fn bench_embedder(
     let mut calls = Vec::with_capacity(questions.len());
     let mut by_category: BTreeMap<&str, Vec<BenchMetrics>> = BTreeMap::new();
     let mut all = Vec::with_capacity(questions.len());
+    let mut query_vectors = Vec::with_capacity(questions.len());
     for question in &questions {
         let started = Instant::now();
         let query = embedder
@@ -289,6 +332,7 @@ pub async fn bench_embedder(
             .with_context(|| format!("embedding query {:?}", question.text))?;
         calls.push(started.elapsed());
         let retrieved = rank(&query, &facts, &vectors);
+        query_vectors.push(query);
         let relevant: HashSet<&str> = question.relevant.iter().copied().collect();
         let metrics = score(&retrieved, &relevant);
         by_category
@@ -299,8 +343,14 @@ pub async fn bench_embedder(
     }
 
     let dims = embedder.dims();
+    let mut vectors = vectors;
+    vectors.extend(query_vectors);
     Ok(BenchReport {
         model_id: model_id.to_string(),
+        backend: embedder.backend().to_string(),
+        device: String::new(),
+        peak_rss_mb: peak_rss_mb(),
+        vectors,
         dims,
         vector_bytes: dims * BYTES_PER_F32,
         facts: facts.len(),
