@@ -661,7 +661,7 @@ mod tests {
     }
 
     impl rmcp::ClientHandler for NamedClient {
-        fn get_info(&self) -> rmcp::model::ClientInfo {
+        fn get_info(&self) -> rmcp::model::ClientConfig {
             rmcp::model::InitializeRequestParams::new(
                 rmcp::model::ClientCapabilities::default(),
                 rmcp::model::Implementation::new(self.name, "0.0.0"),
