@@ -37,6 +37,10 @@ that. Running it again is safe.
 truncated file downloads happily and only fails when something tries to use it,
 which would otherwise be a user's first `recall`, long after the install.
 
+With the default config the embedder is the Q8_0 GGUF of Qwen3-Embedding-0.6B (about 0.6 GB, checked
+against a pinned sha256). The candle safetensors (about 2.4 GB) are downloaded only when
+`embedder.model = "Qwen/Qwen3-Embedding-0.6B"`.
+
 Both models land under `embedder.cache_dir`, each in its own `models--Org--Name`
 subdirectory. That makes a bundle-in-release option possible (ship the weights
 in the tarball, pointed at by that same directory), though fetch-on-install is

@@ -161,3 +161,34 @@ In [2026-11-09-llama-embedder-benchmark/](2026-11-09-llama-embedder-benchmark/):
   summary and the table rows from the per run output.
 - The raw per run JSON, vector and `/usr/bin/time -l` files are not kept: the
   vectors alone are about 20 MB per run.
+
+## Addendum: the default switch on a real store (2026-11-10)
+
+`Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0) became the default `embedder.model`. This
+addendum records the switch on a throwaway store, on the same Apple M1 Pro, with
+the release build, `embedder.device = auto` (Metal) and a mock LLM.
+
+- Store: 300 templated memories written with the old default
+  `Qwen/Qwen3-Embedding-0.6B` (candle), 384 dimensions. The wording repeats, so
+  many hits are close ties.
+- Refusal: starting `liamd` with the new default exited before opening the store
+  with the fingerprint message, which names `liam rebuild --database PATH`.
+- Rebuild: `liam rebuild` re-embedded 300 nodes (0 failed) in 17.6 s wall, which
+  includes loading the model and the reranker.
+- Recall: top 5 for 8 fixed queries before and after. Seven of the eight lists
+  were identical. One differed: record 262 left the top 5, record 70 moved
+  from second to first and record 46 entered second, while the last three hits stayed the same. Equal or near equal, as the cosine figures
+  above predict.
+- Start to first successful `recall` (initialize, then one `recall`), three runs
+  each, interleaved, page cache warm (a cold start needs `sudo purge`, which is
+  not available here):
+
+| Default | Run 1 | Run 2 | Run 3 | Daemon peak RSS (`/usr/bin/time -l`) |
+|---|---|---|---|---|
+| old, candle | 4.27 s | 4.07 s | 3.84 s | 2966, 2830, 2440 MB |
+| new, llama.cpp Q8_0 | 1.68 s | 1.71 s | 1.70 s | 2631, 2636, 2638 MB |
+
+The daemon figure is the whole process: the reranker, the store and the
+model mapping are in it, so the saving of the embedder alone (1072 MB against
+2596 MB in the table above) does not show as a halving at process level. The old
+default's earlier figure of about 6.0 s warm was taken on a busier machine.

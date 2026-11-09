@@ -184,7 +184,7 @@ version = ""
 
 [embedder]
 provider  = "local"                      # "local" (in-process) or "mock" (tests and dev)
-model     = "Qwen/Qwen3-Embedding-0.6B"   # used when provider = "local"
+model     = "Qwen/Qwen3-Embedding-0.6B-GGUF" # Q8_0 on llama.cpp; "Qwen/Qwen3-Embedding-0.6B" selects candle
 cache_dir = "~/.liam/models"       # both reranker and embedder files land here
 
 [llm]
