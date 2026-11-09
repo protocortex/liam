@@ -49,10 +49,10 @@ are downloaded by `liam fetch-models` (which `install.sh` runs) when
 `[extraction]` is enabled, and each file is checked against a pinned size and
 sha256 first.
 
-- **llama-server** (from llama.cpp release `b11860`): MIT. It runs as a separate
+- **llama-server** (from llama.cpp release `b12173`): MIT. It runs as a separate
   local process during extraction. The release archive keeps llama.cpp's
-  `LICENSE` beside the binary, in `~/.liam/bin/llama-b11860/`. Source:
-  <https://github.com/ggml-org/llama.cpp/releases/tag/b11860>.
+  `LICENSE` beside the binary, in `~/.liam/bin/llama-b12173/`. Source:
+  <https://github.com/ggml-org/llama.cpp/releases/tag/b12173>.
 - **Qwen3.5-4B, Q4_K_M GGUF** (unsloth/Qwen3.5-4B-GGUF): Apache-2.0, model
   weights. Source: <https://huggingface.co/unsloth/Qwen3.5-4B-GGUF>.
 

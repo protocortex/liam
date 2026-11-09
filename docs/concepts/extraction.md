@@ -147,11 +147,19 @@ or any event text. A pidfile, `<database>.sidecar.pid`, lets the next daemon cle
 a server a crash left behind. The server is not started when free RAM is below
 `ram_budget_mb`.
 
-`liam fetch-models` downloads the pinned `llama-server` (llama.cpp `b11860`,
+`liam fetch-models` downloads the pinned `llama-server` (llama.cpp `b12173`,
 macOS on Apple Silicon only) and the Qwen3.5-4B Q4_K_M model, checks the size and
 sha256 of each, and prints the two lines to set. `install.sh` runs it when
 `[extraction]` is enabled. Both steps need `curl` and `tar`, which ship with
 macOS. On another platform, point `llama_server_path` at your own build.
+
+To bump the pinned server, pick a `llama.cpp` release at least three days old
+that has a `llama-bNNNN-bin-macos-arm64.tar.gz` asset. Download it, then set the
+URL, `sha256` and `size_bytes` in `SERVER_ASSET` and `SERVER_TAG` in
+`crates/liam-daemon/src/fetch.rs`, plus the tag in `fetch/tests.rs`,
+`THIRD-PARTY-NOTICES.md` and `liam.toml`. Run `cargo test -p liam-daemon --lib --
+--ignored real_server_asset`, then the real-model tier below with the old and the
+new server, and compare the numbers.
 
 ## Experimental status and the real-model baseline
 

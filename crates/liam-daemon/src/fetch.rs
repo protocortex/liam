@@ -34,7 +34,7 @@ pub use curl::CurlFetcher;
 /// The `llama.cpp` release the sidecar is tested against. The server's flags,
 /// environment variables and authentication behaviour were checked on this
 /// line of the project, so a newer tag is a deliberate bump with a new hash.
-pub const SERVER_TAG: &str = "b11860";
+pub const SERVER_TAG: &str = "b12173";
 
 /// A file at a fixed URL with a known size and content hash.
 #[derive(Debug, Clone, Copy)]
@@ -50,9 +50,9 @@ pub struct Asset<'a> {
 /// The macOS arm64 release archive: the server plus the shared libraries it
 /// loads from its own directory.
 pub const SERVER_ASSET: Asset<'static> = Asset {
-    url: "https://github.com/ggml-org/llama.cpp/releases/download/b11860/llama-b11860-bin-macos-arm64.tar.gz",
-    sha256: "204fe983df733653d1045d0dfb768f5604c18f8f2859ed804a561a54311a3a9d",
-    size_bytes: 16_245_641,
+    url: "https://github.com/ggml-org/llama.cpp/releases/download/b12173/llama-b12173-bin-macos-arm64.tar.gz",
+    sha256: "4bddb4df09a84d8181263570b6ebdd55e28eac27228804e138d43eda0c6c43a3",
+    size_bytes: 16_694_553,
 };
 
 /// Qwen3.5 4B at Q4_K_M, from a fixed commit of the unsloth repository so the
