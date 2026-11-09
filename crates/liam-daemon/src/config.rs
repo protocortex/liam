@@ -153,8 +153,8 @@ pub struct EmbedderConfig {
     /// subdirectory (reranker via `FASTEMBED_CACHE_DIR`, embedder via `with_cache_dir`).
     pub cache_dir: String,
     /// Compute device for the local embedder: "auto" (default), "cpu", "metal"
-    /// or "cuda". `auto` is Metal for llama.cpp GGUF models on macOS and the CPU
-    /// for candle. Not part of the embedder fingerprint: the device changes
+    /// or "cuda". `auto` is Metal on macOS for both the llama.cpp GGUF models and
+    /// candle, and the CPU elsewhere. Not part of the embedder fingerprint: the device changes
     /// speed, not what the vectors mean.
     pub device: String,
 }

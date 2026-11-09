@@ -177,9 +177,10 @@ pub struct FastEmbedEmbedder {
     label: &'static str,
 }
 
-/// The candle device for a preference. `Auto` stays on the CPU: on Apple
-/// Silicon candle's Metal path is opt-in until it is measured to be both
-/// correct and faster (see the embedder benchmark spec).
+/// The candle device for a preference. `Auto` is Metal on macOS, falling back
+/// to the CPU when no Metal device opens: the benchmark spec shows candle's
+/// Metal path returns the same vectors as its CPU path (cosine 1.0000) and
+/// answers a query about 2.5 times faster. Elsewhere `Auto` is the CPU.
 fn candle_device(preference: DevicePreference) -> Result<(candle_core::Device, &'static str)> {
     let unavailable = |name: &str| {
         crate::error::ModelError::Embed(format!(
@@ -187,9 +188,9 @@ fn candle_device(preference: DevicePreference) -> Result<(candle_core::Device, &
         ))
     };
     match preference {
-        DevicePreference::Auto | DevicePreference::Cpu => {
-            Ok((candle_core::Device::Cpu, "candle/cpu"))
-        }
+        DevicePreference::Auto => Ok(candle_device(DevicePreference::Metal)
+            .unwrap_or((candle_core::Device::Cpu, "candle/cpu"))),
+        DevicePreference::Cpu => Ok((candle_core::Device::Cpu, "candle/cpu")),
         DevicePreference::Metal => {
             #[cfg(target_os = "macos")]
             {
@@ -334,14 +335,19 @@ mod tests {
     use super::{parse_qwen3_config, weight_fetch_error};
 
     #[test]
-    fn candle_auto_stays_on_the_cpu_and_cpu_is_cpu() {
+    fn candle_auto_is_metal_on_macos_and_cpu_elsewhere() {
         // Arrange / Act
-        let (auto, auto_label) = super::candle_device(DevicePreference::Auto).unwrap();
+        let (auto, label) = super::candle_device(DevicePreference::Auto).unwrap();
         let (cpu, cpu_label) = super::candle_device(DevicePreference::Cpu).unwrap();
 
         // Assert
-        assert!(auto.is_cpu() && cpu.is_cpu());
-        assert_eq!((auto_label, cpu_label), ("candle/cpu", "candle/cpu"));
+        assert!(cpu.is_cpu());
+        assert_eq!(cpu_label, "candle/cpu");
+        if cfg!(target_os = "macos") {
+            assert!(label == "candle/metal" || label == "candle/cpu");
+        } else {
+            assert!(auto.is_cpu());
+        }
     }
 
     #[test]
