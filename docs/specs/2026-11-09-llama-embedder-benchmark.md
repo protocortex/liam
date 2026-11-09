@@ -7,8 +7,10 @@
 LIAM can now run Qwen3-Embedding-0.6B in process on llama.cpp from a GGUF file,
 on the CPU or on the Apple GPU (Metal). On this machine every variant passes the
 quality rule against the candle CPU baseline, and the speed gap is large. The
-best variant answers a query in about 22 ms, against 183 ms for candle on the
-CPU: eight times faster, with a third less memory.
+fastest variant, F16 on Metal, answers a query in 21.8 ms against 183 ms for
+candle on the CPU (8.4 times faster) with 38 percent less peak memory (1597 MB
+against 2596 MB). Q8_0 on Metal is 7.9 times faster (23.2 ms) with 59 percent
+less peak memory (1072 MB).
 
 ## Machine and method
 
@@ -81,6 +83,9 @@ in the speed evaluation (nDCG@10 0.933, MRR 0.920) is reproduced.
 - The in-process llama.cpp CPU rows use only the performance cores. With all
   ten threads a query took 62 ms instead of 37 ms, because the slow
   efficiency cores gate each parallel step.
+- Last token pooling reads the end of text token that llama.cpp appends from
+  the GGUF metadata, which must be the one the candle tokenizer appends. The
+  cosine figures (F16 1.0000, Q8_0 minimum 0.9982) show the two agree.
 - Memory: peak RSS of candle F32 is 2.3 to 2.6 GB. Q8_0 on Metal is 1.07 GB.
 
 ## What was built
@@ -148,6 +153,11 @@ dynamic shape problem would apply to it as well.
 
 ## Artifacts
 
-Raw per run JSON, vectors, `/usr/bin/time -l` output and load lines are in
-`/private/tmp/claude-501/-Users-isantos-Workspace-protocortex-liam/68ec758d-d203-418b-8aa9-9ce7dfd3e0b6/scratchpad/bench/`
-(`runs/`, `summary.json`, `matrix.sh`, `analyze.py`).
+In [2026-11-09-llama-embedder-benchmark/](2026-11-09-llama-embedder-benchmark/):
+
+- `summary.json`: per variant medians, per run values, cosine figures and the
+  load average line of each run.
+- `matrix.sh`, `run1.sh`, `bench.toml`: the exact runs. `analyze.py` builds the
+  summary and the table rows from the per run output.
+- The raw per run JSON, vector and `/usr/bin/time -l` files are not kept: the
+  vectors alone are about 20 MB per run.

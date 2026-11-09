@@ -1,0 +1,4 @@
+embedding_dims = 384
+[embedder]
+provider = "local"
+cache_dir = "~/.liam/models"

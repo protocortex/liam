@@ -450,36 +450,6 @@ fn write_and_check(fetcher: &dyn Fetcher, asset: &Asset<'_>, partial: &Path) -> 
     Ok(())
 }
 
-/// Checks a GGUF embedder file the hub client cached against the size and
-/// sha256 pinned for it, so a truncated or swapped download is reported by
-/// `liam fetch-models` instead of by the first recall.
-pub fn verify_gguf_embedder(
-    spec: &liam_model::GgufEmbedderSpec,
-    path: &Path,
-) -> anyhow::Result<()> {
-    let size = fs::metadata(path)
-        .with_context(|| format!("reading {}", path.display()))?
-        .len();
-    ensure!(
-        size == spec.size_bytes,
-        "{} is {size} bytes, expected {}",
-        path.display(),
-        spec.size_bytes
-    );
-    let asset = Asset {
-        url: "",
-        sha256: spec.sha256,
-        size_bytes: spec.size_bytes,
-    };
-    ensure!(
-        hash_matches(path, &asset),
-        "{} failed its sha256 check, expected {}",
-        path.display(),
-        spec.sha256
-    );
-    Ok(())
-}
-
 fn hash_matches(path: &Path, asset: &Asset<'_>) -> bool {
     let Ok(mut file) = File::open(path) else {
         return false;

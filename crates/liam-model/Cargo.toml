@@ -42,6 +42,8 @@ llama-cpp-2 = { version = "0.1.154", default-features = false, features = ["comm
 encoding_rs = { version = "0.8" }
 # sysctl for the performance core count the llama.cpp embedder sizes its threads by.
 libc = "0.2"
+# Hashes a cached GGUF once before llama.cpp opens it.
+sha2 = { version = "0.11.0", default-features = false }
 
 # Best available backend per host, unioned into the deps above. WHY here and not
 # in `[features]`: this is the only way a macOS user gets GPU
@@ -61,4 +63,5 @@ default = []
 cuda = ["candle-core/cuda"]
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }

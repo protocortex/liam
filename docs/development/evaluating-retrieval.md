@@ -13,6 +13,8 @@ use. BGE-M3 is cached under `HF_HOME` instead when that variable is set.
 | Flag | Meaning |
 |---|---|
 | `--model <ID>` | Required. `Qwen/Qwen3-Embedding-0.6B` or `BAAI/bge-m3`. The match ignores case. Any other id is refused with the list of supported ones. |
+| `--device <DEVICE>` | `auto`, `cpu`, `metal` or `cuda`, instead of `embedder.device`. Applies to the Qwen3 (candle) and GGUF (llama.cpp) models. |
+| `--vectors-out <PATH>` | `liam eval embedder` only: write the fact then question vectors to this JSON file, overwriting it, so two runs can be compared. `liam eval retrieval` refuses it. |
 | `--json` | Print the report as JSON instead of text. Latencies are in milliseconds. |
 | `--config <PATH>` | The config to read, as for the other `liam` commands (`LIAM_CONFIG` also works). |
 

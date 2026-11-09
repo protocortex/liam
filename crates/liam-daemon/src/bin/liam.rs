@@ -134,7 +134,8 @@ struct RetrievalArgs {
     device: Option<String>,
 
     /// Write the fact vectors then the question vectors to this file as JSON,
-    /// so two runs can be compared. `eval embedder` only.
+    /// so two runs can be compared. Overwrites an existing file. Only
+    /// `eval embedder` accepts it.
     #[arg(long, value_name = "PATH")]
     vectors_out: Option<PathBuf>,
 }
@@ -195,6 +196,10 @@ fn main() -> anyhow::Result<()> {
         Command::Eval(EvalArgs {
             command: EvalCommand::Retrieval(args),
         }) => {
+            anyhow::ensure!(
+                args.vectors_out.is_none(),
+                "--vectors-out is only supported by `liam eval embedder`"
+            );
             tracing::debug!(model = args.model.id(), "eval retrieval: starting");
             let config = eval_config_for(&args, &config)?;
             let runtime = tokio::runtime::Runtime::new()?;
@@ -661,9 +666,7 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
         if let Some(cache_dir) = models::export_fastembed_cache_dir(config)? {
             println!("  cache_dir -> {}", cache_dir.display());
         }
-        // Pulls the reranker too, which is a second download the daemon
-        // needs and nobody would think to ask for by name.
-        let (_embedder, _reranker) = models::build_models(config)?;
+        // A GGUF is downloaded and checked before anything loads it.
         if let Some(spec) = liam_model::gguf_embedder_spec(&config.embedder.model) {
             let cache_dir = models::resolve_path_with_home(
                 "embedder.cache_dir",
@@ -671,9 +674,12 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
                 &home,
             )?;
             let path = liam_model::gguf_path_from_hub(spec, &cache_dir)?;
-            fetch::verify_gguf_embedder(spec, &path)?;
+            liam_model::verify_gguf_file(spec, &path)?;
             println!("  sha256 verified: {}", spec.sha256);
         }
+        // Pulls the reranker too, which is a second download the daemon
+        // needs and nobody would think to ask for by name.
+        let (_embedder, _reranker) = models::build_models(config)?;
         println!("embedder: ready, with its reranker");
     }
 

@@ -188,8 +188,10 @@ fn candle_device(preference: DevicePreference) -> Result<(candle_core::Device, &
         ))
     };
     match preference {
-        DevicePreference::Auto => Ok(candle_device(DevicePreference::Metal)
-            .unwrap_or((candle_core::Device::Cpu, "candle/cpu"))),
+        DevicePreference::Auto => Ok(candle_device(DevicePreference::Metal).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "no Metal device for the candle embedder, using the CPU");
+            (candle_core::Device::Cpu, "candle/cpu")
+        })),
         DevicePreference::Cpu => Ok((candle_core::Device::Cpu, "candle/cpu")),
         DevicePreference::Metal => {
             #[cfg(target_os = "macos")]
