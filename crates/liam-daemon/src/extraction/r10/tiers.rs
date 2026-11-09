@@ -520,3 +520,37 @@ async fn three_scripted_faults_lower_f1_to_the_hand_computed_value() {
     assert_eq!(run.report.facts_dropped, 2);
     assert_eq!(run.report.facts_dropped_ungrounded, 1);
 }
+
+/// What the real model answered for the first eight corpus events, captured
+/// from Qwen3.5 4B Q4_K_M. It writes subjects as the text spells them
+/// ("Iris Pinto"), which the scripted tiers never do.
+const CAPTURED_FIRST_BATCH: &str = include_str!("fixtures/qwen_batch_0.json");
+const CAPTURED_BATCH_EVENTS: usize = 8;
+/// The gold facts of those events: five of them state a person fact.
+const CAPTURED_GOLD_FACTS: usize = 5;
+/// The captured answer cites two events that do not hold the URL it states.
+const CAPTURED_UNGROUNDED: usize = 2;
+
+#[tokio::test]
+async fn a_real_answer_with_capitalised_subjects_scores_against_the_labels() {
+    // Arrange
+    let events: Vec<_> = corpus().into_iter().take(CAPTURED_BATCH_EVENTS).collect();
+    let config = ExtractionConfig {
+        ram_budget_mb: 1,
+        batch_events: CAPTURED_BATCH_EVENTS,
+        ..ExtractionConfig::default()
+    };
+    let script = vec![Ok(CAPTURED_FIRST_BATCH.to_string())];
+    let provider = ScriptedProvider(Arc::new(MockExtractor::new(identity(), script)));
+
+    // Act
+    let run = run_pipeline(&events, &provider, &identity(), config, &PlentyOfRam).await;
+
+    // Assert
+    let result = score(&run.extracted(&events).await, &model_labels(&events));
+    assert_eq!(
+        (result.tp, result.fp, result.fn_),
+        (CAPTURED_GOLD_FACTS, 0, 0)
+    );
+    assert_eq!(run.report.facts_dropped_ungrounded, CAPTURED_UNGROUNDED);
+}

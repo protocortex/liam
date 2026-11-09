@@ -140,6 +140,7 @@ fn validate(entry: &RawValue, batch_len: usize, predicates: &[String]) -> Option
     let raw: RawFact = serde_json::from_str(entry.get()).ok()?;
     let [subject, predicate, object] =
         [raw.subject, raw.predicate, raw.object].map(|field| field.trim().to_string());
+    let subject = subject.to_lowercase();
     let fields_ok = [&subject, &predicate, &object]
         .iter()
         .all(|field| !field.is_empty() && field.chars().count() <= MAX_FIELD_CHARS);
@@ -200,6 +201,19 @@ mod tests {
 
     fn fails(text: &str) -> ResponseError {
         parse_response(text, BATCH, &vocabulary()).expect_err("a malformed response")
+    }
+
+    #[test]
+    fn a_subject_is_trimmed_and_lower_cased_like_every_other_subject_key() {
+        // Arrange
+        let facts = vec![fact(json!({ "subject": "  Iris Pinto " }))];
+
+        // Act
+        let batch = parse(facts);
+
+        // Assert
+        assert_eq!(batch.facts[0].subject, "iris pinto");
+        assert_eq!(batch.facts[0].object, "Acme");
     }
 
     #[test]
