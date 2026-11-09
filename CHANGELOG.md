@@ -8,6 +8,8 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- The pinned `llama-server` is now llama.cpp `b12173` (was `b11860`). The launch flags, environment variables and the
+  `/v1/chat/completions` contract the extraction sidecar relies on are unchanged.
 - The `local`, `llama`, `hosted` and `backend-libsql` build flags are removed. Every build now
   includes the local models, llama.cpp and the hosted-provider code, so `cargo install` and
   `cargo build` need no `--features`. Hosted calls stay off until `[hosted]` is configured.

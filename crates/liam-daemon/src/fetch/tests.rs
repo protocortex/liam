@@ -738,19 +738,19 @@ fn pinned_assets_name_the_expected_release_and_repository() {
         .expect("model url has an unexpected repository or file name");
 
     // Act / Assert
-    assert_eq!(SERVER_TAG, "b11860");
+    assert_eq!(SERVER_TAG, "b12173");
     assert_eq!(SERVER_ASSET.url, server_url);
     assert_eq!(revision.len(), 40);
     assert!(revision.bytes().all(|b| b.is_ascii_hexdigit()));
     assert_eq!(
         SERVER_ASSET.sha256,
-        "204fe983df733653d1045d0dfb768f5604c18f8f2859ed804a561a54311a3a9d"
+        "4bddb4df09a84d8181263570b6ebdd55e28eac27228804e138d43eda0c6c43a3"
     );
     assert_eq!(
         MODEL_ASSET.sha256,
         "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
     );
-    assert_eq!(SERVER_ASSET.size_bytes, 16_245_641);
+    assert_eq!(SERVER_ASSET.size_bytes, 16_694_553);
     assert_eq!(MODEL_ASSET.size_bytes, 2_740_937_888);
 }
 
