@@ -10,6 +10,7 @@ mod blocking;
 pub mod embedder;
 pub mod error;
 mod gguf_verify;
+pub mod hardware;
 mod llama_embedder;
 pub mod llm;
 mod onnx;

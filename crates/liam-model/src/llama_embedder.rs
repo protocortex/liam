@@ -167,33 +167,13 @@ pub(crate) fn plan_chunks(
     chunks
 }
 
-/// The sysctl naming the performance cores of an Apple Silicon chip.
-#[cfg(target_os = "macos")]
-const PERFORMANCE_CORES_SYSCTL: &std::ffi::CStr = c"hw.perflevel0.logicalcpu";
-
 /// Threads for the matrix math. On Apple Silicon only the performance cores:
 /// measured on an M1 Pro, 8 threads (its performance cores) answered a query in
 /// 37 ms where 10 threads (adding the efficiency cores) took 62 ms, because the
 /// slowest core gates every parallel step. Elsewhere, every available core.
 fn compute_threads() -> i32 {
-    #[cfg(target_os = "macos")]
-    {
-        let mut count: i32 = 0;
-        let mut size = std::mem::size_of::<i32>();
-        // SAFETY: `count` and `size` are valid for the sysctl to write, and
-        // `size` is the byte length of `count`.
-        let status = unsafe {
-            libc::sysctlbyname(
-                PERFORMANCE_CORES_SYSCTL.as_ptr(),
-                (&raw mut count).cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status == 0 && count > 0 {
-            return count;
-        }
+    if let Some(count) = crate::hardware::performance_cores().and_then(|n| i32::try_from(n).ok()) {
+        return count;
     }
     std::thread::available_parallelism().map_or(1, |n| n.get() as i32)
 }

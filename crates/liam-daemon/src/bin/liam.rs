@@ -31,6 +31,7 @@ use liam_store::{
 use liam_daemon::config::{resolve_config_source, Config};
 use liam_daemon::consolidation::manifest::RunOutcome;
 use liam_daemon::consolidation::offline::{print_status, run_offline};
+use liam_daemon::devices;
 use liam_daemon::embedder_fingerprint::{self, EmbedderFingerprint};
 use liam_daemon::event_log;
 use liam_daemon::fetch;
@@ -64,6 +65,9 @@ enum Command {
     /// Download and load every model liam.toml asks for, so the first daemon
     /// start is not also the first download.
     FetchModels,
+    /// Show the cores, the compute backends this build has, and what `auto`
+    /// resolves to for the embedder and the LLM under the config.
+    Devices(DevicesArgs),
     /// Rebuild a store's nodes and edges from its event log, then check the
     /// result against the log row by row. Refuses while a daemon holds the
     /// store.
@@ -75,6 +79,13 @@ enum Command {
     /// merge near-duplicates, maintain, then commit or roll back. An unfinished
     /// run is resumed. Resynthesis is left to the daemon's scheduled runs.
     Consolidate(ConsolidateArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct DevicesArgs {
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -170,6 +181,18 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::FetchModels => fetch_models(&config, &config_path),
+        Command::Devices(args) => {
+            let report = devices::report(&devices::SystemProbe, &config);
+            println!(
+                "{}",
+                if args.json {
+                    devices::format_json(&report)
+                } else {
+                    devices::format_text(&report)
+                }
+            );
+            Ok(())
+        }
         Command::Rebuild(args) => {
             models::export_fastembed_cache_dir(&config)?;
             let runtime = tokio::runtime::Runtime::new()?;
@@ -731,6 +754,18 @@ mod tests {
         assert_eq!(
             parse(&["liam", "fetch-models"]).command,
             Command::FetchModels
+        );
+    }
+
+    #[test]
+    fn devices_takes_an_optional_json_flag() {
+        assert_eq!(
+            parse(&["liam", "devices"]).command,
+            Command::Devices(DevicesArgs { json: false })
+        );
+        assert_eq!(
+            parse(&["liam", "devices", "--json"]).command,
+            Command::Devices(DevicesArgs { json: true })
         );
     }
 

@@ -31,6 +31,7 @@
 
 pub mod config;
 pub mod consolidation;
+pub mod devices;
 pub mod embedder_fingerprint;
 pub mod event_log;
 pub mod fetch;
