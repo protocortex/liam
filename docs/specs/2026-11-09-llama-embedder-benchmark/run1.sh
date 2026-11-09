@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # usage: run1.sh MODEL DEVICE OUTPREFIX (OUTPREFIX must be an absolute path)
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "${LIAM_REPO:?set LIAM_REPO to a checkout with target/release/liam built}"

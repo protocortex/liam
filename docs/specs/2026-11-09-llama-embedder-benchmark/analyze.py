@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import json,statistics as st,re,glob,math,sys
 B=sys.argv[1]
 names=["a_candle_cpu","b_candle_metal","c_q8_cpu","d_q8_metal","e_f16_cpu","f_f16_metal"]

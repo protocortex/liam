@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 B=$(dirname $0)
 Q=Qwen/Qwen3-Embedding-0.6B; G=Qwen/Qwen3-Embedding-0.6B-GGUF
 for r in 1 2 3; do
