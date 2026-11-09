@@ -2518,7 +2518,7 @@ fn intern(index: &mut HashMap<String, usize>, labels: &mut Vec<String>, id: Stri
     i
 }
 
-#[cfg(all(test, feature = "backend-libsql"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::FixedClock;

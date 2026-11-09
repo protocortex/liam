@@ -85,8 +85,9 @@ sysinfo = "0.37"
 # `launch_activate_socket` is a libSystem call that exists nowhere else, so a
 # Linux build must never see this crate. Same pattern liam-model uses for Metal.
 # The only HTTPS client of the daemon, used by the hosted adapters. MIT OR
-# Apache-2.0. Its rustls backend is why the feature is off by default.
-ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+# Apache-2.0. It is linked in every build; whether anything is sent is decided
+# at runtime by the privacy gate and the host allowlist.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 raunch = "1.0.1"
@@ -117,11 +118,6 @@ libsql = { version = "0.10", default-features = false, features = ["core"] }
 
 [features]
 default = []
-# Hosted model providers over HTTPS. Off by default: the default build links no
-# TLS. `local` and `llama` already carry a TLS-capable ureq through hf-hub, so
-# this feature is not the egress control; the privacy gate and the host
-# allowlist are.
-hosted = ["dep:ureq"]
 # Ship with in-process models (fastembed). Without it, the daemon uses the mock
 # embedder and identity reranker, which keeps the base build light for dev.
 local = ["liam-model/local"]

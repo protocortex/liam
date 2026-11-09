@@ -3,10 +3,10 @@
 [Back to the docs index](../README.md)
 
 LIAM can send extraction and summary requests to Anthropic, OpenAI or Gemini
-instead of the local model. It is off by default, the default build links no
-TLS code for it, and nothing is sent until you build with `--features hosted`
-and set `extraction.provider` or `summary.provider` along with every part of
-`[hosted]`.
+instead of the local model. It is off by default, and nothing is sent until you
+set `extraction.provider` or `summary.provider` along with every part of
+`[hosted]`. Every build includes the HTTPS client, so the controls are the
+privacy gate and the host allowlist below, not the build.
 
 A request goes out only when all of this holds:
 

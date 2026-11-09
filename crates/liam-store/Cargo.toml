@@ -5,7 +5,7 @@ edition = "2021"
 description = "A bitemporal graph store with hybrid retrieval, generic over libSQL or SQLite."
 license = "Apache-2.0"
 
-# Pin exact versions with `cargo add`. Enable exactly one backend feature.
+# Pin exact versions with `cargo add`.
 [dependencies]
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -24,7 +24,7 @@ uuid = { version = "1.27.0", default-features = false, features = ["std", "v7"] 
 # Local-only: drop default replication/remote/sync/tls features, which pull the
 # hyper-rustls -> rustls-webpki -> webpki-roots stack (unused by this local-first
 # store and the source of several RUSTSEC advisories + a CDLA license).
-libsql = { version = "0.10", optional = true, default-features = false, features = ["core"] }
+libsql = { version = "0.10", default-features = false, features = ["core"] }
 # Not optional: the injected log handle is a `tokio::sync::Mutex`, and
 # `liam-log` already pulls tokio into every build.
 tokio = { version = "1", features = ["rt", "sync"] }
@@ -41,11 +41,6 @@ tokio = { version = "1", features = ["rt", "sync"] }
 leiden-rs = "=0.8.1"
 
 [features]
-default = ["backend-libsql"]
-# The read pool and write mutex in `backends/libsql.rs` need
-# `tokio::sync::Mutex`, which this crate depends on directly rather than
-# through libsql's own tokio features.
-backend-libsql = ["dep:libsql"]
 # Constructors for typed text and hits, for tests in other crates that build
 # fixtures without a store. Off in a release build, so production code cannot
 # mint a recorded value from a string it did not read from the store.

@@ -20,7 +20,7 @@ What is built:
   tiering.
 - Deletion and log archive, with metrics and alerts, and a producer trust cap
   on usage.
-- Hosted providers behind the `hosted` feature: pinned models, a default-deny
+- Hosted providers, off unless `[hosted]` is set: pinned models, a default-deny
   privacy gate, batch submit and collect, cost metrics, and cancel on delete.
   The provider request shapes are unchecked against live accounts.
 

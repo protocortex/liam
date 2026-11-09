@@ -28,13 +28,13 @@ licensed (zstd is offered under BSD or GPLv2; LIAM uses it under BSD). It is in
 every build, because the archive reader must open an archived partition even
 when `[archive]` is off.
 
-## The hosted feature
+## The hosted client
 
-A build with `--features hosted` sends requests to Anthropic, OpenAI and Gemini
-over HTTPS through `ureq` 3 with its rustls backend. The shipped `local` and
-`llama` builds already carry the same crates through `hf-hub`, so the lists
-below hold no entry that is new to them. The default build links none of them.
-The crates the feature adds to a default build, with their licenses:
+Every build links an HTTPS client, `ureq` 3 with its rustls backend. The hosted
+providers (Anthropic, OpenAI and Gemini) use it, and so does `hf-hub` when it
+downloads a model. Nothing is sent to a hosted provider unless `[hosted]` is on,
+the host is allowed and the privacy gate passes. The crates this brings in, with
+their licenses:
 
 - MIT OR Apache-2.0: ureq, ureq-proto, rustls-pki-types.
 - Apache-2.0 OR ISC OR MIT: rustls.
@@ -42,9 +42,6 @@ The crates the feature adds to a default build, with their licenses:
 - Apache-2.0 AND ISC, both apply: ring.
 - CDLA-Permissive-2.0: webpki-roots.
 - BSD-3-Clause: subtle.
-
-`scripts/check-default-tls-free.sh` fails when the default build's tree holds
-rustls, ring, webpki-roots or native-tls.
 
 ## Components fetched at install
 

@@ -259,7 +259,7 @@ fn a_hosted_key_missing_from_either_file_fails_the_check() {
 }
 
 #[test]
-fn the_notices_name_each_crate_the_hosted_feature_adds() {
+fn the_notices_name_each_crate_the_hosted_client_links() {
     // Arrange
     let text = read_root("THIRD-PARTY-NOTICES.md");
     let added = [

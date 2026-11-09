@@ -13,7 +13,7 @@ embedding model.
 
 One backend ships today.
 
-- `backend-libsql` (default): native vector search via `F32_BLOB` and
+- libSQL: native vector search via `F32_BLOB` and
   `vector_distance_cos`.
 
 The seam is small by design, and stays even with a single implementation.
@@ -77,17 +77,10 @@ superseded, and a duplicate triple: a second edge with the same source, target,
 and type. It also refuses the reserved `supersedes` relation, which only
 `supersede` writes.
 
-## Features
-
-```
-default        = ["backend-libsql"]
-backend-libsql = ["dep:libsql", "dep:tokio"]
-```
-
 ## Status
 
 The abstraction, the libSQL backend, and the shared graph logic are implemented
-and compile. The acceptance gate is `cargo test --features backend-libsql`,
+and compile. The acceptance gate is `cargo test -p liam-store`,
 which is green.
 
 Verification boundaries, isolated on purpose:

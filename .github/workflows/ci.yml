@@ -94,8 +94,6 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy (hosted feature)
-        run: cargo clippy -p liam-daemon --all-targets --features hosted -- -D warnings
 
   # Linux only. The macOS half of this matrix moved into the `macos` job below,
   # so the workspace compiles once per platform instead of three times on the
@@ -115,11 +113,6 @@ jobs:
           save-if: ${{ env.CACHE_SAVE_IF }}
       - name: Test
         run: cargo test --workspace
-      - name: Test (hosted feature)
-        run: cargo test -p liam-daemon --features hosted
-      # The default build links no TLS; see the script for why only that build.
-      - name: Default build links no TLS
-        run: ./scripts/check-default-tls-free.sh
 
   build-local:
     runs-on: ubuntu-latest
@@ -167,7 +160,7 @@ jobs:
       #
       # `--features` is a global cargo-deny flag, not a `check` subcommand
       # flag, so it must precede `check` on the command line.
-      - run: cargo deny --features local,llama,hosted check
+      - run: cargo deny --features local,llama check
 
   # Blocking: fails below FLOOR. FLOOR is set from the real baseline measured
   # 2026-09-29 (96.55% line coverage), minus a few points of margin, so it
@@ -198,10 +191,10 @@ jobs:
           {
             echo '## Coverage'
             echo '```'
-            cargo llvm-cov --workspace --features liam-daemon/hosted --summary-only
+            cargo llvm-cov --workspace --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov --workspace --features liam-daemon/hosted --summary-only --fail-under-lines "$FLOOR"
+          cargo llvm-cov --workspace --summary-only --fail-under-lines "$FLOOR"
 
   # ONE macOS job doing what `test (macos-latest)`, `build-local
   # (macos-latest)` and `build-llama` used to do as three.

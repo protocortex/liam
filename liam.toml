@@ -141,7 +141,7 @@ model_calls_per_hour       = 1000.0    # model calls an hour at which an alert i
 
 # Calls to hosted model providers (Anthropic, OpenAI, Gemini), for extraction
 # and summaries. Off, and nothing leaves the machine, until every part below is
-# set. Needs a build with `--features hosted`. Read
+# set. Read
 # docs/concepts/hosted-providers.md before turning it on.
 [hosted]
 enabled              = false     # false makes no hosted call

@@ -1,5 +1,5 @@
 # Live R10 results, one row per pinned model id. A live run (`cargo test
-# --features hosted -- --ignored r10_live`) fills it in. No provider key was
+# -p liam-daemon -- --ignored r10_live`) fills it in. No provider key was
 # available when this was written, so there are no rows yet. A pin or prompt
 # version that differs from a row fails the stale-pin check until the row is
 # updated.
