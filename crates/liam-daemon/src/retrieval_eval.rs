@@ -742,6 +742,8 @@ pub enum EvalModel {
     Qwen3,
     BgeM3,
     Onnx(&'static liam_model::OnnxModelSpec),
+    /// A GGUF model that runs on llama.cpp.
+    Gguf(&'static liam_model::GgufEmbedderSpec),
 }
 
 impl EvalModel {
@@ -750,6 +752,7 @@ impl EvalModel {
         [EvalModel::Qwen3, EvalModel::BgeM3]
             .into_iter()
             .chain(liam_model::ONNX_MODELS.iter().map(EvalModel::Onnx))
+            .chain(liam_model::GGUF_EMBEDDERS.iter().map(EvalModel::Gguf))
     }
 
     /// The Hugging Face id the model loads under.
@@ -758,6 +761,7 @@ impl EvalModel {
             EvalModel::Qwen3 => liam_model::QWEN3_EMBEDDING_MODEL_ID,
             EvalModel::BgeM3 => liam_model::BGE_M3_MODEL_ID,
             EvalModel::Onnx(spec) => spec.id,
+            EvalModel::Gguf(spec) => spec.id,
         }
     }
 
@@ -765,7 +769,7 @@ impl EvalModel {
     /// the configured one (truncation); every other model has one fixed width.
     pub fn dims(self, configured: usize) -> usize {
         match self {
-            EvalModel::Qwen3 => configured,
+            EvalModel::Qwen3 | EvalModel::Gguf(_) => configured,
             EvalModel::BgeM3 => liam_model::BGE_M3_DIMS,
             EvalModel::Onnx(spec) if spec.matryoshka => configured,
             EvalModel::Onnx(spec) => spec.native_dims,

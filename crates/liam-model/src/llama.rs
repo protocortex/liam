@@ -278,7 +278,7 @@ impl LlamaCppLlm {
 /// returns `BackendAlreadyInitialized`. So it is initialized exactly once,
 /// cached, and shared; a failed init stays failed rather than being retried
 /// per call.
-fn shared_backend() -> Result<Arc<LlamaBackend>> {
+pub(crate) fn shared_backend() -> Result<Arc<LlamaBackend>> {
     static BACKEND: std::sync::OnceLock<std::result::Result<Arc<LlamaBackend>, String>> =
         std::sync::OnceLock::new();
     BACKEND
@@ -331,7 +331,7 @@ fn runtime_label(compiled: &'static str, gpu_offload: bool) -> &'static str {
 /// compile-time claim nothing can fall back from. A later startup assertion
 /// depends on that: it can only catch a Metal fallback if this label is able
 /// to say cpu.
-fn runtime_backend(backend: &LlamaBackend) -> &'static str {
+pub(crate) fn runtime_backend(backend: &LlamaBackend) -> &'static str {
     runtime_label(compiled_backend(), backend.supports_gpu_offload())
 }
 

@@ -193,7 +193,13 @@ mod real_tier {
         )
         .expect("resolve embedder.cache_dir");
         let embedder: Arc<dyn liam_model::Embedder> = Arc::new(
-            liam_model::FastEmbedEmbedder::load(&model_id, dims, &cache_dir).expect(
+            liam_model::FastEmbedEmbedder::load(
+                &model_id,
+                dims,
+                &cache_dir,
+                liam_model::llm::DevicePreference::Cpu,
+            )
+            .expect(
                 "load real embedder (Qwen3); requires network access for first-time model \
                  download",
             ),

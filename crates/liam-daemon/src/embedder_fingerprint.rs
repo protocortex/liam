@@ -49,12 +49,20 @@ pub struct EmbedderFingerprint {
     pub prompt_scheme: u32,
 }
 
+/// The id a model is recorded under. A GGUF id has two spellings for the same
+/// file (`repo` and `repo:Q8_0`), so it is stored as the spec's explicit id;
+/// every other id is stored as written, which keeps existing fingerprints valid.
+fn canonical_model_id(model: &str) -> String {
+    liam_model::gguf_embedder_spec(model)
+        .map_or_else(|| model.to_string(), |spec| spec.id.to_string())
+}
+
 impl EmbedderFingerprint {
     /// The fingerprint the configured embedder would write.
     pub fn from_config(config: &Config) -> Self {
         Self {
             provider: config.embedder.provider.clone(),
-            model: config.embedder.model.clone(),
+            model: canonical_model_id(&config.embedder.model),
             dims: config.embedding_dims,
             prompt_scheme: PROMPT_SCHEME,
         }
@@ -250,6 +258,25 @@ fn mismatch_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn both_spellings_of_a_gguf_model_share_one_fingerprint_and_other_ids_are_unchanged() {
+        // Arrange
+        let with = |model: &str| {
+            let mut config = Config::default();
+            config.embedder.model = model.to_string();
+            EmbedderFingerprint::from_config(&config)
+        };
+
+        // Act / Assert
+        let bare = with("Qwen/Qwen3-Embedding-0.6B-GGUF");
+        assert_eq!(bare, with("Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0"));
+        assert_ne!(bare, with("Qwen/Qwen3-Embedding-0.6B-GGUF:F16"));
+        assert_eq!(
+            with("Qwen/Qwen3-Embedding-0.6B").model,
+            "Qwen/Qwen3-Embedding-0.6B"
+        );
+    }
+
     use super::*;
 
     fn fingerprint(model: &str, dims: usize, prompt_scheme: u32) -> EmbedderFingerprint {
