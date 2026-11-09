@@ -48,7 +48,10 @@ per row, medians. From the benchmark spec:
 
 Q8_0 on Metal is 7.9 times faster per query than candle on the CPU, loads in 0.2 s
 instead of 2.6 s and holds 59 percent less memory at the embedder level, with the
-same quality (mean cosine to the candle vectors 0.9997).
+same quality (mean cosine to the candle vectors 0.9997). Candle on Metal, which
+`embedder.device = auto` now selects for candle on macOS, is faster than candle
+on the CPU. Against it, Q8_0 on Metal is 3 times faster (23 ms against 72 ms) and
+holds 53 percent less memory at the embedder level (1072 MB against 2299 MB).
 
 The switch was also run on a real throwaway store of 300 memories (see the
 addendum in the spec). The daemon refused the old store and named `liam rebuild`.
