@@ -105,9 +105,11 @@ process.
 3. **Hardware support for Linux and Windows GPUs will use a pinned `llama-server`
    sidecar** that serves embeddings and generation. The build variant is chosen by
    detection (`liam devices`) and downloaded on first run, with its sha256 pinned
-   in a manifest. Vulkan comes first: one Vulkan build covers AMD, Intel and NVIDIA
-   from a single download. CUDA and ROCm are optional faster builds for those
-   cards.
+   in a manifest. Vulkan comes first: llama.cpp publishes Vulkan builds, which
+   should cover AMD, Intel and NVIDIA from a single download (not yet tested on
+   that hardware). CUDA and ROCm builds are expected to be faster on their own
+   cards, which is also untested. The 384 dimension truncation is done by the
+   client, because the server returns full vectors.
 4. **Nothing in the sidecar path ships as a default until a tester has verified it
    on real hardware** of that kind.
 
