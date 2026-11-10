@@ -1481,7 +1481,7 @@ impl MemoryServer {
         let k = clamp_ask_k(args.k);
         let q = build_query(
             &args.question,
-            Some(k),
+            Some(ask::rerank_pool(k)),
             args.kind,
             args.scope.clone(),
             embedding.clone(),
@@ -1511,12 +1511,28 @@ impl MemoryServer {
             .iter()
             .map(|e| e.retrieved.as_text().to_string())
             .collect();
-        let order = self
-            .reranker
-            .order(&args.question, &docs)
-            .await
-            .unwrap_or_else(|_| (0..docs.len()).collect());
-        let evidence: Vec<ask::Evidence> = order.iter().map(|&i| candidates[i].clone()).collect();
+        let order = match self.reranker.order(&args.question, &docs).await {
+            Ok(order) => order,
+            Err(e) => {
+                tracing::warn!(error = %e, "ask answered from unreranked evidence");
+                (0..docs.len()).collect()
+            }
+        };
+        // Candidates list the store hits first, so an index below `hit_count`
+        // is a store hit. Keep k of them plus every summary.
+        let hit_count = hits.len();
+        let mut kept_hits = 0;
+        let evidence: Vec<ask::Evidence> = order
+            .into_iter()
+            .filter(|&i| {
+                if i >= hit_count {
+                    return true;
+                }
+                kept_hits += 1;
+                kept_hits <= k
+            })
+            .map(|i| candidates[i].clone())
+            .collect();
         if mode == Mode::Strict {
             self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
             self.record_evidence_usage(&evidence);
@@ -6172,6 +6188,30 @@ mod tests {
         for handle in expected {
             assert!(out.contains(&handle), "{handle} missing from {out}");
         }
+    }
+
+    #[tokio::test]
+    async fn strict_ask_at_k_one_returns_the_reranked_top_fact_from_a_wider_pool() {
+        // Arrange
+        let store = open_store().await;
+        let target = seed_dog_facts(&store).await;
+        let server = server_over(&store, Arc::new(RetrieverReranker));
+        let args = AskArgs {
+            question: DOG_QUERY.to_string(),
+            kind: None,
+            scope: None,
+            k: Some(1),
+            as_of: None,
+            mode: Some(Mode::Strict),
+        };
+
+        // Act
+        let out = server.ask(Parameters(args)).await;
+
+        // Assert
+        assert!(out.contains(RETRIEVER_WORD), "{out}");
+        assert!(out.contains(target.handle()), "{out}");
+        assert_eq!(out.matches("] (fact) ").count(), 1, "{out}");
     }
 
     #[tokio::test]

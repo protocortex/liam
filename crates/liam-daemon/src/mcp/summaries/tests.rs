@@ -177,6 +177,104 @@ async fn an_ask_in_infer_mode_uses_the_matching_summary_and_labels_it_inferred()
     assert!(!prompt.contains(EVENT), "{prompt}");
 }
 
+const FACT_COUNT: usize = 5;
+const ASK_K: usize = 2;
+const SUMMARY_CAP: usize = 3;
+
+async fn seed_facts(server: &MemoryServer, count: usize) {
+    let store = server.store().await.unwrap();
+    for index in 0..count {
+        store
+            .insert(NewNode::now(
+                "fact",
+                format!("forecast {index}"),
+                SUMMARY_TEXT,
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+async fn seed_summaries(server: &MemoryServer, count: usize) {
+    for index in 0..count {
+        seed(
+            server,
+            Seed {
+                children: vec![(format!("child-{index}"), ChildKind::Node)],
+                ..Seed::default()
+            },
+        )
+        .await;
+    }
+}
+
+/// How many store hits and summaries the model's prompt carried.
+fn evidence_counts(prompt: &str) -> (usize, usize) {
+    (
+        prompt.matches("] (fact) ").count(),
+        prompt.matches("] (summary) ").count(),
+    )
+}
+
+#[tokio::test]
+async fn an_infer_ask_keeps_k_store_hits_and_every_matching_summary() {
+    // Arrange
+    let llm = Arc::new(SpyLlm::default());
+    let server = server_with(llm.clone()).await;
+    seed_facts(&server, FACT_COUNT).await;
+    seed_summaries(&server, SUMMARY_CAP).await;
+    let args = AskArgs {
+        k: Some(ASK_K),
+        ..ask_args(None)
+    };
+
+    // Act
+    server.ask(Parameters(args)).await;
+
+    // Assert
+    let prompt = llm.prompt.lock().unwrap().clone();
+    assert_eq!(evidence_counts(&prompt), (ASK_K, SUMMARY_CAP), "{prompt}");
+}
+
+#[tokio::test]
+async fn an_infer_ask_with_no_matching_summary_keeps_k_store_hits() {
+    // Arrange
+    let llm = Arc::new(SpyLlm::default());
+    let server = server_with(llm.clone()).await;
+    seed_facts(&server, FACT_COUNT).await;
+    let args = AskArgs {
+        k: Some(ASK_K),
+        ..ask_args(None)
+    };
+
+    // Act
+    server.ask(Parameters(args)).await;
+
+    // Assert
+    let prompt = llm.prompt.lock().unwrap().clone();
+    assert_eq!(evidence_counts(&prompt), (ASK_K, 0), "{prompt}");
+}
+
+#[tokio::test]
+async fn an_infer_ask_caps_summaries_and_still_keeps_k_store_hits() {
+    // Arrange
+    let llm = Arc::new(SpyLlm::default());
+    let server = server_with(llm.clone()).await;
+    seed_facts(&server, FACT_COUNT).await;
+    seed_summaries(&server, SUMMARY_CAP + 1).await;
+    let args = AskArgs {
+        k: Some(ASK_K),
+        ..ask_args(None)
+    };
+
+    // Act
+    server.ask(Parameters(args)).await;
+
+    // Assert
+    let prompt = llm.prompt.lock().unwrap().clone();
+    assert_eq!(evidence_counts(&prompt), (ASK_K, SUMMARY_CAP), "{prompt}");
+}
+
 async fn summary_known_since(server: &MemoryServer) -> i64 {
     let store = server.store().await.unwrap();
     let entries = store.summaries_within(None, None, None).await.unwrap();
