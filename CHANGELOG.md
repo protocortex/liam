@@ -8,6 +8,8 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- `recall` and `ask` now reject an empty, whitespace-only or NUL-containing query and one over 4000 characters
+  with a clear error. Only the first 64 distinct words reach the lexical arm; later words reach only the vector arm.
 - `recall` now reranks a wider pool of candidates (twice `k`, at least 16, at most 32) before it cuts to `k`, so
   a relevant hit ranked below `k` by retrieval can reach the top. A `k` over 32 now returns 32, and `k = 0` now returns 1 hit.
 - `ask` now reranks a wider pool of candidates before it cuts, so a relevant hit ranked below `k` by retrieval can

@@ -35,10 +35,13 @@ documented in the pages linked here:
 
 | Field | Required | Notes |
 |---|---|---|
-| `query` | yes | Text; embedded for the vector channel too. |
+| `query` | yes | Text; embedded for the vector channel too. Up to 4000 characters; empty, whitespace-only and NUL-containing queries are rejected. Only the first 64 distinct words (case-insensitive) reach the lexical channel; words past the 64th distinct one reach only the vector arm. |
 | `kind` | no | Restrict to one kind. |
 | `scope` | no | Restrict to one partition. Same format as `remember`'s `scope`. |
 | `k` | no | How many hits to return (default 8, range 1 to 32; larger values are clamped to 32). Recall reranks a pool of twice `k`, at least 16 and at most 32, then returns the top `k`. |
+
+`ask` applies the same limits to its `question`: up to 4000 characters, empty and NUL
+rejected, and words past the 64th distinct one reach only the vector arm.
 
 `timeline` shows an entity's compiled page and the mentions behind it, most
 recent first.

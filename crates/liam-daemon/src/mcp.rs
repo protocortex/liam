@@ -108,6 +108,12 @@ const MAX_ATTRIBUTES_CHARS: usize = 2000;
 /// truncation downstream.
 const MAX_CONTENT_CHARS: usize = 16_000;
 
+/// Cap on `recall`'s `query` and `ask`'s `question`, in characters.
+const MAX_QUERY_CHARS: usize = 4000;
+
+/// Cap on distinct words handed to the lexical arm of a query.
+const MAX_QUERY_TERMS: usize = 64;
+
 /// Cap on `1 + episode.facts.len() + episode.entities.len() +
 /// episode.edges.len()` for `remember`'s `episode` field (the leading `1`
 /// is the always-present top-level fact). Bounds how long
@@ -229,6 +235,31 @@ fn content_problem(content: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Validates a `recall` query or `ask` question: `None` when usable.
+fn query_problem(query: &str) -> Option<String> {
+    if query.trim().is_empty() {
+        Some("query is empty".to_string())
+    } else if query.contains('\0') {
+        Some("query contains a NUL character".to_string())
+    } else if query.chars().count() > MAX_QUERY_CHARS {
+        Some(format!("query is longer than {MAX_QUERY_CHARS} characters"))
+    } else {
+        None
+    }
+}
+
+/// The query text handed to the lexical arm, capped to `MAX_QUERY_TERMS`.
+/// Words are distinct by lowercase; the first spelling is kept.
+fn lexical_text(query: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    query
+        .split_whitespace()
+        .filter(|word| seen.insert(word.to_lowercase()))
+        .take(MAX_QUERY_TERMS)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Applies `remember`'s five optional per-node fields to an
@@ -1110,10 +1141,13 @@ impl MemoryServer {
         if let Err(refusal) = require_strict("recall", args.mode) {
             return refusal;
         }
+        if let Some(problem) = query_problem(&args.query) {
+            return format!("recall failed: {problem}");
+        }
         let embedding = self.embedder.embed(&args.query, TextKind::Query).await.ok();
         let k = crate::ask::clamp_recall_k(args.k);
         let q = build_query(
-            &args.query,
+            &lexical_text(&args.query),
             Some(crate::ask::rerank_pool(k)),
             args.kind,
             args.scope,
@@ -1472,6 +1506,9 @@ impl MemoryServer {
     #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
         let _timer = self.time(Tool::Ask);
+        if let Some(problem) = query_problem(&args.question) {
+            return format!("ask failed: {problem}");
+        }
         let mode = args.mode.unwrap_or(Mode::Infer);
         let embedding = self
             .embedder
@@ -1480,7 +1517,7 @@ impl MemoryServer {
             .ok();
         let k = clamp_ask_k(args.k);
         let q = build_query(
-            &args.question,
+            &lexical_text(&args.question),
             Some(ask::rerank_pool(k)),
             args.kind,
             args.scope.clone(),
@@ -3476,6 +3513,126 @@ mod tests {
             embedder.calls(),
             vec![("where do I live".to_string(), TextKind::Query)]
         );
+    }
+
+    fn recall_args_for(query: &str) -> RecallArgs {
+        RecallArgs {
+            query: query.to_string(),
+            kind: None,
+            scope: None,
+            k: None,
+            as_of: None,
+            mode: None,
+        }
+    }
+
+    fn ask_args_for(question: &str) -> AskArgs {
+        AskArgs {
+            question: question.to_string(),
+            kind: None,
+            scope: None,
+            k: None,
+            as_of: None,
+            mode: None,
+        }
+    }
+
+    fn hundred_words() -> String {
+        (0..100)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[tokio::test]
+    async fn recall_and_ask_reject_invalid_queries_with_exact_replies() {
+        // Arrange
+        let server = server_with_recording_embedder().await.0;
+        let cases: Vec<(String, &str)> = vec![
+            (String::new(), "query is empty"),
+            ("   \n\t".to_string(), "query is empty"),
+            ("alpha\0port".to_string(), "query contains a NUL character"),
+            ("x".repeat(4001), "query is longer than 4000 characters"),
+            (
+                "\u{e9}".repeat(4001),
+                "query is longer than 4000 characters",
+            ),
+        ];
+
+        for (text, problem) in cases {
+            // Act
+            let recall = server.recall(Parameters(recall_args_for(&text))).await;
+            let ask = server.ask(Parameters(ask_args_for(&text))).await;
+
+            // Assert
+            assert_eq!(recall, format!("recall failed: {problem}"));
+            assert_eq!(ask, format!("ask failed: {problem}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_and_ask_accept_queries_at_the_character_limit() {
+        // Arrange
+        let server = server_with_recording_embedder().await.0;
+        let cases = ["x".repeat(4000), "\u{e9}".repeat(4000)];
+
+        for text in cases {
+            assert_eq!(text.chars().count(), 4000);
+
+            // Act
+            let recall = server.recall(Parameters(recall_args_for(&text))).await;
+            let ask = server.ask(Parameters(ask_args_for(&text))).await;
+
+            // Assert
+            assert!(!recall.starts_with("recall failed"), "recall: {recall}");
+            assert!(!ask.starts_with("ask failed"), "ask: {ask}");
+        }
+    }
+
+    #[test]
+    fn lexical_text_keeps_the_first_64_distinct_words_in_order() {
+        // Arrange
+        let question = hundred_words();
+
+        // Act
+        let out = lexical_text(&question);
+
+        // Assert
+        let expected: Vec<String> = (0..64).map(|i| format!("w{i}")).collect();
+        let got: Vec<&str> = out.split_whitespace().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn lexical_text_treats_case_variants_as_one_term() {
+        // Arrange
+        let question = "Word word WORD";
+
+        // Act
+        let out = lexical_text(question);
+
+        // Assert
+        assert_eq!(out.split_whitespace().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn recall_and_ask_embed_the_full_question_while_lexical_text_is_capped() {
+        // Arrange
+        let question = hundred_words();
+        let (server, embedder) = server_with_recording_embedder().await;
+
+        // Act
+        server.recall(Parameters(recall_args_for(&question))).await;
+        server.ask(Parameters(ask_args_for(&question))).await;
+
+        // Assert
+        let calls = embedder.calls();
+        assert_eq!(calls.len(), 2);
+        for (text, kind) in &calls {
+            assert_eq!(text, &question);
+            assert_eq!(*kind, TextKind::Query);
+        }
+        assert_eq!(lexical_text(&question).split_whitespace().count(), 64);
     }
 
     #[tokio::test]
