@@ -7,12 +7,13 @@
 //! row accessors (`column_count`, `get_value`) are the surface to confirm against
 //! the version you pin.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use libsql::{Builder, Connection, Database};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::runtime::Handle;
+use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use crate::backend::{Backend, BackendTx, CheckpointMode, CheckpointResult};
 use crate::error::{Error, Result};
@@ -20,6 +21,11 @@ use crate::graph::scope_within;
 use crate::ids::{Millis, NodeId, FOREVER};
 use crate::types::Derivation;
 use crate::value::{Row, Value};
+
+mod read_hooks;
+#[cfg(test)]
+use read_hooks::ReadEvent;
+use read_hooks::ReadHooks;
 
 /// Milliseconds a connection waits on `SQLITE_BUSY` before giving up.
 /// Config plumbing for this arrives in WU-5; until then a named constant is
@@ -66,16 +72,185 @@ fn can_pool_reads(path: &str) -> bool {
     path != ":memory:" && !path.starts_with("file:")
 }
 
+/// Locks a std mutex, recovering the data if a panicking read poisoned it.
+fn lock<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Read connections, one semaphore permit per connection: a read waits for
+/// a permit, then takes an idle connection, so a slow read never holds up a
+/// read on another connection.
+struct ReadPool {
+    #[cfg(test)]
+    size: usize,
+    permits: Arc<Semaphore>,
+    idle: Arc<StdMutex<Vec<Connection>>>,
+    /// False when the connection is shared with the write path, where an
+    /// interrupt would abort a write.
+    interruptible: bool,
+}
+
+impl ReadPool {
+    fn new(connections: Vec<Connection>, interruptible: bool) -> Self {
+        let size = connections.len();
+        Self {
+            #[cfg(test)]
+            size,
+            permits: Arc::new(Semaphore::new(size)),
+            idle: Arc::new(StdMutex::new(connections)),
+            interruptible,
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.size
+    }
+
+    #[cfg(test)]
+    fn idle_len(&self) -> usize {
+        lock(&self.idle).len()
+    }
+
+    async fn checkout(&self) -> Result<ReadLease> {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Backend("the read pool is closed".to_owned()))?;
+        let conn = lock(&self.idle)
+            .pop()
+            .expect("a free permit always has an idle connection behind it");
+        Ok(ReadLease {
+            conn: Some(conn),
+            permit: Some(permit),
+            state: Arc::default(),
+            idle: self.idle.clone(),
+            interruptible: self.interruptible,
+        })
+    }
+}
+
+#[derive(Default)]
+struct ReadState {
+    /// The lease is over: the connection is back, or about to be.
+    finished: bool,
+    /// The read was dropped before it finished.
+    cancelled: bool,
+}
+
+/// A checked out read connection. Dropping it, on return, error or panic,
+/// marks the read finished, puts the connection back, then frees the permit.
+struct ReadLease {
+    conn: Option<Connection>,
+    permit: Option<OwnedSemaphorePermit>,
+    state: Arc<StdMutex<ReadState>>,
+    idle: Arc<StdMutex<Vec<Connection>>>,
+    interruptible: bool,
+}
+
+impl ReadLease {
+    fn conn(&self) -> &Connection {
+        self.conn
+            .as_ref()
+            .expect("a live lease holds its connection")
+    }
+
+    fn cancel_guard(&self, hooks: ReadHooks) -> CancelGuard {
+        CancelGuard {
+            conn: self.conn().clone(),
+            state: self.state.clone(),
+            interruptible: self.interruptible,
+            hooks,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        lock(&self.state).cancelled
+    }
+}
+
+impl Drop for ReadLease {
+    fn drop(&mut self) {
+        lock(&self.state).finished = true;
+        if let Some(conn) = self.conn.take() {
+            lock(&self.idle).push(conn);
+        }
+        self.permit.take();
+    }
+}
+
+/// Held by the awaiting read. If it drops before the lease finished, the
+/// read was cancelled: it stops the running statement.
+struct CancelGuard {
+    conn: Connection,
+    state: Arc<StdMutex<ReadState>>,
+    interruptible: bool,
+    hooks: ReadHooks,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        // The interrupt runs under the lock so the lease cannot finish, and
+        // hand the connection to another read, in between.
+        let mut state = lock(&self.state);
+        if state.finished {
+            return;
+        }
+        state.cancelled = true;
+        if self.interruptible {
+            self.hooks.count_interrupt();
+            // The only failure is a connection that is already closed.
+            let _ = self.conn.interrupt();
+        }
+    }
+}
+
+/// The blocking half of a read: runs on a blocking thread and owns the lease
+/// until the rows are collected.
+fn read_blocking(
+    lease: ReadLease,
+    runtime: &Handle,
+    sql: &str,
+    params: Vec<libsql::Value>,
+    hooks: &ReadHooks,
+) -> Result<Vec<Row>> {
+    hooks.at_start();
+    if lease.is_cancelled() {
+        hooks.skipped();
+        return Err(Error::Backend(
+            "the read was cancelled before it started".to_owned(),
+        ));
+    }
+    assert!(!hooks.take_panic(), "read panic requested by a test hook");
+    runtime.block_on(async {
+        let rows = lease
+            .conn()
+            .query(sql, libsql::params_from_iter(params))
+            .await
+            .map_err(err);
+        match rows {
+            Ok(rows) => read_rows(rows, hooks).await,
+            Err(e) => {
+                let failed = Err(e);
+                hooks.outcome(&failed);
+                failed
+            }
+        }
+    })
+}
+
 pub struct LibsqlBackend {
     /// The single write connection, taken by `execute`, `execute_batch`,
     /// `execute_atomic`, and every vector-writing method. Guarding it with a
     /// mutex serializes writes at the application level instead of letting
     /// them race on `SQLITE_BUSY` and hoping `busy_timeout` sorts it out.
     write: Mutex<Connection>,
-    /// Connections used for reads (`query`, `vector_search`), picked in
-    /// round robin. Reads never take `write`'s lock, so a read completes
-    /// even while a write is in flight; that is the entire reason this pool
-    /// exists separately from `write`.
+    /// Connections used for reads (`query`, `vector_search`). Reads never
+    /// take `write`'s lock, so a read completes even while a write is in
+    /// flight; that is the entire reason this pool exists separately from
+    /// `write`.
     ///
     /// For any path `can_pool_reads` does not deem safe to pool (every
     /// in-memory spelling, and, conservatively, every `file:` URI) this
@@ -85,8 +260,9 @@ pub struct LibsqlBackend {
     /// `connect()` would silently hand reads an empty store; cloning the
     /// `Connection` handle (cheap: it wraps an `Arc`) reuses the exact same
     /// underlying database instead.
-    read_pool: Vec<Connection>,
-    next_reader: AtomicUsize,
+    read_pool: ReadPool,
+    #[cfg(test)]
+    hooks: ReadHooks,
 }
 
 /// What `nodes_missing_vectors` trims from a node's content to decide whether
@@ -173,7 +349,14 @@ fn bind(params: &[Value]) -> Vec<libsql::Value> {
     params.iter().map(to_libsql).collect()
 }
 
-async fn read_rows(mut rows: libsql::Rows) -> Result<Vec<Row>> {
+async fn read_rows(mut rows: libsql::Rows, hooks: &ReadHooks) -> Result<Vec<Row>> {
+    let result = collect_rows(&mut rows, hooks).await;
+    hooks.statement_ended();
+    hooks.outcome(&result);
+    result
+}
+
+async fn collect_rows(rows: &mut libsql::Rows, hooks: &ReadHooks) -> Result<Vec<Row>> {
     let cols = rows.column_count();
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(err)? {
@@ -182,6 +365,7 @@ async fn read_rows(mut rows: libsql::Rows) -> Result<Vec<Row>> {
             values.push(from_libsql(row.get_value(i).map_err(err)?));
         }
         out.push(Row(values));
+        hooks.row_fetched(out.len())?;
     }
     Ok(out)
 }
@@ -260,16 +444,20 @@ impl Backend for LibsqlBackend {
         let single_read_conn = (!can_pool_reads(path)).then(|| write_conn.clone());
 
         let read_pool = match single_read_conn {
-            Some(shared) => vec![shared],
+            Some(shared) => ReadPool::new(vec![shared], false),
             // Floored here, the only place a pool is actually built: see
             // `MIN_READ_POOL_SIZE` for why.
-            None => open_read_pool(&db, read_pool_size.max(MIN_READ_POOL_SIZE)).await?,
+            None => ReadPool::new(
+                open_read_pool(&db, read_pool_size.max(MIN_READ_POOL_SIZE)).await?,
+                true,
+            ),
         };
 
         Ok(Self {
             write: Mutex::new(write_conn),
             read_pool,
-            next_reader: AtomicUsize::new(0),
+            #[cfg(test)]
+            hooks: ReadHooks::none(),
         })
     }
 
@@ -281,12 +469,7 @@ impl Backend for LibsqlBackend {
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-        let rows = self
-            .reader()
-            .query(sql, libsql::params_from_iter(bind(params)))
-            .await
-            .map_err(err)?;
-        read_rows(rows).await
+        self.read(sql.to_owned(), bind(params)).await
     }
 
     async fn execute_batch(&self, sql: &str) -> Result<()> {
@@ -309,7 +492,7 @@ impl Backend for LibsqlBackend {
             .query(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"), ())
             .await
             .map_err(err);
-        let rows = read_rows(checkpoint?).await?;
+        let rows = read_rows(checkpoint?, &ReadHooks::none()).await?;
         restored?;
         let row = rows
             .first()
@@ -328,7 +511,7 @@ impl Backend for LibsqlBackend {
             .await
             .map_err(err)?;
         let rows = conn.query("PRAGMA secure_delete", ()).await.map_err(err)?;
-        let rows = read_rows(rows).await?;
+        let rows = read_rows(rows, &ReadHooks::none()).await?;
         let value = rows
             .first()
             .ok_or_else(|| Error::Backend("secure_delete returned no row".to_owned()))?;
@@ -464,12 +647,7 @@ impl Backend for LibsqlBackend {
                AND n.valid_from <= ?2 AND n.valid_until > ?2{filters}
              ORDER BY vector_distance_cos(v.embedding, vector(?1)), n.rowid LIMIT ?3"
         );
-        let rows = self
-            .reader()
-            .query(&sql, libsql::params_from_iter(params))
-            .await
-            .map_err(err)?;
-        let rows = read_rows(rows).await?;
+        let rows = self.read(sql, params).await?;
         rows.iter()
             .map(|r| Ok(NodeId::from_raw(r.get_string(0)?)))
             .collect()
@@ -545,7 +723,7 @@ impl<'a> BackendTx for LibsqlTx<'a> {
             .query(sql, libsql::params_from_iter(bind(params)))
             .await
             .map_err(err)?;
-        read_rows(rows).await
+        read_rows(rows, &ReadHooks::none()).await
     }
 
     async fn commit(self: Box<Self>) -> Result<()> {
@@ -560,14 +738,32 @@ impl<'a> BackendTx for LibsqlTx<'a> {
 }
 
 impl LibsqlBackend {
-    /// Picks the next read connection in round robin. For a path
-    /// `can_pool_reads` judges safe this spreads reads across the
-    /// configured number of independent connections, none of which is
-    /// `write`, so reads never queue behind a write. Otherwise it always
-    /// returns the single shared connection `open` built.
-    fn reader(&self) -> &Connection {
-        let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
-        &self.read_pool[idx]
+    /// Runs one read on a pooled connection, on a blocking thread. If the
+    /// caller drops this future, the guard interrupts the running statement
+    /// and the connection goes back to the pool once the thread unwinds.
+    async fn read(&self, sql: String, params: Vec<libsql::Value>) -> Result<Vec<Row>> {
+        let lease = self.read_pool.checkout().await?;
+        let hooks = self.read_hooks();
+        let _guard = lease.cancel_guard(hooks.clone());
+        let runtime = Handle::current();
+        tokio::task::spawn_blocking(move || read_blocking(lease, &runtime, &sql, params, &hooks))
+            .await
+            .map_err(|e| Error::Backend(format!("the read task failed: {e}")))?
+    }
+
+    #[cfg(test)]
+    fn read_hooks(&self) -> ReadHooks {
+        self.hooks.clone()
+    }
+
+    #[cfg(not(test))]
+    fn read_hooks(&self) -> ReadHooks {
+        ReadHooks::none()
+    }
+
+    #[cfg(test)]
+    fn idle_len(&self) -> usize {
+        self.read_pool.idle_len()
     }
 }
 
@@ -732,11 +928,14 @@ mod tests {
         // connection this test builds and configures itself. That pins
         // `open_read_pool` calling `configure_connection`, not merely that
         // the helper works in isolation.
+        let lease = backend.read_pool.checkout().await.expect("check out");
         let rows = read_rows(
-            backend.read_pool[0]
+            lease
+                .conn()
                 .query("PRAGMA busy_timeout", ())
                 .await
                 .expect("query busy_timeout"),
+            &ReadHooks::none(),
         )
         .await
         .expect("read busy_timeout rows");
@@ -1084,5 +1283,383 @@ mod tests {
             .await
             .expect("spawned task did not panic")
             .expect("spawned write succeeded");
+    }
+
+    /// Tests for the read lease, the blocking read and the cancel guard. A
+    /// wall-clock limit appears only as a hang guard around an awaited
+    /// result; every assertion is on rows, counts or reports.
+    mod read_lease {
+        use std::sync::mpsc::Sender;
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
+        use tokio::task::JoinHandle;
+
+        use super::*;
+
+        const HANG_GUARD: Duration = Duration::from_secs(2);
+
+        /// Emits rows without end. Only ever run behind the hold gate.
+        const UNBOUNDED_SQL: &str =
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c";
+        const BOUNDED_ROWS: usize = 1000;
+        const BOUNDED_SQL: &str =
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 1000) SELECT n FROM c";
+
+        type ReadHandle = JoinHandle<Result<Vec<Row>>>;
+
+        async fn guarded<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+            tokio::time::timeout(HANG_GUARD, fut)
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+        }
+
+        async fn next_event(events: &mut UnboundedReceiver<ReadEvent>) -> ReadEvent {
+            guarded("a read report", events.recv())
+                .await
+                .expect("the report channel stays open")
+        }
+
+        fn assert_no_report(events: &mut UnboundedReceiver<ReadEvent>) {
+            assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+        }
+
+        fn spawn_read(backend: &Arc<LibsqlBackend>, sql: &'static str) -> ReadHandle {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.query(sql, &[]).await })
+        }
+
+        async fn read_one(backend: &Arc<LibsqlBackend>, sql: &'static str) -> Vec<Row> {
+            guarded("a read", spawn_read(backend, sql))
+                .await
+                .expect("read task did not panic")
+                .expect("read succeeded")
+        }
+
+        async fn wait_for_idle(backend: &LibsqlBackend, expected: usize) {
+            guarded("the pool to refill", async {
+                while backend.idle_len() != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        }
+
+        /// Drops the read's future and reports whether it is gone. It does
+        /// not panic, so the caller can free what the read still holds
+        /// before it asserts.
+        async fn drop_read(read: &mut ReadHandle) -> bool {
+            read.abort();
+            tokio::time::timeout(HANG_GUARD, async {
+                while !read.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+
+        /// Takes the test's part in a two party barrier from a thread of its
+        /// own, so a read that never reaches the barrier cannot hang the test.
+        fn release(barrier: &Arc<Barrier>) {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+            });
+        }
+
+        /// A pooled store with one unbounded read parked after its first row.
+        struct HeldRead {
+            _dir: TempDir,
+            backend: Arc<LibsqlBackend>,
+            events: UnboundedReceiver<ReadEvent>,
+            gate: Sender<()>,
+            read: ReadHandle,
+        }
+
+        impl HeldRead {
+            async fn start(pool_size: usize) -> Self {
+                let (dir, mut backend) = file_backend_at("held.db", pool_size).await;
+                let mut events = backend.hooks.events();
+                let gate = backend.hooks.arm_hold();
+                let backend = Arc::new(backend);
+                let read = spawn_read(&backend, UNBOUNDED_SQL);
+                assert_eq!(next_event(&mut events).await, ReadEvent::Started);
+                Self {
+                    _dir: dir,
+                    backend,
+                    events,
+                    gate,
+                    read,
+                }
+            }
+
+            /// Drops the read's future, then lets the paused statement go on.
+            async fn drop_then_release(&mut self) -> bool {
+                let dropped = drop_read(&mut self.read).await;
+                let _ = self.gate.send(());
+                dropped
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_paused_read_does_not_hold_up_a_read_on_another_connection() {
+            // Arrange
+            let mut held = HeldRead::start(2).await;
+            assert_no_report(&mut held.events);
+
+            // Act
+            let rows = read_one(&held.backend, "SELECT 2").await;
+
+            // Assert
+            assert_eq!(rows[0].get_i64(0).unwrap(), 2);
+            // The only report so far is the second read's own.
+            assert_eq!(next_event(&mut held.events).await, ReadEvent::Ran);
+            assert_no_report(&mut held.events);
+            held.drop_then_release().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dropping_the_read_future_interrupts_its_running_statement() {
+            // Arrange
+            let mut held = HeldRead::start(2).await;
+
+            // Act
+            let dropped = held.drop_then_release().await;
+
+            // Assert
+            assert_eq!(next_event(&mut held.events).await, ReadEvent::Interrupted);
+            assert!(dropped, "the read future was not dropped");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dropping_the_read_future_returns_its_connection_to_the_pool() {
+            // Arrange
+            let mut held = HeldRead::start(2).await;
+
+            // Act
+            held.drop_then_release().await;
+
+            // Assert
+            wait_for_idle(&held.backend, 2).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn every_connection_serves_a_read_after_an_interrupt() {
+            // Arrange
+            let mut held = HeldRead::start(2).await;
+            held.drop_then_release().await;
+            assert_eq!(next_event(&mut held.events).await, ReadEvent::Interrupted);
+            wait_for_idle(&held.backend, 2).await;
+
+            // Act
+            let (first, second) = tokio::join!(
+                read_one(&held.backend, "SELECT 1"),
+                read_one(&held.backend, "SELECT 2"),
+            );
+
+            // Assert
+            assert_eq!(first[0].get_i64(0).unwrap(), 1);
+            assert_eq!(second[0].get_i64(0).unwrap(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_guard_dropped_after_a_finished_read_does_not_interrupt() {
+            // Arrange
+            let (_dir, backend) = file_backend_at("late.db", 1).await;
+            let backend = Arc::new(backend);
+
+            // Act
+            let first = read_one(&backend, BOUNDED_SQL).await;
+            wait_for_idle(&backend, 1).await;
+
+            // Assert
+            assert_eq!(first.len(), BOUNDED_ROWS);
+            assert_eq!(backend.hooks.interrupt_count(), 0);
+            let second = read_one(&backend, "SELECT 2").await;
+            assert_eq!(second[0].get_i64(0).unwrap(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_guard_dropped_after_the_statement_ends_interrupts_once_and_leaks_nothing() {
+            // Arrange
+            let (_dir, mut backend) = file_backend_at("window.db", 1).await;
+            let mut events = backend.hooks.events();
+            let finish = backend.hooks.arm_finish_barrier();
+            let backend = Arc::new(backend);
+            let mut read = spawn_read(&backend, BOUNDED_SQL);
+            assert_eq!(next_event(&mut events).await, ReadEvent::StatementEnded);
+
+            // Act
+            let dropped = drop_read(&mut read).await;
+            let interrupts = backend.hooks.interrupt_count();
+            release(&finish);
+
+            // Assert
+            assert!(dropped, "the read future was not dropped");
+            assert_eq!(interrupts, 1);
+            let second = read_one(&backend, "SELECT 2").await;
+            assert_eq!(second[0].get_i64(0).unwrap(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dropping_the_guard_while_the_statement_runs_interrupts_it_once() {
+            // Arrange
+            let mut held = HeldRead::start(2).await;
+
+            // Act
+            held.drop_then_release().await;
+
+            // Assert
+            assert_eq!(next_event(&mut held.events).await, ReadEvent::Interrupted);
+            assert_eq!(held.backend.hooks.interrupt_count(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_read_dropped_before_it_starts_is_skipped_and_interrupts_once() {
+            // Arrange
+            let (_dir, mut backend) = file_backend_at("early.db", 1).await;
+            let mut events = backend.hooks.events();
+            let start = backend.hooks.arm_start_barrier();
+            let backend = Arc::new(backend);
+            let mut read = spawn_read(&backend, BOUNDED_SQL);
+            assert_eq!(next_event(&mut events).await, ReadEvent::AtStart);
+
+            // Act
+            let dropped = drop_read(&mut read).await;
+            release(&start);
+
+            // Assert
+            assert!(dropped, "the read future was not dropped");
+            assert_eq!(next_event(&mut events).await, ReadEvent::Skipped);
+            assert_eq!(backend.hooks.interrupt_count(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_panicking_read_returns_an_error_and_its_connection() {
+            // Arrange
+            let (_dir, backend) = file_backend_at("panic.db", 2).await;
+            backend.hooks.arm_panic();
+            let backend = Arc::new(backend);
+
+            // Act
+            let result = guarded("the read", spawn_read(&backend, "SELECT 1"))
+                .await
+                .expect("the panic does not escape the read");
+
+            // Assert
+            assert!(result.is_err(), "the panicking read returned rows");
+            wait_for_idle(&backend, 2).await;
+            let next = read_one(&backend, "SELECT 2").await;
+            assert_eq!(next[0].get_i64(0).unwrap(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_guard_dropped_after_a_panicking_read_does_not_interrupt() {
+            // Arrange
+            let (_dir, backend) = file_backend_at("panic_guard.db", 1).await;
+            backend.hooks.arm_panic();
+            let backend = Arc::new(backend);
+
+            // Act
+            let result = guarded("the read", backend.query("SELECT 1", &[])).await;
+
+            // Assert
+            assert!(result.is_err(), "the panicking read returned rows");
+            assert_eq!(backend.hooks.interrupt_count(), 0);
+            let next = read_one(&backend, "SELECT 2").await;
+            assert_eq!(next[0].get_i64(0).unwrap(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_read_waits_for_a_connection_when_every_permit_is_held() {
+            // Arrange
+            let mut held = HeldRead::start(1).await;
+            let mut waiting = spawn_read(&held.backend, "SELECT 2");
+
+            // Act
+            let timed_out = tokio::time::timeout(Duration::from_millis(200), &mut waiting)
+                .await
+                .is_err();
+            waiting.abort();
+            held.drop_then_release().await;
+
+            // Assert
+            assert!(timed_out, "the read finished without a free connection");
+            wait_for_idle(&held.backend, 1).await;
+        }
+
+        struct WindowRun {
+            interrupts: usize,
+            outcome: ReadEvent,
+            rows_written: i64,
+        }
+
+        /// A bounded read whose statement has ended but whose lease has not
+        /// dropped; its guard drops there, then a write runs.
+        async fn drop_guard_in_the_statement_end_window(single_connection: bool) -> WindowRun {
+            let dir = TempDir::new().expect("create temp dir");
+            let file = dir.path().join("window_write.db");
+            let file = file.to_str().expect("utf8 path");
+            let path = if single_connection {
+                format!("file:{file}")
+            } else {
+                file.to_owned()
+            };
+            let mut backend = LibsqlBackend::open(&path, 2).await.expect("open backend");
+            backend
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .await
+                .expect("create table");
+            let mut events = backend.hooks.events();
+            let finish = backend.hooks.arm_finish_barrier();
+            let backend = Arc::new(backend);
+            let mut read = spawn_read(&backend, BOUNDED_SQL);
+            assert_eq!(next_event(&mut events).await, ReadEvent::StatementEnded);
+
+            drop_read(&mut read).await;
+            let interrupts = backend.hooks.interrupt_count();
+            release(&finish);
+            let outcome = next_event(&mut events).await;
+            let writer = backend.clone();
+            guarded(
+                "the write",
+                tokio::spawn(
+                    async move { writer.execute("INSERT INTO t (id) VALUES (1)", &[]).await },
+                ),
+            )
+            .await
+            .expect("write task did not panic")
+            .expect("write succeeded");
+            let rows = read_one(&backend, "SELECT COUNT(*) FROM t").await;
+
+            WindowRun {
+                interrupts,
+                outcome,
+                rows_written: rows[0].get_i64(0).unwrap(),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_single_connection_store_never_interrupts_a_read() {
+            // Arrange and Act
+            let run = drop_guard_in_the_statement_end_window(true).await;
+
+            // Assert
+            assert_eq!(run.interrupts, 0);
+            assert_eq!(run.outcome, ReadEvent::Ran);
+            assert_eq!(run.rows_written, 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_pooled_store_interrupts_in_the_same_window_as_a_control() {
+            // Arrange and Act
+            let run = drop_guard_in_the_statement_end_window(false).await;
+
+            // Assert
+            assert_eq!(run.interrupts, 1);
+            assert_eq!(run.rows_written, 1);
+        }
     }
 }
