@@ -9,7 +9,7 @@ All notable changes to LIAM are recorded here. The format follows
 ### Changed
 
 - `recall` now reranks a wider pool of candidates (twice `k`, at least 16, at most 32) before it cuts to `k`, so
-  a relevant hit ranked below `k` by retrieval can reach the top. A `k` over 32 now returns 32.
+  a relevant hit ranked below `k` by retrieval can reach the top. A `k` over 32 now returns 32, and `k = 0` now returns 1 hit.
 - `ask` now reranks a wider pool of candidates before it cuts, so a relevant hit ranked below `k` by retrieval can
   reach the evidence. The evidence stays `k` hits plus at most 3 summaries.
 - The pinned `llama-server` is now llama.cpp `b12173` (was `b11860`). The launch flags, environment variables and the

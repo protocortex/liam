@@ -41,13 +41,20 @@ impl Llm for SpyLlm {
 }
 
 async fn server_with(llm: Arc<dyn Llm>) -> MemoryServer {
+    server_with_reranker(llm, Arc::new(liam_model::IdentityReranker)).await
+}
+
+async fn server_with_reranker(
+    llm: Arc<dyn Llm>,
+    reranker: Arc<dyn liam_model::Reranker>,
+) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .unwrap();
     MemoryServer::new(
         Arc::new(store),
         Arc::new(MockEmbedder::new(DIMS)),
-        Arc::new(liam_model::IdentityReranker),
+        reranker,
         llm,
         30,
         false,
@@ -234,6 +241,61 @@ async fn an_infer_ask_keeps_k_store_hits_and_every_matching_summary() {
     // Assert
     let prompt = llm.prompt.lock().unwrap().clone();
     assert_eq!(evidence_counts(&prompt), (ASK_K, SUMMARY_CAP), "{prompt}");
+}
+
+/// Ranks every summary first, then the last store hit retrieval returned, then
+/// the other hits. Candidates list the `FACT_COUNT` store hits before the
+/// summaries, so position tells them apart.
+struct SummaryThenLastHitReranker;
+
+#[async_trait::async_trait]
+impl liam_model::Reranker for SummaryThenLastHitReranker {
+    async fn scores(&self, _q: &str, docs: &[String]) -> liam_model::Result<Vec<f32>> {
+        Ok((0..docs.len())
+            .map(|i| match i {
+                i if i >= FACT_COUNT => 2.0,
+                i if i == FACT_COUNT - 1 => 1.0,
+                _ => 0.0,
+            })
+            .collect())
+    }
+}
+
+/// The store-hit lines of the model's prompt, in order.
+fn fact_lines(prompt: &str) -> Vec<String> {
+    prompt
+        .lines()
+        .filter(|l| l.contains("] (fact) "))
+        .map(|l| l.split_once(' ').map_or("", |(_, rest)| rest).to_string())
+        .collect()
+}
+
+async fn ask_prompt(reranker: Arc<dyn liam_model::Reranker>) -> String {
+    let llm = Arc::new(SpyLlm::default());
+    let server = server_with_reranker(llm.clone(), reranker).await;
+    seed_facts(&server, FACT_COUNT).await;
+    seed_summaries(&server, SUMMARY_CAP).await;
+    let args = AskArgs {
+        k: Some(ASK_K),
+        ..ask_args(None)
+    };
+    server.ask(Parameters(args)).await;
+    let prompt = llm.prompt.lock().unwrap().clone();
+    prompt
+}
+
+#[tokio::test]
+async fn an_infer_ask_keeps_a_reranked_up_hit_alongside_a_top_ranked_summary() {
+    // Arrange
+    let retrieval_kept = fact_lines(&ask_prompt(Arc::new(liam_model::IdentityReranker)).await);
+
+    // Act
+    let prompt = ask_prompt(Arc::new(SummaryThenLastHitReranker)).await;
+
+    // Assert: still k hits and every summary, and the hit retrieval ranked
+    // last displaced one that retrieval kept
+    assert_eq!(evidence_counts(&prompt), (ASK_K, SUMMARY_CAP), "{prompt}");
+    assert_ne!(fact_lines(&prompt), retrieval_kept, "{prompt}");
 }
 
 #[tokio::test]

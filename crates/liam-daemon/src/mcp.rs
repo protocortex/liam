@@ -6140,10 +6140,12 @@ mod tests {
     async fn a_narrow_query_is_a_subset_of_a_wide_one_for_equal_facts() {
         // Arrange: thirty facts of equal confidence
         let store = open_store().await;
-        for index in 0..30 {
+        const FACT_COUNT: usize = 30;
+        const NARROW_K: usize = 3;
+        for index in 0..FACT_COUNT {
             insert_fact(&store, &format!("note {index}"), "the zorbnax gadget").await;
         }
-        let narrow_k = 3;
+        let narrow_k = NARROW_K;
 
         // Act
         let narrow = store
@@ -6156,6 +6158,7 @@ mod tests {
             .unwrap();
 
         // Assert
+        assert_eq!(narrow.iter().filter(|h| !h.expanded).count(), narrow_k);
         for hit in narrow.iter().filter(|h| !h.expanded) {
             assert!(wide.iter().any(|w| w.hit.id == hit.hit.id));
         }

@@ -30,11 +30,11 @@ pub fn clamp_ask_k(k: Option<usize>) -> usize {
 /// candidate goes through a cross-encoder whose cost is linear in documents, so
 /// an unbounded `k` would make one call arbitrarily slow.
 const DEFAULT_RECALL_K: usize = 8;
-const MAX_RECALL_K: usize = 32;
+const MAX_RECALL_K: usize = MAX_ASK_EVIDENCE;
 
 /// Smallest and largest candidate pool `recall` reranks before cutting to `k`.
 const RERANK_POOL_FLOOR: usize = 16;
-const RERANK_POOL_CAP: usize = 32;
+const RERANK_POOL_CAP: usize = MAX_RECALL_K;
 
 /// Resolve the caller's `k` into `1..=MAX_RECALL_K`, defaulting to
 /// `DEFAULT_RECALL_K`. `k = 0` would return nothing for a query the store can
