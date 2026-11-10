@@ -24,7 +24,8 @@ All notable changes to LIAM are recorded here. The format follows
   reach the evidence. The evidence stays `k` hits plus at most 3 summaries.
 - One slow read no longer blocks other clients' reads: each read takes its own connection from the pool and waits for a
   free one when all are busy. A read that is dropped before it finishes now stops its SQLite statement and returns its
-  connection to the pool.
+  connection to the pool. A cancelled read also stops at its next row. Single-connection stores (in-memory and `file:`
+  paths) share one connection with the writer, so they now run one read at a time.
 - The pinned `llama-server` is now llama.cpp `b12173` (was `b11860`). The launch flags, environment variables and the
   `/v1/chat/completions` contract the extraction sidecar relies on are unchanged.
 - The `local`, `llama`, `hosted` and `backend-libsql` build flags are removed. Every build now

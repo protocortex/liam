@@ -24,6 +24,9 @@ impl ReadHooks {
     pub(super) fn at_start(&self) {}
 
     #[inline]
+    pub(super) fn before_step(&self) {}
+
+    #[inline]
     pub(super) fn take_panic(&self) -> bool {
         false
     }
@@ -71,6 +74,9 @@ mod test_hooks {
         Started,
         /// The blocking task is parked before its cancelled check.
         AtStart,
+        /// The task is parked before a row step, after its cancelled check
+        /// at the start.
+        BeforeStep,
         /// The statement is over and the task is parked before its lease drops.
         StatementEnded,
         Ran,
@@ -96,6 +102,7 @@ mod test_hooks {
         /// One shot, like `hold`: the first read to reach the point takes it.
         start_barrier: Mutex<Option<Arc<Barrier>>>,
         finish_barrier: Mutex<Option<Arc<Barrier>>>,
+        step_barrier: Mutex<Option<Arc<Barrier>>>,
         panic_next: AtomicBool,
         interrupts: AtomicUsize,
     }
@@ -109,6 +116,7 @@ mod test_hooks {
                     held: AtomicBool::new(false),
                     start_barrier: Mutex::new(None),
                     finish_barrier: Mutex::new(None),
+                    step_barrier: Mutex::new(None),
                     panic_next: AtomicBool::new(false),
                     interrupts: AtomicUsize::new(0),
                 }),
@@ -135,6 +143,13 @@ mod test_hooks {
 
         pub(in crate::backends) fn arm_finish_barrier(&self) -> Arc<Barrier> {
             Self::arm(&self.shared.finish_barrier)
+        }
+
+        /// Parks the next read before its first row step. The row cap is armed
+        /// too, so a read that is not stopped cannot run away.
+        pub(in crate::backends) fn arm_step_barrier(&self) -> Arc<Barrier> {
+            self.shared.held.store(true, Ordering::SeqCst);
+            Self::arm(&self.shared.step_barrier)
         }
 
         fn arm(slot: &Mutex<Option<Arc<Barrier>>>) -> Arc<Barrier> {
@@ -169,6 +184,19 @@ mod test_hooks {
                 .take();
             if let Some(barrier) = barrier {
                 self.send(ReadEvent::AtStart);
+                barrier.wait();
+            }
+        }
+
+        pub(in crate::backends) fn before_step(&self) {
+            let barrier = self
+                .shared
+                .step_barrier
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(barrier) = barrier {
+                self.send(ReadEvent::BeforeStep);
                 barrier.wait();
             }
         }

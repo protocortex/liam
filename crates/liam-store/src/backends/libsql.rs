@@ -32,10 +32,9 @@ use read_hooks::ReadHooks;
 /// correct, not a parameter nobody can set yet.
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
-/// The smallest read pool `open` will ever build. `reader()` computes `%
-/// self.read_pool.len()`, an integer division whose divisor must never be
-/// zero, so a configured `read_pool_size` of 0 is floored to this instead
-/// of producing an empty pool.
+/// The smallest read pool `open` will ever build. A semaphore with zero
+/// permits would block every read forever, so a configured `read_pool_size`
+/// of 0 is floored to this instead of producing an empty pool.
 const MIN_READ_POOL_SIZE: usize = 1;
 
 /// The vector table has no cascade from `nodes`, so a node's vector is deleted
@@ -209,6 +208,12 @@ impl Drop for CancelGuard {
 
 /// The blocking half of a read: runs on a blocking thread and owns the lease
 /// until the rows are collected.
+///
+/// SQLite clears a pending interrupt when a statement is prepared and at the
+/// first step, so a cancel that lands in between would be lost. The
+/// cancelled flag is therefore checked before the first step and before
+/// every row; only a cancel that lands between the last check and a step
+/// can still let that one step run.
 fn read_blocking(
     lease: ReadLease,
     runtime: &Handle,
@@ -231,7 +236,7 @@ fn read_blocking(
             .await
             .map_err(err);
         match rows {
-            Ok(rows) => read_rows(rows, hooks).await,
+            Ok(rows) => read_rows_until(rows, hooks, || lease.is_cancelled()).await,
             Err(e) => {
                 let failed = Err(e);
                 hooks.outcome(&failed);
@@ -311,10 +316,9 @@ async fn configure_connection(conn: &Connection) -> Result<()> {
 /// crate cannot be sure is not one, would open an unrelated, empty
 /// database rather than another handle onto the same one.
 ///
-/// Callers must pass a `read_pool_size` of at least 1: `reader()` picks a
-/// connection with `% self.read_pool.len()`, which panics on an empty pool.
-/// `open` enforces that floor before calling this, so it is not repeated
-/// here.
+/// Callers must pass a `read_pool_size` of at least 1: an empty pool has no
+/// permits, so every read would wait forever. `open` enforces that floor
+/// before calling this, so it is not repeated here.
 async fn open_read_pool(db: &Database, read_pool_size: usize) -> Result<Vec<Connection>> {
     let mut pool = Vec::with_capacity(read_pool_size);
     for _ in 0..read_pool_size {
@@ -349,17 +353,40 @@ fn bind(params: &[Value]) -> Vec<libsql::Value> {
     params.iter().map(to_libsql).collect()
 }
 
-async fn read_rows(mut rows: libsql::Rows, hooks: &ReadHooks) -> Result<Vec<Row>> {
-    let result = collect_rows(&mut rows, hooks).await;
+async fn read_rows(rows: libsql::Rows, hooks: &ReadHooks) -> Result<Vec<Row>> {
+    read_rows_until(rows, hooks, || false).await
+}
+
+/// Collects every row, stopping with an interrupted error as soon as
+/// `cancelled` reports true before a step.
+async fn read_rows_until(
+    mut rows: libsql::Rows,
+    hooks: &ReadHooks,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<Row>> {
+    let result = collect_rows(&mut rows, hooks, cancelled).await;
     hooks.statement_ended();
     hooks.outcome(&result);
     result
 }
 
-async fn collect_rows(rows: &mut libsql::Rows, hooks: &ReadHooks) -> Result<Vec<Row>> {
+async fn collect_rows(
+    rows: &mut libsql::Rows,
+    hooks: &ReadHooks,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<Row>> {
     let cols = rows.column_count();
     let mut out = Vec::new();
-    while let Some(row) = rows.next().await.map_err(err)? {
+    loop {
+        hooks.before_step();
+        if cancelled() {
+            return Err(Error::Backend(
+                "the read was interrupted: its caller is gone".to_owned(),
+            ));
+        }
+        let Some(row) = rows.next().await.map_err(err)? else {
+            break;
+        };
         let mut values = Vec::with_capacity(cols as usize);
         for i in 0..cols {
             values.push(from_libsql(row.get_value(i).map_err(err)?));
@@ -738,7 +765,9 @@ impl<'a> BackendTx for LibsqlTx<'a> {
 }
 
 impl LibsqlBackend {
-    /// Runs one read on a pooled connection, on a blocking thread. If the
+    /// Runs one read on a pooled connection, on a blocking thread. A store
+    /// that shares one connection with its writer (in-memory and `file:`
+    /// paths) has a pool of one, so its reads run one at a time. If the
     /// caller drops this future, the guard interrupts the running statement
     /// and the connection goes back to the pool once the thread unwinds.
     async fn read(&self, sql: String, params: Vec<libsql::Value>) -> Result<Vec<Row>> {
@@ -1113,9 +1142,9 @@ mod tests {
     }
 
     /// A configured `read_pool_size` of 0 must not produce an empty pool:
-    /// `reader()` computes `% self.read_pool.len()`, which panics on divide
-    /// by zero the moment any query runs. `open` floors the size at 1, so
-    /// this proves the floor rather than merely that `open` did not panic.
+    /// A pool with no connections has no permits, so the first read would
+    /// wait forever. `open` floors the size at 1, so this proves the floor
+    /// rather than merely that `open` did not panic.
     #[tokio::test]
     async fn a_read_pool_size_of_zero_is_floored_to_one_connection() {
         // Given a configured read_pool_size of 0
@@ -1577,17 +1606,62 @@ mod tests {
             // Arrange
             let mut held = HeldRead::start(1).await;
             let mut waiting = spawn_read(&held.backend, "SELECT 2");
-
-            // Act
             let timed_out = tokio::time::timeout(Duration::from_millis(200), &mut waiting)
                 .await
                 .is_err();
-            waiting.abort();
+
+            // Act
             held.drop_then_release().await;
+            let rows = guarded("the waiting read", waiting)
+                .await
+                .expect("read task did not panic")
+                .expect("read succeeded");
 
             // Assert
             assert!(timed_out, "the read finished without a free connection");
+            assert_eq!(rows[0].get_i64(0).unwrap(), 2);
             wait_for_idle(&held.backend, 1).await;
+        }
+
+        /// Parks an unbounded read between its start check and its first
+        /// step, drops its guard there, releases it, and returns how it ended.
+        async fn drop_guard_before_the_first_step(path_prefix: &str) -> ReadEvent {
+            let dir = TempDir::new().expect("create temp dir");
+            let file = dir.path().join("first_step.db");
+            let path = format!("{path_prefix}{}", file.to_str().expect("utf8 path"));
+            let mut backend = LibsqlBackend::open(&path, 2).await.expect("open backend");
+            let mut events = backend.hooks.events();
+            let step = backend.hooks.arm_step_barrier();
+            let backend = Arc::new(backend);
+            let mut read = spawn_read(&backend, UNBOUNDED_SQL);
+            assert_eq!(next_event(&mut events).await, ReadEvent::BeforeStep);
+
+            let dropped = drop_read(&mut read).await;
+            release(&step);
+
+            assert!(dropped, "the read future was not dropped");
+            next_event(&mut events).await
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_guard_dropped_before_the_first_step_stops_the_read() {
+            // Arrange and Act
+            let outcome = drop_guard_before_the_first_step("").await;
+
+            // Assert
+            assert!(
+                matches!(outcome, ReadEvent::Interrupted | ReadEvent::Skipped),
+                "the read ran on after its guard dropped: {outcome:?}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_single_connection_read_stops_at_the_next_row_when_its_caller_is_gone() {
+            // Arrange and Act
+            let outcome = drop_guard_before_the_first_step("file:").await;
+
+            // Assert
+            assert_eq!(outcome, ReadEvent::Interrupted);
         }
 
         struct WindowRun {
