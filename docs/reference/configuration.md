@@ -11,6 +11,7 @@ unknown key fails loudly.
 | `database_path` | `liam.db` | The libSQL file. |
 | `log_filter` | `info,liam=debug` | tracing filter. `RUST_LOG` overrides it. |
 | `embedding_dims` | `384` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see [The embedder fingerprint](../concepts/embedder-fingerprint.md)). |
+| `recall_timeout_secs` | `10` | Seconds `recall` and `ask` may spend retrieving (embedding, store query, summaries). Past it they reply `retrieval took longer than N s`. A reranker that is still running at the deadline is dropped and the hits come back in store order. A value of `0` is read as `1`. Worst-case `ask` wall time is `recall_timeout_secs` plus `ask_timeout_secs`. |
 | `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. |
 | `gc.interval_hours` | `6` | Sweep interval. |
 | `gc.reclaim` | `true` | Run incremental vacuum after a sweep. |

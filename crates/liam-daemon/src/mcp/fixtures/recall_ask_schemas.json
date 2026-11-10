@@ -1,0 +1,126 @@
+{
+  "ask": {
+    "$defs": {
+      "Mode": {
+        "description": "What a read may return. Strict returns only what a client recorded; infer\nmay also return what a model composed from it, each item labelled.",
+        "enum": [
+          "strict",
+          "infer"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "as_of": {
+        "description": "Optional point-in-time recall, epoch milliseconds. Omitted means\n\"now\"; a past instant retrieves the version of each subject that was\nlive then.",
+        "format": "int64",
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "k": {
+        "format": "uint",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "kind": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "mode": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Mode"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "`infer` (the default) may compose the answer from entity pages and\nsummaries as well as recorded memory and labels what it used. `strict`\nreturns recorded evidence only and makes no model call."
+      },
+      "question": {
+        "type": "string"
+      },
+      "scope": {
+        "description": "Optional partition filter; matches memories written with this scope\nor any descendant scope (for example `work` also matches\n`work/liam`, but not `work-archive`). Trimmed; rejected if empty\nafter trimming, over 200 characters, contains a character outside\nASCII letters, digits, `-`, `_`, `/`, or has a leading/trailing `/`\nor an empty segment (`//`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "question"
+    ],
+    "type": "object"
+  },
+  "recall": {
+    "$defs": {
+      "Mode": {
+        "description": "What a read may return. Strict returns only what a client recorded; infer\nmay also return what a model composed from it, each item labelled.",
+        "enum": [
+          "strict",
+          "infer"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "as_of": {
+        "description": "Optional point-in-time recall, epoch milliseconds. Omitted means\n\"now\"; a past instant surfaces the version of each subject that was\nlive then.",
+        "format": "int64",
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "k": {
+        "format": "uint",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "kind": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "mode": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Mode"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Only `strict` is supported: recall returns recorded memory."
+      },
+      "query": {
+        "type": "string"
+      },
+      "scope": {
+        "description": "Optional partition filter; matches memories written with this scope\nor any descendant scope (for example `work` also matches\n`work/liam`, but not `work-archive`). Trimmed; rejected if empty\nafter trimming, over 200 characters, contains a character outside\nASCII letters, digits, `-`, `_`, `/`, or has a leading/trailing `/`\nor an empty segment (`//`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "type": "object"
+  }
+}

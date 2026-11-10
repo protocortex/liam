@@ -6,6 +6,13 @@ All notable changes to LIAM are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `recall_timeout_secs` (default `10`) bounds how long `recall` and `ask` spend retrieving. Past it they reply
+  with a timeout, and a reranker still running at the deadline gives way to the hits in store order. Cancelling a
+  request now stops it with a `cancelled` reply. A call that gave up waiting for the reranker no longer runs
+  after the busy call finishes.
+
 ### Changed
 
 - `recall` and `ask` now reject an empty, whitespace-only or NUL-containing query and one over 4000 characters

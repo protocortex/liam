@@ -60,6 +60,8 @@ pub struct Config {
     pub llm: LlmConfig,
     /// Wall-clock cap on `ask` synthesis before falling back to ranked evidence.
     pub ask_timeout_secs: u64,
+    /// Seconds `recall` and `ask` may spend retrieving before they answer with a timeout.
+    pub recall_timeout_secs: u64,
     /// Whether `ask` runs a yes/no sufficiency pre-pass before synthesizing. On
     /// by default: without it no local model tested will decline to answer a
     /// question its evidence cannot answer. Costs one extra short model call per
@@ -218,6 +220,7 @@ impl Default for Config {
             embedder: EmbedderConfig::default(),
             llm: LlmConfig::default(),
             ask_timeout_secs: 30,
+            recall_timeout_secs: 10,
             ask_sufficiency_check: true,
             socket_path: "~/.liam/liamd.sock".into(),
             read_pool_size: 4,
@@ -564,6 +567,31 @@ mod tests {
         ));
         std::fs::write(&path, contents).expect("write temp config fixture");
         path
+    }
+
+    #[test]
+    fn recall_timeout_defaults_to_ten_seconds() {
+        // Arrange
+        let path = write_temp_toml("");
+
+        // Act
+        let c = Config::load(&path).expect("empty config parses");
+
+        // Assert
+        assert_eq!(Config::default().recall_timeout_secs, 10);
+        assert_eq!(c.recall_timeout_secs, 10);
+    }
+
+    #[test]
+    fn an_explicit_recall_timeout_round_trips() {
+        // Arrange
+        let path = write_temp_toml("recall_timeout_secs = 3\n");
+
+        // Act
+        let c = Config::load(&path).expect("config with the key parses");
+
+        // Assert
+        assert_eq!(c.recall_timeout_secs, 3);
     }
 
     #[test]

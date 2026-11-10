@@ -11,6 +11,8 @@ mod admin;
 #[cfg(test)]
 mod admin_tests;
 mod consolidate;
+#[cfg(test)]
+mod deadline_tests;
 mod delete;
 pub mod facts;
 pub mod feedback;
@@ -433,6 +435,8 @@ pub struct MemoryServer {
     /// Wall-clock deadline for the WHOLE `ask` request (permit acquire,
     /// sufficiency pre-pass, `ask`'s own synthesis); `synthesize_entity` shares it too.
     ask_timeout_secs: u64,
+    /// Seconds `recall` and `ask` may spend retrieving; see `retrieval_deadline`.
+    recall_timeout_secs: u64,
     /// Whether `ask` runs the yes/no sufficiency pre-pass before synthesizing;
     /// see `config::Config::ask_sufficiency_check`.
     ask_sufficiency_check: bool,
@@ -560,6 +564,85 @@ impl Drop for PermitTimer {
     }
 }
 
+/// Server default for the retrieval deadline, matching the config default.
+const DEFAULT_RECALL_TIMEOUT_SECS: u64 = 10;
+
+/// Least time worth giving the reranker; below it retrieval keeps store order.
+const MIN_RERANK_BUDGET: Duration = Duration::from_millis(200);
+
+/// Why a retrieval stage stopped before it finished.
+enum Interrupted {
+    Deadline,
+    Cancelled,
+}
+
+fn cancelled_reply(tool: &str) -> String {
+    format!("{tool} cancelled")
+}
+
+/// Races `work` against the deadline and the caller's cancel token.
+async fn until_interrupted<T>(
+    deadline: tokio::time::Instant,
+    cancel: &CancellationToken,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, Interrupted> {
+    tokio::select! {
+        out = work => Ok(out),
+        _ = tokio::time::sleep_until(deadline) => Err(Interrupted::Deadline),
+        _ = cancel.cancelled() => Err(Interrupted::Cancelled),
+    }
+}
+
+impl MemoryServer {
+    /// The instant retrieval must finish by. `max(1)` keeps a configured `0`
+    /// from timing every request out at once.
+    fn retrieval_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(self.recall_timeout_secs.max(1))
+    }
+
+    fn interruption_reply(&self, tool: &str, why: Interrupted) -> String {
+        match why {
+            Interrupted::Deadline => format!(
+                "{tool} failed: retrieval took longer than {} s",
+                self.recall_timeout_secs.max(1)
+            ),
+            Interrupted::Cancelled => cancelled_reply(tool),
+        }
+    }
+
+    /// Reranks `docs`. When the reranker fails, is skipped for lack of time,
+    /// or outlasts the deadline, returns store order. `Err` is the cancel reply.
+    async fn rerank_within(
+        &self,
+        tool: &str,
+        query: &str,
+        docs: &[String],
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<usize>, String> {
+        let store_order = || (0..docs.len()).collect();
+        if deadline.saturating_duration_since(tokio::time::Instant::now()) < MIN_RERANK_BUDGET {
+            tracing::warn!(
+                tool,
+                "too little retrieval time left, skipping the reranker"
+            );
+            return Ok(store_order());
+        }
+        match until_interrupted(deadline, cancel, self.reranker.order(query, docs)).await {
+            Ok(Ok(order)) => Ok(order),
+            Ok(Err(e)) => {
+                tracing::warn!(tool, error = %e, "answered from unreranked evidence");
+                Ok(store_order())
+            }
+            Err(Interrupted::Deadline) => {
+                tracing::warn!(tool, "reranker outlasted the retrieval deadline");
+                Ok(store_order())
+            }
+            Err(Interrupted::Cancelled) => Err(cancelled_reply(tool)),
+        }
+    }
+}
+
 #[tool_router]
 impl MemoryServer {
     // Each argument is a distinct config field threaded straight through, the
@@ -587,6 +670,7 @@ impl MemoryServer {
             reranker,
             llm,
             ask_timeout_secs,
+            recall_timeout_secs: DEFAULT_RECALL_TIMEOUT_SECS,
             ask_sufficiency_check,
             ask_context_tokens,
             max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
@@ -613,6 +697,12 @@ impl MemoryServer {
     /// Ties this server to the daemon's shutdown token.
     pub(crate) fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
         self.shutdown = shutdown;
+        self
+    }
+
+    /// Sets the seconds `recall` and `ask` may spend retrieving.
+    pub(crate) fn with_recall_timeout(mut self, secs: u64) -> Self {
+        self.recall_timeout_secs = secs;
         self
     }
 
@@ -1135,8 +1225,24 @@ impl MemoryServer {
 
     // `pub(crate)` so the tool-eval grounding harness (see `tool_eval.rs`) drives
     // the same code path an MCP client hits, rather than a re-implementation of it.
-    #[tool(description = "Retrieve relevant long-term memory, reranked for precision.")]
+    #[tool(
+        name = "recall",
+        description = "Retrieve relevant long-term memory, reranked for precision."
+    )]
+    async fn recall_tool(
+        &self,
+        Parameters(args): Parameters<RecallArgs>,
+        cancel: CancellationToken,
+    ) -> String {
+        self.recall_with(args, cancel).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
+        self.recall_with(args, CancellationToken::new()).await
+    }
+
+    pub(crate) async fn recall_with(&self, args: RecallArgs, cancel: CancellationToken) -> String {
         let _timer = self.time(Tool::Recall);
         if let Err(refusal) = require_strict("recall", args.mode) {
             return refusal;
@@ -1144,20 +1250,28 @@ impl MemoryServer {
         if let Some(problem) = query_problem(&args.query) {
             return format!("recall failed: {problem}");
         }
-        let embedding = self.embedder.embed(&args.query, TextKind::Query).await.ok();
+        if cancel.is_cancelled() {
+            return cancelled_reply("recall");
+        }
+        let deadline = self.retrieval_deadline();
         let k = crate::ask::clamp_recall_k(args.k);
-        let q = build_query(
-            &lexical_text(&args.query),
-            Some(crate::ask::rerank_pool(k)),
-            args.kind,
-            args.scope,
-            embedding,
-            args.as_of,
-            false,
-        );
-        let hits = match self.explained(&q).await {
-            Ok(h) => h,
-            Err(e) => return format!("recall failed: {e}"),
+        let retrieve = async {
+            let embedding = self.embedder.embed(&args.query, TextKind::Query).await.ok();
+            let q = build_query(
+                &lexical_text(&args.query),
+                Some(crate::ask::rerank_pool(k)),
+                args.kind,
+                args.scope,
+                embedding,
+                args.as_of,
+                false,
+            );
+            self.explained(&q).await
+        };
+        let hits = match until_interrupted(deadline, &cancel, retrieve).await {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => return format!("recall failed: {e}"),
+            Err(why) => return self.interruption_reply("recall", why),
         };
         if hits.is_empty() {
             return "no relevant memory".to_string();
@@ -1166,11 +1280,13 @@ impl MemoryServer {
             .iter()
             .map(|h| h.hit.retrieved.as_text().to_string())
             .collect();
-        let order = self
-            .reranker
-            .order(&args.query, &docs)
+        let order = match self
+            .rerank_within("recall", &args.query, &docs, deadline, &cancel)
             .await
-            .unwrap_or_else(|_| (0..hits.len()).collect());
+        {
+            Ok(order) => order,
+            Err(reply) => return reply,
+        };
         let order = &order[..order.len().min(k)];
         // Usage and handles cover only the hits returned, not the wider pool.
         self.record_usage(
@@ -1503,38 +1619,67 @@ impl MemoryServer {
 
     // `pub(crate)` so the grounding eval (see `eval.rs`) drives the same code
     // path an MCP client hits, rather than a re-implementation of it.
-    #[tool(description = "Answer a question from long-term memory, synthesized and cited.")]
+    #[tool(
+        name = "ask",
+        description = "Answer a question from long-term memory, synthesized and cited."
+    )]
+    async fn ask_tool(
+        &self,
+        Parameters(args): Parameters<AskArgs>,
+        cancel: CancellationToken,
+    ) -> String {
+        self.ask_with(args, cancel).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
+        self.ask_with(args, CancellationToken::new()).await
+    }
+
+    pub(crate) async fn ask_with(&self, args: AskArgs, cancel: CancellationToken) -> String {
         let _timer = self.time(Tool::Ask);
         if let Some(problem) = query_problem(&args.question) {
             return format!("ask failed: {problem}");
         }
+        if cancel.is_cancelled() {
+            return cancelled_reply("ask");
+        }
+        let retrieval_deadline = self.retrieval_deadline();
         let mode = args.mode.unwrap_or(Mode::Infer);
-        let embedding = self
-            .embedder
-            .embed(&args.question, TextKind::Query)
-            .await
-            .ok();
         let k = clamp_ask_k(args.k);
-        let q = build_query(
-            &lexical_text(&args.question),
-            Some(ask::rerank_pool(k)),
-            args.kind,
-            args.scope.clone(),
-            embedding.clone(),
-            args.as_of,
-            mode == Mode::Infer,
-        );
-        let hits = match self.explained(&q).await {
-            Ok(h) => h,
-            Err(e) => return format!("ask failed: {e}"),
+        let retrieve = async {
+            let embedding = self
+                .embedder
+                .embed(&args.question, TextKind::Query)
+                .await
+                .ok();
+            let q = build_query(
+                &lexical_text(&args.question),
+                Some(ask::rerank_pool(k)),
+                args.kind,
+                args.scope.clone(),
+                embedding.clone(),
+                args.as_of,
+                mode == Mode::Infer,
+            );
+            let hits = match self.explained(&q).await {
+                Ok(hits) => hits,
+                Err(e) => return Err(format!("ask failed: {e}")),
+            };
+            // Summaries are model-written, so only infer mode looks for them.
+            let summaries = match (&embedding, mode) {
+                (Some(question), Mode::Infer) => {
+                    summaries::matching(self, question, &args.scope, args.as_of).await
+                }
+                _ => Vec::new(),
+            };
+            Ok((hits, summaries))
         };
-        // Summaries are model-written, so only infer mode looks for them.
-        let summaries = match (&embedding, mode) {
-            (Some(question), Mode::Infer) => {
-                summaries::matching(self, question, &args.scope, args.as_of).await
-            }
-            _ => Vec::new(),
+        let (hits, summaries) = match until_interrupted(retrieval_deadline, &cancel, retrieve).await
+        {
+            Ok(Ok(found)) => found,
+            Ok(Err(reply)) => return reply,
+            Err(why) => return self.interruption_reply("ask", why),
         };
         if hits.is_empty() && summaries.is_empty() {
             return "no relevant memory".to_string();
@@ -1548,12 +1693,12 @@ impl MemoryServer {
             .iter()
             .map(|e| e.retrieved.as_text().to_string())
             .collect();
-        let order = match self.reranker.order(&args.question, &docs).await {
+        let order = match self
+            .rerank_within("ask", &args.question, &docs, retrieval_deadline, &cancel)
+            .await
+        {
             Ok(order) => order,
-            Err(e) => {
-                tracing::warn!(error = %e, "ask answered from unreranked evidence");
-                (0..docs.len()).collect()
-            }
+            Err(reply) => return reply,
         };
         // Candidates list the store hits first, so an index below `hit_count`
         // is a store hit. Keep k of them plus every summary.
@@ -8084,5 +8229,58 @@ mod tests {
         // Assert
         assert!(reported(&sink, MetricId::AskLatencyP50Ms));
         assert!(!reported(&sink, MetricId::RecallLatencyP50Ms));
+    }
+
+    /// Rewrites the recall and ask schema fixture from the live tool list.
+    /// Run it by hand with `--ignored` when an input schema changes on purpose.
+    #[tokio::test]
+    #[ignore = "writes the recall and ask schema fixture"]
+    async fn capture_recall_ask_schemas() {
+        // Arrange
+        let server = plain_server().await;
+
+        // Act
+        let schemas = recall_ask_schemas(&server);
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/mcp/fixtures/recall_ask_schemas.json"
+        );
+        std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_string_pretty(&schemas).unwrap() + "\n").unwrap();
+
+        // Assert
+        assert!(schemas["recall"].is_object() && schemas["ask"].is_object());
+    }
+
+    #[tokio::test]
+    async fn recall_and_ask_list_the_schemas_clients_already_rely_on() {
+        // Arrange
+        let server = plain_server().await;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("mcp/fixtures/recall_ask_schemas.json"))
+                .expect("fixture is JSON");
+
+        // Act
+        let listed = recall_ask_schemas(&server);
+
+        // Assert
+        assert_eq!(listed, fixture);
+    }
+
+    /// The `recall` and `ask` input schemas as listed by the server, by tool name.
+    fn recall_ask_schemas(server: &MemoryServer) -> serde_json::Value {
+        let tools = server.tool_router.list_all();
+        let mut out = serde_json::Map::new();
+        for name in ["recall", "ask"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} must be listed"));
+            out.insert(
+                name.to_string(),
+                serde_json::to_value(&tool.input_schema).unwrap(),
+            );
+        }
+        serde_json::Value::Object(out)
     }
 }
