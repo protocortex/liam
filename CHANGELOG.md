@@ -8,6 +8,8 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- `recall` now reranks a wider pool of candidates (twice `k`, at least 16, at most 32) before it cuts to `k`, so
+  a relevant hit ranked below `k` by retrieval can reach the top. A `k` over 32 now returns 32.
 - The pinned `llama-server` is now llama.cpp `b12173` (was `b11860`). The launch flags, environment variables and the
   `/v1/chat/completions` contract the extraction sidecar relies on are unchanged.
 - The `local`, `llama`, `hosted` and `backend-libsql` build flags are removed. Every build now

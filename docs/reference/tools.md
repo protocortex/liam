@@ -38,7 +38,7 @@ documented in the pages linked here:
 | `query` | yes | Text; embedded for the vector channel too. |
 | `kind` | no | Restrict to one kind. |
 | `scope` | no | Restrict to one partition. Same format as `remember`'s `scope`. |
-| `k` | no | How many hits to return (default 8). |
+| `k` | no | How many hits to return (default 8, range 1 to 32; larger values are clamped to 32). Recall reranks a pool of twice `k`, at least 16 and at most 32, then returns the top `k`. |
 
 `timeline` shows an entity's compiled page and the mentions behind it, most
 recent first.
