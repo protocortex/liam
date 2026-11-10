@@ -10,7 +10,8 @@ All notable changes to LIAM are recorded here. The format follows
 
 - `recall_timeout_secs` (default `10`) bounds how long `recall` and `ask` spend retrieving. Past it they reply
   with a timeout, and a reranker still running at the deadline gives way to the hits in store order. Cancelling a
-  request now stops it with a `cancelled` reply. A call that gave up waiting for the reranker no longer runs
+  request now stops retrieval with a `cancelled` reply; the `ask` model call that follows retrieval still runs
+  until `ask_timeout_secs`. A call that gave up waiting for the reranker no longer runs
   after the busy call finishes.
 
 ### Changed

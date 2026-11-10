@@ -315,9 +315,10 @@ async fn recall_skips_the_reranker_when_too_little_of_the_budget_is_left() {
 #[tokio::test(start_paused = true)]
 async fn recall_replies_cancelled_when_the_token_is_cancelled_during_the_rerank() {
     // Arrange
+    let reranker = SleepingReranker::new(SLOW);
     let server = server_with_models(
         SleepingEmbedder::new(Duration::ZERO),
-        SleepingReranker::new(SLOW),
+        reranker.clone(),
         Arc::new(MockLlm),
     )
     .await
@@ -331,6 +332,11 @@ async fn recall_replies_cancelled_when_the_token_is_cancelled_during_the_rerank(
 
     // Assert
     assert_eq!(out, "recall cancelled");
+    assert_eq!(
+        reranker.call_count(),
+        1,
+        "the cancel should land in the rerank"
+    );
 }
 
 #[tokio::test(start_paused = true)]

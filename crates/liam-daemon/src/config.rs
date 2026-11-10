@@ -220,7 +220,7 @@ impl Default for Config {
             embedder: EmbedderConfig::default(),
             llm: LlmConfig::default(),
             ask_timeout_secs: 30,
-            recall_timeout_secs: 10,
+            recall_timeout_secs: DEFAULT_RECALL_TIMEOUT_SECS,
             ask_sufficiency_check: true,
             socket_path: "~/.liam/liamd.sock".into(),
             read_pool_size: 4,
@@ -389,6 +389,9 @@ pub(crate) fn default_log_dir(database: &Path) -> PathBuf {
 /// Default vector width: Qwen3-Embedding-0.6B truncated to 384 dims (MRL). See
 /// `docs/specs/2026-11-06-embedder-speed-evaluation.md`.
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
+
+/// Default seconds `recall` and `ask` may spend retrieving.
+pub const DEFAULT_RECALL_TIMEOUT_SECS: u64 = 10;
 
 /// The config file read when neither `--config` nor `LIAM_CONFIG` says
 /// otherwise.

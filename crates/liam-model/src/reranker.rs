@@ -47,7 +47,7 @@ impl DocScorer for fastembed::TextRerank {
         let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
         let results = self
             .rerank(query, refs, false, None)
-            .map_err(|e| crate::error::ModelError::Rerank(e.to_string()))?;
+            .map_err(|e| ModelError::Rerank(e.to_string()))?;
         let mut scores = vec![0.0f32; docs.len()];
         for r in results {
             if r.index < docs.len() {
@@ -79,6 +79,7 @@ impl<S: DocScorer> Reranker for ModelReranker<S> {
         // The owned guard is taken before the blocking job exists, so a caller
         // that gives up waiting never queues a scorer run behind the lock.
         let mut model = self.model.clone().lock_owned().await;
+        // A scorer panic no longer poisons the lock: it surfaces as one error.
         tokio::task::spawn_blocking(move || model.score(&query, &docs))
             .await
             .map_err(|e| ModelError::Rerank(e.to_string()))?
@@ -98,7 +99,7 @@ impl FastEmbedReranker {
     /// Load the default cross-encoder reranker (a BGE reranker).
     pub fn load() -> Result<Self> {
         let model = fastembed::TextRerank::try_new(Default::default())
-            .map_err(|e| crate::error::ModelError::Rerank(e.to_string()))?;
+            .map_err(|e| ModelError::Rerank(e.to_string()))?;
         Ok(Self {
             inner: ModelReranker::new(model),
         })

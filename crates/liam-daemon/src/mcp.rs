@@ -55,7 +55,7 @@ use crate::ask::{
 use crate::clusters::{narrow_groups, render_clusters};
 use crate::config::{
     resolve_vocabulary, AdminConfig, ExtractionConfig, DEFAULT_MAX_BASIS_IDS_RENDERED,
-    DEFAULT_MIN_SUMMARY_SIMILARITY,
+    DEFAULT_MIN_SUMMARY_SIMILARITY, DEFAULT_RECALL_TIMEOUT_SECS,
 };
 use crate::consolidation_job::ConsolidationJob;
 use crate::deletion::DeletePreview;
@@ -432,8 +432,9 @@ pub struct MemoryServer {
     embedder: Arc<dyn Embedder>,
     reranker: Arc<dyn Reranker>,
     llm: Arc<dyn Llm>,
-    /// Wall-clock deadline for the WHOLE `ask` request (permit acquire,
-    /// sufficiency pre-pass, `ask`'s own synthesis); `synthesize_entity` shares it too.
+    /// Wall-clock deadline for the `ask` stages after retrieval (permit acquire,
+    /// sufficiency pre-pass, synthesis); `synthesize_entity` shares it too.
+    /// Retrieval has its own `recall_timeout_secs` budget.
     ask_timeout_secs: u64,
     /// Seconds `recall` and `ask` may spend retrieving; see `retrieval_deadline`.
     recall_timeout_secs: u64,
@@ -564,9 +565,6 @@ impl Drop for PermitTimer {
     }
 }
 
-/// Server default for the retrieval deadline, matching the config default.
-const DEFAULT_RECALL_TIMEOUT_SECS: u64 = 10;
-
 /// Least time worth giving the reranker; below it retrieval keeps store order.
 const MIN_RERANK_BUDGET: Duration = Duration::from_millis(200);
 
@@ -594,17 +592,16 @@ async fn until_interrupted<T>(
 }
 
 impl MemoryServer {
-    /// The instant retrieval must finish by. `max(1)` keeps a configured `0`
-    /// from timing every request out at once.
+    /// The instant retrieval must finish by.
     fn retrieval_deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::now() + Duration::from_secs(self.recall_timeout_secs.max(1))
+        tokio::time::Instant::now() + Duration::from_secs(self.recall_timeout_secs)
     }
 
     fn interruption_reply(&self, tool: &str, why: Interrupted) -> String {
         match why {
             Interrupted::Deadline => format!(
                 "{tool} failed: retrieval took longer than {} s",
-                self.recall_timeout_secs.max(1)
+                self.recall_timeout_secs
             ),
             Interrupted::Cancelled => cancelled_reply(tool),
         }
@@ -700,9 +697,10 @@ impl MemoryServer {
         self
     }
 
-    /// Sets the seconds `recall` and `ask` may spend retrieving.
+    /// Sets the seconds `recall` and `ask` may spend retrieving. Stored as at
+    /// least one, so a configured `0` cannot time every request out at once.
     pub(crate) fn with_recall_timeout(mut self, secs: u64) -> Self {
-        self.recall_timeout_secs = secs;
+        self.recall_timeout_secs = secs.max(1);
         self
     }
 
@@ -1237,19 +1235,20 @@ impl MemoryServer {
         self.recall_with(args, cancel).await
     }
 
+    // Test-only: the server routes through the token-taking wrapper above.
     #[cfg(test)]
     pub(crate) async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         self.recall_with(args, CancellationToken::new()).await
     }
 
     pub(crate) async fn recall_with(&self, args: RecallArgs, cancel: CancellationToken) -> String {
-        let _timer = self.time(Tool::Recall);
         if let Err(refusal) = require_strict("recall", args.mode) {
             return refusal;
         }
         if let Some(problem) = query_problem(&args.query) {
             return format!("recall failed: {problem}");
         }
+        let _timer = self.time(Tool::Recall);
         if cancel.is_cancelled() {
             return cancelled_reply("recall");
         }
@@ -1631,16 +1630,17 @@ impl MemoryServer {
         self.ask_with(args, cancel).await
     }
 
+    // Test-only: the server routes through the token-taking wrapper above.
     #[cfg(test)]
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
         self.ask_with(args, CancellationToken::new()).await
     }
 
     pub(crate) async fn ask_with(&self, args: AskArgs, cancel: CancellationToken) -> String {
-        let _timer = self.time(Tool::Ask);
         if let Some(problem) = query_problem(&args.question) {
             return format!("ask failed: {problem}");
         }
+        let _timer = self.time(Tool::Ask);
         if cancel.is_cancelled() {
             return cancelled_reply("ask");
         }
@@ -1739,7 +1739,8 @@ impl MemoryServer {
         // Every reply from here on shows these results, with their handles.
         self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
 
-        // One deadline for the whole request: the permit acquire, the
+        // One deadline for the stages after retrieval (retrieval has its own
+        // `recall_timeout_secs` budget): the permit acquire, the
         // sufficiency pre-pass, and synthesis below all race against this
         // same instant instead of each getting its own fresh
         // `ask_timeout_secs`, so a slow stage eats into the budget the later
