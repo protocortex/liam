@@ -2396,8 +2396,15 @@ fn opt_string(row: &Row, i: usize) -> Result<Option<String>> {
 /// ORing recovers that recall: BM25 still ranks by inverse document frequency,
 /// so a rare shared term dominates the score while "the" or "when" contribute
 /// almost nothing, and RRF plus the reranker re-sort the fused result anyway.
+///
+/// Tokens are lowercased and only the first occurrence of each is kept, so a
+/// long repetitive query cannot expand into thousands of redundant OR terms.
+/// The consolidation probes share this function, so they get the same dedupe.
 fn fts5_query(text: &str) -> String {
+    let mut seen = HashSet::new();
     text.split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|t| seen.insert(t.clone()))
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ")
@@ -2520,6 +2527,42 @@ fn intern(index: &mut HashMap<String, usize>, labels: &mut Vec<String>, id: Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fts5_query_collapses_a_repeated_term() {
+        // Arrange
+        let text = "word ".repeat(2000);
+
+        // Act
+        let query = fts5_query(&text);
+
+        // Assert
+        assert_eq!(query, "\"word\"");
+    }
+
+    #[test]
+    fn fts5_query_dedupes_case_insensitively() {
+        // Arrange
+        let text = "Word word WORD";
+
+        // Act
+        let query = fts5_query(text);
+
+        // Assert
+        assert_eq!(query, "\"word\"");
+    }
+
+    #[test]
+    fn fts5_query_still_doubles_quotes_after_dedupe() {
+        // Arrange
+        let text = "a \"b\" a";
+
+        // Act
+        let query = fts5_query(text);
+
+        // Assert
+        assert_eq!(query, "\"a\" OR \"\"\"b\"\"\"");
+    }
+
     use super::*;
     use crate::clock::FixedClock;
     use crate::types::{relation, RetentionPolicy};
