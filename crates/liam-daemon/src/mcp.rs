@@ -1111,9 +1111,10 @@ impl MemoryServer {
             return refusal;
         }
         let embedding = self.embedder.embed(&args.query, TextKind::Query).await.ok();
+        let k = crate::ask::clamp_recall_k(args.k);
         let q = build_query(
             &args.query,
-            args.k,
+            Some(crate::ask::rerank_pool(k)),
             args.kind,
             args.scope,
             embedding,
@@ -1127,8 +1128,6 @@ impl MemoryServer {
         if hits.is_empty() {
             return "no relevant memory".to_string();
         }
-        self.record_usage(hits.iter().filter(|h| !h.expanded).map(|h| &h.hit.id));
-        self.issue_handles(hits.iter().map(|h| &h.hit.id));
         let docs: Vec<String> = hits
             .iter()
             .map(|h| h.hit.retrieved.as_text().to_string())
@@ -1138,6 +1137,16 @@ impl MemoryServer {
             .order(&args.query, &docs)
             .await
             .unwrap_or_else(|_| (0..hits.len()).collect());
+        let order = &order[..order.len().min(k)];
+        // Usage and handles cover only the hits returned, not the wider pool.
+        self.record_usage(
+            order
+                .iter()
+                .map(|&i| &hits[i])
+                .filter(|h| !h.expanded)
+                .map(|h| &h.hit.id),
+        );
+        self.issue_handles(order.iter().map(|&i| &hits[i].hit.id));
         // The handle rides inside the kind bracket so a hit still opens with
         // one bracketed field. It is here because an agent cannot link what it
         // recalled without a name for it, which is the gap ADR-0001 exists to
@@ -1472,7 +1481,7 @@ impl MemoryServer {
         let k = clamp_ask_k(args.k);
         let q = build_query(
             &args.question,
-            Some(k),
+            Some(ask::rerank_pool(k)),
             args.kind,
             args.scope.clone(),
             embedding.clone(),
@@ -1502,12 +1511,28 @@ impl MemoryServer {
             .iter()
             .map(|e| e.retrieved.as_text().to_string())
             .collect();
-        let order = self
-            .reranker
-            .order(&args.question, &docs)
-            .await
-            .unwrap_or_else(|_| (0..docs.len()).collect());
-        let evidence: Vec<ask::Evidence> = order.iter().map(|&i| candidates[i].clone()).collect();
+        let order = match self.reranker.order(&args.question, &docs).await {
+            Ok(order) => order,
+            Err(e) => {
+                tracing::warn!(error = %e, "ask answered from unreranked evidence");
+                (0..docs.len()).collect()
+            }
+        };
+        // Candidates list the store hits first, so an index below `hit_count`
+        // is a store hit. Keep k of them plus every summary.
+        let hit_count = hits.len();
+        let mut kept_hits = 0;
+        let evidence: Vec<ask::Evidence> = order
+            .into_iter()
+            .filter(|&i| {
+                if i >= hit_count {
+                    return true;
+                }
+                kept_hits += 1;
+                kept_hits <= k
+            })
+            .map(|i| candidates[i].clone())
+            .collect();
         if mode == Mode::Strict {
             self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
             self.record_evidence_usage(&evidence);
@@ -5941,6 +5966,255 @@ mod tests {
         // assert *which* one: with mock scoring the three are near-tied, and the
         // contract under test is the count.
         assert_eq!(out.split("\n\n").count(), 1, "expected 1 block: {out}");
+    }
+
+    /// Scores a document 1.0 when it mentions a retriever and 0.0 otherwise, so
+    /// the rerank order is known up front.
+    struct RetrieverReranker;
+    #[async_trait::async_trait]
+    impl liam_model::Reranker for RetrieverReranker {
+        async fn scores(&self, _q: &str, docs: &[String]) -> liam_model::Result<Vec<f32>> {
+            Ok(docs
+                .iter()
+                .map(|d| if d.contains(RETRIEVER_WORD) { 1.0 } else { 0.0 })
+                .collect())
+        }
+    }
+
+    const RETRIEVER_WORD: &str = "retriever";
+    const DOG_QUERY: &str = "dog";
+    const DOG_FACT_COUNT: usize = 12;
+    const WIDE_POOL_K: usize = 16;
+    const STORE_DIMS: usize = 8;
+    const LARGE_STORE_SIZE: usize = 40;
+    const LARGE_K: usize = 1000;
+    const EXPECTED_MAX_K: usize = 32;
+
+    async fn open_store() -> Arc<DefaultGraph> {
+        Arc::new(
+            DefaultGraph::open(":memory:", GraphConfig::new(STORE_DIMS))
+                .await
+                .expect("open in-memory store"),
+        )
+    }
+
+    fn server_over(store: &Arc<DefaultGraph>, reranker: Arc<dyn Reranker>) -> MemoryServer {
+        MemoryServer::new(
+            store.clone(),
+            Arc::new(liam_model::MockEmbedder::new(STORE_DIMS)),
+            reranker,
+            Arc::new(liam_model::MockLlm),
+            30,
+            false,
+            8192,
+            1,
+        )
+    }
+
+    async fn insert_fact(store: &DefaultGraph, label: &str, content: &str) -> NodeId {
+        store
+            .insert(liam_store::NewNode::now("fact", label, content))
+            .await
+            .expect("insert fact")
+    }
+
+    /// The query `recall` builds for `text` at `k`, with no filters.
+    async fn recall_query(text: &str, k: usize) -> Query {
+        let embedding = liam_model::MockEmbedder::new(STORE_DIMS)
+            .embed(text, TextKind::Query)
+            .await
+            .ok();
+        build_query(text, Some(k), None, None, embedding, None, false)
+    }
+
+    fn recall_k(query: &str, k: usize) -> RecallArgs {
+        RecallArgs {
+            query: query.to_string(),
+            kind: None,
+            scope: None,
+            k: Some(k),
+            as_of: None,
+            mode: None,
+        }
+    }
+
+    fn hit_count(out: &str) -> usize {
+        out.matches("[fact ").count()
+    }
+
+    /// Eleven short dog facts and one longer retriever fact that the store
+    /// ranks below them.
+    async fn seed_dog_facts(store: &DefaultGraph) -> NodeId {
+        for index in 0..DOG_FACT_COUNT - 1 {
+            insert_fact(
+                store,
+                &format!("dog rule {index}"),
+                "dog dog dog must stay on a leash",
+            )
+            .await;
+        }
+        insert_fact(
+            store,
+            "breed note",
+            "A retriever is a friendly breed that loves to swim and fetch, and it is a dog",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn recall_at_k_one_returns_the_reranked_top_hit_from_a_wider_pool() {
+        // Arrange
+        let store = open_store().await;
+        let target = seed_dog_facts(&store).await;
+        let server = server_over(&store, Arc::new(RetrieverReranker));
+        let narrow = store
+            .query_explained(&recall_query(DOG_QUERY, 1).await)
+            .await
+            .unwrap();
+        let wide = store
+            .query_explained(&recall_query(DOG_QUERY, WIDE_POOL_K).await)
+            .await
+            .unwrap();
+        assert_eq!(narrow.len(), 1);
+        assert_ne!(narrow[0].hit.id, target, "the target must not rank first");
+        let target_position = wide.iter().position(|h| h.hit.id == target);
+        assert!(
+            target_position.is_some_and(|i| i >= 1),
+            "the target must be in the wide pool below the first place"
+        );
+        let retriever_docs = wide
+            .iter()
+            .filter(|h| h.hit.retrieved.as_text().contains(RETRIEVER_WORD))
+            .count();
+        assert_eq!(retriever_docs, 1);
+
+        // Act
+        let out = server.recall(Parameters(recall_k(DOG_QUERY, 1))).await;
+
+        // Assert
+        assert_eq!(hit_count(&out), 1, "{out}");
+        assert!(out.contains(RETRIEVER_WORD), "{out}");
+    }
+
+    #[tokio::test]
+    async fn recall_clamps_k_into_one_to_thirty_two() {
+        // Arrange
+        let store = open_store().await;
+        for index in 0..LARGE_STORE_SIZE {
+            insert_fact(&store, &format!("note {index}"), "the zorbnax gadget").await;
+        }
+        let server = server_over(&store, Arc::new(liam_model::IdentityReranker));
+
+        // Act
+        let zero = server.recall(Parameters(recall_k("zorbnax", 0))).await;
+        let one = server.recall(Parameters(recall_k("zorbnax", 1))).await;
+        let large = server
+            .recall(Parameters(recall_k("zorbnax", LARGE_K)))
+            .await;
+
+        // Assert
+        assert_eq!(hit_count(&zero), 1, "{zero}");
+        assert_eq!(hit_count(&one), 1, "{one}");
+        assert_eq!(
+            hit_count(&large),
+            EXPECTED_MAX_K.min(LARGE_STORE_SIZE),
+            "{large}"
+        );
+    }
+
+    #[test]
+    fn rerank_pool_doubles_k_between_sixteen_and_thirty_two() {
+        // Arrange: k and the pool it should widen to
+        let cases = [(1, 16), (8, 16), (9, 18), (16, 32), (17, 32), (32, 32)];
+
+        for (k, expected) in cases {
+            // Act
+            let pool = crate::ask::rerank_pool(k);
+
+            // Assert
+            assert_eq!(pool, expected, "pool for k={k}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_narrow_query_is_a_subset_of_a_wide_one_for_equal_facts() {
+        // Arrange: thirty facts of equal confidence
+        let store = open_store().await;
+        const FACT_COUNT: usize = 30;
+        const NARROW_K: usize = 3;
+        for index in 0..FACT_COUNT {
+            insert_fact(&store, &format!("note {index}"), "the zorbnax gadget").await;
+        }
+        let narrow_k = NARROW_K;
+
+        // Act
+        let narrow = store
+            .query_explained(&recall_query("zorbnax", narrow_k).await)
+            .await
+            .unwrap();
+        let wide = store
+            .query_explained(&recall_query("zorbnax", WIDE_POOL_K).await)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(narrow.iter().filter(|h| !h.expanded).count(), narrow_k);
+        for hit in narrow.iter().filter(|h| !h.expanded) {
+            assert!(wide.iter().any(|w| w.hit.id == hit.hit.id));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_reranker_falls_back_to_the_first_k_of_the_wide_pool() {
+        // Arrange
+        let store = open_store().await;
+        for index in 0..LARGE_STORE_SIZE {
+            insert_fact(&store, &format!("note {index}"), "the zorbnax gadget").await;
+        }
+        let k = 3;
+        let server = server_over(&store, Arc::new(FailingReranker));
+        let pool = store
+            .query_explained(&recall_query("zorbnax", crate::ask::rerank_pool(k)).await)
+            .await
+            .unwrap();
+        let expected: Vec<String> = pool
+            .iter()
+            .take(k)
+            .map(|h| h.hit.id.handle().to_string())
+            .collect();
+
+        // Act
+        let out = server.recall(Parameters(recall_k("zorbnax", k))).await;
+
+        // Assert
+        assert_eq!(hit_count(&out), k, "{out}");
+        for handle in expected {
+            assert!(out.contains(&handle), "{handle} missing from {out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_ask_at_k_one_returns_the_reranked_top_fact_from_a_wider_pool() {
+        // Arrange
+        let store = open_store().await;
+        let target = seed_dog_facts(&store).await;
+        let server = server_over(&store, Arc::new(RetrieverReranker));
+        let args = AskArgs {
+            question: DOG_QUERY.to_string(),
+            kind: None,
+            scope: None,
+            k: Some(1),
+            as_of: None,
+            mode: Some(Mode::Strict),
+        };
+
+        // Act
+        let out = server.ask(Parameters(args)).await;
+
+        // Assert
+        assert!(out.contains(RETRIEVER_WORD), "{out}");
+        assert!(out.contains(target.handle()), "{out}");
+        assert_eq!(out.matches("] (fact) ").count(), 1, "{out}");
     }
 
     #[tokio::test]

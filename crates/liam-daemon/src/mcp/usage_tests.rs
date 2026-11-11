@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use liam_model::{Llm, MockEmbedder};
-use liam_store::{DefaultGraph, GraphConfig, NewEdge, NewNode, NodeId, Query};
+use liam_store::{DefaultGraph, GraphConfig, NewEdge, NewNode, NodeId, Query, HANDLE_LEN};
 use rmcp::handler::server::wrapper::Parameters;
 
 use super::{AskArgs, MemoryServer, Mode, RecallArgs};
@@ -14,6 +14,8 @@ use crate::tiering::usage::UsageRecorder;
 const DIMS: usize = 8;
 const FENCE_OPEN: &str = "<<<EVIDENCE";
 const TRACKED: usize = 100;
+const WIDE_POOL_MATCHES: usize = 20;
+const CUT_K: usize = 3;
 
 /// Answers the sufficiency pre-pass with `verdict` and the answer prompt with
 /// `answer`, and keeps the prompts it saw.
@@ -153,6 +155,35 @@ async fn recall_counts_the_ranked_results_it_returns_and_no_more() {
     let hits = fixture.usage.hits();
     assert_eq!(hits.len(), 3);
     assert!(hits.iter().all(|(_, hits)| *hits == 1));
+}
+
+#[tokio::test]
+async fn recall_counts_only_the_cut_hits_when_it_reranks_a_wider_pool() {
+    // Arrange: more matches than the rerank pool holds, three asked for
+    let fixture = plain().await;
+    for index in 0..WIDE_POOL_MATCHES {
+        note(
+            &fixture.store,
+            &format!("note {index}"),
+            "the zorbnax gadget",
+        )
+        .await;
+    }
+
+    // Act
+    let out = fixture
+        .server
+        .recall(Parameters(recall_args("zorbnax gadget", Some(CUT_K))))
+        .await;
+
+    // Assert: the counted ids are exactly the returned ones
+    let counted = counted(&fixture);
+    assert_eq!(counted.len(), CUT_K);
+    assert_eq!(out.matches("[fact ").count(), CUT_K, "{out}");
+    for id in &counted {
+        let handle = &id[..HANDLE_LEN];
+        assert!(out.contains(handle), "{handle} was counted but not shown");
+    }
 }
 
 #[tokio::test]

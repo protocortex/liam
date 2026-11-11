@@ -11,9 +11,8 @@ pub(crate) const MAX_EVIDENCE_CHARS: usize = 2000;
 /// Default and upper bound on the number of evidence items `ask` feeds the LLM.
 /// WHY the cap: caller-supplied `k` is otherwise unbounded and each item can be
 /// `MAX_EVIDENCE_CHARS` long, so a large `k` would blow a small local model's
-/// context. The per-item `truncate` caps size; this caps count. `recall` stays
-/// unbounded (it never calls an LLM), so the clamp lives here, not in the shared
-/// query builder.
+/// context. The per-item `truncate` caps size; this caps count. `recall` has its
+/// own bound below, so the clamp lives here, not in the shared query builder.
 const DEFAULT_ASK_EVIDENCE: usize = 8;
 const MAX_ASK_EVIDENCE: usize = 32;
 
@@ -25,6 +24,29 @@ const MAX_ASK_EVIDENCE: usize = 32;
 /// argument.
 pub fn clamp_ask_k(k: Option<usize>) -> usize {
     k.unwrap_or(DEFAULT_ASK_EVIDENCE).clamp(1, MAX_ASK_EVIDENCE)
+}
+
+/// Default and upper bound on the hits `recall` returns. WHY the cap: every
+/// candidate goes through a cross-encoder whose cost is linear in documents, so
+/// an unbounded `k` would make one call arbitrarily slow.
+const DEFAULT_RECALL_K: usize = 8;
+const MAX_RECALL_K: usize = MAX_ASK_EVIDENCE;
+
+/// Smallest and largest candidate pool `recall` reranks before cutting to `k`.
+const RERANK_POOL_FLOOR: usize = 16;
+const RERANK_POOL_CAP: usize = MAX_RECALL_K;
+
+/// Resolve the caller's `k` into `1..=MAX_RECALL_K`, defaulting to
+/// `DEFAULT_RECALL_K`. `k = 0` would return nothing for a query the store can
+/// answer.
+pub fn clamp_recall_k(k: Option<usize>) -> usize {
+    k.unwrap_or(DEFAULT_RECALL_K).clamp(1, MAX_RECALL_K)
+}
+
+/// Candidates `recall` reranks before cutting to `k`: twice `k`, kept within
+/// the floor and cap so a small `k` still reranks a useful pool.
+pub(crate) fn rerank_pool(k: usize) -> usize {
+    (k * 2).clamp(RERANK_POOL_FLOOR, RERANK_POOL_CAP)
 }
 
 /// Fence opener/closer wrapping each evidence block. WHY: `kind`, `label`, and
