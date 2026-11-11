@@ -9,29 +9,20 @@ on:
   # because changing the base fires `pull_request.edited`, which is not a
   # trigger; checks start on a freshly opened PR or on a push to its branch.
   #
-  # `paths-ignore` skips the whole workflow for changes that cannot affect a
-  # build. Measured 2026-08-22: a CHANGELOG-only pull request compiled Rust on
-  # macOS three times, for 2.1 macOS minutes, to prove a markdown file still
-  # parses. Three docs-only pull requests landed in one day.
+  # A docs-only change skips the build jobs through the `changes` job below,
+  # not through `paths-ignore`. Measured 2026-08-22: a CHANGELOG-only pull
+  # request compiled Rust on macOS three times, for 2.1 macOS minutes, to prove
+  # a markdown file still parses. The workflow itself has to run, because the
+  # branch ruleset requires these checks and a merge queue needs them on every
+  # merge group: a workflow skipped by `paths-ignore` never reports, which
+  # would block a docs PR forever. A job skipped by `if:` reports as skipped,
+  # which a required check accepts.
   #
-  # This is only safe because the branch ruleset declares NO
-  # `required_status_checks` rule (verified via
-  # `gh api repos/protocortex/liam/rulesets`). A skipped job never reports, so
-  # with required checks configured this would block every docs PR from merging
-  # forever. Re-check that before adding required checks.
-  #
-  # Deliberately NOT ignored: Cargo.toml, Cargo.lock, deny.toml, rust-toolchain
-  # and anything under .github/workflows. Those change what gets built even
-  # when no .rs file moves.
+  # Deliberately NOT treated as docs: Cargo.toml, Cargo.lock, deny.toml,
+  # rust-toolchain and anything under .github/workflows. Those change what
+  # gets built even when no .rs file moves.
   pull_request:
-    paths-ignore:
-      # `**.md`, NOT `**/*.md`. GitHub's glob requires a directory separator
-      # for the second form, so `**/*.md` would miss CHANGELOG.md at the repo
-      # root, which is precisely the file that triggered this whole change.
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.github/ISSUE_TEMPLATE/**'
+  merge_group:
   push:
     branches: [main]
     paths-ignore:
@@ -77,7 +68,45 @@ env:
 # 12s), with a 5 minute floor and extra room for a cold cache. They make a hung
 # runner fail fast instead of holding the job for GitHub's 360 minute default.
 jobs:
+  # Decides whether the build jobs run. Push to main is already path filtered,
+  # so it always builds. A pull request or merge group builds unless every
+  # changed file is docs: `*.md` anywhere, `docs/`, LICENSE, or issue templates.
+  # This job is a required check too: if it fails, every build job skips, and
+  # only its own failure keeps the merge blocked.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          # The compare API lists at most this many files; a longer list is
+          # treated as a code change rather than trusted as complete.
+          MAX_LISTED_FILES: "300"
+          DOCS_PATTERN: '\.md$|^docs/|^LICENSE$|^\.github/ISSUE_TEMPLATE/'
+        run: |
+          if [ "$EVENT" = push ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" --jq '.files[].filename')
+          count=$(printf '%s\n' "$files" | grep -c . || true)
+          code_files=$(printf '%s\n' "$files" | grep -vE "$DOCS_PATTERN" | grep -c . || true)
+          if [ "$count" -ge "$MAX_LISTED_FILES" ] || [ "$code_files" -gt 0 ] || [ "$count" -eq 0 ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "changed files: $count, non-docs: $code_files"
+
   lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -100,6 +129,8 @@ jobs:
   # so the workspace compiles once per platform instead of three times on the
   # expensive one.
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -116,6 +147,8 @@ jobs:
         run: cargo test --workspace
 
   deny:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -138,6 +171,8 @@ jobs:
   # catches a real regression without failing on normal day-to-day noise.
   # Ratchet it up over time; never lower it without a documented reason.
   coverage:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -173,6 +208,8 @@ jobs:
   # One macOS job: macOS bills at 10.3x Linux, so it runs the workspace tests
   # and the release-shaped build in one job that shares one target directory.
   macos:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
     timeout-minutes: 25
     env:
