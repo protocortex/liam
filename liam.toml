@@ -12,7 +12,8 @@
 database_path  = "liam.db"
 log_filter     = "info,liam=debug"   # RUST_LOG overrides when set
 embedding_dims = 384              # MRL truncation length; fixed at DB creation
-ask_timeout_secs = 30             # ask falls back to ranked evidence past this
+ask_timeout_secs = 30             # ask falls back to ranked evidence past this, after retrieval
+recall_timeout_secs = 10          # recall and ask reply with a timeout if retrieval runs past this
 ask_sufficiency_check = true      # extra yes/no pass so ask can refuse; costs one call
 socket_path    = "~/.liam/liamd.sock"   # multi-client listener; ~ is expanded before binding
 read_pool_size = 4                # independent read connections liam-store holds open

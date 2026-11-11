@@ -6,8 +6,18 @@ All notable changes to LIAM are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `recall_timeout_secs` (default `10`) bounds how long `recall` and `ask` spend retrieving. Past it they reply
+  with a timeout, and a reranker still running at the deadline gives way to the hits in store order. Cancelling a
+  request now stops retrieval with a `cancelled` reply; the `ask` model call that follows retrieval still runs
+  until `ask_timeout_secs`. A call that gave up waiting for the reranker no longer runs
+  after the busy call finishes.
+
 ### Changed
 
+- `recall` and `ask` now reject an empty, whitespace-only or NUL-containing query and one over 4000 characters
+  with a clear error. Only the first 64 distinct words reach the lexical arm; later words reach only the vector arm.
 - `recall` now reranks a wider pool of candidates (twice `k`, at least 16, at most 32) before it cuts to `k`, so
   a relevant hit ranked below `k` by retrieval can reach the top. A `k` over 32 now returns 32, and `k = 0` now returns 1 hit.
 - `ask` now reranks a wider pool of candidates before it cuts, so a relevant hit ranked below `k` by retrieval can

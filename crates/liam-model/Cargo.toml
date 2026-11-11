@@ -64,4 +64,4 @@ cuda = ["candle-core/cuda"]
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
