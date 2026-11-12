@@ -43,6 +43,33 @@ documented in the pages linked here:
 `ask` applies the same limits to its `question`: up to 4000 characters, empty and NUL
 rejected, and words past the 64th distinct one reach only the vector arm.
 
+## Degraded replies
+
+Every `recall` and `ask` reply carries a structured `degraded` list next to the text.
+An empty list means the reply used every step it was meant to use. A reason in the
+list means a step did not run or failed, and the reply is still useful.
+
+| Reason | Meaning |
+|---|---|
+| `embed_failed` | The embedder failed. The search used keywords only. |
+| `rerank_skipped` | Under 200 ms of the retrieval budget remained, too little to rerank. The hits are in store order. |
+| `rerank_failed` | The reranker returned an error. The hits are in store order. |
+| `rerank_timeout` | The reranker did not finish before the retrieval deadline. The hits are in store order. |
+| `synthesis_unavailable` | `ask` could not write an answer. This covers a model timeout, a model error, an empty answer, an answer the evidence does not support, and no free generation slot. The reply shows the retrieved evidence. |
+
+When the list has reasons, the first line of the text is a marker that names each
+reason with a short hint, for example
+`(degraded: rerank_timeout, hits are in store order)`. The body follows on the next
+line. Several reasons appear in the order they happened, each once.
+
+A reply sets `isError` when the call failed: the retrieval deadline passed, the
+store failed, or the query was invalid. `recall` also sets it when asked for a
+non-strict mode. A cancelled call stays a normal reply with the text `cancelled`
+(`ask cancelled` for `ask`).
+
+Each degraded reason also adds one to the `degraded_replies` metric, labelled with
+the tool and the reason. See [Metrics and alerts](../operations/metrics-and-alerts.md).
+
 `timeline` shows an entity's compiled page and the mentions behind it, most
 recent first.
 
