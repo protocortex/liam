@@ -11,6 +11,8 @@ use liam_model::{Embedder, IdentityReranker, Llm, MockEmbedder, MockLlm, Reranke
 use liam_store::{EventRef, GraphConfig, Millis, NewNode, NewSummary, PutOutcome, SummaryChild};
 use tokio_util::sync::CancellationToken;
 
+use super::reply::ToolReply;
+use super::test_doubles::{ErroringEmbedder, FailingReranker, GatedEmbedder};
 use super::*;
 use crate::summary::generate::SUMMARY_PROMPT_VERSION;
 
@@ -19,6 +21,15 @@ const QUERY: &str = "quarterly forecasts for the finance team";
 const SLOW: Duration = Duration::from_secs(30);
 const FACT_COUNT: usize = 5;
 const K: usize = 2;
+const NO_REASONS: &[&str] = &[];
+const CANCELLED_TEXT: &str = "recall cancelled";
+const TIMEOUT_TEXT: &str = "recall failed: retrieval took longer than 1 s";
+const NO_MEMORY_TEXT: &str = "no relevant memory";
+const HIT_PREFIX: &str = "[fact ";
+const BOUNDARY_RECALL_TIMEOUT_SECS: u64 = 1;
+const BOUNDARY_BUDGET_MS: u64 = 200;
+const REASONS_EMBED_AND_TIMEOUT: &str = "(degraded: embed_failed, searched by keyword only; \
+rerank_timeout, hits are in store order)";
 
 /// Embeds like `MockEmbedder` after sleeping `delay`, counting its calls.
 struct SleepingEmbedder {
@@ -201,6 +212,31 @@ fn cancel_after(token: &CancellationToken, after: Duration) {
     });
 }
 
+/// Converts to the wire result, asserts the structured reasons and the error
+/// flag, and returns the text.
+fn wire_text(reply: ToolReply, degraded: &[&str], is_error: bool) -> String {
+    let result = reply.into_call_result();
+    assert_eq!(
+        result.structured_content,
+        Some(serde_json::json!({ "degraded": degraded }))
+    );
+    assert_eq!(result.is_error == Some(true), is_error);
+    result.content[0]
+        .as_text()
+        .expect("content item is text")
+        .text
+        .clone()
+}
+
+fn marker_for(reason: &str) -> String {
+    let hint = if reason == "embed_failed" {
+        "searched by keyword only"
+    } else {
+        "hits are in store order"
+    };
+    format!("(degraded: {reason}, {hint})")
+}
+
 fn block_count(out: &str) -> usize {
     out.matches("[fact ").count()
 }
@@ -219,7 +255,7 @@ async fn recall_replies_with_the_timeout_when_the_embedder_outlasts_the_deadline
         .await;
 
     // Assert
-    assert_eq!(out, "recall failed: retrieval took longer than 1 s");
+    assert_eq!(wire_text(out, NO_REASONS, true), TIMEOUT_TEXT);
 }
 
 #[tokio::test(start_paused = true)]
@@ -236,7 +272,7 @@ async fn a_zero_recall_timeout_gives_a_one_second_deadline() {
         .await;
 
     // Assert
-    assert_eq!(out, "recall failed: retrieval took longer than 1 s");
+    assert_eq!(wire_text(out, NO_REASONS, true), TIMEOUT_TEXT);
 }
 
 #[tokio::test(start_paused = true)]
@@ -255,7 +291,7 @@ async fn recall_replies_cancelled_without_embedding_when_the_token_is_already_ca
     let out = server.recall_with(recall_args(), cancelled()).await;
 
     // Assert
-    assert_eq!(out, "recall cancelled");
+    assert_eq!(wire_text(out, NO_REASONS, false), CANCELLED_TEXT);
     assert_eq!(embedder.call_count(), 0);
 }
 
@@ -281,8 +317,8 @@ async fn recall_returns_k_hits_in_store_order_when_the_reranker_outlasts_the_dea
         .await;
 
     // Assert
-    assert_eq!(block_count(&out), K, "{out}");
-    assert_eq!(out, expected);
+    assert_eq!(block_count(out.text()), K, "{}", out.text());
+    assert_eq!(out.text(), expected.text());
 }
 
 #[tokio::test(start_paused = true)]
@@ -308,8 +344,8 @@ async fn recall_skips_the_reranker_when_too_little_of_the_budget_is_left() {
 
     // Assert
     assert_eq!(reranker.call_count(), 0);
-    assert_eq!(block_count(&out), K, "{out}");
-    assert_eq!(out, expected);
+    assert_eq!(block_count(out.text()), K, "{}", out.text());
+    assert_eq!(out.text(), expected.text());
 }
 
 #[tokio::test(start_paused = true)]
@@ -331,7 +367,7 @@ async fn recall_replies_cancelled_when_the_token_is_cancelled_during_the_rerank(
     let out = server.recall_with(recall_args(), token).await;
 
     // Assert
-    assert_eq!(out, "recall cancelled");
+    assert_eq!(wire_text(out, NO_REASONS, false), CANCELLED_TEXT);
     assert_eq!(
         reranker.call_count(),
         1,
@@ -403,4 +439,318 @@ async fn ask_keeps_store_order_hits_then_summaries_when_the_reranker_outlasts_th
     assert_eq!(prompt.matches("] (fact) ").count(), K, "{prompt}");
     assert_eq!(prompt.matches("] (summary) ").count(), 2, "{prompt}");
     assert_eq!(prompt, expected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recall_marks_each_rerank_degradation_and_keeps_store_order() {
+    // Arrange
+    let cases: [(&str, Duration, Arc<dyn Reranker>); 3] = [
+        (
+            "rerank_timeout",
+            Duration::ZERO,
+            SleepingReranker::new(SLOW),
+        ),
+        (
+            "rerank_skipped",
+            Duration::from_millis(900),
+            SleepingReranker::new(Duration::ZERO),
+        ),
+        ("rerank_failed", Duration::ZERO, Arc::new(FailingReranker)),
+    ];
+
+    for (reason, embed_delay, reranker) in cases {
+        let server = server_with_models(
+            SleepingEmbedder::new(embed_delay),
+            reranker,
+            Arc::new(MockLlm),
+        )
+        .await
+        .with_recall_timeout(1);
+        seed_facts(&server).await;
+        let expected = in_store_order(&server)
+            .recall_with(recall_args(), CancellationToken::new())
+            .await;
+
+        // Act
+        let out = server
+            .recall_with(recall_args(), CancellationToken::new())
+            .await;
+
+        // Assert
+        let text = wire_text(out, &[reason], false);
+        let expected_text = format!("{}\n{}", marker_for(reason), expected.text());
+        assert_eq!(text, expected_text, "{reason}");
+        assert_eq!(block_count(&text), K, "{reason}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn recall_returns_lexical_hits_with_a_marker_when_the_embedder_errors() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(ErroringEmbedder::new(DIMS)),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+    seed_facts(&server).await;
+
+    // Act
+    let out = server
+        .recall_with(recall_args(), CancellationToken::new())
+        .await;
+
+    // Assert
+    let text = wire_text(out, &["embed_failed"], false);
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some(marker_for("embed_failed").as_str()));
+    assert!(lines.next().unwrap().starts_with(HIT_PREFIX), "{text}");
+    assert_eq!(block_count(&text), K, "{text}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn recall_names_keyword_only_search_when_the_embedder_errors_and_nothing_matches() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(ErroringEmbedder::new(DIMS)),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+
+    // Act
+    let out = server
+        .recall_with(recall_args(), CancellationToken::new())
+        .await;
+
+    // Assert
+    let text = wire_text(out, &["embed_failed"], false);
+    assert_eq!(
+        text,
+        format!("(degraded: embed_failed, searched by keyword only)\n{NO_MEMORY_TEXT}")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn recall_does_not_call_an_erroring_embedder_when_already_cancelled() {
+    // Arrange
+    let embedder = Arc::new(ErroringEmbedder::new(DIMS));
+    let server = server_with_models(
+        embedder.clone(),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+
+    // Act
+    let out = server.recall_with(recall_args(), cancelled()).await;
+
+    // Assert
+    assert_eq!(wire_text(out, NO_REASONS, false), CANCELLED_TEXT);
+    assert_eq!(embedder.call_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recall_refuses_infer_mode_as_an_error() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(MockEmbedder::new(DIMS)),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+    let args = RecallArgs {
+        mode: Some(Mode::Infer),
+        ..recall_args()
+    };
+
+    // Act
+    let out = server.recall_with(args, CancellationToken::new()).await;
+
+    // Assert
+    assert!(out.is_error());
+    assert!(out.degraded().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_healthy_recall_has_no_degraded_reasons_and_opens_with_a_hit() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(MockEmbedder::new(DIMS)),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+    seed_facts(&server).await;
+
+    // Act
+    let out = server
+        .recall_with(recall_args(), CancellationToken::new())
+        .await;
+
+    // Assert
+    let text = wire_text(out, NO_REASONS, false);
+    assert!(text.starts_with(HIT_PREFIX), "{text}");
+}
+
+#[tokio::test]
+async fn the_recall_tool_declares_an_output_schema_requiring_degraded() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(MockEmbedder::new(DIMS)),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+    let expected = serde_json::Value::Object((*super::reply::output_schema()).clone());
+
+    // Act
+    let tools = server.tool_router.list_all();
+    let recall = tools.iter().find(|t| t.name == "recall").unwrap();
+
+    // Assert
+    let schema = recall.output_schema.as_ref().expect("recall output schema");
+    assert_eq!(serde_json::Value::Object((**schema).clone()), expected);
+    assert_eq!(expected["required"], serde_json::json!(["degraded"]));
+    assert_eq!(
+        expected["properties"]["degraded"]["type"],
+        serde_json::json!("array")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn recall_skips_the_reranker_only_below_the_minimum_budget() {
+    // Arrange
+    let cases: [(u64, usize, &[&str]); 2] = [
+        (BOUNDARY_BUDGET_MS, 1, NO_REASONS),
+        (BOUNDARY_BUDGET_MS - 1, 0, &["rerank_skipped"]),
+    ];
+
+    for (remaining_ms, reranker_calls, reasons) in cases {
+        // The embedder consumes all but `remaining_ms` of the deadline, on the
+        // paused clock, so the budget left at the rerank is exact.
+        let embed_delay =
+            Duration::from_secs(BOUNDARY_RECALL_TIMEOUT_SECS) - Duration::from_millis(remaining_ms);
+        let reranker = SleepingReranker::new(Duration::ZERO);
+        let server = server_with_models(
+            SleepingEmbedder::new(embed_delay),
+            reranker.clone(),
+            Arc::new(MockLlm),
+        )
+        .await
+        .with_recall_timeout(BOUNDARY_RECALL_TIMEOUT_SECS);
+        seed_facts(&server).await;
+
+        // Act
+        let out = server
+            .recall_with(recall_args(), CancellationToken::new())
+            .await;
+
+        // Assert
+        wire_text(out, reasons, false);
+        assert_eq!(reranker.call_count(), reranker_calls, "{remaining_ms} ms");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn recall_fails_without_degraded_reasons_when_the_store_is_unavailable() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(MockEmbedder::new(DIMS)),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+    *server.shared_store().exclusive().await = None;
+
+    // Act
+    let out = server
+        .recall_with(recall_args(), CancellationToken::new())
+        .await;
+
+    // Assert
+    let text = wire_text(out, NO_REASONS, true);
+    assert!(text.starts_with("recall failed:"), "{text}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn recall_fails_without_degraded_reasons_when_the_query_is_too_long() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(MockEmbedder::new(DIMS)),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+    let args = RecallArgs {
+        query: "a".repeat(MAX_QUERY_CHARS + 1),
+        ..recall_args()
+    };
+
+    // Act
+    let out = server.recall_with(args, CancellationToken::new()).await;
+
+    // Assert
+    let text = wire_text(out, NO_REASONS, true);
+    assert!(text.starts_with("recall failed:"), "{text}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn recall_names_both_reasons_when_the_embed_errors_and_the_reranker_times_out() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(ErroringEmbedder::new(DIMS)),
+        SleepingReranker::new(SLOW),
+        Arc::new(MockLlm),
+    )
+    .await
+    .with_recall_timeout(1);
+    seed_facts(&server).await;
+
+    // Act
+    let out = server
+        .recall_with(recall_args(), CancellationToken::new())
+        .await;
+
+    // Assert
+    let text = wire_text(out, &["embed_failed", "rerank_timeout"], false);
+    assert_eq!(text.lines().next(), Some(REASONS_EMBED_AND_TIMEOUT));
+    assert_eq!(block_count(&text), K, "{text}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_recall_drops_its_embed_before_it_takes_the_gate() {
+    // Arrange
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let embedder = Arc::new(GatedEmbedder::new(DIMS, gate.clone()));
+    let server = server_with_models(
+        embedder.clone(),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+    let held = gate.lock().await;
+    let token = CancellationToken::new();
+    let mut first = std::pin::pin!(server.recall_with(recall_args(), token.clone()));
+    tokio::select! {
+        biased;
+        _ = &mut first => panic!("the recall finished while the gate was held"),
+        _ = std::future::ready(()) => {}
+    }
+
+    // Act
+    token.cancel();
+    let cancelled_reply = first.await;
+    drop(held);
+    let second = server
+        .recall_with(recall_args(), CancellationToken::new())
+        .await;
+
+    // Assert
+    assert_eq!(
+        wire_text(cancelled_reply, NO_REASONS, false),
+        CANCELLED_TEXT
+    );
+    assert_eq!(embedder.call_count(), 1, "only the second recall embeds");
+    wire_text(second, NO_REASONS, false);
 }
