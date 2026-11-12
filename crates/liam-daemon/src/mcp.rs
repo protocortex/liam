@@ -1621,9 +1621,15 @@ impl MemoryServer {
         question: &str,
         evidence: &[ask::Evidence],
         deadline: tokio::time::Instant,
-    ) -> String {
+    ) -> (String, Option<Degraded>) {
         let (system, user) = build_ask_prompt(question, evidence);
         let synth = tokio::time::timeout_at(deadline, self.llm.complete(&system, &user)).await;
+        let unavailable = |reason: &str| {
+            (
+                fallback_answer(reason, evidence, self.max_basis_ids_rendered),
+                Some(Degraded::SynthesisUnavailable),
+            )
+        };
         match synth {
             Ok(Ok(a)) if !a.trim().is_empty() => {
                 let answer = a.trim();
@@ -1633,24 +1639,17 @@ impl MemoryServer {
                 // Unlike the prompt rules, this does not depend on the model
                 // cooperating. See `ask::is_grounded`.
                 if ask::is_grounded(answer, question, evidence) {
-                    format_answer(answer, evidence, self.max_basis_ids_rendered)
-                } else {
-                    fallback_answer(
-                        "the answer was not grounded in the evidence",
-                        evidence,
-                        self.max_basis_ids_rendered,
+                    (
+                        format_answer(answer, evidence, self.max_basis_ids_rendered),
+                        None,
                     )
+                } else {
+                    unavailable("the answer was not grounded in the evidence")
                 }
             }
-            Ok(Ok(_)) => fallback_answer(
-                "the model returned an empty answer",
-                evidence,
-                self.max_basis_ids_rendered,
-            ),
-            Ok(Err(_)) => {
-                fallback_answer("the model failed", evidence, self.max_basis_ids_rendered)
-            }
-            Err(_) => fallback_answer("synthesis timed out", evidence, self.max_basis_ids_rendered),
+            Ok(Ok(_)) => unavailable("the model returned an empty answer"),
+            Ok(Err(_)) => unavailable("the model failed"),
+            Err(_) => unavailable("synthesis timed out"),
         }
     }
 
@@ -1658,39 +1657,50 @@ impl MemoryServer {
     // path an MCP client hits, rather than a re-implementation of it.
     #[tool(
         name = "ask",
-        description = "Answer a question from long-term memory, synthesized and cited."
+        description = "Answer a question from long-term memory, synthesized and cited.",
+        output_schema = reply::output_schema()
     )]
     async fn ask_tool(
         &self,
         Parameters(args): Parameters<AskArgs>,
         cancel: CancellationToken,
-    ) -> String {
-        self.ask_with(args, cancel).await
+    ) -> rmcp::model::CallToolResult {
+        self.ask_with(args, cancel).await.into_call_result()
     }
 
     // Test-only: the server routes through the token-taking wrapper above.
     #[cfg(test)]
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
-        self.ask_with(args, CancellationToken::new()).await
+        self.ask_with(args, CancellationToken::new())
+            .await
+            .text()
+            .to_string()
     }
 
-    pub(crate) async fn ask_with(&self, args: AskArgs, cancel: CancellationToken) -> String {
+    pub(crate) async fn ask_with(&self, args: AskArgs, cancel: CancellationToken) -> ToolReply {
         if let Some(problem) = query_problem(&args.question) {
-            return format!("ask failed: {problem}");
+            return ToolReply::failed(format!("ask failed: {problem}"));
         }
         let _timer = self.time(Tool::Ask);
         if cancel.is_cancelled() {
-            return cancelled_reply("ask");
+            return ToolReply::ok(cancelled_reply("ask"));
         }
         let retrieval_deadline = self.retrieval_deadline();
         let mode = args.mode.unwrap_or(Mode::Infer);
         let k = clamp_ask_k(args.k);
         let retrieve = async {
-            let embedding = self
-                .embedder
-                .embed(&args.question, TextKind::Query)
-                .await
-                .ok();
+            let (embedding, embed_degraded) =
+                match self.embedder.embed(&args.question, TextKind::Query).await {
+                    Ok(vector) => (Some(vector), None),
+                    Err(e) => {
+                        tracing::warn!(
+                            tool = "ask",
+                            error = %e,
+                            "embed failed, searching without a vector"
+                        );
+                        (None, Some(Degraded::EmbedFailed))
+                    }
+                };
             let q = build_query(
                 &lexical_text(&args.question),
                 Some(ask::rerank_pool(k)),
@@ -1702,7 +1712,7 @@ impl MemoryServer {
             );
             let hits = match self.explained(&q).await {
                 Ok(hits) => hits,
-                Err(e) => return Err(format!("ask failed: {e}")),
+                Err(e) => return Err(ToolReply::failed(format!("ask failed: {e}"))),
             };
             // Summaries are model-written, so only infer mode looks for them.
             let summaries = match (&embedding, mode) {
@@ -1711,16 +1721,16 @@ impl MemoryServer {
                 }
                 _ => Vec::new(),
             };
-            Ok((hits, summaries))
+            Ok((hits, summaries, embed_degraded))
         };
-        let (hits, summaries) = match until_interrupted(retrieval_deadline, &cancel, retrieve).await
-        {
-            Ok(Ok(found)) => found,
-            Ok(Err(reply)) => return reply,
-            Err(why) => return self.interruption_reply("ask", why).text().to_string(),
-        };
+        let (hits, summaries, embed_degraded) =
+            match until_interrupted(retrieval_deadline, &cancel, retrieve).await {
+                Ok(Ok(found)) => found,
+                Ok(Err(reply)) => return reply,
+                Err(why) => return self.interruption_reply("ask", why),
+            };
         if hits.is_empty() && summaries.is_empty() {
-            return "no relevant memory".to_string();
+            return with_reasons(ToolReply::ok("no relevant memory"), [embed_degraded]);
         }
         let candidates: Vec<ask::Evidence> = hits
             .iter()
@@ -1731,13 +1741,14 @@ impl MemoryServer {
             .iter()
             .map(|e| e.retrieved.as_text().to_string())
             .collect();
-        let order = match self
+        let (order, rerank_degraded) = match self
             .rerank_within("ask", &args.question, &docs, retrieval_deadline, &cancel)
             .await
         {
-            Ok((order, _reason)) => order,
-            Err(reply) => return reply.text().to_string(),
+            Ok(ranked) => ranked,
+            Err(reply) => return reply,
         };
+        let retrieval_reasons = [embed_degraded, rerank_degraded];
         // Candidates list the store hits first, so an index below `hit_count`
         // is a store hit. Keep k of them plus every summary.
         let hit_count = hits.len();
@@ -1756,7 +1767,10 @@ impl MemoryServer {
         if mode == Mode::Strict {
             self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
             self.record_evidence_usage(&evidence);
-            return ask::strict_answer(&evidence, self.max_basis_ids_rendered);
+            return with_reasons(
+                ToolReply::ok(ask::strict_answer(&evidence, self.max_basis_ids_rendered)),
+                retrieval_reasons,
+            );
         }
         // Trim ONCE, before the sufficiency pre-pass, and reuse this same
         // slice for both prompts below. Trimming twice, or only for the
@@ -1798,7 +1812,18 @@ impl MemoryServer {
         let acquire_start = tokio::time::Instant::now();
         let _generation_permit = match self.acquire_generation_permit(deadline).await {
             Ok(permit) => permit,
-            Err(reason) => return fallback_answer(reason, evidence, self.max_basis_ids_rendered),
+            Err(reason) => {
+                return with_reasons(
+                    ToolReply::ok(fallback_answer(
+                        reason,
+                        evidence,
+                        self.max_basis_ids_rendered,
+                    )),
+                    retrieval_reasons
+                        .into_iter()
+                        .chain([Some(Degraded::SynthesisUnavailable)]),
+                )
+            }
         };
         // Covers every return path below, not just one model call.
         let _permit_timer = PermitTimer::new(
@@ -1816,14 +1841,25 @@ impl MemoryServer {
                 .passes_sufficiency_check(&args.question, evidence, deadline)
                 .await
         {
-            return ask::insufficient_answer(evidence, self.max_basis_ids_rendered);
+            return with_reasons(
+                ToolReply::ok(ask::insufficient_answer(
+                    evidence,
+                    self.max_basis_ids_rendered,
+                )),
+                retrieval_reasons,
+            );
         }
         // From here the model sees the evidence, so it counts even if the
         // answer then fails.
         self.record_evidence_usage(evidence);
 
-        self.synthesize_answer(&args.question, evidence, deadline)
-            .await
+        let (answer, synthesis_degraded) = self
+            .synthesize_answer(&args.question, evidence, deadline)
+            .await;
+        with_reasons(
+            ToolReply::ok(answer),
+            retrieval_reasons.into_iter().chain([synthesis_degraded]),
+        )
     }
 }
 
