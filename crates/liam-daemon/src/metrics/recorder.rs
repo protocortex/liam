@@ -19,18 +19,26 @@ use super::sink::{
     Labels, MetricId, MetricsSink, ModelCatalog, Provider, RetrievalArm, Sample, Snapshot,
     TokenUsage, Usage,
 };
+use crate::degraded::Degraded;
 use crate::tiering::AppliedMoves;
 
 /// Timings kept per window, the size `ask` already keeps for its own.
 const LATENCY_WINDOW: usize = 50;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tool {
     Recall,
     Ask,
 }
 
 impl Tool {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Recall => "recall",
+            Self::Ask => "ask",
+        }
+    }
+
     const fn metrics(self) -> [MetricId; 2] {
         match self {
             Self::Recall => [MetricId::RecallLatencyP50Ms, MetricId::RecallLatencyP95Ms],
@@ -66,6 +74,7 @@ pub struct Metrics {
     windows: Mutex<Windows>,
     models: Mutex<Models>,
     rollbacks: AtomicU64,
+    degraded: Mutex<BTreeMap<(Tool, Degraded), u64>>,
     alerting: Option<Alerting>,
     /// Held while a run publishes its readings and alerts, and by a reader of
     /// the snapshot, so a reader never sees one run's readings with the
@@ -85,6 +94,7 @@ impl Metrics {
             }),
             models: Mutex::new(Models::default()),
             rollbacks: AtomicU64::new(0),
+            degraded: Mutex::new(BTreeMap::new()),
             alerting: None,
             publication: tokio::sync::Mutex::new(()),
         }
@@ -200,6 +210,23 @@ impl Metrics {
         for sample in window.samples(tool.metrics(), Labels::None, now) {
             self.sink.record(sample);
         }
+    }
+
+    /// One degraded `recall` or `ask` reply. The count only grows.
+    pub fn record_degraded(&self, tool: Tool, reason: Degraded) {
+        let count = {
+            // A panic while counting leaves a total one reply short at worst.
+            let mut counts = self.degraded.lock().unwrap_or_else(PoisonError::into_inner);
+            let count = counts.entry((tool, reason)).or_insert(0);
+            *count += 1;
+            *count
+        };
+        self.sink.record(Sample {
+            metric: MetricId::DegradedReplies,
+            value: count as f64,
+            labels: Labels::Degraded { tool, reason },
+            at: self.clock.now(),
+        });
     }
 
     /// The per-arm timings of one query, for the arms it ran.

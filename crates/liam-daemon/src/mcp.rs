@@ -604,6 +604,15 @@ impl MemoryServer {
         tokio::time::Instant::now() + Duration::from_secs(self.recall_timeout_secs)
     }
 
+    /// Counts each reason of a degraded reply. A failure or a cancel carries
+    /// none, so it counts nothing.
+    fn count_degraded(&self, tool: Tool, reply: &ToolReply) {
+        let Some(metrics) = &self.metrics else { return };
+        for reason in reply.degraded() {
+            metrics.record_degraded(tool, *reason);
+        }
+    }
+
     fn interruption_reply(&self, tool: &str, why: Interrupted) -> ToolReply {
         match why {
             Interrupted::Deadline => ToolReply::failed(format!(
@@ -1251,7 +1260,9 @@ impl MemoryServer {
         Parameters(args): Parameters<RecallArgs>,
         cancel: CancellationToken,
     ) -> rmcp::model::CallToolResult {
-        self.recall_with(args, cancel).await.into_call_result()
+        let reply = self.recall_with(args, cancel).await;
+        self.count_degraded(Tool::Recall, &reply);
+        reply.into_call_result()
     }
 
     // Test-only: the server routes through the token-taking wrapper above.
@@ -1665,7 +1676,9 @@ impl MemoryServer {
         Parameters(args): Parameters<AskArgs>,
         cancel: CancellationToken,
     ) -> rmcp::model::CallToolResult {
-        self.ask_with(args, cancel).await.into_call_result()
+        let reply = self.ask_with(args, cancel).await;
+        self.count_degraded(Tool::Ask, &reply);
+        reply.into_call_result()
     }
 
     // Test-only: the server routes through the token-taking wrapper above.

@@ -6,6 +6,7 @@ use liam_store::FixedClock;
 
 use super::*;
 use crate::metrics::alerts::Rule;
+use crate::metrics::recorder::Tool;
 
 const NOW: Millis = Millis(1_000);
 const THREADS: usize = 8;
@@ -51,6 +52,10 @@ fn every_label_is_copy_and_none_holds_text() {
             provider: Provider::Local | Provider::Anthropic | Provider::OpenAi | Provider::Gemini,
             ..
         } => 3,
+        Labels::Degraded {
+            tool: Tool::Recall | Tool::Ask,
+            reason: _,
+        } => 4,
     };
     assert_eq!(label(Labels::None), 0);
 }

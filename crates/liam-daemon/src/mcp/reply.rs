@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The reply every tool returns: a text body plus the reasons it is degraded.
-// The tool handlers adopt this in the next change; until then only tests use it.
+// Some items here are only used by tests.
 #![allow(dead_code)]
 
 use std::sync::Arc;

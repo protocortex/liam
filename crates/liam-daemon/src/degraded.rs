@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Reasons a recall or ask reply is degraded rather than fully ranked.
-// The tool handlers adopt this in the next change; until then only tests use it.
+// Some items here are only used by tests.
 #![allow(dead_code)]
 
 use schemars::JsonSchema;

@@ -92,13 +92,16 @@ fn render(snapshot: &Snapshot, filter: Option<MetricId>, limit: usize) -> String
     text
 }
 
-fn label_suffix(labels: Labels) -> String {
+pub(super) fn label_suffix(labels: Labels) -> String {
     match labels {
         Labels::None => String::new(),
         Labels::Tier(tier) => format!("{{tier={tier:?}}}").to_lowercase(),
         Labels::Arm(arm) => format!("{{arm={arm:?}}}").to_lowercase(),
         Labels::Model { provider, model } => {
             format!("{{provider={provider:?},model={model:?}}}").to_lowercase()
+        }
+        Labels::Degraded { tool, reason } => {
+            format!("{{tool={},reason={}}}", tool.name(), reason.as_str())
         }
     }
 }
