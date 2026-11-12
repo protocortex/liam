@@ -9,6 +9,7 @@ mod ask;
 mod cli;
 mod clusters;
 mod consolidation_job;
+mod degraded;
 mod deletion;
 /// Grounding eval for `ask`; test-only, see the module docs to run it.
 #[cfg(test)]

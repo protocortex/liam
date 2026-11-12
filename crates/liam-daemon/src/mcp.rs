@@ -17,8 +17,11 @@ mod delete;
 pub mod facts;
 pub mod feedback;
 mod metrics;
+mod reply;
 #[cfg(test)]
 mod metrics_exit_criteria;
+#[cfg(test)]
+mod metrics_tests;
 pub mod producer;
 pub mod summaries;
 #[cfg(test)]

@@ -78,7 +78,10 @@ async fn the_tool_lists_each_reading_and_the_active_alerts() {
     // Assert
     assert!(text.contains("probe_recall_at_10 = 0.5"), "{text}");
     assert!(text.contains("rollback_count = 3"), "{text}");
-    assert!(text.contains("alerts:\nrollback_count = 3: reached 1"), "{text}");
+    assert!(
+        text.contains("alerts:\nrollback_count = 3: reached 1"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -113,7 +116,10 @@ async fn an_unknown_metric_is_named_with_the_known_ones() {
     let text = ask(&server, Some("speed"), None).await;
 
     // Assert
-    assert!(text.starts_with("metrics failed: unknown metric \"speed\""), "{text}");
+    assert!(
+        text.starts_with("metrics failed: unknown metric \"speed\""),
+        "{text}"
+    );
     assert!(text.contains("probe_recall_at_10"), "{text}");
 }
 
@@ -133,7 +139,10 @@ async fn a_limit_of_zero_returns_nothing_and_a_large_one_is_capped() {
 
     // Assert
     assert_eq!(none, "no readings requested: limit is 0");
-    assert_eq!(capped.matches(" = ").count(), MetricId::ALL.len().min(MAX_LIMIT));
+    assert_eq!(
+        capped.matches(" = ").count(),
+        MetricId::ALL.len().min(MAX_LIMIT)
+    );
     assert_eq!(two.matches("(samples").count(), 2);
 }
 
