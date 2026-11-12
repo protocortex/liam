@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The reply every tool returns: a text body plus the reasons it is degraded.
-// Some items here are only used by tests.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -63,6 +61,7 @@ impl ToolReply {
     }
 
     /// The body text, without the marker line.
+    #[cfg(test)]
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -73,6 +72,7 @@ impl ToolReply {
     }
 
     /// Whether this reply reports a tool-level failure.
+    #[cfg(test)]
     pub fn is_error(&self) -> bool {
         self.is_error
     }

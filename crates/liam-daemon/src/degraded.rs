@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Reasons a recall or ask reply is degraded rather than fully ranked.
-// Some items here are only used by tests.
-#![allow(dead_code)]
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -18,6 +16,7 @@ pub enum Degraded {
 }
 
 impl Degraded {
+    #[cfg(test)]
     pub const ALL: [Degraded; 5] = [
         Degraded::EmbedFailed,
         Degraded::RerankSkipped,
