@@ -9,9 +9,31 @@ use liam_store::{Clock, Millis};
 use serde::{Deserialize, Serialize};
 
 use super::alerts::Alert;
-use super::recorder::Tool;
 pub use crate::config::{Provider, TokenUsage};
 use crate::degraded::Degraded;
+
+/// A tool whose replies the daemon times and counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tool {
+    Recall,
+    Ask,
+}
+
+impl Tool {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Recall => "recall",
+            Self::Ask => "ask",
+        }
+    }
+
+    pub(super) const fn metrics(self) -> [MetricId; 2] {
+        match self {
+            Self::Recall => [MetricId::RecallLatencyP50Ms, MetricId::RecallLatencyP95Ms],
+            Self::Ask => [MetricId::AskLatencyP50Ms, MetricId::AskLatencyP95Ms],
+        }
+    }
+}
 
 /// Every metric the daemon keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

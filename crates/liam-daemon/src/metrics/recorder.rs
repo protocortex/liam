@@ -17,35 +17,13 @@ use super::alerts::{evaluate_run, Observation, RuleSet};
 use super::collect::{self, LatencyWindow, ModelMeter, Price};
 use super::sink::{
     Labels, MetricId, MetricsSink, ModelCatalog, Provider, RetrievalArm, Sample, Snapshot,
-    TokenUsage, Usage,
+    TokenUsage, Tool, Usage,
 };
 use crate::degraded::Degraded;
 use crate::tiering::AppliedMoves;
 
 /// Timings kept per window, the size `ask` already keeps for its own.
 const LATENCY_WINDOW: usize = 50;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Tool {
-    Recall,
-    Ask,
-}
-
-impl Tool {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Recall => "recall",
-            Self::Ask => "ask",
-        }
-    }
-
-    const fn metrics(self) -> [MetricId; 2] {
-        match self {
-            Self::Recall => [MetricId::RecallLatencyP50Ms, MetricId::RecallLatencyP95Ms],
-            Self::Ask => [MetricId::AskLatencyP50Ms, MetricId::AskLatencyP95Ms],
-        }
-    }
-}
 
 const ARM_METRICS: [MetricId; 2] = [MetricId::ArmLatencyP50Ms, MetricId::ArmLatencyP95Ms];
 
@@ -214,16 +192,14 @@ impl Metrics {
 
     /// One degraded `recall` or `ask` reply. The count only grows.
     pub fn record_degraded(&self, tool: Tool, reason: Degraded) {
-        let count = {
-            // A panic while counting leaves a total one reply short at worst.
-            let mut counts = self.degraded.lock().unwrap_or_else(PoisonError::into_inner);
-            let count = counts.entry((tool, reason)).or_insert(0);
-            *count += 1;
-            *count
-        };
+        // A panic while counting leaves a total one reply short at worst.
+        let mut counts = self.degraded.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = counts.entry((tool, reason)).or_insert(0);
+        *count += 1;
+        // The sink keeps the last write, so write while the lock still orders the counts.
         self.sink.record(Sample {
             metric: MetricId::DegradedReplies,
-            value: count as f64,
+            value: *count as f64,
             labels: Labels::Degraded { tool, reason },
             at: self.clock.now(),
         });

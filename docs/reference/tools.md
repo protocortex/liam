@@ -63,9 +63,7 @@ reason with a short hint, for example
 line. Several reasons appear in the order they happened, each once.
 
 A reply sets `isError` when the call failed: the retrieval deadline passed, the
-store failed, or the query was invalid. `recall` also sets it when asked for a
-non-strict mode. A cancelled call stays a normal reply with the text `cancelled`
-(`ask cancelled` for `ask`).
+store failed, or the query was invalid. `recall` also sets it when called with `mode` set to `infer`. A cancelled call stays a normal reply with the text `recall cancelled` or `ask cancelled`.
 
 Each degraded reason also adds one to the `degraded_replies` metric, labelled with
 the tool and the reason. See [Metrics and alerts](../operations/metrics-and-alerts.md).

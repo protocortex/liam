@@ -139,6 +139,16 @@ impl Llm for SleepingLlm {
     }
 }
 
+/// Says the evidence cannot answer, so the sufficiency pre-pass refuses.
+struct RefusingLlm;
+
+#[async_trait::async_trait]
+impl Llm for RefusingLlm {
+    async fn complete(&self, _system: &str, _prompt: &str) -> liam_model::Result<String> {
+        Ok("NO".to_string())
+    }
+}
+
 /// Fresh in-memory server over the given doubles, with a 30 s ask timeout and
 /// no sufficiency pre-pass.
 async fn server_with_models(
@@ -775,7 +785,7 @@ async fn recall_names_both_reasons_when_the_embed_errors_and_the_reranker_times_
 }
 
 #[tokio::test(start_paused = true)]
-async fn cancelling_a_recall_drops_its_embed_before_it_takes_the_gate() {
+async fn a_recall_cancelled_while_waiting_on_the_embedder_never_takes_the_gate() {
     // Arrange
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let embedder = Arc::new(GatedEmbedder::new(DIMS, gate.clone()));
@@ -864,7 +874,7 @@ async fn ask_marks_each_fallback_as_synthesis_unavailable_and_keeps_the_evidence
             Some(marker_for("synthesis_unavailable").as_str()),
             "{name}"
         );
-        assert!(text.contains(QUERY), "{name}: {text}");
+        assert_eq!(text.matches(" note ").count(), K, "{name}: {text}");
     }
 }
 
@@ -1027,4 +1037,78 @@ async fn ask_names_the_rerank_timeout_and_the_synthesis_timeout_together() {
     let expected_marker = "(degraded: rerank_timeout, hits are in store order; \
 synthesis_unavailable, showing the retrieved evidence)";
     assert_eq!(text.lines().next(), Some(expected_marker));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ask_names_keyword_only_search_when_the_embedder_errors_and_nothing_matches() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(ErroringEmbedder::new(DIMS)),
+        Arc::new(IdentityReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+
+    // Act
+    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
+
+    // Assert
+    let text = wire_text(out, &["embed_failed"], false);
+    assert_eq!(
+        text,
+        format!("{}\n{NO_MEMORY_TEXT}", marker_for("embed_failed"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ask_keeps_the_rerank_reason_in_strict_mode() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(MockEmbedder::new(DIMS)),
+        Arc::new(FailingReranker),
+        Arc::new(MockLlm),
+    )
+    .await;
+    seed_facts(&server).await;
+    let args = AskArgs {
+        mode: Some(Mode::Strict),
+        ..ask_args()
+    };
+
+    // Act
+    let out = server.ask_with(args, CancellationToken::new()).await;
+
+    // Assert
+    let text = wire_text(out, &["rerank_failed"], false);
+    assert_eq!(
+        text.lines().next(),
+        Some(marker_for("rerank_failed").as_str())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ask_keeps_the_rerank_reason_when_the_pre_pass_refuses() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(MockEmbedder::new(DIMS)),
+        Arc::new(FailingReranker),
+        Arc::new(RefusingLlm),
+    )
+    .await;
+    let server = MemoryServer {
+        ask_sufficiency_check: true,
+        ..server
+    };
+    seed_facts(&server).await;
+
+    // Act
+    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
+
+    // Assert
+    let text = wire_text(out, &["rerank_failed"], false);
+    assert_eq!(
+        text.lines().next(),
+        Some(marker_for("rerank_failed").as_str())
+    );
+    assert!(text.contains("does not contain an answer"), "{text}");
 }

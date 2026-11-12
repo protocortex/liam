@@ -14,7 +14,8 @@ use super::{AskArgs, MemoryServer, RecallArgs};
 use crate::degraded::Degraded;
 use crate::log_startup::test_support::{embedder, DIMS};
 use crate::metrics::alerts::{Alert, Rule};
-use crate::metrics::recorder::{Metrics, Tool};
+use crate::metrics::recorder::Metrics;
+use crate::metrics::sink::Tool;
 use crate::metrics::sink::{Labels, MemorySink, MetricId, MetricsSink, Sample};
 
 const AT: Millis = Millis(1_000);

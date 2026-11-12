@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The reply every tool returns: a text body plus the reasons it is degraded.
+//! The reply of `recall` and `ask`: a text body plus the reasons it is degraded.
 
 use std::sync::Arc;
 
@@ -7,7 +7,6 @@ use rmcp::handler::server::common::schema_for_type;
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject};
 use schemars::JsonSchema;
 use serde::Serialize;
-use serde_json::json;
 
 use crate::degraded::Degraded;
 
@@ -16,13 +15,13 @@ pub const DEGRADED_MARKER_PREFIX: &str = "(degraded: ";
 const MARKER_SUFFIX: &str = ")";
 const REASON_SEPARATOR: &str = "; ";
 
-/// Shape of the structured content every tool reply carries.
+/// Shape of the structured content a `recall` or `ask` reply carries.
 #[derive(Serialize, JsonSchema)]
 struct DegradedOutput {
     degraded: Vec<Degraded>,
 }
 
-/// The JSON schema advertised as each tool's output schema.
+/// The JSON schema advertised as the output schema of `recall` and `ask`.
 pub fn output_schema() -> Arc<JsonObject> {
     schema_for_type::<DegradedOutput>()
 }
@@ -85,7 +84,12 @@ impl ToolReply {
             format!("{}\n{}", marker_line(&self.degraded), self.text)
         };
         let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-        result.structured_content = Some(json!({ "degraded": self.degraded }));
+        result.structured_content = Some(
+            serde_json::to_value(DegradedOutput {
+                degraded: self.degraded,
+            })
+            .expect("a list of reason names always serializes"),
+        );
         result.is_error = Some(self.is_error);
         result
     }

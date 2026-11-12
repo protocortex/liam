@@ -6,7 +6,7 @@ use liam_store::FixedClock;
 
 use super::*;
 use crate::metrics::alerts::Rule;
-use crate::metrics::recorder::Tool;
+use crate::metrics::sink::Tool;
 
 const NOW: Millis = Millis(1_000);
 const THREADS: usize = 8;

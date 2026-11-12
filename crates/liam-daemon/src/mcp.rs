@@ -66,7 +66,8 @@ use crate::config::{
 use crate::consolidation_job::ConsolidationJob;
 use crate::degraded::Degraded;
 use crate::deletion::DeletePreview;
-use crate::metrics::recorder::{Metrics, Tool, ToolTimer};
+use crate::metrics::recorder::{Metrics, ToolTimer};
+use crate::metrics::sink::Tool;
 use crate::render;
 use crate::synthesis;
 use crate::tiering::usage::UsageRecorder;
@@ -1274,6 +1275,22 @@ impl MemoryServer {
             .to_string()
     }
 
+    /// Embeds `text` as a query. An embedder error is logged and reported as
+    /// `EmbedFailed`, and the search then runs on keywords alone.
+    async fn embed_or_degrade(
+        &self,
+        tool: &str,
+        text: &str,
+    ) -> (Option<Vec<f32>>, Option<Degraded>) {
+        match self.embedder.embed(text, TextKind::Query).await {
+            Ok(vector) => (Some(vector), None),
+            Err(e) => {
+                tracing::warn!(tool, error = %e, "embed failed, searching without a vector");
+                (None, Some(Degraded::EmbedFailed))
+            }
+        }
+    }
+
     pub(crate) async fn recall_with(
         &self,
         args: RecallArgs,
@@ -1292,18 +1309,7 @@ impl MemoryServer {
         let deadline = self.retrieval_deadline();
         let k = crate::ask::clamp_recall_k(args.k);
         let retrieve = async {
-            let (embedding, embed_degraded) =
-                match self.embedder.embed(&args.query, TextKind::Query).await {
-                    Ok(vector) => (Some(vector), None),
-                    Err(e) => {
-                        tracing::warn!(
-                            tool = "recall",
-                            error = %e,
-                            "embed failed, searching without a vector"
-                        );
-                        (None, Some(Degraded::EmbedFailed))
-                    }
-                };
+            let (embedding, embed_degraded) = self.embed_or_degrade("recall", &args.query).await;
             let q = build_query(
                 &lexical_text(&args.query),
                 Some(crate::ask::rerank_pool(k)),
@@ -1702,18 +1708,7 @@ impl MemoryServer {
         let mode = args.mode.unwrap_or(Mode::Infer);
         let k = clamp_ask_k(args.k);
         let retrieve = async {
-            let (embedding, embed_degraded) =
-                match self.embedder.embed(&args.question, TextKind::Query).await {
-                    Ok(vector) => (Some(vector), None),
-                    Err(e) => {
-                        tracing::warn!(
-                            tool = "ask",
-                            error = %e,
-                            "embed failed, searching without a vector"
-                        );
-                        (None, Some(Degraded::EmbedFailed))
-                    }
-                };
+            let (embedding, embed_degraded) = self.embed_or_degrade("ask", &args.question).await;
             let q = build_query(
                 &lexical_text(&args.question),
                 Some(ask::rerank_pool(k)),
