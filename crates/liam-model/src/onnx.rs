@@ -143,7 +143,7 @@ fn validate_onnx_dims(spec: &OnnxModelSpec, dims: usize) -> Result<()> {
 /// In-process ONNX embedder for one `OnnxModelSpec`. The sync ONNX call runs on
 /// a blocking thread so the async runtime stays free.
 pub struct OnnxEmbedder {
-    model: std::sync::Arc<std::sync::Mutex<fastembed::TextEmbedding>>,
+    model: std::sync::Arc<tokio::sync::Mutex<fastembed::TextEmbedding>>,
     spec: &'static OnnxModelSpec,
     dims: usize,
 }
@@ -168,7 +168,7 @@ impl OnnxEmbedder {
         let model = fastembed::TextEmbedding::try_new(options)
             .map_err(|e| ModelError::Embed(format!("load {}: {e}", spec.id)))?;
         Ok(Self {
-            model: std::sync::Arc::new(std::sync::Mutex::new(model)),
+            model: std::sync::Arc::new(tokio::sync::Mutex::new(model)),
             spec,
             dims,
         })

@@ -13,6 +13,7 @@ defeat a delete.
 | `probe_recall_at_10` | Mean recall at 10 over the consolidation probes. |
 | `arm_latency_p50_ms`, `arm_latency_p95_ms` | Nearest-rank percentiles of the last 50 timings of each retrieval arm. |
 | `recall_latency_*`, `ask_latency_*` | The same for the `recall` and `ask` tools. |
+| `degraded_replies` | Count of `recall` and `ask` replies that used a fallback, per tool and reason. See [Degraded replies](../reference/tools.md#degraded-replies). |
 | `tier_bytes` | Bytes of vectors and signatures in the hot and the cold tier. |
 | `log_bytes`, `archive_bytes` | Size of the log and archive directories. |
 | `peak_rss_bytes` | Resident memory of the daemon and the processes it started. |

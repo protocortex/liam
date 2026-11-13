@@ -172,7 +172,7 @@ fn weight_fetch_error(model_id: &str, cause: &str) -> crate::error::ModelError {
 /// free. `dims` is the output embedding width after Matryoshka truncation
 /// (see `mrl_truncate`); it must not exceed the model's native hidden size.
 pub struct FastEmbedEmbedder {
-    model: std::sync::Arc<std::sync::Mutex<fastembed::Qwen3TextEmbedding>>,
+    model: std::sync::Arc<tokio::sync::Mutex<fastembed::Qwen3TextEmbedding>>,
     dims: usize,
     label: &'static str,
 }
@@ -302,7 +302,7 @@ impl FastEmbedEmbedder {
 
         let model = fastembed::Qwen3TextEmbedding::new(qwen3_model, tokenizer);
         Ok(Self {
-            model: std::sync::Arc::new(std::sync::Mutex::new(model)),
+            model: std::sync::Arc::new(tokio::sync::Mutex::new(model)),
             dims,
             label,
         })

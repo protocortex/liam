@@ -17,27 +17,13 @@ use super::alerts::{evaluate_run, Observation, RuleSet};
 use super::collect::{self, LatencyWindow, ModelMeter, Price};
 use super::sink::{
     Labels, MetricId, MetricsSink, ModelCatalog, Provider, RetrievalArm, Sample, Snapshot,
-    TokenUsage, Usage,
+    TokenUsage, Tool, Usage,
 };
+use crate::degraded::Degraded;
 use crate::tiering::AppliedMoves;
 
 /// Timings kept per window, the size `ask` already keeps for its own.
 const LATENCY_WINDOW: usize = 50;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tool {
-    Recall,
-    Ask,
-}
-
-impl Tool {
-    const fn metrics(self) -> [MetricId; 2] {
-        match self {
-            Self::Recall => [MetricId::RecallLatencyP50Ms, MetricId::RecallLatencyP95Ms],
-            Self::Ask => [MetricId::AskLatencyP50Ms, MetricId::AskLatencyP95Ms],
-        }
-    }
-}
 
 const ARM_METRICS: [MetricId; 2] = [MetricId::ArmLatencyP50Ms, MetricId::ArmLatencyP95Ms];
 
@@ -66,6 +52,7 @@ pub struct Metrics {
     windows: Mutex<Windows>,
     models: Mutex<Models>,
     rollbacks: AtomicU64,
+    degraded: Mutex<BTreeMap<(Tool, Degraded), u64>>,
     alerting: Option<Alerting>,
     /// Held while a run publishes its readings and alerts, and by a reader of
     /// the snapshot, so a reader never sees one run's readings with the
@@ -85,6 +72,7 @@ impl Metrics {
             }),
             models: Mutex::new(Models::default()),
             rollbacks: AtomicU64::new(0),
+            degraded: Mutex::new(BTreeMap::new()),
             alerting: None,
             publication: tokio::sync::Mutex::new(()),
         }
@@ -200,6 +188,21 @@ impl Metrics {
         for sample in window.samples(tool.metrics(), Labels::None, now) {
             self.sink.record(sample);
         }
+    }
+
+    /// One degraded `recall` or `ask` reply. The count only grows.
+    pub fn record_degraded(&self, tool: Tool, reason: Degraded) {
+        // A panic while counting leaves a total one reply short at worst.
+        let mut counts = self.degraded.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = counts.entry((tool, reason)).or_insert(0);
+        *count += 1;
+        // The sink keeps the last write, so write while the lock still orders the counts.
+        self.sink.record(Sample {
+            metric: MetricId::DegradedReplies,
+            value: *count as f64,
+            labels: Labels::Degraded { tool, reason },
+            at: self.clock.now(),
+        });
     }
 
     /// The per-arm timings of one query, for the arms it ran.

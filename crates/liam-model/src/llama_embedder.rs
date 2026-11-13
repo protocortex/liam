@@ -16,7 +16,7 @@
 //! can see another call's keys. Building a Metal context costs about 10 ms and
 //! freeing one about as much, which dominated a per-call context.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
@@ -26,6 +26,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::token::LlamaToken;
+use tokio::sync::Mutex;
 
 use crate::blocking::with_model_blocking;
 use crate::embedder::{
@@ -189,8 +190,8 @@ struct Inner {
 }
 
 // SAFETY: the context is not tied to the thread that made it, and `Inner`
-// only ever lives behind the `Mutex` in `LlamaEmbedder`, so one thread uses it
-// at a time.
+// only ever lives behind the tokio `Mutex` in `LlamaEmbedder`, so one thread
+// uses it at a time.
 unsafe impl Send for Inner {}
 
 pub struct LlamaEmbedder {

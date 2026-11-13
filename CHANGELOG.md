@@ -13,9 +13,19 @@ All notable changes to LIAM are recorded here. The format follows
   request now stops retrieval with a `cancelled` reply; the `ask` model call that follows retrieval still runs
   until `ask_timeout_secs`. A call that gave up waiting for the reranker no longer runs
   after the busy call finishes.
+- `recall` and `ask` now report when a reply used a fallback. Every reply carries a structured `degraded` list
+  (`embed_failed`, `rerank_skipped`, `rerank_failed`, `rerank_timeout`, `synthesis_unavailable`), and a degraded reply
+  starts with a marker line that names each reason. A new `degraded_replies` metric counts them by tool and reason.
+  See [Degraded replies](docs/reference/tools.md#degraded-replies).
 
 ### Changed
 
+- `recall` and `ask` now set `isError` when the call fails: the retrieval deadline passes, the store fails, or the
+  query is invalid. A cancelled call still returns a normal reply. `recall` and `ask` now log a failed embed and
+  report `embed_failed` instead of hiding it.
+- An embed that gave up waiting for the model no longer queues behind it. A call waits for the model lock before it
+  starts the work, so a client that disconnects while waiting leaves no thread behind. A cancel that arrives after
+  the call took the lock still runs its embed to the end.
 - `recall` and `ask` now reject an empty, whitespace-only or NUL-containing query and one over 4000 characters
   with a clear error. Only the first 64 distinct words reach the lexical arm; later words reach only the vector arm.
 - `recall` now reranks a wider pool of candidates (twice `k`, at least 16, at most 32) before it cuts to `k`, so

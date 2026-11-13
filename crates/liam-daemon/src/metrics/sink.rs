@@ -10,6 +10,30 @@ use serde::{Deserialize, Serialize};
 
 use super::alerts::Alert;
 pub use crate::config::{Provider, TokenUsage};
+use crate::degraded::Degraded;
+
+/// A tool whose replies the daemon times and counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tool {
+    Recall,
+    Ask,
+}
+
+impl Tool {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Recall => "recall",
+            Self::Ask => "ask",
+        }
+    }
+
+    pub(super) const fn metrics(self) -> [MetricId; 2] {
+        match self {
+            Self::Recall => [MetricId::RecallLatencyP50Ms, MetricId::RecallLatencyP95Ms],
+            Self::Ask => [MetricId::AskLatencyP50Ms, MetricId::AskLatencyP95Ms],
+        }
+    }
+}
 
 /// Every metric the daemon keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -38,11 +62,12 @@ pub enum MetricId {
     CacheHitRate,
     DeletionBacklogCount,
     DeletionBacklogAgeDays,
+    DegradedReplies,
 }
 
 impl MetricId {
     /// Every metric, in declaration order.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::ProbeRecallAt10,
         Self::ArmLatencyP50Ms,
         Self::ArmLatencyP95Ms,
@@ -67,6 +92,7 @@ impl MetricId {
         Self::CacheHitRate,
         Self::DeletionBacklogCount,
         Self::DeletionBacklogAgeDays,
+        Self::DegradedReplies,
     ];
 
     /// The metric called `name`.
@@ -100,6 +126,7 @@ impl MetricId {
             Self::CacheHitRate => "cache_hit_rate",
             Self::DeletionBacklogCount => "deletion_backlog_count",
             Self::DeletionBacklogAgeDays => "deletion_backlog_age_days",
+            Self::DegradedReplies => "degraded_replies",
         }
     }
 }
@@ -188,6 +215,7 @@ pub enum Labels {
     Tier(TierLabel),
     Arm(RetrievalArm),
     Model { provider: Provider, model: ModelId },
+    Degraded { tool: Tool, reason: Degraded },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

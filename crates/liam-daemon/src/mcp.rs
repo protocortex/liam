@@ -19,8 +19,13 @@ pub mod feedback;
 mod metrics;
 #[cfg(test)]
 mod metrics_exit_criteria;
+#[cfg(test)]
+mod metrics_tests;
 pub mod producer;
+mod reply;
 pub mod summaries;
+#[cfg(test)]
+mod test_doubles;
 #[cfg(test)]
 mod usage_tests;
 
@@ -47,6 +52,7 @@ use self::episode::{resolved_id, validate_episode, EpisodeArgs};
 use self::facts::FactsArgs;
 use self::feedback::{Feedback, FeedbackArgs};
 use self::metrics::MetricsArgs;
+use self::reply::ToolReply;
 use self::summaries::SummariesArgs;
 use crate::ask::{
     self, build_ask_prompt, clamp_ask_k, estimate_tokens, fallback_answer, fit_evidence_to_budget,
@@ -58,8 +64,10 @@ use crate::config::{
     DEFAULT_MIN_SUMMARY_SIMILARITY, DEFAULT_RECALL_TIMEOUT_SECS,
 };
 use crate::consolidation_job::ConsolidationJob;
+use crate::degraded::Degraded;
 use crate::deletion::DeletePreview;
-use crate::metrics::recorder::{Metrics, Tool, ToolTimer};
+use crate::metrics::recorder::{Metrics, ToolTimer};
+use crate::metrics::sink::Tool;
 use crate::render;
 use crate::synthesis;
 use crate::tiering::usage::UsageRecorder;
@@ -597,18 +605,27 @@ impl MemoryServer {
         tokio::time::Instant::now() + Duration::from_secs(self.recall_timeout_secs)
     }
 
-    fn interruption_reply(&self, tool: &str, why: Interrupted) -> String {
+    /// Counts each reason of a degraded reply. A failure or a cancel carries
+    /// none, so it counts nothing.
+    fn count_degraded(&self, tool: Tool, reply: &ToolReply) {
+        let Some(metrics) = &self.metrics else { return };
+        for reason in reply.degraded() {
+            metrics.record_degraded(tool, *reason);
+        }
+    }
+
+    fn interruption_reply(&self, tool: &str, why: Interrupted) -> ToolReply {
         match why {
-            Interrupted::Deadline => format!(
+            Interrupted::Deadline => ToolReply::failed(format!(
                 "{tool} failed: retrieval took longer than {} s",
                 self.recall_timeout_secs
-            ),
-            Interrupted::Cancelled => cancelled_reply(tool),
+            )),
+            Interrupted::Cancelled => ToolReply::ok(cancelled_reply(tool)),
         }
     }
 
     /// Reranks `docs`. When the reranker fails, is skipped for lack of time,
-    /// or outlasts the deadline, returns store order. `Err` is the cancel reply.
+    /// or outlasts the deadline, returns store order and why. `Err` is the cancel reply.
     async fn rerank_within(
         &self,
         tool: &str,
@@ -616,28 +633,39 @@ impl MemoryServer {
         docs: &[String],
         deadline: tokio::time::Instant,
         cancel: &CancellationToken,
-    ) -> Result<Vec<usize>, String> {
+    ) -> Result<(Vec<usize>, Option<Degraded>), ToolReply> {
         let store_order = || (0..docs.len()).collect();
         if deadline.saturating_duration_since(tokio::time::Instant::now()) < MIN_RERANK_BUDGET {
             tracing::warn!(
                 tool,
                 "too little retrieval time left, skipping the reranker"
             );
-            return Ok(store_order());
+            return Ok((store_order(), Some(Degraded::RerankSkipped)));
         }
         match until_interrupted(deadline, cancel, self.reranker.order(query, docs)).await {
-            Ok(Ok(order)) => Ok(order),
+            Ok(Ok(order)) => Ok((order, None)),
             Ok(Err(e)) => {
                 tracing::warn!(tool, error = %e, "answered from unreranked evidence");
-                Ok(store_order())
+                Ok((store_order(), Some(Degraded::RerankFailed)))
             }
             Err(Interrupted::Deadline) => {
                 tracing::warn!(tool, "reranker outlasted the retrieval deadline");
-                Ok(store_order())
+                Ok((store_order(), Some(Degraded::RerankTimeout)))
             }
-            Err(Interrupted::Cancelled) => Err(cancelled_reply(tool)),
+            Err(Interrupted::Cancelled) => Err(ToolReply::ok(cancelled_reply(tool))),
         }
     }
+}
+
+/// Adds each present reason to `reply`, in order.
+fn with_reasons(
+    reply: ToolReply,
+    reasons: impl IntoIterator<Item = Option<Degraded>>,
+) -> ToolReply {
+    reasons
+        .into_iter()
+        .flatten()
+        .fold(reply, ToolReply::with_degraded)
 }
 
 #[tool_router]
@@ -1225,37 +1253,63 @@ impl MemoryServer {
     // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(
         name = "recall",
-        description = "Retrieve relevant long-term memory, reranked for precision."
+        description = "Retrieve relevant long-term memory, reranked for precision.",
+        output_schema = reply::output_schema()
     )]
     async fn recall_tool(
         &self,
         Parameters(args): Parameters<RecallArgs>,
         cancel: CancellationToken,
-    ) -> String {
-        self.recall_with(args, cancel).await
+    ) -> rmcp::model::CallToolResult {
+        let reply = self.recall_with(args, cancel).await;
+        self.count_degraded(Tool::Recall, &reply);
+        reply.into_call_result()
     }
 
     // Test-only: the server routes through the token-taking wrapper above.
     #[cfg(test)]
     pub(crate) async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
-        self.recall_with(args, CancellationToken::new()).await
+        self.recall_with(args, CancellationToken::new())
+            .await
+            .text()
+            .to_string()
     }
 
-    pub(crate) async fn recall_with(&self, args: RecallArgs, cancel: CancellationToken) -> String {
+    /// Embeds `text` as a query. An embedder error is logged and reported as
+    /// `EmbedFailed`, and the search then runs on keywords alone.
+    async fn embed_or_degrade(
+        &self,
+        tool: &str,
+        text: &str,
+    ) -> (Option<Vec<f32>>, Option<Degraded>) {
+        match self.embedder.embed(text, TextKind::Query).await {
+            Ok(vector) => (Some(vector), None),
+            Err(e) => {
+                tracing::warn!(tool, error = %e, "embed failed, searching without a vector");
+                (None, Some(Degraded::EmbedFailed))
+            }
+        }
+    }
+
+    pub(crate) async fn recall_with(
+        &self,
+        args: RecallArgs,
+        cancel: CancellationToken,
+    ) -> ToolReply {
         if let Err(refusal) = require_strict("recall", args.mode) {
-            return refusal;
+            return ToolReply::failed(refusal);
         }
         if let Some(problem) = query_problem(&args.query) {
-            return format!("recall failed: {problem}");
+            return ToolReply::failed(format!("recall failed: {problem}"));
         }
         let _timer = self.time(Tool::Recall);
         if cancel.is_cancelled() {
-            return cancelled_reply("recall");
+            return ToolReply::ok(cancelled_reply("recall"));
         }
         let deadline = self.retrieval_deadline();
         let k = crate::ask::clamp_recall_k(args.k);
         let retrieve = async {
-            let embedding = self.embedder.embed(&args.query, TextKind::Query).await.ok();
+            let (embedding, embed_degraded) = self.embed_or_degrade("recall", &args.query).await;
             let q = build_query(
                 &lexical_text(&args.query),
                 Some(crate::ask::rerank_pool(k)),
@@ -1265,25 +1319,25 @@ impl MemoryServer {
                 args.as_of,
                 false,
             );
-            self.explained(&q).await
+            (self.explained(&q).await, embed_degraded)
         };
-        let hits = match until_interrupted(deadline, &cancel, retrieve).await {
-            Ok(Ok(h)) => h,
-            Ok(Err(e)) => return format!("recall failed: {e}"),
+        let (hits, embed_degraded) = match until_interrupted(deadline, &cancel, retrieve).await {
+            Ok((Ok(h), degraded)) => (h, degraded),
+            Ok((Err(e), _)) => return ToolReply::failed(format!("recall failed: {e}")),
             Err(why) => return self.interruption_reply("recall", why),
         };
         if hits.is_empty() {
-            return "no relevant memory".to_string();
+            return with_reasons(ToolReply::ok("no relevant memory"), [embed_degraded]);
         }
         let docs: Vec<String> = hits
             .iter()
             .map(|h| h.hit.retrieved.as_text().to_string())
             .collect();
-        let order = match self
+        let (order, rerank_degraded) = match self
             .rerank_within("recall", &args.query, &docs, deadline, &cancel)
             .await
         {
-            Ok(order) => order,
+            Ok(ranked) => ranked,
             Err(reply) => return reply,
         };
         let order = &order[..order.len().min(k)];
@@ -1306,7 +1360,7 @@ impl MemoryServer {
         // bracket as a rejected alternative: it broke `resolve_handle`'s
         // alphanumeric-only gate, so the bracket stays `[{kind} {handle}]`
         // and nothing else, under every combination of these fields.
-        order
+        let text = order
             .iter()
             .map(|&i| {
                 let hit = &hits[i];
@@ -1329,7 +1383,8 @@ impl MemoryServer {
                 )
             })
             .collect::<Vec<_>>()
-            .join("\n\n")
+            .join("\n\n");
+        with_reasons(ToolReply::ok(text), [embed_degraded, rerank_degraded])
     }
 
     #[tool(
@@ -1583,9 +1638,15 @@ impl MemoryServer {
         question: &str,
         evidence: &[ask::Evidence],
         deadline: tokio::time::Instant,
-    ) -> String {
+    ) -> (String, Option<Degraded>) {
         let (system, user) = build_ask_prompt(question, evidence);
         let synth = tokio::time::timeout_at(deadline, self.llm.complete(&system, &user)).await;
+        let unavailable = |reason: &str| {
+            (
+                fallback_answer(reason, evidence, self.max_basis_ids_rendered),
+                Some(Degraded::SynthesisUnavailable),
+            )
+        };
         match synth {
             Ok(Ok(a)) if !a.trim().is_empty() => {
                 let answer = a.trim();
@@ -1595,24 +1656,17 @@ impl MemoryServer {
                 // Unlike the prompt rules, this does not depend on the model
                 // cooperating. See `ask::is_grounded`.
                 if ask::is_grounded(answer, question, evidence) {
-                    format_answer(answer, evidence, self.max_basis_ids_rendered)
-                } else {
-                    fallback_answer(
-                        "the answer was not grounded in the evidence",
-                        evidence,
-                        self.max_basis_ids_rendered,
+                    (
+                        format_answer(answer, evidence, self.max_basis_ids_rendered),
+                        None,
                     )
+                } else {
+                    unavailable("the answer was not grounded in the evidence")
                 }
             }
-            Ok(Ok(_)) => fallback_answer(
-                "the model returned an empty answer",
-                evidence,
-                self.max_basis_ids_rendered,
-            ),
-            Ok(Err(_)) => {
-                fallback_answer("the model failed", evidence, self.max_basis_ids_rendered)
-            }
-            Err(_) => fallback_answer("synthesis timed out", evidence, self.max_basis_ids_rendered),
+            Ok(Ok(_)) => unavailable("the model returned an empty answer"),
+            Ok(Err(_)) => unavailable("the model failed"),
+            Err(_) => unavailable("synthesis timed out"),
         }
     }
 
@@ -1620,39 +1674,41 @@ impl MemoryServer {
     // path an MCP client hits, rather than a re-implementation of it.
     #[tool(
         name = "ask",
-        description = "Answer a question from long-term memory, synthesized and cited."
+        description = "Answer a question from long-term memory, synthesized and cited.",
+        output_schema = reply::output_schema()
     )]
     async fn ask_tool(
         &self,
         Parameters(args): Parameters<AskArgs>,
         cancel: CancellationToken,
-    ) -> String {
-        self.ask_with(args, cancel).await
+    ) -> rmcp::model::CallToolResult {
+        let reply = self.ask_with(args, cancel).await;
+        self.count_degraded(Tool::Ask, &reply);
+        reply.into_call_result()
     }
 
     // Test-only: the server routes through the token-taking wrapper above.
     #[cfg(test)]
     pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
-        self.ask_with(args, CancellationToken::new()).await
+        self.ask_with(args, CancellationToken::new())
+            .await
+            .text()
+            .to_string()
     }
 
-    pub(crate) async fn ask_with(&self, args: AskArgs, cancel: CancellationToken) -> String {
+    pub(crate) async fn ask_with(&self, args: AskArgs, cancel: CancellationToken) -> ToolReply {
         if let Some(problem) = query_problem(&args.question) {
-            return format!("ask failed: {problem}");
+            return ToolReply::failed(format!("ask failed: {problem}"));
         }
         let _timer = self.time(Tool::Ask);
         if cancel.is_cancelled() {
-            return cancelled_reply("ask");
+            return ToolReply::ok(cancelled_reply("ask"));
         }
         let retrieval_deadline = self.retrieval_deadline();
         let mode = args.mode.unwrap_or(Mode::Infer);
         let k = clamp_ask_k(args.k);
         let retrieve = async {
-            let embedding = self
-                .embedder
-                .embed(&args.question, TextKind::Query)
-                .await
-                .ok();
+            let (embedding, embed_degraded) = self.embed_or_degrade("ask", &args.question).await;
             let q = build_query(
                 &lexical_text(&args.question),
                 Some(ask::rerank_pool(k)),
@@ -1664,7 +1720,7 @@ impl MemoryServer {
             );
             let hits = match self.explained(&q).await {
                 Ok(hits) => hits,
-                Err(e) => return Err(format!("ask failed: {e}")),
+                Err(e) => return Err(ToolReply::failed(format!("ask failed: {e}"))),
             };
             // Summaries are model-written, so only infer mode looks for them.
             let summaries = match (&embedding, mode) {
@@ -1673,16 +1729,16 @@ impl MemoryServer {
                 }
                 _ => Vec::new(),
             };
-            Ok((hits, summaries))
+            Ok((hits, summaries, embed_degraded))
         };
-        let (hits, summaries) = match until_interrupted(retrieval_deadline, &cancel, retrieve).await
-        {
-            Ok(Ok(found)) => found,
-            Ok(Err(reply)) => return reply,
-            Err(why) => return self.interruption_reply("ask", why),
-        };
+        let (hits, summaries, embed_degraded) =
+            match until_interrupted(retrieval_deadline, &cancel, retrieve).await {
+                Ok(Ok(found)) => found,
+                Ok(Err(reply)) => return reply,
+                Err(why) => return self.interruption_reply("ask", why),
+            };
         if hits.is_empty() && summaries.is_empty() {
-            return "no relevant memory".to_string();
+            return with_reasons(ToolReply::ok("no relevant memory"), [embed_degraded]);
         }
         let candidates: Vec<ask::Evidence> = hits
             .iter()
@@ -1693,13 +1749,14 @@ impl MemoryServer {
             .iter()
             .map(|e| e.retrieved.as_text().to_string())
             .collect();
-        let order = match self
+        let (order, rerank_degraded) = match self
             .rerank_within("ask", &args.question, &docs, retrieval_deadline, &cancel)
             .await
         {
-            Ok(order) => order,
+            Ok(ranked) => ranked,
             Err(reply) => return reply,
         };
+        let retrieval_reasons = [embed_degraded, rerank_degraded];
         // Candidates list the store hits first, so an index below `hit_count`
         // is a store hit. Keep k of them plus every summary.
         let hit_count = hits.len();
@@ -1718,7 +1775,10 @@ impl MemoryServer {
         if mode == Mode::Strict {
             self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
             self.record_evidence_usage(&evidence);
-            return ask::strict_answer(&evidence, self.max_basis_ids_rendered);
+            return with_reasons(
+                ToolReply::ok(ask::strict_answer(&evidence, self.max_basis_ids_rendered)),
+                retrieval_reasons,
+            );
         }
         // Trim ONCE, before the sufficiency pre-pass, and reuse this same
         // slice for both prompts below. Trimming twice, or only for the
@@ -1760,7 +1820,18 @@ impl MemoryServer {
         let acquire_start = tokio::time::Instant::now();
         let _generation_permit = match self.acquire_generation_permit(deadline).await {
             Ok(permit) => permit,
-            Err(reason) => return fallback_answer(reason, evidence, self.max_basis_ids_rendered),
+            Err(reason) => {
+                return with_reasons(
+                    ToolReply::ok(fallback_answer(
+                        reason,
+                        evidence,
+                        self.max_basis_ids_rendered,
+                    )),
+                    retrieval_reasons
+                        .into_iter()
+                        .chain([Some(Degraded::SynthesisUnavailable)]),
+                )
+            }
         };
         // Covers every return path below, not just one model call.
         let _permit_timer = PermitTimer::new(
@@ -1778,14 +1849,25 @@ impl MemoryServer {
                 .passes_sufficiency_check(&args.question, evidence, deadline)
                 .await
         {
-            return ask::insufficient_answer(evidence, self.max_basis_ids_rendered);
+            return with_reasons(
+                ToolReply::ok(ask::insufficient_answer(
+                    evidence,
+                    self.max_basis_ids_rendered,
+                )),
+                retrieval_reasons,
+            );
         }
         // From here the model sees the evidence, so it counts even if the
         // answer then fails.
         self.record_evidence_usage(evidence);
 
-        self.synthesize_answer(&args.question, evidence, deadline)
-            .await
+        let (answer, synthesis_degraded) = self
+            .synthesize_answer(&args.question, evidence, deadline)
+            .await;
+        with_reasons(
+            ToolReply::ok(answer),
+            retrieval_reasons.into_iter().chain([synthesis_degraded]),
+        )
     }
 }
 
@@ -1802,6 +1884,7 @@ impl ServerHandler for MemoryServer {
 mod tests {
     use super::episode::test_support::{episode_edge, episode_entity, episode_fact};
     use super::episode::{EpisodeEntityArgs, EpisodeFactArgs};
+    use super::test_doubles::{CountingEmbedder, FailingReranker};
     use super::*;
     use liam_store::{FixedClock, GraphConfig, Millis, HANDLE_LEN};
     use serde_json::json;
@@ -1812,56 +1895,6 @@ mod tests {
     impl liam_model::Llm for FailingLlm {
         async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
             Err(liam_model::ModelError::Llm("boom".into()))
-        }
-    }
-
-    /// Always-errors `Reranker`, so `ask` must fall back to identity order
-    /// (via `Reranker::order`'s default `unwrap_or_else`) instead of panicking.
-    struct FailingReranker;
-    #[async_trait::async_trait]
-    impl liam_model::Reranker for FailingReranker {
-        async fn scores(&self, _q: &str, _d: &[String]) -> liam_model::Result<Vec<f32>> {
-            Err(liam_model::ModelError::Rerank("boom".into()))
-        }
-    }
-
-    /// Wraps a real `Embedder`, recording every `(text, kind)` it is asked to
-    /// embed, so a test can assert how many calls one handler made and in
-    /// which role.
-    /// `MockEmbedder` itself has no counter of its own; this follows the
-    /// same small-custom-double pattern as `FailingLlm`/`FailingReranker`
-    /// above, delegating the real work to the wrapped embedder instead of
-    /// faking a result.
-    struct CountingEmbedder {
-        inner: liam_model::MockEmbedder,
-        calls: std::sync::Mutex<Vec<(String, TextKind)>>,
-    }
-
-    impl CountingEmbedder {
-        fn new(dims: usize) -> Self {
-            Self {
-                inner: liam_model::MockEmbedder::new(dims),
-                calls: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-
-        fn call_count(&self) -> usize {
-            self.calls().len()
-        }
-
-        fn calls(&self) -> Vec<(String, TextKind)> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Embedder for CountingEmbedder {
-        fn dims(&self) -> usize {
-            self.inner.dims()
-        }
-        async fn embed(&self, text: &str, kind: TextKind) -> liam_model::Result<Vec<f32>> {
-            self.calls.lock().unwrap().push((text.to_string(), kind));
-            self.inner.embed(text, kind).await
         }
     }
 

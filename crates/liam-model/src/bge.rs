@@ -54,7 +54,7 @@ pub(crate) fn hf_home_overriding<'a>(hf_home: Option<&'a str>, cache_dir: &str) 
 /// In-process BGE-M3 dense embedder. The sync ONNX call runs on a blocking
 /// thread so the async runtime stays free.
 pub struct BgeM3Embedder {
-    model: std::sync::Arc<std::sync::Mutex<fastembed::TextEmbedding>>,
+    model: std::sync::Arc<tokio::sync::Mutex<fastembed::TextEmbedding>>,
 }
 
 impl BgeM3Embedder {
@@ -76,7 +76,7 @@ impl BgeM3Embedder {
         let model = fastembed::TextEmbedding::try_new(options)
             .map_err(|e| ModelError::Embed(format!("load {BGE_M3_MODEL_ID}: {e}")))?;
         Ok(Self {
-            model: std::sync::Arc::new(std::sync::Mutex::new(model)),
+            model: std::sync::Arc::new(tokio::sync::Mutex::new(model)),
         })
     }
 }
