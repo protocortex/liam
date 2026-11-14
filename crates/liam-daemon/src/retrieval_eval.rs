@@ -149,6 +149,7 @@ use crate::models::LOCAL_PROVIDER;
 
 mod embedder_bench;
 mod golden_set;
+pub mod multilingual;
 #[cfg(test)]
 mod scale_probe;
 pub use embedder_bench::{run_embedder_bench, BenchReport};
