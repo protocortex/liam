@@ -35,6 +35,37 @@ impl Tool {
     }
 }
 
+/// A step of `recall` and `ask` that is timed on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Stage {
+    Embed,
+    StoreSearch,
+    Rerank,
+    RecordUsage,
+    IssueHandles,
+}
+
+impl Stage {
+    pub(super) const fn metrics(self) -> [MetricId; 2] {
+        match self {
+            Self::Embed => [MetricId::StageEmbedP50Ms, MetricId::StageEmbedP95Ms],
+            Self::StoreSearch => [
+                MetricId::StageStoreSearchP50Ms,
+                MetricId::StageStoreSearchP95Ms,
+            ],
+            Self::Rerank => [MetricId::StageRerankP50Ms, MetricId::StageRerankP95Ms],
+            Self::RecordUsage => [
+                MetricId::StageRecordUsageP50Ms,
+                MetricId::StageRecordUsageP95Ms,
+            ],
+            Self::IssueHandles => [
+                MetricId::StageIssueHandlesP50Ms,
+                MetricId::StageIssueHandlesP95Ms,
+            ],
+        }
+    }
+}
+
 /// Every metric the daemon keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum MetricId {
@@ -63,11 +94,21 @@ pub enum MetricId {
     DeletionBacklogCount,
     DeletionBacklogAgeDays,
     DegradedReplies,
+    StageEmbedP50Ms,
+    StageEmbedP95Ms,
+    StageStoreSearchP50Ms,
+    StageStoreSearchP95Ms,
+    StageRerankP50Ms,
+    StageRerankP95Ms,
+    StageRecordUsageP50Ms,
+    StageRecordUsageP95Ms,
+    StageIssueHandlesP50Ms,
+    StageIssueHandlesP95Ms,
 }
 
 impl MetricId {
     /// Every metric, in declaration order.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 35] = [
         Self::ProbeRecallAt10,
         Self::ArmLatencyP50Ms,
         Self::ArmLatencyP95Ms,
@@ -93,6 +134,16 @@ impl MetricId {
         Self::DeletionBacklogCount,
         Self::DeletionBacklogAgeDays,
         Self::DegradedReplies,
+        Self::StageEmbedP50Ms,
+        Self::StageEmbedP95Ms,
+        Self::StageStoreSearchP50Ms,
+        Self::StageStoreSearchP95Ms,
+        Self::StageRerankP50Ms,
+        Self::StageRerankP95Ms,
+        Self::StageRecordUsageP50Ms,
+        Self::StageRecordUsageP95Ms,
+        Self::StageIssueHandlesP50Ms,
+        Self::StageIssueHandlesP95Ms,
     ];
 
     /// The metric called `name`.
@@ -127,6 +178,16 @@ impl MetricId {
             Self::DeletionBacklogCount => "deletion_backlog_count",
             Self::DeletionBacklogAgeDays => "deletion_backlog_age_days",
             Self::DegradedReplies => "degraded_replies",
+            Self::StageEmbedP50Ms => "stage_embed_p50_ms",
+            Self::StageEmbedP95Ms => "stage_embed_p95_ms",
+            Self::StageStoreSearchP50Ms => "stage_store_search_p50_ms",
+            Self::StageStoreSearchP95Ms => "stage_store_search_p95_ms",
+            Self::StageRerankP50Ms => "stage_rerank_p50_ms",
+            Self::StageRerankP95Ms => "stage_rerank_p95_ms",
+            Self::StageRecordUsageP50Ms => "stage_record_usage_p50_ms",
+            Self::StageRecordUsageP95Ms => "stage_record_usage_p95_ms",
+            Self::StageIssueHandlesP50Ms => "stage_issue_handles_p50_ms",
+            Self::StageIssueHandlesP95Ms => "stage_issue_handles_p95_ms",
         }
     }
 }

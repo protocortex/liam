@@ -11,12 +11,12 @@ use std::time::Duration;
 
 use liam_daemon::consolidation::manifest::RunOutcome;
 use liam_daemon::consolidation::probes::ProbeReport;
-use liam_store::{Clock, QueryTimings};
+use liam_store::{Clock, Millis, QueryTimings};
 
 use super::alerts::{evaluate_run, Observation, RuleSet};
 use super::collect::{self, LatencyWindow, ModelMeter, Price};
 use super::sink::{
-    Labels, MetricId, MetricsSink, ModelCatalog, Provider, RetrievalArm, Sample, Snapshot,
+    Labels, MetricId, MetricsSink, ModelCatalog, Provider, RetrievalArm, Sample, Snapshot, Stage,
     TokenUsage, Tool, Usage,
 };
 use crate::degraded::Degraded;
@@ -37,6 +37,7 @@ struct Models {
 struct Windows {
     tools: BTreeMap<Tool, LatencyWindow>,
     arms: BTreeMap<RetrievalArm, LatencyWindow>,
+    stages: BTreeMap<Stage, LatencyWindow>,
 }
 
 /// Where the alert state is kept between runs, and what raises an alert.
@@ -69,6 +70,7 @@ impl Metrics {
             windows: Mutex::new(Windows {
                 tools: BTreeMap::new(),
                 arms: BTreeMap::new(),
+                stages: BTreeMap::new(),
             }),
             models: Mutex::new(Models::default()),
             rollbacks: AtomicU64::new(0),
@@ -190,6 +192,25 @@ impl Metrics {
         }
     }
 
+    /// The injected clock's reading, to time a stage against.
+    pub fn now(&self) -> Millis {
+        self.clock.now()
+    }
+
+    /// One finished stage that began at `started`.
+    pub fn record_stage(&self, stage: Stage, started: Millis) {
+        let now = self.clock.now();
+        let mut windows = self.windows();
+        let window = windows
+            .stages
+            .entry(stage)
+            .or_insert_with(|| LatencyWindow::new(LATENCY_WINDOW));
+        window.record(elapsed_millis(started, now));
+        for sample in window.samples(stage.metrics(), Labels::None, now) {
+            self.sink.record(sample);
+        }
+    }
+
     /// One degraded `recall` or `ask` reply. The count only grows.
     pub fn record_degraded(&self, tool: Tool, reason: Degraded) {
         // A panic while counting leaves a total one reply short at worst.
@@ -279,12 +300,14 @@ impl Metrics {
 pub struct ToolTimer {
     metrics: Arc<Metrics>,
     tool: Tool,
-    started: std::time::Instant,
+    started: Millis,
 }
 
 impl Drop for ToolTimer {
     fn drop(&mut self) {
-        self.metrics.record_tool(self.tool, self.started.elapsed());
+        let elapsed = self.metrics.now().0 - self.started.0;
+        let elapsed = Duration::from_millis(u64::try_from(elapsed).unwrap_or(0));
+        self.metrics.record_tool(self.tool, elapsed);
     }
 }
 
@@ -293,7 +316,7 @@ impl Metrics {
         ToolTimer {
             metrics: Arc::clone(self),
             tool,
-            started: std::time::Instant::now(),
+            started: self.now(),
         }
     }
 }
@@ -317,6 +340,11 @@ fn observations_of(snapshot: &Snapshot) -> Vec<Observation> {
             });
     }
     by_metric.into_values().collect()
+}
+
+/// Milliseconds from `started` to `now`, never negative if the clock steps back.
+fn elapsed_millis(started: Millis, now: Millis) -> f64 {
+    (now.0 - started.0).max(0) as f64
 }
 
 fn millis(elapsed: Duration) -> f64 {
