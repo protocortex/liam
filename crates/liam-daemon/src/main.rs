@@ -19,6 +19,9 @@ mod hosted;
 mod log_startup;
 mod mcp;
 mod metrics;
+/// Recall latency and nDCG@10 benchmark; test-only, see the module docs to run it.
+#[cfg(test)]
+mod recall_bench;
 mod render;
 mod shutdown;
 mod summary;
