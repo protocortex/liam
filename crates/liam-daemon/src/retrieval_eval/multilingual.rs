@@ -12,9 +12,10 @@
 //! turns it into per-language nDCG@10, and [`gate`] compares a candidate report
 //! against the baseline report.
 
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _};
 use serde::{Deserialize, Serialize};
@@ -38,8 +39,8 @@ const LANGUAGE_FILES: [(&str, &str); 8] = [
 pub const QUERIES_PER_LANGUAGE: usize = 30;
 pub const CANDIDATES_PER_QUERY: usize = 32;
 
-/// File name of the baseline score file, next to the data files.
-const BASELINE_FILE: &str = "baseline-bge-reranker-base.json";
+/// Model whose scores form the baseline.
+pub const DEFAULT_RERANKER_MODEL: &str = "bge-reranker-base";
 const DATA_DIR: &str = "src/retrieval_eval/multilingual";
 
 /// Scores are compared after rounding to this many thousandths of a point.
@@ -118,6 +119,13 @@ impl Dataset {
                     pair.candidates.len()
                 );
             }
+            let mut seen = HashSet::new();
+            if let Some(repeat) = pair.candidates.iter().find(|c| !seen.insert(*c)) {
+                bail!(
+                    "query {} lists candidate {repeat} twice (duplicate)",
+                    pair.qid
+                );
+            }
             if pair.relevant.is_empty() {
                 bail!("query {} has no relevant fact", pair.qid);
             }
@@ -171,14 +179,17 @@ impl ScoreFile {
     }
 }
 
-/// Loads the baseline score file, or an error naming the missing file. The
-/// file is produced on a quiet machine and is not part of the source tree
-/// until then.
+/// Loads the committed baseline score file for the default reranker.
 pub fn load_baseline() -> anyhow::Result<ScoreFile> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(DATA_DIR)
-        .join(BASELINE_FILE);
-    let raw = std::fs::read_to_string(&path)
+        .join(format!("baseline-{DEFAULT_RERANKER_MODEL}.json"));
+    load_baseline_from(&path)
+}
+
+/// Loads a baseline score file, or an error naming the file that failed.
+pub fn load_baseline_from(path: &Path) -> anyhow::Result<ScoreFile> {
+    let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading baseline score file {}", path.display()))?;
     ScoreFile::from_json(&raw).with_context(|| format!("in {}", path.display()))
 }
@@ -197,7 +208,13 @@ pub fn rank_candidates(candidates: &[String], scores: &[f32]) -> anyhow::Result<
         bail!("scores contain NaN");
     }
     let mut order: Vec<usize> = (0..candidates.len()).collect();
-    order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+    // NaN is rejected above, so `partial_cmp` always orders; unlike
+    // `total_cmp` it treats -0.0 and 0.0 as a tie.
+    order.sort_by(|a, b| {
+        scores[*b]
+            .partial_cmp(&scores[*a])
+            .unwrap_or(Ordering::Equal)
+    });
     Ok(order.into_iter().map(|i| candidates[i].clone()).collect())
 }
 
@@ -233,6 +250,14 @@ impl Report {
         {
             bail!("score file has unknown language {unknown}");
         }
+        for (code, by_query) in &file.scores {
+            if let Some(stray) = by_query
+                .keys()
+                .find(|qid| !dataset.pairs.iter().any(|p| &p.qid == *qid))
+            {
+                bail!("score file has unknown query {stray} for language {code}");
+            }
+        }
         let per_language = dataset
             .languages
             .iter()
@@ -248,6 +273,15 @@ impl Report {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self::new(per_language))
+    }
+
+    /// Codes of the languages that have a value.
+    fn covered(&self) -> BTreeSet<&str> {
+        self.per_language
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(code, _)| code.as_str())
+            .collect()
     }
 
     fn value(&self, language: &str) -> Option<f64> {
@@ -314,24 +348,32 @@ impl fmt::Display for GateOutcome {
 pub fn gate(baseline: &Report, candidate: &Report) -> GateOutcome {
     let mut reasons = Vec::new();
     match (baseline.mean, candidate.mean) {
+        (None, _) => reasons.push(format!("mean: {NO_BASELINE}")),
+        (_, None) => reasons.push(format!("mean: candidate {MISSING}")),
+        (Some(_), Some(_)) if baseline.covered() != candidate.covered() => {
+            reasons.push("mean: baseline and candidate cover different languages".to_string());
+        }
         (Some(base), Some(cand)) => {
-            let drop = milli(base) - milli(cand);
+            let drop = milli(base - cand);
             if drop > MAX_MEAN_DROP_MILLI {
                 reasons.push(format!(
-                    "mean fell {} thousandths, the limit is {MAX_MEAN_DROP_MILLI}",
-                    drop
+                    "mean fell {drop} thousandths, the limit is {MAX_MEAN_DROP_MILLI}"
                 ));
             }
         }
-        (None, _) => reasons.push(format!("mean: {NO_BASELINE}")),
-        (_, None) => reasons.push(format!("mean: candidate {MISSING}")),
     }
-    for (code, cand) in &candidate.per_language {
-        match (baseline.value(code), cand) {
+    let codes: BTreeSet<&str> = baseline
+        .per_language
+        .iter()
+        .chain(&candidate.per_language)
+        .map(|(code, _)| code.as_str())
+        .collect();
+    for code in codes {
+        match (baseline.value(code), candidate.value(code)) {
             (None, _) => reasons.push(format!("{code}: {NO_BASELINE}")),
             (Some(_), None) => reasons.push(format!("{code}: candidate {MISSING}")),
             (Some(base), Some(cand)) => {
-                let drop = milli(base) - milli(*cand);
+                let drop = milli(base - cand);
                 if drop > MAX_LANGUAGE_DROP_MILLI {
                     reasons.push(format!(
                         "{code}: fell {drop} thousandths, the limit is {MAX_LANGUAGE_DROP_MILLI}"
@@ -354,6 +396,8 @@ mod tests {
 
     const SCORES_OUT_ENV: &str = "LIAM_MULTILINGUAL_SCORES_OUT";
     const TOLERANCE: f64 = 0.0005;
+    const STUB_MODEL: &str = "stub";
+    const ABSENT_BASELINE_PATH: &str = "/nonexistent-liam-dir/no-such-baseline.json";
 
     fn ids(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -401,7 +445,7 @@ mod tests {
             })
             .collect();
         ScoreFile {
-            model: "stub".into(),
+            model: STUB_MODEL.into(),
             scores,
         }
     }
@@ -411,8 +455,12 @@ mod tests {
     }
 
     fn uniform(value: f64) -> Report {
-        let codes = ["en", "pt", "es", "zh", "fr", "de", "ja", "ar"];
-        Report::new(codes.iter().map(|c| (c.to_string(), Some(value))).collect())
+        Report::new(
+            LANGUAGE_FILES
+                .iter()
+                .map(|(code, _)| (code.to_string(), Some(value)))
+                .collect(),
+        )
     }
 
     /// `uniform(base)` with one language moved to `value`.
@@ -617,12 +665,13 @@ mod tests {
     #[test]
     fn the_missing_baseline_error_names_the_file() {
         // Act
-        let result = load_baseline();
+        let error = load_baseline_from(Path::new(ABSENT_BASELINE_PATH)).expect_err("no file");
 
-        // Assert: the baseline is produced later, so it is absent until then.
-        if let Err(error) = result {
-            assert!(format!("{error:#}").contains(BASELINE_FILE));
-        }
+        // Assert
+        assert!(
+            format!("{error:#}").contains("no-such-baseline.json"),
+            "{error:#}"
+        );
     }
 
     // Gate
@@ -705,6 +754,154 @@ mod tests {
         assert!(outcome.passed, "{outcome}");
     }
 
+    #[test]
+    fn a_baseline_language_absent_from_the_candidate_fails() {
+        // Arrange
+        let baseline = report(&[("en", Some(0.8)), ("pt", Some(0.8))]);
+        let candidate = report(&[("en", Some(0.8))]);
+
+        // Act
+        let outcome = gate(&baseline, &candidate);
+
+        // Assert
+        assert!(!outcome.passed);
+        assert!(
+            outcome.reasons.iter().any(|r| r == "pt: candidate missing"),
+            "{outcome}"
+        );
+    }
+
+    #[test]
+    fn a_baseline_value_with_no_candidate_value_fails() {
+        // Arrange
+        let baseline = report(&[("en", Some(0.8)), ("pt", Some(0.8))]);
+        let candidate = report(&[("en", Some(0.8)), ("pt", None)]);
+
+        // Act
+        let outcome = gate(&baseline, &candidate);
+
+        // Assert
+        assert!(!outcome.passed);
+        assert!(
+            outcome.reasons.iter().any(|r| r == "pt: candidate missing"),
+            "{outcome}"
+        );
+    }
+
+    #[test]
+    fn a_missing_mean_on_either_side_fails() {
+        // Arrange
+        let full = uniform(0.8);
+        let no_mean = Report {
+            mean: None,
+            ..uniform(0.8)
+        };
+
+        // Act
+        let baseline_less = gate(&no_mean, &full);
+        let candidate_less = gate(&full, &no_mean);
+
+        // Assert
+        assert!(baseline_less
+            .reasons
+            .contains(&"mean: no baseline".to_string()));
+        assert!(candidate_less
+            .reasons
+            .contains(&"mean: candidate missing".to_string()));
+        assert!(!baseline_less.passed && !candidate_less.passed);
+    }
+
+    #[test]
+    fn a_mean_over_different_language_sets_fails_with_one_mean_reason() {
+        // Arrange
+        let baseline = report(&[("en", Some(0.8)), ("pt", Some(0.8))]);
+        let candidate = report(&[("en", Some(0.8)), ("pt", None)]);
+
+        // Act
+        let outcome = gate(&baseline, &candidate);
+
+        // Assert
+        let mean_reasons = outcome
+            .reasons
+            .iter()
+            .filter(|r| r.starts_with("mean"))
+            .count();
+        assert_eq!(mean_reasons, 1, "{outcome}");
+    }
+
+    #[test]
+    fn a_drop_that_rounds_to_twenty_one_fails_even_when_the_rounded_values_differ_by_twenty() {
+        // Arrange: raw drop is 0.0208, but 0.800 and 0.780 differ by 0.020.
+        let baseline = uniform(0.8004);
+        let candidate = uniform(0.7796);
+
+        // Act
+        let outcome = gate(&baseline, &candidate);
+
+        // Assert
+        assert!(!outcome.passed);
+    }
+
+    #[test]
+    fn float_noise_does_not_flip_a_drop_of_twenty_thousandths() {
+        // Arrange
+        let cases = [(0.9, 0.88), (0.5, 0.48)];
+
+        for (base, cand) in cases {
+            // Act
+            let outcome = gate(&uniform(base), &uniform(cand));
+
+            // Assert
+            assert!(outcome.passed, "{base} vs {cand}: {outcome}");
+        }
+    }
+
+    #[test]
+    fn negative_and_positive_zero_tie_in_canonical_order() {
+        // Arrange
+        let candidates = ids(&["c0", "c1"]);
+
+        // Act
+        let ranked = rank_candidates(&candidates, &[-0.0, 0.0]).expect("ranks");
+
+        // Assert
+        assert_eq!(ranked, candidates);
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_candidates_within_a_pair() {
+        // Arrange
+        let mut dataset = Dataset::load().expect("embedded data is valid");
+        let first = dataset.pairs[0].candidates[0].clone();
+        dataset.pairs[0].candidates[1] = first.clone();
+
+        // Act
+        let error = dataset.validate().expect_err("duplicate candidate");
+
+        // Assert
+        let message = error.to_string();
+        assert!(
+            message.contains("duplicate") && message.contains(&first),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_score_file_with_a_query_outside_the_dataset_is_an_error() {
+        // Arrange
+        let dataset = small_dataset();
+        let file = score_file(&[(
+            "en",
+            &[("q1", &[0.0; 4]), ("q2", &[0.0; 4]), ("q9", &[0.0; 4])],
+        )]);
+
+        // Act
+        let error = Report::from_scores(&dataset, &file).expect_err("unknown query");
+
+        // Assert
+        assert!(format!("{error:#}").contains("q9"));
+    }
+
     // Score producing harness
 
     /// Scores every query and candidate pair in every language with the
@@ -745,7 +942,7 @@ mod tests {
             scores.insert(lang.language.clone(), by_query);
         }
         let file = ScoreFile {
-            model: "bge-reranker-base".into(),
+            model: DEFAULT_RERANKER_MODEL.into(),
             scores,
         };
         std::fs::write(&out, file.to_json().expect("serialises")).expect("writes the score file");
