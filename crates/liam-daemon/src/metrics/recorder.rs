@@ -15,8 +15,9 @@ use liam_store::{Clock, QueryTimings};
 
 use super::alerts::{evaluate_run, Observation, RuleSet};
 use super::collect::{self, LatencyWindow, ModelMeter, Price};
+use super::monotonic::{InstantSource, Monotonic};
 use super::sink::{
-    Labels, MetricId, MetricsSink, ModelCatalog, Provider, RetrievalArm, Sample, Snapshot,
+    Labels, MetricId, MetricsSink, ModelCatalog, Provider, RetrievalArm, Sample, Snapshot, Stage,
     TokenUsage, Tool, Usage,
 };
 use crate::degraded::Degraded;
@@ -37,6 +38,7 @@ struct Models {
 struct Windows {
     tools: BTreeMap<Tool, LatencyWindow>,
     arms: BTreeMap<RetrievalArm, LatencyWindow>,
+    stages: BTreeMap<Stage, LatencyWindow>,
 }
 
 /// Where the alert state is kept between runs, and what raises an alert.
@@ -48,6 +50,7 @@ struct Alerting {
 pub struct Metrics {
     sink: Arc<dyn MetricsSink>,
     clock: Arc<dyn Clock>,
+    timer: Arc<dyn Monotonic>,
     min_samples: usize,
     windows: Mutex<Windows>,
     models: Mutex<Models>,
@@ -65,10 +68,12 @@ impl Metrics {
         Self {
             sink,
             clock,
+            timer: Arc::new(InstantSource::new()),
             min_samples,
             windows: Mutex::new(Windows {
                 tools: BTreeMap::new(),
                 arms: BTreeMap::new(),
+                stages: BTreeMap::new(),
             }),
             models: Mutex::new(Models::default()),
             rollbacks: AtomicU64::new(0),
@@ -82,6 +87,14 @@ impl Metrics {
     /// previous values in `state_path`.
     pub fn with_alerts(mut self, state_path: PathBuf, rules: RuleSet) -> Self {
         self.alerting = Some(Alerting { state_path, rules });
+        self
+    }
+
+    /// Times tool calls and stages against `timer` instead of the real
+    /// monotonic clock.
+    #[cfg(test)]
+    pub fn with_monotonic(mut self, timer: Arc<dyn Monotonic>) -> Self {
+        self.timer = timer;
         self
     }
 
@@ -190,6 +203,31 @@ impl Metrics {
         }
     }
 
+    /// The monotonic reading a span is measured from.
+    pub fn now(&self) -> Duration {
+        self.timer.elapsed()
+    }
+
+    /// The time since `started`, a reading from [`Self::now`].
+    fn since(&self, started: Duration) -> Duration {
+        self.now().saturating_sub(started)
+    }
+
+    /// One finished stage that began at `started`.
+    pub fn record_stage(&self, stage: Stage, started: Duration) {
+        let elapsed = self.since(started);
+        let now = self.clock.now();
+        let mut windows = self.windows();
+        let window = windows
+            .stages
+            .entry(stage)
+            .or_insert_with(|| LatencyWindow::new(LATENCY_WINDOW));
+        window.record(millis(elapsed));
+        for sample in window.samples(stage.metrics(), Labels::None, now) {
+            self.sink.record(sample);
+        }
+    }
+
     /// One degraded `recall` or `ask` reply. The count only grows.
     pub fn record_degraded(&self, tool: Tool, reason: Degraded) {
         // A panic while counting leaves a total one reply short at worst.
@@ -279,12 +317,13 @@ impl Metrics {
 pub struct ToolTimer {
     metrics: Arc<Metrics>,
     tool: Tool,
-    started: std::time::Instant,
+    started: Duration,
 }
 
 impl Drop for ToolTimer {
     fn drop(&mut self) {
-        self.metrics.record_tool(self.tool, self.started.elapsed());
+        let elapsed = self.metrics.since(self.started);
+        self.metrics.record_tool(self.tool, elapsed);
     }
 }
 
@@ -293,7 +332,7 @@ impl Metrics {
         ToolTimer {
             metrics: Arc::clone(self),
             tool,
-            started: std::time::Instant::now(),
+            started: self.now(),
         }
     }
 }

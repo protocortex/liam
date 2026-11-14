@@ -67,7 +67,7 @@ use crate::consolidation_job::ConsolidationJob;
 use crate::degraded::Degraded;
 use crate::deletion::DeletePreview;
 use crate::metrics::recorder::{Metrics, ToolTimer};
-use crate::metrics::sink::Tool;
+use crate::metrics::sink::{Stage, Tool};
 use crate::render;
 use crate::synthesis;
 use crate::tiering::usage::UsageRecorder;
@@ -642,8 +642,12 @@ impl MemoryServer {
             );
             return Ok((store_order(), Some(Degraded::RerankSkipped)));
         }
+        let started = self.stage_start();
         match until_interrupted(deadline, cancel, self.reranker.order(query, docs)).await {
-            Ok(Ok(order)) => Ok((order, None)),
+            Ok(Ok(order)) => {
+                self.stage_end(Stage::Rerank, started);
+                Ok((order, None))
+            }
             Ok(Err(e)) => {
                 tracing::warn!(tool, error = %e, "answered from unreranked evidence");
                 Ok((store_order(), Some(Degraded::RerankFailed)))
@@ -791,12 +795,25 @@ impl MemoryServer {
         self.metrics.as_ref().map(|metrics| metrics.time(tool))
     }
 
+    fn stage_start(&self) -> Option<Duration> {
+        self.metrics.as_ref().map(|metrics| metrics.now())
+    }
+
+    fn stage_end(&self, stage: Stage, started: Option<Duration>) {
+        if let (Some(metrics), Some(started)) = (&self.metrics, started) {
+            metrics.record_stage(stage, started);
+        }
+    }
+
     /// Runs `q` and reports how long each retrieval arm took.
     async fn explained(
         &self,
         q: &Query,
     ) -> Result<Vec<liam_store::ExplainedHit>, liam_store::Error> {
-        let (hits, timings) = on_store!(self, |store| store.query_timed(q))?;
+        let started = self.stage_start();
+        let searched = on_store!(self, |store| store.query_timed(q));
+        self.stage_end(Stage::StoreSearch, started);
+        let (hits, timings) = searched?;
         if let Some(metrics) = &self.metrics {
             metrics.record_arms(timings);
         }
@@ -806,7 +823,9 @@ impl MemoryServer {
     /// Makes the results a client is shown ones it can give a verdict on.
     fn issue_handles<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
         if let Some(feedback) = &self.feedback {
+            let started = self.stage_start();
             feedback.issue(nodes);
+            self.stage_end(Stage::IssueHandles, started);
         }
     }
 
@@ -814,7 +833,9 @@ impl MemoryServer {
     /// Neighbours pulled in beside a result are not credited.
     fn record_usage<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
         if let Some(recorder) = &self.usage {
+            let started = self.stage_start();
             recorder.record(&self.producer(), nodes, Millis::now());
+            self.stage_end(Stage::RecordUsage, started);
         }
     }
 
@@ -1282,7 +1303,10 @@ impl MemoryServer {
         tool: &str,
         text: &str,
     ) -> (Option<Vec<f32>>, Option<Degraded>) {
-        match self.embedder.embed(text, TextKind::Query).await {
+        let started = self.stage_start();
+        let embedded = self.embedder.embed(text, TextKind::Query).await;
+        self.stage_end(Stage::Embed, started);
+        match embedded {
             Ok(vector) => (Some(vector), None),
             Err(e) => {
                 tracing::warn!(tool, error = %e, "embed failed, searching without a vector");
@@ -8199,11 +8223,27 @@ mod tests {
         assert!(infer.contains("mode infer"), "{infer}");
     }
 
+    /// Under a millisecond, to show timings keep their fraction.
+    const TICK: Duration = Duration::from_micros(250);
+
     fn metered(server: MemoryServer) -> (MemoryServer, Arc<crate::metrics::sink::MemorySink>) {
         let clock = Arc::new(FixedClock::new(Millis(1_000)));
         let sink = Arc::new(crate::metrics::sink::MemorySink::new(clock.clone()));
-        let metrics = Arc::new(Metrics::new(sink.clone(), clock, 2));
+        let metrics = Arc::new(
+            Metrics::new(sink.clone(), clock, 2).with_monotonic(Arc::new(
+                crate::metrics::monotonic::TickingMonotonic::new(TICK),
+            )),
+        );
         (server.with_metrics(metrics), sink)
+    }
+
+    /// Counts and feedback on, so the stages that need them have work to time.
+    fn with_usage_and_feedback(server: MemoryServer) -> MemoryServer {
+        const TRACKED: usize = 100;
+        const VERDICTS_PER_HOUR: u32 = 10;
+        server
+            .with_usage_recorder(Arc::new(UsageRecorder::new(TRACKED)))
+            .with_feedback(VERDICTS_PER_HOUR, TRACKED)
     }
 
     fn reported(
@@ -8240,6 +8280,212 @@ mod tests {
         assert!(reported(&sink, MetricId::RecallLatencyP95Ms));
         assert!(reported(&sink, MetricId::ArmLatencyP95Ms));
         assert!(!reported(&sink, MetricId::AskLatencyP95Ms));
+    }
+
+    fn samples_of(
+        sink: &crate::metrics::sink::MemorySink,
+        metric: crate::metrics::sink::MetricId,
+    ) -> u64 {
+        use crate::metrics::sink::MetricsSink;
+        sink.snapshot()
+            .readings
+            .iter()
+            .filter(|reading| reading.metric == metric)
+            .map(|reading| reading.samples)
+            .sum()
+    }
+
+    fn latest(
+        sink: &crate::metrics::sink::MemorySink,
+        metric: crate::metrics::sink::MetricId,
+    ) -> f64 {
+        use crate::metrics::sink::MetricsSink;
+        sink.snapshot()
+            .readings
+            .iter()
+            .find(|reading| reading.metric == metric)
+            .map_or(f64::NAN, |reading| reading.value)
+    }
+
+    #[tokio::test]
+    async fn recall_records_one_sample_per_stage_and_the_stages_fit_in_the_total() {
+        use crate::metrics::sink::MetricId;
+        // Arrange
+        let (server, sink) = metered(with_usage_and_feedback(plain_server().await));
+        seed(&server, "fact", "One", "zorbnax note one").await;
+        let stages = [
+            MetricId::StageEmbedP50Ms,
+            MetricId::StageStoreSearchP50Ms,
+            MetricId::StageRerankP50Ms,
+            MetricId::StageRecordUsageP50Ms,
+            MetricId::StageIssueHandlesP50Ms,
+        ];
+
+        // Act
+        server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax note".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+                mode: None,
+            }))
+            .await;
+
+        // Assert
+        for stage in stages {
+            assert_eq!(samples_of(&sink, stage), 1, "{stage}");
+        }
+        assert_eq!(samples_of(&sink, MetricId::RecallLatencyP50Ms), 1);
+        let staged: f64 = stages.into_iter().map(|stage| latest(&sink, stage)).sum();
+        assert!(staged <= latest(&sink, MetricId::RecallLatencyP50Ms));
+    }
+
+    #[tokio::test]
+    async fn a_server_without_usage_or_feedback_records_no_such_stage_sample() {
+        use crate::metrics::sink::MetricId;
+        // Arrange
+        let (server, sink) = metered(plain_server().await);
+        seed(&server, "fact", "One", "zorbnax note one").await;
+
+        // Act
+        server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax note".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+                mode: None,
+            }))
+            .await;
+
+        // Assert
+        assert_eq!(samples_of(&sink, MetricId::StageRecordUsageP50Ms), 0);
+        assert_eq!(samples_of(&sink, MetricId::StageIssueHandlesP50Ms), 0);
+        assert_eq!(samples_of(&sink, MetricId::StageEmbedP50Ms), 1);
+    }
+
+    /// Embeds like `MockEmbedder` after waiting `delay`.
+    struct DelayedEmbedder {
+        delay: Duration,
+        inner: liam_model::MockEmbedder,
+    }
+
+    #[async_trait::async_trait]
+    impl liam_model::Embedder for DelayedEmbedder {
+        fn dims(&self) -> usize {
+            self.inner.dims()
+        }
+        async fn embed(&self, text: &str, kind: TextKind) -> liam_model::Result<Vec<f32>> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.embed(text, kind).await
+        }
+    }
+
+    /// Scores after waiting `delay`.
+    struct DelayedReranker(Duration);
+
+    #[async_trait::async_trait]
+    impl Reranker for DelayedReranker {
+        async fn scores(&self, _q: &str, docs: &[String]) -> liam_model::Result<Vec<f32>> {
+            tokio::time::sleep(self.0).await;
+            Ok(vec![0.0; docs.len()])
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_records_one_sample_per_stage() {
+        use crate::metrics::sink::MetricId;
+        // Arrange
+        let llm = Arc::new(RecordingLlm::new(
+            "The zorbnax gadget uses libSQL for storage [1].",
+        ));
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm).await;
+        let (server, sink) = metered(with_usage_and_feedback(server));
+        seed(
+            &server,
+            "decision",
+            "Storage engine",
+            "The zorbnax gadget uses libSQL for storage.",
+        )
+        .await;
+        let stages = [
+            MetricId::StageEmbedP50Ms,
+            MetricId::StageStoreSearchP50Ms,
+            MetricId::StageRerankP50Ms,
+            MetricId::StageRecordUsageP50Ms,
+            MetricId::StageIssueHandlesP50Ms,
+        ];
+
+        // Act
+        server
+            .ask(Parameters(ask_args_for(
+                "What storage engine does the zorbnax gadget use?",
+            )))
+            .await;
+
+        // Assert
+        for stage in stages {
+            assert_eq!(samples_of(&sink, stage), 1, "{stage}");
+        }
+        assert_eq!(samples_of(&sink, MetricId::AskLatencyP50Ms), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_degraded_rerank_records_no_rerank_sample() {
+        use crate::metrics::sink::MetricId;
+        // Arrange
+        const SLOW: Duration = Duration::from_secs(30);
+        const NEARLY_ALL_THE_BUDGET: Duration = Duration::from_millis(900);
+        let cases: [(&str, Duration, Arc<dyn Reranker>); 3] = [
+            (
+                "skipped",
+                NEARLY_ALL_THE_BUDGET,
+                Arc::new(DelayedReranker(Duration::ZERO)),
+            ),
+            ("failed", Duration::ZERO, Arc::new(FailingReranker)),
+            ("timeout", Duration::ZERO, Arc::new(DelayedReranker(SLOW))),
+        ];
+        for (case, embed_delay, reranker) in cases {
+            let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+                .await
+                .expect("open in-memory store");
+            let server = MemoryServer::new(
+                Arc::new(store),
+                Arc::new(DelayedEmbedder {
+                    delay: embed_delay,
+                    inner: liam_model::MockEmbedder::new(8),
+                }),
+                reranker,
+                Arc::new(liam_model::MockLlm),
+                30,
+                false,
+                8192,
+                1,
+            )
+            .with_recall_timeout(1);
+            let (server, sink) = metered(with_usage_and_feedback(server));
+            seed(&server, "fact", "One", "zorbnax note one").await;
+
+            // Act
+            server
+                .recall(Parameters(RecallArgs {
+                    query: "zorbnax note".to_string(),
+                    kind: None,
+                    scope: None,
+                    k: None,
+                    as_of: None,
+                    mode: None,
+                }))
+                .await;
+
+            // Assert
+            assert_eq!(samples_of(&sink, MetricId::RecallLatencyP50Ms), 1, "{case}");
+            assert_eq!(samples_of(&sink, MetricId::StageEmbedP50Ms), 1, "{case}");
+            assert_eq!(samples_of(&sink, MetricId::StageRerankP50Ms), 0, "{case}");
+        }
     }
 
     #[tokio::test]

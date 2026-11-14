@@ -13,6 +13,7 @@ defeat a delete.
 | `probe_recall_at_10` | Mean recall at 10 over the consolidation probes. |
 | `arm_latency_p50_ms`, `arm_latency_p95_ms` | Nearest-rank percentiles of the last 50 timings of each retrieval arm. |
 | `recall_latency_*`, `ask_latency_*` | The same for the `recall` and `ask` tools. |
+| `stage_<embed\|store_search\|rerank\|record_usage\|issue_handles>_p50_ms`, `_p95_ms` | Nearest-rank percentiles, in milliseconds, of the last 50 timings of one step of `recall` and `ask`: `embed` embeds the query, `store_search` runs the store query, `rerank` reorders the evidence (not recorded when the rerank is skipped, fails or times out), `record_usage` counts the hits and `issue_handles` hands out the verdict handles (both only when tiering is on). |
 | `degraded_replies` | Count of `recall` and `ask` replies that used a fallback, per tool and reason. See [Degraded replies](../reference/tools.md#degraded-replies). |
 | `tier_bytes` | Bytes of vectors and signatures in the hot and the cold tier. |
 | `log_bytes`, `archive_bytes` | Size of the log and archive directories. |

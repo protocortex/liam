@@ -191,3 +191,23 @@ fn concurrent_records_lose_no_sample() {
         (THREADS * RECORDS_PER_THREAD) as u64
     );
 }
+
+#[test]
+fn every_stage_names_its_two_metrics() {
+    for stage in Stage::ALL {
+        // Arrange
+        let [p50, p95] = stage.metrics();
+
+        // Act
+        let names = (p50.name(), p95.name());
+
+        // Assert
+        assert_eq!(
+            names,
+            (
+                format!("stage_{}_p50_ms", stage.name()).as_str(),
+                format!("stage_{}_p95_ms", stage.name()).as_str()
+            )
+        );
+    }
+}
