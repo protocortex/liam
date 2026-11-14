@@ -14,11 +14,13 @@ use super::{AskArgs, MemoryServer, RecallArgs};
 use crate::degraded::Degraded;
 use crate::log_startup::test_support::{embedder, DIMS};
 use crate::metrics::alerts::{Alert, Rule};
+use crate::metrics::monotonic::TickingMonotonic;
 use crate::metrics::recorder::Metrics;
 use crate::metrics::sink::Tool;
 use crate::metrics::sink::{Labels, MemorySink, MetricId, MetricsSink, Sample};
 
 const AT: Millis = Millis(1_000);
+const TICK: Duration = Duration::from_micros(250);
 
 const QUERY: &str = "quarterly forecasts for the finance team";
 const SLOW: Duration = Duration::from_secs(30);
@@ -149,7 +151,9 @@ async fn degraded_lines(server: &MemoryServer) -> String {
 fn recorder() -> (Arc<Metrics>, Arc<MemorySink>) {
     let clock = Arc::new(FixedClock::new(AT));
     let sink = Arc::new(MemorySink::new(clock.clone()));
-    (Arc::new(Metrics::new(sink.clone(), clock, 2)), sink)
+    let metrics =
+        Metrics::new(sink.clone(), clock, 2).with_monotonic(Arc::new(TickingMonotonic::new(TICK)));
+    (Arc::new(metrics), sink)
 }
 
 fn record(sink: &MemorySink, metric: MetricId, value: f64) {
@@ -304,6 +308,26 @@ async fn degraded_recalls_and_asks_are_counted_by_tool_and_reason() {
         text.contains("degraded_replies{tool=ask,reason=synthesis_unavailable} = 1"),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn a_recall_reports_a_latency_above_zero() {
+    // Arrange
+    let (metrics, sink) = recorder();
+    let server = server(Some(metrics)).await;
+    seed_facts(&server).await;
+
+    // Act
+    recall_reply(&server).await;
+
+    // Assert
+    let latency = sink
+        .snapshot()
+        .readings
+        .into_iter()
+        .find(|reading| reading.metric == MetricId::RecallLatencyP50Ms)
+        .unwrap();
+    assert!(latency.value > 0.0, "{}", latency.value);
 }
 
 #[tokio::test]

@@ -137,7 +137,7 @@ async fn seed(server: &mcp::MemoryServer, facts: &[Fact]) {
 /// a parser that matched brackets in general would have to guess which pair
 /// is the delimiter. `split_once` takes the first occurrence, which is
 /// always the delimiter in this format, and needs none of that guessing.
-fn labels_in_order(recall_text: &str) -> Vec<String> {
+pub(crate) fn labels_in_order(recall_text: &str) -> Vec<String> {
     recall_text
         .split("\n\n")
         .filter(|block| !block.is_empty())

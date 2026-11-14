@@ -6,6 +6,7 @@
 pub mod alerts;
 pub mod collect;
 pub mod memory;
+pub mod monotonic;
 pub mod recorder;
 pub mod sink;
 pub mod sources;

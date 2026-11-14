@@ -3,15 +3,21 @@
 use liam_store::{FixedClock, Millis};
 
 use super::*;
+use crate::metrics::monotonic::TickingMonotonic;
 use crate::metrics::sink::{MemorySink, Reading};
 use crate::tiering::AppliedMoves;
 
 const MIN_PAIRS: usize = 2;
+/// Under a millisecond, to show timings keep their fraction.
+const TICK: Duration = Duration::from_micros(250);
 
 fn recorder() -> (Arc<Metrics>, Arc<MemorySink>) {
     let clock = Arc::new(FixedClock::new(Millis(5_000)));
     let sink = Arc::new(MemorySink::new(clock.clone()));
-    let metrics = Arc::new(Metrics::new(sink.clone(), clock, MIN_PAIRS));
+    let metrics = Arc::new(
+        Metrics::new(sink.clone(), clock, MIN_PAIRS)
+            .with_monotonic(Arc::new(TickingMonotonic::new(TICK))),
+    );
     (metrics, sink)
 }
 
@@ -51,7 +57,22 @@ fn dropping_a_timer_records_the_call() {
     drop(metrics.time(Tool::Recall));
 
     // Assert
-    assert!(reading(&sink, MetricId::RecallLatencyP50Ms, Labels::None).is_some());
+    let p50 = reading(&sink, MetricId::RecallLatencyP50Ms, Labels::None).unwrap();
+    assert!(p50.value > 0.0 && p50.value < 1.0, "{}", p50.value);
+}
+
+#[test]
+fn a_stage_keeps_its_sub_millisecond_time() {
+    // Arrange
+    let (metrics, sink) = recorder();
+
+    // Act
+    let started = metrics.now();
+    metrics.record_stage(Stage::RecordUsage, started);
+
+    // Assert
+    let p50 = reading(&sink, MetricId::StageRecordUsageP50Ms, Labels::None).unwrap();
+    assert!(p50.value > 0.0 && p50.value < 1.0, "{}", p50.value);
 }
 
 #[test]

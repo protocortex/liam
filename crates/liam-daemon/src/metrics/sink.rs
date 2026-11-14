@@ -27,7 +27,7 @@ impl Tool {
         }
     }
 
-    pub(super) const fn metrics(self) -> [MetricId; 2] {
+    pub(crate) const fn metrics(self) -> [MetricId; 2] {
         match self {
             Self::Recall => [MetricId::RecallLatencyP50Ms, MetricId::RecallLatencyP95Ms],
             Self::Ask => [MetricId::AskLatencyP50Ms, MetricId::AskLatencyP95Ms],
@@ -46,7 +46,29 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub(super) const fn metrics(self) -> [MetricId; 2] {
+    /// Every stage, in the order a report lists them.
+    #[cfg(test)]
+    pub const ALL: [Self; 5] = [
+        Self::Embed,
+        Self::StoreSearch,
+        Self::Rerank,
+        Self::RecordUsage,
+        Self::IssueHandles,
+    ];
+
+    /// The name its metrics carry between `stage_` and `_p50_ms`.
+    #[cfg(test)]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Embed => "embed",
+            Self::StoreSearch => "store_search",
+            Self::Rerank => "rerank",
+            Self::RecordUsage => "record_usage",
+            Self::IssueHandles => "issue_handles",
+        }
+    }
+
+    pub(crate) const fn metrics(self) -> [MetricId; 2] {
         match self {
             Self::Embed => [MetricId::StageEmbedP50Ms, MetricId::StageEmbedP95Ms],
             Self::StoreSearch => [

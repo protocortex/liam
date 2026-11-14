@@ -795,11 +795,11 @@ impl MemoryServer {
         self.metrics.as_ref().map(|metrics| metrics.time(tool))
     }
 
-    fn stage_start(&self) -> Option<Millis> {
+    fn stage_start(&self) -> Option<Duration> {
         self.metrics.as_ref().map(|metrics| metrics.now())
     }
 
-    fn stage_end(&self, stage: Stage, started: Option<Millis>) {
+    fn stage_end(&self, stage: Stage, started: Option<Duration>) {
         if let (Some(metrics), Some(started)) = (&self.metrics, started) {
             metrics.record_stage(stage, started);
         }
@@ -822,21 +822,21 @@ impl MemoryServer {
 
     /// Makes the results a client is shown ones it can give a verdict on.
     fn issue_handles<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
-        let started = self.stage_start();
         if let Some(feedback) = &self.feedback {
+            let started = self.stage_start();
             feedback.issue(nodes);
+            self.stage_end(Stage::IssueHandles, started);
         }
-        self.stage_end(Stage::IssueHandles, started);
     }
 
     /// Counts one hit on each node a client was given as a ranked result.
     /// Neighbours pulled in beside a result are not credited.
     fn record_usage<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
-        let started = self.stage_start();
         if let Some(recorder) = &self.usage {
+            let started = self.stage_start();
             recorder.record(&self.producer(), nodes, Millis::now());
+            self.stage_end(Stage::RecordUsage, started);
         }
-        self.stage_end(Stage::RecordUsage, started);
     }
 
     fn record_evidence_usage(&self, evidence: &[ask::Evidence]) {
@@ -8223,11 +8223,27 @@ mod tests {
         assert!(infer.contains("mode infer"), "{infer}");
     }
 
+    /// Under a millisecond, to show timings keep their fraction.
+    const TICK: Duration = Duration::from_micros(250);
+
     fn metered(server: MemoryServer) -> (MemoryServer, Arc<crate::metrics::sink::MemorySink>) {
         let clock = Arc::new(FixedClock::new(Millis(1_000)));
         let sink = Arc::new(crate::metrics::sink::MemorySink::new(clock.clone()));
-        let metrics = Arc::new(Metrics::new(sink.clone(), clock, 2));
+        let metrics = Arc::new(
+            Metrics::new(sink.clone(), clock, 2).with_monotonic(Arc::new(
+                crate::metrics::monotonic::TickingMonotonic::new(TICK),
+            )),
+        );
         (server.with_metrics(metrics), sink)
+    }
+
+    /// Counts and feedback on, so the stages that need them have work to time.
+    fn with_usage_and_feedback(server: MemoryServer) -> MemoryServer {
+        const TRACKED: usize = 100;
+        const VERDICTS_PER_HOUR: u32 = 10;
+        server
+            .with_usage_recorder(Arc::new(UsageRecorder::new(TRACKED)))
+            .with_feedback(VERDICTS_PER_HOUR, TRACKED)
     }
 
     fn reported(
@@ -8266,16 +8282,6 @@ mod tests {
         assert!(!reported(&sink, MetricId::AskLatencyP95Ms));
     }
 
-    /// A clock that moves one millisecond on every read, so each stage lasts
-    /// a fixed, nonzero time and the stages nest inside the total.
-    struct TickingClock(std::sync::atomic::AtomicI64);
-
-    impl liam_store::Clock for TickingClock {
-        fn now(&self) -> Millis {
-            Millis(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-        }
-    }
-
     fn samples_of(
         sink: &crate::metrics::sink::MemorySink,
         metric: crate::metrics::sink::MetricId,
@@ -8303,12 +8309,9 @@ mod tests {
 
     #[tokio::test]
     async fn recall_records_one_sample_per_stage_and_the_stages_fit_in_the_total() {
-        use crate::metrics::sink::{MemorySink, MetricId};
+        use crate::metrics::sink::MetricId;
         // Arrange
-        let clock = Arc::new(TickingClock(std::sync::atomic::AtomicI64::new(1_000)));
-        let sink = Arc::new(MemorySink::new(clock.clone()));
-        let metrics = Arc::new(Metrics::new(sink.clone(), clock, 2));
-        let server = plain_server().await.with_metrics(metrics);
+        let (server, sink) = metered(with_usage_and_feedback(plain_server().await));
         seed(&server, "fact", "One", "zorbnax note one").await;
         let stages = [
             MetricId::StageEmbedP50Ms,
@@ -8337,6 +8340,31 @@ mod tests {
         assert_eq!(samples_of(&sink, MetricId::RecallLatencyP50Ms), 1);
         let staged: f64 = stages.into_iter().map(|stage| latest(&sink, stage)).sum();
         assert!(staged <= latest(&sink, MetricId::RecallLatencyP50Ms));
+    }
+
+    #[tokio::test]
+    async fn a_server_without_usage_or_feedback_records_no_such_stage_sample() {
+        use crate::metrics::sink::MetricId;
+        // Arrange
+        let (server, sink) = metered(plain_server().await);
+        seed(&server, "fact", "One", "zorbnax note one").await;
+
+        // Act
+        server
+            .recall(Parameters(RecallArgs {
+                query: "zorbnax note".to_string(),
+                kind: None,
+                scope: None,
+                k: None,
+                as_of: None,
+                mode: None,
+            }))
+            .await;
+
+        // Assert
+        assert_eq!(samples_of(&sink, MetricId::StageRecordUsageP50Ms), 0);
+        assert_eq!(samples_of(&sink, MetricId::StageIssueHandlesP50Ms), 0);
+        assert_eq!(samples_of(&sink, MetricId::StageEmbedP50Ms), 1);
     }
 
     /// Embeds like `MockEmbedder` after waiting `delay`.
@@ -8369,17 +8397,13 @@ mod tests {
 
     #[tokio::test]
     async fn ask_records_one_sample_per_stage() {
-        use crate::metrics::sink::{MemorySink, MetricId};
+        use crate::metrics::sink::MetricId;
         // Arrange
-        let clock = Arc::new(TickingClock(std::sync::atomic::AtomicI64::new(1_000)));
-        let sink = Arc::new(MemorySink::new(clock.clone()));
-        let metrics = Arc::new(Metrics::new(sink.clone(), clock, 2));
         let llm = Arc::new(RecordingLlm::new(
             "The zorbnax gadget uses libSQL for storage [1].",
         ));
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm)
-            .await
-            .with_metrics(metrics);
+        let server = server_with(Arc::new(liam_model::IdentityReranker), llm).await;
+        let (server, sink) = metered(with_usage_and_feedback(server));
         seed(
             &server,
             "decision",
@@ -8411,7 +8435,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_degraded_rerank_records_no_rerank_sample() {
-        use crate::metrics::sink::{MemorySink, MetricId};
+        use crate::metrics::sink::MetricId;
         // Arrange
         const SLOW: Duration = Duration::from_secs(30);
         const NEARLY_ALL_THE_BUDGET: Duration = Duration::from_millis(900);
@@ -8425,9 +8449,6 @@ mod tests {
             ("timeout", Duration::ZERO, Arc::new(DelayedReranker(SLOW))),
         ];
         for (case, embed_delay, reranker) in cases {
-            let clock = Arc::new(TickingClock(std::sync::atomic::AtomicI64::new(1_000)));
-            let sink = Arc::new(MemorySink::new(clock.clone()));
-            let metrics = Arc::new(Metrics::new(sink.clone(), clock, 2));
             let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
                 .await
                 .expect("open in-memory store");
@@ -8444,8 +8465,8 @@ mod tests {
                 8192,
                 1,
             )
-            .with_recall_timeout(1)
-            .with_metrics(metrics);
+            .with_recall_timeout(1);
+            let (server, sink) = metered(with_usage_and_feedback(server));
             seed(&server, "fact", "One", "zorbnax note one").await;
 
             // Act

@@ -11,10 +11,11 @@ use std::time::Duration;
 
 use liam_daemon::consolidation::manifest::RunOutcome;
 use liam_daemon::consolidation::probes::ProbeReport;
-use liam_store::{Clock, Millis, QueryTimings};
+use liam_store::{Clock, QueryTimings};
 
 use super::alerts::{evaluate_run, Observation, RuleSet};
 use super::collect::{self, LatencyWindow, ModelMeter, Price};
+use super::monotonic::{InstantSource, Monotonic};
 use super::sink::{
     Labels, MetricId, MetricsSink, ModelCatalog, Provider, RetrievalArm, Sample, Snapshot, Stage,
     TokenUsage, Tool, Usage,
@@ -49,6 +50,7 @@ struct Alerting {
 pub struct Metrics {
     sink: Arc<dyn MetricsSink>,
     clock: Arc<dyn Clock>,
+    timer: Arc<dyn Monotonic>,
     min_samples: usize,
     windows: Mutex<Windows>,
     models: Mutex<Models>,
@@ -66,6 +68,7 @@ impl Metrics {
         Self {
             sink,
             clock,
+            timer: Arc::new(InstantSource::new()),
             min_samples,
             windows: Mutex::new(Windows {
                 tools: BTreeMap::new(),
@@ -84,6 +87,14 @@ impl Metrics {
     /// previous values in `state_path`.
     pub fn with_alerts(mut self, state_path: PathBuf, rules: RuleSet) -> Self {
         self.alerting = Some(Alerting { state_path, rules });
+        self
+    }
+
+    /// Times tool calls and stages against `timer` instead of the real
+    /// monotonic clock.
+    #[cfg(test)]
+    pub fn with_monotonic(mut self, timer: Arc<dyn Monotonic>) -> Self {
+        self.timer = timer;
         self
     }
 
@@ -192,20 +203,26 @@ impl Metrics {
         }
     }
 
-    /// The injected clock's reading, to time a stage against.
-    pub fn now(&self) -> Millis {
-        self.clock.now()
+    /// The monotonic reading a span is measured from.
+    pub fn now(&self) -> Duration {
+        self.timer.elapsed()
+    }
+
+    /// The time since `started`, a reading from [`Self::now`].
+    fn since(&self, started: Duration) -> Duration {
+        self.now().saturating_sub(started)
     }
 
     /// One finished stage that began at `started`.
-    pub fn record_stage(&self, stage: Stage, started: Millis) {
+    pub fn record_stage(&self, stage: Stage, started: Duration) {
+        let elapsed = self.since(started);
         let now = self.clock.now();
         let mut windows = self.windows();
         let window = windows
             .stages
             .entry(stage)
             .or_insert_with(|| LatencyWindow::new(LATENCY_WINDOW));
-        window.record(elapsed_millis(started, now));
+        window.record(millis(elapsed));
         for sample in window.samples(stage.metrics(), Labels::None, now) {
             self.sink.record(sample);
         }
@@ -300,13 +317,12 @@ impl Metrics {
 pub struct ToolTimer {
     metrics: Arc<Metrics>,
     tool: Tool,
-    started: Millis,
+    started: Duration,
 }
 
 impl Drop for ToolTimer {
     fn drop(&mut self) {
-        let elapsed = self.metrics.now().0 - self.started.0;
-        let elapsed = Duration::from_millis(u64::try_from(elapsed).unwrap_or(0));
+        let elapsed = self.metrics.since(self.started);
         self.metrics.record_tool(self.tool, elapsed);
     }
 }
@@ -340,11 +356,6 @@ fn observations_of(snapshot: &Snapshot) -> Vec<Observation> {
             });
     }
     by_metric.into_values().collect()
-}
-
-/// Milliseconds from `started` to `now`, never negative if the clock steps back.
-fn elapsed_millis(started: Millis, now: Millis) -> f64 {
-    (now.0 - started.0).max(0) as f64
 }
 
 fn millis(elapsed: Duration) -> f64 {
