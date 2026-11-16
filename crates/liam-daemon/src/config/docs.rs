@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::{
     AdminConfig, ArchiveConfig, DeletionConfig, EncryptionConfig, HostedConfig, MetricsConfig,
+    RerankerConfig,
 };
 
 /// Each section with its default config as JSON, and each table nested in one
@@ -37,6 +38,7 @@ fn sections() -> Vec<(String, Value)> {
         ("archive", json(ArchiveConfig::default())),
         ("metrics", json(MetricsConfig::default())),
         ("hosted", json(HostedConfig::default())),
+        ("reranker", json(RerankerConfig::default())),
     ] {
         with_tables(name, value, &mut found);
     }

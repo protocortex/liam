@@ -50,6 +50,11 @@ unknown key fails loudly.
 | `metrics.rollback_ceiling` | `1.0` | Rollbacks at which an alert is raised. |
 | `metrics.extraction_backlog_ceiling` | `10000.0` | Events past an extraction cursor at which an alert is raised. |
 | `metrics.model_calls_per_hour` | `1000.0` | Model calls an hour at which an alert is raised. |
+| `reranker.model` | `bge-reranker-base` | The cross-encoder that reorders `recall` candidates: `bge-reranker-base`, `gte-multilingual-reranker-base` or `bge-reranker-v2-m3`. An unknown name fails at load. |
+| `reranker.threads` | `0` | Threads the reranker runs on. `0` uses the performance cores. |
+| `reranker.pool_cap` | `16` | Most candidates `recall` reranks before cutting to `k`. A value below `16` lowers the pool on purpose to cut latency. At least `1`. |
+| `reranker.max_tokens` | `512` | Longest query plus document pair, in tokens. At least `1`. |
+| `reranker.model_dir` | unset | A local directory of model files. Not allowed with `bge-reranker-base`. |
 | `hosted.enabled` | `false` | Allow calls to hosted model providers. |
 | `hosted.allowed_hosts` | empty | The only hosts a request may go to, each lowercase with no scheme, port or path. Required when `hosted.enabled` is true. |
 | `hosted.request_timeout_secs` | `60` | How long one request may take, answer included. At least `1`. |

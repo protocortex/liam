@@ -23,6 +23,7 @@ mod hosted;
 mod metrics;
 mod pins;
 mod pricing;
+mod reranker;
 mod summary;
 mod tiering;
 
@@ -40,6 +41,7 @@ pub use hosted::{HostedConfig, PricesConfig, PrivacyConfig};
 pub use metrics::{MetricsConfig, SinkKind};
 pub use pins::{ModelPin, PinError};
 pub use pricing::{Price, Provider, TokenUsage};
+pub use reranker::{RerankerConfig, RerankerModel};
 pub use summary::{
     SummaryConfig, DEFAULT_MAX_BASIS_IDS_RENDERED, DEFAULT_MIN_SUMMARY_SIMILARITY,
     MAX_SUMMARY_DEPTH,
@@ -107,6 +109,8 @@ pub struct Config {
     pub archive: ArchiveConfig,
     /// Metrics, their alert thresholds and where an alert is reported.
     pub metrics: MetricsConfig,
+    /// The cross-encoder that reorders `recall` candidates.
+    pub reranker: RerankerConfig,
     /// Calls to hosted model providers. Off by default.
     pub hosted: HostedConfig,
 }
@@ -236,6 +240,7 @@ impl Default for Config {
             admin: AdminConfig::default(),
             archive: ArchiveConfig::default(),
             metrics: MetricsConfig::default(),
+            reranker: RerankerConfig::default(),
             hosted: HostedConfig::default(),
         }
     }
@@ -469,6 +474,7 @@ impl Config {
         config.admin.validate()?;
         config.archive.validate()?;
         config.metrics.validate()?;
+        config.reranker.validate()?;
         config.hosted.validate()?;
         config
             .hosted
