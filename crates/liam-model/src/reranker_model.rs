@@ -2,8 +2,9 @@
 //! Pinned ONNX cross-encoder rerankers that load from a local directory.
 //!
 //! Each spec in `RERANKER_MODELS` names a Hugging Face repo at one revision and
-//! lists every file the loader needs with its size and sha256. A downloader
-//! fetches those files into a directory; this module only reads them.
+//! lists every file the loader needs with its size and sha256. Loading checks
+//! that each file exists and has its pinned size; `verify_installed` adds the
+//! sha256 check.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -195,13 +196,27 @@ fn real_threads(configured: usize) -> usize {
     })
 }
 
-/// Refuses a model directory whose files are missing or the wrong size.
+/// Refuses a model directory whose files are missing, not regular files, or
+/// the wrong size. A symlink is refused so a pinned file cannot point outside
+/// the directory.
 fn check_sizes(dir: &Path, spec: &RerankerModelSpec) -> Result<()> {
     for pinned in spec.files {
         let path = dir.join(pinned.name);
-        let size = fs::metadata(&path)
-            .map_err(|e| rerank_error(format!("{} of model {}: {e}", pinned.name, spec.id)))?
-            .len();
+        let metadata = fs::symlink_metadata(&path).map_err(|e| {
+            let message = format!("{} of model {}: {e}", pinned.name, spec.id);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ModelError::RerankFilesNotFound(message)
+            } else {
+                rerank_error(message)
+            }
+        })?;
+        if !metadata.is_file() {
+            return Err(rerank_error(format!(
+                "{} of model {} is not a regular file",
+                pinned.name, spec.id
+            )));
+        }
+        let size = metadata.len();
         if size != pinned.size {
             return Err(rerank_error(format!(
                 "{} of model {} is {size} bytes, expected {}",
@@ -212,9 +227,10 @@ fn check_sizes(dir: &Path, spec: &RerankerModelSpec) -> Result<()> {
     Ok(())
 }
 
-/// Checks every file's size, then its hash through `verify`, which takes the
-/// path, the pinned size and the pinned sha256 (`verify_pinned_file` in
-/// production). A file whose size is wrong never reaches `verify`.
+/// The full check: every file's size, then its hash through `verify`, which
+/// takes the path, the pinned size and the pinned sha256 (`verify_pinned_file`
+/// in production). It is the entry point an installer calls once files are in
+/// place. A file whose size is wrong never reaches `verify`.
 ///
 /// # Errors
 ///
@@ -254,20 +270,21 @@ fn fastembed_session(request: SessionRequest) -> Result<fastembed::TextRerank> {
         .map_err(|e| rerank_error(e.to_string()))
 }
 
-/// A pinned ONNX reranker loaded from a directory a downloader filled.
+/// A pinned ONNX reranker loaded from a local model directory.
 pub struct UserDefinedReranker {
     inner: Box<dyn Reranker>,
 }
 
 impl UserDefinedReranker {
     /// Loads the model in `dir`. Start-up checks that every file exists and has
-    /// its pinned size; the sha256 check is `verify_installed`, run once after a
-    /// download, because hashing the model on every start takes too long.
+    /// its pinned size; `verify_installed` performs the sha256 check, which
+    /// start-up skips because hashing the model takes too long.
     ///
     /// # Errors
     ///
-    /// Fails when a file is missing or the wrong size, or the session cannot
-    /// be built.
+    /// Fails with `RerankFilesNotFound` when a file is absent, and with `Rerank`
+    /// when a file is not a regular file or the wrong size, or the session
+    /// cannot be built.
     pub fn load(dir: &Path, spec: &RerankerModelSpec, settings: RerankerSettings) -> Result<Self> {
         Self::load_with(dir, spec, settings, fastembed_session)
     }
@@ -375,6 +392,23 @@ mod tests {
         assert_eq!(factory_calls, 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_correctly_sized_file_is_refused_before_the_factory_runs() {
+        // Arrange
+        let dir = model_dir(gte());
+        let target = dir.path().join("elsewhere");
+        fs::rename(dir.path().join(CONFIG_FILE_NAME), &target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(CONFIG_FILE_NAME)).unwrap();
+
+        // Act
+        let (loaded, factory_calls) = load_counting(dir.path());
+
+        // Assert
+        assert!(rerank_message(loaded).contains(CONFIG_FILE_NAME));
+        assert_eq!(factory_calls, 0);
+    }
+
     #[test]
     fn a_missing_file_is_refused_before_the_factory_runs() {
         // Arrange
@@ -385,7 +419,10 @@ mod tests {
         let (loaded, factory_calls) = load_counting(dir.path());
 
         // Assert
-        assert!(rerank_message(loaded).contains(CONFIG_FILE_NAME));
+        assert!(matches!(
+            loaded,
+            Err(ModelError::RerankFilesNotFound(m)) if m.contains(CONFIG_FILE_NAME)
+        ));
         assert_eq!(factory_calls, 0);
     }
 
