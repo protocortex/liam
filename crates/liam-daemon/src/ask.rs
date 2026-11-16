@@ -550,7 +550,7 @@ mod tests {
 
     /// The formula before `pool_cap` existed: twice `k`, kept within 16 and 32.
     fn old_pool(k: usize) -> usize {
-        (k * 2).clamp(16, MAX_RECALL_K)
+        (k * 2).clamp(RERANK_POOL_FLOOR, MAX_RECALL_K)
     }
 
     #[test]

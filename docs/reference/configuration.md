@@ -51,9 +51,9 @@ unknown key fails loudly.
 | `metrics.extraction_backlog_ceiling` | `10000.0` | Events past an extraction cursor at which an alert is raised. |
 | `metrics.model_calls_per_hour` | `1000.0` | Model calls an hour at which an alert is raised. |
 | `reranker.model` | `bge-reranker-base` | The cross-encoder that reorders `recall` candidates: `bge-reranker-base`, `gte-multilingual-reranker-base` or `bge-reranker-v2-m3`. An unknown name fails at load. When the files of an ONNX model are missing, the daemon still starts, logs one warning and answers `recall` in store order. |
-| `reranker.threads` | `0` | Threads the reranker runs on. `0` uses the performance cores. |
-| `reranker.pool_cap` | `16` | Most candidates `recall` reranks before cutting to `k`. A value below `16` lowers the pool on purpose to cut latency. At least `1`. |
-| `reranker.max_tokens` | `512` | Longest query plus document pair, in tokens. At least `1`. |
+| `reranker.threads` | `0` | Threads the reranker runs on. `0` uses the performance cores. Applies only to the ONNX models, not to `bge-reranker-base`. |
+| `reranker.pool_cap` | `16` | Most candidates `recall` reranks before cutting to `k`. A value below `16` lowers the pool on purpose to cut latency. At least `1`. A value above the recall maximum of `32` is capped at `32`. |
+| `reranker.max_tokens` | `512` | Longest query plus document pair, in tokens. At least `1`. Applies only to the ONNX models, not to `bge-reranker-base`. |
 | `reranker.model_dir` | unset | A local directory of model files. Not allowed with `bge-reranker-base`. |
 | `hosted.enabled` | `false` | Allow calls to hosted model providers. |
 | `hosted.allowed_hosts` | empty | The only hosts a request may go to, each lowercase with no scheme, port or path. Required when `hosted.enabled` is true. |

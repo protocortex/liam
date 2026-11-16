@@ -40,11 +40,14 @@ impl RerankerModel {
 pub struct RerankerConfig {
     /// The cross-encoder that scores recall candidates.
     pub model: RerankerModel,
-    /// Threads the model runs on. `0` means the performance cores.
+    /// Threads the model runs on. `0` means the performance cores. Applies only
+    /// to the ONNX models, not to `bge-reranker-base`.
     pub threads: usize,
-    /// Most candidates `recall` reranks. Lower it to cut latency.
+    /// Most candidates `recall` reranks. Lower it to cut latency. A value above
+    /// the recall maximum of 32 is capped at 32.
     pub pool_cap: usize,
-    /// Longest query plus document pair, in tokens.
+    /// Longest query plus document pair, in tokens. Applies only to the ONNX
+    /// models, not to `bge-reranker-base`.
     pub max_tokens: usize,
     /// A local directory of model files used instead of the download cache.
     pub model_dir: Option<String>,

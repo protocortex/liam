@@ -290,6 +290,7 @@ trait RerankerLoader {
         settings: RerankerSettings,
     ) -> liam_model::error::Result<Arc<dyn Reranker>>;
     fn warn(&self, message: &str);
+    fn error(&self, message: &str);
 }
 
 struct RealRerankerLoader;
@@ -311,10 +312,14 @@ impl RerankerLoader for RealRerankerLoader {
     fn warn(&self, message: &str) {
         tracing::warn!("{message}");
     }
+
+    fn error(&self, message: &str) {
+        tracing::error!("{message}");
+    }
 }
 
-/// An ONNX reranker whose files are missing falls back to store order, so a
-/// daemon that has not downloaded the model still starts. A legacy load
+/// An ONNX reranker that is missing or fails to load falls back to store
+/// order, so the daemon still starts. A legacy load
 /// failure is an error, as before.
 fn build_local_reranker(
     config: &Config,
@@ -329,11 +334,20 @@ fn build_local_reranker(
             };
             match loader.onnx(&dir, spec, settings) {
                 Ok(reranker) => Ok(reranker),
-                Err(error) => {
+                Err(liam_model::ModelError::RerankFilesNotFound(_)) => {
                     loader.warn(&format!(
                         "reranker unavailable, recall will answer in store order: model {} \
-                         is not usable in {} ({error}). Place the model files there, or set \
+                         has no files in {}. Place the model files there, or set \
                          reranker.model_dir to a directory that has them.",
+                        spec.id,
+                        dir.display()
+                    ));
+                    Ok(Arc::new(IdentityReranker))
+                }
+                Err(error) => {
+                    loader.error(&format!(
+                        "reranker disabled, recall will answer in store order: model {} \
+                         in {} failed to load ({error})",
                         spec.id,
                         dir.display()
                     ));
@@ -647,13 +661,20 @@ mod tests {
 
     const FAKE_ONNX_DIR: &str = "/models/reranker";
 
+    #[derive(Clone, Copy)]
+    enum OnnxFailure {
+        FilesNotFound,
+        LoadFailed,
+    }
+
     #[derive(Default)]
     struct FakeLoader {
-        onnx_fails: bool,
+        onnx_failure: Option<OnnxFailure>,
         legacy_fails: bool,
         legacy_calls: Cell<usize>,
         onnx_calls: RefCell<Vec<(PathBuf, &'static str, RerankerSettings)>>,
         warnings: RefCell<Vec<String>>,
+        errors: RefCell<Vec<String>>,
     }
 
     impl RerankerLoader for FakeLoader {
@@ -674,16 +695,28 @@ mod tests {
             self.onnx_calls
                 .borrow_mut()
                 .push((dir.to_path_buf(), spec.id, settings));
-            if self.onnx_fails {
-                return Err(liam_model::ModelError::Rerank(
-                    "model_int8.onnx: No such file".to_string(),
-                ));
+            match self.onnx_failure {
+                Some(OnnxFailure::FilesNotFound) => {
+                    return Err(liam_model::ModelError::RerankFilesNotFound(
+                        "model_int8.onnx: No such file".to_string(),
+                    ));
+                }
+                Some(OnnxFailure::LoadFailed) => {
+                    return Err(liam_model::ModelError::Rerank(
+                        "model_int8.onnx is 10 bytes, expected 20".to_string(),
+                    ));
+                }
+                None => {}
             }
             Ok(Arc::new(IdentityReranker))
         }
 
         fn warn(&self, message: &str) {
             self.warnings.borrow_mut().push(message.to_string());
+        }
+
+        fn error(&self, message: &str) {
+            self.errors.borrow_mut().push(message.to_string());
         }
     }
 
@@ -792,7 +825,7 @@ mod tests {
         let mut config = reranker_config(RerankerModel::BgeRerankerV2M3);
         config.reranker.model_dir = Some(FAKE_ONNX_DIR.to_string());
         let loader = FakeLoader {
-            onnx_fails: true,
+            onnx_failure: Some(OnnxFailure::FilesNotFound),
             ..FakeLoader::default()
         };
         let docs = vec!["a".to_string(), "b".to_string()];
@@ -821,6 +854,34 @@ mod tests {
         );
         assert!(warnings[0].contains(FAKE_ONNX_DIR), "{}", warnings[0]);
         assert!(warnings[0].contains("model_dir"), "{}", warnings[0]);
+        assert!(loader.errors.borrow().is_empty());
+    }
+
+    #[test]
+    fn present_but_unloadable_onnx_files_fall_back_with_one_error_naming_the_cause() {
+        // Arrange
+        let mut config = reranker_config(RerankerModel::BgeRerankerV2M3);
+        config.reranker.model_dir = Some(FAKE_ONNX_DIR.to_string());
+        let loader = FakeLoader {
+            onnx_failure: Some(OnnxFailure::LoadFailed),
+            ..FakeLoader::default()
+        };
+
+        // Act
+        let result = build_local_reranker(&config, &loader);
+
+        // Assert
+        assert!(result.is_ok());
+        assert!(loader.warnings.borrow().is_empty());
+        let errors = loader.errors.borrow();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("bge-reranker-v2-m3"), "{}", errors[0]);
+        assert!(
+            errors[0].contains("is 10 bytes, expected 20"),
+            "{}",
+            errors[0]
+        );
+        assert!(errors[0].contains("disabled"), "{}", errors[0]);
     }
 
     #[test]
