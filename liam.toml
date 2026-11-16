@@ -240,3 +240,11 @@ unknown_id = "unknown"     # producer id recorded for a client not named in [pro
 [producers.clients]
 # MCP client name = canonical producer id
 ai-notetaker = "notetaker"
+
+# The cross-encoder that reorders recall candidates.
+[reranker]
+model      = "bge-reranker-base"   # or "gte-multilingual-reranker-base", "bge-reranker-v2-m3"
+threads    = 0                     # 0 uses the performance cores; ONNX models only, not bge-reranker-base
+pool_cap   = 32                    # most candidates reranked; 16 cuts latency; above 32 is capped at 32
+max_tokens = 512                   # longest query plus document pair, in tokens; ONNX models only
+# model_dir = "/path/to/model"     # local model files; not allowed with bge-reranker-base

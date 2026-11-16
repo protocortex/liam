@@ -446,6 +446,8 @@ pub struct MemoryServer {
     ask_timeout_secs: u64,
     /// Seconds `recall` and `ask` may spend retrieving; see `retrieval_deadline`.
     recall_timeout_secs: u64,
+    /// Most candidates `recall` and `ask` rerank; see `ask::rerank_pool`.
+    rerank_pool_cap: usize,
     /// Whether `ask` runs the yes/no sufficiency pre-pass before synthesizing;
     /// see `config::Config::ask_sufficiency_check`.
     ask_sufficiency_check: bool,
@@ -700,6 +702,7 @@ impl MemoryServer {
             llm,
             ask_timeout_secs,
             recall_timeout_secs: DEFAULT_RECALL_TIMEOUT_SECS,
+            rerank_pool_cap: crate::config::DEFAULT_RERANK_POOL_CAP,
             ask_sufficiency_check,
             ask_context_tokens,
             max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
@@ -733,6 +736,12 @@ impl MemoryServer {
     /// least one, so a configured `0` cannot time every request out at once.
     pub(crate) fn with_recall_timeout(mut self, secs: u64) -> Self {
         self.recall_timeout_secs = secs.max(1);
+        self
+    }
+
+    /// Sets the most candidates `recall` and `ask` rerank.
+    pub(crate) fn with_rerank_pool_cap(mut self, pool_cap: usize) -> Self {
+        self.rerank_pool_cap = pool_cap;
         self
     }
 
@@ -1336,7 +1345,7 @@ impl MemoryServer {
             let (embedding, embed_degraded) = self.embed_or_degrade("recall", &args.query).await;
             let q = build_query(
                 &lexical_text(&args.query),
-                Some(crate::ask::rerank_pool(k)),
+                Some(crate::ask::rerank_pool(k, self.rerank_pool_cap)),
                 args.kind,
                 args.scope,
                 embedding,
@@ -1735,7 +1744,7 @@ impl MemoryServer {
             let (embedding, embed_degraded) = self.embed_or_degrade("ask", &args.question).await;
             let q = build_query(
                 &lexical_text(&args.question),
-                Some(ask::rerank_pool(k)),
+                Some(ask::rerank_pool(k, self.rerank_pool_cap)),
                 args.kind,
                 args.scope.clone(),
                 embedding.clone(),
@@ -6483,13 +6492,13 @@ mod tests {
     }
 
     #[test]
-    fn rerank_pool_doubles_k_between_sixteen_and_thirty_two() {
+    fn rerank_pool_widens_k_to_sixteen_then_follows_twice_k_to_the_default_cap() {
         // Arrange: k and the pool it should widen to
         let cases = [(1, 16), (8, 16), (9, 18), (16, 32), (17, 32), (32, 32)];
 
         for (k, expected) in cases {
             // Act
-            let pool = crate::ask::rerank_pool(k);
+            let pool = crate::ask::rerank_pool(k, crate::config::DEFAULT_RERANK_POOL_CAP);
 
             // Assert
             assert_eq!(pool, expected, "pool for k={k}");
@@ -6534,7 +6543,13 @@ mod tests {
         let k = 3;
         let server = server_over(&store, Arc::new(FailingReranker));
         let pool = store
-            .query_explained(&recall_query("zorbnax", crate::ask::rerank_pool(k)).await)
+            .query_explained(
+                &recall_query(
+                    "zorbnax",
+                    crate::ask::rerank_pool(k, crate::config::DEFAULT_RERANK_POOL_CAP),
+                )
+                .await,
+            )
             .await
             .unwrap();
         let expected: Vec<String> = pool
