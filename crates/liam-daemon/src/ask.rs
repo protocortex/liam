@@ -545,8 +545,8 @@ mod tests {
         Evidence::recorded(kind, label, content, valid_from_ms)
     }
 
-    const DEFAULT_CAP: usize = 16;
     const LOW_CAP: usize = 8;
+    const MID_CAP: usize = 16;
 
     /// The formula before `pool_cap` existed: twice `k`, kept within 16 and 32.
     fn old_pool(k: usize) -> usize {
@@ -554,13 +554,33 @@ mod tests {
     }
 
     #[test]
+    fn the_default_cap_is_the_recall_maximum() {
+        // Assert
+        assert_eq!(crate::config::DEFAULT_RERANK_POOL_CAP, MAX_RECALL_K);
+    }
+
+    #[test]
     fn the_pool_follows_k_and_the_default_cap() {
         // Arrange: k and its pool at the default cap
-        let cases = [(0, 16), (1, 16), (8, 16), (20, 20), (32, 32), (40, 32)];
+        let cases = [(0, 16), (1, 16), (8, 16), (20, 32), (32, 32), (40, 32)];
 
         for (k, expected) in cases {
             // Act
-            let pool = rerank_pool(k, DEFAULT_CAP);
+            let pool = rerank_pool(k, crate::config::DEFAULT_RERANK_POOL_CAP);
+
+            // Assert
+            assert_eq!(pool, expected, "pool for k={k}");
+        }
+    }
+
+    #[test]
+    fn a_cap_of_sixteen_stops_the_pool_widening_past_k() {
+        // Arrange: k and its pool at a cap of 16
+        let cases = [(1, 16), (8, 16), (10, 16), (16, 16), (20, 20)];
+
+        for (k, expected) in cases {
+            // Act
+            let pool = rerank_pool(k, MID_CAP);
 
             // Assert
             assert_eq!(pool, expected, "pool for k={k}");
@@ -582,17 +602,16 @@ mod tests {
     }
 
     #[test]
-    fn the_default_cap_matches_the_old_pool_only_at_the_ends() {
-        for k in 0..=MAX_RECALL_K + 8 {
-            // Act
-            let (new, old) = (rerank_pool(k, DEFAULT_CAP), old_pool(k));
+    fn the_default_cap_gives_the_pool_the_old_formula_gave() {
+        for requested in 1..=40 {
+            // Arrange: production clamps k before sizing the pool
+            let k = clamp_recall_k(Some(requested));
 
-            // Assert: equal up to 8 and from 32, and below the old pool between
-            match k {
-                0..=8 | 32.. => assert_eq!(new, old, "k={k}"),
-                9..=16 => assert_eq!((new, old), (16, k * 2), "k={k}"),
-                _ => assert_eq!((new, old), (k, MAX_RECALL_K), "k={k}"),
-            }
+            // Act
+            let pool = rerank_pool(k, crate::config::DEFAULT_RERANK_POOL_CAP);
+
+            // Assert
+            assert_eq!(pool, old_pool(k), "k={k}");
         }
     }
 

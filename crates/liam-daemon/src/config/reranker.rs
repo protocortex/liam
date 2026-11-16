@@ -6,7 +6,10 @@ use serde::Deserialize;
 #[cfg(test)]
 use serde::Serialize;
 
-pub const DEFAULT_POOL_CAP: usize = 16;
+/// Equals the recall maximum, so the default pool matches the one recall built
+/// before the cap existed. A lower default needs a measured nDCG cost under
+/// 0.02 against 32 on the multilingual set, which has not been measured yet.
+pub const DEFAULT_POOL_CAP: usize = 32;
 const DEFAULT_MAX_TOKENS: usize = 512;
 /// Zero asks the loader to use the performance cores.
 const DEFAULT_THREADS: usize = 0;
@@ -43,8 +46,8 @@ pub struct RerankerConfig {
     /// Threads the model runs on. `0` means the performance cores. Applies only
     /// to the ONNX models, not to `bge-reranker-base`.
     pub threads: usize,
-    /// Most candidates `recall` reranks. Lower it to cut latency. A value above
-    /// the recall maximum of 32 is capped at 32.
+    /// Most candidates `recall` reranks. Lower it, for example to 16, to cut
+    /// latency. A value above the recall maximum of 32 is capped at 32.
     pub pool_cap: usize,
     /// Longest query plus document pair, in tokens. Applies only to the ONNX
     /// models, not to `bge-reranker-base`.
@@ -101,7 +104,7 @@ mod tests {
         // Assert
         assert_eq!(config.reranker, RerankerConfig::default());
         assert_eq!(config.reranker.model.as_str(), "bge-reranker-base");
-        assert_eq!(config.reranker.pool_cap, 16);
+        assert_eq!(config.reranker.pool_cap, 32);
         assert_eq!(config.reranker.threads, 0);
         assert_eq!(config.reranker.max_tokens, 512);
         assert_eq!(config.reranker.model_dir, None);

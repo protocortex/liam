@@ -245,6 +245,6 @@ ai-notetaker = "notetaker"
 [reranker]
 model      = "bge-reranker-base"   # or "gte-multilingual-reranker-base", "bge-reranker-v2-m3"
 threads    = 0                     # 0 uses the performance cores; ONNX models only, not bge-reranker-base
-pool_cap   = 16                    # most candidates reranked; lower it to cut latency; above 32 is capped at 32
+pool_cap   = 32                    # most candidates reranked; 16 cuts latency; above 32 is capped at 32
 max_tokens = 512                   # longest query plus document pair, in tokens; ONNX models only
 # model_dir = "/path/to/model"     # local model files; not allowed with bge-reranker-base

@@ -6492,9 +6492,9 @@ mod tests {
     }
 
     #[test]
-    fn rerank_pool_widens_k_to_sixteen_and_never_past_the_default_cap() {
+    fn rerank_pool_widens_k_to_sixteen_then_follows_twice_k_to_the_default_cap() {
         // Arrange: k and the pool it should widen to
-        let cases = [(1, 16), (8, 16), (9, 16), (16, 16), (17, 17), (32, 32)];
+        let cases = [(1, 16), (8, 16), (9, 18), (16, 32), (17, 32), (32, 32)];
 
         for (k, expected) in cases {
             // Act
