@@ -32,9 +32,8 @@ pub fn clamp_ask_k(k: Option<usize>) -> usize {
 const DEFAULT_RECALL_K: usize = 8;
 const MAX_RECALL_K: usize = MAX_ASK_EVIDENCE;
 
-/// Smallest and largest candidate pool `recall` reranks before cutting to `k`.
+/// Candidate pool `recall` reranks when `k` is small.
 const RERANK_POOL_FLOOR: usize = 16;
-const RERANK_POOL_CAP: usize = MAX_RECALL_K;
 
 /// Resolve the caller's `k` into `1..=MAX_RECALL_K`, defaulting to
 /// `DEFAULT_RECALL_K`. `k = 0` would return nothing for a query the store can
@@ -43,10 +42,13 @@ pub fn clamp_recall_k(k: Option<usize>) -> usize {
     k.unwrap_or(DEFAULT_RECALL_K).clamp(1, MAX_RECALL_K)
 }
 
-/// Candidates `recall` reranks before cutting to `k`: twice `k`, kept within
-/// the floor and cap so a small `k` still reranks a useful pool.
-pub(crate) fn rerank_pool(k: usize) -> usize {
-    (k * 2).clamp(RERANK_POOL_FLOOR, RERANK_POOL_CAP)
+/// Candidates `recall` reranks before cutting to `k`: twice `k`, at least the
+/// floor, at most `pool_cap`. A `pool_cap` below the floor lowers the pool on
+/// purpose, since it is the latency lever. The pool never drops below `k` and
+/// never passes `MAX_RECALL_K`.
+pub(crate) fn rerank_pool(k: usize, pool_cap: usize) -> usize {
+    let wanted = (k * 2).max(RERANK_POOL_FLOOR).min(pool_cap);
+    wanted.max(k).min(MAX_RECALL_K)
 }
 
 /// Fence opener/closer wrapping each evidence block. WHY: `kind`, `label`, and
@@ -541,6 +543,57 @@ mod tests {
 
     fn evidence(kind: &str, label: &str, content: &str, valid_from_ms: i64) -> Evidence {
         Evidence::recorded(kind, label, content, valid_from_ms)
+    }
+
+    const DEFAULT_CAP: usize = 16;
+    const LOW_CAP: usize = 8;
+
+    /// The formula before `pool_cap` existed: twice `k`, kept within 16 and 32.
+    fn old_pool(k: usize) -> usize {
+        (k * 2).clamp(16, MAX_RECALL_K)
+    }
+
+    #[test]
+    fn the_pool_follows_k_and_the_default_cap() {
+        // Arrange: k and its pool at the default cap
+        let cases = [(0, 16), (1, 16), (8, 16), (20, 20), (32, 32), (40, 32)];
+
+        for (k, expected) in cases {
+            // Act
+            let pool = rerank_pool(k, DEFAULT_CAP);
+
+            // Assert
+            assert_eq!(pool, expected, "pool for k={k}");
+        }
+    }
+
+    #[test]
+    fn a_cap_below_the_floor_lowers_the_pool_but_never_below_k() {
+        // Arrange: k and its pool at a cap of 8
+        let cases = [(1, 8), (8, 8), (20, 20)];
+
+        for (k, expected) in cases {
+            // Act
+            let pool = rerank_pool(k, LOW_CAP);
+
+            // Assert
+            assert_eq!(pool, expected, "pool for k={k}");
+        }
+    }
+
+    #[test]
+    fn the_default_cap_matches_the_old_pool_only_at_the_ends() {
+        for k in 0..=MAX_RECALL_K + 8 {
+            // Act
+            let (new, old) = (rerank_pool(k, DEFAULT_CAP), old_pool(k));
+
+            // Assert: equal up to 8 and from 32, and below the old pool between
+            match k {
+                0..=8 | 32.. => assert_eq!(new, old, "k={k}"),
+                9..=16 => assert_eq!((new, old), (16, k * 2), "k={k}"),
+                _ => assert_eq!((new, old), (k, MAX_RECALL_K), "k={k}"),
+            }
+        }
     }
 
     #[test]

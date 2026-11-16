@@ -255,6 +255,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     let server = server
         .with_shutdown(shutdown.token())
         .with_recall_timeout(config.recall_timeout_secs)
+        .with_rerank_pool_cap(config.reranker.pool_cap)
         .with_vocabulary(config::resolve_vocabulary(&config.extraction))
         .with_max_basis_ids_rendered(config.summary.max_basis_ids_rendered)
         .with_min_summary_similarity(config.summary.min_summary_similarity);

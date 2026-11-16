@@ -6,7 +6,7 @@ use serde::Deserialize;
 #[cfg(test)]
 use serde::Serialize;
 
-const DEFAULT_POOL_CAP: usize = 16;
+pub const DEFAULT_POOL_CAP: usize = 16;
 const DEFAULT_MAX_TOKENS: usize = 512;
 /// Zero asks the loader to use the performance cores.
 const DEFAULT_THREADS: usize = 0;

@@ -8,6 +8,7 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Added
 
+- A `[reranker]` section sets the reranker model, threads, `pool_cap` (default `16`), `max_tokens` and `model_dir`. The default `pool_cap` of `16` narrows the rerank pool for `k` above 8, which used to widen to as many as 32 candidates.
 - `recall_timeout_secs` (default `10`) bounds how long `recall` and `ask` spend retrieving. Past it they reply
   with a timeout, and a reranker still running at the deadline gives way to the hits in store order. Cancelling a
   request now stops retrieval with a `cancelled` reply; the `ask` model call that follows retrieval still runs

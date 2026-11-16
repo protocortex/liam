@@ -41,7 +41,7 @@ pub use hosted::{HostedConfig, PricesConfig, PrivacyConfig};
 pub use metrics::{MetricsConfig, SinkKind};
 pub use pins::{ModelPin, PinError};
 pub use pricing::{Price, Provider, TokenUsage};
-pub use reranker::{RerankerConfig, RerankerModel};
+pub use reranker::{RerankerConfig, RerankerModel, DEFAULT_POOL_CAP as DEFAULT_RERANK_POOL_CAP};
 pub use summary::{
     SummaryConfig, DEFAULT_MAX_BASIS_IDS_RENDERED, DEFAULT_MIN_SUMMARY_SIMILARITY,
     MAX_SUMMARY_DEPTH,
