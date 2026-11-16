@@ -50,7 +50,7 @@ unknown key fails loudly.
 | `metrics.rollback_ceiling` | `1.0` | Rollbacks at which an alert is raised. |
 | `metrics.extraction_backlog_ceiling` | `10000.0` | Events past an extraction cursor at which an alert is raised. |
 | `metrics.model_calls_per_hour` | `1000.0` | Model calls an hour at which an alert is raised. |
-| `reranker.model` | `bge-reranker-base` | The cross-encoder that reorders `recall` candidates: `bge-reranker-base`, `gte-multilingual-reranker-base` or `bge-reranker-v2-m3`. An unknown name fails at load. |
+| `reranker.model` | `bge-reranker-base` | The cross-encoder that reorders `recall` candidates: `bge-reranker-base`, `gte-multilingual-reranker-base` or `bge-reranker-v2-m3`. An unknown name fails at load. When the files of an ONNX model are missing, the daemon still starts, logs one warning and answers `recall` in store order. |
 | `reranker.threads` | `0` | Threads the reranker runs on. `0` uses the performance cores. |
 | `reranker.pool_cap` | `16` | Most candidates `recall` reranks before cutting to `k`. A value below `16` lowers the pool on purpose to cut latency. At least `1`. |
 | `reranker.max_tokens` | `512` | Longest query plus document pair, in tokens. At least `1`. |
