@@ -15,6 +15,7 @@ mod llama_embedder;
 pub mod llm;
 mod onnx;
 pub mod reranker;
+mod reranker_model;
 
 pub mod llama;
 
@@ -29,7 +30,9 @@ pub use bge::BgeM3Embedder;
 pub use embedder::FastEmbedEmbedder;
 pub use onnx::OnnxEmbedder;
 pub use reranker::FastEmbedReranker;
+pub use reranker_model::{reranker_model_spec, PinnedFile, RerankerModelSpec, RERANKER_MODELS};
 
+pub use gguf_verify::verify_pinned_file;
 pub use llama::LlamaCppLlm;
 pub use llama_embedder::{
     gguf_embedder_spec, gguf_path_from_hub, verify_gguf_file, GgufEmbedderSpec, LlamaEmbedder,
