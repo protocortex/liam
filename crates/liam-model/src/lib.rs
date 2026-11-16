@@ -30,7 +30,10 @@ pub use bge::BgeM3Embedder;
 pub use embedder::FastEmbedEmbedder;
 pub use onnx::OnnxEmbedder;
 pub use reranker::FastEmbedReranker;
-pub use reranker_model::{reranker_model_spec, PinnedFile, RerankerModelSpec, RERANKER_MODELS};
+pub use reranker_model::{
+    reranker_model_spec, resolve_threads, verify_installed, PinnedFile, RerankerModelSpec,
+    RerankerSettings, SessionRequest, UserDefinedReranker, RERANKER_MODELS,
+};
 
 pub use gguf_verify::verify_pinned_file;
 pub use llama::LlamaCppLlm;
