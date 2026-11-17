@@ -72,6 +72,24 @@ unknown key fails loudly.
 | `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
 | `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
 
+### When to turn the reranker on
+
+The reranker is off by default. That suits a small store. On 300 facts it moved English nDCG@10 by +0.002 to +0.003, which is inside the noise.
+
+On a larger store the reranker helps. On 10,000 Wikipedia passages (MIRACL dev, in three languages), reranking the top 16 results of the default embedder raised the mean nDCG@10 from 0.903 to 0.940 with `gte-multilingual-reranker-base` and to 0.954 with `bge-reranker-v2-m3`. The gain was above zero in every language, and `bge-reranker-v2-m3` beat gte in every language. The embedder already finds the right passages (recall at 16 was 0.98 to 0.99). The reranker improves their order.
+
+For a store of several thousand facts or more, set:
+
+```toml
+[reranker]
+model    = "bge-reranker-v2-m3"
+pool_cap = 16
+```
+
+Then run `liam fetch-models` so the model files are on disk. Without them the daemon still starts and answers `recall` in store order, as the `reranker.model` row says.
+
+The cost is real. A reranker adds about 1.2 GB of resident memory. On an Apple M1 Pro, `gte-multilingual-reranker-base` took about 254 ms per recall at 16 pairs, and `bge-reranker-v2-m3` (a 571 MB file) took about 779 ms. These timings did not come from a quiet machine. The test data was Wikipedia text, not agent memory, and the run did not cover Portuguese at that size. See [ADR 0013](../adr/0013-arctic-default-embedder-and-reranker-off.md).
+
 `[producers.clients]` is a plain table, and the ids are what land in the
 `producer` column:
 

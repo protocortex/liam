@@ -89,3 +89,23 @@ probe on an M1 Pro, not from a long running daemon.
   the retrieval order and its stage timer still runs.
 - **A pinned download path.** A new model that fastembed does not list is one
   table row with its file sizes and hashes.
+
+## Addendum, 2026-11-17: a reranker on a store of 10,000 passages
+
+The evidence above came from small stores. A later run used 10,000 Wikipedia passages from MIRACL dev (`mteb/MIRACLRetrievalHardNegatives`, CC BY-SA 4.0), with 200 English, 100 Spanish and 100 Japanese queries. Each reranker reordered the top 16 results of the default arctic embedder. The mean nDCG@10 over the three languages was:
+
+| Reranker | Mean nDCG@10 |
+|---|---|
+| none | 0.903 |
+| `gte-multilingual-reranker-base` | 0.940 |
+| `bge-reranker-v2-m3` | 0.954 |
+
+For English the gain was +0.031 (gte) and +0.041 (bge). For Spanish and Japanese the mean gain was +0.040 (gte) and +0.057 (bge). Paired bootstrap 95% intervals were above zero for both rerankers in every language. `bge-reranker-v2-m3` beat gte in every language, and a pool of 16 beat a pool of 8. The embedder alone already found the right passages (recall at 16 was 0.98 to 0.99), so the reranker improves their order.
+
+The cost, from a probe on an Apple M1 Pro on a machine that was not quiet: about 1.2 GB of resident memory, and about 254 ms per recall for gte at 16 pairs. `bge-reranker-v2-m3` took about 779 ms per 16 pairs in an earlier measurement and has a 571 MB file. The data is Wikipedia text, not agent memory, and the run did not cover Portuguese at this size.
+
+Consequences:
+
+- The default stays `none`, by the user's choice.
+- A large store should opt in to `bge-reranker-v2-m3`. The [configuration reference](../reference/configuration.md#when-to-turn-the-reranker-on) says how.
+- Loading the reranker on demand, so it costs memory only while in use, is a possible later change.
