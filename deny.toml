@@ -10,6 +10,16 @@ ignore = [
     # this project calls directly depends on `paste`. Revisit and drop this
     # ignore once fastembed and its candle dependencies move off `paste`.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained, pulled in transitively by the candle and fastembed tree, not used directly" },
+    # RUSTSEC-2026-0543: `chrono` is unmaintained. This is an unmaintained
+    # advisory, not a known vulnerability, and it names no fixed version. It
+    # reaches this project only transitively, through arrow, parquet,
+    # object_store and rmcp. Drop this ignore once those crates move off
+    # `chrono`.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, pulled in transitively by arrow, parquet, object_store and rmcp, not used directly" },
+    # RUSTSEC-2026-0542: `humantime` is unmaintained, for the same reason as
+    # `chrono`. It reaches this project only through object_store. Drop this
+    # ignore once object_store moves off `humantime`.
+    { id = "RUSTSEC-2026-0542", reason = "unmaintained, pulled in transitively by object_store, not used directly" },
 ]
 
 [licenses]
