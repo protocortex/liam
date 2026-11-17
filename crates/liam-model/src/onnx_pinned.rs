@@ -5,6 +5,10 @@
 //! every file the loader needs with its size and sha256. The files download
 //! into the embedder cache, are checked against the pins, and only then reach
 //! the ONNX session, so a truncated or swapped file never gets loaded.
+//!
+//! After the first run a size and mtime marker stands in for the hash, and the session reads
+//! the file by path later, so the cache directory is trusted to the daemon's own user: a process
+//! with write access to it can replace a file that was already verified.
 
 use std::path::{Path, PathBuf};
 
