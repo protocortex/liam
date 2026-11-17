@@ -141,6 +141,20 @@ pub fn onnx_model_spec(model: &str) -> Option<&'static OnnxModelSpec> {
         .find(|spec| spec.id.eq_ignore_ascii_case(model))
 }
 
+/// The `HF_HOME` value that redirects `spec`'s download away from `cache_dir`.
+/// A pinned model downloads through an explicit cache directory, which
+/// `HF_HOME` cannot override; only fastembed's own download honours it.
+fn hf_home_override<'a>(
+    spec: &OnnxModelSpec,
+    hf_home: Option<&'a str>,
+    cache_dir: &str,
+) -> Option<&'a str> {
+    match spec.source {
+        OnnxSource::Fastembed(_) => crate::bge::hf_home_overriding(hf_home, cache_dir),
+        OnnxSource::Pinned(_) => None,
+    }
+}
+
 /// The exact string handed to the model for `text` in its `kind` role.
 fn onnx_input(spec: &OnnxModelSpec, text: &str, kind: TextKind) -> String {
     let prefix = match kind {
@@ -179,7 +193,7 @@ impl OnnxEmbedder {
     pub fn load(spec: &'static OnnxModelSpec, dims: usize, cache_dir: &str) -> Result<Self> {
         validate_onnx_dims(spec, dims)?;
         if let Some(hf_home) =
-            crate::bge::hf_home_overriding(std::env::var("HF_HOME").ok().as_deref(), cache_dir)
+            hf_home_override(spec, std::env::var("HF_HOME").ok().as_deref(), cache_dir)
         {
             tracing::warn!(
                 hf_home,
@@ -247,13 +261,28 @@ impl crate::Embedder for OnnxEmbedder {
 #[cfg(test)]
 mod tests {
     use super::{
-        onnx_input, onnx_model_spec, validate_onnx_dims, OnnxModelSpec, BGE_STYLE_QUERY_PREFIX,
-        ONNX_MODELS,
+        hf_home_override, onnx_input, onnx_model_spec, validate_onnx_dims, OnnxModelSpec,
+        BGE_STYLE_QUERY_PREFIX, ONNX_MODELS,
     };
     use crate::TextKind;
 
     fn spec(id: &str) -> &'static OnnxModelSpec {
         onnx_model_spec(id).expect("a listed model")
+    }
+
+    #[test]
+    fn hf_home_is_reported_for_a_fastembed_download_but_not_a_pinned_one() {
+        // Arrange
+        let fastembed = spec("BAAI/bge-small-en-v1.5");
+        let pinned = spec(crate::DEFAULT_EMBEDDER_MODEL_ID);
+
+        // Act
+        let for_fastembed = hf_home_override(fastembed, Some("/hf"), "/cache");
+        let for_pinned = hf_home_override(pinned, Some("/hf"), "/cache");
+
+        // Assert
+        assert_eq!(for_fastembed, Some("/hf"));
+        assert_eq!(for_pinned, None);
     }
 
     #[test]
