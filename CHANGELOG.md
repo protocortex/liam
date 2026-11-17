@@ -21,6 +21,24 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- **Breaking:** the default `embedder.model` is now `Snowflake/snowflake-arctic-embed-m-v2.0`, an int8 ONNX
+  model on the CPU (311 MB, cut to 384 dimensions). On English, Portuguese and Spanish it matches or beats the
+  previous default, Qwen3 Q8 on llama.cpp (nDCG@10 0.949 against 0.932 on the English 340 question set, 0.966
+  against 0.935 on Portuguese, 0.931 against 0.924 on Spanish), and answers a query in about 8 ms against 37 ms.
+  Qwen3 is better on Arabic and Chinese. A store built with the old default is refused at start with a message
+  that names `liam rebuild --database PATH`; run it with `liamd` stopped, then `liam fetch-models` downloads the
+  new model. To keep the old model set `embedder.model = "Qwen/Qwen3-Embedding-0.6B-GGUF"`. See
+  [ADR 0013](docs/adr/0013-arctic-default-embedder-and-reranker-off.md).
+- A store with data and no `<database>.embedder.json` is now taken to hold the vectors of the default from before fingerprints,
+  `Qwen/Qwen3-Embedding-0.6B` at 768 dimensions, instead of the configured embedder's. Opened under any other
+  model or width, including the new default, it is refused with the same message that names `liam rebuild`.
+- The embedder fingerprint records an ONNX model under its canonical id, so `embedder.model` spelled in another
+  case no longer reads as a change of embedder.
+- **Breaking:** the reranker is now off by default (`reranker.model = "none"`), so `recall` answers in store
+  order. The best reranker moved nDCG@10 by +0.017, -0.010 and +0.033 on English, Portuguese and Spanish, inside
+  the noise, for 254 ms and over 1 GB of memory. To turn it on set `reranker.model` to `bge-reranker-base`,
+  `gte-multilingual-reranker-base` or `bge-reranker-v2-m3`. `liam fetch-models` fetches a reranker only when one
+  is configured.
 - `recall` and `ask` now set `isError` when the call fails: the retrieval deadline passes, the store fails, or the
   query is invalid. A cancelled call still returns a normal reply. `recall` and `ask` now log a failed embed and
   report `embed_failed` instead of hiding it.

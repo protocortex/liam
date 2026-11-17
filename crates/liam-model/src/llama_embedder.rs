@@ -102,9 +102,10 @@ pub const GGUF_EMBEDDERS: &[GgufEmbedderSpec] = &[
     },
 ];
 
-/// The default embedding model id: the Q8_0 build of Qwen3-Embedding-0.6B on llama.cpp.
-/// The candle build stays available under `QWEN3_EMBEDDING_MODEL_ID`.
-pub const DEFAULT_EMBEDDER_MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B-GGUF";
+/// The id of the Q8_0 build of Qwen3-Embedding-0.6B on llama.cpp, the embedder
+/// before arctic became the default. The candle build is
+/// `QWEN3_EMBEDDING_MODEL_ID`.
+pub const QWEN3_GGUF_EMBEDDER_MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B-GGUF";
 
 /// The spec a model id names: `repo` for the default quantisation, or
 /// `repo:QUANT`. Matching ignores case, like Hugging Face ids do.

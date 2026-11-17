@@ -30,9 +30,10 @@ skips the check.
   is written after the store opens, so a start that fails leaves nothing
   behind.
 - **No record, and a database that holds data:** a store from before
-  fingerprints. It is taken to hold the configured provider, model and
-  dimensions under prompt scheme 0, so it fails the check (the binary is on
-  scheme 2). `liam rebuild` clears this and needs an event log. A store that
+  fingerprints. It is taken to hold the vectors of the default from that time,
+  `Qwen/Qwen3-Embedding-0.6B` at 768 dimensions, under prompt scheme 0, whatever
+  the default is now. So it fails the check under any other model or width, and
+  under the current binary too (it is on scheme 2). `liam rebuild` clears this and needs an event log. A store that
   predates the log has none, so `liamd` copies its rows into a new log before
   it runs the check. The start is still refused, but the log now exists: run
   `liam rebuild --database PATH` and start again.
@@ -43,10 +44,11 @@ skips the check.
   with a message distinct from the mismatch one. The file is never overwritten,
   because that could hide a change of embedder.
 
-The default `embedder.model` is `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0 on llama.cpp). A store built
-with the earlier default, `Qwen/Qwen3-Embedding-0.6B` (candle), is refused at start. Run `liam rebuild`,
-or set `embedder.model = "Qwen/Qwen3-Embedding-0.6B"` to keep the old model. Both spellings of the
-GGUF id (`...-GGUF` and `...-GGUF:Q8_0`) record as one model.
+The default `embedder.model` is `Snowflake/snowflake-arctic-embed-m-v2.0` (int8 ONNX on the CPU). A
+store built with an earlier default, `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0 on llama.cpp) or
+`Qwen/Qwen3-Embedding-0.6B` (candle), is refused at start. Run `liam rebuild`, or set `embedder.model` to the
+old id to keep the old model. Both spellings of the GGUF id (`...-GGUF` and `...-GGUF:Q8_0`) record as one
+model.
 
 To change `embedder.provider`, `embedder.model` or `embedding_dims`, stop
 `liamd`, edit `liam.toml`, and run:

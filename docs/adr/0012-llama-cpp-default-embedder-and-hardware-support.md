@@ -1,6 +1,6 @@
 # ADR-0012: llama.cpp is the default embedder, and Linux and Windows GPUs use a pinned llama-server sidecar
 
-- **Status:** Accepted
+- **Status:** Accepted. Superseded in part by [ADR-0013](0013-arctic-default-embedder-and-reranker-off.md): the llama.cpp embedder stays and is no longer the default.
 - **Date created:** 2026-11-10
 - **Date modified:** 2026-11-10
 
