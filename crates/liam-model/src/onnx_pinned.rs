@@ -13,7 +13,31 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{ModelError, Result};
-use crate::reranker_model::{file, PinnedFile};
+
+/// One file of a pinned model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedFile {
+    /// The file name inside the model directory.
+    pub name: &'static str,
+    /// The path of the file inside the Hugging Face repo.
+    pub remote_path: &'static str,
+    pub size: u64,
+    pub sha256: &'static str,
+}
+
+const fn file(
+    name: &'static str,
+    remote_path: &'static str,
+    size: u64,
+    sha256: &'static str,
+) -> PinnedFile {
+    PinnedFile {
+        name,
+        remote_path,
+        size,
+        sha256,
+    }
+}
 
 /// A model pinned to one Hugging Face revision.
 #[derive(Debug, Clone, PartialEq, Eq)]

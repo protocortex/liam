@@ -44,7 +44,6 @@ impl Fixture {
         let server = MemoryServer::new(
             Arc::clone(&subjects.store),
             embedder(),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(liam_model::MockLlm),
             30,
             false,

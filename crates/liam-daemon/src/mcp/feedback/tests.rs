@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use liam_model::{IdentityReranker, MockEmbedder, MockLlm};
+use liam_model::{MockEmbedder, MockLlm};
 use liam_store::{CountedFeedback, DefaultGraph, FixedClock, Millis, NewNode, NodeId};
 use rmcp::handler::server::wrapper::Parameters;
 
@@ -31,7 +31,6 @@ async fn fixture(per_hour: Option<u32>) -> Fixture {
     let mut server = MemoryServer::new(
         store.clone(),
         Arc::new(MockEmbedder::new(DIMS)),
-        Arc::new(IdentityReranker),
         Arc::new(MockLlm),
         30,
         false,

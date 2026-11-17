@@ -139,7 +139,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Whether this mode loads the embedder and reranker. The proxy forwards
+    /// Whether this mode loads the embedder. The proxy forwards
     /// bytes, and a delete only reads the log and destroys keys.
     pub fn loads_models(&self) -> bool {
         !matches!(self, Self::Proxy | Self::Delete(_))

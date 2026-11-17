@@ -40,7 +40,6 @@ impl Tool {
 pub enum Stage {
     Embed,
     StoreSearch,
-    Rerank,
     RecordUsage,
     IssueHandles,
 }
@@ -48,10 +47,9 @@ pub enum Stage {
 impl Stage {
     /// Every stage, in the order a report lists them.
     #[cfg(test)]
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::Embed,
         Self::StoreSearch,
-        Self::Rerank,
         Self::RecordUsage,
         Self::IssueHandles,
     ];
@@ -62,7 +60,6 @@ impl Stage {
         match self {
             Self::Embed => "embed",
             Self::StoreSearch => "store_search",
-            Self::Rerank => "rerank",
             Self::RecordUsage => "record_usage",
             Self::IssueHandles => "issue_handles",
         }
@@ -75,7 +72,6 @@ impl Stage {
                 MetricId::StageStoreSearchP50Ms,
                 MetricId::StageStoreSearchP95Ms,
             ],
-            Self::Rerank => [MetricId::StageRerankP50Ms, MetricId::StageRerankP95Ms],
             Self::RecordUsage => [
                 MetricId::StageRecordUsageP50Ms,
                 MetricId::StageRecordUsageP95Ms,
@@ -120,8 +116,6 @@ pub enum MetricId {
     StageEmbedP95Ms,
     StageStoreSearchP50Ms,
     StageStoreSearchP95Ms,
-    StageRerankP50Ms,
-    StageRerankP95Ms,
     StageRecordUsageP50Ms,
     StageRecordUsageP95Ms,
     StageIssueHandlesP50Ms,
@@ -130,7 +124,7 @@ pub enum MetricId {
 
 impl MetricId {
     /// Every metric, in declaration order.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 33] = [
         Self::ProbeRecallAt10,
         Self::ArmLatencyP50Ms,
         Self::ArmLatencyP95Ms,
@@ -160,8 +154,6 @@ impl MetricId {
         Self::StageEmbedP95Ms,
         Self::StageStoreSearchP50Ms,
         Self::StageStoreSearchP95Ms,
-        Self::StageRerankP50Ms,
-        Self::StageRerankP95Ms,
         Self::StageRecordUsageP50Ms,
         Self::StageRecordUsageP95Ms,
         Self::StageIssueHandlesP50Ms,
@@ -204,8 +196,6 @@ impl MetricId {
             Self::StageEmbedP95Ms => "stage_embed_p95_ms",
             Self::StageStoreSearchP50Ms => "stage_store_search_p50_ms",
             Self::StageStoreSearchP95Ms => "stage_store_search_p95_ms",
-            Self::StageRerankP50Ms => "stage_rerank_p50_ms",
-            Self::StageRerankP95Ms => "stage_rerank_p95_ms",
             Self::StageRecordUsageP50Ms => "stage_record_usage_p50_ms",
             Self::StageRecordUsageP95Ms => "stage_record_usage_p95_ms",
             Self::StageIssueHandlesP50Ms => "stage_issue_handles_p50_ms",

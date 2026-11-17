@@ -61,7 +61,6 @@ async fn staged() -> Staged {
     let server = MemoryServer::new(
         Arc::new(store),
         embedder(),
-        Arc::new(liam_model::IdentityReranker),
         Arc::new(liam_model::MockLlm),
         30,
         false,

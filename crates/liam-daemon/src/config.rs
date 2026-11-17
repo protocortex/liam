@@ -23,7 +23,6 @@ mod hosted;
 mod metrics;
 mod pins;
 mod pricing;
-mod reranker;
 mod summary;
 mod tiering;
 
@@ -41,7 +40,6 @@ pub use hosted::{HostedConfig, PricesConfig, PrivacyConfig};
 pub use metrics::{MetricsConfig, SinkKind};
 pub use pins::{ModelPin, PinError};
 pub use pricing::{Price, Provider, TokenUsage};
-pub use reranker::{RerankerConfig, RerankerModel, DEFAULT_POOL_CAP as DEFAULT_RERANK_POOL_CAP};
 pub use summary::{
     SummaryConfig, DEFAULT_MAX_BASIS_IDS_RENDERED, DEFAULT_MIN_SUMMARY_SIMILARITY,
     MAX_SUMMARY_DEPTH,
@@ -50,6 +48,9 @@ pub use tiering::TieringConfig;
 
 /// Producer ids starting with this are reserved for consolidation writes.
 pub const RESERVED_PRODUCER_PREFIX: &str = "consolidation";
+
+const REMOVED_RERANKER_WARNING: &str =
+    "the reranker was removed and the [reranker] section is ignored: delete it from your liam.toml";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -109,8 +110,11 @@ pub struct Config {
     pub archive: ArchiveConfig,
     /// Metrics, their alert thresholds and where an alert is reported.
     pub metrics: MetricsConfig,
-    /// The cross-encoder that reorders `recall` candidates.
-    pub reranker: RerankerConfig,
+    /// The removed `[reranker]` section. Kept so an old `liam.toml` still
+    /// loads, since `deny_unknown_fields` would reject it. Its content is
+    /// ignored, see `removed_reranker_warning`.
+    #[doc(hidden)]
+    pub reranker: Option<toml::Value>,
     /// Calls to hosted model providers. Off by default.
     pub hosted: HostedConfig,
 }
@@ -155,8 +159,8 @@ pub struct EmbedderConfig {
     pub provider: String,
     /// Hugging Face model id for the local provider.
     pub model: String,
-    /// Where both models' files live, each under its own `models--Org--Name`
-    /// subdirectory (reranker via `FASTEMBED_CACHE_DIR`, embedder via `with_cache_dir`).
+    /// Where the model's files live, under their own `models--Org--Name`
+    /// subdirectory.
     pub cache_dir: String,
     /// Compute device for the local embedder: "auto" (default), "cpu", "metal"
     /// or "cuda". `auto` is Metal on macOS for both the llama.cpp GGUF models and
@@ -240,7 +244,7 @@ impl Default for Config {
             admin: AdminConfig::default(),
             archive: ArchiveConfig::default(),
             metrics: MetricsConfig::default(),
-            reranker: RerankerConfig::default(),
+            reranker: None,
             hosted: HostedConfig::default(),
         }
     }
@@ -474,7 +478,6 @@ impl Config {
         config.admin.validate()?;
         config.archive.validate()?;
         config.metrics.validate()?;
-        config.reranker.validate()?;
         config.hosted.validate()?;
         config
             .hosted
@@ -489,6 +492,12 @@ impl Config {
             "a hosted provider needs metrics.enabled = true, so its calls and cost are counted"
         );
         Ok(config)
+    }
+
+    /// The warning to log at start when the config still has a `[reranker]`
+    /// section, which no longer does anything.
+    pub fn removed_reranker_warning(&self) -> Option<&'static str> {
+        self.reranker.as_ref().map(|_| REMOVED_RERANKER_WARNING)
     }
 
     pub fn gc_policy(&self) -> RetentionPolicy {
@@ -524,6 +533,31 @@ mod tests {
         let path = dir.path().join("liam.toml");
         std::fs::write(&path, text).unwrap();
         Config::load_with_home(&path, home)
+    }
+
+    #[test]
+    fn a_reranker_section_loads_and_yields_one_removal_warning() {
+        // Arrange
+        let text = "[reranker]\nmodel = \"bge-reranker-v2-m3\"\npool_cap = 16\n";
+
+        // Act
+        let config = load_text(text, "/home/alice").unwrap();
+
+        // Assert
+        let warning = config.removed_reranker_warning().unwrap();
+        assert!(warning.contains("reranker was removed"), "{warning}");
+        assert!(warning.contains("delete it"), "{warning}");
+    }
+
+    #[test]
+    fn a_config_without_a_reranker_section_has_no_removal_warning() {
+        // Act
+        let loaded = load_text("[gc]\n", "/home/alice").unwrap();
+
+        // Assert
+        assert_eq!(loaded.removed_reranker_warning(), None);
+        assert!(Config::default().reranker.is_none());
+        assert_eq!(Config::default().removed_reranker_warning(), None);
     }
 
     #[test]

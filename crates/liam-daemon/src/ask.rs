@@ -26,14 +26,13 @@ pub fn clamp_ask_k(k: Option<usize>) -> usize {
     k.unwrap_or(DEFAULT_ASK_EVIDENCE).clamp(1, MAX_ASK_EVIDENCE)
 }
 
-/// Default and upper bound on the hits `recall` returns. WHY the cap: every
-/// candidate goes through a cross-encoder whose cost is linear in documents, so
-/// an unbounded `k` would make one call arbitrarily slow.
+/// Default and upper bound on the hits `recall` returns. WHY the cap: an
+/// unbounded `k` would make one call arbitrarily slow.
 const DEFAULT_RECALL_K: usize = 8;
 const MAX_RECALL_K: usize = MAX_ASK_EVIDENCE;
 
-/// Candidate pool `recall` reranks when `k` is small.
-const RERANK_POOL_FLOOR: usize = 16;
+/// Fewest candidates the store fuses for `recall` and `ask`, however small `k` is.
+const CANDIDATE_POOL_FLOOR: usize = 16;
 
 /// Resolve the caller's `k` into `1..=MAX_RECALL_K`, defaulting to
 /// `DEFAULT_RECALL_K`. `k = 0` would return nothing for a query the store can
@@ -42,13 +41,11 @@ pub fn clamp_recall_k(k: Option<usize>) -> usize {
     k.unwrap_or(DEFAULT_RECALL_K).clamp(1, MAX_RECALL_K)
 }
 
-/// Candidates `recall` reranks before cutting to `k`: twice `k`, at least the
-/// floor, at most `pool_cap`. A `pool_cap` below the floor lowers the pool on
-/// purpose, since it is the latency lever. The pool never drops below `k` and
-/// never passes `MAX_RECALL_K`.
-pub(crate) fn rerank_pool(k: usize, pool_cap: usize) -> usize {
-    let wanted = (k * 2).max(RERANK_POOL_FLOOR).min(pool_cap);
-    wanted.max(k).min(MAX_RECALL_K)
+/// Candidates the store fuses before the cut to `k`: twice `k`, within the
+/// floor and `MAX_RECALL_K`. The fused order depends on the pool size, so
+/// narrowing it changes which hits come first.
+pub(crate) fn candidate_pool(k: usize) -> usize {
+    (k * 2).clamp(CANDIDATE_POOL_FLOOR, MAX_RECALL_K)
 }
 
 /// Fence opener/closer wrapping each evidence block. WHY: `kind`, `label`, and
@@ -545,73 +542,17 @@ mod tests {
         Evidence::recorded(kind, label, content, valid_from_ms)
     }
 
-    const LOW_CAP: usize = 8;
-    const MID_CAP: usize = 16;
-
-    /// The formula before `pool_cap` existed: twice `k`, kept within 16 and 32.
-    fn old_pool(k: usize) -> usize {
-        (k * 2).clamp(RERANK_POOL_FLOOR, MAX_RECALL_K)
-    }
-
     #[test]
-    fn the_default_cap_is_the_recall_maximum() {
-        // Assert
-        assert_eq!(crate::config::DEFAULT_RERANK_POOL_CAP, MAX_RECALL_K);
-    }
-
-    #[test]
-    fn the_pool_follows_k_and_the_default_cap() {
-        // Arrange: k and its pool at the default cap
-        let cases = [(0, 16), (1, 16), (8, 16), (20, 32), (32, 32), (40, 32)];
+    fn the_pool_is_twice_k_within_the_floor_and_the_recall_maximum() {
+        // Arrange: k and its pool
+        let cases = [(1, 16), (8, 16), (9, 18), (16, 32), (20, 32), (32, 32)];
 
         for (k, expected) in cases {
             // Act
-            let pool = rerank_pool(k, crate::config::DEFAULT_RERANK_POOL_CAP);
+            let pool = candidate_pool(k);
 
             // Assert
             assert_eq!(pool, expected, "pool for k={k}");
-        }
-    }
-
-    #[test]
-    fn a_cap_of_sixteen_stops_the_pool_widening_past_k() {
-        // Arrange: k and its pool at a cap of 16
-        let cases = [(1, 16), (8, 16), (10, 16), (16, 16), (20, 20)];
-
-        for (k, expected) in cases {
-            // Act
-            let pool = rerank_pool(k, MID_CAP);
-
-            // Assert
-            assert_eq!(pool, expected, "pool for k={k}");
-        }
-    }
-
-    #[test]
-    fn a_cap_below_the_floor_lowers_the_pool_but_never_below_k() {
-        // Arrange: k and its pool at a cap of 8
-        let cases = [(1, 8), (8, 8), (20, 20)];
-
-        for (k, expected) in cases {
-            // Act
-            let pool = rerank_pool(k, LOW_CAP);
-
-            // Assert
-            assert_eq!(pool, expected, "pool for k={k}");
-        }
-    }
-
-    #[test]
-    fn the_default_cap_gives_the_pool_the_old_formula_gave() {
-        for requested in 1..=40 {
-            // Arrange: production clamps k before sizing the pool
-            let k = clamp_recall_k(Some(requested));
-
-            // Act
-            let pool = rerank_pool(k, crate::config::DEFAULT_RERANK_POOL_CAP);
-
-            // Assert
-            assert_eq!(pool, old_pool(k), "k={k}");
         }
     }
 

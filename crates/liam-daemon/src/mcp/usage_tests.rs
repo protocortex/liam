@@ -74,7 +74,6 @@ async fn fixture(llm: Arc<dyn Llm>, sufficiency: bool, context_tokens: usize) ->
     let server = MemoryServer::new(
         store.clone(),
         Arc::new(MockEmbedder::new(DIMS)),
-        Arc::new(liam_model::IdentityReranker),
         llm,
         1,
         sufficiency,
@@ -158,8 +157,8 @@ async fn recall_counts_the_ranked_results_it_returns_and_no_more() {
 }
 
 #[tokio::test]
-async fn recall_counts_only_the_cut_hits_when_it_reranks_a_wider_pool() {
-    // Arrange: more matches than the rerank pool holds, three asked for
+async fn recall_counts_only_the_cut_hits_when_it_fetches_a_wider_pool() {
+    // Arrange: more matches than the candidate pool holds, three asked for
     let fixture = plain().await;
     for index in 0..WIDE_POOL_MATCHES {
         note(

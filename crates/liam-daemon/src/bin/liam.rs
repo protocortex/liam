@@ -28,7 +28,7 @@ use liam_store::{
     RebuildMode, RebuildReport, SharedLog,
 };
 
-use liam_daemon::config::{resolve_config_source, Config, RerankerModel};
+use liam_daemon::config::{resolve_config_source, Config};
 use liam_daemon::consolidation::manifest::RunOutcome;
 use liam_daemon::consolidation::offline::{print_status, run_offline};
 use liam_daemon::devices;
@@ -357,7 +357,6 @@ fn expand_home(flag: &str, path: &Path) -> anyhow::Result<PathBuf> {
     models::resolve_config_path(flag, text)
 }
 
-/// Only the embedder: whether the reranker loads has no bearing on a rebuild.
 fn store_embedder(config: &Config) -> anyhow::Result<Arc<dyn ContentEmbedder>> {
     Ok(Arc::new(StoreEmbedder(models::build_embedder(config)?)))
 }
@@ -700,14 +699,8 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
             liam_model::verify_gguf_file(spec, &path)?;
             println!("  sha256 verified: {}", spec.sha256);
         }
-        // Pulls the reranker too when one is configured, which is a second
-        // download the daemon needs and nobody would think to ask for by name.
-        let (_embedder, _reranker) = models::build_models(config)?;
-        if config.reranker.model == RerankerModel::None {
-            println!("embedder: ready");
-        } else {
-            println!("embedder: ready, with its reranker");
-        }
+        let _embedder = models::build_embedder(config)?;
+        println!("embedder: ready");
     }
 
     if plan.llm {

@@ -10,10 +10,10 @@
 //!
 //! # Two tiers
 //!
-//! - **Mock tier, always-on:** `MockEmbedder`, `IdentityReranker` and a gated
+//! - **Mock tier, always-on:** `MockEmbedder` and a gated
 //!   fake model, no network and never `~/.liam`. Runs under
 //!   `cargo test -p liam-daemon --bin liamd recall_bench`.
-//! - **Real tier, `#[ignore]`d:** the local embedder and reranker, downloading
+//! - **Real tier, `#[ignore]`d:** the local embedder, downloading
 //!   weights on first run. Reads the pair file named by `LIAM_RECALL_BENCH_PAIRS`
 //!   (default: a small built-in set) and `LIAM_RECALL_BENCH_RUNS` (default 50),
 //!   and the embedder from `LIAM_TOOL_EVAL_MODEL` like `tool_eval`. The store
@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use liam_daemon::retrieval_eval::ndcg_at_10;
-use liam_model::{Embedder, Llm, Reranker};
+use liam_model::{Embedder, Llm};
 use liam_store::{DefaultGraph, GraphConfig, SystemClock};
 use rmcp::handler::server::wrapper::Parameters;
 use tokio::sync::{Notify, Semaphore};
@@ -168,7 +168,6 @@ impl Llm for GatedLlm {
 pub async fn run_recall_bench(
     config: &RecallBenchConfig,
     embedder: Arc<dyn Embedder>,
-    reranker: Arc<dyn Reranker>,
     timer: Arc<dyn Monotonic>,
 ) -> anyhow::Result<RecallBenchReport> {
     tracing::debug!(runs = config.runs, "recall bench: validating");
@@ -190,7 +189,7 @@ pub async fn run_recall_bench(
         entered: Notify::new(),
         gate: Semaphore::new(0),
     });
-    let server = open_server(&config.store_dir, embedder, reranker, llm.clone()).await?;
+    let server = open_server(&config.store_dir, embedder, llm.clone()).await?;
     seed(&server, &pairs).await?;
 
     tracing::debug!("recall bench: idle phase");
@@ -237,7 +236,6 @@ fn read_pairs(path: &Path) -> anyhow::Result<Vec<Pair>> {
 async fn open_server(
     dir: &Path,
     embedder: Arc<dyn Embedder>,
-    reranker: Arc<dyn Reranker>,
     llm: Arc<dyn Llm>,
 ) -> anyhow::Result<MemoryServer> {
     std::fs::create_dir_all(dir)
@@ -251,7 +249,6 @@ async fn open_server(
     let server = MemoryServer::new(
         Arc::new(store),
         embedder,
-        reranker,
         llm,
         ASK_TIMEOUT_SECS,
         defaults.ask_sufficiency_check,
@@ -415,7 +412,6 @@ mod tests {
         run_recall_bench(
             config,
             Arc::new(liam_model::MockEmbedder::new(MOCK_DIMS)),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(TickingMonotonic::new(TICK)),
         )
         .await
@@ -520,7 +516,7 @@ mod tests {
         assert!(stage(&report.during_ask, "record_usage").samples > 0);
     }
 
-    /// Real tier: prints the report for the local embedder and reranker. See
+    /// Real tier: prints the report for the local embedder. See
     /// the module doc for the run command.
     #[tokio::test]
     #[ignore = "downloads model weights; see module doc for the run command"]
@@ -536,8 +532,8 @@ mod tests {
         }
         liam_daemon::models::export_fastembed_cache_dir(&daemon_config)
             .expect("export the model cache directory");
-        let (embedder, reranker) = liam_daemon::models::build_models(&daemon_config)
-            .expect("load real models; needs network access for the first download");
+        let embedder = liam_daemon::models::build_embedder(&daemon_config)
+            .expect("load the real embedder; needs network access for the first download");
         let dir = tempfile::tempdir().unwrap();
         let mut config = config(dir.path(), DEFAULT_REAL_RUNS);
         if let Ok(pairs) = std::env::var("LIAM_RECALL_BENCH_PAIRS") {
@@ -549,7 +545,7 @@ mod tests {
         config.forbidden_root = Path::new(&std::env::var("HOME").unwrap_or_default()).join(".liam");
 
         // Act
-        let report = run_recall_bench(&config, embedder, reranker, Arc::new(InstantSource::new()))
+        let report = run_recall_bench(&config, embedder, Arc::new(InstantSource::new()))
             .await
             .unwrap();
 

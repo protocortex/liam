@@ -363,7 +363,7 @@ mod tests {
         }
     }
 
-    /// Fresh in-memory `MemoryServer` with the mock embedder/reranker/llm,
+    /// Fresh in-memory `MemoryServer` with the mock embedder/llm,
     /// wired the same way `mcp`'s own tests do. Good enough for the socket
     /// layer's tests, which only need something `rmcp::ServiceExt::serve`
     /// can be called on, not real model output.
@@ -374,7 +374,6 @@ mod tests {
         MemoryServer::new(
             Arc::new(store),
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(liam_model::MockLlm),
             30,
             false,
@@ -398,7 +397,6 @@ mod tests {
         MemoryServer::new(
             Arc::new(store),
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(liam_model::MockLlm),
             30,
             false,

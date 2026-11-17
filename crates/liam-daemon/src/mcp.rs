@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use liam_daemon::consolidation::shared_store::SharedStore;
-use liam_model::{Embedder, Llm, Reranker, TextKind};
+use liam_model::{Embedder, Llm, TextKind};
 use liam_store::types::{EpisodeEdge, EpisodeRef};
 use liam_store::{
     relation, DefaultGraph, EventRef, EventRole, Millis, NewNode, NodeId, Query, Vocabulary,
@@ -438,7 +438,6 @@ pub struct MemoryServer {
     /// slot: reach it through `store()`, never keeping the guard across calls.
     store: Arc<SharedStore>,
     embedder: Arc<dyn Embedder>,
-    reranker: Arc<dyn Reranker>,
     llm: Arc<dyn Llm>,
     /// Wall-clock deadline for the `ask` stages after retrieval (permit acquire,
     /// sufficiency pre-pass, synthesis); `synthesize_entity` shares it too.
@@ -446,8 +445,6 @@ pub struct MemoryServer {
     ask_timeout_secs: u64,
     /// Seconds `recall` and `ask` may spend retrieving; see `retrieval_deadline`.
     recall_timeout_secs: u64,
-    /// Most candidates `recall` and `ask` rerank; see `ask::rerank_pool`.
-    rerank_pool_cap: usize,
     /// Whether `ask` runs the yes/no sufficiency pre-pass before synthesizing;
     /// see `config::Config::ask_sufficiency_check`.
     ask_sufficiency_check: bool,
@@ -575,9 +572,6 @@ impl Drop for PermitTimer {
     }
 }
 
-/// Least time worth giving the reranker; below it retrieval keeps store order.
-const MIN_RERANK_BUDGET: Duration = Duration::from_millis(200);
-
 /// Why a retrieval stage stopped before it finished.
 enum Interrupted {
     Deadline,
@@ -625,42 +619,6 @@ impl MemoryServer {
             Interrupted::Cancelled => ToolReply::ok(cancelled_reply(tool)),
         }
     }
-
-    /// Reranks `docs`. When the reranker fails, is skipped for lack of time,
-    /// or outlasts the deadline, returns store order and why. `Err` is the cancel reply.
-    async fn rerank_within(
-        &self,
-        tool: &str,
-        query: &str,
-        docs: &[String],
-        deadline: tokio::time::Instant,
-        cancel: &CancellationToken,
-    ) -> Result<(Vec<usize>, Option<Degraded>), ToolReply> {
-        let store_order = || (0..docs.len()).collect();
-        if deadline.saturating_duration_since(tokio::time::Instant::now()) < MIN_RERANK_BUDGET {
-            tracing::warn!(
-                tool,
-                "too little retrieval time left, skipping the reranker"
-            );
-            return Ok((store_order(), Some(Degraded::RerankSkipped)));
-        }
-        let started = self.stage_start();
-        match until_interrupted(deadline, cancel, self.reranker.order(query, docs)).await {
-            Ok(Ok(order)) => {
-                self.stage_end(Stage::Rerank, started);
-                Ok((order, None))
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(tool, error = %e, "answered from unreranked evidence");
-                Ok((store_order(), Some(Degraded::RerankFailed)))
-            }
-            Err(Interrupted::Deadline) => {
-                tracing::warn!(tool, "reranker outlasted the retrieval deadline");
-                Ok((store_order(), Some(Degraded::RerankTimeout)))
-            }
-            Err(Interrupted::Cancelled) => Err(ToolReply::ok(cancelled_reply(tool))),
-        }
-    }
 }
 
 /// Adds each present reason to `reply`, in order.
@@ -684,7 +642,6 @@ impl MemoryServer {
     pub fn new(
         store: Arc<DefaultGraph>,
         embedder: Arc<dyn Embedder>,
-        reranker: Arc<dyn Reranker>,
         llm: Arc<dyn Llm>,
         ask_timeout_secs: u64,
         ask_sufficiency_check: bool,
@@ -698,11 +655,9 @@ impl MemoryServer {
         Self {
             store: Arc::new(SharedStore::from_arc(store)),
             embedder,
-            reranker,
             llm,
             ask_timeout_secs,
             recall_timeout_secs: DEFAULT_RECALL_TIMEOUT_SECS,
-            rerank_pool_cap: crate::config::DEFAULT_RERANK_POOL_CAP,
             ask_sufficiency_check,
             ask_context_tokens,
             max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
@@ -736,12 +691,6 @@ impl MemoryServer {
     /// least one, so a configured `0` cannot time every request out at once.
     pub(crate) fn with_recall_timeout(mut self, secs: u64) -> Self {
         self.recall_timeout_secs = secs.max(1);
-        self
-    }
-
-    /// Sets the most candidates `recall` and `ask` rerank.
-    pub(crate) fn with_rerank_pool_cap(mut self, pool_cap: usize) -> Self {
-        self.rerank_pool_cap = pool_cap;
         self
     }
 
@@ -1283,7 +1232,7 @@ impl MemoryServer {
     // the same code path an MCP client hits, rather than a re-implementation of it.
     #[tool(
         name = "recall",
-        description = "Retrieve relevant long-term memory, reranked for precision.",
+        description = "Retrieve relevant long-term memory.",
         output_schema = reply::output_schema()
     )]
     async fn recall_tool(
@@ -1345,7 +1294,7 @@ impl MemoryServer {
             let (embedding, embed_degraded) = self.embed_or_degrade("recall", &args.query).await;
             let q = build_query(
                 &lexical_text(&args.query),
-                Some(crate::ask::rerank_pool(k, self.rerank_pool_cap)),
+                Some(crate::ask::candidate_pool(k)),
                 args.kind,
                 args.scope,
                 embedding,
@@ -1362,27 +1311,10 @@ impl MemoryServer {
         if hits.is_empty() {
             return with_reasons(ToolReply::ok("no relevant memory"), [embed_degraded]);
         }
-        let docs: Vec<String> = hits
-            .iter()
-            .map(|h| h.hit.retrieved.as_text().to_string())
-            .collect();
-        let (order, rerank_degraded) = match self
-            .rerank_within("recall", &args.query, &docs, deadline, &cancel)
-            .await
-        {
-            Ok(ranked) => ranked,
-            Err(reply) => return reply,
-        };
-        let order = &order[..order.len().min(k)];
+        let shown = &hits[..hits.len().min(k)];
         // Usage and handles cover only the hits returned, not the wider pool.
-        self.record_usage(
-            order
-                .iter()
-                .map(|&i| &hits[i])
-                .filter(|h| !h.expanded)
-                .map(|h| &h.hit.id),
-        );
-        self.issue_handles(order.iter().map(|&i| &hits[i].hit.id));
+        self.record_usage(shown.iter().filter(|h| !h.expanded).map(|h| &h.hit.id));
+        self.issue_handles(shown.iter().map(|h| &h.hit.id));
         // The handle rides inside the kind bracket so a hit still opens with
         // one bracketed field. It is here because an agent cannot link what it
         // recalled without a name for it, which is the gap ADR-0001 exists to
@@ -1393,10 +1325,9 @@ impl MemoryServer {
         // bracket as a rejected alternative: it broke `resolve_handle`'s
         // alphanumeric-only gate, so the bracket stays `[{kind} {handle}]`
         // and nothing else, under every combination of these fields.
-        let text = order
+        let text = shown
             .iter()
-            .map(|&i| {
-                let hit = &hits[i];
+            .map(|hit| {
                 let mut trailing = Vec::new();
                 if hit.confidence != 1.0 {
                     trailing.push(format!("confidence: {:.2}", hit.confidence));
@@ -1417,7 +1348,7 @@ impl MemoryServer {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        with_reasons(ToolReply::ok(text), [embed_degraded, rerank_degraded])
+        with_reasons(ToolReply::ok(text), [embed_degraded])
     }
 
     #[tool(
@@ -1744,7 +1675,7 @@ impl MemoryServer {
             let (embedding, embed_degraded) = self.embed_or_degrade("ask", &args.question).await;
             let q = build_query(
                 &lexical_text(&args.question),
-                Some(ask::rerank_pool(k, self.rerank_pool_cap)),
+                Some(ask::candidate_pool(k)),
                 args.kind,
                 args.scope.clone(),
                 embedding.clone(),
@@ -1778,32 +1709,22 @@ impl MemoryServer {
             .map(ask::Evidence::from_hit)
             .chain(summaries)
             .collect();
-        let docs: Vec<String> = candidates
-            .iter()
-            .map(|e| e.retrieved.as_text().to_string())
-            .collect();
-        let (order, rerank_degraded) = match self
-            .rerank_within("ask", &args.question, &docs, retrieval_deadline, &cancel)
-            .await
-        {
-            Ok(ranked) => ranked,
-            Err(reply) => return reply,
-        };
-        let retrieval_reasons = [embed_degraded, rerank_degraded];
+        let retrieval_reasons = [embed_degraded];
         // Candidates list the store hits first, so an index below `hit_count`
         // is a store hit. Keep k of them plus every summary.
         let hit_count = hits.len();
         let mut kept_hits = 0;
-        let evidence: Vec<ask::Evidence> = order
+        let evidence: Vec<ask::Evidence> = candidates
             .into_iter()
-            .filter(|&i| {
+            .enumerate()
+            .filter(|&(i, _)| {
                 if i >= hit_count {
                     return true;
                 }
                 kept_hits += 1;
                 kept_hits <= k
             })
-            .map(|i| candidates[i].clone())
+            .map(|(_, candidate)| candidate)
             .collect();
         if mode == Mode::Strict {
             self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
@@ -1917,7 +1838,7 @@ impl ServerHandler for MemoryServer {
 mod tests {
     use super::episode::test_support::{episode_edge, episode_entity, episode_fact};
     use super::episode::{EpisodeEntityArgs, EpisodeFactArgs};
-    use super::test_doubles::{CountingEmbedder, FailingReranker};
+    use super::test_doubles::CountingEmbedder;
     use super::*;
     use liam_store::{FixedClock, GraphConfig, Millis, HANDLE_LEN};
     use serde_json::json;
@@ -2174,25 +2095,23 @@ mod tests {
         }
     }
 
-    /// Fresh in-memory server wired with the given reranker/llm, a 30s ask
+    /// Fresh in-memory server wired with the given llm, a 30s ask
     /// timeout, and the shipped default 8192-token context budget. Dims 8 to
     /// match `MockEmbedder::new(8)`.
-    async fn server_with(reranker: Arc<dyn Reranker>, llm: Arc<dyn Llm>) -> MemoryServer {
-        server_with_timeout(reranker, llm, 30, false, 8192).await
+    async fn server_with(llm: Arc<dyn Llm>) -> MemoryServer {
+        server_with_timeout(llm, 30, false, 8192).await
     }
 
-    /// Fresh in-memory server wired with the given reranker/llm/ask
+    /// Fresh in-memory server wired with the given llm/ask
     /// timeout/context budget, generation capped to 1 concurrent call (the
     /// shipped default). Dims 8 to match `MockEmbedder::new(8)`.
     async fn server_with_timeout(
-        reranker: Arc<dyn Reranker>,
         llm: Arc<dyn Llm>,
         ask_timeout_secs: u64,
         ask_sufficiency_check: bool,
         ask_context_tokens: usize,
     ) -> MemoryServer {
         server_with_generation_limit(
-            reranker,
             llm,
             ask_timeout_secs,
             ask_sufficiency_check,
@@ -2206,7 +2125,6 @@ mod tests {
     /// for the tests in this module that exercise the generation semaphore
     /// itself; every other test goes through `server_with_timeout`'s fixed 1.
     async fn server_with_generation_limit(
-        reranker: Arc<dyn Reranker>,
         llm: Arc<dyn Llm>,
         ask_timeout_secs: u64,
         ask_sufficiency_check: bool,
@@ -2219,7 +2137,6 @@ mod tests {
         MemoryServer::new(
             Arc::new(store),
             Arc::new(liam_model::MockEmbedder::new(8)),
-            reranker,
             llm,
             ask_timeout_secs,
             ask_sufficiency_check,
@@ -2259,15 +2176,11 @@ mod tests {
         out.trim_start_matches("remembered ").to_string()
     }
 
-    /// Server with the neutral doubles used by the filter tests: identity rerank
-    /// (so ordering is the store's) and the echo llm (so `ask`'s answer contains
+    /// Server with the neutral doubles used by the filter tests: the store's
+    /// ordering and the echo llm (so `ask`'s answer contains
     /// whatever evidence reached the prompt, which is what they assert on).
     async fn plain_server() -> MemoryServer {
-        server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(liam_model::MockLlm),
-        )
-        .await
+        server_with(Arc::new(liam_model::MockLlm)).await
     }
 
     /// Server backed by a `FixedClock`-driven store instead of the real
@@ -2283,7 +2196,6 @@ mod tests {
         MemoryServer::new(
             Arc::new(store),
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(liam_model::MockLlm),
             30,
             false,
@@ -2345,7 +2257,6 @@ mod tests {
         let server = MemoryServer::new(
             Arc::new(store),
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(liam_model::MockLlm),
             30,
             false,
@@ -2403,7 +2314,6 @@ mod tests {
         let template = MemoryServer::new(
             Arc::new(store),
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(liam_model::MockLlm),
             30,
             false,
@@ -3666,16 +3576,7 @@ mod tests {
             .await
             .expect("open in-memory store");
         let embedder = Arc::new(CountingEmbedder::new(8));
-        let server = MemoryServer::new(
-            Arc::new(store),
-            embedder.clone(),
-            Arc::new(liam_model::IdentityReranker),
-            llm,
-            30,
-            false,
-            8192,
-            1,
-        );
+        let server = MemoryServer::new(Arc::new(store), embedder.clone(), llm, 30, false, 8192, 1);
         (server, embedder)
     }
 
@@ -3966,7 +3867,7 @@ mod tests {
     async fn resynthesize_entity_lists_each_mentions_origin_event_once_as_the_pages_basis() {
         // Arrange
         let llm = Arc::new(CountingLlm::new());
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm).await;
+        let server = server_with(llm).await;
         let store = server.store().await.unwrap();
         let page = page_with_three_mentions(&store).await;
         let mut expected = std::collections::BTreeSet::new();
@@ -4002,8 +3903,7 @@ mod tests {
     async fn resynthesize_entity_leaves_a_mention_the_budget_dropped_out_of_the_basis() {
         // Arrange: a context budget that keeps only the first mention
         let llm = Arc::new(CountingLlm::new());
-        let server =
-            server_with_timeout(Arc::new(liam_model::IdentityReranker), llm, 30, false, 1).await;
+        let server = server_with_timeout(llm, 30, false, 1).await;
         let store = server.store().await.unwrap();
         let page = page_with_three_mentions(&store).await;
         let mentions = store
@@ -4083,7 +3983,6 @@ mod tests {
         let server = MemoryServer::new(
             Arc::new(store),
             embedder.clone(),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(liam_model::MockLlm),
             30,
             false,
@@ -4177,11 +4076,7 @@ mod tests {
         // the entity side. Uses `CountingLlm` instead of `plain_server`'s
         // `MockLlm` because this episode triggers entity synthesis, which
         // `MockLlm`'s echo cannot pass `is_grounded`.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(CountingLlm::new()),
-        )
-        .await;
+        let server = server_with(Arc::new(CountingLlm::new())).await;
 
         // When remember is called
         let out = server
@@ -4333,7 +4228,7 @@ mod tests {
         // Given an episode where 2 separate facts each carry a mentions
         // edge to the SAME fresh entity
         let llm = Arc::new(CountingLlm::new());
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
 
         // When remember runs
         let out = server
@@ -4366,7 +4261,7 @@ mod tests {
     async fn remember_synthesizes_every_freshly_mentioned_entity_before_returning() {
         // Given an episode mentioning 2 distinct fresh entities
         let llm = Arc::new(CountingLlm::new());
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
 
         // When remember runs
         let out = server
@@ -4435,7 +4330,7 @@ mod tests {
     async fn resynthesize_entity_preserves_existing_attributes_on_the_new_node() {
         // Given a live entity that already carries attributes
         let llm = Arc::new(CountingLlm::new());
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
         let entity_id = server
             .store()
             .await
@@ -4484,7 +4379,7 @@ mod tests {
     async fn resynthesize_entity_preserves_the_original_entitys_scope() {
         // Given a live entity scoped to "proj-x"
         let llm = Arc::new(CountingLlm::new());
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
         let entity_id = server
             .store()
             .await
@@ -4559,15 +4454,7 @@ mod tests {
         // Given an already-elapsed deadline, a sole permit held all test long,
         // and an hour-long `ask_timeout_secs` a fresh deadline would never miss.
         let llm = Arc::new(CountingLlm::new());
-        let server = server_with_generation_limit(
-            Arc::new(liam_model::IdentityReranker),
-            llm,
-            3600,
-            false,
-            8192,
-            1,
-        )
-        .await;
+        let server = server_with_generation_limit(llm, 3600, false, 8192, 1).await;
         let _held = server
             .generation_permits
             .clone()
@@ -4605,7 +4492,7 @@ mod tests {
     async fn remember_still_commits_the_episode_when_entity_synthesis_fails() {
         // Given a mock llm that always errors
         let llm = Arc::new(FailingLlm);
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm).await;
+        let server = server_with(llm).await;
 
         // When remember runs an episode mentioning a fresh entity
         let out = server
@@ -4661,17 +4548,7 @@ mod tests {
         // reach 2, proving true concurrency, not just bounded queuing.
         let release = Arc::new(tokio::sync::Notify::new());
         let llm = Arc::new(GatedLlm::new_grounded(release.clone()));
-        let server = Arc::new(
-            server_with_generation_limit(
-                Arc::new(liam_model::IdentityReranker),
-                llm.clone(),
-                30,
-                false,
-                8192,
-                2,
-            )
-            .await,
-        );
+        let server = Arc::new(server_with_generation_limit(llm.clone(), 30, false, 8192, 2).await);
 
         // When remember runs an episode mentioning 2 distinct fresh
         // entities, spawned since the gated llm blocks until released
@@ -4714,7 +4591,7 @@ mod tests {
         // Given a llm that errors on its first call and succeeds after,
         // and an episode mentioning 2 distinct fresh entities
         let llm = Arc::new(FirstCallErrorsLlm::new());
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm).await;
+        let server = server_with(llm).await;
 
         // When remember runs
         let out = server
@@ -4786,7 +4663,7 @@ mod tests {
     async fn remember_does_not_resynthesize_an_existing_entity_referenced_only_by_handle() {
         // Given a live entity from a prior call
         let llm = Arc::new(CountingLlm::new());
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
         let prior_out = server
             .remember(Parameters(RememberArgs {
                 episode: Some(EpisodeArgs {
@@ -4832,7 +4709,7 @@ mod tests {
         // Given a fresh entity linked to a fact via a correctly-directed
         // mentions edge (`from`: entity, `to`: fact)
         let llm = Arc::new(RecordingLlm::new("person Xyzzy Entity"));
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
 
         // When remember runs
         let out = server
@@ -4866,11 +4743,7 @@ mod tests {
         // `CountingLlm` instead of `plain_server`'s `MockLlm` because this
         // episode triggers entity synthesis, which `MockLlm`'s echo cannot
         // pass `is_grounded`.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(CountingLlm::new()),
-        )
-        .await;
+        let server = server_with(Arc::new(CountingLlm::new())).await;
 
         let prior_entity_out = server
             .remember(Parameters(RememberArgs {
@@ -5240,7 +5113,7 @@ mod tests {
         let llm = Arc::new(RecordingLlm::new(
             "The zorbnax gadget uses libSQL for storage [1].",
         ));
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
         seed(
             &server,
             "decision",
@@ -5294,14 +5167,7 @@ mod tests {
         // reserve. The sufficiency pre-pass is off, so the recording llm's one
         // call is the answer prompt itself.
         let llm = Arc::new(RecordingLlm::new("[mock] answer"));
-        let server = server_with_timeout(
-            Arc::new(liam_model::IdentityReranker),
-            llm.clone(),
-            30,
-            false,
-            1000,
-        )
-        .await;
+        let server = server_with_timeout(llm.clone(), 30, false, 1000).await;
         for i in 1..=5 {
             seed(
                 &server,
@@ -5345,7 +5211,7 @@ mod tests {
         // Arrange: 3 small evidence items and the shipped default 8192-token
         // budget, which comfortably holds all of them untrimmed.
         let llm = Arc::new(RecordingLlm::new("[mock] answer"));
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
         for i in 1..=3 {
             seed(
                 &server,
@@ -5380,7 +5246,7 @@ mod tests {
     /// Server with the sufficiency pre-pass ON (the shipped default), which the
     /// other handler tests leave off so they exercise synthesis directly.
     async fn server_with_sufficiency(llm: Arc<dyn Llm>) -> MemoryServer {
-        server_with_timeout(Arc::new(liam_model::IdentityReranker), llm, 30, true, 8192).await
+        server_with_timeout(llm, 30, true, 8192).await
     }
 
     #[tokio::test]
@@ -5509,11 +5375,7 @@ mod tests {
     async fn ask_falls_back_when_the_answer_is_not_grounded() {
         // Arrange: the model answers from its own priors, sharing no vocabulary
         // with what was retrieved.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(UngroundedLlm),
-        )
-        .await;
+        let server = server_with(Arc::new(UngroundedLlm)).await;
         seed(
             &server,
             "decision",
@@ -5553,8 +5415,7 @@ mod tests {
     #[tokio::test]
     async fn ask_falls_back_on_llm_error() {
         // Arrange
-        let server =
-            server_with(Arc::new(liam_model::IdentityReranker), Arc::new(FailingLlm)).await;
+        let server = server_with(Arc::new(FailingLlm)).await;
         seed(
             &server,
             "fact",
@@ -5592,14 +5453,7 @@ mod tests {
         // Arrange: a 1s ask timeout against an llm that sleeps 30s, so the
         // test must return promptly (~1s) via the fallback path, not wait for
         // the slow completion.
-        let server = server_with_timeout(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(SlowLlm),
-            1,
-            false,
-            8192,
-        )
-        .await;
+        let server = server_with_timeout(Arc::new(SlowLlm), 1, false, 8192).await;
         seed(
             &server,
             "fact",
@@ -5642,8 +5496,7 @@ mod tests {
         // deadline must fall back in about 1s instead.
         let release = Arc::new(tokio::sync::Notify::new());
         let llm = Arc::new(GatedLlm::new(release));
-        let server =
-            server_with_timeout(Arc::new(liam_model::IdentityReranker), llm, 1, true, 8192).await;
+        let server = server_with_timeout(llm, 1, true, 8192).await;
         seed(
             &server,
             "fact",
@@ -5687,17 +5540,7 @@ mod tests {
         // the peak number of complete() calls it ever saw in flight together.
         let release = Arc::new(tokio::sync::Notify::new());
         let llm = Arc::new(GatedLlm::new(release.clone()));
-        let server = Arc::new(
-            server_with_generation_limit(
-                Arc::new(liam_model::IdentityReranker),
-                llm.clone(),
-                30,
-                false,
-                8192,
-                1,
-            )
-            .await,
-        );
+        let server = Arc::new(server_with_generation_limit(llm.clone(), 30, false, 8192, 1).await);
         seed(
             &server,
             "fact",
@@ -5779,7 +5622,6 @@ mod tests {
             MemoryServer::new(
                 Arc::new(store),
                 Arc::new(liam_model::MockEmbedder::new(8)),
-                Arc::new(liam_model::IdentityReranker),
                 Arc::new(liam_model::MockLlm),
                 30,
                 false,
@@ -5799,15 +5641,8 @@ mod tests {
     #[tokio::test]
     async fn explicit_max_concurrent_generations_is_used_as_is() {
         // Given an explicit positive value, unrelated to the 0 sentinel
-        let server = server_with_generation_limit(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(liam_model::MockLlm),
-            30,
-            false,
-            8192,
-            5,
-        )
-        .await;
+        let server =
+            server_with_generation_limit(Arc::new(liam_model::MockLlm), 30, false, 8192, 5).await;
 
         // Then the semaphore is sized to exactly that value, unchanged from
         // today's behavior
@@ -5819,7 +5654,7 @@ mod tests {
         // Arrange: seed evidence so `ask` reaches its model call, then clone
         // the server the way the accept loop clones one per connection.
         let llm = Arc::new(liam_model::MockLlm);
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
         seed(
             &server,
             "fact",
@@ -5877,15 +5712,8 @@ mod tests {
     #[tokio::test]
     async fn generation_permits_handle_shares_the_same_semaphore_across_clones() {
         // Given two independently obtained handles to the same server
-        let server = server_with_generation_limit(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(liam_model::MockLlm),
-            30,
-            false,
-            8192,
-            1,
-        )
-        .await;
+        let server =
+            server_with_generation_limit(Arc::new(liam_model::MockLlm), 30, false, 8192, 1).await;
         let first = server.generation_permits_handle();
         let second = server.generation_permits_handle();
 
@@ -5905,17 +5733,7 @@ mod tests {
         // released, so it holds the sole permit for the rest of the test.
         let release = Arc::new(tokio::sync::Notify::new());
         let llm = Arc::new(GatedLlm::new(release));
-        let server = Arc::new(
-            server_with_generation_limit(
-                Arc::new(liam_model::IdentityReranker),
-                llm.clone(),
-                1,
-                false,
-                8192,
-                1,
-            )
-            .await,
-        );
+        let server = Arc::new(server_with_generation_limit(llm.clone(), 1, false, 8192, 1).await);
         seed(
             &server,
             "fact",
@@ -5955,11 +5773,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_generation_permit_returns_ok_when_a_permit_is_available() {
         // Arrange: the default single-slot semaphore, untouched.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(liam_model::MockLlm),
-        )
-        .await;
+        let server = server_with(Arc::new(liam_model::MockLlm)).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 
         // Act
@@ -5973,11 +5787,7 @@ mod tests {
     async fn acquire_generation_permit_returns_err_when_the_semaphore_is_closed() {
         // Arrange: close the semaphore instead of exhausting it, mirroring a
         // shutdown path rather than ordinary contention.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(liam_model::MockLlm),
-        )
-        .await;
+        let server = server_with(Arc::new(liam_model::MockLlm)).await;
         server.generation_permits_handle().close();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 
@@ -5993,11 +5803,7 @@ mod tests {
         // Arrange: hold the sole permit directly so the callee's own acquire
         // attempt can never complete, then advance the paused clock past the
         // deadline instead of waiting on a real timer.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(liam_model::MockLlm),
-        )
-        .await;
+        let server = server_with(Arc::new(liam_model::MockLlm)).await;
         let _held = server
             .generation_permits_handle()
             .try_acquire_owned()
@@ -6018,13 +5824,10 @@ mod tests {
     #[tokio::test]
     async fn passes_sufficiency_check_returns_true_on_an_explicit_yes() {
         // Arrange
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(SufficiencyLlm {
-                verdict: "YES",
-                answer: "unused",
-            }),
-        )
+        let server = server_with(Arc::new(SufficiencyLlm {
+            verdict: "YES",
+            answer: "unused",
+        }))
         .await;
         let evidence = vec![sufficiency_evidence()];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -6044,13 +5847,10 @@ mod tests {
     #[tokio::test]
     async fn passes_sufficiency_check_returns_false_on_an_explicit_no() {
         // Arrange
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(SufficiencyLlm {
-                verdict: "NO",
-                answer: "unused",
-            }),
-        )
+        let server = server_with(Arc::new(SufficiencyLlm {
+            verdict: "NO",
+            answer: "unused",
+        }))
         .await;
         let evidence = vec![sufficiency_evidence()];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -6068,7 +5868,7 @@ mod tests {
     async fn passes_sufficiency_check_fails_open_on_a_timeout() {
         // Arrange: a deadline that has already elapsed by the time the
         // never-returning `SlowLlm::complete` is polled.
-        let server = server_with(Arc::new(liam_model::IdentityReranker), Arc::new(SlowLlm)).await;
+        let server = server_with(Arc::new(SlowLlm)).await;
         let evidence = vec![sufficiency_evidence()];
         let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
 
@@ -6084,8 +5884,7 @@ mod tests {
     #[tokio::test]
     async fn passes_sufficiency_check_fails_open_on_an_llm_error() {
         // Arrange
-        let server =
-            server_with(Arc::new(liam_model::IdentityReranker), Arc::new(FailingLlm)).await;
+        let server = server_with(Arc::new(FailingLlm)).await;
         let evidence = vec![sufficiency_evidence()];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 
@@ -6102,13 +5901,10 @@ mod tests {
     async fn passes_sufficiency_check_fails_open_on_an_unparseable_reply() {
         // Arrange: a model that ignores "reply YES or NO" must not be read
         // as a refusal, or a chatty model would deny memory the store holds.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(SufficiencyLlm {
-                verdict: "Well, it depends on what you mean.",
-                answer: "unused",
-            }),
-        )
+        let server = server_with(Arc::new(SufficiencyLlm {
+            verdict: "Well, it depends on what you mean.",
+            answer: "unused",
+        }))
         .await;
         let evidence = vec![sufficiency_evidence()];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -6137,7 +5933,7 @@ mod tests {
     #[tokio::test]
     async fn ask_falls_back_on_empty_answer() {
         // Arrange: llm "succeeds" but returns only whitespace.
-        let server = server_with(Arc::new(liam_model::IdentityReranker), Arc::new(EmptyLlm)).await;
+        let server = server_with(Arc::new(EmptyLlm)).await;
         seed(
             &server,
             "fact",
@@ -6171,57 +5967,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_survives_reranker_failure() {
-        // Arrange
-        let llm = Arc::new(RecordingLlm::new(
-            "The team mascot is a wombat named Pixel [1].",
-        ));
-        let server = server_with(Arc::new(FailingReranker), llm.clone()).await;
-        seed(
-            &server,
-            "fact",
-            "Mascot",
-            "The team mascot is a wombat named Pixel.",
-        )
-        .await;
-
-        // Act
-        let answer = server
-            .ask(Parameters(AskArgs {
-                question: "Who is the team mascot".to_string(),
-                kind: None,
-                scope: None,
-                k: None,
-                as_of: None,
-                mode: None,
-            }))
-            .await;
-
-        // Assert: a failing `scores` makes `order` return `Err`, which the
-        // handler catches with `unwrap_or_else` into identity order — no panic,
-        // still a real answer, and the evidence isn't silently dropped on the way
-        // to the model.
-        assert!(!answer.is_empty());
-        assert!(
-            answer.contains("Sources:"),
-            "answer missing sources: {answer}"
-        );
-        assert!(
-            llm.last_prompt()
-                .contains("The team mascot is a wombat named Pixel."),
-            "prompt missing evidence content: {}",
-            llm.last_prompt()
-        );
-    }
-
-    #[tokio::test]
     async fn ask_no_matches_returns_no_relevant_memory() {
         // Arrange: fresh server, nothing remembered.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(liam_model::MockLlm),
-        )
-        .await;
+        let server = server_with(Arc::new(liam_model::MockLlm)).await;
 
         // Act
         let answer = server
@@ -6337,22 +6085,6 @@ mod tests {
         assert_eq!(out.split("\n\n").count(), 1, "expected 1 block: {out}");
     }
 
-    /// Scores a document 1.0 when it mentions a retriever and 0.0 otherwise, so
-    /// the rerank order is known up front.
-    struct RetrieverReranker;
-    #[async_trait::async_trait]
-    impl liam_model::Reranker for RetrieverReranker {
-        async fn scores(&self, _q: &str, docs: &[String]) -> liam_model::Result<Vec<f32>> {
-            Ok(docs
-                .iter()
-                .map(|d| if d.contains(RETRIEVER_WORD) { 1.0 } else { 0.0 })
-                .collect())
-        }
-    }
-
-    const RETRIEVER_WORD: &str = "retriever";
-    const DOG_QUERY: &str = "dog";
-    const DOG_FACT_COUNT: usize = 12;
     const WIDE_POOL_K: usize = 16;
     const STORE_DIMS: usize = 8;
     const LARGE_STORE_SIZE: usize = 40;
@@ -6367,11 +6099,10 @@ mod tests {
         )
     }
 
-    fn server_over(store: &Arc<DefaultGraph>, reranker: Arc<dyn Reranker>) -> MemoryServer {
+    fn server_over(store: &Arc<DefaultGraph>) -> MemoryServer {
         MemoryServer::new(
             store.clone(),
             Arc::new(liam_model::MockEmbedder::new(STORE_DIMS)),
-            reranker,
             Arc::new(liam_model::MockLlm),
             30,
             false,
@@ -6411,60 +6142,6 @@ mod tests {
         out.matches("[fact ").count()
     }
 
-    /// Eleven short dog facts and one longer retriever fact that the store
-    /// ranks below them.
-    async fn seed_dog_facts(store: &DefaultGraph) -> NodeId {
-        for index in 0..DOG_FACT_COUNT - 1 {
-            insert_fact(
-                store,
-                &format!("dog rule {index}"),
-                "dog dog dog must stay on a leash",
-            )
-            .await;
-        }
-        insert_fact(
-            store,
-            "breed note",
-            "A retriever is a friendly breed that loves to swim and fetch, and it is a dog",
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn recall_at_k_one_returns_the_reranked_top_hit_from_a_wider_pool() {
-        // Arrange
-        let store = open_store().await;
-        let target = seed_dog_facts(&store).await;
-        let server = server_over(&store, Arc::new(RetrieverReranker));
-        let narrow = store
-            .query_explained(&recall_query(DOG_QUERY, 1).await)
-            .await
-            .unwrap();
-        let wide = store
-            .query_explained(&recall_query(DOG_QUERY, WIDE_POOL_K).await)
-            .await
-            .unwrap();
-        assert_eq!(narrow.len(), 1);
-        assert_ne!(narrow[0].hit.id, target, "the target must not rank first");
-        let target_position = wide.iter().position(|h| h.hit.id == target);
-        assert!(
-            target_position.is_some_and(|i| i >= 1),
-            "the target must be in the wide pool below the first place"
-        );
-        let retriever_docs = wide
-            .iter()
-            .filter(|h| h.hit.retrieved.as_text().contains(RETRIEVER_WORD))
-            .count();
-        assert_eq!(retriever_docs, 1);
-
-        // Act
-        let out = server.recall(Parameters(recall_k(DOG_QUERY, 1))).await;
-
-        // Assert
-        assert_eq!(hit_count(&out), 1, "{out}");
-        assert!(out.contains(RETRIEVER_WORD), "{out}");
-    }
-
     #[tokio::test]
     async fn recall_clamps_k_into_one_to_thirty_two() {
         // Arrange
@@ -6472,7 +6149,7 @@ mod tests {
         for index in 0..LARGE_STORE_SIZE {
             insert_fact(&store, &format!("note {index}"), "the zorbnax gadget").await;
         }
-        let server = server_over(&store, Arc::new(liam_model::IdentityReranker));
+        let server = server_over(&store);
 
         // Act
         let zero = server.recall(Parameters(recall_k("zorbnax", 0))).await;
@@ -6489,20 +6166,6 @@ mod tests {
             EXPECTED_MAX_K.min(LARGE_STORE_SIZE),
             "{large}"
         );
-    }
-
-    #[test]
-    fn rerank_pool_widens_k_to_sixteen_then_follows_twice_k_to_the_default_cap() {
-        // Arrange: k and the pool it should widen to
-        let cases = [(1, 16), (8, 16), (9, 18), (16, 32), (17, 32), (32, 32)];
-
-        for (k, expected) in cases {
-            // Act
-            let pool = crate::ask::rerank_pool(k, crate::config::DEFAULT_RERANK_POOL_CAP);
-
-            // Assert
-            assert_eq!(pool, expected, "pool for k={k}");
-        }
     }
 
     #[tokio::test]
@@ -6534,22 +6197,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failing_reranker_falls_back_to_the_first_k_of_the_wide_pool() {
+    async fn recall_returns_the_first_k_of_the_wide_pool_in_store_order() {
         // Arrange
         let store = open_store().await;
         for index in 0..LARGE_STORE_SIZE {
             insert_fact(&store, &format!("note {index}"), "the zorbnax gadget").await;
         }
         let k = 3;
-        let server = server_over(&store, Arc::new(FailingReranker));
+        let server = server_over(&store);
         let pool = store
-            .query_explained(
-                &recall_query(
-                    "zorbnax",
-                    crate::ask::rerank_pool(k, crate::config::DEFAULT_RERANK_POOL_CAP),
-                )
-                .await,
-            )
+            .query_explained(&recall_query("zorbnax", crate::ask::candidate_pool(k)).await)
             .await
             .unwrap();
         let expected: Vec<String> = pool
@@ -6566,30 +6223,6 @@ mod tests {
         for handle in expected {
             assert!(out.contains(&handle), "{handle} missing from {out}");
         }
-    }
-
-    #[tokio::test]
-    async fn strict_ask_at_k_one_returns_the_reranked_top_fact_from_a_wider_pool() {
-        // Arrange
-        let store = open_store().await;
-        let target = seed_dog_facts(&store).await;
-        let server = server_over(&store, Arc::new(RetrieverReranker));
-        let args = AskArgs {
-            question: DOG_QUERY.to_string(),
-            kind: None,
-            scope: None,
-            k: Some(1),
-            as_of: None,
-            mode: Some(Mode::Strict),
-        };
-
-        // Act
-        let out = server.ask(Parameters(args)).await;
-
-        // Assert
-        assert!(out.contains(RETRIEVER_WORD), "{out}");
-        assert!(out.contains(target.handle()), "{out}");
-        assert_eq!(out.matches("] (fact) ").count(), 1, "{out}");
     }
 
     #[tokio::test]
@@ -6648,10 +6281,9 @@ mod tests {
         // Arrange: three matching nodes, but the caller wants one piece of
         // evidence. The canned reply is grounded so the synthesized path (and
         // therefore the `Sources:` index this asserts on) is the one taken.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(RecordingLlm::new("The zorbnax report says one [1].")),
-        )
+        let server = server_with(Arc::new(RecordingLlm::new(
+            "The zorbnax report says one [1].",
+        )))
         .await;
         seed(&server, "fact", "One", "zorbnax report one").await;
         seed(&server, "fact", "Two", "zorbnax report two").await;
@@ -6687,11 +6319,7 @@ mod tests {
         // `[{kind} {handle}] {label}\n{content}\nprovenance: ...`. The handle was added by
         // ADR-0001 so an agent can name what it recalled and pass it to
         // `relate`; before that, `recall` dropped `Hit::id` entirely.
-        let server = server_with(
-            Arc::new(liam_model::IdentityReranker),
-            Arc::new(liam_model::MockLlm),
-        )
-        .await;
+        let server = server_with(Arc::new(liam_model::MockLlm)).await;
         let id = seed(&server, "decision", "Use libSQL", "single file db").await;
 
         let out = server
@@ -8110,7 +7738,7 @@ mod tests {
     async fn ask_defaults_to_infer_with_labelled_evidence_and_an_inferred_answer() {
         // Arrange
         let llm = Arc::new(RecordingLlm::new("Zorbnax likes green tea [1]."));
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
         fact_and_page(&server).await;
 
         // Act
@@ -8133,7 +7761,7 @@ mod tests {
     async fn ask_in_strict_mode_makes_no_model_call_and_shows_no_inferred_row() {
         // Arrange
         let llm = Arc::new(RecordingLlm::new("Zorbnax likes green tea [1]."));
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm.clone()).await;
+        let server = server_with(llm.clone()).await;
         fact_and_page(&server).await;
 
         // Act
@@ -8151,8 +7779,7 @@ mod tests {
     #[tokio::test]
     async fn the_ask_fallback_labels_every_evidence_block() {
         // Arrange
-        let server =
-            server_with(Arc::new(liam_model::IdentityReranker), Arc::new(FailingLlm)).await;
+        let server = server_with(Arc::new(FailingLlm)).await;
         fact_and_page(&server).await;
 
         // Act
@@ -8331,7 +7958,6 @@ mod tests {
         let stages = [
             MetricId::StageEmbedP50Ms,
             MetricId::StageStoreSearchP50Ms,
-            MetricId::StageRerankP50Ms,
             MetricId::StageRecordUsageP50Ms,
             MetricId::StageIssueHandlesP50Ms,
         ];
@@ -8382,34 +8008,6 @@ mod tests {
         assert_eq!(samples_of(&sink, MetricId::StageEmbedP50Ms), 1);
     }
 
-    /// Embeds like `MockEmbedder` after waiting `delay`.
-    struct DelayedEmbedder {
-        delay: Duration,
-        inner: liam_model::MockEmbedder,
-    }
-
-    #[async_trait::async_trait]
-    impl liam_model::Embedder for DelayedEmbedder {
-        fn dims(&self) -> usize {
-            self.inner.dims()
-        }
-        async fn embed(&self, text: &str, kind: TextKind) -> liam_model::Result<Vec<f32>> {
-            tokio::time::sleep(self.delay).await;
-            self.inner.embed(text, kind).await
-        }
-    }
-
-    /// Scores after waiting `delay`.
-    struct DelayedReranker(Duration);
-
-    #[async_trait::async_trait]
-    impl Reranker for DelayedReranker {
-        async fn scores(&self, _q: &str, docs: &[String]) -> liam_model::Result<Vec<f32>> {
-            tokio::time::sleep(self.0).await;
-            Ok(vec![0.0; docs.len()])
-        }
-    }
-
     #[tokio::test]
     async fn ask_records_one_sample_per_stage() {
         use crate::metrics::sink::MetricId;
@@ -8417,7 +8015,7 @@ mod tests {
         let llm = Arc::new(RecordingLlm::new(
             "The zorbnax gadget uses libSQL for storage [1].",
         ));
-        let server = server_with(Arc::new(liam_model::IdentityReranker), llm).await;
+        let server = server_with(llm).await;
         let (server, sink) = metered(with_usage_and_feedback(server));
         seed(
             &server,
@@ -8429,7 +8027,6 @@ mod tests {
         let stages = [
             MetricId::StageEmbedP50Ms,
             MetricId::StageStoreSearchP50Ms,
-            MetricId::StageRerankP50Ms,
             MetricId::StageRecordUsageP50Ms,
             MetricId::StageIssueHandlesP50Ms,
         ];
@@ -8446,61 +8043,6 @@ mod tests {
             assert_eq!(samples_of(&sink, stage), 1, "{stage}");
         }
         assert_eq!(samples_of(&sink, MetricId::AskLatencyP50Ms), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_degraded_rerank_records_no_rerank_sample() {
-        use crate::metrics::sink::MetricId;
-        // Arrange
-        const SLOW: Duration = Duration::from_secs(30);
-        const NEARLY_ALL_THE_BUDGET: Duration = Duration::from_millis(900);
-        let cases: [(&str, Duration, Arc<dyn Reranker>); 3] = [
-            (
-                "skipped",
-                NEARLY_ALL_THE_BUDGET,
-                Arc::new(DelayedReranker(Duration::ZERO)),
-            ),
-            ("failed", Duration::ZERO, Arc::new(FailingReranker)),
-            ("timeout", Duration::ZERO, Arc::new(DelayedReranker(SLOW))),
-        ];
-        for (case, embed_delay, reranker) in cases {
-            let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
-                .await
-                .expect("open in-memory store");
-            let server = MemoryServer::new(
-                Arc::new(store),
-                Arc::new(DelayedEmbedder {
-                    delay: embed_delay,
-                    inner: liam_model::MockEmbedder::new(8),
-                }),
-                reranker,
-                Arc::new(liam_model::MockLlm),
-                30,
-                false,
-                8192,
-                1,
-            )
-            .with_recall_timeout(1);
-            let (server, sink) = metered(with_usage_and_feedback(server));
-            seed(&server, "fact", "One", "zorbnax note one").await;
-
-            // Act
-            server
-                .recall(Parameters(RecallArgs {
-                    query: "zorbnax note".to_string(),
-                    kind: None,
-                    scope: None,
-                    k: None,
-                    as_of: None,
-                    mode: None,
-                }))
-                .await;
-
-            // Assert
-            assert_eq!(samples_of(&sink, MetricId::RecallLatencyP50Ms), 1, "{case}");
-            assert_eq!(samples_of(&sink, MetricId::StageEmbedP50Ms), 1, "{case}");
-            assert_eq!(samples_of(&sink, MetricId::StageRerankP50Ms), 0, "{case}");
-        }
     }
 
     #[tokio::test]

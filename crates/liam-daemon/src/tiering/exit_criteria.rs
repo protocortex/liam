@@ -11,7 +11,7 @@ use liam_daemon::consolidation::hooks::TierHook;
 use liam_daemon::consolidation::tier_history::TierHistory;
 use liam_daemon::models::StoreEmbedder;
 use liam_daemon::store_open::open_store_on_log;
-use liam_model::{IdentityReranker, MockEmbedder, MockLlm};
+use liam_model::{MockEmbedder, MockLlm};
 use liam_store::{
     ChildKind, Clock, DefaultGraph, EventRole, FixedClock, GraphConfig, ItemView, LineageKey,
     Millis, NewEdge, NewNode, NewSummary, NodeId, OriginClaim, OriginVerdict, Query, RebuildMode,
@@ -87,7 +87,6 @@ async fn a_cold_item_found_by_a_paraphrase_is_counted_and_promoted_with_its_vect
     let server = MemoryServer::new(
         fixture.store.clone(),
         Arc::new(embedding_of("target", TARGET_PATTERN)),
-        Arc::new(IdentityReranker),
         Arc::new(MockLlm),
         1,
         false,
