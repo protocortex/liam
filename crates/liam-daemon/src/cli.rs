@@ -138,14 +138,6 @@ pub enum Mode {
     Delete(DeleteAction),
 }
 
-impl Mode {
-    /// Whether this mode loads the embedder. The proxy forwards
-    /// bytes, and a delete only reads the log and destroys keys.
-    pub fn loads_models(&self) -> bool {
-        !matches!(self, Self::Proxy | Self::Delete(_))
-    }
-}
-
 impl Cli {
     /// Which mode the parsed arguments select.
     pub fn mode(&self) -> Mode {
@@ -293,15 +285,6 @@ mod tests {
         ] {
             let error = Cli::try_parse_from(args).expect_err("must be a usage error");
             assert_eq!(error.exit_code(), 2, "{args:?}");
-        }
-    }
-
-    #[test]
-    fn only_the_proxy_and_delete_skip_the_models() {
-        assert!(!Mode::Proxy.loads_models());
-        assert!(!Mode::Delete(DeleteAction::Status).loads_models());
-        for mode in [Mode::Stdio, Mode::Serve, Mode::EncryptLog] {
-            assert!(mode.loads_models(), "{mode:?}");
         }
     }
 

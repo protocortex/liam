@@ -194,7 +194,6 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Rebuild(args) => {
-            models::export_fastembed_cache_dir(&config)?;
             let runtime = tokio::runtime::Runtime::new()?;
             let code = runtime.block_on(rebuild(
                 &args,
@@ -280,7 +279,6 @@ fn try_consolidate(
         print_status(&database, &mut std::io::stdout())?;
         return Ok(None);
     }
-    models::export_fastembed_cache_dir(config)?;
     let embedder = models::build_embedder(config)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let outcome = runtime.block_on(run_offline(
@@ -685,9 +683,6 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
     }
     if plan.embedder {
         println!("embedder: {}", config.embedder.model);
-        if let Some(cache_dir) = models::export_fastembed_cache_dir(config)? {
-            println!("  cache_dir -> {}", cache_dir.display());
-        }
         // A GGUF is downloaded and checked before anything loads it.
         if let Some(spec) = liam_model::gguf_embedder_spec(&config.embedder.model) {
             let cache_dir = models::resolve_path_with_home(

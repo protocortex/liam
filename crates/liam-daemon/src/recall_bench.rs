@@ -530,8 +530,6 @@ mod tests {
         if let Ok(dir) = std::env::var(CACHE_DIR_ENV) {
             daemon_config.embedder.cache_dir = dir;
         }
-        liam_daemon::models::export_fastembed_cache_dir(&daemon_config)
-            .expect("export the model cache directory");
         let embedder = liam_daemon::models::build_embedder(&daemon_config)
             .expect("load the real embedder; needs network access for the first download");
         let dir = tempfile::tempdir().unwrap();

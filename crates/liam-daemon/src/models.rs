@@ -136,29 +136,9 @@ pub const MOCK_PROVIDER: &str = "mock";
 /// The `llm.provider` value that selects in-process llama.cpp.
 pub const LLAMA_PROVIDER: &str = "llama-cpp";
 
-/// Points fastembed's cache at the configured directory when the embedder is
-/// local, and returns that directory.
-///
-/// fastembed reads the cache directory from the environment, and mutating the
-/// environment once other threads exist is a data race on POSIX, so callers run
-/// this before starting a runtime. The configured value is resolved first
-/// because fastembed does not expand `~`, and passing it raw downloads models
-/// into a directory named `~`. The embedder reaches the same
-/// directory through its own explicit parameter.
-pub fn export_fastembed_cache_dir(config: &Config) -> anyhow::Result<Option<PathBuf>> {
-    if config.embedder.provider != LOCAL_PROVIDER {
-        return Ok(None);
-    }
-    let cache_dir = resolve_config_path("embedder.cache_dir", &config.embedder.cache_dir)?;
-    std::env::set_var("FASTEMBED_CACHE_DIR", &cache_dir);
-    Ok(Some(cache_dir))
-}
-
 /// Choose the embedder from config. `mock` is for tests and dev; the `local`
 /// provider loads fastembed in-process. Any other name is an error, so a typo
 /// cannot quietly select the mock.
-///
-/// Callers must run `export_fastembed_cache_dir` first.
 pub fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
     if config.embedder.provider == LOCAL_PROVIDER {
         return build_local_embedder(config);
@@ -537,14 +517,6 @@ mod tests {
 
         // Assert
         assert_eq!(embedder.dims(), config.embedding_dims);
-    }
-
-    #[test]
-    fn a_mock_embedder_exports_no_cache_directory() {
-        assert_eq!(
-            export_fastembed_cache_dir(&Config::default()).unwrap(),
-            None
-        );
     }
 
     #[test]

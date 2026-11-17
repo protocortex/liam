@@ -53,9 +53,7 @@ pub use liam_daemon::config;
 use config::Config;
 use consolidation_job::{ConsolidationJob, JobSetup};
 use liam_daemon::consolidation::maintenance::standard_steps;
-use liam_daemon::models::{
-    build_embedder, build_llm, export_fastembed_cache_dir, resolve_config_path, resolve_log_dir,
-};
+use liam_daemon::models::{build_embedder, build_llm, resolve_config_path, resolve_log_dir};
 use liam_daemon::{embedder_fingerprint, storelock, telemetry};
 use liam_model::{Embedder, Llm};
 use log_startup::StartedStore;
@@ -82,10 +80,6 @@ fn main() -> anyhow::Result<()> {
     let config_path = cli.config_path(std::env::var("LIAM_CONFIG").ok().as_deref());
 
     let config = Config::load(config_path.as_ref())?;
-    // Before the runtime starts; skipped for the proxy, which loads no model.
-    if mode.loads_models() {
-        export_fastembed_cache_dir(&config)?;
-    }
     let is_proxy = mode == cli::Mode::Proxy;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
