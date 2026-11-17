@@ -64,11 +64,14 @@ impl EmbedderFingerprint {
 }
 
 /// The id a model is recorded under. A GGUF id has two spellings for the same
-/// file (`repo` and `repo:Q8_0`), so it is stored as the spec's explicit id;
-/// every other id is stored as written, which keeps existing fingerprints valid.
+/// file (`repo` and `repo:Q8_0`), and an ONNX id matches without regard to
+/// case, so each is stored as its spec's id; every other id is stored as
+/// written, which keeps existing fingerprints valid.
 fn canonical_model_id(model: &str) -> String {
-    liam_model::gguf_embedder_spec(model)
-        .map_or_else(|| model.to_string(), |spec| spec.id.to_string())
+    if let Some(spec) = liam_model::gguf_embedder_spec(model) {
+        return spec.id.to_string();
+    }
+    liam_model::onnx_model_spec(model).map_or_else(|| model.to_string(), |spec| spec.id.to_string())
 }
 
 impl EmbedderFingerprint {
@@ -292,6 +295,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn every_spelling_of_an_onnx_model_id_shares_one_fingerprint() {
+        // Arrange
+        let with = |model: &str| {
+            let mut config = Config::default();
+            config.embedder.model = model.to_string();
+            EmbedderFingerprint::from_config(&config)
+        };
+
+        // Act
+        let exact = with(liam_model::DEFAULT_EMBEDDER_MODEL_ID);
+        let lowered = with(&liam_model::DEFAULT_EMBEDDER_MODEL_ID.to_lowercase());
+
+        // Assert
+        assert_eq!(exact, lowered);
+        assert_eq!(lowered.model, liam_model::DEFAULT_EMBEDDER_MODEL_ID);
+    }
 
     fn fingerprint(model: &str, dims: usize, prompt_scheme: u32) -> EmbedderFingerprint {
         EmbedderFingerprint {
