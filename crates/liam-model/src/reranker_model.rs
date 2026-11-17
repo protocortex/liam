@@ -52,7 +52,7 @@ const SPECIAL_TOKENS_SIZE: u64 = 964;
 const SPECIAL_TOKENS_SHA256: &str =
     "8c785abebea9ae3257b61681b4e6fd8365ceafde980c21970d001e834cf10835";
 
-const fn file(
+pub(crate) const fn file(
     name: &'static str,
     remote_path: &'static str,
     size: u64,

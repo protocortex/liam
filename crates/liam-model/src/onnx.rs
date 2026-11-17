@@ -5,10 +5,12 @@
 //! path, the same one BGE-M3 uses. fastembed owns the pooling and the L2
 //! normalisation per model; this module owns what it leaves to the caller: the
 //! query and document prefixes, the input token cap, and the output width.
-//! Adding a model is one row in the table plus its fastembed variant.
+//! Adding a model is one row in the table, naming either its fastembed variant
+//! or a pinned download for a model fastembed does not list.
 
 use crate::blocking::with_model_blocking;
 use crate::error::{ModelError, Result};
+use crate::onnx_pinned::{self, PinnedOnnxModel, ARCTIC_EMBED_M_V2};
 use crate::TextKind;
 use async_trait::async_trait;
 
@@ -16,9 +18,25 @@ use async_trait::async_trait;
 /// longest input; a small batch bounds that.
 const EMBED_BATCH_SIZE: usize = 16;
 
+/// The model accepts 8192 tokens. Stored facts are short, so 512 bounds the
+/// latency of a long input without cutting normal ones.
+const ARCTIC_M_V2_MAX_TOKENS: usize = 512;
+
 /// The retrieval query instruction of the BGE and Arctic model cards. Passages
 /// take no prefix.
 const BGE_STYLE_QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
+
+/// The embedding model `embedder.model` selects when the config names none.
+pub const DEFAULT_EMBEDDER_MODEL_ID: &str = "Snowflake/snowflake-arctic-embed-m-v2.0";
+
+/// Where a model's files and loader come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnnxSource {
+    /// A variant fastembed downloads and loads itself.
+    Fastembed(fastembed::EmbeddingModel),
+    /// Files pinned by size and sha256, downloaded and checked here.
+    Pinned(&'static PinnedOnnxModel),
+}
 
 /// Everything the loader needs to know about one ONNX model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +54,7 @@ pub struct OnnxModelSpec {
     pub query_prefix: &'static str,
     /// Written before stored text. Empty when the model takes none.
     pub document_prefix: &'static str,
-    /// The fastembed variant that loads it.
-    pub model: fastembed::EmbeddingModel,
+    pub source: OnnxSource,
 }
 
 /// All of the models this module loads, in the order the docs list them.
@@ -49,7 +66,7 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 256,
         query_prefix: "",
         document_prefix: "",
-        model: fastembed::EmbeddingModel::AllMiniLML6V2,
+        source: OnnxSource::Fastembed(fastembed::EmbeddingModel::AllMiniLML6V2),
     },
     OnnxModelSpec {
         id: "sentence-transformers/all-MiniLM-L12-v2",
@@ -58,7 +75,7 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 128,
         query_prefix: "",
         document_prefix: "",
-        model: fastembed::EmbeddingModel::AllMiniLML12V2,
+        source: OnnxSource::Fastembed(fastembed::EmbeddingModel::AllMiniLML12V2),
     },
     OnnxModelSpec {
         id: "BAAI/bge-small-en-v1.5",
@@ -67,7 +84,7 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 512,
         query_prefix: BGE_STYLE_QUERY_PREFIX,
         document_prefix: "",
-        model: fastembed::EmbeddingModel::BGESmallENV15,
+        source: OnnxSource::Fastembed(fastembed::EmbeddingModel::BGESmallENV15),
     },
     OnnxModelSpec {
         id: "Snowflake/snowflake-arctic-embed-xs",
@@ -76,7 +93,7 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 512,
         query_prefix: BGE_STYLE_QUERY_PREFIX,
         document_prefix: "",
-        model: fastembed::EmbeddingModel::SnowflakeArcticEmbedXS,
+        source: OnnxSource::Fastembed(fastembed::EmbeddingModel::SnowflakeArcticEmbedXS),
     },
     OnnxModelSpec {
         id: "Snowflake/snowflake-arctic-embed-s",
@@ -85,7 +102,7 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 512,
         query_prefix: BGE_STYLE_QUERY_PREFIX,
         document_prefix: "",
-        model: fastembed::EmbeddingModel::SnowflakeArcticEmbedS,
+        source: OnnxSource::Fastembed(fastembed::EmbeddingModel::SnowflakeArcticEmbedS),
     },
     OnnxModelSpec {
         id: "nomic-ai/nomic-embed-text-v1.5",
@@ -94,7 +111,7 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 8192,
         query_prefix: "search_query: ",
         document_prefix: "search_document: ",
-        model: fastembed::EmbeddingModel::NomicEmbedTextV15,
+        source: OnnxSource::Fastembed(fastembed::EmbeddingModel::NomicEmbedTextV15),
     },
     OnnxModelSpec {
         id: "intfloat/multilingual-e5-small",
@@ -103,7 +120,16 @@ pub const ONNX_MODELS: &[OnnxModelSpec] = &[
         max_tokens: 512,
         query_prefix: "query: ",
         document_prefix: "passage: ",
-        model: fastembed::EmbeddingModel::MultilingualE5Small,
+        source: OnnxSource::Fastembed(fastembed::EmbeddingModel::MultilingualE5Small),
+    },
+    OnnxModelSpec {
+        id: DEFAULT_EMBEDDER_MODEL_ID,
+        native_dims: 768,
+        matryoshka: true,
+        max_tokens: ARCTIC_M_V2_MAX_TOKENS,
+        query_prefix: "query: ",
+        document_prefix: "",
+        source: OnnxSource::Pinned(&ARCTIC_EMBED_M_V2),
     },
 ];
 
@@ -162,11 +188,21 @@ impl OnnxEmbedder {
                 spec.id
             );
         }
-        let options = fastembed::TextInitOptions::new(spec.model.clone())
-            .with_cache_dir(std::path::PathBuf::from(cache_dir))
-            .with_max_length(spec.max_tokens);
-        let model = fastembed::TextEmbedding::try_new(options)
-            .map_err(|e| ModelError::Embed(format!("load {}: {e}", spec.id)))?;
+        let model = match &spec.source {
+            OnnxSource::Fastembed(variant) => {
+                let options = fastembed::TextInitOptions::new(variant.clone())
+                    .with_cache_dir(std::path::PathBuf::from(cache_dir))
+                    .with_max_length(spec.max_tokens);
+                fastembed::TextEmbedding::try_new(options)
+                    .map_err(|e| ModelError::Embed(format!("load {}: {e}", spec.id)))?
+            }
+            OnnxSource::Pinned(pinned) => onnx_pinned::load_pinned(
+                pinned,
+                |file| onnx_pinned::fetch_from_hub(pinned, cache_dir, file),
+                crate::verify_pinned_file,
+                |paths| onnx_pinned::fastembed_session(pinned, spec.max_tokens, paths),
+            )?,
+        };
         Ok(Self {
             model: std::sync::Arc::new(tokio::sync::Mutex::new(model)),
             spec,
@@ -269,6 +305,49 @@ mod tests {
     }
 
     #[test]
+    fn arctic_is_the_default_and_loads_from_pinned_files() {
+        // Arrange / Act
+        let arctic = spec(super::DEFAULT_EMBEDDER_MODEL_ID);
+
+        // Assert
+        assert_eq!(arctic.id, "Snowflake/snowflake-arctic-embed-m-v2.0");
+        assert_eq!(arctic.native_dims, 768);
+        assert!(arctic.matryoshka);
+        assert_eq!(arctic.max_tokens, 512);
+        assert_eq!(
+            arctic.source,
+            super::OnnxSource::Pinned(&super::ARCTIC_EMBED_M_V2)
+        );
+    }
+
+    #[test]
+    fn arctic_prefixes_queries_and_leaves_documents_bare() {
+        // Arrange
+        let arctic = spec(super::DEFAULT_EMBEDDER_MODEL_ID);
+
+        // Act / Assert
+        assert_eq!(onnx_input(arctic, "q", TextKind::Query), "query: q");
+        assert_eq!(onnx_input(arctic, "d", TextKind::Document), "d");
+    }
+
+    #[test]
+    fn a_768_wide_arctic_vector_is_cut_to_384_and_renormalised() {
+        // Arrange
+        let arctic = spec(super::DEFAULT_EMBEDDER_MODEL_ID);
+        let unit = 1.0 / (arctic.native_dims as f32).sqrt();
+        let full = vec![unit; arctic.native_dims];
+
+        // Act
+        let cut = crate::embedder::mrl_truncate(&full, 384);
+
+        // Assert
+        assert!(validate_onnx_dims(arctic, 384).is_ok());
+        assert_eq!(cut.len(), 384);
+        let norm = cut.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "{norm}");
+    }
+
+    #[test]
     fn a_fixed_width_model_accepts_only_its_native_width() {
         // Arrange
         let bge = spec("BAAI/bge-small-en-v1.5");
@@ -321,6 +400,41 @@ mod tests {
         let cosine = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         assert_eq!(vectors[0].len(), bge.native_dims);
         assert!(cosine(&vectors[0], &vectors[1]) > cosine(&vectors[0], &vectors[2]));
+    }
+
+    /// Uses the pinned files in the directory `LIAM_MODEL_CACHE` names and
+    /// downloads the missing ones (311 MB). Run with
+    /// `LIAM_MODEL_CACHE=/path/to/cache cargo test -p liam-model -- --ignored arctic`.
+    #[tokio::test]
+    #[ignore = "downloads the arctic weights; see the doc comment for the run command"]
+    async fn arctic_ranks_the_relevant_document_first() {
+        use crate::Embedder;
+
+        // Arrange
+        let cache_dir = std::env::var("LIAM_MODEL_CACHE").expect("set LIAM_MODEL_CACHE");
+        let arctic = spec(super::DEFAULT_EMBEDDER_MODEL_ID);
+        let embedder = super::OnnxEmbedder::load(arctic, 384, &cache_dir).expect("load arctic");
+        let documents = [
+            "The mitochondria is the powerhouse of the cell".to_string(),
+            "I live in Lisbon, Portugal".to_string(),
+            "The stock market closed higher on Tuesday".to_string(),
+        ];
+
+        // Act
+        let query = embedder
+            .embed("where do I live", TextKind::Query)
+            .await
+            .expect("embed query");
+        let vectors = embedder
+            .embed_batch(&documents, TextKind::Document)
+            .await
+            .expect("embed documents");
+
+        // Assert
+        let cosine = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let scores: Vec<f32> = vectors.iter().map(|v| cosine(&query, v)).collect();
+        assert_eq!(query.len(), 384);
+        assert!(scores[1] > scores[0] && scores[1] > scores[2], "{scores:?}");
     }
 
     #[test]

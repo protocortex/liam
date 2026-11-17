@@ -14,6 +14,7 @@ pub mod hardware;
 mod llama_embedder;
 pub mod llm;
 mod onnx;
+mod onnx_pinned;
 pub mod reranker;
 mod reranker_model;
 
@@ -23,7 +24,10 @@ pub use bge::{BGE_M3_DIMS, BGE_M3_MODEL_ID};
 pub use embedder::{Embedder, MockEmbedder, TextKind, QWEN3_EMBEDDING_MODEL_ID};
 pub use error::{ModelError, Result};
 pub use llm::{Llm, MockLlm};
-pub use onnx::{onnx_model_spec, OnnxModelSpec, ONNX_MODELS};
+pub use onnx::{
+    onnx_model_spec, OnnxModelSpec, OnnxSource, DEFAULT_EMBEDDER_MODEL_ID, ONNX_MODELS,
+};
+pub use onnx_pinned::{PinnedOnnxModel, ARCTIC_EMBED_M_V2};
 pub use reranker::{IdentityReranker, Reranker};
 
 pub use bge::BgeM3Embedder;
@@ -39,5 +43,5 @@ pub use gguf_verify::verify_pinned_file;
 pub use llama::LlamaCppLlm;
 pub use llama_embedder::{
     gguf_embedder_spec, gguf_path_from_hub, verify_gguf_file, GgufEmbedderSpec, LlamaEmbedder,
-    DEFAULT_EMBEDDER_MODEL_ID, GGUF_EMBEDDERS,
+    GGUF_EMBEDDERS, QWEN3_GGUF_EMBEDDER_MODEL_ID,
 };
