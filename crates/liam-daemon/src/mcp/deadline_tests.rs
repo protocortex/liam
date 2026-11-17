@@ -26,6 +26,7 @@ const TIMEOUT_TEXT: &str = "recall failed: retrieval took longer than 1 s";
 const NO_MEMORY_TEXT: &str = "no relevant memory";
 const HIT_PREFIX: &str = "[fact ";
 const ASK_CANCELLED_TEXT: &str = "ask cancelled";
+const PRE_PASS_REFUSAL: &str = "NO";
 const ASK_TIMEOUT_TEXT: &str = "ask failed: retrieval took longer than 1 s";
 const ASK_TIMEOUT_SECS: u64 = 1;
 const MARKER_PREFIX: &str = "(degraded: ";
@@ -579,4 +580,81 @@ async fn ask_names_keyword_only_search_when_the_embedder_errors_and_nothing_matc
         text,
         format!("{}\n{NO_MEMORY_TEXT}", marker_for("embed_failed"))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_ask_cancelled_while_waiting_on_the_embedder_replies_cancelled() {
+    // Arrange
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let embedder = Arc::new(GatedEmbedder::new(DIMS, gate.clone()));
+    let server = server_with_models(embedder.clone(), Arc::new(MockLlm)).await;
+    let _held = gate.lock().await;
+    let token = CancellationToken::new();
+    let mut pending = std::pin::pin!(server.ask_with(ask_args(), token.clone()));
+    tokio::select! {
+        biased;
+        _ = &mut pending => panic!("the ask finished while the gate was held"),
+        _ = std::future::ready(()) => {}
+    }
+
+    // Act
+    token.cancel();
+    let out = pending.await;
+
+    // Assert
+    assert_eq!(wire_text(out, NO_REASONS, false), ASK_CANCELLED_TEXT);
+    assert_eq!(
+        embedder.call_count(),
+        0,
+        "the embed never got past the gate"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ask_keeps_the_embed_reason_in_strict_mode() {
+    // Arrange
+    let server = server_with_models(Arc::new(ErroringEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
+    seed_facts(&server).await;
+    let args = AskArgs {
+        mode: Some(Mode::Strict),
+        ..ask_args()
+    };
+
+    // Act
+    let out = server.ask_with(args, CancellationToken::new()).await;
+
+    // Assert
+    let text = wire_text(out, &["embed_failed"], false);
+    assert_eq!(
+        text.lines().next(),
+        Some(marker_for("embed_failed").as_str())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ask_keeps_the_embed_reason_when_the_pre_pass_refuses() {
+    // Arrange
+    let server = server_with_models(
+        Arc::new(ErroringEmbedder::new(DIMS)),
+        Arc::new(CannedLlm {
+            reply: Some(PRE_PASS_REFUSAL),
+        }),
+    )
+    .await;
+    let server = MemoryServer {
+        ask_sufficiency_check: true,
+        ..server
+    };
+    seed_facts(&server).await;
+
+    // Act
+    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
+
+    // Assert
+    let text = wire_text(out, &["embed_failed"], false);
+    assert_eq!(
+        text.lines().next(),
+        Some(marker_for("embed_failed").as_str())
+    );
+    assert!(text.contains("does not contain an answer"), "{text}");
 }
