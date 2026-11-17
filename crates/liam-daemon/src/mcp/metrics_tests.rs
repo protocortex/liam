@@ -10,6 +10,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use tokio_util::sync::CancellationToken;
 
 use super::metrics::{label_suffix, MetricsArgs, MAX_LIMIT};
+use super::test_doubles::ErroringEmbedder;
 use super::{AskArgs, MemoryServer, RecallArgs};
 use crate::degraded::Degraded;
 use crate::log_startup::test_support::{embedder, DIMS};
@@ -28,23 +29,6 @@ const RECALL_TIMEOUT_SECS: u64 = 1;
 const FACT_COUNT: usize = 3;
 const DEGRADED_RECALLS: usize = 3;
 const DEGRADED_REPLIES: &str = "degraded_replies";
-
-/// Always fails, so recall degrades to a keyword search.
-struct FailingEmbedder;
-
-#[async_trait::async_trait]
-impl liam_model::Embedder for FailingEmbedder {
-    fn dims(&self) -> usize {
-        DIMS
-    }
-    async fn embed(
-        &self,
-        _text: &str,
-        _kind: liam_model::TextKind,
-    ) -> liam_model::Result<Vec<f32>> {
-        Err(liam_model::ModelError::Embed("boom".into()))
-    }
-}
 
 /// Embeds after a delay no deadline outlasts, so retrieval fails on time.
 struct SleepingEmbedder;
@@ -266,7 +250,7 @@ async fn degraded_recalls_and_asks_are_counted_by_tool_and_reason() {
     // Arrange
     let (metrics, _sink) = recorder();
     let recalling = MemoryServer {
-        embedder: Arc::new(FailingEmbedder),
+        embedder: Arc::new(ErroringEmbedder::new(DIMS)),
         ..server(Some(metrics.clone())).await
     };
     seed_facts(&recalling).await;
@@ -359,7 +343,7 @@ async fn a_server_without_metrics_replies_the_same_for_a_degraded_recall() {
     // Arrange
     let (metrics, _sink) = recorder();
     let with = MemoryServer {
-        embedder: Arc::new(FailingEmbedder),
+        embedder: Arc::new(ErroringEmbedder::new(DIMS)),
         ..server(Some(metrics)).await
     };
     let without = MemoryServer {
