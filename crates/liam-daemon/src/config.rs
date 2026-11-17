@@ -550,6 +550,19 @@ mod tests {
     }
 
     #[test]
+    fn a_non_table_reranker_value_loads_and_yields_the_removal_warning() {
+        // Arrange
+        let text = "reranker = \"none\"\n";
+
+        // Act
+        let config = load_text(text, "/home/alice").unwrap();
+
+        // Assert
+        let warning = config.removed_reranker_warning().unwrap();
+        assert!(warning.contains("[reranker] section"), "{warning}");
+    }
+
+    #[test]
     fn a_config_without_a_reranker_section_has_no_removal_warning() {
         // Act
         let loaded = load_text("[gc]\n", "/home/alice").unwrap();
