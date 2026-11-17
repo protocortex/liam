@@ -14,3 +14,23 @@ to upgrade to. It reaches this project only transitively, through the candle
 and fastembed dependency tree, and nothing here calls it directly. Drop this entry once fastembed and its candle dependencies move off
 `paste`. The same advisory is ignored in deny.toml, with the same reasoning.
 """
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = """
+`chrono` is unmaintained. This is an unmaintained advisory, not a known
+vulnerability: the scanner reports no fixed version. It reaches this project
+only transitively, through arrow, parquet, object_store and rmcp, and nothing
+here depends on it directly. Drop this entry once those crates move off
+`chrono`. The same advisory is ignored in deny.toml, with the same reasoning.
+"""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0542"
+reason = """
+`humantime` is unmaintained, as a result of the `chrono` advisory. This is an
+unmaintained advisory, not a known vulnerability: the scanner reports no fixed
+version. It reaches this project only through object_store. Drop this entry
+once object_store moves off `humantime`. The same advisory is ignored in
+deny.toml, with the same reasoning.
+"""
