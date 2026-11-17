@@ -526,30 +526,18 @@ mod tests {
     #[ignore = "downloads model weights; see module doc for the run command"]
     async fn real_models_report_recall_latency_and_ndcg() {
         // Arrange
-        let defaults = Config::default();
-        let model_id = std::env::var("LIAM_TOOL_EVAL_MODEL").unwrap_or(defaults.embedder.model);
-        let cache_dir = match std::env::var(CACHE_DIR_ENV) {
-            Ok(dir) => dir,
-            Err(_) => liam_daemon::models::resolve_path_with_home(
-                "embedder.cache_dir",
-                &defaults.embedder.cache_dir,
-                &std::env::var("HOME").unwrap_or_default(),
-            )
-            .expect("resolve embedder.cache_dir"),
-        };
-        let embedder: Arc<dyn Embedder> = Arc::new(
-            liam_model::FastEmbedEmbedder::load(
-                &model_id,
-                defaults.embedding_dims,
-                &cache_dir,
-                liam_model::llm::DevicePreference::Cpu,
-            )
-            .expect("load real embedder; needs network access for the first download"),
-        );
-        let reranker: Arc<dyn Reranker> = Arc::new(
-            liam_model::FastEmbedReranker::load()
-                .expect("load real reranker; needs network access for the first download"),
-        );
+        let mut daemon_config = Config::default();
+        daemon_config.embedder.provider = liam_daemon::models::LOCAL_PROVIDER.into();
+        if let Ok(model_id) = std::env::var("LIAM_TOOL_EVAL_MODEL") {
+            daemon_config.embedder.model = model_id;
+        }
+        if let Ok(dir) = std::env::var(CACHE_DIR_ENV) {
+            daemon_config.embedder.cache_dir = dir;
+        }
+        liam_daemon::models::export_fastembed_cache_dir(&daemon_config)
+            .expect("export the model cache directory");
+        let (embedder, reranker) = liam_daemon::models::build_models(&daemon_config)
+            .expect("load real models; needs network access for the first download");
         let dir = tempfile::tempdir().unwrap();
         let mut config = config(dir.path(), DEFAULT_REAL_RUNS);
         if let Ok(pairs) = std::env::var("LIAM_RECALL_BENCH_PAIRS") {
