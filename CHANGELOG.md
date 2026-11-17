@@ -29,6 +29,11 @@ All notable changes to LIAM are recorded here. The format follows
   that names `liam rebuild --database PATH`; run it with `liamd` stopped, then `liam fetch-models` downloads the
   new model. To keep the old model set `embedder.model = "Qwen/Qwen3-Embedding-0.6B-GGUF"`. See
   [ADR 0013](docs/adr/0013-arctic-default-embedder-and-reranker-off.md).
+- A store with data and no `<database>.embedder.json` is now taken to hold the vectors of the default from before fingerprints,
+  `Qwen/Qwen3-Embedding-0.6B` at 768 dimensions, instead of the configured embedder's. Opened under any other
+  model or width, including the new default, it is refused with the same message that names `liam rebuild`.
+- The embedder fingerprint records an ONNX model under its canonical id, so `embedder.model` spelled in another
+  case no longer reads as a change of embedder.
 - **Breaking:** the reranker is now off by default (`reranker.model = "none"`), so `recall` answers in store
   order. The best reranker moved nDCG@10 by +0.017, -0.010 and +0.033 on English, Portuguese and Spanish, inside
   the noise, for 254 ms and over 1 GB of memory. To turn it on set `reranker.model` to `bge-reranker-base`,

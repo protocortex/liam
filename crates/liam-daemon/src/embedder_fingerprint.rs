@@ -34,6 +34,14 @@ pub const PROMPT_SCHEME: u32 = 2;
 /// under. It stays 0 however far `PROMPT_SCHEME` moves.
 const LEGACY_PROMPT_SCHEME: u32 = 0;
 
+/// The model every store written before fingerprints held vectors from: the
+/// default then. It is fixed, whatever the default is now, because those
+/// stores never change.
+const LEGACY_MODEL_ID: &str = liam_model::QWEN3_EMBEDDING_MODEL_ID;
+
+/// The width of those stores' vectors, the default `embedding_dims` then.
+const LEGACY_DIMS: usize = 768;
+
 /// Appended to the database path to name the sidecar file.
 const FINGERPRINT_SUFFIX: &str = ".embedder.json";
 
@@ -85,12 +93,15 @@ impl EmbedderFingerprint {
         }
     }
 
-    /// What a store with vectors but no record is assumed to hold: the
-    /// configured embedder, under the scheme that predates fingerprints.
+    /// What a store with vectors but no record is assumed to hold: the model
+    /// and width that were the default before fingerprints, under the scheme
+    /// that predates them. Only the provider follows the configuration.
     fn legacy_of(current: &Self) -> Self {
         Self {
+            provider: current.provider.clone(),
+            model: LEGACY_MODEL_ID.to_string(),
+            dims: LEGACY_DIMS,
             prompt_scheme: LEGACY_PROMPT_SCHEME,
-            ..current.clone()
         }
     }
 }
@@ -129,9 +140,9 @@ impl PendingRecord {
 /// opens, and creates no file.
 ///
 /// With no record, a database file that holds data is a legacy store, assumed
-/// to hold the configured embedder's vectors under the pre fingerprint prompt
-/// scheme; a missing or empty file is a fresh install, which will record
-/// `current`. Either comes back as a [`PendingRecord`] to commit after the
+/// to hold the vectors of the pre fingerprint default model and width under the
+/// pre fingerprint prompt scheme; a missing or empty file is a fresh install,
+/// which will record `current`. Either comes back as a [`PendingRecord`] to commit after the
 /// store opens. A record that cannot be read or parsed is an error, never
 /// "absent": overwriting it would erase the evidence of a model change.
 pub fn verify(
@@ -382,7 +393,7 @@ mod tests {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
         let database = existing_database(dir.path());
-        let current = fingerprint("model-a", 768, 0);
+        let current = fingerprint(LEGACY_MODEL_ID, LEGACY_DIMS, 0);
 
         // Act
         start(&database, &current).unwrap();
@@ -408,6 +419,63 @@ mod tests {
         assert!(error.contains("prompt scheme 1"), "{error}");
         assert!(error.contains(&sidecar.display().to_string()), "{error}");
         assert!(!sidecar.exists(), "a refusal must write nothing");
+    }
+
+    #[test]
+    fn a_store_with_data_and_no_record_is_refused_under_the_default_embedder() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let database = existing_database(dir.path());
+        let sidecar = fingerprint_path_for(&database);
+        let mut config = Config::default();
+        config.embedder.provider = "local".to_string();
+        let current = EmbedderFingerprint {
+            prompt_scheme: LEGACY_PROMPT_SCHEME,
+            ..EmbedderFingerprint::from_config(&config)
+        };
+
+        // Act
+        let error = verify(&database, &current)
+            .expect_err("the default model must not read the pre fingerprint vectors")
+            .to_string();
+
+        // Assert
+        assert!(error.contains("liam rebuild"), "{error}");
+        assert!(error.contains(LEGACY_MODEL_ID), "{error}");
+        assert!(
+            error.contains(liam_model::DEFAULT_EMBEDDER_MODEL_ID),
+            "{error}"
+        );
+        assert!(!sidecar.exists(), "a refusal must write nothing");
+    }
+
+    #[test]
+    fn a_store_with_data_and_no_record_is_refused_at_other_dimensions() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let database = existing_database(dir.path());
+        let current = fingerprint(LEGACY_MODEL_ID, LEGACY_DIMS / 2, LEGACY_PROMPT_SCHEME);
+
+        // Act
+        let result = verify(&database, &current);
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn an_empty_store_opens_under_any_model() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        std::fs::write(&database, b"").unwrap();
+        let current = fingerprint(liam_model::DEFAULT_EMBEDDER_MODEL_ID, 384, PROMPT_SCHEME);
+
+        // Act
+        start(&database, &current).unwrap();
+
+        // Assert
+        assert_eq!(read(&fingerprint_path_for(&database)), current);
     }
 
     #[test]
@@ -484,7 +552,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let database = existing_database(dir.path());
         let current = fingerprint("model-a", 768, 0);
-        start(&database, &current).unwrap();
+        record(&database, &current).unwrap();
 
         // Act
         let pending = verify(&database, &current).unwrap();
@@ -510,7 +578,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let database = existing_database(dir.path());
             let sidecar = fingerprint_path_for(&database);
-            start(&database, &recorded).unwrap();
+            record(&database, &recorded).unwrap();
 
             // Act
             let error = verify(&database, &configured)
@@ -543,7 +611,7 @@ mod tests {
         let database = existing_database(dir.path());
         let mut mock = fingerprint("model-a", 768, 0);
         mock.provider = "mock".to_string();
-        start(&database, &mock).unwrap();
+        record(&database, &mock).unwrap();
 
         // Act
         let result = verify(&database, &fingerprint("model-a", 768, 0));

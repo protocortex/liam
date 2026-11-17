@@ -30,9 +30,10 @@ skips the check.
   is written after the store opens, so a start that fails leaves nothing
   behind.
 - **No record, and a database that holds data:** a store from before
-  fingerprints. It is taken to hold the configured provider, model and
-  dimensions under prompt scheme 0, so it fails the check (the binary is on
-  scheme 2). `liam rebuild` clears this and needs an event log. A store that
+  fingerprints. It is taken to hold the vectors of the default from that time,
+  `Qwen/Qwen3-Embedding-0.6B` at 768 dimensions, under prompt scheme 0, whatever
+  the default is now. So it fails the check under any other model or width, and
+  under the current binary too (it is on scheme 2). `liam rebuild` clears this and needs an event log. A store that
   predates the log has none, so `liamd` copies its rows into a new log before
   it runs the check. The start is still refused, but the log now exists: run
   `liam rebuild --database PATH` and start again.
