@@ -152,8 +152,6 @@ mod tests {
         // Act
         let legacy =
             load("[reranker]\nmodel = \"bge-reranker-base\"\nmodel_dir = \"/m\"\n").unwrap_err();
-        let legacy_named =
-            load("[reranker]\nmodel = \"bge-reranker-base\"\nmodel_dir = \"/m\"\n").unwrap_err();
         let v2 = load("[reranker]\nmodel = \"bge-reranker-v2-m3\"\nmodel_dir = \"/m\"\n").unwrap();
         let gte =
             load("[reranker]\nmodel = \"gte-multilingual-reranker-base\"\nmodel_dir = \"/m\"\n")
@@ -161,7 +159,6 @@ mod tests {
 
         // Assert
         assert!(format!("{legacy:#}").contains("reranker.model_dir"));
-        assert!(format!("{legacy_named:#}").contains("reranker.model_dir"));
         assert_eq!(v2.reranker.model_dir.as_deref(), Some("/m"));
         assert_eq!(gte.reranker.model_dir.as_deref(), Some("/m"));
     }
