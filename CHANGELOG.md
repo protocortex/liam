@@ -34,8 +34,8 @@ All notable changes to LIAM are recorded here. The format follows
 - **Breaking:** the reranker is removed. `recall` and `ask` return candidates in store order, which is what
   the default setting already gave. A `[reranker]` section in `liam.toml` is ignored and the daemon logs one
   warning at start, so you can delete it; the `rerank_*` degraded reasons and the `stage_rerank_*` metrics are
-  gone. On 10,000 passages the best reranker gained 0.05 nDCG@10 but took hundreds of milliseconds and over
-  1 GB, and no model under 150 MB gained anything significant. A lighter daemon is worth more than that gain.
+  gone. On 10,000 passages the best reranker gained 0.05 nDCG@10 but took hundreds of milliseconds to seconds per
+  recall and over 1 GB, and no model under 150 MB gained anything significant. A lighter daemon is worth more than that gain.
   See [ADR 0014](docs/adr/0014-remove-the-reranker.md).
 - `recall` and `ask` now set `isError` when the call fails: the retrieval deadline passes, the store fails, or the
   query is invalid. A cancelled call still returns a normal reply. `recall` and `ask` now log a failed embed and

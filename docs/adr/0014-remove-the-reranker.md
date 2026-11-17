@@ -47,8 +47,9 @@ The user decided to give up the large store gain for a lighter daemon.
 
 ### Remove the reranker (effort: M, chosen)
 
-- Trade-offs: deletes the loader, the config section, the stage timer and three
-  degraded reasons. Gives up the large store gain.
+- Trade-offs: deletes the loader, the stage timer and three
+  degraded reasons. The config section is no longer read; a hidden field accepts
+  and ignores it. Gives up the large store gain.
 
 ## Decision
 

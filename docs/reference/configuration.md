@@ -67,8 +67,6 @@ unknown key fails loudly.
 | `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
 | `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
 
-The reranker was removed. A `[reranker]` section from an older `liam.toml` is ignored, and the daemon logs one warning at start. You can delete it.
-
 `[producers.clients]` is a plain table, and the ids are what land in the
 `producer` column:
 
@@ -77,6 +75,8 @@ The reranker was removed. A `[reranker]` section from an older `liam.toml` is ig
 claude-code = "claude"
 ai-notetaker = "notetaker"
 ```
+
+The reranker was removed. A `[reranker]` section from an older `liam.toml` is ignored, and the daemon logs one warning at start. You can delete it.
 
 Logs go to stderr. Stdout carries the MCP JSON-RPC stream, so it stays clean.
 
