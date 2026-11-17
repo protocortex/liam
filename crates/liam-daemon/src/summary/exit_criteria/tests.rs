@@ -439,7 +439,6 @@ impl World {
         let server = MemoryServer::new(
             Arc::new(store),
             Arc::new(MockEmbedder::new(DIMS)),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(FixedLlm),
             ASK_TIMEOUT_SECS,
             false,

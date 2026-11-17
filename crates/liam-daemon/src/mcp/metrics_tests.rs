@@ -4,12 +4,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use liam_model::{Llm, Reranker};
+use liam_model::Llm;
 use liam_store::{DefaultGraph, FixedClock, GraphConfig, Millis, NewNode};
 use rmcp::handler::server::wrapper::Parameters;
 use tokio_util::sync::CancellationToken;
 
 use super::metrics::{label_suffix, MetricsArgs, MAX_LIMIT};
+use super::test_doubles::ErroringEmbedder;
 use super::{AskArgs, MemoryServer, RecallArgs};
 use crate::degraded::Degraded;
 use crate::log_startup::test_support::{embedder, DIMS};
@@ -28,17 +29,6 @@ const RECALL_TIMEOUT_SECS: u64 = 1;
 const FACT_COUNT: usize = 3;
 const DEGRADED_RECALLS: usize = 3;
 const DEGRADED_REPLIES: &str = "degraded_replies";
-
-/// Outlasts any retrieval deadline, so recall falls back to store order.
-struct SleepingReranker;
-
-#[async_trait::async_trait]
-impl Reranker for SleepingReranker {
-    async fn scores(&self, _query: &str, docs: &[String]) -> liam_model::Result<Vec<f32>> {
-        tokio::time::sleep(SLOW).await;
-        Ok(vec![0.0; docs.len()])
-    }
-}
 
 /// Embeds after a delay no deadline outlasts, so retrieval fails on time.
 struct SleepingEmbedder;
@@ -68,32 +58,14 @@ impl Llm for FailingLlm {
 }
 
 async fn server(metrics: Option<Arc<Metrics>>) -> MemoryServer {
-    server_with(
-        metrics,
-        Arc::new(liam_model::IdentityReranker),
-        Arc::new(liam_model::MockLlm),
-    )
-    .await
+    server_with(metrics, Arc::new(liam_model::MockLlm)).await
 }
 
-async fn server_with(
-    metrics: Option<Arc<Metrics>>,
-    reranker: Arc<dyn Reranker>,
-    llm: Arc<dyn Llm>,
-) -> MemoryServer {
+async fn server_with(metrics: Option<Arc<Metrics>>, llm: Arc<dyn Llm>) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .unwrap();
-    let server = MemoryServer::new(
-        Arc::new(store),
-        embedder(),
-        reranker,
-        llm,
-        30,
-        false,
-        8192,
-        1,
-    );
+    let server = MemoryServer::new(Arc::new(store), embedder(), llm, 30, false, 8192, 1);
     let server = server.with_recall_timeout(RECALL_TIMEOUT_SECS);
     match metrics {
         Some(metrics) => server.with_metrics(metrics),
@@ -277,16 +249,14 @@ async fn a_server_without_metrics_says_so() {
 async fn degraded_recalls_and_asks_are_counted_by_tool_and_reason() {
     // Arrange
     let (metrics, _sink) = recorder();
-    let recalling = server_with(
-        Some(metrics.clone()),
-        Arc::new(SleepingReranker),
-        Arc::new(liam_model::MockLlm),
-    )
-    .await;
+    let recalling = MemoryServer {
+        embedder: Arc::new(ErroringEmbedder::new(DIMS)),
+        ..server(Some(metrics.clone())).await
+    };
     seed_facts(&recalling).await;
     let asking = MemoryServer {
         llm: Arc::new(FailingLlm),
-        reranker: Arc::new(liam_model::IdentityReranker),
+        embedder: embedder(),
         ..recalling.clone()
     };
 
@@ -301,7 +271,7 @@ async fn degraded_recalls_and_asks_are_counted_by_tool_and_reason() {
 
     // Assert
     assert!(
-        text.contains("degraded_replies{tool=recall,reason=rerank_timeout} = 3"),
+        text.contains("degraded_replies{tool=recall,reason=embed_failed} = 3"),
         "{text}"
     );
     assert!(
@@ -372,12 +342,10 @@ async fn a_deadline_failure_and_a_cancel_are_not_counted() {
 async fn a_server_without_metrics_replies_the_same_for_a_degraded_recall() {
     // Arrange
     let (metrics, _sink) = recorder();
-    let with = server_with(
-        Some(metrics),
-        Arc::new(SleepingReranker),
-        Arc::new(liam_model::MockLlm),
-    )
-    .await;
+    let with = MemoryServer {
+        embedder: Arc::new(ErroringEmbedder::new(DIMS)),
+        ..server(Some(metrics)).await
+    };
     let without = MemoryServer {
         metrics: None,
         ..with.clone()
@@ -393,7 +361,7 @@ async fn a_server_without_metrics_replies_the_same_for_a_degraded_recall() {
     assert_eq!(uncounted.content, counted.content);
     assert_eq!(
         uncounted.structured_content,
-        Some(serde_json::json!({ "degraded": [Degraded::RerankTimeout] }))
+        Some(serde_json::json!({ "degraded": [Degraded::EmbedFailed] }))
     );
 }
 

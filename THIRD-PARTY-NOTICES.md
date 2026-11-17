@@ -183,7 +183,7 @@ assumed:
   only as the runtime behind the local embedder.
 - **fastembed and ort**: `fastembed` (Apache-2.0) and `ort` plus `ort-sys`
   (MIT OR Apache-2.0) are still in the tree; they run the local embedding
-  and reranking models.
+  models.
 - **tokenizers**: `tokenizers` (Apache-2.0) is still in the tree, used by
   fastembed for text tokenization. It was not pruned.
 

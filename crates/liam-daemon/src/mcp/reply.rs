@@ -141,7 +141,7 @@ mod tests {
     fn two_reasons_are_marked_in_insertion_order_and_structured_in_snake_case() {
         // Arrange
         let reply = ToolReply::ok(BODY)
-            .with_degraded(Degraded::RerankTimeout)
+            .with_degraded(Degraded::EmbedFailed)
             .with_degraded(Degraded::SynthesisUnavailable);
 
         // Act
@@ -149,13 +149,13 @@ mod tests {
 
         // Assert
         let expected_text = format!(
-            "{DEGRADED_MARKER_PREFIX}rerank_timeout, hits are in store order; \
+            "{DEGRADED_MARKER_PREFIX}embed_failed, searched by keyword only; \
              synthesis_unavailable, showing the retrieved evidence)\n{BODY}"
         );
         assert_eq!(text_of(&result), expected_text);
         assert_eq!(
             result.structured_content,
-            Some(json!({"degraded": ["rerank_timeout", "synthesis_unavailable"]}))
+            Some(json!({"degraded": ["embed_failed", "synthesis_unavailable"]}))
         );
     }
 
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn output_schema_requires_degraded_array_of_the_five_reasons() {
+    fn output_schema_requires_degraded_array_of_every_reason() {
         // Arrange
         let expected_reasons: Vec<&str> = Degraded::ALL.iter().map(|d| d.as_str()).collect();
 
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn text_accessor_excludes_the_marker() {
         // Arrange
-        let reply = ToolReply::ok(BODY).with_degraded(Degraded::RerankFailed);
+        let reply = ToolReply::ok(BODY).with_degraded(Degraded::EmbedFailed);
 
         // Act
         let body = reply.text();
@@ -226,21 +226,6 @@ mod tests {
                 Degraded::EmbedFailed,
                 "embed_failed",
                 "searched by keyword only",
-            ),
-            (
-                Degraded::RerankSkipped,
-                "rerank_skipped",
-                "hits are in store order",
-            ),
-            (
-                Degraded::RerankFailed,
-                "rerank_failed",
-                "hits are in store order",
-            ),
-            (
-                Degraded::RerankTimeout,
-                "rerank_timeout",
-                "hits are in store order",
             ),
             (
                 Degraded::SynthesisUnavailable,

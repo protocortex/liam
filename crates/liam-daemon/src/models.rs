@@ -10,18 +10,15 @@
 //! Every loader here is synchronous, so the CLI needs no async runtime to
 //! drive them.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use liam_model::llm::DevicePreference;
-use liam_model::{
-    Embedder, IdentityReranker, Llm, MockEmbedder, MockLlm, Reranker, RerankerModelSpec,
-    RerankerSettings, TextKind, UserDefinedReranker,
-};
+use liam_model::{Embedder, Llm, MockEmbedder, MockLlm, TextKind};
 use liam_store::{ContentEmbedder, EmbedError};
 
-use crate::config::{self, Config, RerankerModel};
+use crate::config::{self, Config};
 
 /// Expands `~` in a configured path. Nothing below the config layer
 /// understands a home directory: the socket API would create a directory
@@ -139,29 +136,9 @@ pub const MOCK_PROVIDER: &str = "mock";
 /// The `llm.provider` value that selects in-process llama.cpp.
 pub const LLAMA_PROVIDER: &str = "llama-cpp";
 
-/// Points fastembed's cache at the configured directory when the embedder is
-/// local, and returns that directory.
-///
-/// fastembed reads the cache directory from the environment, and mutating the
-/// environment once other threads exist is a data race on POSIX, so callers run
-/// this before starting a runtime. The configured value is resolved first
-/// because fastembed does not expand `~`, and passing it raw downloads models
-/// into a directory named `~`. It sets the reranker's cache; the embedder
-/// reaches the same directory through its own explicit parameter.
-pub fn export_fastembed_cache_dir(config: &Config) -> anyhow::Result<Option<PathBuf>> {
-    if config.embedder.provider != LOCAL_PROVIDER {
-        return Ok(None);
-    }
-    let cache_dir = resolve_config_path("embedder.cache_dir", &config.embedder.cache_dir)?;
-    std::env::set_var("FASTEMBED_CACHE_DIR", &cache_dir);
-    Ok(Some(cache_dir))
-}
-
 /// Choose the embedder from config. `mock` is for tests and dev; the `local`
 /// provider loads fastembed in-process. Any other name is an error, so a typo
 /// cannot quietly select the mock.
-///
-/// Callers must run `export_fastembed_cache_dir` first.
 pub fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
     if config.embedder.provider == LOCAL_PROVIDER {
         return build_local_embedder(config);
@@ -173,18 +150,6 @@ pub fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
         "embedder.provider = {:?} is not one of {LOCAL_PROVIDER:?}, {MOCK_PROVIDER:?}",
         config.embedder.provider
     )
-}
-
-/// The embedder from `build_embedder` and the reranker the same config asks for:
-/// identity for the mock provider, the configured backend for `local`.
-pub fn build_models(config: &Config) -> anyhow::Result<(Arc<dyn Embedder>, Arc<dyn Reranker>)> {
-    let embedder = build_embedder(config)?;
-    let reranker: Arc<dyn Reranker> = if config.embedder.provider == LOCAL_PROVIDER {
-        build_local_reranker(config, &RealRerankerLoader)?
-    } else {
-        Arc::new(IdentityReranker)
-    };
-    Ok((embedder, reranker))
 }
 
 /// Whether `model` names BGE-M3, which loads through its own embedder. A model
@@ -239,129 +204,6 @@ fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
         &cache_dir,
         device,
     )?))
-}
-
-/// Subdirectory of `embedder.cache_dir` that holds the ONNX rerankers.
-const RERANKERS_CACHE_SUBDIR: &str = "rerankers";
-
-/// Which reranker implementation a config asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RerankerBackend {
-    /// No reranker: recall keeps store order and nothing is loaded.
-    Off,
-    /// The fastembed model, which downloads itself and ignores `threads` and
-    /// `max_tokens`.
-    Legacy,
-    /// A pinned ONNX model read from `dir`.
-    Onnx {
-        spec: &'static RerankerModelSpec,
-        dir: PathBuf,
-    },
-}
-
-/// Picks the backend from `config.reranker`. The ONNX directory is
-/// `reranker.model_dir` when set, else `<embedder.cache_dir>/rerankers/<id>`.
-fn select_reranker_backend(config: &Config) -> anyhow::Result<RerankerBackend> {
-    let model = config.reranker.model;
-    if model == RerankerModel::None {
-        return Ok(RerankerBackend::Off);
-    }
-    if model == RerankerModel::BgeRerankerBase {
-        return Ok(RerankerBackend::Legacy);
-    }
-    let spec = liam_model::reranker_model_spec(model.as_str()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "reranker.model = {:?} has no ONNX model spec",
-            model.as_str()
-        )
-    })?;
-    let dir = match &config.reranker.model_dir {
-        Some(dir) => resolve_config_path("reranker.model_dir", dir)?,
-        None => resolve_config_path("embedder.cache_dir", &config.embedder.cache_dir)?
-            .join(RERANKERS_CACHE_SUBDIR)
-            .join(spec.id),
-    };
-    Ok(RerankerBackend::Onnx { spec, dir })
-}
-
-/// How `build_local_reranker` loads a model and reports a fallback, so tests
-/// need neither model files nor a log subscriber.
-trait RerankerLoader {
-    fn legacy(&self) -> anyhow::Result<Arc<dyn Reranker>>;
-    fn onnx(
-        &self,
-        dir: &Path,
-        spec: &RerankerModelSpec,
-        settings: RerankerSettings,
-    ) -> liam_model::error::Result<Arc<dyn Reranker>>;
-    fn warn(&self, message: &str);
-    fn error(&self, message: &str);
-}
-
-struct RealRerankerLoader;
-
-impl RerankerLoader for RealRerankerLoader {
-    fn legacy(&self) -> anyhow::Result<Arc<dyn Reranker>> {
-        Ok(Arc::new(liam_model::FastEmbedReranker::load()?))
-    }
-
-    fn onnx(
-        &self,
-        dir: &Path,
-        spec: &RerankerModelSpec,
-        settings: RerankerSettings,
-    ) -> liam_model::error::Result<Arc<dyn Reranker>> {
-        Ok(Arc::new(UserDefinedReranker::load(dir, spec, settings)?))
-    }
-
-    fn warn(&self, message: &str) {
-        tracing::warn!("{message}");
-    }
-
-    fn error(&self, message: &str) {
-        tracing::error!("{message}");
-    }
-}
-
-/// An ONNX reranker that is missing or fails to load falls back to store
-/// order, so the daemon still starts. A legacy load
-/// failure is an error, as before.
-fn build_local_reranker(
-    config: &Config,
-    loader: &dyn RerankerLoader,
-) -> anyhow::Result<Arc<dyn Reranker>> {
-    match select_reranker_backend(config)? {
-        RerankerBackend::Off => Ok(Arc::new(IdentityReranker)),
-        RerankerBackend::Legacy => loader.legacy(),
-        RerankerBackend::Onnx { spec, dir } => {
-            let settings = RerankerSettings {
-                threads: config.reranker.threads,
-                max_tokens: config.reranker.max_tokens,
-            };
-            match loader.onnx(&dir, spec, settings) {
-                Ok(reranker) => Ok(reranker),
-                Err(liam_model::ModelError::RerankFilesNotFound(_)) => {
-                    loader.warn(&format!(
-                        "reranker unavailable, recall will answer in store order: model {} \
-                         has no files in {}. Place the model files there, or set \
-                         reranker.model_dir to a directory that has them.",
-                        spec.id,
-                        dir.display()
-                    ));
-                    Ok(Arc::new(IdentityReranker))
-                }
-                Err(error) => {
-                    loader.error(&format!(
-                        "reranker disabled, recall will answer in store order: model {} \
-                         in {} failed to load ({error})",
-                        spec.id,
-                        dir.display()
-                    ));
-                    Ok(Arc::new(IdentityReranker))
-                }
-            }
-        }
-    }
 }
 
 /// Choose the LLM from config. Mock is for tests and dev; `llama-cpp`
@@ -467,7 +309,7 @@ fn macos_backend_error(backend: &str, device: DevicePreference) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::path::Path;
 
     /// The model cache dirs are the two paths that were NOT being expanded,
     /// while `socket_path` and `database_path` always were. Left raw, fastembed
@@ -665,282 +507,16 @@ mod tests {
         assert!(error.to_string().contains("no model"), "{error}");
     }
 
-    const FAKE_ONNX_DIR: &str = "/models/reranker";
-
-    #[derive(Clone, Copy)]
-    enum OnnxFailure {
-        FilesNotFound,
-        LoadFailed,
-    }
-
-    #[derive(Default)]
-    struct FakeLoader {
-        onnx_failure: Option<OnnxFailure>,
-        legacy_fails: bool,
-        legacy_calls: Cell<usize>,
-        onnx_calls: RefCell<Vec<(PathBuf, &'static str, RerankerSettings)>>,
-        warnings: RefCell<Vec<String>>,
-        errors: RefCell<Vec<String>>,
-    }
-
-    impl RerankerLoader for FakeLoader {
-        fn legacy(&self) -> anyhow::Result<Arc<dyn Reranker>> {
-            self.legacy_calls.set(self.legacy_calls.get() + 1);
-            if self.legacy_fails {
-                anyhow::bail!("legacy load failed");
-            }
-            Ok(Arc::new(IdentityReranker))
-        }
-
-        fn onnx(
-            &self,
-            dir: &Path,
-            spec: &RerankerModelSpec,
-            settings: RerankerSettings,
-        ) -> liam_model::error::Result<Arc<dyn Reranker>> {
-            self.onnx_calls
-                .borrow_mut()
-                .push((dir.to_path_buf(), spec.id, settings));
-            match self.onnx_failure {
-                Some(OnnxFailure::FilesNotFound) => {
-                    return Err(liam_model::ModelError::RerankFilesNotFound(
-                        "model_int8.onnx: No such file".to_string(),
-                    ));
-                }
-                Some(OnnxFailure::LoadFailed) => {
-                    return Err(liam_model::ModelError::Rerank(
-                        "model_int8.onnx is 10 bytes, expected 20".to_string(),
-                    ));
-                }
-                None => {}
-            }
-            Ok(Arc::new(IdentityReranker))
-        }
-
-        fn warn(&self, message: &str) {
-            self.warnings.borrow_mut().push(message.to_string());
-        }
-
-        fn error(&self, message: &str) {
-            self.errors.borrow_mut().push(message.to_string());
-        }
-    }
-
-    fn reranker_config(model: RerankerModel) -> Config {
-        let mut config = Config::default();
-        config.reranker.model = model;
-        config.embedder.cache_dir = "/cache".to_string();
-        config
-    }
-
     #[test]
-    fn the_default_reranker_is_off_and_loads_nothing_and_warns_of_nothing() {
+    fn the_default_config_builds_only_an_embedder() {
         // Arrange
         let config = Config::default();
-        let loader = FakeLoader::default();
-        let docs = vec!["a".to_string(), "b".to_string()];
 
         // Act
-        let backend = select_reranker_backend(&config).unwrap();
-        let reranker = build_local_reranker(&config, &loader).unwrap();
-        let scores = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(reranker.scores("q", &docs))
-            .unwrap();
+        let embedder: Arc<dyn Embedder> = build_embedder(&config).unwrap();
 
         // Assert
-        assert_eq!(config.reranker.model, RerankerModel::None);
-        assert_eq!(backend, RerankerBackend::Off);
-        assert_eq!(scores, vec![0.0, 0.0]);
-        assert_eq!(loader.legacy_calls.get(), 0);
-        assert!(loader.onnx_calls.borrow().is_empty());
-        assert!(loader.warnings.borrow().is_empty());
-        assert!(loader.errors.borrow().is_empty());
-    }
-
-    #[test]
-    fn the_legacy_model_selects_the_legacy_backend() {
-        // Arrange
-        let config = reranker_config(RerankerModel::BgeRerankerBase);
-
-        // Act
-        let backend = select_reranker_backend(&config).unwrap();
-
-        // Assert
-        assert_eq!(backend, RerankerBackend::Legacy);
-    }
-
-    #[test]
-    fn each_onnx_model_selects_its_own_spec() {
-        for (model, id) in [
-            (
-                RerankerModel::BgeRerankerV2M3,
-                liam_model::reranker_model_spec("bge-reranker-v2-m3")
-                    .unwrap()
-                    .id,
-            ),
-            (
-                RerankerModel::GteMultilingualRerankerBase,
-                liam_model::reranker_model_spec("gte-multilingual-reranker-base")
-                    .unwrap()
-                    .id,
-            ),
-        ] {
-            // Arrange
-            let config = reranker_config(model);
-
-            // Act
-            let backend = select_reranker_backend(&config).unwrap();
-
-            // Assert
-            match backend {
-                RerankerBackend::Onnx { spec, .. } => assert_eq!(spec.id, id),
-                RerankerBackend::Legacy | RerankerBackend::Off => {
-                    panic!("{id} must select the ONNX backend")
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_onnx_directory_is_the_configured_one_or_lives_under_the_cache() {
-        // Arrange
-        let mut configured = reranker_config(RerankerModel::BgeRerankerV2M3);
-        configured.reranker.model_dir = Some("/elsewhere/v2m3".to_string());
-        let unset = reranker_config(RerankerModel::BgeRerankerV2M3);
-
-        // Act
-        let configured_backend = select_reranker_backend(&configured).unwrap();
-        let unset_backend = select_reranker_backend(&unset).unwrap();
-
-        // Assert
-        let dir_of = |backend| match backend {
-            RerankerBackend::Onnx { dir, .. } => dir,
-            RerankerBackend::Legacy | RerankerBackend::Off => panic!("expected the ONNX backend"),
-        };
-        assert_eq!(dir_of(configured_backend), PathBuf::from("/elsewhere/v2m3"));
-        assert_eq!(
-            dir_of(unset_backend),
-            PathBuf::from("/cache/rerankers/bge-reranker-v2-m3")
-        );
-    }
-
-    #[test]
-    fn the_onnx_loader_receives_the_configured_threads_and_token_limit() {
-        // Arrange
-        let mut config = reranker_config(RerankerModel::GteMultilingualRerankerBase);
-        config.reranker.model_dir = Some(FAKE_ONNX_DIR.to_string());
-        config.reranker.threads = 3;
-        config.reranker.max_tokens = 256;
-        let loader = FakeLoader::default();
-
-        // Act
-        build_local_reranker(&config, &loader).unwrap();
-
-        // Assert
-        assert_eq!(
-            *loader.onnx_calls.borrow(),
-            vec![(
-                PathBuf::from(FAKE_ONNX_DIR),
-                "gte-multilingual-reranker-base",
-                RerankerSettings {
-                    threads: 3,
-                    max_tokens: 256
-                }
-            )]
-        );
-        assert_eq!(loader.legacy_calls.get(), 0);
-    }
-
-    #[test]
-    fn missing_onnx_files_fall_back_to_the_identity_reranker_with_one_warning() {
-        // Arrange
-        let mut config = reranker_config(RerankerModel::BgeRerankerV2M3);
-        config.reranker.model_dir = Some(FAKE_ONNX_DIR.to_string());
-        let loader = FakeLoader {
-            onnx_failure: Some(OnnxFailure::FilesNotFound),
-            ..FakeLoader::default()
-        };
-        let docs = vec!["a".to_string(), "b".to_string()];
-
-        // Act
-        let reranker = build_local_reranker(&config, &loader).unwrap();
-        let scores = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(reranker.scores("q", &docs))
-            .unwrap();
-
-        // Assert
-        assert_eq!(scores, vec![0.0, 0.0]);
-        let warnings = loader.warnings.borrow();
-        assert_eq!(warnings.len(), 1);
-        assert!(
-            warnings[0].contains("reranker unavailable"),
-            "{}",
-            warnings[0]
-        );
-        assert!(
-            warnings[0].contains("bge-reranker-v2-m3"),
-            "{}",
-            warnings[0]
-        );
-        assert!(warnings[0].contains(FAKE_ONNX_DIR), "{}", warnings[0]);
-        assert!(warnings[0].contains("model_dir"), "{}", warnings[0]);
-        assert!(loader.errors.borrow().is_empty());
-    }
-
-    #[test]
-    fn present_but_unloadable_onnx_files_fall_back_with_one_error_naming_the_cause() {
-        // Arrange
-        let mut config = reranker_config(RerankerModel::BgeRerankerV2M3);
-        config.reranker.model_dir = Some(FAKE_ONNX_DIR.to_string());
-        let loader = FakeLoader {
-            onnx_failure: Some(OnnxFailure::LoadFailed),
-            ..FakeLoader::default()
-        };
-
-        // Act
-        let result = build_local_reranker(&config, &loader);
-
-        // Assert
-        assert!(result.is_ok());
-        assert!(loader.warnings.borrow().is_empty());
-        let errors = loader.errors.borrow();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("bge-reranker-v2-m3"), "{}", errors[0]);
-        assert!(
-            errors[0].contains("is 10 bytes, expected 20"),
-            "{}",
-            errors[0]
-        );
-        assert!(errors[0].contains("disabled"), "{}", errors[0]);
-    }
-
-    #[test]
-    fn a_legacy_load_failure_is_still_an_error() {
-        // Arrange
-        let config = reranker_config(RerankerModel::BgeRerankerBase);
-        let loader = FakeLoader {
-            legacy_fails: true,
-            ..FakeLoader::default()
-        };
-
-        // Act
-        let result = build_local_reranker(&config, &loader);
-
-        // Assert
-        assert!(result.is_err());
-        assert!(loader.warnings.borrow().is_empty());
-    }
-
-    #[test]
-    fn a_mock_embedder_exports_no_cache_directory() {
-        assert_eq!(
-            export_fastembed_cache_dir(&Config::default()).unwrap(),
-            None
-        );
+        assert_eq!(embedder.dims(), config.embedding_dims);
     }
 
     #[test]

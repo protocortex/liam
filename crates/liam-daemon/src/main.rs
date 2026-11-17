@@ -2,8 +2,7 @@
 //! liam-daemon: serves liam memory to agents over MCP.
 //!
 //! A thin shell wiring `liam-store` (retrieval) and `liam-model`
-//! (embedding, reranking). `provider = "local"` loads fastembed in-process (Qwen3 embedder,
-//! cross-encoder reranker), no server.
+//! (embedding). `provider = "local"` loads the embedder in-process, no server.
 
 mod ask;
 mod cli;
@@ -54,11 +53,9 @@ pub use liam_daemon::config;
 use config::Config;
 use consolidation_job::{ConsolidationJob, JobSetup};
 use liam_daemon::consolidation::maintenance::standard_steps;
-use liam_daemon::models::{
-    build_llm, build_models, export_fastembed_cache_dir, resolve_config_path, resolve_log_dir,
-};
+use liam_daemon::models::{build_embedder, build_llm, resolve_config_path, resolve_log_dir};
 use liam_daemon::{embedder_fingerprint, storelock, telemetry};
-use liam_model::{Embedder, Llm, Reranker};
+use liam_model::{Embedder, Llm};
 use log_startup::StartedStore;
 use mcp::MemoryServer;
 use shutdown::Shutdown;
@@ -83,10 +80,6 @@ fn main() -> anyhow::Result<()> {
     let config_path = cli.config_path(std::env::var("LIAM_CONFIG").ok().as_deref());
 
     let config = Config::load(config_path.as_ref())?;
-    // Before the runtime starts; skipped for the proxy, which loads no model.
-    if mode.loads_models() {
-        export_fastembed_cache_dir(&config)?;
-    }
     let is_proxy = mode == cli::Mode::Proxy;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -168,7 +161,10 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         &embedder_fingerprint::EmbedderFingerprint::from_config(&config),
     )?;
 
-    let (embedder, reranker) = build_models(&config)?;
+    if let Some(warning) = config.removed_reranker_warning() {
+        tracing::warn!("{warning}");
+    }
+    let embedder = build_embedder(&config)?;
     let StartedStore {
         store,
         compactor,
@@ -208,7 +204,6 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         build_autotuned_server(
             store,
             embedder,
-            reranker,
             llm,
             config.ask_timeout_secs,
             config.ask_sufficiency_check,
@@ -221,7 +216,6 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         MemoryServer::new(
             store,
             embedder,
-            reranker,
             llm,
             config.ask_timeout_secs,
             config.ask_sufficiency_check,
@@ -255,7 +249,6 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     let server = server
         .with_shutdown(shutdown.token())
         .with_recall_timeout(config.recall_timeout_secs)
-        .with_rerank_pool_cap(config.reranker.pool_cap)
         .with_vocabulary(config::resolve_vocabulary(&config.extraction))
         .with_max_basis_ids_rendered(config.summary.max_basis_ids_rendered)
         .with_min_summary_similarity(config.summary.min_summary_similarity);
@@ -400,7 +393,6 @@ async fn stop_background_tasks(
 fn build_autotuned_server(
     store: Arc<DefaultGraph>,
     embedder: Arc<dyn Embedder>,
-    reranker: Arc<dyn Reranker>,
     llm: Arc<dyn Llm>,
     ask_timeout_secs: u64,
     ask_sufficiency_check: bool,
@@ -414,7 +406,6 @@ fn build_autotuned_server(
     let server = MemoryServer::new(
         store,
         embedder,
-        reranker,
         llm.clone(),
         ask_timeout_secs,
         ask_sufficiency_check,
@@ -698,13 +689,12 @@ mod tests {
     }
 
     /// A `MemoryServer` wrapping `store`, backed by mock model doubles that
-    /// never touch a real embedder, reranker, or LLM: enough for
+    /// never touch a real embedder or LLM: enough for
     /// `maintenance_tick` to reach the store it holds, nothing else.
     fn test_server(store: Arc<DefaultGraph>) -> MemoryServer {
         MemoryServer::new(
             store,
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::IdentityReranker),
             Arc::new(liam_model::MockLlm),
             30,
             false,
@@ -879,7 +869,6 @@ mod tests {
         let server = build_autotuned_server(
             autotune_store().await,
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::IdentityReranker),
             llm,
             30,
             false,
@@ -923,7 +912,6 @@ mod tests {
         let server = build_autotuned_server(
             autotune_store().await,
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::IdentityReranker),
             llm,
             30,
             false,
@@ -1062,7 +1050,6 @@ mod tests {
         MemoryServer::new(
             store,
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::IdentityReranker),
             llm,
             30,
             false,

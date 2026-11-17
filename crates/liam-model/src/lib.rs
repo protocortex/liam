@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! liam-model: embedding and reranking for liam.
+//! liam-model: embedding and generation for liam.
 //!
 //! The store is model-free by design. This crate holds the `Embedder` and
-//! `Reranker` traits plus adapters, so the daemon can embed before writing and
-//! rerank after retrieving without the store ever depending on a model runtime.
+//! `Llm` traits plus adapters, so the daemon can embed before writing without
+//! the store ever depending on a model runtime.
 
 mod bge;
 mod blocking;
@@ -15,8 +15,6 @@ mod llama_embedder;
 pub mod llm;
 mod onnx;
 mod onnx_pinned;
-pub mod reranker;
-mod reranker_model;
 
 pub mod llama;
 
@@ -27,17 +25,11 @@ pub use llm::{Llm, MockLlm};
 pub use onnx::{
     onnx_model_spec, OnnxModelSpec, OnnxSource, DEFAULT_EMBEDDER_MODEL_ID, ONNX_MODELS,
 };
-pub use onnx_pinned::{PinnedOnnxModel, ARCTIC_EMBED_M_V2};
-pub use reranker::{IdentityReranker, Reranker};
+pub use onnx_pinned::{PinnedFile, PinnedOnnxModel, ARCTIC_EMBED_M_V2};
 
 pub use bge::BgeM3Embedder;
 pub use embedder::FastEmbedEmbedder;
 pub use onnx::OnnxEmbedder;
-pub use reranker::FastEmbedReranker;
-pub use reranker_model::{
-    reranker_model_spec, resolve_threads, verify_installed, PinnedFile, RerankerModelSpec,
-    RerankerSettings, SessionRequest, UserDefinedReranker, RERANKER_MODELS,
-};
 
 pub use gguf_verify::verify_pinned_file;
 pub use llama::LlamaCppLlm;

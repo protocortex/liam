@@ -13,12 +13,12 @@ links them.
 
 Retrieval blends three signals instead of relying on vectors alone: full-text
 match, vector similarity, and one-hop graph expansion, fused into one ranked
-list and reranked for precision.
+list.
 
 ## What you get
 
 - Hybrid retrieval. BM25 full-text, cosine vector search, and graph expansion,
-  fused with reciprocal rank fusion (RRF), then reranked by a cross-encoder.
+  fused with reciprocal rank fusion (RRF).
 - As-of recall. Point-in-time queries over both timelines, so history is a
   first-class read, not an audit log you dig through.
 - Contradiction handling on write. `upsert_by` supersedes the prior fact with
@@ -30,5 +30,5 @@ list and reranked for precision.
 - Labelled provenance. Every item says whether it was recorded, extracted or
   inferred and which log events it rests on, and strict reads never return
   model-written text.
-- A model-free core. The store takes vectors as input. Embedding and reranking
-  live in a separate crate, so you swap models without touching storage.
+- A model-free core. The store takes vectors as input. Embedding
+  lives in a separate crate, so you swap models without touching storage.

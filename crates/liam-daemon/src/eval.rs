@@ -451,7 +451,6 @@ mod run {
         let server = MemoryServer::new(
             store,
             embedder,
-            Arc::new(liam_model::IdentityReranker),
             llm,
             ASK_TIMEOUT_SECS,
             // Measure what the daemon ships, including the pre-pass.

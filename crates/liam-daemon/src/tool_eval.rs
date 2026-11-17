@@ -10,16 +10,14 @@
 //!
 //! # Two tiers
 //!
-//! - **Mock tier, always-on:** `MockEmbedder`/`IdentityReranker`/`MockLlm`, no
-//!   model download. A plain `#[tokio::test]`, runs under
+//! - **Mock tier, always-on:** `MockEmbedder` and `MockLlm`, no model
+//!   download. A plain `#[tokio::test]`, runs under
 //!   `cargo test -p liam-daemon --bin liamd tool_eval`.
 //! - **Real-tier, gated + `#[ignore]`d:** the actual local embedder
-//!   (`FastEmbedEmbedder`, Qwen3) AND the actual local reranker
-//!   (`FastEmbedReranker`, a BGE cross-encoder) and `#[ignore]`d,
-//!   downloading weights on first run:
+//!   (`FastEmbedEmbedder`, Qwen3), downloading weights on first run:
 //!
 //!   ```text
-//!   cargo test --release -p liam-daemon --bin liamd -- --ignored --nocapture reranking
+//!   cargo test --release -p liam-daemon --bin liamd -- --ignored --nocapture semantic_paraphrase
 //!   ```
 //!
 //!   Env override: `LIAM_TOOL_EVAL_MODEL`, mirroring `eval.rs`'s
@@ -27,30 +25,17 @@
 //!   for a local A/B run against a different embedding model.
 //!
 //! # Real-tier baseline (2026-08-31, Apple M1 Pro, macOS 15.7.5,
-//! # Qwen/Qwen3-Embedding-0.6B, 768 dims, default BGE reranker via fastembed,
-//! # `cargo test --release -p liam-daemon --bin liamd --
-//! # --ignored --nocapture reranking`)
+//! # Qwen/Qwen3-Embedding-0.6B, 768 dims, `cargo test --release -p liam-daemon
+//! # --bin liamd -- --ignored --nocapture semantic_paraphrase`)
 //!
-//! `reranking_promotes_the_correct_target_over_a_surface_decoy`: under
-//! `IdentityReranker` (real embedding + lexical RRF, no rerank), recall
-//! ordered `["Gizmo ship date", "Nightjar ship date"]` for the query "When
-//! does the zorbnax gizmo's successor ship?" (decoy reciprocal rank 1.0,
-//! target reciprocal rank 0.5). Under `FastEmbedReranker`, the same query
-//! against the same fixture reordered to `["Nightjar ship date", "Gizmo ship
-//! date"]` (target reciprocal rank 1.0). See `mod real_tier` below for why
-//! this fixture reproduces the flaw.
-//!
-//! `semantic_paraphrase_recovers_the_remembered_fact` (2026-08-31, same
-//! machine/model as above,
-//! `cargo test --release -p liam-daemon --bin liamd --
-//! --ignored --nocapture semantic_paraphrase`): recalling under
-//! `IdentityReranker` with the paraphrase query "Will they fix it for free
-//! if liquid gets inside accidentally?" against the sole seeded fact
-//! "Nightjar's warranty only covers manufacturing defects, never water
-//! damage." (zero shared non-stopword tokens between query and fact
-//! content) returned that fact, label "Nightjar warranty terms", as the
-//! only and top hit (reciprocal rank 1.0), confirming the real embedder
-//! alone, with no lexical overlap to lean on, recovers the fact.
+//! `semantic_paraphrase_recovers_the_remembered_fact`: recalling with the
+//! paraphrase query "Will they fix it for free if liquid gets inside
+//! accidentally?" against the sole seeded fact "Nightjar's warranty only
+//! covers manufacturing defects, never water damage." (zero shared
+//! non-stopword tokens between query and fact content) returned that fact,
+//! label "Nightjar warranty terms", as the only and top hit (reciprocal rank
+//! 1.0), confirming the real embedder alone, with no lexical overlap to lean
+//! on, recovers the fact.
 
 use std::sync::Arc;
 
@@ -67,23 +52,19 @@ type Fact = (&'static str, &'static str, &'static str);
 const ASK_TIMEOUT_SECS: u64 = 300;
 
 /// Opens a fresh in-memory store and wires it into a `MemoryServer` with the
-/// given embedder/reranker and a `MockLlm` (this module never exercises
+/// given embedder and a `MockLlm` (this module never exercises
 /// `ask`).
 ///
 /// WHY this doesn't reuse `eval.rs`'s server construction: `eval.rs` builds
 /// its server once, inline, inside a single `#[ignore]`d test behind a fixed
-/// real LLM and reranker, because it only ever measures answer synthesis.
+/// real LLM, because it only ever measures answer synthesis.
 /// This module's tests each need a fresh store per test (`seed` mutates it)
-/// and vary the embedder/reranker across tiers, mock now (`mod tests` below)
+/// and vary the embedder across tiers, mock now (`mod tests` below)
 /// and a real embedder (`mod real_tier` below), both in this file, so the
 /// construction has to be a reusable function rather than one inline block;
 /// there being no third caller yet, that function stays here instead of
 /// becoming a shared helper across the eval modules.
-async fn build_server(
-    embedder: Arc<dyn liam_model::Embedder>,
-    reranker: Arc<dyn liam_model::Reranker>,
-    dims: usize,
-) -> mcp::MemoryServer {
+async fn build_server(embedder: Arc<dyn liam_model::Embedder>, dims: usize) -> mcp::MemoryServer {
     let store = Arc::new(
         liam_store::DefaultGraph::open(":memory:", liam_store::GraphConfig::new(dims))
             .await
@@ -92,7 +73,6 @@ async fn build_server(
     mcp::MemoryServer::new(
         store,
         embedder,
-        reranker,
         Arc::new(liam_model::MockLlm),
         ASK_TIMEOUT_SECS,
         crate::config::Config::default().ask_sufficiency_check,
@@ -207,130 +187,6 @@ mod real_tier {
         (embedder, dims)
     }
 
-    /// Label of the fixture's correct answer to `QUERY`.
-    const TARGET_LABEL: &str = "Nightjar ship date";
-    /// Label of the fixture's surface-similar wrong answer to `QUERY`.
-    const DECOY_LABEL: &str = "Gizmo ship date";
-
-    /// Query asking specifically about the zorbnax gizmo's SUCCESSOR, not
-    /// the gizmo itself.
-    const QUERY: &str = "When does the zorbnax gizmo's successor ship?";
-
-    /// The two-fact fixture that reproduces the ranking flaw. WHY the decoy
-    /// beats the target under `IdentityReranker` (real embedding + lexical
-    /// RRF, no rerank) despite answering the wrong question: `DECOY`'s
-    /// wording ("The zorbnax gizmo ships in June 2026") repeats `QUERY`'s
-    /// most literal phrase, "zorbnax gizmo ... ship", verbatim, but never
-    /// mentions a successor at all: it's the ORIGINAL product's ship date,
-    /// not the one `QUERY` actually asks for. `TARGET` answers the actual
-    /// question (the successor's ship date, under its own name "Nightjar")
-    /// and shares the word "successor" with `QUERY`, but paraphrases the
-    /// verb ("launches" instead of "ship") and never repeats `QUERY`'s
-    /// "zorbnax gizmo ships" phrase, so it has less raw surface/n-gram
-    /// overlap with `QUERY` than `DECOY` does, despite being the fact
-    /// `QUERY` is actually about. A cross-encoder reranker scores `QUERY`
-    /// and each document JOINTLY (not via separately-computed vectors), so
-    /// it can tell "this document is about the ORIGINAL gizmo, not its
-    /// successor" in a way that surface-overlap-driven ranking cannot; see
-    /// this module's top-of-file doc comment for the real ranks this fixture
-    /// produced.
-    const FIXTURE: [Fact; 2] = [
-        ("fact", DECOY_LABEL, "The zorbnax gizmo ships in June 2026."),
-        (
-            "fact",
-            TARGET_LABEL,
-            "Nightjar, the zorbnax gizmo's successor, launches in November 2026.",
-        ),
-    ];
-
-    /// Given a target fact and a surface-similar decoy fact seeded
-    /// identically into two real-embedding stores, when the same query is
-    /// recalled under `IdentityReranker`, then the decoy ranks first and the
-    /// target is outranked; when the same query is recalled under
-    /// `FastEmbedReranker`, then the target is promoted to rank first.
-    #[tokio::test]
-    #[ignore = "downloads reranker weights; see module doc for the run command"]
-    async fn reranking_promotes_the_correct_target_over_a_surface_decoy() {
-        // Arrange: one real embedder, loaded once, shared by both servers,
-        // since both need to embed the SAME facts/query identically for the
-        // comparison to isolate the reranker as the only variable that
-        // differs between them.
-        let (embedder, dims) = load_real_embedder();
-
-        let baseline_server = build_server(
-            embedder.clone(),
-            Arc::new(liam_model::IdentityReranker),
-            dims,
-        )
-        .await;
-        seed(&baseline_server, &FIXTURE).await;
-
-        let real_reranker = liam_model::FastEmbedReranker::load().expect(
-            "load reranker (BGE cross-encoder); requires network access for first-time model \
-             download",
-        );
-        let real_server = build_server(embedder, Arc::new(real_reranker), dims).await;
-        seed(&real_server, &FIXTURE).await;
-
-        // Act
-        let baseline_recall_text = baseline_server
-            .recall(Parameters(RecallArgs {
-                query: QUERY.to_string(),
-                kind: None,
-                scope: None,
-                k: Some(FIXTURE.len()),
-                as_of: None,
-                mode: None,
-            }))
-            .await;
-        let real_recall_text = real_server
-            .recall(Parameters(RecallArgs {
-                query: QUERY.to_string(),
-                kind: None,
-                scope: None,
-                k: Some(FIXTURE.len()),
-                as_of: None,
-                mode: None,
-            }))
-            .await;
-        println!("baseline (IdentityReranker) order: {baseline_recall_text}");
-        println!("real (FastEmbedReranker) order: {real_recall_text}");
-
-        let baseline_labels = labels_in_order(&baseline_recall_text);
-        let real_labels = labels_in_order(&real_recall_text);
-        println!("baseline labels: {baseline_labels:?}");
-        println!("real labels: {real_labels:?}");
-
-        // Assert
-        let decoy = HashSet::from([DECOY_LABEL]);
-        let target = HashSet::from([TARGET_LABEL]);
-        let baseline_decoy_rr =
-            liam_daemon::retrieval_eval::reciprocal_rank(&baseline_labels, &decoy);
-        let baseline_target_rr =
-            liam_daemon::retrieval_eval::reciprocal_rank(&baseline_labels, &target);
-        let real_target_rr = liam_daemon::retrieval_eval::reciprocal_rank(&real_labels, &target);
-        println!(
-            "reciprocal rank: baseline decoy={baseline_decoy_rr}, baseline \
-             target={baseline_target_rr}, real target={real_target_rr}"
-        );
-
-        assert_eq!(
-            baseline_decoy_rr, 1.0,
-            "expected the decoy to rank first under IdentityReranker, proving it is a real, \
-             retrieved competitor rather than the target simply being missing: {baseline_labels:?}"
-        );
-        assert_eq!(
-            baseline_target_rr, 0.5,
-            "expected the target to be outranked (not missing) under IdentityReranker: \
-             {baseline_labels:?}"
-        );
-        assert_eq!(
-            real_target_rr, 1.0,
-            "expected the target to be promoted to rank first under FastEmbedReranker: \
-             {real_labels:?}"
-        );
-    }
-
     /// Label of the sole fact seeded for
     /// `semantic_paraphrase_recovers_the_remembered_fact`.
     const PARAPHRASE_FACT_LABEL: &str = "Nightjar warranty terms";
@@ -357,19 +213,14 @@ mod real_tier {
 
     /// Given a fact remembered with wording A, when recalled with a
     /// paraphrase B sharing minimal lexical overlap with A, then the
-    /// fact's reciprocal rank in the recall output is exactly 1.0. Uses
-    /// `IdentityReranker`, not `FastEmbedReranker`: the sibling test above
-    /// already covers reranking quality, so this test isolates the
-    /// embedder as the only variable being measured, per this module's
-    /// doc comment. Loads its OWN `Arc<FastEmbedEmbedder>` rather than
-    /// reusing the sibling test's instance: each `#[tokio::test]` function
-    /// gets a fresh instance, no cross-test-function shared state.
+    /// fact's reciprocal rank in the recall output is exactly 1.0. This
+    /// isolates the embedder as the only variable being measured.
     #[tokio::test]
     #[ignore = "downloads embedder weights; see module doc for the run command"]
     async fn semantic_paraphrase_recovers_the_remembered_fact() {
         // Arrange
         let (embedder, dims) = load_real_embedder();
-        let server = build_server(embedder, Arc::new(liam_model::IdentityReranker), dims).await;
+        let server = build_server(embedder, dims).await;
         seed(&server, &[PARAPHRASE_FACT]).await;
 
         // Act
@@ -402,10 +253,10 @@ mod real_tier {
 }
 
 /// Real-model ranking regression: a twelve-fact store with the real embedder
-/// and reranker, one `#[ignore]`d test per (question, tool, k) case so a
+/// alone, one `#[ignore]`d test per (question, tool, k) case so a
 /// failure does not hide the others. Run with
-/// `cargo test --release -p liam-daemon --bin liamd -- --ignored --nocapture rerank_regression`.
-mod rerank_regression {
+/// `cargo test --release -p liam-daemon --bin liamd -- --ignored --nocapture embedder_ranking_regression`.
+mod embedder_ranking_regression {
     use super::*;
     use crate::mcp::{AskArgs, Mode, RecallArgs};
 
@@ -448,25 +299,17 @@ mod rerank_regression {
         ("fact", "On-call", "On-call this week is Carol."),
     ];
 
-    /// Real embedder and reranker, built by the daemon's own loader so the
-    /// test ranks with the models production uses, over a freshly seeded
-    /// in-memory store.
+    /// Real embedder, built by the daemon's own loader so the test ranks with
+    /// the model production uses, over a freshly seeded in-memory store.
     ///
     /// The LLM stays `MockLlm`: strict `ask` makes no model call, so the
     /// evidence it returns is what the ask cases assert on.
     async fn real_server() -> mcp::MemoryServer {
         let mut config = crate::config::Config::default();
-        config.embedder.provider = "local".into();
-        // fastembed reads its cache directory from the environment, so it is
-        // exported once, before any model loads.
-        static EXPORT_CACHE_DIR: std::sync::Once = std::sync::Once::new();
-        EXPORT_CACHE_DIR.call_once(|| {
-            liam_daemon::models::export_fastembed_cache_dir(&config)
-                .expect("export fastembed cache dir");
-        });
-        let (embedder, reranker) = liam_daemon::models::build_models(&config)
-            .expect("load real embedder and reranker; first run needs network access");
-        let server = build_server(embedder, reranker, config.embedding_dims).await;
+        config.embedder.provider = liam_daemon::models::LOCAL_PROVIDER.into();
+        let embedder = liam_daemon::models::build_embedder(&config)
+            .expect("load the real embedder; first run needs network access");
+        let server = build_server(embedder, config.embedding_dims).await;
         seed(&server, &FIXTURE).await;
         server
     }
@@ -564,8 +407,7 @@ mod tests {
         // Arrange
         const DIMS: usize = 8;
         let embedder = Arc::new(liam_model::MockEmbedder::new(DIMS));
-        let reranker = Arc::new(liam_model::IdentityReranker);
-        let server = build_server(embedder, reranker, DIMS).await;
+        let server = build_server(embedder, DIMS).await;
         let facts: [Fact; 2] = [
             (
                 "fact",

@@ -3,22 +3,12 @@
 
 use liam_model::{Embedder, TextKind};
 
-/// Always-errors `Reranker`, so `ask` must fall back to identity order
-/// (via `Reranker::order`'s default `unwrap_or_else`) instead of panicking.
-pub(super) struct FailingReranker;
-#[async_trait::async_trait]
-impl liam_model::Reranker for FailingReranker {
-    async fn scores(&self, _q: &str, _d: &[String]) -> liam_model::Result<Vec<f32>> {
-        Err(liam_model::ModelError::Rerank("boom".into()))
-    }
-}
-
 /// Wraps a real `Embedder`, recording every `(text, kind)` it is asked to
 /// embed, so a test can assert how many calls one handler made and in
 /// which role.
 /// `MockEmbedder` itself has no counter of its own; this follows the
-/// same small-custom-double pattern as `FailingLlm` in the `mcp.rs` tests
-/// and `FailingReranker` in this file, delegating the real work to the
+/// same small-custom-double pattern as `FailingLlm` in the `mcp.rs` tests,
+/// delegating the real work to the
 /// wrapped embedder instead of faking a result.
 pub(super) struct CountingEmbedder {
     inner: liam_model::MockEmbedder,
