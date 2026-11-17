@@ -108,4 +108,4 @@ Consequences:
 
 - The default stays `none`, by the user's choice.
 - A large store should opt in to `bge-reranker-v2-m3`. The [configuration reference](../reference/configuration.md#when-to-turn-the-reranker-on) says how.
-- Loading the reranker on demand, so it costs memory only while in use, is a possible later change.
+- A reranker that is turned on must load on demand and unload when idle, so it costs memory only while in use. This is required follow-up work and is not built yet: today a configured reranker loads at daemon start.

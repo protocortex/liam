@@ -86,7 +86,7 @@ model    = "bge-reranker-v2-m3"
 pool_cap = 16
 ```
 
-Then run `liam fetch-models` so the model files are on disk. Without them the daemon still starts and answers `recall` in store order, as the `reranker.model` row says.
+Put the model files on disk yourself: `liam fetch-models` does not download this reranker yet. Download `onnx/model_int8.onnx` (save it as `model_int8.onnx`), `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json` and `config.json` from the Hugging Face repo `onnx-community/bge-reranker-v2-m3-ONNX` at revision `6f5ff65298512715a1e669753bc754d2bc8f367b`. Place them in `<embedder.cache_dir>/rerankers/bge-reranker-v2-m3`, or in the directory `reranker.model_dir` names. The daemon checks each file's size at start. Without the files the daemon still starts and answers `recall` in store order, as the `reranker.model` row says.
 
 The cost is real. A reranker adds about 1.2 GB of resident memory. On an Apple M1 Pro, `gte-multilingual-reranker-base` took about 254 ms per recall at 16 pairs, and `bge-reranker-v2-m3` (a 571 MB file) took about 779 ms. These timings did not come from a quiet machine. The test data was Wikipedia text, not agent memory, and the run did not cover Portuguese at that size. See [ADR 0013](../adr/0013-arctic-default-embedder-and-reranker-off.md).
 
