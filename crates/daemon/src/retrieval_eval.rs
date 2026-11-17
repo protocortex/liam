@@ -611,7 +611,7 @@ const HARNESS_K: usize = CORPUS.len();
 /// corpus comment's "linked" half, reachable only through the edge). `seed
 /// -> linked` mirrors the existing
 /// `kind_filter_holds_for_graph_expanded_neighbours` test in
-/// `liam-store/src/graph.rs` (`NewEdge::new(&seed, &neighbour, ...)`) and
+/// `store/src/graph.rs` (`NewEdge::new(&seed, &neighbour, ...)`) and
 /// the plan's own `seed_id`/`neighbor_id` naming. `Graph::neighbors` is a
 /// bidirectional UNION either way (`graph.rs:848-858`), so this choice is
 /// for readability, not correctness. Shared by both tiers for the same reason

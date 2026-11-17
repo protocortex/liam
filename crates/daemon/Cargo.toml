@@ -20,9 +20,9 @@ name = "liam"
 path = "src/bin/liam.rs"
 
 [dependencies]
-liam-store = { path = "../liam-store" }
-liam-model = { path = "../liam-model" }
-liam-log = { path = "../liam-log" }
+liam-store = { path = "../store" }
+liam-model = { path = "../model" }
+liam-log = { path = "../log" }
 
 async-trait = "0.1"
 # The extraction hook reads the event log as a stream of records.
@@ -94,7 +94,7 @@ raunch = "1.0.1"
 
 [dev-dependencies]
 # Tests build typed hits and text without a store.
-liam-store = { path = "../liam-store", features = ["test-support"] }
+liam-store = { path = "../store", features = ["test-support"] }
 # storelock tests need an isolated, disposable directory per test.
 tempfile = "3"
 # Test log writers implement `LogWriter`, whose `log_id` returns a `Uuid`.
