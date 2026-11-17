@@ -8,10 +8,10 @@
 
 LIAM's roadmap reached M2.5 (local multi-client transport) with M2.6 next: close the gap between
 what `liam-store` already tracks and what an MCP client can reach. `NewNode`
-(`crates/liam-store/src/types.rs:68-93`) has had `with_attributes`, `with_valid_from`, and
+(`crates/store/src/types.rs:68-93`) has had `with_attributes`, `with_valid_from`, and
 `with_confidence` builders since before this milestone; `Query` (`types.rs:180-238`) has had
 `with_as_of` the same way. None of it is reachable through the daemon: `RememberArgs`
-(`crates/liam-daemon/src/mcp.rs:69-78`) exposes only `kind`, `label`, `content`, `scope`,
+(`crates/daemon/src/mcp.rs:69-78`) exposes only `kind`, `label`, `content`, `scope`,
 `subject`; `RecallArgs`/`AskArgs` (`mcp.rs:81-105`) never expose `as_of`.
 
 The gap is asymmetric in a way worth recording. `recall` calls `Graph::query()`, which returns
@@ -38,7 +38,7 @@ did we decide as of last Tuesday"). This milestone is what unblocks both, per th
   or the defense has a gap.
 - `recall`'s bracket format (`[{kind} {handle}] {label}`) is a load-bearing contract:
   `recall_renders_a_handle_relate_can_resolve` (`mcp.rs:1713-1757`) and `resolve_handle`
-  (`crates/liam-store/src/graph.rs:319-334`, rejects non-alphanumeric input) both depend on the
+  (`crates/store/src/graph.rs:319-334`, rejects non-alphanumeric input) both depend on the
   bracket containing exactly `{kind} {handle}` and nothing else.
 
 ## Considered Alternatives

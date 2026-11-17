@@ -34,7 +34,7 @@ and no retrieval change.
 
 ### 1. `Llm` trait (liam-model)
 
-New file `liam-model/src/llm.rs`:
+New file `model/src/llm.rs`:
 
 ```rust
 #[async_trait]
@@ -52,17 +52,17 @@ pub trait Llm: Send + Sync {
   (`candle-transformers`, `tokenizers`, `hf-hub`), loaded by Hugging Face model
   id + cache dir, following the offline-first pattern of `FastEmbedEmbedder`.
 - `ModelError` gains an `Llm(String)` variant.
-- `liam-model/src/lib.rs` exports `Llm`, `MockLlm` unconditionally and
+- `model/src/lib.rs` exports `Llm`, `MockLlm` unconditionally and
   `CandleLlm` under `#[cfg(feature = "local")]`.
 
 **Cargo features:** the new candle chat deps are added under the existing
-`local` feature in `liam-model/Cargo.toml`; `liam-daemon`'s `local` feature
+`local` feature in `model/Cargo.toml`; `liam-daemon`'s `local` feature
 already forwards `liam-model/local`.
 
 ### 2. Config + daemon wiring
 
 - `LlmConfig { provider: String, model: String, cache_dir: String }` added to
-  `liam-daemon/src/config.rs`, mirroring `EmbedderConfig`; add `llm: LlmConfig`
+  `daemon/src/config.rs`, mirroring `EmbedderConfig`; add `llm: LlmConfig`
   to `Config` with serde defaults (`provider = "mock"`).
 - `build_llm(config) -> anyhow::Result<Arc<dyn Llm>>` in `main.rs`, mirroring
   `build_models`: dispatch on `config.llm.provider`, with
@@ -111,15 +111,15 @@ already forwards `liam-model/local`.
 
 ## Affected files
 
-- `crates/liam-model/src/llm.rs` (new)
-- `crates/liam-model/src/lib.rs`
-- `crates/liam-model/src/error.rs`
-- `crates/liam-model/Cargo.toml`
-- `crates/liam-store/src/types.rs` (`NewNode::entity`, `relation` module)
-- `crates/liam-store/src/graph.rs` (`supersede` uses `relation::SUPERSEDES`)
-- `crates/liam-daemon/src/config.rs` (`LlmConfig`)
-- `crates/liam-daemon/src/main.rs` (`build_llm`, injection)
-- `crates/liam-daemon/src/mcp.rs` (`MemoryServer.llm` field)
+- `crates/model/src/llm.rs` (new)
+- `crates/model/src/lib.rs`
+- `crates/model/src/error.rs`
+- `crates/model/Cargo.toml`
+- `crates/store/src/types.rs` (`NewNode::entity`, `relation` module)
+- `crates/store/src/graph.rs` (`supersede` uses `relation::SUPERSEDES`)
+- `crates/daemon/src/config.rs` (`LlmConfig`)
+- `crates/daemon/src/main.rs` (`build_llm`, injection)
+- `crates/daemon/src/mcp.rs` (`MemoryServer.llm` field)
 - Tests in the above crates.
 
 ## Non-goals (M1)

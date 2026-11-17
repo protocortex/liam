@@ -8,7 +8,7 @@
 
 The M2b entity-pages PR review (PRs #120-#126, merged) left five follow-up findings recorded in
 `.claude/plans/m2b-entity-pages.md`. Three of them concern the AIMD adaptive-concurrency loop in
-`crates/liam-daemon/src/tuning.rs`:
+`crates/daemon/src/tuning.rs`:
 
 - `memory_ceiling()` (`tuning.rs:271-287`) tracks live RAM and produces a ceiling, but
   `AimdHandles.granted_capacity` (`tuning.rs:90-96`) never shrinks purely because the ceiling
@@ -22,7 +22,7 @@ The M2b entity-pages PR review (PRs #120-#126, merged) left five follow-up findi
   plain `handles.evaluating.store(false, Ordering::Release)` statement after `decide().await`
   (`tuning.rs:132-172`), not a scope guard. A panic mid-decision would wedge the guard
   permanently. No live trigger exists today, but the pattern is already precedented safely
-  elsewhere in this codebase (`PermitTimer`'s `impl Drop`, `crates/liam-daemon/src/mcp.rs:471-479`).
+  elsewhere in this codebase (`PermitTimer`'s `impl Drop`, `crates/daemon/src/mcp.rs:471-479`).
 
 `main.rs` already has a working shrink mechanism for the ceiling case:
 `reconcile_capacity_after_benchmark` (`main.rs:269-288`) moves `granted_capacity` toward a target,

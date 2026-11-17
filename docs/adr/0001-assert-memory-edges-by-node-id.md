@@ -14,13 +14,13 @@ signals at retrieval. The graph half of that has never carried real data, becaus
 can create a relationship.
 
 The MCP surface is three tools: `remember`, `recall`, `ask`
-(`crates/liam-daemon/src/mcp.rs:238`, `:260`, `:286`). None asserts an edge. `Graph::link`
-(`crates/liam-store/src/graph.rs:170`) exists but has no caller outside tests: its five call
+(`crates/daemon/src/mcp.rs:238`, `:260`, `:286`). None asserts an edge. `Graph::link`
+(`crates/store/src/graph.rs:170`) exists but has no caller outside tests: its five call
 sites (`graph.rs:792`, `:829`, `:1052`, `:1430`, `:1434`) all sit inside `mod tests`, which
 begins at `graph.rs:694`.
 
 The one edge production does write is structural. `Graph::supersede` (`graph.rs:130`) inserts
-an edge of type `relation::SUPERSEDES` (`crates/liam-store/src/types.rs:18`) at `graph.rs:146`,
+an edge of type `relation::SUPERSEDES` (`crates/store/src/types.rs:18`) at `graph.rs:146`,
 inside the same `execute_atomic` transaction that closes the old node. `remember` reaches it
 through `upsert_by` whenever an argument carries a subject. So a mature store holds version
 chains and nothing else.
@@ -42,11 +42,11 @@ Three properties of the current code decide how edges can safely be asserted:
   `format!("[{}] {}\n{}", hits[i].kind, hits[i].label, hits[i].content)` (`mcp.rs:279`).
   The id is dropped, so an agent can link what it just wrote (`remember` returns the id at
   `mcp.rs:255`) but cannot link what it recalled.
-- `NodeId::from_raw` (`crates/liam-store/src/ids.rs:37`, from `branded_id!`) takes
+- `NodeId::from_raw` (`crates/store/src/ids.rs:37`, from `branded_id!`) takes
   `impl Into<String>` and validates nothing.
 - The declared foreign keys are not enforced. `schema.rs:58` and `:59` declare
   `src`/`dst` as `REFERENCES nodes(id)`, but SQLite disables enforcement by default and no
-  `PRAGMA foreign_keys = ON` exists anywhere in `crates/liam-store/src/`.
+  `PRAGMA foreign_keys = ON` exists anywhere in `crates/store/src/`.
 
   > **Amended 2026-08-23. This is false.** libSQL enforces them by default. The missing pragma
   > is real, the conclusion drawn from it is not. See Amendment 4.
@@ -83,12 +83,12 @@ clusters work has something real to cluster.
   rendering change rather than a data change. Requires a new store method for the liveness
   check, since `Graph` has no `get` or `exists`. Changes `recall`'s output but not `ask`'s:
   the two share `build_query` and the store, not rendering, and `ask::Evidence::from_hit`
-  (`crates/liam-daemon/src/ask.rs:51`) never reads `Hit::id`.
+  (`crates/daemon/src/ask.rs:51`) never reads `Hit::id`.
 
 ### Link at write time by subject (effort: S)
 
 - Extend `remember` with an optional list of related subjects, resolved to ids server-side
-  through `find_live_by_subject` (`crates/liam-store/src/graph.rs:465`, currently private),
+  through `find_live_by_subject` (`crates/store/src/graph.rs:465`, currently private),
   the same path `upsert_by` already uses.
 - Trade-offs: smallest surface, no new tool, no change to `recall`. But
   relationships can only be expressed at the moment of writing. An agent that recalls two
@@ -107,7 +107,7 @@ clusters work has something real to cluster.
 - New `relate` tool keyed on the human-readable label or subject already shown by `recall`.
 - Trade-offs: no change to `recall`'s output, and the calls read naturally.
   But labels carry no uniqueness constraint: `nodes` declares `label TEXT NOT NULL`
-  (`crates/liam-store/src/schema.rs:16`) and the table's only `UNIQUE` is on `id`
+  (`crates/store/src/schema.rs:16`) and the table's only `UNIQUE` is on `id`
   (`schema.rs:14`). So the server must disambiguate by guessing. A wrong guess writes a
   plausible edge between the wrong pair, indistinguishable afterwards from a correct one, and
   surfacing only as a nonsense cluster much later.
@@ -115,8 +115,8 @@ clusters work has something real to cluster.
 ### Derive the graph from embedding similarity instead (effort: L)
 
 - Skip client-asserted edges. Build a k-nearest-neighbour graph from stored embeddings using
-  `Backend::vector_search` (`crates/liam-store/src/backend.rs:71`, implemented at
-  `crates/liam-store/src/backends/libsql.rs:293` over `vector_distance_cos`), and run Leiden
+  `Backend::vector_search` (`crates/store/src/backend.rs:71`, implemented at
+  `crates/store/src/backends/libsql.rs:293` over `vector_distance_cos`), and run Leiden
   on that.
 - Trade-offs: works today with no edge writer and no contract change, and would cluster the
   whole store rather than only linked parts. But it infers relationships rather than recording
@@ -147,9 +147,9 @@ not merely clutter the table, they weight the graph Leiden reads.
 The obvious shape, check first and insert afterwards, is a time-of-check-to-time-of-use race:
 a concurrent `supersede` closes an endpoint in between and the edge still lands. Less
 obviously, **the fix is not "do both inside `execute_atomic`".** That method takes a statement
-list built before the call and returns `Result<()>` (`crates/liam-store/src/backend.rs:53`),
+list built before the call and returns `Result<()>` (`crates/store/src/backend.rs:53`),
 and the libSQL implementation runs each statement with `execute` rather than `query`
-(`crates/liam-store/src/backends/libsql.rs:247`). Nothing inside that transaction can read a
+(`crates/store/src/backends/libsql.rs:247`). Nothing inside that transaction can read a
 row and branch on it. `supersede` is not a precedent for it either: its `exists_as_of` check
 runs before the transaction is built (`graph.rs:132`), and the real race guard is the
 `WHERE id = ?2 AND tx_to = ?3` clause on its UPDATE (`graph.rs:141`), a conditional write that
@@ -230,10 +230,10 @@ burying it in a record about addressing would have let it ship unargued.
 **Negative**
 
 - `recall`'s output format changes, for every client, permanently. The blast radius is
-  narrower than it looks: `recall` renders at `crates/liam-daemon/src/mcp.rs:279` while `ask`
-  builds `ask::Evidence::from_hit` (`crates/liam-daemon/src/ask.rs:51`) from `kind`, `label`,
+  narrower than it looks: `recall` renders at `crates/daemon/src/mcp.rs:279` while `ask`
+  builds `ask::Evidence::from_hit` (`crates/daemon/src/ask.rs:51`) from `kind`, `label`,
   `content`, and `valid_from_ms`, never touching `Hit::id`. Since the grounding eval drives
-  `ask` (`crates/liam-daemon/src/eval.rs:470`), its 6/6 with 0 retrieval misses cannot regress
+  `ask` (`crates/daemon/src/eval.rs:470`), its 6/6 with 0 retrieval misses cannot regress
   from this change alone. Re-running it stays a release check; it is not the gate this
   decision turns on. Putting ids into `ask`'s evidence would be a separate decision with real
   eval risk, and this record does not take it.

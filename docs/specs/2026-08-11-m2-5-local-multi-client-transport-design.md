@@ -9,7 +9,7 @@
 ## Purpose
 
 One `liamd` must serve several local clients at once. Today the daemon speaks
-stdio only (`crates/liam-daemon/src/main.rs`, `rmcp::transport::stdio()`), and
+stdio only (`crates/daemon/src/main.rs`, `rmcp::transport::stdio()`), and
 stdio MCP is one client per process, so the coding agent and ai-notetaker cannot
 share a store. The amendment names this the blocker that gates M2.6, M3, and
 M3.5.
@@ -28,17 +28,17 @@ the transport is not safe without them.
    journal a write blocks readers, so concurrent clients would stall on each
    other. M2.5 turns WAL on deliberately.
 2. **There is one shared connection, and the `Database` handle is discarded.**
-   `crates/liam-store/src/backends/libsql.rs:88` returns `Self { conn }`, keeping
+   `crates/store/src/backends/libsql.rs:88` returns `Self { conn }`, keeping
    a single `Connection` and dropping the `Database` it came from. Even with WAL
    on, reads cannot run in parallel until the backend retains `db` and can open
    more connections.
-3. **There is no migration mechanism.** `crates/liam-store/src/schema.rs` is all
+3. **There is no migration mechanism.** `crates/store/src/schema.rs` is all
    `CREATE TABLE IF NOT EXISTS`, which skips an existing table wholesale. Adding
    a `producer` column to a database that already exists needs an explicit
    `ALTER TABLE ADD COLUMN` step, not a schema edit.
 
 Two things are already in our favour: `MemoryServer` derives `Clone`
-(`crates/liam-daemon/src/mcp.rs:82`), so it can be handed to one `serve()` per
+(`crates/daemon/src/mcp.rs:82`), so it can be handed to one `serve()` per
 connection; and `rmcp` 2.2.0 ships `transport-async-rw`, which is generic over
 `AsyncRead` plus `AsyncWrite`, so a `UnixStream` needs no custom transport.
 

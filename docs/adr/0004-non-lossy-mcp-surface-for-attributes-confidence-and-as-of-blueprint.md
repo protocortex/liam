@@ -9,20 +9,20 @@ file is the `/playbook:implement`-consumable form.
 
 ## System Snapshot
 
-- `crates/liam-daemon/src/mcp.rs`: tool handlers (`remember`, `recall`, `relate`, `ask`), args
+- `crates/daemon/src/mcp.rs`: tool handlers (`remember`, `recall`, `relate`, `ask`), args
   structs (`RememberArgs` at `mcp.rs:69-78`, `RecallArgs`/`AskArgs` at `mcp.rs:81-105`),
   `build_query` helper (`mcp.rs:48-66`), `MemoryServer` struct and constructor
   (`mcp.rs:106-206`), test module with `plain_server()`/`server_with_timeout()`/`seed()` helpers
   (`mcp.rs:702-789`).
-- `crates/liam-daemon/src/ask.rs`: `Evidence` struct (`ask.rs:41-46`), `from_hit`
+- `crates/daemon/src/ask.rs`: `Evidence` struct (`ask.rs:41-46`), `from_hit`
   (`ask.rs:51-58`), `neutralize_fence` (`ask.rs:65-67`), `render_evidence` (`ask.rs:119-135`),
   `fit_evidence_to_budget` (`ask.rs:204-228`), test helper `evidence()` (`ask.rs:357-364`, ~29
   call sites).
-- `crates/liam-store/src/types.rs`: `NewNode` builders `with_attributes`/`with_valid_from`/
+- `crates/store/src/types.rs`: `NewNode` builders `with_attributes`/`with_valid_from`/
   `with_confidence` (`types.rs:128-147`), `Query.with_as_of` (`types.rs:230-233`), `Hit`
   (`types.rs:242-249`, no `confidence`), `ExplainedHit` (`types.rs:253-264`, has `confidence`
   and `valid_from`). No changes needed here; read-only reference.
-- `crates/liam-store/src/graph.rs`: `Graph::query()`/`query_explained()` (`graph.rs:402-415`),
+- `crates/store/src/graph.rs`: `Graph::query()`/`query_explained()` (`graph.rs:402-415`),
   `resolve_handle` (`graph.rs:319-334`), `upsert_by_supersedes_same_subject` as the
   `FixedClock` test pattern to mirror (`graph.rs:1548-1565`).
 
@@ -30,7 +30,7 @@ file is the `/playbook:implement`-consumable form.
 
 ### WU-1: `remember` accepts and validates attributes/valid_from/confidence
 - **Requires:** nothing
-- **Files:** `crates/liam-daemon/src/mcp.rs` (production + tests, same file per existing convention)
+- **Files:** `crates/daemon/src/mcp.rs` (production + tests, same file per existing convention)
 - **Changes:** `RememberArgs` gains `attributes: Option<serde_json::Value>`,
   `valid_from: Option<i64>`, `confidence: Option<f64>`. New `MAX_ATTRIBUTES_CHARS: usize = 2000`
   constant (distinct from `ask.rs`'s private `MAX_EVIDENCE_CHARS`, same value by deliberate
@@ -56,7 +56,7 @@ file is the `/playbook:implement`-consumable form.
 
 ### WU-2: `as_of` on `RecallArgs`/`AskArgs`/`build_query`
 - **Requires:** WU-1 (file-conflict avoidance only, not a logical dependency)
-- **Files:** `crates/liam-daemon/src/mcp.rs`
+- **Files:** `crates/daemon/src/mcp.rs`
 - **Changes:** `RecallArgs`/`AskArgs` gain `as_of: Option<i64>`. `build_query` gains an
   `as_of: Option<i64>` parameter calling `q.with_as_of(Millis(v))` when set.
 - **Verification:** `cargo test -p liam-daemon --bin liamd as_of`
@@ -82,7 +82,7 @@ file is the `/playbook:implement`-consumable form.
 
 ### WU-3: `recall` renders confidence/attributes via `query_explained`
 - **Requires:** WU-2 (genuine: needs `RecallArgs.as_of` to already exist)
-- **Files:** `crates/liam-daemon/src/mcp.rs`
+- **Files:** `crates/daemon/src/mcp.rs`
 - **Changes:** `recall` switches from `self.store.query(&q)` to `self.store.query_explained(&q)`;
   reranker/docs/order logic reads through `.hit.*`. Output:
   `[{kind} {handle}] {label}\n{content}\nconfidence: {c:.2}\nattributes: {json}`, last two lines
@@ -105,7 +105,7 @@ file is the `/playbook:implement`-consumable form.
 
 ### WU-4: `ask`'s `Evidence`/`render_evidence` gain confidence/attributes
 - **Requires:** nothing (parallel-safe with WU-1)
-- **Files:** `crates/liam-daemon/src/ask.rs`
+- **Files:** `crates/daemon/src/ask.rs`
 - **Changes:** `Evidence` gains `confidence: f64`, `attributes: Option<String>`. `from_hit` sets
   `confidence` from `ExplainedHit.confidence`; sets `attributes` to
   `Some(neutralize_fence(&h.hit.attributes.to_string()))` when non-empty, `None` otherwise.
@@ -143,7 +143,7 @@ file is the `/playbook:implement`-consumable form.
 
 ### WU-5: End-to-end integration + tool-schema registration tests
 - **Requires:** WU-1, WU-3, WU-4
-- **Files:** `crates/liam-daemon/src/mcp.rs` (tests only)
+- **Files:** `crates/daemon/src/mcp.rs` (tests only)
 - **Changes:** none (test-only WU).
 - **Verification:** `cargo test -p liam-daemon --bin liamd` (full suite) `&& cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 - **Tests:**

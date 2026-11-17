@@ -160,7 +160,7 @@ macOS. On another platform, point `llama_server_path` at your own build.
 To bump the pinned server, pick a `llama.cpp` release at least three days old
 that has a `llama-bNNNN-bin-macos-arm64.tar.gz` asset. Download it, then set the
 URL, `sha256` and `size_bytes` in `SERVER_ASSET` and `SERVER_TAG` in
-`crates/liam-daemon/src/fetch.rs`, plus the tag in `fetch/tests.rs`,
+`crates/daemon/src/fetch.rs`, plus the tag in `fetch/tests.rs`,
 `THIRD-PARTY-NOTICES.md` and `liam.toml`. Run `cargo test -p liam-daemon --lib --
 --ignored real_server_asset`, then the real-model tier below with the old and the
 new server, and compare the numbers.
@@ -168,7 +168,7 @@ new server, and compare the numbers.
 ## Experimental status and the real-model baseline
 
 Model extraction is experimental. Its quality on the real model has not been
-measured: `crates/liam-daemon/src/extraction/r10/baseline.json` holds
+measured: `crates/daemon/src/extraction/r10/baseline.json` holds
 `"measured": null`, so the only gates in force are an F1 floor of `0.5` and a
 ceiling of `150` facts dropped as ungrounded over the 300-event corpus. The
 rules and plumbing tiers run in CI. The real-model tier does not.
