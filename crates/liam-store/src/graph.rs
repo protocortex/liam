@@ -2395,7 +2395,7 @@ fn opt_string(row: &Row, i: usize) -> Result<Option<String>> {
 /// made the lexical arm return zero hits for any natural-language question.
 /// ORing recovers that recall: BM25 still ranks by inverse document frequency,
 /// so a rare shared term dominates the score while "the" or "when" contribute
-/// almost nothing, and RRF plus the reranker re-sort the fused result anyway.
+/// almost nothing, and RRF re-sorts the fused result anyway.
 ///
 /// Tokens are lowercased and only the first occurrence of each is kept, so a
 /// long repetitive query cannot expand into thousands of redundant OR terms.

@@ -8,15 +8,11 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Added
 
-- Guidance on when to turn the reranker on: it stays off by default, and a store of several thousand facts or more gains better ordering with `bge-reranker-v2-m3`. See [the configuration reference](docs/reference/configuration.md#when-to-turn-the-reranker-on).
-- A `[reranker]` section sets the reranker model, threads, `pool_cap` (default `32`), `max_tokens` and `model_dir`. The default `pool_cap` is `32`, the same rerank pool as before, and `16` is available as a latency setting.
 - `recall_timeout_secs` (default `10`) bounds how long `recall` and `ask` spend retrieving. Past it they reply
-  with a timeout, and a reranker still running at the deadline gives way to the hits in store order. Cancelling a
-  request now stops retrieval with a `cancelled` reply; the `ask` model call that follows retrieval still runs
-  until `ask_timeout_secs`. A call that gave up waiting for the reranker no longer runs
-  after the busy call finishes.
+  with a timeout. Cancelling a request now stops retrieval with a `cancelled` reply; the `ask` model call that
+  follows retrieval still runs until `ask_timeout_secs`.
 - `recall` and `ask` now report when a reply used a fallback. Every reply carries a structured `degraded` list
-  (`embed_failed`, `rerank_skipped`, `rerank_failed`, `rerank_timeout`, `synthesis_unavailable`), and a degraded reply
+  (`embed_failed`, `synthesis_unavailable`), and a degraded reply
   starts with a marker line that names each reason. A new `degraded_replies` metric counts them by tool and reason.
   See [Degraded replies](docs/reference/tools.md#degraded-replies).
 
@@ -35,11 +31,12 @@ All notable changes to LIAM are recorded here. The format follows
   model or width, including the new default, it is refused with the same message that names `liam rebuild`.
 - The embedder fingerprint records an ONNX model under its canonical id, so `embedder.model` spelled in another
   case no longer reads as a change of embedder.
-- **Breaking:** the reranker is now off by default (`reranker.model = "none"`), so `recall` answers in store
-  order. The best reranker moved nDCG@10 by +0.017, -0.010 and +0.033 on English, Portuguese and Spanish, inside
-  the noise, for 254 ms and over 1 GB of memory. To turn it on set `reranker.model` to `bge-reranker-base`,
-  `gte-multilingual-reranker-base` or `bge-reranker-v2-m3`. `liam fetch-models` fetches a reranker only when one
-  is configured.
+- **Breaking:** the reranker is removed. `recall` and `ask` return candidates in store order, which is what
+  the default setting already gave. A `[reranker]` section in `liam.toml` is ignored and the daemon logs one
+  warning at start, so you can delete it; the `rerank_*` degraded reasons and the `stage_rerank_*` metrics are
+  gone. On 10,000 passages the best reranker gained 0.05 nDCG@10 but took hundreds of milliseconds and over
+  1 GB, and no model under 150 MB gained anything significant. A lighter daemon is worth more than that gain.
+  See [ADR 0014](docs/adr/0014-remove-the-reranker.md).
 - `recall` and `ask` now set `isError` when the call fails: the retrieval deadline passes, the store fails, or the
   query is invalid. A cancelled call still returns a normal reply. `recall` and `ask` now log a failed embed and
   report `embed_failed` instead of hiding it.
@@ -48,10 +45,8 @@ All notable changes to LIAM are recorded here. The format follows
   the call took the lock still runs its embed to the end.
 - `recall` and `ask` now reject an empty, whitespace-only or NUL-containing query and one over 4000 characters
   with a clear error. Only the first 64 distinct words reach the lexical arm; later words reach only the vector arm.
-- `recall` now reranks a wider pool of candidates (twice `k`, at least 16, at most 32) before it cuts to `k`, so
-  a relevant hit ranked below `k` by retrieval can reach the top. A `k` over 32 now returns 32, and `k = 0` now returns 1 hit.
-- `ask` now reranks a wider pool of candidates before it cuts, so a relevant hit ranked below `k` by retrieval can
-  reach the evidence. The evidence stays `k` hits plus at most 3 summaries.
+- `recall` now fetches a wider pool of candidates (twice `k`, at least 16, at most 32) before it cuts to `k`. A `k` over 32 now returns 32, and `k = 0` now returns 1 hit.
+- `ask` now fetches a wider pool of candidates before it cuts. The evidence stays `k` hits plus at most 3 summaries.
 - One slow read no longer blocks other clients' reads: each read takes its own connection from the pool and waits for a
   free one when all are busy. A read that is dropped before it finishes now stops its SQLite statement and returns its
   connection to the pool. A cancelled read also stops at its next row. Single-connection stores (in-memory and `file:`
@@ -70,7 +65,7 @@ All notable changes to LIAM are recorded here. The format follows
   and uses 53 percent less embedder memory (1072 MB against 2299 MB). Retrieval quality is equal
   (nDCG@10 0.934 against 0.933). A store created with `provider = "mock"` is not affected.
   `liam fetch-models` now downloads the 0.6 GB GGUF and no longer the safetensors unless the candle
-  id is configured. The reranker is unchanged.
+  id is configured.
 - The shipped `liam.toml` now uses the local embedder and the llama-cpp LLM. `provider = "mock"`
   is still accepted for tests and dev, and an unknown provider name is now an error.
 

@@ -1,8 +1,8 @@
 # ADR-0013: arctic-embed-m-v2.0 is the default embedder, and the reranker is off by default
 
-- **Status:** Accepted. Supersedes in part [ADR-0012](0012-llama-cpp-default-embedder-and-hardware-support.md): the llama.cpp embedder stays, and it is no longer the default.
+- **Status:** Accepted. Supersedes in part [ADR-0012](0012-llama-cpp-default-embedder-and-hardware-support.md): the llama.cpp embedder stays, and it is no longer the default. Superseded in part by [ADR-0014](0014-remove-the-reranker.md): the embedder decision stands, and the reranker decision and its addendum no longer apply because the reranker was removed.
 - **Date created:** 2026-11-17
-- **Date modified:** 2026-11-17
+- **Date modified:** 2026-11-18
 
 ## Context
 
@@ -107,5 +107,5 @@ The cost, from a probe on an Apple M1 Pro on a machine that was not quiet: about
 Consequences:
 
 - The default stays `none`, by the user's choice.
-- A large store should opt in to `bge-reranker-v2-m3`. The [configuration reference](../reference/configuration.md#when-to-turn-the-reranker-on) says how.
+- A large store should opt in to `bge-reranker-v2-m3`.
 - A reranker that is turned on must load on demand and unload when idle, so it costs memory only while in use. This is required follow-up work and is not built yet: today a configured reranker loads at daemon start.

@@ -3,7 +3,7 @@
 [Back to the docs index](../README.md)
 
 LIAM has few build flags, because every part of the product is needed. The
-local embedder and reranker (fastembed), llama.cpp generation, libSQL storage,
+local embedder (fastembed), llama.cpp generation, libSQL storage,
 Leiden community detection and the hosted-provider code are part of every
 build. Hosted calls stay off at runtime until `[hosted]` is configured, and the
 privacy gate and host allowlist decide what may leave the machine, not the
@@ -18,5 +18,5 @@ The flags that remain:
   tests in other crates use. They stay out of a release build so production code
   cannot mint a recorded value it did not read from the store or the log.
 
-The mock embedder, reranker and LLM are not build flags. They are runtime
+The mock embedder and LLM are not build flags. They are runtime
 choices (`provider = "mock"`) that tests and dev use.

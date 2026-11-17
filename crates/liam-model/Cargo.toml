@@ -24,7 +24,7 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Parses config.json into fastembed::Qwen3Config. fastembed already depends on
 # it to parse the same file internally; this makes it directly callable here.
 serde_json = "1"
-# "rt" for spawn_blocking: the embedder, reranker, and llama.cpp provider all
+# "rt" for spawn_blocking: the embedder and llama.cpp provider both
 # run blocking model calls on it instead of the async runtime.
 tokio = { version = "1", features = ["rt", "sync"] }
 tracing = { workspace = true }

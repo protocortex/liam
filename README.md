@@ -10,11 +10,11 @@ can ask what you believed last Tuesday. See [Why LIAM](docs/concepts/why.md).
 
 ## What you get
 
-- Hybrid retrieval: full-text, vector and graph signals, fused and reranked.
+- Hybrid retrieval: full-text, vector and graph signals, fused with reciprocal rank fusion.
 - As-of recall over both timelines.
 - Contradiction handling on write, with version history kept.
 - Labelled provenance: recorded, extracted or inferred, with the events behind it.
-- A model-free core: embedding and reranking live in a separate crate.
+- A model-free core: embedding lives in a separate crate.
 
 ## Quickstart
 

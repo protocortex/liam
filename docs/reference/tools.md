@@ -31,14 +31,14 @@ documented in the pages linked here:
 | `scope` | no | Partition by project or agent. Trimmed; ASCII letters, digits, `-`, `_`, `/`; up to 200 characters; no leading/trailing `/` or empty segment (`//`). |
 | `subject` | no | Identity. A new value with the same subject supersedes the old. |
 
-`recall` retrieves and reranks.
+`recall` retrieves the best matches in store order.
 
 | Field | Required | Notes |
 |---|---|---|
 | `query` | yes | Text; embedded for the vector channel too. Up to 4000 characters; empty, whitespace-only and NUL-containing queries are rejected. Only the first 64 distinct words (case-insensitive) reach the lexical channel; words past the 64th distinct one reach only the vector arm. |
 | `kind` | no | Restrict to one kind. |
 | `scope` | no | Restrict to one partition. Same format as `remember`'s `scope`. |
-| `k` | no | How many hits to return (default 8, range 1 to 32; larger values are clamped to 32). Recall reranks a pool of twice `k`, at least 16 and at most 32, then returns the top `k`. |
+| `k` | no | How many hits to return (default 8, range 1 to 32; larger values are clamped to 32). Recall fuses a pool of twice `k`, at least 16 and at most 32, then returns the first `k`. |
 
 `ask` applies the same limits to its `question`: up to 4000 characters, empty and NUL
 rejected, and words past the 64th distinct one reach only the vector arm.
@@ -52,14 +52,11 @@ list means a step did not run or failed, and the reply is still useful.
 | Reason | Meaning |
 |---|---|
 | `embed_failed` | The embedder failed. The search used keywords only. |
-| `rerank_skipped` | Under 200 ms of the retrieval budget remained, too little to rerank. The hits are in store order. |
-| `rerank_failed` | The reranker returned an error. The hits are in store order. |
-| `rerank_timeout` | The reranker did not finish before the retrieval deadline. The hits are in store order. |
 | `synthesis_unavailable` | `ask` could not write an answer. This covers a model timeout, a model error, an empty answer, an answer the evidence does not support, and no free generation slot. The reply shows the retrieved evidence. |
 
 When the list has reasons, the first line of the text is a marker that names each
 reason with a short hint, for example
-`(degraded: rerank_timeout, hits are in store order)`. The body follows on the next
+`(degraded: embed_failed, searched by keyword only)`. The body follows on the next
 line. Several reasons appear in the order they happened, each once.
 
 A reply sets `isError` when the call failed: the retrieval deadline passed, the

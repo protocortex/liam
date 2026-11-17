@@ -11,7 +11,7 @@ unknown key fails loudly.
 | `database_path` | `liam.db` | The libSQL file. |
 | `log_filter` | `info,liam=debug` | tracing filter. `RUST_LOG` overrides it. |
 | `embedding_dims` | `384` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see [The embedder fingerprint](../concepts/embedder-fingerprint.md)). |
-| `recall_timeout_secs` | `10` | Seconds `recall` and `ask` may spend retrieving (embedding, store query, summaries). Past it they reply `retrieval took longer than N s`. A reranker that is still running at the deadline is dropped and the hits come back in store order. A value of `0` is read as `1`. Worst-case `ask` wall time is `recall_timeout_secs` plus `ask_timeout_secs`. |
+| `recall_timeout_secs` | `10` | Seconds `recall` and `ask` may spend retrieving (embedding, store query, summaries). Past it they reply `retrieval took longer than N s`. A value of `0` is read as `1`. Worst-case `ask` wall time is `recall_timeout_secs` plus `ask_timeout_secs`. |
 | `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. |
 | `gc.interval_hours` | `6` | Sweep interval. |
 | `gc.reclaim` | `true` | Run incremental vacuum after a sweep. |
@@ -21,7 +21,7 @@ unknown key fails loudly.
 | `gc.full_synthesis_max_new_tokens` | `512` | Output token budget for a full-tier resynthesis. |
 | `embedder.provider` | `mock` | `local` for in-process fastembed, or `mock` for tests and dev. The shipped `liam.toml` sets `local`; the built-in default is `mock`. Part of the embedder fingerprint. |
 | `embedder.model` | `Snowflake/snowflake-arctic-embed-m-v2.0` | Model id for `local`. The default is Snowflake arctic-embed-m-v2.0 as an int8 ONNX file (311 MB, Apache-2.0) on the CPU, with CLS pooling, the `query: ` prefix on queries and 512 input tokens. It is pinned to one revision and `liam fetch-models` checks its size and sha256. Its native width is 768 and `embedding_dims` (384 by default) cuts it and normalises again. Other ids: `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0 on llama.cpp, the previous default; `embedding_dims` is at most 1024) or `Qwen/Qwen3-Embedding-0.6B-GGUF:F16`, `Qwen/Qwen3-Embedding-0.6B` (the candle build), `BAAI/bge-m3`, or a small ONNX model (`BAAI/bge-small-en-v1.5`, `sentence-transformers/all-MiniLM-L6-v2`, `sentence-transformers/all-MiniLM-L12-v2`, `Snowflake/snowflake-arctic-embed-xs`, `Snowflake/snowflake-arctic-embed-s`, `nomic-ai/nomic-embed-text-v1.5`, `intfloat/multilingual-e5-small`). The small models need `embedding_dims` equal to their width (384; nomic accepts up to 768). Arctic matches or beats Qwen3 on English, Portuguese and Spanish; Qwen3 is better on Arabic and Chinese, so choose it if those matter. See [ADR 0013](../adr/0013-arctic-default-embedder-and-reranker-off.md). A store built with another model is refused at start until `liam rebuild`. Part of the embedder fingerprint. |
-| `embedder.cache_dir` | `~/.liam/models` | Files for both the reranker and the embedder, each under its own `models--Org--Name` subdirectory. |
+| `embedder.cache_dir` | `~/.liam/models` | Files for the embedder, each model under its own `models--Org--Name` subdirectory. |
 | `embedder.device` | `auto` | Where the local embedder runs: `auto`, `cpu`, `metal` or `cuda`. `auto` means Metal on macOS (falling back to the CPU if no Metal device opens) for both the GGUF models and the candle Qwen3 model, and the CPU elsewhere. The BGE-M3 and ONNX models ignore it. It is not part of the embedder fingerprint, so changing it needs no rebuild. Run [`liam devices`](devices.md) to see what `auto` resolves to. Measured results are in [`docs/specs/2026-11-09-llama-embedder-benchmark.md`](../specs/2026-11-09-llama-embedder-benchmark.md). |
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
 | `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
@@ -50,11 +50,6 @@ unknown key fails loudly.
 | `metrics.rollback_ceiling` | `1.0` | Rollbacks at which an alert is raised. |
 | `metrics.extraction_backlog_ceiling` | `10000.0` | Events past an extraction cursor at which an alert is raised. |
 | `metrics.model_calls_per_hour` | `1000.0` | Model calls an hour at which an alert is raised. |
-| `reranker.model` | `none` | The cross-encoder that reorders `recall` candidates: `none` (no reranker, `recall` keeps the order the store returns), `bge-reranker-base`, `gte-multilingual-reranker-base` or `bge-reranker-v2-m3`. An unknown name fails at load. When the files of an ONNX model are missing, the daemon still starts, logs one warning and answers `recall` in store order. |
-| `reranker.threads` | `0` | Threads the reranker runs on. `0` uses the performance cores. Applies only to the ONNX models, not to `bge-reranker-base`, and it has no effect with `none`. |
-| `reranker.pool_cap` | `32` | Most candidates `recall` reranks before cutting to `k`. The default keeps the same pool as before the setting existed. A lower value, such as `16`, cuts latency on purpose; lowering the default itself needs a measured nDCG cost under 0.02 against `32` on the multilingual set, which has not been measured yet. At least `1`. A value above the recall maximum of `32` is capped at `32`. |
-| `reranker.max_tokens` | `512` | Longest query plus document pair, in tokens. At least `1`. Applies only to the ONNX models, not to `bge-reranker-base`, and it has no effect with `none`. |
-| `reranker.model_dir` | unset | A local directory of model files. Not allowed with `none` or `bge-reranker-base`. |
 | `hosted.enabled` | `false` | Allow calls to hosted model providers. |
 | `hosted.allowed_hosts` | empty | The only hosts a request may go to, each lowercase with no scheme, port or path. Required when `hosted.enabled` is true. |
 | `hosted.request_timeout_secs` | `60` | How long one request may take, answer included. At least `1`. |
@@ -72,23 +67,7 @@ unknown key fails loudly.
 | `producers.unknown_id` | `unknown` | Producer recorded for a client not in the table below. |
 | `producers.clients` | empty | Maps a client's declared MCP name to a producer id. Matching ignores case. |
 
-### When to turn the reranker on
-
-The reranker is off by default. That suits a small store. On 300 facts it moved English nDCG@10 by +0.002 to +0.003, which is inside the noise.
-
-On a larger store the reranker helps. On 10,000 Wikipedia passages (MIRACL dev, in three languages), reranking the top 16 results of the default embedder raised the mean nDCG@10 from 0.903 to 0.940 with `gte-multilingual-reranker-base` and to 0.954 with `bge-reranker-v2-m3`. The gain was above zero in every language, and `bge-reranker-v2-m3` beat gte in every language. The embedder already finds the right passages (recall at 16 was 0.98 to 0.99). The reranker improves their order.
-
-For a store of several thousand facts or more, set:
-
-```toml
-[reranker]
-model    = "bge-reranker-v2-m3"
-pool_cap = 16
-```
-
-Put the model files on disk yourself: `liam fetch-models` does not download this reranker yet. Download `onnx/model_int8.onnx` (save it as `model_int8.onnx`), `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json` and `config.json` from the Hugging Face repo `onnx-community/bge-reranker-v2-m3-ONNX` at revision `6f5ff65298512715a1e669753bc754d2bc8f367b`. Place them in `<embedder.cache_dir>/rerankers/bge-reranker-v2-m3`, or in the directory `reranker.model_dir` names. The daemon checks each file's size at start. Without the files the daemon still starts and answers `recall` in store order, as the `reranker.model` row says.
-
-The cost is real. A reranker adds about 1.2 GB of resident memory. On an Apple M1 Pro, `gte-multilingual-reranker-base` took about 254 ms per recall at 16 pairs, and `bge-reranker-v2-m3` (a 571 MB file) took about 779 ms. These timings did not come from a quiet machine. The test data was Wikipedia text, not agent memory, and the run did not cover Portuguese at that size. See [ADR 0013](../adr/0013-arctic-default-embedder-and-reranker-off.md).
+The reranker was removed. A `[reranker]` section from an older `liam.toml` is ignored, and the daemon logs one warning at start. You can delete it.
 
 `[producers.clients]` is a plain table, and the ids are what land in the
 `producer` column:
