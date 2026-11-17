@@ -342,7 +342,7 @@ mod tests {
         // Arrange
         let config = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "auto",
         );
 
@@ -364,7 +364,7 @@ mod tests {
         };
         let config = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "auto",
         );
 
@@ -381,7 +381,7 @@ mod tests {
         // Arrange
         let config = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "auto",
         );
 
@@ -399,12 +399,12 @@ mod tests {
         // Arrange
         let metal = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "metal",
         );
         let cuda = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "cuda",
         );
         let candle_cuda = config(LOCAL_PROVIDER, liam_model::QWEN3_EMBEDDING_MODEL_ID, "cuda");
@@ -428,7 +428,7 @@ mod tests {
         // Arrange
         let mut cuda = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "auto",
         );
         cuda.llm.device = "cuda".into();
@@ -476,7 +476,7 @@ mod tests {
         let mock = Config::default();
         let typo = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "gpux",
         );
 
@@ -495,7 +495,7 @@ mod tests {
         // Arrange
         let config = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "auto",
         );
 
@@ -516,7 +516,7 @@ mod tests {
         // Arrange
         let config = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "auto",
         );
 
@@ -534,7 +534,7 @@ mod tests {
         // Arrange
         let config = config(
             LOCAL_PROVIDER,
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
             "auto",
         );
 

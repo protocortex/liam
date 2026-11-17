@@ -628,6 +628,31 @@ mod tests {
     }
 
     #[test]
+    fn a_store_made_with_the_qwen3_gguf_default_is_refused_under_arctic_with_a_rebuild_hint() {
+        // Arrange
+        let local = |model: &str| {
+            let mut config = Config::default();
+            config.embedder.provider = "local".to_string();
+            config.embedder.model = model.to_string();
+            EmbedderFingerprint::from_config(&config)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        start(&database, &local(liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID)).unwrap();
+        std::fs::write(&database, b"existing vectors").unwrap();
+
+        // Act
+        let error = verify(&database, &local(liam_model::DEFAULT_EMBEDDER_MODEL_ID))
+            .expect_err("the new default must not read the old default's vectors")
+            .to_string();
+
+        // Assert
+        assert!(error.contains("liam rebuild"), "{error}");
+        assert!(error.contains("snowflake-arctic-embed-m-v2.0"), "{error}");
+        assert!(error.contains("Qwen3-Embedding-0.6B-GGUF:Q8_0"), "{error}");
+    }
+
+    #[test]
     fn switching_from_qwen3_to_bge_m3_is_refused_by_the_model_alone() {
         // Arrange: both models are 1024 wide, so only the model id differs.
         let local_config = |model: &str| {

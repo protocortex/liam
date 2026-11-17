@@ -648,18 +648,32 @@ mod tests {
     }
 
     #[test]
-    fn embedder_model_defaults_to_the_llama_cpp_q8_gguf_and_candle_stays_selectable() {
+    fn embedder_model_defaults_to_arctic_and_the_qwen3_builds_stay_selectable() {
         // Arrange
-        let path = write_temp_toml("[embedder]\nmodel = \"Qwen/Qwen3-Embedding-0.6B\"\n");
+        let absent = write_temp_toml("[gc]\n");
+        let candle = write_temp_toml("[embedder]\nmodel = \"Qwen/Qwen3-Embedding-0.6B\"\n");
+        let gguf = write_temp_toml("[embedder]\nmodel = \"Qwen/Qwen3-Embedding-0.6B-GGUF\"\n");
 
         // Act
-        let candle = Config::load(&path).unwrap();
+        let loaded_default = Config::load(&absent).unwrap();
+        let loaded_candle = Config::load(&candle).unwrap();
+        let loaded_gguf = Config::load(&gguf).unwrap();
 
         // Assert
         let default = Config::default().embedder.model;
+        assert_eq!(default, "Snowflake/snowflake-arctic-embed-m-v2.0");
         assert_eq!(default, liam_model::DEFAULT_EMBEDDER_MODEL_ID);
-        assert!(liam_model::gguf_embedder_spec(&default).is_some_and(|spec| spec.is_default));
-        assert_eq!(candle.embedder.model, liam_model::QWEN3_EMBEDDING_MODEL_ID);
+        assert_eq!(loaded_default.embedder.model, default);
+        assert!(liam_model::onnx_model_spec(&default).is_some());
+        assert_eq!(
+            loaded_candle.embedder.model,
+            liam_model::QWEN3_EMBEDDING_MODEL_ID
+        );
+        assert_eq!(
+            loaded_gguf.embedder.model,
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID
+        );
+        assert!(liam_model::gguf_embedder_spec(&loaded_gguf.embedder.model).is_some());
     }
 
     #[test]

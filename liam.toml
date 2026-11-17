@@ -185,7 +185,7 @@ version = ""
 
 [embedder]
 provider  = "local"                      # "local" (in-process) or "mock" (tests and dev)
-model     = "Qwen/Qwen3-Embedding-0.6B-GGUF" # Q8_0 on llama.cpp; "Qwen/Qwen3-Embedding-0.6B" selects candle
+model     = "Snowflake/snowflake-arctic-embed-m-v2.0" # int8 ONNX on the CPU; "Qwen/Qwen3-Embedding-0.6B-GGUF" selects Qwen3 on llama.cpp
 cache_dir = "~/.liam/models"       # both reranker and embedder files land here
 
 [llm]
@@ -241,10 +241,12 @@ unknown_id = "unknown"     # producer id recorded for a client not named in [pro
 # MCP client name = canonical producer id
 ai-notetaker = "notetaker"
 
-# The cross-encoder that reorders recall candidates.
+# The cross-encoder that reorders recall candidates. Off by default: it adds
+# about 250 ms and over 1 GB of memory for no measured gain in English,
+# Portuguese or Spanish.
 [reranker]
-model      = "bge-reranker-base"   # or "gte-multilingual-reranker-base", "bge-reranker-v2-m3"
-threads    = 0                     # 0 uses the performance cores; ONNX models only, not bge-reranker-base
+model      = "none"                # or "bge-reranker-base", "gte-multilingual-reranker-base", "bge-reranker-v2-m3"
+threads    = 0                     # 0 uses the performance cores; ONNX models only; no effect with "none"
 pool_cap   = 32                    # most candidates reranked; 16 cuts latency; above 32 is capped at 32
-max_tokens = 512                   # longest query plus document pair, in tokens; ONNX models only
-# model_dir = "/path/to/model"     # local model files; not allowed with bge-reranker-base
+max_tokens = 512                   # longest query plus document pair, in tokens; ONNX models only; no effect with "none"
+# model_dir = "/path/to/model"     # local model files; not allowed with "none" or bge-reranker-base
