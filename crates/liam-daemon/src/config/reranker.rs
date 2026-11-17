@@ -18,6 +18,9 @@ const DEFAULT_THREADS: usize = 0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
 pub enum RerankerModel {
+    /// No reranker: recall keeps the order the store returns.
+    #[serde(rename = "none")]
+    None,
     /// The legacy fastembed model.
     #[serde(rename = "bge-reranker-base")]
     BgeRerankerBase,
@@ -30,6 +33,7 @@ pub enum RerankerModel {
 impl RerankerModel {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::BgeRerankerBase => "bge-reranker-base",
             Self::GteMultilingualRerankerBase => "gte-multilingual-reranker-base",
             Self::BgeRerankerV2M3 => "bge-reranker-v2-m3",
@@ -41,7 +45,8 @@ impl RerankerModel {
 #[cfg_attr(test, derive(Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct RerankerConfig {
-    /// The cross-encoder that scores recall candidates.
+    /// The cross-encoder that scores recall candidates. `none` turns reranking
+    /// off, and then `threads` and `max_tokens` have no effect.
     pub model: RerankerModel,
     /// Threads the model runs on. `0` means the performance cores. Applies only
     /// to the ONNX models, not to `bge-reranker-base`.
@@ -59,7 +64,7 @@ pub struct RerankerConfig {
 impl Default for RerankerConfig {
     fn default() -> Self {
         Self {
-            model: RerankerModel::BgeRerankerBase,
+            model: RerankerModel::None,
             threads: DEFAULT_THREADS,
             pool_cap: DEFAULT_POOL_CAP,
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -79,6 +84,10 @@ impl RerankerConfig {
             self.model_dir.is_none() || self.model != RerankerModel::BgeRerankerBase,
             "reranker.model_dir cannot be used with {}: that model loads through fastembed, which has no model directory",
             RerankerModel::BgeRerankerBase.as_str()
+        );
+        anyhow::ensure!(
+            self.model_dir.is_none() || self.model != RerankerModel::None,
+            "reranker.model_dir cannot be used with reranker.model = \"none\": there is no model to load"
         );
         Ok(())
     }
@@ -103,7 +112,8 @@ mod tests {
 
         // Assert
         assert_eq!(config.reranker, RerankerConfig::default());
-        assert_eq!(config.reranker.model.as_str(), "bge-reranker-base");
+        assert_eq!(config.reranker.model, RerankerModel::None);
+        assert_eq!(config.reranker.model.as_str(), "none");
         assert_eq!(config.reranker.pool_cap, 32);
         assert_eq!(config.reranker.threads, 0);
         assert_eq!(config.reranker.max_tokens, 512);
@@ -124,6 +134,7 @@ mod tests {
     #[test]
     fn every_model_name_round_trips_through_the_config() {
         for model in [
+            RerankerModel::None,
             RerankerModel::BgeRerankerBase,
             RerankerModel::GteMultilingualRerankerBase,
             RerankerModel::BgeRerankerV2M3,
@@ -139,7 +150,8 @@ mod tests {
     #[test]
     fn a_model_dir_is_rejected_for_the_legacy_model_only() {
         // Act
-        let legacy = load("[reranker]\nmodel_dir = \"/m\"\n").unwrap_err();
+        let legacy =
+            load("[reranker]\nmodel = \"bge-reranker-base\"\nmodel_dir = \"/m\"\n").unwrap_err();
         let legacy_named =
             load("[reranker]\nmodel = \"bge-reranker-base\"\nmodel_dir = \"/m\"\n").unwrap_err();
         let v2 = load("[reranker]\nmodel = \"bge-reranker-v2-m3\"\nmodel_dir = \"/m\"\n").unwrap();
@@ -152,6 +164,19 @@ mod tests {
         assert!(format!("{legacy_named:#}").contains("reranker.model_dir"));
         assert_eq!(v2.reranker.model_dir.as_deref(), Some("/m"));
         assert_eq!(gte.reranker.model_dir.as_deref(), Some("/m"));
+    }
+
+    #[test]
+    fn a_model_dir_is_rejected_when_the_reranker_is_off() {
+        // Act
+        let default = load("[reranker]\nmodel_dir = \"/m\"\n").unwrap_err();
+        let named = load("[reranker]\nmodel = \"none\"\nmodel_dir = \"/m\"\n").unwrap_err();
+        let tuned = load("[reranker]\nthreads = 2\nmax_tokens = 128\n").unwrap();
+
+        // Assert
+        assert!(format!("{default:#}").contains("reranker.model_dir"));
+        assert!(format!("{named:#}").contains("reranker.model_dir"));
+        assert_eq!(tuned.reranker.model, RerankerModel::None);
     }
 
     #[test]

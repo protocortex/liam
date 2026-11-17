@@ -247,6 +247,8 @@ const RERANKERS_CACHE_SUBDIR: &str = "rerankers";
 /// Which reranker implementation a config asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RerankerBackend {
+    /// No reranker: recall keeps store order and nothing is loaded.
+    Off,
     /// The fastembed model, which downloads itself and ignores `threads` and
     /// `max_tokens`.
     Legacy,
@@ -261,6 +263,9 @@ enum RerankerBackend {
 /// `reranker.model_dir` when set, else `<embedder.cache_dir>/rerankers/<id>`.
 fn select_reranker_backend(config: &Config) -> anyhow::Result<RerankerBackend> {
     let model = config.reranker.model;
+    if model == RerankerModel::None {
+        return Ok(RerankerBackend::Off);
+    }
     if model == RerankerModel::BgeRerankerBase {
         return Ok(RerankerBackend::Legacy);
     }
@@ -326,6 +331,7 @@ fn build_local_reranker(
     loader: &dyn RerankerLoader,
 ) -> anyhow::Result<Arc<dyn Reranker>> {
     match select_reranker_backend(config)? {
+        RerankerBackend::Off => Ok(Arc::new(IdentityReranker)),
         RerankerBackend::Legacy => loader.legacy(),
         RerankerBackend::Onnx { spec, dir } => {
             let settings = RerankerSettings {
@@ -728,6 +734,32 @@ mod tests {
     }
 
     #[test]
+    fn the_default_reranker_is_off_and_loads_nothing_and_warns_of_nothing() {
+        // Arrange
+        let config = Config::default();
+        let loader = FakeLoader::default();
+        let docs = vec!["a".to_string(), "b".to_string()];
+
+        // Act
+        let backend = select_reranker_backend(&config).unwrap();
+        let reranker = build_local_reranker(&config, &loader).unwrap();
+        let scores = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(reranker.scores("q", &docs))
+            .unwrap();
+
+        // Assert
+        assert_eq!(config.reranker.model, RerankerModel::None);
+        assert_eq!(backend, RerankerBackend::Off);
+        assert_eq!(scores, vec![0.0, 0.0]);
+        assert_eq!(loader.legacy_calls.get(), 0);
+        assert!(loader.onnx_calls.borrow().is_empty());
+        assert!(loader.warnings.borrow().is_empty());
+        assert!(loader.errors.borrow().is_empty());
+    }
+
+    #[test]
     fn the_legacy_model_selects_the_legacy_backend() {
         // Arrange
         let config = reranker_config(RerankerModel::BgeRerankerBase);
@@ -764,7 +796,9 @@ mod tests {
             // Assert
             match backend {
                 RerankerBackend::Onnx { spec, .. } => assert_eq!(spec.id, id),
-                RerankerBackend::Legacy => panic!("{id} must select the ONNX backend"),
+                RerankerBackend::Legacy | RerankerBackend::Off => {
+                    panic!("{id} must select the ONNX backend")
+                }
             }
         }
     }
@@ -783,7 +817,7 @@ mod tests {
         // Assert
         let dir_of = |backend| match backend {
             RerankerBackend::Onnx { dir, .. } => dir,
-            RerankerBackend::Legacy => panic!("expected the ONNX backend"),
+            RerankerBackend::Legacy | RerankerBackend::Off => panic!("expected the ONNX backend"),
         };
         assert_eq!(dir_of(configured_backend), PathBuf::from("/elsewhere/v2m3"));
         assert_eq!(
