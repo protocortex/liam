@@ -4,19 +4,21 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const FAILURE_EXIT: i32 = 1;
 const READY_LINE: &str = "socket listener started";
 const SHUTDOWN_LINE: &str = "shutting down";
 const SOCKET_NAME: &str = "s.sock";
-/// How long a spawned `liamd` may live before it is killed: every read and
-/// wait on it ends once it is gone, so none of them can hang the test run.
+/// How long a spawned `liamd` may live before a wait on it kills it, and how
+/// long a reply may take, so no wait can hang the test run.
 const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+/// How often a wait for the child to end looks at it again.
+const EXIT_POLL: Duration = Duration::from_millis(20);
 /// How long a daemon may take to log that it listens.
 const READY_DEADLINE: Duration = Duration::from_secs(30);
 /// Prefix of the scratch directories, kept short for the socket path limit.
@@ -129,13 +131,12 @@ impl Log {
     }
 }
 
-/// A spawned `liamd` that is killed and reaped on every exit path, and by a
-/// watchdog once [`CHILD_DEADLINE`] passes.
+/// A spawned `liamd` that is killed and reaped on every exit path, and by
+/// [`Running::wait`] once [`CHILD_DEADLINE`] passes.
 struct Running {
     child: Child,
     log: Log,
     reader: Option<JoinHandle<()>>,
-    watchdog: Option<(mpsc::Sender<()>, JoinHandle<bool>)>,
 }
 
 impl Running {
@@ -155,49 +156,42 @@ impl Running {
             lock.lock().unwrap().ended = true;
             changed.notify_all();
         });
-        let pid = child.id() as libc::pid_t;
-        let (disarm, armed) = mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            let expired = armed.recv_timeout(CHILD_DEADLINE) == Err(RecvTimeoutError::Timeout);
-            if expired {
-                // SAFETY: the child is reaped only after the watchdog is
-                // disarmed and joined, so the pid is still its own.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
-            expired
-        });
         Self {
             child,
             log,
             reader: Some(reader),
-            watchdog: Some((disarm, watchdog)),
         }
     }
 
-    /// Stops the watchdog and says whether it had to kill the child.
-    fn disarm(&mut self) -> bool {
-        self.watchdog
-            .take()
-            .map(|(disarm, watchdog)| {
-                drop(disarm);
-                watchdog.join().expect("watchdog thread")
-            })
-            .unwrap_or(false)
-    }
-
-    /// Waits for the child to end. A child that outlived the deadline was
-    /// killed, and that fails the test with its log.
+    /// Waits for the child to end. A child still running at the deadline is
+    /// killed and reaped, and that fails the test with its log.
     fn wait(&mut self) -> ExitStatus {
-        let status = self.child.wait().expect("wait for liamd");
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll liamd") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                self.kill_and_reap();
+                panic!(
+                    "liamd was still running after {CHILD_DEADLINE:?} and was killed:\n{}",
+                    self.log.text()
+                );
+            }
+            std::thread::park_timeout(EXIT_POLL);
+        };
         if let Some(reader) = self.reader.take() {
             reader.join().expect("log reader thread");
         }
-        assert!(
-            !self.disarm(),
-            "liamd was still running after {CHILD_DEADLINE:?} and was killed:\n{}",
-            self.log.text()
-        );
         status
+    }
+
+    fn kill_and_reap(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 
     fn pid(&self) -> libc::pid_t {
@@ -207,43 +201,47 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.disarm();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        self.kill_and_reap();
     }
 }
 
 /// The client side of an MCP session over a child's piped stdin and stdout.
 struct Session {
     to_server: ChildStdin,
-    replies: BufReader<ChildStdout>,
+    replies: mpsc::Receiver<String>,
     log: Log,
 }
 
 impl Session {
     fn over(running: &mut Running) -> Self {
+        let stdout = running.child.stdout.take().expect("piped stdout");
+        let (send, replies) = mpsc::channel();
+        // Ends when the child closes stdout, which `Running` ensures on drop.
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             to_server: running.child.stdin.take().expect("piped stdin"),
-            replies: BufReader::new(running.child.stdout.take().expect("piped stdout")),
+            replies,
             log: running.log.clone(),
         }
     }
 
-    /// Sends a request and returns the one line that answers it. The read
-    /// ends when the watchdog kills a child that never replies.
+    /// Sends a request and returns the one line that answers it, or fails
+    /// with the daemon log when none comes within [`CHILD_DEADLINE`].
     fn request(&mut self, message: &str) -> String {
         self.notify(message);
-        let mut reply = String::new();
-        self.replies.read_line(&mut reply).expect("read a reply");
-        assert!(
-            !reply.is_empty(),
-            "no reply to {message}; the daemon log:\n{}",
-            self.log.text()
-        );
-        reply
+        match self.replies.recv_timeout(CHILD_DEADLINE) {
+            Ok(line) => line,
+            Err(error) => panic!(
+                "no reply to {message} ({error}); the daemon log:\n{}",
+                self.log.text()
+            ),
+        }
     }
 
     fn notify(&mut self, message: &str) {
@@ -346,7 +344,7 @@ impl Daemon {
 
     /// Sends SIGTERM and returns the exit status with the whole log.
     fn stop_with_sigterm(&mut self) -> (ExitStatus, String) {
-        // SAFETY: the pid is that of the child this test started and still holds.
+        // SAFETY: the pid is that of a child this test has not yet reaped.
         let sent = unsafe { libc::kill(self.0.pid(), libc::SIGTERM) };
         assert_eq!(sent, 0);
         let status = self.0.wait();
