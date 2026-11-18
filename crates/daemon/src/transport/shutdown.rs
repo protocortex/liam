@@ -94,6 +94,22 @@ impl SignalWatch {
     }
 }
 
+/// Installs the signal handlers, and only then runs `resolve`, the step that
+/// makes the socket appear. The order is what lets a stop that lands as soon
+/// as a client can connect run the orderly shutdown instead of ending the
+/// process. The install result is returned as is, for the caller to report.
+pub async fn watch_signals_before<T, E, F, Fut>(
+    resolve: F,
+) -> Result<(std::io::Result<SignalWatch>, T), E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let signals = SignalWatch::install();
+    let resolved = resolve().await?;
+    Ok((signals, resolved))
+}
+
 /// Waits for every live session to finish, then aborts whatever is left
 /// once `deadline` passes. Returns `true` if the drain completed on its own.
 ///
@@ -174,6 +190,7 @@ pub fn unlink_owned_socket(source: &ListenerSource) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use tokio::net::UnixListener;
@@ -187,6 +204,78 @@ mod tests {
             "/tmp/liam-shutdown-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    const CHILD_MARKER: &str = "LIAM_SIGNAL_ORDER_CHILD";
+    const CHILD_TEST: &str = "transport::shutdown::tests::a_stop_during_listener_setup_is_held";
+    const HELD_LINE: &str = "held SIGTERM";
+    /// Longest the child may take to see the signal it sent itself.
+    const HELD_DEADLINE: Duration = Duration::from_secs(10);
+    /// Longest the parent waits for the child process to end.
+    const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
+    /// A SIGTERM raised while the listener is still being set up must be held
+    /// for the shutdown. Run in a child of the test binary: with the handlers
+    /// installed after setup, the signal would end the process, and a signal
+    /// disposition is process-wide, so it cannot be tried inside the shared
+    /// test process.
+    #[tokio::test]
+    async fn a_stop_during_listener_setup_is_held() {
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+
+        let (signals, ()) = watch_signals_before(|| async {
+            // SAFETY: raising a signal at this process has no preconditions.
+            let raised = unsafe { libc::raise(libc::SIGTERM) };
+            assert_eq!(raised, 0);
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .expect("setup");
+        let trigger = tokio::time::timeout(HELD_DEADLINE, signals.expect("install").wait()).await;
+
+        println!("{HELD_LINE}: {trigger:?}");
+    }
+
+    #[test]
+    fn a_stop_during_listener_setup_runs_the_ordered_shutdown_path() {
+        // Arrange
+        let child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_MARKER, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the child test");
+        let pid = child.id();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if finished.recv_timeout(CHILD_DEADLINE)
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                // SAFETY: the child is not reaped before `done` is dropped.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
+        });
+
+        // Act
+        let output = child.wait_with_output().expect("wait for the child");
+        drop(done);
+        watchdog.join().expect("watchdog");
+
+        // Assert
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{:?}\n{stdout}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("{HELD_LINE}: Ok(Term)")),
+            "{stdout}"
+        );
     }
 
     #[test]

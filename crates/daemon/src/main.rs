@@ -559,10 +559,9 @@ async fn serve_socket(
     ) {
         state_dir::secure_dirs(&[parent], &state_root, SOCKET_RISK);
     }
-    // Before the socket exists, so a stop sent as soon as a client can connect
-    // is already caught.
-    let signals = transport::shutdown::SignalWatch::install();
-    let source = transport::activation::resolve(&socket_path).await?;
+    let (signals, source) =
+        transport::shutdown::watch_signals_before(|| transport::activation::resolve(&socket_path))
+            .await?;
 
     // Signals are watched on their own task so the accept loop owns the
     // main flow. Cancelling the token is all this does; the drain and the
