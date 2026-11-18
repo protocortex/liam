@@ -41,6 +41,10 @@ const FAKE_BIND_FAIL_CODE: i32 = 4;
 const FAKE_READY_FILE: &str = "FAKE_READY_FILE";
 const GONE_POLL: Duration = Duration::from_millis(20);
 const GONE_WAIT: Duration = Duration::from_secs(5);
+/// Spawns of a freshly written script may be refused as busy this many times.
+const BUSY_RETRIES: usize = 5;
+const BUSY_RETRY_PAUSE: Duration = Duration::from_millis(50);
+const EXECUTABLE_MODE: u32 = 0o755;
 /// How long a re-run of this test binary may take before it is killed.
 const RERUN_DEADLINE: Duration = Duration::from_secs(60);
 const CHAT_BODY: &str = r#"{"choices":[{"message":{"content":"{}"}}]}"#;
@@ -842,8 +846,7 @@ async fn starting_with_the_system_wiring_reports_a_server_that_exits_at_once() {
     let model = dir.path().join("model.gguf");
     std::fs::write(&model, "x").unwrap();
     let server = dir.path().join("llama-server");
-    std::fs::write(&server, "#!/bin/sh\nexit 3\n").unwrap();
-    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&server, "#!/bin/sh\nexit 3\n");
     let config = ExtractionConfig {
         llama_server_path: Some(server.to_str().unwrap().into()),
         model_gguf: Some(model.to_str().unwrap().into()),
@@ -852,7 +855,14 @@ async fn starting_with_the_system_wiring_reports_a_server_that_exits_at_once() {
     };
 
     // Act
-    let result = SidecarGuard::start(&config, &dir.path().join("pid")).await;
+    let mut result = SidecarGuard::start(&config, &dir.path().join("pid")).await;
+    for _ in 0..BUSY_RETRIES {
+        if !matches!(&result, Err(SidecarError::Spawn(e)) if is_busy(e)) {
+            break;
+        }
+        std::thread::sleep(BUSY_RETRY_PAUSE);
+        result = SidecarGuard::start(&config, &dir.path().join("pid")).await;
+    }
 
     // Assert
     assert!(
@@ -939,8 +949,7 @@ fn leak_probe_entry() {
     }
     let dir = TempDir::new().unwrap();
     let script = dir.path().join("print-env");
-    std::fs::write(&script, "#!/bin/sh\nenv\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&script, "#!/bin/sh\nenv\n");
     let paths = Paths {
         server: script,
         model: "/models/m.gguf".into(),
@@ -952,9 +961,8 @@ fn leak_probe_entry() {
         key: "the-key",
     };
 
-    let output = server_command(&ExtractionConfig::default(), &paths, &launch)
-        .output()
-        .unwrap();
+    let output =
+        retry_while_busy(|| server_command(&ExtractionConfig::default(), &paths, &launch).output());
 
     let printed = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -981,6 +989,33 @@ fn the_random_values_differ_and_are_hex() {
 }
 
 mod provider_tests;
+
+fn is_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::ExecutableFileBusy
+}
+
+/// Writes a script and closes its handle before the mode is set: another test
+/// thread that forks while the handle is open would hold it past our exec,
+/// and the exec would fail as busy.
+fn write_executable(path: &Path, body: &str) {
+    let mut file = std::fs::File::create(path).unwrap();
+    file.write_all(body.as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(EXECUTABLE_MODE)).unwrap();
+}
+
+/// A fork racing the write can still hold the script for a moment, so a busy
+/// refusal is tried again a few times.
+fn retry_while_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> T {
+    for _ in 0..BUSY_RETRIES {
+        match attempt() {
+            Err(error) if is_busy(&error) => std::thread::sleep(BUSY_RETRY_PAUSE),
+            other => return other.unwrap(),
+        }
+    }
+    attempt().unwrap()
+}
 
 #[tokio::test]
 async fn a_host_that_is_not_an_address_fails_setup_and_shows_the_parse_error() {
