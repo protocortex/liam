@@ -16,6 +16,8 @@ use crate::reader::{LogReader, LogStream, ReaderError, SequentialScanReader};
 use crate::wal::WalWriter;
 use crate::LogWriter;
 
+mod manifest_tests;
+
 const AFTER_DAYS: u32 = 5;
 const NOW: i64 = 100 * MILLIS_PER_DAY;
 const POLICY: ArchivePolicy = ArchivePolicy {

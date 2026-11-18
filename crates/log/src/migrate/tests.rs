@@ -15,6 +15,8 @@ use crate::reader::{LogReader, SequentialScanReader};
 use crate::wal::{WalConfig, WalWriter};
 use crate::LogWriter;
 
+mod state_tests;
+
 const EVENTS: usize = 40;
 const SUBJECTS: usize = 5;
 const SECRET: &str = "secret content";

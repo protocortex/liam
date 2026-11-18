@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::*;
 use crate::crypto::TestMaster;
 
+mod damage_tests;
+
 const MASTER_SEED: u8 = 4;
 
 fn master() -> Arc<dyn MasterKeyProvider> {
