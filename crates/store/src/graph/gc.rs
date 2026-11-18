@@ -16,13 +16,16 @@ use super::logged_write::{abandon, commit_or_abandon, HeldLog};
 use super::projection::{apply_steps, steps_for};
 use super::Graph;
 use crate::backend::{Backend, BackendTx};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ids::Millis;
 use crate::types::{GcReport, RetentionPolicy, RetentionRule};
 
 /// Targets one tombstone event carries at most, which also bounds the length of
 /// the transaction that applies it.
 const GC_CHUNK_TARGETS: usize = 500;
+
+/// The shortest age a rule may keep nodes for: anything less would doom every node of its kind.
+const MIN_MAX_AGE_MS: i64 = 1;
 
 /// The one definition of which nodes a retention rule dooms.
 const DOOMED: &str = "SELECT id FROM nodes WHERE kind = ?1 AND valid_from < ?2";
@@ -55,6 +58,17 @@ impl<B: Backend> Graph<B> {
         chunk: usize,
         source: &str,
     ) -> Result<GcReport> {
+        // Checked first so a refused policy takes no log lock and deletes nothing.
+        if let Some(rule) = policy
+            .rules
+            .iter()
+            .find(|rule| rule.max_age.0 < MIN_MAX_AGE_MS)
+        {
+            return Err(Error::InvalidRetention {
+                kind: rule.kind.clone(),
+                max_age_ms: rule.max_age.0,
+            });
+        }
         let mut held = match &self.log {
             Some(log) => Some(HeldLog::acquire_for_write(log).await?),
             None => None,

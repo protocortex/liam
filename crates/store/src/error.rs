@@ -264,6 +264,10 @@ pub enum Error {
     #[error("a fact cannot be valid from {valid_from} until {valid_until}")]
     InvalidFactInterval { valid_from: i64, valid_until: i64 },
 
+    /// A retention rule that keeps nodes for no time or less, which would delete every node of its kind.
+    #[error("retention for kind {kind:?} must keep nodes for at least 1 ms, got {max_age_ms} ms")]
+    InvalidRetention { kind: String, max_age_ms: i64 },
+
     /// A batch of facts is longer than one transaction may hold, so nothing was written.
     #[error("a batch of {len} facts is over the limit of {max}")]
     FactBatchTooLarge { len: usize, max: usize },
