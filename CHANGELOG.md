@@ -79,9 +79,9 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Fixed
 
-- The daemon now refuses a non-positive `gc.episode_retention_days` and a `gc.interval_hours` outside 1 to 8760
+- The daemon now refuses a `gc.episode_retention_days` outside 1 to 36500 and a `gc.interval_hours` outside 1 to 8760
   at config load. Before, `0` days deleted every episode at the next sweep and `0` hours stopped maintenance. A
-  maintenance task that panics is now logged at error level at shutdown.
+  maintenance task that ends abnormally is now logged at error level at shutdown.
 
 ### Upgrading
 

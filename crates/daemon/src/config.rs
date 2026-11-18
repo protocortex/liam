@@ -331,10 +331,12 @@ impl GcConfig {
     /// naming the key to fix.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.episode_retention_days >= MIN_EPISODE_RETENTION_DAYS,
-            "gc.episode_retention_days must be at least {MIN_EPISODE_RETENTION_DAYS}, got {}: \
-             a retention of 0 or less would delete every episode. Set a large number, such as \
-             36500, to keep episodes for longer; there is no key that turns episode deletion off",
+            (MIN_EPISODE_RETENTION_DAYS..=MAX_EPISODE_RETENTION_DAYS)
+                .contains(&self.episode_retention_days),
+            "gc.episode_retention_days must be between {MIN_EPISODE_RETENTION_DAYS} and \
+             {MAX_EPISODE_RETENTION_DAYS}, got {}: a retention of 0 or less would delete every \
+             episode. Set {MAX_EPISODE_RETENTION_DAYS} to keep episodes for the longest allowed \
+             time; there is no key that turns episode deletion off",
             self.episode_retention_days
         );
         anyhow::ensure!(
@@ -424,6 +426,9 @@ pub(crate) fn default_log_dir(database: &Path) -> PathBuf {
 
 /// Fewest days an episode is kept; a smaller value would sweep every episode.
 pub const MIN_EPISODE_RETENTION_DAYS: i64 = 1;
+
+/// Most days an episode is kept (100 years); keeps the window in range.
+pub const MAX_EPISODE_RETENTION_DAYS: i64 = 36_500;
 
 /// Bounds on the hours between maintenance ticks. Zero is not a valid timer
 /// period, and a year is the longest interval that still makes sense.
@@ -589,6 +594,33 @@ mod tests {
             // Assert
             assert!(error.contains("gc.episode_retention_days"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_retention_above_the_maximum_is_refused_at_load() {
+        for days in [MAX_EPISODE_RETENTION_DAYS + 1, i64::MAX] {
+            // Arrange
+            let text = format!("[gc]\nepisode_retention_days = {days}\n");
+
+            // Act
+            let error = load_text(&text, "/home/alice").unwrap_err().to_string();
+
+            // Assert
+            assert!(error.contains("gc.episode_retention_days"), "{error}");
+            assert!(error.contains("36500"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_retention_of_the_maximum_loads() {
+        // Arrange
+        let text = format!("[gc]\nepisode_retention_days = {MAX_EPISODE_RETENTION_DAYS}\n");
+
+        // Act
+        let config = load_text(&text, "/home/alice").unwrap();
+
+        // Assert
+        assert_eq!(config.gc.episode_retention_days, MAX_EPISODE_RETENTION_DAYS);
     }
 
     #[test]

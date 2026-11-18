@@ -717,6 +717,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancelled_task_yields_an_error_message_naming_it() {
+        // Arrange
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let joined = handle.await;
+
+        // Act
+        let message = task_failure_message("maintenance loop", &joined);
+
+        // Assert
+        let message = message.expect("a cancellation must be reported");
+        assert!(message.contains("maintenance loop"), "{message}");
+    }
+
+    #[tokio::test]
     async fn a_task_that_finished_cleanly_yields_no_message() {
         // Arrange
         let joined = tokio::spawn(async {}).await;
