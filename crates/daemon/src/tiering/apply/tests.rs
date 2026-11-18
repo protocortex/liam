@@ -15,6 +15,8 @@ use crate::tiering::test_support::{
     StubVerifier,
 };
 
+mod error_tests;
+
 const DIMS: usize = 8;
 const START: Millis = Millis(10 * 86_400_000);
 const RUN: &str = "run-1";
