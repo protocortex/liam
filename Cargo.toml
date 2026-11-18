@@ -5,7 +5,9 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-# File::try_lock (std, 1.89) is the newest std API the crates call.
+# 1.89 is the highest rust-version any resolved dependency declares (aes and uuid) and what
+# the code needs (File::try_lock). CI builds on the pinned toolchain only, so this minimum is
+# declared, not tested.
 rust-version = "1.89"
 
 [workspace.lints.rust]

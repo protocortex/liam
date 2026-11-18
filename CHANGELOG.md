@@ -19,7 +19,7 @@ All notable changes to LIAM are recorded here. The format follows
 ### Changed
 
 - The toolchain is pinned to Rust 1.99.1 in `rust-toolchain.toml`, CI installs it from that file, and the
-  workspace declares a minimum supported Rust version of 1.89.
+  workspace declares a minimum Rust version of 1.89.
 - The answer LLM now loads on first use and unloads after 5 minutes idle, so a daemon nobody is asking holds
   no model memory (about 1.0 to 1.3 GB). The first `ask` after an idle period is slower by the load time. A new
   `llm.idle_unload_secs` key (default `300`, `0` never unloads) sets the idle period, and the default of

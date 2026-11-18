@@ -9,7 +9,7 @@
 //! against the rmcp version you resolve before bumping again.
 //!
 //! The daemon sets no cap on the size of an incoming message line. It relies on
-//! rmcp's default of 16 MiB (`DEFAULT_MAX_LINE_LENGTH`, added in 3.9.0), so a
+//! rmcp's default of 16 MiB (`DEFAULT_MAX_LINE_LENGTH`, added in 3.6.0), so a
 //! rmcp release that lowers or removes it changes what a client may send.
 
 mod admin;
