@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
+mod error_text_tests;
 mod stale_tests;
 
 use super::*;
