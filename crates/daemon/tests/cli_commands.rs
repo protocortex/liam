@@ -3,6 +3,8 @@
 //! the exit code and the text a person reads are the shipped ones. Every case
 //! stops before any weights would be fetched.
 
+mod support;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -199,4 +201,69 @@ fn an_eval_with_an_unknown_device_is_refused_before_loading_any_model() {
             text(&output.stderr)
         );
     }
+}
+
+const STEPS_DONE: &str =
+    "steps done: snapshot, baseline, dedup, maintenance, extract:skipped, extract, \
+     summarize:skipped, summarize, tier:skipped, tier, probes";
+
+/// A store with its log, and the embedder record that `rebuild` writes.
+async fn recorded_store(dir: &Path) {
+    support::fixture(dir).await;
+    let rebuilt = liam(
+        dir,
+        &["--config", "liam.toml", "rebuild", "--database", "liam.db"],
+    );
+    assert_eq!(rebuilt.status.code(), Some(0), "{}", text(&rebuilt.stderr));
+}
+
+#[tokio::test]
+async fn a_consolidation_commits_and_a_later_status_reports_the_same_run() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    recorded_store(dir.path()).await;
+    let consolidate = [
+        "--config",
+        "liam.toml",
+        "consolidate",
+        "--database",
+        "liam.db",
+    ];
+    let status = [consolidate.as_slice(), &["status"]].concat();
+
+    // Act
+    let ran = liam(dir.path(), &consolidate);
+    let reported = liam(dir.path(), &status);
+
+    // Assert
+    assert_eq!(ran.status.code(), Some(0), "{}", text(&ran.stderr));
+    let ran_text = text(&ran.stdout);
+    assert!(ran_text.contains(": committed\n"), "{ran_text}");
+    assert!(ran_text.contains(STEPS_DONE), "{ran_text}");
+    assert_eq!(text(&reported.stdout), ran_text);
+}
+
+#[test]
+fn a_consolidation_over_a_database_with_no_log_exits_one_and_says_how_to_make_one() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    with_config(dir.path());
+
+    // Act
+    let output = liam(
+        dir.path(),
+        &[
+            "--config",
+            "liam.toml",
+            "consolidate",
+            "--database",
+            "liam.db",
+        ],
+    );
+
+    // Assert
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(FAILURE_EXIT));
+    assert!(stderr.starts_with("liam consolidate: "), "{stderr}");
+    assert!(stderr.contains("start liamd once to create it"), "{stderr}");
 }
