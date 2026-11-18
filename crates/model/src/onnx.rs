@@ -353,6 +353,45 @@ mod tests {
     }
 
     #[test]
+    fn the_spec_decides_whether_embed_inputs_batches() {
+        for (id, expected_calls) in [
+            (super::DEFAULT_EMBEDDER_MODEL_ID, TEXT_COUNT),
+            ("BAAI/bge-small-en-v1.5", 1),
+        ] {
+            // Arrange
+            let batching = spec(id).allows_batching();
+            let inputs = texts(TEXT_COUNT);
+            let mut calls = Vec::new();
+
+            // Act
+            embed_inputs(&inputs, batching, recording(&mut calls)).unwrap();
+
+            // Assert
+            assert_eq!(calls.len(), expected_calls, "{id}: {calls:?}");
+        }
+    }
+
+    #[test]
+    fn no_fastembed_spec_that_allows_batching_is_dynamically_quantised() {
+        for spec in ONNX_MODELS {
+            // Arrange
+            let super::OnnxSource::Fastembed(variant) = &spec.source else {
+                continue;
+            };
+
+            // Act
+            let mode = fastembed::TextEmbedding::get_quantization_mode(variant);
+
+            // Assert
+            assert!(
+                !(spec.allows_batching() && matches!(mode, fastembed::QuantizationMode::Dynamic)),
+                "{} is dynamically quantised: make allows_batching return false for that spec",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
     fn an_empty_input_returns_no_vectors_and_makes_no_call() {
         for batching in [false, true] {
             // Arrange
