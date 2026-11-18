@@ -19,6 +19,8 @@ const RUN_NOTE: &str = "note written by the run's maintenance";
 const SCRAP: &str = "scrap";
 const WAIT: Duration = Duration::from_millis(300);
 const POLL: Duration = Duration::from_millis(20);
+/// Lets a node pass the 1 ms age a sweep needs on the real clock.
+const SWEEP_AGE_WAIT: Duration = Duration::from_millis(5);
 const CLIENT: &str = "client:mcp";
 
 /// Writes under the source the run hands it, as a tagged sweep or resynthesis would.
@@ -82,7 +84,9 @@ impl ProbeRunner for ProbesWithClient {
                     store.insert(note(text)).await.unwrap();
                 }
                 Client::SweepsScrap => {
-                    let policy = RetentionPolicy::keep(SCRAP, Millis(0)).without_reclaim();
+                    tokio::time::sleep(SWEEP_AGE_WAIT).await;
+                    tokio::time::sleep(SWEEP_AGE_WAIT).await;
+                    let policy = RetentionPolicy::keep(SCRAP, Millis(1)).without_reclaim();
                     store.gc(&policy).await.unwrap();
                 }
             }
@@ -140,7 +144,8 @@ impl Maintenance for TickPath {
     async fn run(&self, store: &DefaultGraph, source: &str) -> anyhow::Result<()> {
         let worked = match self.path {
             Path::Sweep => {
-                let policy = RetentionPolicy::keep(SCRAP, Millis(0)).without_reclaim();
+                tokio::time::sleep(SWEEP_AGE_WAIT).await;
+                let policy = RetentionPolicy::keep(SCRAP, Millis(1)).without_reclaim();
                 store.gc_from(&policy, source).await.unwrap().nodes_removed > 0
             }
             Path::Repair => store.repair_superseded_mentions_from(source).await.unwrap() > 0,
@@ -675,8 +680,8 @@ struct SweepsKind {
 #[async_trait]
 impl Maintenance for SweepsKind {
     async fn run(&self, store: &DefaultGraph, source: &str) -> anyhow::Result<()> {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let policy = RetentionPolicy::keep(self.kind, Millis(0)).without_reclaim();
+        tokio::time::sleep(SWEEP_AGE_WAIT).await;
+        let policy = RetentionPolicy::keep(self.kind, Millis(1)).without_reclaim();
         if self.anonymous {
             store.gc(&policy).await.unwrap();
         } else {

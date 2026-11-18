@@ -4297,6 +4297,25 @@ mod tests {
         support::gc_ages_out_by_kind(&g, &clock).await;
     }
 
+    #[tokio::test]
+    async fn gc_with_a_non_positive_max_age_deletes_nothing() {
+        for max_age in [Millis(0), Millis(-1)] {
+            // Arrange
+            let (g, clock) = gc_graph().await;
+            clock.set(Millis(100_000));
+            g.insert(NewNode::now("episode", "old", "x").with_valid_from(Millis(10)))
+                .await
+                .unwrap();
+
+            // Act
+            let swept = g.gc(&RetentionPolicy::keep("episode", max_age)).await;
+
+            // Assert
+            assert!(swept.is_err(), "max_age {max_age:?} must be refused");
+            assert_eq!(support::count(&g, "nodes").await, 1, "max_age {max_age:?}");
+        }
+    }
+
     #[test]
     fn new_node_entity_sets_kind_label_subject() {
         let n = NewNode::entity("person", "  Ada Lovelace ");

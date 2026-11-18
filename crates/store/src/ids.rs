@@ -26,8 +26,9 @@ impl Millis {
     }
 
     /// A duration of `days` expressed in milliseconds, for retention windows.
+    /// Saturates instead of wrapping, so a huge window never becomes a small one.
     pub fn days(days: i64) -> Self {
-        Millis(days * MILLIS_PER_DAY)
+        Millis(days.saturating_mul(MILLIS_PER_DAY))
     }
 
     /// The UTC day this instant falls in, as days since the epoch.
@@ -92,5 +93,22 @@ impl NodeId {
             Some((byte, _)) => &self.0[..byte],
             None => &self.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_huge_day_count_saturates_instead_of_wrapping_negative() {
+        // Arrange
+        let days = i64::MAX;
+
+        // Act
+        let window = Millis::days(days);
+
+        // Assert
+        assert_eq!(window, Millis(i64::MAX));
     }
 }

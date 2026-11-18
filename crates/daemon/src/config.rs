@@ -326,6 +326,29 @@ impl Default for ProducersConfig {
     }
 }
 
+impl GcConfig {
+    /// Rejects values that would delete every episode or stop maintenance,
+    /// naming the key to fix.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (MIN_EPISODE_RETENTION_DAYS..=MAX_EPISODE_RETENTION_DAYS)
+                .contains(&self.episode_retention_days),
+            "gc.episode_retention_days must be between {MIN_EPISODE_RETENTION_DAYS} and \
+             {MAX_EPISODE_RETENTION_DAYS}, got {}: a retention of 0 or less would delete every \
+             episode. Set {MAX_EPISODE_RETENTION_DAYS} to keep episodes for the longest allowed \
+             time; there is no key that turns episode deletion off",
+            self.episode_retention_days
+        );
+        anyhow::ensure!(
+            (MIN_GC_INTERVAL_HOURS..=MAX_GC_INTERVAL_HOURS).contains(&self.interval_hours),
+            "gc.interval_hours must be between {MIN_GC_INTERVAL_HOURS} and \
+             {MAX_GC_INTERVAL_HOURS}, got {}",
+            self.interval_hours
+        );
+        Ok(())
+    }
+}
+
 impl Default for GcConfig {
     fn default() -> Self {
         Self {
@@ -401,8 +424,22 @@ pub(crate) fn default_log_dir(database: &Path) -> PathBuf {
     database.with_file_name(name)
 }
 
-/// Default vector width: Qwen3-Embedding-0.6B truncated to 384 dims (MRL). See
-/// `docs/specs/2026-11-06-embedder-speed-evaluation.md`.
+/// Fewest days an episode is kept; a smaller value would sweep every episode.
+pub const MIN_EPISODE_RETENTION_DAYS: i64 = 1;
+
+/// Most days an episode is kept (100 years); keeps the window in range.
+pub const MAX_EPISODE_RETENTION_DAYS: i64 = 36_500;
+
+/// Bounds on the hours between maintenance ticks. Zero is not a valid timer
+/// period, and a year is the longest interval that still makes sense.
+pub const MIN_GC_INTERVAL_HOURS: u64 = 1;
+pub const MAX_GC_INTERVAL_HOURS: u64 = 8760;
+
+const SECS_PER_HOUR: u64 = 3600;
+
+/// Default vector width: the default embedder (Snowflake arctic-embed-m-v2.0,
+/// int8 ONNX) truncated to 384 dims (MRL). Qwen3-Embedding-0.6B stays
+/// selectable at the same width. See `docs/specs/2026-11-06-embedder-speed-evaluation.md`.
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 /// Default seconds `recall` and `ask` may spend retrieving.
@@ -477,6 +514,7 @@ impl Config {
         config.encryption.expand_paths(home)?;
         config.archive.expand_paths(home)?;
         config.log.validate()?;
+        config.gc.validate()?;
         config.producers.validate()?;
         config.extraction.validate()?;
         config.consolidation.validate()?;
@@ -515,7 +553,7 @@ impl Config {
     }
 
     pub fn gc_interval(&self) -> Duration {
-        Duration::from_secs(self.gc.interval_hours * 3600)
+        Duration::from_secs(self.gc.interval_hours.saturating_mul(SECS_PER_HOUR))
     }
 }
 
@@ -542,6 +580,87 @@ mod tests {
         let path = dir.path().join("liam.toml");
         std::fs::write(&path, text).unwrap();
         Config::load_with_home(&path, home)
+    }
+
+    #[test]
+    fn a_retention_below_one_day_is_refused_at_load() {
+        for days in [0, -1] {
+            // Arrange
+            let text = format!("[gc]\nepisode_retention_days = {days}\n");
+
+            // Act
+            let error = load_text(&text, "/home/alice").unwrap_err().to_string();
+
+            // Assert
+            assert!(error.contains("gc.episode_retention_days"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_retention_above_the_maximum_is_refused_at_load() {
+        for days in [MAX_EPISODE_RETENTION_DAYS + 1, i64::MAX] {
+            // Arrange
+            let text = format!("[gc]\nepisode_retention_days = {days}\n");
+
+            // Act
+            let error = load_text(&text, "/home/alice").unwrap_err().to_string();
+
+            // Assert
+            assert!(error.contains("gc.episode_retention_days"), "{error}");
+            assert!(error.contains("36500"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_retention_of_the_maximum_loads() {
+        // Arrange
+        let text = format!("[gc]\nepisode_retention_days = {MAX_EPISODE_RETENTION_DAYS}\n");
+
+        // Act
+        let config = load_text(&text, "/home/alice").unwrap();
+
+        // Assert
+        assert_eq!(config.gc.episode_retention_days, MAX_EPISODE_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn a_retention_of_one_day_loads() {
+        // Arrange
+        let text = "[gc]\nepisode_retention_days = 1\n";
+
+        // Act
+        let config = load_text(text, "/home/alice").unwrap();
+
+        // Assert
+        assert_eq!(config.gc.episode_retention_days, 1);
+    }
+
+    #[test]
+    fn an_interval_outside_one_to_8760_hours_is_refused_at_load() {
+        for hours in [0, MAX_GC_INTERVAL_HOURS + 1] {
+            // Arrange
+            let text = format!("[gc]\ninterval_hours = {hours}\n");
+
+            // Act
+            let error = load_text(&text, "/home/alice").unwrap_err().to_string();
+
+            // Assert
+            assert!(error.contains("gc.interval_hours"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_interval_at_either_end_of_the_range_loads() {
+        for hours in [MIN_GC_INTERVAL_HOURS, MAX_GC_INTERVAL_HOURS] {
+            // Arrange
+            let text = format!("[gc]\ninterval_hours = {hours}\n");
+
+            // Act
+            let config = load_text(&text, "/home/alice").unwrap();
+
+            // Assert
+            assert_eq!(config.gc_interval(), Duration::from_secs(hours * 3600));
+        }
     }
 
     #[test]

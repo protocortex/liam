@@ -77,6 +77,12 @@ All notable changes to LIAM are recorded here. The format follows
 - The shipped `liam.toml` now uses the local embedder and the llama-cpp LLM. `provider = "mock"`
   is still accepted for tests and dev, and an unknown provider name is now an error.
 
+### Fixed
+
+- The daemon now refuses a `gc.episode_retention_days` outside 1 to 36500 and a `gc.interval_hours` outside 1 to 8760
+  at config load. Before, `0` days deleted every episode at the next sweep and `0` hours stopped maintenance. A
+  maintenance task that ends abnormally is now logged at error level at shutdown.
+
 ### Upgrading
 
 - An existing store is refused at its first start on this version until you run `liam rebuild

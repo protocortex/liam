@@ -55,8 +55,8 @@ already listening, and replaces the socket only when it is stale.
 The tools a client sees, with their fields, are listed in
 [Tools](../reference/tools.md).
 
-The shipped `liam.toml` uses the local embedder (Qwen3-Embedding-0.6B as a Q8_0 GGUF on llama.cpp,
-on the Apple GPU when there is one). With
+The shipped `liam.toml` uses the local embedder (`Snowflake/snowflake-arctic-embed-m-v2.0` as an int8 ONNX model on the CPU, cut to
+384 dimensions; Qwen3-Embedding-0.6B on llama.cpp stays selectable through `embedder.model`). With
 `provider = "mock"` the embedder is a hash-derived placeholder, so retrieval
 leans on full-text and graph signals; that is for tests and dev.
 
