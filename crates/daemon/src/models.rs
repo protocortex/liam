@@ -19,6 +19,7 @@ use liam_model::{Embedder, Llm, MockEmbedder, MockLlm, TextKind};
 use liam_store::{ContentEmbedder, EmbedError};
 
 use crate::config::{self, Config};
+use crate::lazy_llm::{LazyLlm, Loader};
 
 /// Expands `~` in a configured path. Nothing below the config layer
 /// understands a home directory: the socket API would create a directory
@@ -239,19 +240,20 @@ pub fn build_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
     // asked for. Any provider that already validated `llm.device` above
     // guarantees it parses here too, so `unwrap_or_default` only matters
     // for the mock provider, whose "mock" label never trips the check.
-    #[cfg(target_os = "macos")]
-    {
-        let device = DevicePreference::parse(&config.llm.device).unwrap_or_default();
-        if let Some(message) = macos_backend_error(llm.backend(), device) {
-            anyhow::bail!(message);
-        }
-    }
+    let device = DevicePreference::parse(&config.llm.device).unwrap_or_default();
+    reject_unexpected_cpu_backend(llm.backend(), device)?;
 
     Ok(llm)
 }
 
-fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
-    use liam_model::LlamaCppLlm;
+/// The llama.cpp settings both the eager and the lazy path read, resolved and
+/// checked once.
+struct LlamaSettings {
+    device: DevicePreference,
+    cache_dir: String,
+}
+
+fn llama_settings(config: &Config) -> anyhow::Result<LlamaSettings> {
     // Reject an unknown device rather than quietly running 5x slower on CPU.
     let device = DevicePreference::parse(&config.llm.device).ok_or_else(|| {
         anyhow::anyhow!(
@@ -267,13 +269,68 @@ fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
         &config.llm.cache_dir,
         &std::env::var("HOME").unwrap_or_default(),
     )?;
+    Ok(LlamaSettings { device, cache_dir })
+}
+
+fn load_llama(config: &Config, settings: &LlamaSettings) -> liam_model::Result<Arc<dyn Llm>> {
+    use liam_model::LlamaCppLlm;
     Ok(Arc::new(LlamaCppLlm::load_from_hub(
         &config.llm.model,
         &config.llm.gguf_file,
-        &cache_dir,
+        &settings.cache_dir,
         config.llm.context_tokens as u32,
-        device,
+        settings.device,
     )?))
+}
+
+fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
+    let settings = llama_settings(config)?;
+    Ok(load_llama(config, &settings)?)
+}
+
+/// The LLM the daemon serves with, plus the handle that unloads it when idle.
+pub struct ServingLlm {
+    pub llm: Arc<dyn Llm>,
+    /// `Some` for a provider that loads on first use, `None` for the mock.
+    pub lazy: Option<Arc<LazyLlm>>,
+}
+
+/// Like `build_llm`, but a llama.cpp model is not loaded here: the returned
+/// handle loads it on the first call and gives it back after an idle period.
+/// Config errors and the macOS backend check still fail startup, because the
+/// backend label is read without loading weights. `liam fetch-models` keeps
+/// `build_llm`, which loads, because it exists to prove the model loads.
+pub fn build_serving_llm(config: &Config) -> anyhow::Result<ServingLlm> {
+    if config.llm.provider != LLAMA_PROVIDER {
+        return Ok(ServingLlm {
+            llm: build_llm(config)?,
+            lazy: None,
+        });
+    }
+    let settings = llama_settings(config)?;
+    let backend = liam_model::llama::llama_runtime_backend()?;
+    reject_unexpected_cpu_backend(backend, settings.device)?;
+    let loader: Loader = {
+        let config = config.clone();
+        Arc::new(move || load_llama(&config, &settings))
+    };
+    let lazy = Arc::new(LazyLlm::new(loader, backend));
+    tracing::info!(backend, "llm ready, loads on first use");
+    Ok(ServingLlm {
+        llm: lazy.clone(),
+        lazy: Some(lazy),
+    })
+}
+
+/// Applies `macos_backend_error` on macOS and does nothing elsewhere.
+fn reject_unexpected_cpu_backend(backend: &str, device: DevicePreference) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(message) = macos_backend_error(backend, device) {
+        anyhow::bail!(message);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (backend, device);
+    Ok(())
 }
 
 /// Whether a resolved backend label is a macOS startup error. Pure and

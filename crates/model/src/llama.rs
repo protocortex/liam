@@ -335,6 +335,14 @@ pub(crate) fn runtime_backend(backend: &LlamaBackend) -> &'static str {
     runtime_label(compiled_backend(), backend.supports_gpu_offload())
 }
 
+/// The backend label a loaded `LlamaCppLlm` will report, without loading any
+/// weights. Initialising the process-global backend is cheap, so a caller that
+/// loads the model later can still check and log the backend at startup.
+pub fn llama_runtime_backend() -> Result<&'static str> {
+    let backend = shared_backend()?;
+    Ok(runtime_backend(&backend))
+}
+
 #[async_trait]
 impl Llm for LlamaCppLlm {
     async fn complete(&self, system: &str, prompt: &str) -> Result<String> {
@@ -425,6 +433,18 @@ mod tests {
             let metal = LlamaCppLlm::load("missing.gguf", 512, DevicePreference::Metal);
             assert!(metal.err().unwrap().to_string().contains("macOS"));
         }
+    }
+
+    #[test]
+    fn the_runtime_backend_probe_matches_the_label_a_loaded_model_reports() {
+        // Arrange
+        let backend = shared_backend().expect("backend init");
+
+        // Act
+        let probed = llama_runtime_backend().expect("probe");
+
+        // Assert
+        assert_eq!(probed, runtime_backend(&backend));
     }
 
     #[test]

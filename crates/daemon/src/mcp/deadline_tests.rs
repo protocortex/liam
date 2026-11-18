@@ -658,3 +658,53 @@ async fn ask_keeps_the_embed_reason_when_the_pre_pass_refuses() {
     );
     assert!(text.contains("does not contain an answer"), "{text}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_ask_whose_deadline_passes_during_the_model_load_takes_the_synthesis_fallback() {
+    // Arrange: a lazy model whose load stays blocked until the gate closes.
+    // The paused clock does not advance while a blocking load runs, so the
+    // test moves it by hand once the load has started.
+    let (open, gate) = std::sync::mpsc::channel::<()>();
+    let (started_tx, started) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    let loader: liam_daemon::lazy_llm::Loader = Arc::new(move || {
+        started_tx.send(()).ok();
+        gate.lock().unwrap().recv().ok();
+        Ok(Arc::new(CannedLlm {
+            reply: Some(GROUNDED_ANSWER),
+        }) as Arc<dyn Llm>)
+    });
+    let lazy = Arc::new(liam_daemon::lazy_llm::LazyLlm::new(loader, "test"));
+    let server = server_with_ask_timeout(
+        Arc::new(MockEmbedder::new(DIMS)),
+        lazy.clone(),
+        ASK_TIMEOUT_SECS,
+    )
+    .await;
+    seed_facts(&server).await;
+
+    // Act: the first ask times out inside the load, then the load finishes.
+    let (slow, ()) = tokio::join!(
+        server.ask_with(ask_args(), CancellationToken::new()),
+        async {
+            tokio::task::spawn_blocking(move || started.recv().unwrap())
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(ASK_TIMEOUT_SECS + 1)).await;
+        }
+    );
+    drop(open);
+    lazy.warmup()
+        .await
+        .expect("the load finishes after the deadline");
+    let ready = server.ask_with(ask_args(), CancellationToken::new()).await;
+
+    // Assert
+    let text = wire_text(slow, &["synthesis_unavailable"], false);
+    assert_eq!(
+        text.lines().next(),
+        Some(marker_for("synthesis_unavailable").as_str())
+    );
+    assert_eq!(text.matches(" note ").count(), K, "{text}");
+    wire_text(ready, NO_REASONS, false);
+}

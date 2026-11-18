@@ -188,9 +188,14 @@ pub struct LlmConfig {
     /// builds include Metal automatically; CUDA needs `--features cuda` at build
     /// time. See `liam_model::llm::DevicePreference`.
     pub device: String,
-    /// Generate one throwaway token at startup so the backend's first-call cost
-    /// (on Metal, ~10s of GPU kernel compilation) is paid before a user waits.
+    /// Load the model and generate one throwaway token at startup, so the
+    /// backend's first-call cost (on Metal, ~10s of GPU kernel compilation) is
+    /// paid before a user waits. Off by default: the model then loads on the
+    /// first call that needs it.
     pub warmup: bool,
+    /// Seconds without a generation after which the model is unloaded to give
+    /// its memory back; the next call loads it again. `0` never unloads.
+    pub idle_unload_secs: u64,
     /// The model's context window. Sizes both the llama.cpp context and the
     /// evidence trimming in `ask`, because those two have to agree: if they
     /// disagreed a full-size prompt would overflow the context and decode
@@ -358,7 +363,8 @@ impl Default for LlmConfig {
             gguf_file: "qwen2.5-1.5b-instruct-q4_k_m.gguf".into(),
             cache_dir: "~/.liam/models".into(),
             device: "auto".into(),
-            warmup: true,
+            warmup: false,
+            idle_unload_secs: DEFAULT_LLM_IDLE_UNLOAD_SECS,
             context_tokens: 8192,
             max_concurrent_generations: 0,
         }
@@ -401,6 +407,9 @@ pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 /// Default seconds `recall` and `ask` may spend retrieving.
 pub const DEFAULT_RECALL_TIMEOUT_SECS: u64 = 10;
+
+/// Default seconds the LLM may sit unused before it is unloaded.
+pub const DEFAULT_LLM_IDLE_UNLOAD_SECS: u64 = 300;
 
 /// The config file read when neither `--config` nor `LIAM_CONFIG` says
 /// otherwise.
@@ -651,6 +660,48 @@ mod tests {
     }
 
     #[test]
+    fn the_llm_loads_on_first_use_and_unloads_after_five_idle_minutes_by_default() {
+        // Arrange
+        let path = write_temp_toml("");
+
+        // Act
+        let c = Config::load(&path).expect("empty config parses");
+
+        // Assert
+        assert!(!c.llm.warmup);
+        assert_eq!(c.llm.idle_unload_secs, 300);
+    }
+
+    #[test]
+    fn an_explicit_idle_unload_and_warmup_round_trip() {
+        // Arrange
+        let path = write_temp_toml("[llm]\nwarmup = true\nidle_unload_secs = 0\n");
+
+        // Act
+        let c = Config::load(&path).expect("config with the keys parses");
+
+        // Assert
+        assert!(c.llm.warmup);
+        assert_eq!(c.llm.idle_unload_secs, 0);
+    }
+
+    #[test]
+    fn a_bad_idle_unload_value_fails_the_config_load() {
+        // Arrange
+        let cases = ["\"soon\"", "-1", "1.5"];
+
+        for bad in cases {
+            let path = write_temp_toml(&format!("[llm]\nidle_unload_secs = {bad}\n"));
+
+            // Act
+            let result = Config::load(&path);
+
+            // Assert
+            assert!(result.is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
     fn llm_defaults_to_mock() {
         let c = Config::default();
         assert_eq!(c.llm.provider, "mock");
@@ -691,7 +742,7 @@ mod tests {
             liam_model::llm::DevicePreference::parse(&c.llm.device),
             Some(liam_model::llm::DevicePreference::Auto)
         );
-        assert!(c.llm.warmup, "warmup should be on by default");
+        assert!(!c.llm.warmup, "the model loads on first use by default");
     }
 
     #[test]
