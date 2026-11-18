@@ -37,3 +37,36 @@ figures plus a row per question. The ranking metrics are deterministic: two
 runs of the same model give the same values. Only the timings vary with the
 machine. The measured comparison of the two models is in
 [`docs/specs/2026-10-23-m-l2-d42-embedder-evaluation.md`](../specs/2026-10-23-m-l2-d42-embedder-evaluation.md).
+
+## Multilingual embedder check
+
+`crates/daemon/src/retrieval_eval/multilingual/` holds an embedder-only check in
+eight languages: English, Portuguese, Spanish, Chinese, French, German, Japanese
+and Arabic. Each language has 30 queries over 287 facts, and `pairs.json` names
+the relevant facts for each query. English is the source. The other seven are
+machine translated, so a gap between languages is a signal, not a measure of
+translation quality. For each language the check embeds every fact as a
+document, embeds each query as a query, ranks all facts by cosine similarity,
+and reports the mean nDCG@10 over the 30 queries.
+
+English, Portuguese and Spanish gate, because they are the languages the
+project targets. Each may fall at most 0.05 below its baseline, and their mean
+at most 0.02. The other five are printed with their change from the baseline
+and never fail the check.
+
+The baseline is `baseline-arctic-embed-m-v2-384.json` in the same folder. It
+records the embedder id and width it was measured with. The check refuses to
+run against a different default embedder or width, and says to re-measure.
+
+The test is `#[ignore]`d because it loads the real model, about 311 MB on the
+first run:
+
+```sh
+cargo test --release -p liam-daemon --lib -- --ignored --nocapture \
+  multilingual::tests::the_default_embedder_meets_the_multilingual_baseline
+```
+
+Set `LIAM_EVAL_CACHE_DIR` to keep the model files out of `embedder.cache_dir`.
+To re-measure the baseline, for example after changing the default embedder, run
+the test and copy the printed `ndcg@10` column, with the new embedder id and
+`dims`, into the baseline file.
