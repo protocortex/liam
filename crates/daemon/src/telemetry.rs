@@ -9,7 +9,7 @@ const LLAMA_CPP_TARGET: &str = "llama-cpp-2";
 
 /// The filter used when `RUST_LOG` is not set: `default_filter`, with
 /// llama.cpp held to warnings so its model-loading and shader-compile lines
-/// stay out of the output. Set `RUST_LOG=llama-cpp-2=debug` to see them.
+/// stay out of the output. Set `RUST_LOG=info,llama-cpp-2=debug` to see them.
 fn default_env_filter(default_filter: &str) -> EnvFilter {
     EnvFilter::new(format!("{default_filter},{LLAMA_CPP_TARGET}=warn"))
 }

@@ -115,6 +115,17 @@ async fn a_rebuild_without_a_database_flag_uses_the_configured_database_and_tigh
     // Assert
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
     assert!(text(&output.stdout).contains("nodes: 1"));
+    let database = state.join("liam.db").display().to_string();
+    assert!(
+        text(&output.stderr).contains(&format!("rebuilding {database} with")),
+        "{}",
+        text(&output.stderr)
+    );
+    assert!(
+        text(&output.stderr).contains(&format!("the database {database} already holds rows")),
+        "{}",
+        text(&output.stderr)
+    );
     for file in &wide {
         let mode = std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{}", file.display());

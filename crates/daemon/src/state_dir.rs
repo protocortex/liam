@@ -26,6 +26,9 @@ const DATABASE_SIDE_FILES: [&str; 2] = ["-wal", "-shm"];
 const DATABASE_SIDECAR_EXTENSIONS: [&str; 5] = ["json", "jsonl", "lock", "pid", "tmp"];
 /// Extensions of the snapshot files: the copied database and its metadata.
 const SNAPSHOT_FILE_EXTENSIONS: [&str; 2] = ["db", "json"];
+/// The group and other permission bits.
+#[cfg(unix)]
+const GROUP_AND_OTHER_BITS: u32 = 0o077;
 /// Where a bare file name sits.
 const CURRENT_DIR: &str = ".";
 
@@ -169,10 +172,9 @@ fn outside_root(dir: &Path) -> std::io::Result<DirOutcome> {
 #[cfg(unix)]
 fn wide_mode(dir: &Path) -> std::io::Result<Option<u32>> {
     use std::os::unix::fs::PermissionsExt;
-    const GROUP_AND_OTHER: u32 = 0o077;
 
     let mode = std::fs::metadata(dir)?.permissions().mode() & 0o7777;
-    Ok((mode & GROUP_AND_OTHER != 0).then_some(mode))
+    Ok((mode & GROUP_AND_OTHER_BITS != 0).then_some(mode))
 }
 
 #[cfg(not(unix))]
@@ -262,56 +264,100 @@ fn has_extension(name: &str, extensions: &[&str]) -> bool {
         .is_some_and(|extension| extensions.contains(&extension))
 }
 
-/// Narrows the regular files directly in `dir` that `is_own` accepts, and
-/// returns how many were wider. Nothing happens for a directory outside
-/// `state_root` or one reached through a symbolic link, because only the state
-/// root is known to hold nothing but LIAM's files. A file that is a symbolic
-/// link is skipped, and a file already owner-only is left as it is.
+/// What one sweep over a directory did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Sweep {
+    /// Files that were wider and are now owner-only.
+    tightened: usize,
+    /// Files opened to narrow them. A file already owner-only is never opened.
+    opened: usize,
+    /// Files that could not be narrowed.
+    failed: usize,
+    /// The first file that could not be narrowed, with its error.
+    first_failure: Option<(PathBuf, String)>,
+}
+
+impl Sweep {
+    fn record_failure(&mut self, path: PathBuf, error: &std::io::Error) {
+        self.failed += 1;
+        self.first_failure
+            .get_or_insert_with(|| (path, error.to_string()));
+    }
+}
+
+/// Whether the mode has a group or other bit set.
+#[cfg(unix)]
+fn is_wide(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & GROUP_AND_OTHER_BITS != 0
+}
+
+#[cfg(not(unix))]
+fn is_wide(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Narrows the regular files directly in `dir` that `is_own` accepts. Nothing
+/// happens for a directory outside `state_root` or one reached through a
+/// symbolic link, because only the state root is known to hold nothing but
+/// LIAM's files. The directory entry's own metadata (it does not follow links)
+/// tells a regular file from a link and shows the mode, so a symbolic link and
+/// a file already owner-only are passed over without being opened.
 fn secure_files_in(
     dir: &Path,
     state_root: &Path,
     is_own: impl Fn(&str) -> bool,
-) -> std::io::Result<usize> {
+) -> std::io::Result<Sweep> {
+    let mut sweep = Sweep::default();
     let (Ok(dir), Ok(root)) = (normalise(dir), normalise(state_root)) else {
-        return Ok(0);
+        return Ok(sweep);
     };
     if !dir.starts_with(&root)
         || has_symlink_from(&root, &dir)
             .map_err(|error| failed("check for symbolic links in", error))?
     {
-        return Ok(0);
+        return Ok(sweep);
     }
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(error) if NOT_THERE.contains(&error.kind()) => return Ok(0),
+        Err(error) if NOT_THERE.contains(&error.kind()) => return Ok(sweep),
         Err(error) => return Err(error),
     };
-    let mut tightened = 0;
     for entry in entries {
         let entry = entry?;
-        let is_regular_file = entry.file_type().is_ok_and(|kind| kind.is_file());
-        let name = entry.file_name();
-        if !is_regular_file || !name.to_str().is_some_and(&is_own) {
+        if !entry.file_name().to_str().is_some_and(&is_own) {
             continue;
         }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() || !is_wide(&meta) {
+            continue;
+        }
+        sweep.opened += 1;
         match narrow_to_owner(&entry.path()) {
-            Ok(Some(_)) => tightened += 1,
+            Ok(Some(_)) => sweep.tightened += 1,
             Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(file = %entry.path().display(), %error, "could not restrict this file to its owner");
-            }
+            Err(error) => sweep.record_failure(entry.path(), &error),
         }
     }
-    Ok(tightened)
+    Ok(sweep)
 }
 
 /// Restricts the files the daemon keeps to the owner: the database and its
 /// sidecars, the event log's files and the snapshot files. Run after the store
 /// has opened, and at the end of a command that opened it. Files outside
 /// `state_root` and files that are not LIAM's by name are never touched, and a
-/// failure is a warning, not a failed start.
+/// failure is a warning, not a failed start. A file that is a hard link is
+/// narrowed like any other file the same user owns, which narrows every name
+/// it has.
 pub fn secure_state_files(database: &Path, log_dir: &Path, snapshot_dir: &Path, state_root: &Path) {
     secure_database_files(database);
+    secure_sidecar_files(database, log_dir, snapshot_dir, state_root);
+}
+
+/// The part of `secure_state_files` that is limited to the state root.
+fn secure_sidecar_files(database: &Path, log_dir: &Path, snapshot_dir: &Path, state_root: &Path) {
     let db_name = database
         .file_name()
         .and_then(|name| name.to_str())
@@ -328,30 +374,54 @@ pub fn secure_state_files(database: &Path, log_dir: &Path, snapshot_dir: &Path, 
     secure_group(snapshot_dir, state_root, is_snapshot_file);
 }
 
-/// `secure_files_in`, with what it did logged.
+/// `secure_files_in`, with what it did logged: one warning per directory, not
+/// one per file, so a large directory cannot flood the log.
 fn secure_group(dir: &Path, state_root: &Path, is_own: impl Fn(&str) -> bool) {
     match secure_files_in(dir, state_root, is_own) {
-        Ok(0) => {}
-        Ok(count) => {
-            tracing::info!(dir = %dir.display(), count, "restricted the state files to their owner");
-        }
+        Ok(sweep) => log_sweep(dir, &sweep),
         Err(error) => {
             tracing::warn!(dir = %dir.display(), %error, "could not secure the files in this directory");
         }
     }
 }
 
-/// `secure_state_files` for the directories `config` names around `database`.
-/// Does nothing when `HOME` gives no state root.
-pub fn secure_state_files_for(config: &Config, database: &Path) {
-    let Some(state_root) = state_root_from_home(std::env::var_os("HOME")) else {
+fn log_sweep(dir: &Path, sweep: &Sweep) {
+    let dir = dir.display();
+    if sweep.tightened > 0 {
+        tracing::info!(dir = %dir, count = sweep.tightened, "restricted the state files to their owner");
+    }
+    if let Some((first, error)) = &sweep.first_failure {
+        tracing::warn!(dir = %dir, count = sweep.failed, first = %first.display(), %error, "could not restrict some files to their owner");
+    }
+}
+
+/// `secure_state_files` for the directories `config` names around `database`,
+/// with `log_dir` taking the place of the configured log directory when the
+/// command was given one. The database files are narrowed whatever `HOME` is,
+/// because the user pointed the tool at them. The rest needs a state root from
+/// `HOME`, and is skipped without one.
+pub fn secure_state_files_for(config: &Config, database: &Path, log_dir: Option<&Path>) {
+    secure_state_files_with_home(config, database, log_dir, std::env::var_os("HOME"));
+}
+
+fn secure_state_files_with_home(
+    config: &Config,
+    database: &Path,
+    log_dir: Option<&Path>,
+    home: Option<OsString>,
+) {
+    secure_database_files(database);
+    let Some(state_root) = state_root_from_home(home) else {
         return;
     };
-    let dirs = models::resolve_log_dir(config, database)
-        .and_then(|log| Ok((log, models::resolve_snapshot_dir(config, database)?)));
+    let dirs = match log_dir {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => models::resolve_log_dir(config, database),
+    }
+    .and_then(|log| Ok((log, models::resolve_snapshot_dir(config, database)?)));
     match dirs {
         Ok((log_dir, snapshot_dir)) => {
-            secure_state_files(database, &log_dir, &snapshot_dir, &state_root);
+            secure_sidecar_files(database, &log_dir, &snapshot_dir, &state_root);
         }
         Err(error) => {
             tracing::warn!(%error, "could not work out the state directories, so their files were not checked");
@@ -794,5 +864,101 @@ mod tests {
 
         // Assert
         assert_eq!(mode_of(&real), 0o644);
+    }
+
+    #[test]
+    fn the_database_files_are_narrowed_when_home_gives_no_state_root() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        let files = [
+            database.clone(),
+            dir.path().join("liam.db-wal"),
+            dir.path().join("liam.db-shm"),
+        ];
+        for file in &files {
+            fs::write(file, b"data").unwrap();
+            set_mode(file, 0o644);
+        }
+
+        // Act
+        for home in [None, Some(OsString::from("relative/home"))] {
+            secure_state_files_with_home(&Config::default(), &database, None, home);
+        }
+
+        // Assert
+        for file in &files {
+            assert_eq!(mode_of(file), 0o600, "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn a_log_directory_given_by_the_command_is_the_one_secured() {
+        // Arrange
+        let layout = Layout::new();
+        let other_log = layout.root.join("other.log");
+        fs::create_dir(&other_log).unwrap();
+        let wal = other_log.join("00000000000000000000.wal");
+        layout.write_wide(&wal);
+        let home = layout.root.parent().unwrap().as_os_str().to_owned();
+
+        // Act
+        secure_state_files_with_home(
+            &Config::default(),
+            &layout.database,
+            Some(&other_log),
+            Some(home),
+        );
+
+        // Assert
+        assert_eq!(mode_of(&wal), 0o600);
+    }
+
+    #[test]
+    fn an_already_narrow_file_is_not_opened() {
+        // Arrange
+        let layout = Layout::new();
+        let wal = layout.log_dir.join("00000000000000000000.wal");
+        let segment = layout.log_dir.join("00000000000000000002.wal");
+        layout.write_wide(&segment);
+        set_mode(&wal, 0o600);
+        fs::remove_file(layout.log_dir.join("00000000000000000001.parquet")).unwrap();
+        fs::remove_file(layout.log_dir.join(MANIFEST_NAME)).unwrap();
+
+        // Act
+        let sweep = secure_files_in(&layout.log_dir, &layout.root, is_log_file).unwrap();
+
+        // Assert
+        assert_eq!(sweep.opened, 1);
+        assert_eq!(sweep.tightened, 1);
+        assert_eq!(sweep.failed, 0);
+    }
+
+    #[test]
+    fn failing_files_in_one_directory_make_one_summary_with_a_count() {
+        // Arrange: a mode with no owner read bit makes the open fail
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let layout = Layout::new();
+        let names = [
+            "00000000000000000010.wal",
+            "00000000000000000011.wal",
+            "00000000000000000012.wal",
+        ];
+        for name in names {
+            let file = layout.log_dir.join(name);
+            layout.write_wide(&file);
+            set_mode(&file, 0o070);
+        }
+
+        // Act
+        let sweep = secure_files_in(&layout.log_dir, &layout.root, is_log_file).unwrap();
+
+        // Assert
+        assert_eq!(sweep.failed, 3);
+        let (first, error) = sweep.first_failure.unwrap();
+        assert!(names.iter().any(|name| first.ends_with(name)), "{first:?}");
+        assert!(!error.is_empty());
     }
 }

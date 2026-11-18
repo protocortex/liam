@@ -13,9 +13,9 @@ const RMCP_ARGUMENT_ERROR_PREFIX: &str = "failed to deserialize parameters:";
 /// How serde names a required field the input lacks, up to the field's name.
 const MISSING_FIELD_MARKER: &str = "missing field `";
 
-/// The kinds `remember` documents. Any label is stored, but these are the
-/// ones clients should use.
-const REMEMBER_KINDS: [&str; 4] = ["decision", "fact", "symbol", "episode"];
+/// The common kinds `remember` documents on its `kind` field. Any label is
+/// stored; a test keeps this list equal to the field's description.
+pub(super) const REMEMBER_KINDS: [&str; 4] = ["decision", "fact", "symbol", "episode"];
 
 /// Replaces the raw serde text of a missing-field reply from `tool`. Any other
 /// response is returned as it came.
@@ -42,7 +42,10 @@ fn missing_field_message(tool: &str, raw: &str) -> Option<String> {
     let field = after_marker.split_once('`')?.0;
     let hint = match (tool, field) {
         ("remember", "kind") => {
-            format!(", the kind of memory: one of {}", REMEMBER_KINDS.join(", "))
+            format!(
+                ", the kind of memory. The common kinds are {}, but any label is stored",
+                REMEMBER_KINDS.join(", ")
+            )
         }
         _ => String::new(),
     };

@@ -293,7 +293,7 @@ fn try_consolidate(
         embedder,
         &mut std::io::stdout(),
     ));
-    state_dir::secure_state_files_for(config, &database);
+    state_dir::secure_state_files_for(config, &database, None);
     Ok(Some(outcome?))
 }
 
@@ -349,11 +349,15 @@ const REBUILD_WAL: WalConfig = WalConfig {
 
 /// A sweep is tombstoned only when the store has a log attached; any other
 /// sweep is invisible to a rebuild.
-const GC_WARNING: &str =
-    "warning: the database already holds rows, and a rebuild replaces them with \
-     what the log records. A GC sweep made while no log was attached is not in the log, so the \
-     rebuild can bring back rows that sweep removed. Copy the database file first if you may need \
-     its current rows.";
+fn gc_warning(database: &Path) -> String {
+    format!(
+        "warning: the database {} already holds rows, and a rebuild replaces them with \
+         what the log records. A GC sweep made while no log was attached is not in the log, so the \
+         rebuild can bring back rows that sweep removed. Copy the database file first if you may \
+         need its current rows.",
+        database.display()
+    )
+}
 
 /// The database `liam rebuild` works on: `--database`, else the one the config
 /// names, resolved the way `liamd` resolves it.
@@ -361,6 +365,18 @@ fn rebuild_database(args: &RebuildArgs, config: &Config) -> anyhow::Result<PathB
     match &args.database {
         Some(path) => expand_home("--database", path),
         None => models::resolve_config_path("database_path", &config.database_path),
+    }
+}
+
+/// The log `liam rebuild` reads: `--log-dir`, else the one the config names.
+fn rebuild_log_dir(
+    args: &RebuildArgs,
+    config: &Config,
+    database: &Path,
+) -> anyhow::Result<PathBuf> {
+    match &args.log_dir {
+        Some(dir) => expand_home("--log-dir", dir),
+        None => models::resolve_log_dir(config, database),
     }
 }
 
@@ -390,7 +406,8 @@ async fn rebuild(
     let result = try_rebuild(args, config, config_path, embedder_for, out, err).await;
     // The store has created or rewritten its files by now, whatever the outcome.
     if let Ok(database) = rebuild_database(args, config) {
-        state_dir::secure_state_files_for(config, &database);
+        let log_dir = rebuild_log_dir(args, config, &database).ok();
+        state_dir::secure_state_files_for(config, &database, log_dir.as_deref());
     }
     match result {
         Ok(()) => 0,
@@ -421,16 +438,19 @@ async fn try_rebuild(
         config_path.display()
     );
     let database = rebuild_database(args, config)?;
-    let log_dir = match &args.log_dir {
-        Some(dir) => expand_home("--log-dir", dir)?,
-        None => models::resolve_log_dir(config, &database)?,
-    };
+    let log_dir = rebuild_log_dir(args, config, &database)?;
     anyhow::ensure!(
         event_log::holds_log(&log_dir),
         "{} is not an event log, it has no {MANIFEST_NAME} file; pass --log-dir if the log \
          lives elsewhere",
         log_dir.display()
     );
+    writeln!(
+        err,
+        "rebuilding {} with {}",
+        database.display(),
+        embedder_name(config)
+    )?;
     let _lock = StoreLock::acquire(&database)
         .context("liam rebuild needs the store to itself: stop liamd, then rerun")?;
     tracing::debug!("rebuild: store lock taken");
@@ -524,7 +544,7 @@ async fn replay_log(
     };
 
     if mode != RebuildMode::RequireEmpty {
-        writeln!(err, "{GC_WARNING}")?;
+        writeln!(err, "{}", gc_warning(database))?;
     }
     let rebuilt = match graph.rebuild_from_log(log.clone(), mode).await {
         Err(refusal) if force && is_forceable(&refusal) => {

@@ -82,3 +82,31 @@ async fn the_schema_marks_kind_as_required_as_the_code_treats_it() {
         "{required}"
     );
 }
+
+#[tokio::test]
+async fn the_kinds_in_the_error_message_match_the_kind_field_description() {
+    // Arrange
+    let server = plain_server().await;
+    let tool = server
+        .tool_router
+        .list_all()
+        .into_iter()
+        .find(|tool| tool.name == "remember")
+        .expect("remember is listed");
+
+    // Act
+    let description = tool.input_schema["properties"]["kind"]["description"]
+        .as_str()
+        .expect("kind has a description")
+        .to_owned();
+
+    // Assert: the description reads `a | b | c (note).`
+    let listed: Vec<&str> = description
+        .split('(')
+        .next()
+        .unwrap()
+        .split('|')
+        .map(str::trim)
+        .collect();
+    assert_eq!(listed, crate::mcp::argument_errors::REMEMBER_KINDS);
+}

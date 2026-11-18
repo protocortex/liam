@@ -71,7 +71,10 @@ directory (`consolidation.snapshot_dir`, by default beside the database) and the
 parent directory of the socket. It narrows a directory only when it lies inside
 `~/.liam`, after resolving `.` and `..`, and no part of its path from `~/.liam`
 down is a symbolic link. The database file and its `-wal` and `-shm` files are
-tightened as well, unless they are symbolic links. In the same directories,
+tightened as well at any path, even outside `~/.liam`, because you pointed LIAM at
+them (for example `liam rebuild --database /elsewhere/copy.db`), unless they are
+symbolic links. A file that is a hard link is narrowed like any other file the same
+user owns, so every name it has gets the narrower mode. In the same directories,
 inside `~/.liam`, it also narrows the files it keeps itself that an older start left
 wider: the sidecars named after the database (`liam.db.*.json`, `.jsonl`, `.lock`),
 the log's `.wal` and `.parquet` segments, `log.id`, `log.lock` and `keys.registry`,

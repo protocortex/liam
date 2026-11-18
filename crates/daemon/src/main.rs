@@ -127,13 +127,13 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
 
     if mode == cli::Mode::EncryptLog {
         let result = deletion::encrypt_log(&config).await;
-        secure_state_files_after_command(&config);
+        secure_state_files_after_command(&config).await;
         return result;
     }
 
     if let cli::Mode::Delete(action) = mode {
         let result = deletion::delete_command(&config, action, &mut std::io::stdout()).await;
-        secure_state_files_after_command(&config);
+        secure_state_files_after_command(&config).await;
         return result;
     }
 
@@ -142,9 +142,21 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
 
 /// A command that opens the store may leave files wider than their owner,
 /// whatever its outcome.
-fn secure_state_files_after_command(config: &Config) {
+async fn secure_state_files_after_command(config: &Config) {
     if let Ok(database) = resolve_config_path("database_path", &config.database_path) {
-        state_dir::secure_state_files_for(config, &database);
+        secure_state_files_off_runtime(config, database).await;
+    }
+}
+
+/// The walk reads every directory entry, which can take a while for a large log
+/// directory, so it runs on a blocking thread and leaves the async workers free.
+async fn secure_state_files_off_runtime(config: &Config, database: std::path::PathBuf) {
+    let config = config.clone();
+    let walk = tokio::task::spawn_blocking(move || {
+        state_dir::secure_state_files_for(&config, &database, None);
+    });
+    if let Err(error) = walk.await {
+        tracing::warn!(%error, "the check of the state files did not finish");
     }
 }
 
@@ -230,7 +242,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     )
     .await?;
     // The store has created its files by now, and an older start left others wider.
-    state_dir::secure_state_files_for(&config, &database_path);
+    secure_state_files_off_runtime(&config, database_path.clone()).await;
     if let Some(fingerprint) = fingerprint {
         fingerprint.commit()?;
     }
