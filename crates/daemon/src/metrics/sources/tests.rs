@@ -10,6 +10,8 @@ use crate::log_startup::{open_store_with_log, StartedStore};
 use crate::metrics::sink::{Labels, MemorySink, MetricsSink, Reading};
 use crate::shutdown::Shutdown;
 
+mod failure_tests;
+
 const NODES: usize = 4;
 
 async fn started_with_nodes(dir: &Path) -> StartedStore {
