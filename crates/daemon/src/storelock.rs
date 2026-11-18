@@ -110,6 +110,9 @@ fn lock_failure_message(lock_path: &Path, error: &std::fs::TryLockError) -> Stri
 }
 
 #[cfg(test)]
+mod failure_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

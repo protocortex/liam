@@ -309,6 +309,9 @@ fn mismatch_message(
 }
 
 #[cfg(test)]
+mod io_error_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn both_spellings_of_a_gguf_model_share_one_fingerprint_and_other_ids_are_unchanged() {
