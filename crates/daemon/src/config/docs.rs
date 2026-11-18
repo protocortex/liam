@@ -189,6 +189,23 @@ fn a_file_with_a_key_removed_fails_the_check() {
 }
 
 #[test]
+fn the_getting_started_pages_name_the_default_embedder() {
+    for page in [
+        "docs/getting-started/running.md",
+        "docs/getting-started/install.md",
+    ] {
+        // Arrange
+        let text = read_root(page);
+
+        // Act
+        let names_default = text.contains(liam_model::DEFAULT_EMBEDDER_MODEL_ID);
+
+        // Assert
+        assert!(names_default, "{page} must name the default embedder");
+    }
+}
+
+#[test]
 fn the_notices_name_each_dependency_the_core_changes_added() {
     // Arrange
     let text = read_root("THIRD-PARTY-NOTICES.md");

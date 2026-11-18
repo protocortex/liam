@@ -12,8 +12,8 @@ unknown key fails loudly.
 | `log_filter` | `info,liam=debug` | tracing filter. `RUST_LOG` overrides it. |
 | `embedding_dims` | `384` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see [The embedder fingerprint](../concepts/embedder-fingerprint.md)). |
 | `recall_timeout_secs` | `10` | Seconds `recall` and `ask` may spend retrieving (embedding, store query, summaries). Past it they reply `retrieval took longer than N s`. A value of `0` is read as `1`. Worst-case `ask` wall time is `recall_timeout_secs` plus `ask_timeout_secs`. |
-| `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. |
-| `gc.interval_hours` | `6` | Sweep interval. |
+| `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. Must be at least `1`: `0` or less is refused at load, because it would delete every episode. For longer retention set a larger number. |
+| `gc.interval_hours` | `6` | Sweep interval in hours, from `1` to `8760`. `0` and larger values are refused at load. |
 | `gc.reclaim` | `true` | Run incremental vacuum after a sweep. |
 | `gc.run_on_start` | `false` | Sweep once at boot. |
 | `gc.max_resynth_per_tick` | `5` | Ceiling on entities re-synthesized per maintenance tick. |
