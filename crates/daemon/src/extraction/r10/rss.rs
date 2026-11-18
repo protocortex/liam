@@ -65,6 +65,14 @@ mod tests {
     const LOW: u64 = 10;
     const HIGH: u64 = 90;
     const AFTER_THE_SPIKE: u64 = 20;
+    /// The first, spike and post-spike readings the scripted sampler takes.
+    const SCRIPTED_READINGS: usize = 3;
+    /// A byte the parent sends to let the sleeper child end.
+    const RELEASE_BYTE: u8 = 1;
+    /// A pid no process can have, so the tree is empty.
+    /// The test process and its sleeper child.
+    const PARENT_AND_CHILD: usize = 2;
+    const NO_SUCH_PID: u32 = u32::MAX;
 
     /// Runs only as a child of the test below: announces itself, then waits
     /// for one byte so the parent controls how long it lives.
@@ -96,7 +104,7 @@ mod tests {
             readings.next().unwrap()
         });
         // The first reading, the spike and one reading after it.
-        for _ in 0..3 {
+        for _ in 0..SCRIPTED_READINGS {
             reading_taken.recv().unwrap();
         }
         let peak = sampler.stop();
@@ -125,11 +133,56 @@ mod tests {
 
         // Act
         let members = SystemMemory::new().resident_bytes().len();
-        child.stdin.take().unwrap().write_all(&[1]).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&[RELEASE_BYTE])
+            .unwrap();
         child.wait().unwrap();
 
         // Assert
-        assert!(members >= 2, "the tree held {members} process(es)");
+        assert!(
+            members >= PARENT_AND_CHILD,
+            "the tree held {members} process(es)"
+        );
+    }
+
+    #[test]
+    fn the_tree_reading_is_at_least_the_parents_own_with_a_child_running() {
+        // Arrange
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", ENTRY_TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains(READY_LINE) {
+            line.clear();
+            assert_ne!(output.read_line(&mut line).unwrap(), 0, "the child exited");
+        }
+        let parent = Pid::from_u32(std::process::id());
+        let mut system = System::new();
+
+        // Act
+        let tree = tree_rss_bytes(&mut system, parent);
+        let own = system
+            .process(parent)
+            .expect("the parent is listed")
+            .memory();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&[RELEASE_BYTE])
+            .unwrap();
+        child.wait().unwrap();
+
+        // Assert
+        assert!(tree >= own, "tree {tree} is below the parent's own {own}");
     }
 
     #[test]
@@ -150,7 +203,7 @@ mod tests {
         let mut system = System::new();
 
         // Act
-        let bytes = tree_rss_bytes(&mut system, Pid::from_u32(u32::MAX));
+        let bytes = tree_rss_bytes(&mut system, Pid::from_u32(NO_SUCH_PID));
 
         // Assert
         assert_eq!(bytes, 0);

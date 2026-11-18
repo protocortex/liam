@@ -397,6 +397,13 @@ async fn stop_background_tasks(
         // The benchmark does not watch the shutdown token, and its result is
         // only a cache entry that the next start recomputes.
         autotune.abort();
+        match tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, autotune).await {
+            Ok(Err(error)) if error.is_cancelled() => {}
+            Ok(joined) => log_task_failure("autotune benchmark", &joined),
+            Err(_) => {
+                tracing::warn!("the autotune benchmark is still running; leaving it to the exit");
+            }
+        }
     }
     match tokio::time::timeout(COMPACTOR_DRAIN_DEADLINE, &mut compactor).await {
         Ok(Ok(())) => tracing::info!("compactor stopped"),
@@ -713,6 +720,45 @@ mod tests {
     use liam_store::{
         relation, Fingerprint, FixedClock, GraphConfig, Millis, NewEdge, NewNode, RetentionPolicy,
     };
+
+    /// Sets a flag when its task is dropped, which a task only is once the
+    /// runtime has handled its abort.
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_aborted_autotune_task_to_end() {
+        // Arrange
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(Arc::clone(&ended));
+        let autotune = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let maintenance = tokio::spawn(async {});
+        let compactor = tokio::spawn(async {});
+        // Let the benchmark start, so the abort has a running task to end.
+        tokio::task::yield_now().await;
+
+        // Act
+        stop_background_tasks(
+            &Shutdown::default(),
+            None,
+            maintenance,
+            None,
+            Some(autotune),
+            compactor,
+        )
+        .await;
+
+        // Assert
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn a_panicked_task_yields_an_error_message_naming_it() {

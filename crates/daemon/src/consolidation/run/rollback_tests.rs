@@ -19,6 +19,8 @@ const RUN_NOTE: &str = "note written by the run's maintenance";
 const SCRAP: &str = "scrap";
 /// Lets a node pass the 1 ms age a sweep needs on the real clock.
 const SWEEP_AGE_WAIT: Duration = Duration::from_millis(5);
+/// How long the restore may take to queue behind the open request.
+const CONTENTION_DEADLINE: Duration = Duration::from_secs(30);
 const CLIENT: &str = "client:mcp";
 
 /// Writes under the source the run hands it, as a tagged sweep or resynthesis would.
@@ -592,10 +594,15 @@ async fn a_rollback_waits_for_a_request_in_flight_and_then_completes() {
     // The slot reports contention only once the restore is queued for its
     // write guard, which the open request blocks. A run that finished without
     // queuing would never report it, so that case fails here, not by timing.
+    let give_up = std::time::Instant::now() + CONTENTION_DEADLINE;
     while !shared.is_contended() {
         assert!(
             !task.is_finished(),
             "the restore never waited for the request"
+        );
+        assert!(
+            std::time::Instant::now() < give_up,
+            "the restore was still not waiting for the request after {CONTENTION_DEADLINE:?}"
         );
         tokio::task::yield_now().await;
     }
