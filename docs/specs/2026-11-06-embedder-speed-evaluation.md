@@ -206,7 +206,7 @@ were not independently checked.
 
 ## What adding a model costs, and what changing one forces
 
-- **Code:** one row in `ONNX_MODELS` in `crates/liam-model/src/onnx.rs`: id, native
+- **Code:** one row in `ONNX_MODELS` in `crates/model/src/onnx.rs`: id, native
   width, Matryoshka flag, token cap, query and document prefixes, and the
   fastembed variant. The daemon routes by id (`models.rs`), the CLI lists it in
   the unknown id error, and `fetch-models` downloads it with no other change.

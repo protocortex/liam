@@ -25,15 +25,15 @@
 Reserved edge-type constants, the `supersede` refactor to use them, and a `NewNode::entity` constructor. Independent of the `Llm` work.
 
 **Files:**
-- Modify: `crates/liam-store/src/types.rs` (add `relation` module + `NewNode::entity`)
-- Modify: `crates/liam-store/src/graph.rs:119-134` (supersede uses `relation::SUPERSEDES`)
-- Modify: `crates/liam-store/src/lib.rs:27-30` (re-export `relation`)
-- Test: `crates/liam-store/src/graph.rs` (tests module at end of file)
+- Modify: `crates/store/src/types.rs` (add `relation` module + `NewNode::entity`)
+- Modify: `crates/store/src/graph.rs:119-134` (supersede uses `relation::SUPERSEDES`)
+- Modify: `crates/store/src/lib.rs:27-30` (re-export `relation`)
+- Test: `crates/store/src/graph.rs` (tests module at end of file)
 
 **Interfaces:**
 - Produces: `liam_store::types::relation::{SUPERSEDES, MENTIONS}` (`&str` consts); `liam_store::relation` (re-export); `NewNode::entity(entity_type: impl Into<String>, name: impl Into<String>) -> NewNode` (sets `kind = entity_type`, `label = name`, `subject = name.trim().to_lowercase()`, empty content).
 
-- [ ] **Step 1: Write the failing test** for the entity constructor and provenance round-trip. Append to the `#[cfg(all(test, feature = "backend-libsql"))] mod tests` block in `crates/liam-store/src/graph.rs`:
+- [ ] **Step 1: Write the failing test** for the entity constructor and provenance round-trip. Append to the `#[cfg(all(test, feature = "backend-libsql"))] mod tests` block in `crates/store/src/graph.rs`:
 
 ```rust
 #[test]
@@ -66,7 +66,7 @@ Note: if `Graph` exposes no `neighbors(node, edge_type)` helper, replace the las
 Run: `cargo test -p liam-store new_node_entity_sets_kind_label_subject -- --nocapture`
 Expected: FAIL — `no function or associated item named 'entity' found for struct 'NewNode'`.
 
-- [ ] **Step 3: Add the `relation` module and `NewNode::entity`** to `crates/liam-store/src/types.rs`. Add the module just below the `empty_attributes` helper (after line 11):
+- [ ] **Step 3: Add the `relation` module and `NewNode::entity`** to `crates/store/src/types.rs`. Add the module just below the `empty_attributes` helper (after line 11):
 
 ```rust
 /// Reserved edge `type` values that carry library meaning. Use these instead of
@@ -94,7 +94,7 @@ Add the constructor inside `impl NewNode` (after `now`, around line 71):
     }
 ```
 
-- [ ] **Step 4: Refactor `supersede` to use the constant** in `crates/liam-store/src/graph.rs`. Replace the third statement of the `statements` vec (lines 125-133) with a bound `type` parameter:
+- [ ] **Step 4: Refactor `supersede` to use the constant** in `crates/store/src/graph.rs`. Replace the third statement of the `statements` vec (lines 125-133) with a bound `type` parameter:
 
 ```rust
             (
@@ -112,7 +112,7 @@ Add the constructor inside `impl NewNode` (after `now`, around line 71):
             ),
 ```
 
-- [ ] **Step 5: Re-export `relation`** in `crates/liam-store/src/lib.rs`. Extend the `pub use types::{...}` list (lines 27-30) to add `relation`:
+- [ ] **Step 5: Re-export `relation`** in `crates/store/src/lib.rs`. Extend the `pub use types::{...}` list (lines 27-30) to add `relation`:
 
 ```rust
 pub use types::{
@@ -135,15 +135,15 @@ Expected: PASS — the two new tests plus all existing tests (including `upsert_
 ### Task 2: `Llm` trait + `MockLlm` (liam-model)
 
 **Files:**
-- Create: `crates/liam-model/src/llm.rs`
-- Modify: `crates/liam-model/src/error.rs:5-12` (add `Llm` variant)
-- Modify: `crates/liam-model/src/lib.rs:7-13` (module + exports)
-- Modify: `crates/liam-model/Cargo.toml:19-22` (dev-dependency tokio for async tests)
+- Create: `crates/model/src/llm.rs`
+- Modify: `crates/model/src/error.rs:5-12` (add `Llm` variant)
+- Modify: `crates/model/src/lib.rs:7-13` (module + exports)
+- Modify: `crates/model/Cargo.toml:19-22` (dev-dependency tokio for async tests)
 
 **Interfaces:**
 - Produces: `liam_model::Llm` (`#[async_trait]` trait with `async fn complete(&self, system: &str, prompt: &str) -> liam_model::Result<String>`); `liam_model::MockLlm` (unit struct); `ModelError::Llm(String)`.
 
-- [ ] **Step 1: Write the failing test.** Create `crates/liam-model/src/llm.rs` containing only the test module for now:
+- [ ] **Step 1: Write the failing test.** Create `crates/model/src/llm.rs` containing only the test module for now:
 
 ```rust
 #[cfg(test)]
@@ -166,7 +166,7 @@ mod tests {
 Run: `cargo test -p liam-model mock_llm_is_deterministic_and_echoes_prompt`
 Expected: FAIL — `cannot find type 'MockLlm' in this scope` / module not declared.
 
-- [ ] **Step 3: Implement the trait and mock.** Prepend to `crates/liam-model/src/llm.rs` (above the test module):
+- [ ] **Step 3: Implement the trait and mock.** Prepend to `crates/model/src/llm.rs` (above the test module):
 
 ```rust
 //! Generative completion: turn a prompt into text. The store never does this;
@@ -193,20 +193,20 @@ impl Llm for MockLlm {
 }
 ```
 
-- [ ] **Step 4: Add the `Llm` error variant** to `crates/liam-model/src/error.rs`, after the `Rerank` variant (line 11):
+- [ ] **Step 4: Add the `Llm` error variant** to `crates/model/src/error.rs`, after the `Rerank` variant (line 11):
 
 ```rust
     #[error("llm: {0}")]
     Llm(String),
 ```
 
-- [ ] **Step 5: Declare the module and export** in `crates/liam-model/src/lib.rs`. Add `pub mod llm;` to the module list (after line 9) and extend exports (after line 13):
+- [ ] **Step 5: Declare the module and export** in `crates/model/src/lib.rs`. Add `pub mod llm;` to the module list (after line 9) and extend exports (after line 13):
 
 ```rust
 pub use llm::{Llm, MockLlm};
 ```
 
-- [ ] **Step 6: Add the tokio dev-dependency** so async tests run. Append to `crates/liam-model/Cargo.toml`:
+- [ ] **Step 6: Add the tokio dev-dependency** so async tests run. Append to `crates/model/Cargo.toml`:
 
 ```toml
 
@@ -230,14 +230,14 @@ Expected: PASS.
 In-process generative model behind the `local` feature, following the `FastEmbedEmbedder` pattern (`Arc<Mutex<model>>`, `spawn_blocking`). No unit test (requires a model download); the deliverable is that it compiles under `--features local`.
 
 **Files:**
-- Modify: `crates/liam-model/Cargo.toml:14-22` (candle chat deps under `local`)
-- Modify: `crates/liam-model/src/llm.rs` (append `CandleLlm`)
-- Modify: `crates/liam-model/src/lib.rs` (feature-gated export)
+- Modify: `crates/model/Cargo.toml:14-22` (candle chat deps under `local`)
+- Modify: `crates/model/src/llm.rs` (append `CandleLlm`)
+- Modify: `crates/model/src/lib.rs` (feature-gated export)
 
 **Interfaces:**
 - Produces: `#[cfg(feature = "local")] liam_model::CandleLlm` with `pub fn load(model_id: &str, cache_dir: &str) -> Result<Self>` and the `Llm` impl.
 
-- [ ] **Step 1: Add candle chat dependencies** under the `local` feature in `crates/liam-model/Cargo.toml`. Add to `[dependencies]` (optional) and extend the `local` feature list:
+- [ ] **Step 1: Add candle chat dependencies** under the `local` feature in `crates/model/Cargo.toml`. Add to `[dependencies]` (optional) and extend the `local` feature list:
 
 ```toml
 # Generative chat model for the Llm trait (feature `local`). VERSION CHECK:
@@ -251,7 +251,7 @@ hf-hub = { version = "0.3", optional = true }
 local = ["dep:fastembed", "dep:candle-core", "dep:tokio", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
 ```
 
-- [ ] **Step 2: Implement `CandleLlm`.** Append to `crates/liam-model/src/llm.rs`:
+- [ ] **Step 2: Implement `CandleLlm`.** Append to `crates/model/src/llm.rs`:
 
 ```rust
 /// In-process chat model over candle (feature `local`). Loads a quantized
@@ -303,7 +303,7 @@ Then create the `candle_chat` submodule holding the concrete candle glue (weight
 
 Rationale for the split: it isolates the version-fragile candle API in one file so the trait/provider boundary stays stable.
 
-- [ ] **Step 3: Add the feature-gated export** to `crates/liam-model/src/lib.rs` (near the other `#[cfg(feature = "local")]` exports):
+- [ ] **Step 3: Add the feature-gated export** to `crates/model/src/lib.rs` (near the other `#[cfg(feature = "local")]` exports):
 
 ```rust
 #[cfg(feature = "local")]
@@ -329,15 +329,15 @@ Expected: SUCCESS. If candle-transformers/tokenizers/hf-hub versions mismatch th
 ### Task 4: Daemon wiring (`LlmConfig`, `build_llm`, injection)
 
 **Files:**
-- Modify: `crates/liam-daemon/src/config.rs` (add `LlmConfig`, `llm` field, defaults)
-- Modify: `crates/liam-daemon/src/main.rs` (add `build_llm`, inject into `MemoryServer`)
-- Modify: `crates/liam-daemon/src/mcp.rs` (add `llm` field + constructor param)
+- Modify: `crates/daemon/src/config.rs` (add `LlmConfig`, `llm` field, defaults)
+- Modify: `crates/daemon/src/main.rs` (add `build_llm`, inject into `MemoryServer`)
+- Modify: `crates/daemon/src/mcp.rs` (add `llm` field + constructor param)
 
 **Interfaces:**
 - Consumes: `liam_model::{Llm, MockLlm}` (Task 2); `#[cfg(feature="local")] liam_model::CandleLlm` (Task 3).
 - Produces: `Config.llm: LlmConfig` (`provider`, `model`, `cache_dir`); `build_llm(&Config) -> anyhow::Result<Arc<dyn Llm>>`; `MemoryServer::new(store, embedder, reranker, llm)`.
 
-- [ ] **Step 1: Write the failing test** for config defaults. Append a test module to `crates/liam-daemon/src/config.rs`:
+- [ ] **Step 1: Write the failing test** for config defaults. Append a test module to `crates/daemon/src/config.rs`:
 
 ```rust
 #[cfg(test)]
@@ -357,7 +357,7 @@ mod tests {
 Run: `cargo test -p liam-daemon llm_defaults_to_mock`
 Expected: FAIL — `no field 'llm' on type 'Config'`.
 
-- [ ] **Step 3: Add `LlmConfig` and the `llm` field** to `crates/liam-daemon/src/config.rs`. Add the field to `Config` (after `embedder` on line 17):
+- [ ] **Step 3: Add `LlmConfig` and the `llm` field** to `crates/daemon/src/config.rs`. Add the field to `Config` (after `embedder` on line 17):
 
 ```rust
     pub llm: LlmConfig,
@@ -401,7 +401,7 @@ impl Default for LlmConfig {
 Run: `cargo test -p liam-daemon llm_defaults_to_mock`
 Expected: PASS.
 
-- [ ] **Step 5: Add `build_llm`** to `crates/liam-daemon/src/main.rs`, mirroring `build_models` (after line 80):
+- [ ] **Step 5: Add `build_llm`** to `crates/daemon/src/main.rs`, mirroring `build_models` (after line 80):
 
 ```rust
 /// Choose the LLM from config. Mock keeps the base build runnable; the `local`
@@ -432,7 +432,7 @@ Update the `use liam_model::...` import (line 14) to include the LLM types:
 use liam_model::{Embedder, IdentityReranker, Llm, MockEmbedder, MockLlm, Reranker};
 ```
 
-- [ ] **Step 6: Construct and inject the LLM** in `run()` in `crates/liam-daemon/src/main.rs`. After the `build_models` line (line 40), add:
+- [ ] **Step 6: Construct and inject the LLM** in `run()` in `crates/daemon/src/main.rs`. After the `build_models` line (line 40), add:
 
 ```rust
     let llm = build_llm(&config)?;
@@ -444,7 +444,7 @@ Change the server construction (line 44) to pass it:
     let server = MemoryServer::new(store, embedder, reranker, llm);
 ```
 
-- [ ] **Step 7: Add the `llm` field to `MemoryServer`** in `crates/liam-daemon/src/mcp.rs`. Extend the import (line 9):
+- [ ] **Step 7: Add the `llm` field to `MemoryServer`** in `crates/daemon/src/mcp.rs`. Extend the import (line 9):
 
 ```rust
 use liam_model::{Embedder, Llm, Reranker};

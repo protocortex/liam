@@ -14,7 +14,7 @@ ADR-0001 gives clients a way to assert edges, so community detection finally has
 real to work on. It deliberately leaves three questions open, and they are one question:
 **when does clustering run, and who pays for it?**
 
-`Graph::recompute_communities` (`crates/liam-store/src/graph.rs:581`) has no caller in
+`Graph::recompute_communities` (`crates/store/src/graph.rs:581`) has no caller in
 production. It reads every live edge, runs Leiden over the whole graph, then replaces the
 entire assignment table in one transaction: `DELETE FROM node_community` followed by one
 `INSERT` per node (`graph.rs:603-616`).
@@ -22,7 +22,7 @@ entire assignment table in one transaction: `DELETE FROM node_community` followe
 Four properties of the current code decide the answer:
 
 - **Leiden's output is global, but it can be warm-started.** `cluster::detect`
-  (`crates/liam-store/src/cluster.rs:15`) calls `Leiden::new(config).run(&graph)`, which starts
+  (`crates/store/src/cluster.rs:15`) calls `Leiden::new(config).run(&graph)`, which starts
   from singletons every time. The pinned `leiden-rs` 0.8.1 also exposes
   `run_with_initial_partition(&self, data, initial_partition)` (`src/leiden.rs:478`),
   documented for "Incremental refinement after minor graph changes", with `Partition::from_membership`
@@ -38,10 +38,10 @@ Four properties of the current code decide the answer:
 - **`gc` hard-deletes.** It removes expired nodes (`graph.rs:550`) and then always sweeps
   orphaned edges in the same call (`graph.rs:558`). Deletion is invisible to any
   newest-timestamp signal, because deleting rows never advances a maximum.
-- **Writes serialize, reads do not** (`crates/liam-store/src/backend.rs:16`), and reads must
+- **Writes serialize, reads do not** (`crates/store/src/backend.rs:16`), and reads must
   not queue behind an in-flight write.
 
-The `cluster` Cargo feature (`crates/liam-store/Cargo.toml:39`) is on by default and gates all
+The `cluster` Cargo feature (`crates/store/Cargo.toml:39`) is on by default and gates all
 of the above.
 
 ## Decision Drivers
@@ -63,7 +63,7 @@ of the above.
 ### Recompute on the GC tick only (effort: S)
 
 - Call `recompute_communities` from `spawn_gc` after each sweep, on `gc.interval_hours`,
-  default 6 (`crates/liam-daemon/src/config.rs:153`).
+  default 6 (`crates/daemon/src/config.rs:153`).
 - Trade-offs: trivial to wire, reads are always cheap. But an edge asserted now stays invisible
   for up to six hours, which violates the staleness driver; it does full-graph work whether or
   not anything reads it; and under a job with no `KeepAlive` the daemon may exit before a tick

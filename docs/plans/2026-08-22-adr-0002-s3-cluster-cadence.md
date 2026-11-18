@@ -21,7 +21,7 @@ instead, under a path that is actually tracked.
 ## Verified against leiden-rs 0.8.1 source
 
 Line references below are into the `leiden-rs` 0.8.1 sources as vendored by cargo, at the
-version pinned in `crates/liam-store/Cargo.toml`.
+version pinned in `crates/store/Cargo.toml`.
 
 - Warm start is `Leiden::run_with_initial_partition(&graph, Partition)` (`src/leiden.rs:478`).
   Both it and `Partition::from_membership` (`src/partition.rs:29`) take their argument **by

@@ -22,10 +22,10 @@ This decomposes into two requirements the current design does not meet:
 
 ## What the current design cannot do (grounded in the code)
 
-- **Transport is stdio only** (`crates/liam-daemon/src/main.rs`, `rmcp::transport::stdio()`). stdio MCP is one client per process. Two independent apps cannot share one `liamd`. This is the blocker.
-- **The MCP surface is lossy.** `remember` accepts only `kind, label, content, scope, subject` (`crates/liam-daemon/src/mcp.rs`). The store's `NewNode` also carries `attributes` (a JSON bag), `valid_from` (backdating), `confidence`, and the graph supports typed edges via `link` and a reserved `MENTIONS` relation (`crates/liam-store/src/types.rs`). None of `attributes`, `valid_from`, `confidence`, edge assertion, or the read-side `as_of`/`half_life` cross the MCP boundary. A structured consumer loses its structure at the wire.
+- **Transport is stdio only** (`crates/daemon/src/main.rs`, `rmcp::transport::stdio()`). stdio MCP is one client per process. Two independent apps cannot share one `liamd`. This is the blocker.
+- **The MCP surface is lossy.** `remember` accepts only `kind, label, content, scope, subject` (`crates/daemon/src/mcp.rs`). The store's `NewNode` also carries `attributes` (a JSON bag), `valid_from` (backdating), `confidence`, and the graph supports typed edges via `link` and a reserved `MENTIONS` relation (`crates/store/src/types.rs`). None of `attributes`, `valid_from`, `confidence`, edge assertion, or the read-side `as_of`/`half_life` cross the MCP boundary. A structured consumer loses its structure at the wire.
 - **Ingestion assumes raw text.** The roadmap's M3 is "text/markdown in, LIAM's LLM extracts." ai-notetaker already extracts typed facts with a larger model (Gemma 4 E4B, validated at zero hallucinated commitments). Re-extracting from raw transcript with LIAM's smaller default model would be worse and redundant.
-- **Scope is a single flat string with a one-or-all filter** (`crates/liam-store/src/graph.rs`, `AND n.scope = ?`). It cannot isolate two domains on write yet span them on read.
+- **Scope is a single flat string with a one-or-all filter** (`crates/store/src/graph.rs`, `AND n.scope = ?`). It cannot isolate two domains on write yet span them on read.
 - **No producer provenance.** With two writers there is no field recording which app wrote a node, so business and technical facts cannot be told apart except by convention.
 
 ## Additional foundational decisions (extend the gbrain roadmap's approved list)
@@ -70,7 +70,7 @@ The root `LICENSE` is AGPL while every crate's `Cargo.toml` declares `MIT OR Apa
 - **Concurrent write correctness.** One writer over a socket is the model; the transport must serialize writes cleanly and let readers proceed under WAL. Getting the single-writer discipline wrong risks corruption or stalls.
 - **Cross-scope over-linking.** Explicit `same_as` is safer than automatic merge, but a wrong alias still bridges two things that should stay apart. Needs a review or confidence gate.
 - **Backdating and history.** `valid_from` on ingest is what makes "as of last month" correct for backfilled meetings. If a consumer omits it, history silently collapses to ingest time. The surface should make valid time hard to forget.
-- **rusqlite backend is stubbed** (`crates/liam-store/src/backends/rusqlite.rs`, `todo!()`). The ai-notetaker storage spike found plain SQLite brute-force beats a libSQL vector index at this scale, but acting on that inside LIAM waits on finishing this backend. Near term LIAM stays libSQL; the finding is a note, not an action.
+- **rusqlite backend is stubbed** (`crates/store/src/backends/rusqlite.rs`, `todo!()`). The ai-notetaker storage spike found plain SQLite brute-force beats a libSQL vector index at this scale, but acting on that inside LIAM waits on finishing this backend. Near term LIAM stays libSQL; the finding is a note, not an action.
 
 ## Next step
 

@@ -4,7 +4,7 @@
 
 ## System Snapshot
 
-- `crates/liam-daemon/src/tuning.rs`: `AimdHandles` (90-96: `generation_permits: Arc<Semaphore>`,
+- `crates/daemon/src/tuning.rs`: `AimdHandles` (90-96: `generation_permits: Arc<Semaphore>`,
   `granted_capacity: Arc<AtomicUsize>`, `held_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>`,
   `evaluating: Arc<AtomicBool>`, `previous_window_average: Arc<Mutex<Option<Duration>>>`),
   `record_and_maybe_evaluate` (102-128), `evaluate`/`evaluate_with_hooks`/`EvaluationHooks`
@@ -15,17 +15,17 @@
   `aimd_releases_the_held_permit_instead_of_growing_on_top_of_it` (845-886),
   `aimd_first_evaluation_skips_the_did_it_help_check` (946),
   `aimd_single_flight_guard_lets_only_one_evaluation_run_at_a_time` (977-1008).
-- `crates/liam-daemon/src/main.rs`: `build_autotuned_server` (216-258),
+- `crates/daemon/src/main.rs`: `build_autotuned_server` (216-258),
   `reconcile_capacity_after_benchmark` (269-288), its sole call site (253), its 6 tests
   (575-687).
-- `crates/liam-daemon/src/mcp.rs`: `remember`'s edge-validation loop (660-730, per-edge checks at
+- `crates/daemon/src/mcp.rs`: `remember`'s edge-validation loop (660-730, per-edge checks at
   691-710), `TimelineArgs` (366-370), `timeline` (1090-1131), `TIMELINE_MENTIONS_LIMIT` (83),
   `parse_fact_ref`/`parse_entity_ref`/`is_handle_shaped` (161-185), `PermitTimer`'s `impl Drop`
   (471-479, the RAII precedent this blueprint's WU-5 follows).
-- `crates/liam-daemon/src/ask.rs`: `clamp_ask_k` (26-28) and its test
+- `crates/daemon/src/ask.rs`: `clamp_ask_k` (26-28) and its test
   `clamp_ask_k_defaults_and_bounds_the_evidence_count` (439-454), the pattern WU-1's
   `clamp_timeline_limit` mirrors.
-- `crates/liam-store/src/types.rs`: `NewNode::entity` (119), confirming a node's `kind` is
+- `crates/store/src/types.rs`: `NewNode::entity` (119), confirming a node's `kind` is
   arbitrary caller-supplied text with no reserved entity marker (grounds WU-0's scope boundary).
 
 ## Work Units
@@ -36,7 +36,7 @@
 - Goal: `remember` rejects a `mentions` edge whose `to` is a fresh entity or whose `from` is a
   fact, at write time, with no partial write.
 - Files:
-  - `crates/liam-daemon/src/mcp.rs` (production: edge-validation loop ~691-710; test: new cases
+  - `crates/daemon/src/mcp.rs` (production: edge-validation loop ~691-710; test: new cases
     near `remember_with_episode_rejects_supersedes_edge_kind`, ~2286)
 - Verification: `cargo test -p liam-daemon --bin liamd`, `cargo clippy -p liam-daemon
   --all-targets -- -D warnings`, `cargo fmt --all -- --check`
@@ -64,7 +64,7 @@
 - Goal: `timeline` accepts an optional `limit` (default 50, max 200), and its response indicates
   when mentions were capped, without claiming a specific count it cannot prove.
 - Files:
-  - `crates/liam-daemon/src/mcp.rs` (production: `TimelineArgs` 366-370, `timeline` 1090-1131,
+  - `crates/daemon/src/mcp.rs` (production: `TimelineArgs` 366-370, `timeline` 1090-1131,
     `TIMELINE_MENTIONS_LIMIT` 83; test: near 5382-5525)
   - `README.md` (`timeline` args table, ~148-150)
   - `CHANGELOG.md` (`timeline` bullet, ~22)
@@ -97,9 +97,9 @@
 - Requires: nothing
 - Goal: pure code-motion refactor, zero behavior change, zero test count change.
 - Files:
-  - `crates/liam-daemon/src/main.rs` (remove `reconcile_capacity_after_benchmark` ~269-286 and its
+  - `crates/daemon/src/main.rs` (remove `reconcile_capacity_after_benchmark` ~269-286 and its
     6 tests ~576-690; update call site ~253)
-  - `crates/liam-daemon/src/tuning.rs` (add the moved function, renamed `reconcile_capacity`, and
+  - `crates/daemon/src/tuning.rs` (add the moved function, renamed `reconcile_capacity`, and
     its 6 moved tests)
 - Verification: `cargo test -p liam-daemon --bin liamd`, `cargo clippy -p liam-daemon
   --all-targets -- -D warnings`, `cargo fmt --all -- --check`
@@ -122,7 +122,7 @@
   to the ordinary decision (using an unconditionally-updated `previous_window_average`) when the
   correction cannot fully succeed.
 - Files:
-  - `crates/liam-daemon/src/tuning.rs` (`decide`, currently 196-219; production + new tests)
+  - `crates/daemon/src/tuning.rs` (`decide`, currently 196-219; production + new tests)
 - Verification: `cargo test -p liam-daemon --bin liamd`, `cargo clippy -p liam-daemon
   --all-targets -- -D warnings`, `cargo fmt --all -- --check`
 - Tests:
@@ -167,7 +167,7 @@
 - Goal: shrink only on a regression exceeding `SHRINK_REGRESSION_THRESHOLD`; recover a held-back
   permit on any non-regressing window, not only a queue-wait-dominant one.
 - Files:
-  - `crates/liam-daemon/src/tuning.rs` (`decide` 196-219, `grow` 223-236; production + new tests)
+  - `crates/daemon/src/tuning.rs` (`decide` 196-219, `grow` 223-236; production + new tests)
 - Changes (in addition to the split of `grow()` and the new `SHRINK_REGRESSION_THRESHOLD`
   constant described in the parent plan): extract the boundary computation into a private helper,
   `fn shrink_bar(prev: Duration) -> Duration { prev.mul_f64(1.0 + SHRINK_REGRESSION_THRESHOLD) }`,
@@ -216,7 +216,7 @@
 - Goal: `handles.evaluating` resets via a `Drop` guard in both `evaluate` and
   `evaluate_with_hooks`, surviving a panic mid-decision.
 - Files:
-  - `crates/liam-daemon/src/tuning.rs` (`evaluate` 132-148, `evaluate_with_hooks` 152-172;
+  - `crates/daemon/src/tuning.rs` (`evaluate` 132-148, `evaluate_with_hooks` 152-172;
     production + new tests)
 - Verification: `cargo test -p liam-daemon --bin liamd`, `cargo clippy -p liam-daemon
   --all-targets -- -D warnings`, `cargo fmt --all -- --check`
@@ -255,7 +255,7 @@
 
 ## Parallel Groups
 
-None. WU-0 and WU-1 have no dependency edge but both touch `crates/liam-daemon/src/mcp.rs`
+None. WU-0 and WU-1 have no dependency edge but both touch `crates/daemon/src/mcp.rs`
 (shared-file risk), so they are left sequential rather than marked parallel-safe. WU-2 through
 WU-5 form a real dependency chain inside `tuning.rs`/`main.rs`.
 
@@ -286,7 +286,7 @@ graph TD
   time).
 - Open items (verify downstream):
   - WU-0's exact error message wording should match the sibling checks' voice in
-    `crates/liam-daemon/src/mcp.rs`'s edge-validation loop; not fully specified here, left to
+    `crates/daemon/src/mcp.rs`'s edge-validation loop; not fully specified here, left to
     `/playbook:implement`'s grounding pass.
   - WU-1's `MAX_TIMELINE_LIMIT = 200` was chosen during scoping, not explicitly confirmed against
     real usage patterns; flagging in case it needs adjustment later.

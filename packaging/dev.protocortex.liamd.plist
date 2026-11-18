@@ -21,7 +21,7 @@
   to be literal by the time launchd reads it.
 
   The socket name below (Listener) MUST match LAUNCHD_SOCKET_NAME in
-  crates/liam-daemon/src/transport/activation.rs. A test reads this file and
+  crates/daemon/src/transport/activation.rs. A test reads this file and
   asserts that, because a mismatch is silent: launchd would hold a socket
   nobody serves while liamd binds one nobody connects to.
 -->

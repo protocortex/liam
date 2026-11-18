@@ -351,7 +351,7 @@ impl Default for LlmConfig {
         Self {
             provider: "mock".into(),
             // Chosen by measurement, not by size: on the grounding eval
-            // (crates/liam-daemon/src/eval.rs) 1.5B scored 3/4 judged cases at
+            // (crates/daemon/src/eval.rs) 1.5B scored 3/4 judged cases at
             // ~4.8s per answer, against 2/4 for 0.5B, 3/4 for Gemma-3-1B at ~9.3s,
             // and 2/4 for Qwen3-1.7B. Apache-2.0 at this size (the 3B is not).
             model: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".into(),

@@ -22,24 +22,24 @@ at `mcp/producer.rs` since its input is the MCP handshake. Both use the
 `foo.rs` plus `foo/bar.rs` pattern already used by `llama.rs` and
 `llama/template.rs`, so nothing existing moves and no file is renamed. `cli.rs` and
 `storelock.rs` stay top level: neither is transport.
-Deliberately NOT in scope: splitting `liam-store/src/graph.rs` (~680 lines of code,
+Deliberately NOT in scope: splitting `store/src/graph.rs` (~680 lines of code,
 the repo's only genuine implementation monolith). That is a pure move touching the
 highest-risk correctness surface in the project, so it belongs in its own PR after
 this milestone, not mixed into a feature.
 
 `liam-store`'s libSQL backend currently holds one `Connection` and drops the
-`Database` it came from (`crates/liam-store/src/backends/libsql.rs:88`), and no
+`Database` it came from (`crates/store/src/backends/libsql.rs:88`), and no
 journal pragma is set anywhere. So the first Segment retains the `Database`,
 applies WAL and timeout pragmas per connection, and splits reads (a small pool)
 from writes (one connection behind an async lock). Nothing above the `Backend`
 trait changes shape.
 
-`nodes` then gains a `producer` column. Because `crates/liam-store/src/schema.rs`
+`nodes` then gains a `producer` column. Because `crates/store/src/schema.rs`
 is all `CREATE TABLE IF NOT EXISTS`, an existing database will not pick the column
 up from a schema edit, so a guarded `ALTER TABLE ADD COLUMN` runs at open.
 
 The daemon keeps `MemoryServer` exactly as it is (it already derives `Clone` at
-`crates/liam-daemon/src/mcp.rs:82`) and gains a Unix socket listener that clones
+`crates/daemon/src/mcp.rs:82`) and gains a Unix socket listener that clones
 it per accepted connection over `rmcp`'s `transport-async-rw`. Producer identity
 is resolved once per connection from the MCP `initialize` handshake and stamped on
 every write from that connection.
@@ -59,26 +59,26 @@ them transparently with no protocol awareness and no second parse.
 
 | File | Action | Purpose |
 |------|--------|---------|
-| crates/liam-store/src/backends/libsql.rs | modify | retain `Database`; per-connection pragmas; read pool + write lock; `:memory:` guard |
-| crates/liam-store/src/backend.rs | modify | doc the read/write connection contract on the trait |
-| crates/liam-store/Cargo.toml | modify | `tempfile` dev-dependency: WAL and pool tests need a file-backed database |
-| crates/liam-store/src/migrate.rs | create | guarded, idempotent `ALTER TABLE ADD COLUMN` helper |
-| crates/liam-store/src/lib.rs | modify | declare `mod migrate` |
-| crates/liam-store/src/schema.rs | modify | `producer` column on `nodes` for fresh databases |
-| crates/liam-store/src/types.rs | modify | `producer` on `NewNode` and the node row |
-| crates/liam-store/src/graph.rs | modify | write `producer` on insert and carry it through supersede |
-| crates/liam-daemon/Cargo.toml | modify | rmcp `transport-async-rw`; rmcp client in dev-deps |
-| crates/liam-daemon/src/config.rs | modify | socket path, read pool size, `[producers]` table |
-| crates/liam-daemon/src/mcp/producer.rs | create | resolve `clientInfo.name` to a canonical producer id |
-| crates/liam-daemon/src/mcp.rs | modify | carry a producer on `MemoryServer`; stamp it on writes; `mod producer;` |
-| crates/liam-daemon/src/transport.rs | create | module root: `ListenerSource` enum plus `mod socket/activation/proxy/shutdown` |
-| crates/liam-daemon/src/transport/socket.rs | create | listener, stale-socket handling, permissions, accept loop |
-| crates/liam-daemon/src/transport/activation.rs | create | launchd-supplied listener (macOS), Bound fallback |
-| crates/liam-daemon/src/transport/shutdown.rs | create | signals, cancellation token, drain |
-| crates/liam-daemon/src/transport/proxy.rs | create | stdin/stdout to socket byte shuttle |
-| crates/liam-daemon/src/storelock.rs | create | exclusive advisory lock so only one process opens the store |
-| crates/liam-daemon/src/cli.rs | create | clap derive: subcommands, `--version`, `--config` |
-| crates/liam-daemon/src/main.rs | modify | thin dispatch; `mod transport;` `mod cli;` `mod storelock;` |
+| crates/store/src/backends/libsql.rs | modify | retain `Database`; per-connection pragmas; read pool + write lock; `:memory:` guard |
+| crates/store/src/backend.rs | modify | doc the read/write connection contract on the trait |
+| crates/store/Cargo.toml | modify | `tempfile` dev-dependency: WAL and pool tests need a file-backed database |
+| crates/store/src/migrate.rs | create | guarded, idempotent `ALTER TABLE ADD COLUMN` helper |
+| crates/store/src/lib.rs | modify | declare `mod migrate` |
+| crates/store/src/schema.rs | modify | `producer` column on `nodes` for fresh databases |
+| crates/store/src/types.rs | modify | `producer` on `NewNode` and the node row |
+| crates/store/src/graph.rs | modify | write `producer` on insert and carry it through supersede |
+| crates/daemon/Cargo.toml | modify | rmcp `transport-async-rw`; rmcp client in dev-deps |
+| crates/daemon/src/config.rs | modify | socket path, read pool size, `[producers]` table |
+| crates/daemon/src/mcp/producer.rs | create | resolve `clientInfo.name` to a canonical producer id |
+| crates/daemon/src/mcp.rs | modify | carry a producer on `MemoryServer`; stamp it on writes; `mod producer;` |
+| crates/daemon/src/transport.rs | create | module root: `ListenerSource` enum plus `mod socket/activation/proxy/shutdown` |
+| crates/daemon/src/transport/socket.rs | create | listener, stale-socket handling, permissions, accept loop |
+| crates/daemon/src/transport/activation.rs | create | launchd-supplied listener (macOS), Bound fallback |
+| crates/daemon/src/transport/shutdown.rs | create | signals, cancellation token, drain |
+| crates/daemon/src/transport/proxy.rs | create | stdin/stdout to socket byte shuttle |
+| crates/daemon/src/storelock.rs | create | exclusive advisory lock so only one process opens the store |
+| crates/daemon/src/cli.rs | create | clap derive: subcommands, `--version`, `--config` |
+| crates/daemon/src/main.rs | modify | thin dispatch; `mod transport;` `mod cli;` `mod storelock;` |
 | packaging/dev.protocortex.liamd.plist | create | launchd job with the `Sockets` key for activation |
 | liam.toml | modify | document the new keys with defaults |
 | README.md | modify | document the three modes and the shared-daemon setup |
@@ -101,19 +101,19 @@ look broken for a reason that has nothing to do with the transport.
 
 | WU | Title | Files | Requires | Segment | Parallel group | Done When |
 |----|-------|-------|----------|---------|----------------|-----------|
-| WU-0 | File-backed test harness (`tempfile` dev-dep) | crates/liam-store/Cargo.toml, crates/liam-store/src/graph.rs (tests) | none | S1 | none | a helper opens a graph on a temp file; existing `:memory:` tests untouched and green |
-| WU-1 | Retain `Database`, apply pragmas per connection | crates/liam-store/src/backends/libsql.rs | WU-0 | S1 | none | `PRAGMA journal_mode` reports `wal` on a FILE database; every new connection gets `busy_timeout` |
-| WU-2 | Read pool + write lock, with a `:memory:` guard | crates/liam-store/src/backends/libsql.rs, crates/liam-store/src/backend.rs | WU-1 | S1 | none | a read completes while a write is in flight; N concurrent writes all land with no `SQLITE_BUSY`; a `:memory:` path forces pool size 1 |
-| WU-2b | Exclusive store lock for store-opening modes | crates/liam-daemon/src/main.rs, crates/liam-daemon/src/storelock.rs | WU-2 | S1 | none | a second store-opening `liamd` fails fast naming the holder; the proxy is unaffected |
-| WU-3 | Guarded column migration helper | crates/liam-store/src/migrate.rs, crates/liam-store/src/lib.rs | WU-2 | S2 | none | running it twice is a no-op; two processes racing it both succeed |
-| WU-4 | `producer` on nodes, end to end | crates/liam-store/src/schema.rs, crates/liam-store/src/types.rs, crates/liam-store/src/graph.rs | WU-3 | S2 | none | insert and supersede both record the producer; a pre-existing database gains the column with data intact |
-| WU-5 | Config: socket path, pool size, producers table | crates/liam-daemon/src/config.rs, liam.toml | WU-4 | S3 | none | shipped liam.toml parses; defaults present; unknown keys still fail loudly |
-| WU-6 | Socket listener and accept loop | crates/liam-daemon/src/transport/socket.rs, crates/liam-daemon/Cargo.toml, crates/liam-daemon/src/main.rs | WU-5 | S3 | none | `liamd serve` binds owner-only; a stale socket is replaced, a live one refused |
-| WU-7 | Producer resolution per connection | crates/liam-daemon/src/mcp/producer.rs, crates/liam-daemon/src/mcp.rs | WU-5 | S3 | none | a known client maps to its id, an unknown one to `unknown` with a warning |
-| WU-8 | Two-client integration test | crates/liam-daemon/src/transport/socket.rs (tests), crates/liam-daemon/Cargo.toml | WU-6, WU-7 | S3 | none | two clients on one socket both read and write; each node carries the right producer |
-| WU-6b | launchd socket activation | crates/liam-daemon/src/transport/activation.rs, crates/liam-daemon/src/transport.rs, crates/liam-daemon/Cargo.toml, packaging/dev.protocortex.liamd.plist | WU-8 | S3b | none | an activated listener is used when launchd supplies one; the socket is never unlinked in that mode; Bound still works with no supervisor |
-| WU-6c | Signals, cancellation, drain | crates/liam-daemon/src/transport/shutdown.rs, crates/liam-daemon/src/transport/socket.rs, crates/liam-daemon/Cargo.toml | WU-6b | S3b | none | SIGTERM stops accepting, cancels, drains within a deadline, then unlinks only if we own the socket |
-| WU-9 | Mode dispatch and stdio proxy | crates/liam-daemon/src/transport/proxy.rs, crates/liam-daemon/src/cli.rs, crates/liam-daemon/src/main.rs, crates/liam-daemon/Cargo.toml | WU-6c | S4 | none | `liamd` unchanged; `liamd proxy` forwards; no daemon gives an actionable error |
+| WU-0 | File-backed test harness (`tempfile` dev-dep) | crates/store/Cargo.toml, crates/store/src/graph.rs (tests) | none | S1 | none | a helper opens a graph on a temp file; existing `:memory:` tests untouched and green |
+| WU-1 | Retain `Database`, apply pragmas per connection | crates/store/src/backends/libsql.rs | WU-0 | S1 | none | `PRAGMA journal_mode` reports `wal` on a FILE database; every new connection gets `busy_timeout` |
+| WU-2 | Read pool + write lock, with a `:memory:` guard | crates/store/src/backends/libsql.rs, crates/store/src/backend.rs | WU-1 | S1 | none | a read completes while a write is in flight; N concurrent writes all land with no `SQLITE_BUSY`; a `:memory:` path forces pool size 1 |
+| WU-2b | Exclusive store lock for store-opening modes | crates/daemon/src/main.rs, crates/daemon/src/storelock.rs | WU-2 | S1 | none | a second store-opening `liamd` fails fast naming the holder; the proxy is unaffected |
+| WU-3 | Guarded column migration helper | crates/store/src/migrate.rs, crates/store/src/lib.rs | WU-2 | S2 | none | running it twice is a no-op; two processes racing it both succeed |
+| WU-4 | `producer` on nodes, end to end | crates/store/src/schema.rs, crates/store/src/types.rs, crates/store/src/graph.rs | WU-3 | S2 | none | insert and supersede both record the producer; a pre-existing database gains the column with data intact |
+| WU-5 | Config: socket path, pool size, producers table | crates/daemon/src/config.rs, liam.toml | WU-4 | S3 | none | shipped liam.toml parses; defaults present; unknown keys still fail loudly |
+| WU-6 | Socket listener and accept loop | crates/daemon/src/transport/socket.rs, crates/daemon/Cargo.toml, crates/daemon/src/main.rs | WU-5 | S3 | none | `liamd serve` binds owner-only; a stale socket is replaced, a live one refused |
+| WU-7 | Producer resolution per connection | crates/daemon/src/mcp/producer.rs, crates/daemon/src/mcp.rs | WU-5 | S3 | none | a known client maps to its id, an unknown one to `unknown` with a warning |
+| WU-8 | Two-client integration test | crates/daemon/src/transport/socket.rs (tests), crates/daemon/Cargo.toml | WU-6, WU-7 | S3 | none | two clients on one socket both read and write; each node carries the right producer |
+| WU-6b | launchd socket activation | crates/daemon/src/transport/activation.rs, crates/daemon/src/transport.rs, crates/daemon/Cargo.toml, packaging/dev.protocortex.liamd.plist | WU-8 | S3b | none | an activated listener is used when launchd supplies one; the socket is never unlinked in that mode; Bound still works with no supervisor |
+| WU-6c | Signals, cancellation, drain | crates/daemon/src/transport/shutdown.rs, crates/daemon/src/transport/socket.rs, crates/daemon/Cargo.toml | WU-6b | S3b | none | SIGTERM stops accepting, cancels, drains within a deadline, then unlinks only if we own the socket |
+| WU-9 | Mode dispatch and stdio proxy | crates/daemon/src/transport/proxy.rs, crates/daemon/src/cli.rs, crates/daemon/src/main.rs, crates/daemon/Cargo.toml | WU-6c | S4 | none | `liamd` unchanged; `liamd proxy` forwards; no daemon gives an actionable error |
 | WU-10 | Document the modes | README.md, liam.toml | WU-9 | S4 | none | README explains the three modes and the shared-daemon setup |
 
 ## Parallel Groups
@@ -127,7 +127,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-0: File-backed test harness
 - **Requires:** nothing
-- **Files:** `crates/liam-store/Cargo.toml`, `crates/liam-store/src/graph.rs` (test module only)
+- **Files:** `crates/store/Cargo.toml`, `crates/store/src/graph.rs` (test module only)
 - **Changes:** add `tempfile` as a dev-dependency and a test helper that opens a
   graph on a temp file path with an injected clock, alongside the existing
   `:memory:` helper. WHY this exists as its own Work Unit: every store test today
@@ -148,7 +148,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-1: Retain `Database`, apply pragmas per connection
 - **Requires:** WU-0
-- **Files:** `crates/liam-store/src/backends/libsql.rs`
+- **Files:** `crates/store/src/backends/libsql.rs`
 - **Changes:** keep the `Database` on the struct alongside the connection.
   Factor connection creation into one helper that applies
   `PRAGMA busy_timeout` and `PRAGMA synchronous=NORMAL` to every connection it
@@ -169,7 +169,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-2: Read pool + write lock, with a `:memory:` guard
 - **Requires:** WU-1
-- **Files:** `crates/liam-store/src/backends/libsql.rs`, `crates/liam-store/src/backend.rs`
+- **Files:** `crates/store/src/backends/libsql.rs`, `crates/store/src/backend.rs`
 - **Changes:** hold a small pool of read connections and one write connection
   behind a `tokio::sync::Mutex`. Route `query` to the pool and
   `execute`/`execute_batch`/`execute_atomic` to the write connection. Document on
@@ -200,7 +200,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-2b: Exclusive store lock for store-opening modes
 - **Requires:** WU-2
-- **Files:** `crates/liam-daemon/src/storelock.rs` (create), `crates/liam-daemon/src/main.rs`
+- **Files:** `crates/daemon/src/storelock.rs` (create), `crates/daemon/src/main.rs`
 - **Changes:** before opening the store, take an exclusive advisory lock on a lock
   file beside the database (`<database_path>.lock`), holding it for the process
   lifetime. A second store-opening process fails immediately with an error naming
@@ -232,7 +232,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-3: Guarded column migration helper
 - **Requires:** WU-2b
-- **Files:** `crates/liam-store/src/migrate.rs`, `crates/liam-store/src/lib.rs`
+- **Files:** `crates/store/src/migrate.rs`, `crates/store/src/lib.rs`
 - **Changes:** a helper that adds a column only when absent: read
   `PRAGMA table_info(<table>)`, and if the column is missing run
   `ALTER TABLE ... ADD COLUMN`. Treat a duplicate-column error from a racing
@@ -249,7 +249,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-4: `producer` on nodes, end to end
 - **Requires:** WU-3
-- **Files:** `crates/liam-store/src/schema.rs`, `crates/liam-store/src/types.rs`, `crates/liam-store/src/graph.rs`
+- **Files:** `crates/store/src/schema.rs`, `crates/store/src/types.rs`, `crates/store/src/graph.rs`
 - **Changes:** add `producer TEXT NOT NULL DEFAULT 'unknown'` to the `nodes` DDL
   for fresh databases, call the WU-3 helper at open so existing databases gain it,
   and add `producer` to `NewNode` and the node row. `insert` writes it;
@@ -269,7 +269,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-5: Config: socket path, pool size, producers table
 - **Requires:** WU-4
-- **Files:** `crates/liam-daemon/src/config.rs`, `liam.toml`
+- **Files:** `crates/daemon/src/config.rs`, `liam.toml`
 - **Changes:** add a socket path (default `~/.liam/liamd.sock`, matching the
   existing `~/.liam` convention used by `cache_dir`), a read pool size (default
   4), and a `[producers]` map from MCP client name to canonical producer id plus
@@ -285,7 +285,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-6: Socket listener and accept loop
 - **Requires:** WU-5
-- **Files:** `crates/liam-daemon/src/transport/socket.rs`, `crates/liam-daemon/Cargo.toml`, `crates/liam-daemon/src/main.rs`
+- **Files:** `crates/daemon/src/transport/socket.rs`, `crates/daemon/Cargo.toml`, `crates/daemon/src/main.rs`
 - **Changes:** no rmcp feature change is needed. `transport-async-rw` is ALREADY
   enabled transitively: `cargo info rmcp` (2.2.0) shows
   `server = [transport-async-rw, ...]` and
@@ -329,7 +329,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-7: Producer resolution per connection
 - **Requires:** WU-5
-- **Files:** `crates/liam-daemon/src/mcp/producer.rs`, `crates/liam-daemon/src/mcp.rs`
+- **Files:** `crates/daemon/src/mcp/producer.rs`, `crates/daemon/src/mcp.rs`
 - **Changes:** a pure function mapping an optional client name to a canonical
   producer id via the config table, falling back to the configured unknown id and
   logging a warning once per connection. `MemoryServer` carries the resolved
@@ -346,7 +346,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-8: Two-client integration test
 - **Requires:** WU-6, WU-7
-- **Files:** `crates/liam-daemon/src/transport/socket.rs` (tests), `crates/liam-daemon/Cargo.toml`
+- **Files:** `crates/daemon/src/transport/socket.rs` (tests), `crates/daemon/Cargo.toml`
 - **Changes:** add rmcp with client and `transport-async-rw` features as a
   dev-dependency. Start a daemon on a temp socket over a temp database, connect
   two clients declaring different names, have both write and both read, and assert
@@ -363,7 +363,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-6b: launchd socket activation
 - **Requires:** WU-8
-- **Files:** `crates/liam-daemon/src/transport/activation.rs` (create), `crates/liam-daemon/src/transport.rs`, `crates/liam-daemon/Cargo.toml`, `packaging/dev.protocortex.liamd.plist` (create)
+- **Files:** `crates/daemon/src/transport/activation.rs` (create), `crates/daemon/src/transport.rs`, `crates/daemon/Cargo.toml`, `packaging/dev.protocortex.liamd.plist` (create)
 - **Changes:** add the `Activated(UnixListener)` arm to `ListenerSource` and resolve
   it once at startup: if launchd handed us a socket, use it; otherwise fall back to
   `Bound`. On macOS use `raunch` (1.0.1, MIT OR Apache-2.0, a safe wrapper over
@@ -402,7 +402,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-6c: Signals, cancellation, drain
 - **Requires:** WU-6b
-- **Files:** `crates/liam-daemon/src/transport/shutdown.rs` (create), `crates/liam-daemon/src/transport/socket.rs`, `crates/liam-daemon/Cargo.toml`
+- **Files:** `crates/daemon/src/transport/shutdown.rs` (create), `crates/daemon/src/transport/socket.rs`, `crates/daemon/Cargo.toml`
 - **Changes:** the plan previously said only "unlink on graceful shutdown", which
   named neither what triggers shutdown nor what happens to in-flight sessions. With
   concurrent clients that is the whole problem, so make it explicit.
@@ -434,7 +434,7 @@ order. Marking them parallel would put two agents in the same wire-up.
 
 ### WU-9: Mode dispatch and stdio proxy
 - **Requires:** WU-6c
-- **Files:** `crates/liam-daemon/src/transport/proxy.rs`, `crates/liam-daemon/src/main.rs`
+- **Files:** `crates/daemon/src/transport/proxy.rs`, `crates/daemon/src/main.rs`
 - **Changes:** dispatch with clap's derive API: no subcommand is today's stdio
   server, `serve` is the socket daemon, `proxy` is the shuttle, plus `--version`,
   `--help`, and `--config` to override `LIAM_CONFIG`. Use clap rather than a

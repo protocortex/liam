@@ -90,7 +90,7 @@ in the speed evaluation (nDCG@10 0.933, MRR 0.920) is reproduced.
 
 ## What was built
 
-- `LlamaEmbedder` in `crates/liam-model/src/llama_embedder.rs`: llama.cpp
+- `LlamaEmbedder` in `crates/model/src/llama_embedder.rs`: llama.cpp
   context with embeddings on and last token pooling, the Qwen3 query
   instruction, plain documents, L2 normalise then Matryoshka cut and normalise
   on the host. One context is kept and its KV cache cleared before each decode.

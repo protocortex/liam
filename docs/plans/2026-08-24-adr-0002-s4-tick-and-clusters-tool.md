@@ -90,7 +90,7 @@ gets.
 
 So `clusters` renders groups largest-first while a **token budget** allows, then stops and says
 what it withheld. The budget is one tenth of `llm.context_tokens`. Counting uses
-`Llm::count_tokens` (the trait method in `liam-model/src/llm.rs`, backed by `llama.rs`) with the
+`Llm::count_tokens` (the trait method in `model/src/llm.rs`, backed by `llama.rs`) with the
 `estimate_tokens` chars-over-four fallback from `ask.rs`, the identical count-with-fallback
 closure `mcp.rs` already builds for `ask`. Two crates, not one file: `count_tokens` is model
 crate surface, `estimate_tokens` is the daemon's local fallback, and the daemon wires them

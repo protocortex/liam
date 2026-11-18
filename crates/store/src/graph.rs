@@ -4129,7 +4129,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_by_supersedes_scoped_entity_rebuilt_from_candidate_scope() {
         // Arrange: a scoped entity, matching what `resynthesize_entity`
-        // (crates/liam-daemon/src/mcp.rs, a separate later fix) will read via
+        // (crates/daemon/src/mcp.rs, a separate later fix) will read via
         // `Graph::get` and rebuild.
         let clock = Arc::new(FixedClock::new(Millis(1000)));
         let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())

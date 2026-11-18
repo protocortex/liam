@@ -15,7 +15,7 @@ ulid = "2"
 tracing = "0.1"
 # The extraction batch key and the snapshot checksums are SHA-256, as in liam-log.
 sha2 = { version = "0.11.0", default-features = false }
-liam-log = { path = "../liam-log" }
+liam-log = { path = "../log" }
 # Replay pulls the log reader's record stream.
 futures-util = { version = "0.3", default-features = false }
 # The log's event ids are v7 UUIDs, so they sort by creation time.
@@ -61,6 +61,6 @@ test-support = []
 # regression hangs the test instead of the whole suite.
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
-liam-log = { path = "../liam-log", features = ["test-support"] }
+liam-log = { path = "../log", features = ["test-support"] }
 # Backfill progress is only observable in the log lines it writes.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
