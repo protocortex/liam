@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use liam_log::private_fs::create_private_dir_all;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -45,7 +46,9 @@ const SOCKET_MODE: u32 = 0o600;
 /// to `max_concurrent_generations`.
 const MIN_MAX_CONNECTIONS: usize = 1;
 
-/// Ensures a parent directory exists, decides what to do about whatever is
+/// Ensures a parent directory exists (owner-only when this creates it, which
+/// is what keeps the socket unreachable by others between `bind` and the
+/// `chmod`), decides what to do about whatever is
 /// already at `path` (see [`prepare_existing_path`] for the order that
 /// matters), binds a fresh listener there, and locks its permissions down
 /// to owner-only. Always returns [`ListenerSource::Bound`]: this process
@@ -56,7 +59,7 @@ const MIN_MAX_CONNECTIONS: usize = 1;
 pub async fn bind(path: &Path) -> anyhow::Result<ListenerSource> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.map_err(|source| {
+            create_private_dir_all(parent).map_err(|source| {
                 anyhow::anyhow!(
                     "failed to create socket directory {}: {source}",
                     parent.display()
@@ -530,6 +533,23 @@ mod tests {
             "a directory must never be treated as a socket"
         );
         assert!(path.is_dir(), "the directory must survive the failed bind");
+    }
+
+    #[tokio::test]
+    async fn a_parent_directory_created_for_the_socket_is_owner_only() {
+        // Given a socket path whose parent does not exist yet
+        let root = TestPath::new();
+        let parent = root.join("state");
+        let path = parent.join("liamd.sock");
+
+        // When the socket is bound
+        let source = bind(&path).await.expect("bind");
+
+        // Then the new parent is 0700, so the socket was never reachable by
+        // others, even before its own chmod
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        drop(source);
     }
 
     #[tokio::test]

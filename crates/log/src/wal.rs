@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::archive::{read_manifest, ArchivedPartition};
 use crate::compactor::{parquet_name, read_event_count_from_file};
 use crate::event::{EventError, LogEvent};
+use crate::private_fs::{create_private_dir_all, private_file_options};
 use crate::{LogOffset, LogWriter};
 
 pub(crate) const SEGMENT_EXTENSION: &str = "wal";
@@ -167,7 +168,11 @@ pub fn write_atomically(path: &Path, bytes: &[u8], ops: &mut dyn FileOps) -> io:
     let mut staged = path.as_os_str().to_owned();
     staged.push(".tmp");
     let staged = PathBuf::from(staged);
-    let mut file = File::create(&staged)?;
+    let mut file = private_file_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&staged)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     ops.rename(&staged, path)?;
@@ -574,7 +579,7 @@ fn read_frame(bytes: &[u8]) -> Frame<'_> {
 
 /// Takes the directory's exclusive advisory lock without blocking.
 fn lock_directory(dir: &Path) -> Result<File, WalError> {
-    let file = OpenOptions::new()
+    let file = private_file_options()
         .create(true)
         .truncate(false)
         .write(true)
@@ -677,7 +682,7 @@ fn create_dir_all_durably(dir: &Path, ops: &mut dyn FileOps) -> io::Result<()> {
     let Some(topmost) = created.last() else {
         return Ok(());
     };
-    fs::create_dir_all(dir)?;
+    create_private_dir_all(dir)?;
     for path in &created {
         ops.sync_dir(path)?;
     }
@@ -697,7 +702,11 @@ fn create_segment(
     ops: &mut dyn FileOps,
 ) -> Result<OpenSegment, WalError> {
     let path = dir.join(segment_name(sequence));
-    let file = match OpenOptions::new().create_new(true).append(true).open(&path) {
+    let file = match private_file_options()
+        .create_new(true)
+        .append(true)
+        .open(&path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let file = OpenOptions::new().append(true).open(&path)?;
@@ -812,6 +821,39 @@ mod tests {
 
     fn open(dir: &Path, max_bytes: u64, clock: &FakeClock) -> WalWriter<FakeClock> {
         WalWriter::open(dir, config(max_bytes), clock.clone()).expect("open wal")
+    }
+
+    #[cfg(unix)]
+    mod modes {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::*;
+
+        fn mode_of(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        fn a_new_log_directory_and_every_segment_in_it_are_owner_only() {
+            // Arrange
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("liam.log");
+            let clock = FakeClock::default();
+            let mut writer = open(&dir, 1, &clock);
+
+            // Act
+            writer.append(&event(0)).unwrap();
+            writer.append(&event(1)).unwrap();
+
+            // Assert
+            let segments = segment_files(&dir);
+            assert!(segments.len() >= 2, "the second write rotates the segment");
+            assert_eq!(mode_of(&dir), 0o700);
+            for segment in segments {
+                assert_eq!(mode_of(&segment), 0o600, "{}", segment.display());
+            }
+            assert_eq!(mode_of(&dir.join(LOCK_NAME)), 0o600);
+        }
     }
 
     #[test]
