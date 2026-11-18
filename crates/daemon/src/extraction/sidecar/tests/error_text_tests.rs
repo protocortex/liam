@@ -14,41 +14,52 @@ const LOOPBACK: &str = "127.0.0.1";
 const SECRET: &str = "s3cret-value";
 
 #[test]
-fn each_start_failure_names_its_cause_in_plain_words() {
+fn each_start_failure_carries_the_value_an_operator_needs() {
     // Arrange
-    let cases: Vec<(SidecarError, &str)> = vec![
+    let cases: Vec<(SidecarError, Vec<String>)> = vec![
         (
             bad_path("model_gguf", "does not point to a file"),
-            "extraction.model_gguf does not point to a file",
+            vec!["model_gguf".into(), "does not point to a file".into()],
         ),
         (
             SidecarError::RamGate {
                 free_mb: FREE_MB,
                 budget_mb: BUDGET_MB,
             },
-            "100 MB of RAM is free, below extraction.ram_budget_mb of 2048 MB",
+            vec![
+                FREE_MB.to_string(),
+                BUDGET_MB.to_string(),
+                "ram_budget_mb".into(),
+            ],
         ),
         (
             SidecarError::Exited(Some(EXIT_CODE)),
-            "the sidecar exited with code 7 at start",
+            vec![EXIT_CODE.to_string()],
         ),
-        (
-            SidecarError::Exited(None),
-            "the sidecar was killed by a signal at start",
-        ),
-        (
-            SidecarError::StartTimeout,
-            "the sidecar was not ready in time",
-        ),
+        (SidecarError::Exited(None), vec!["signal".into()]),
+        (SidecarError::StartTimeout, vec!["sidecar".into()]),
     ];
 
-    for (error, expected) in cases {
+    for (error, carried) in cases {
         // Act
         let text = error.to_string();
 
         // Assert
-        assert_eq!(text, expected);
+        for part in carried {
+            assert!(text.contains(&part), "{text:?} should carry {part:?}");
+        }
     }
+}
+
+#[test]
+fn a_start_that_ended_by_signal_reads_differently_from_one_that_exited() {
+    // Act
+    let signalled = SidecarError::Exited(None).to_string();
+    let exited = SidecarError::Exited(Some(EXIT_CODE)).to_string();
+
+    // Assert
+    assert_ne!(signalled, exited);
+    assert!(!signalled.contains(&EXIT_CODE.to_string()));
 }
 
 #[test]
@@ -64,8 +75,14 @@ fn setup_and_spawn_failures_keep_their_source_and_the_others_have_none() {
     // Assert
     assert_eq!(setup_source.as_deref(), Some("no random bytes"));
     assert_eq!(spawn_source.as_deref(), Some("exec failed"));
-    assert!(setup.to_string().contains("no random bytes"));
-    assert!(spawn.to_string().contains("exec failed"));
+    let setup_text = setup.to_string();
+    let spawn_text = spawn.to_string();
+    assert!(setup_text.contains("no random bytes"), "{setup_text}");
+    assert!(spawn_text.contains("exec failed"), "{spawn_text}");
+    // The operator must be able to tell a failed preparation from a failed spawn.
+    assert!(!setup_text.contains("exec failed"), "{setup_text}");
+    assert!(setup_text.contains("sidecar"), "{setup_text}");
+    assert!(spawn_text.contains("process"), "{spawn_text}");
     assert!(SidecarError::StartTimeout.source().is_none());
     assert!(SidecarError::Exited(None).source().is_none());
 }

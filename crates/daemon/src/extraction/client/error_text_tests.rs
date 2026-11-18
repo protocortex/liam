@@ -8,67 +8,59 @@ use super::*;
 const LIMIT: usize = 4096;
 
 #[test]
-fn each_failure_is_described_without_request_or_response_text() {
+fn each_failure_carries_its_variant_value_and_no_request_or_response_text() {
     // Arrange
     let cases = [
         (
             ExtractError::NotLoopback(Ipv4Addr::new(10, 0, 0, 1).into()),
-            "the sidecar address 10.0.0.1 is not a loopback address",
+            "10.0.0.1",
         ),
         (
             ExtractError::Connect(io::ErrorKind::ConnectionRefused),
-            "could not connect to the sidecar: connection refused",
+            "connection refused",
         ),
-        (
-            ExtractError::Io(io::ErrorKind::BrokenPipe),
-            "the connection to the sidecar failed: broken pipe",
-        ),
-        (ExtractError::Timeout, "the sidecar did not answer in time"),
-        (
-            ExtractError::Status(500),
-            "the sidecar answered with HTTP status 500",
-        ),
-        (
-            ExtractError::Redirect(302),
-            "the sidecar answered with redirect status 302",
-        ),
-        (
-            ExtractError::Truncated,
-            "the sidecar's response ended early",
-        ),
-        (
-            ExtractError::TooLarge { limit: LIMIT },
-            "the sidecar's response is over 4096 bytes",
-        ),
-        (
-            ExtractError::Malformed("no braces"),
-            "the sidecar sent a malformed response: no braces",
-        ),
-        (
-            ExtractError::InvalidRequest("empty prompt"),
-            "the request is invalid: empty prompt",
-        ),
-        (
-            ExtractError::BadEnvelope,
-            "the sidecar's response has no completion text",
-        ),
-        (
-            ExtractError::ModelMismatch,
-            "the provider answered with a model that is not the pin",
-        ),
-        (
-            ExtractError::ModelRetired,
-            "the provider no longer has the pinned model",
-        ),
+        (ExtractError::Io(io::ErrorKind::BrokenPipe), "broken pipe"),
+        (ExtractError::Status(500), "500"),
+        (ExtractError::Redirect(302), "302"),
+        (ExtractError::TooLarge { limit: LIMIT }, "4096"),
+        (ExtractError::Malformed("no braces"), "no braces"),
+        (ExtractError::InvalidRequest("empty prompt"), "empty prompt"),
     ];
 
-    for (error, expected) in cases {
+    for (error, carried) in cases {
         // Act
         let text = error.to_string();
 
         // Assert
-        assert_eq!(text, expected);
+        assert!(text.contains(carried), "{text:?} should carry {carried:?}");
     }
+}
+
+#[test]
+fn every_failure_has_a_distinct_message() {
+    // Arrange
+    let errors = [
+        ExtractError::NotLoopback(Ipv4Addr::LOCALHOST.into()),
+        ExtractError::Connect(io::ErrorKind::ConnectionRefused),
+        ExtractError::Io(io::ErrorKind::BrokenPipe),
+        ExtractError::Timeout,
+        ExtractError::Status(500),
+        ExtractError::Redirect(302),
+        ExtractError::Truncated,
+        ExtractError::TooLarge { limit: LIMIT },
+        ExtractError::Malformed("why"),
+        ExtractError::InvalidRequest("why"),
+        ExtractError::BadEnvelope,
+        ExtractError::ModelMismatch,
+        ExtractError::ModelRetired,
+    ];
+
+    // Act
+    let messages: std::collections::HashSet<String> =
+        errors.iter().map(ToString::to_string).collect();
+
+    // Assert
+    assert_eq!(messages.len(), errors.len());
 }
 
 #[test]

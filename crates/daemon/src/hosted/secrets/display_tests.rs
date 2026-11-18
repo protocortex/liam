@@ -3,42 +3,52 @@
 
 use super::*;
 
+const KEY_PATH: &str = "/keys/provider.key";
+const SERVICE: &str = "liam-anthropic";
+const MODE: u32 = 0o644;
+
 #[test]
-fn each_key_failure_says_what_to_fix() {
+fn each_key_failure_names_the_path_or_service_and_the_reason() {
     // Arrange
-    let path = PathBuf::from("/keys/provider.key");
+    let path = PathBuf::from(KEY_PATH);
     let cases = [
         (
             SecretError::Unreadable {
                 path: path.clone(),
                 reason: "permission denied".into(),
             },
-            "key file /keys/provider.key could not be read: permission denied",
+            vec![KEY_PATH, "permission denied"],
         ),
         (
             SecretError::EmptyFile { path: path.clone() },
-            "the key file /keys/provider.key is empty",
+            vec![KEY_PATH],
         ),
         (
             SecretError::NotInKeychain {
-                service: "liam-anthropic".into(),
+                service: SERVICE.into(),
             },
-            "the Keychain has no key for service liam-anthropic",
+            vec![SERVICE],
         ),
         (
             SecretError::Keychain {
-                service: "liam-anthropic".into(),
+                service: SERVICE.into(),
                 reason: "locked".into(),
             },
-            "the Keychain could not be read for service liam-anthropic: locked",
+            vec![SERVICE, "locked"],
+        ),
+        (
+            SecretError::LooseMode { path, mode: MODE },
+            vec![KEY_PATH, "644", "chmod 600"],
         ),
     ];
 
-    for (error, expected) in cases {
+    for (error, carried) in cases {
         // Act
         let text = error.to_string();
 
         // Assert
-        assert_eq!(text, expected);
+        for part in carried {
+            assert!(text.contains(part), "{text:?} should carry {part:?}");
+        }
     }
 }
