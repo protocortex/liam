@@ -452,6 +452,9 @@ fn secure_state_files_with_home(
 }
 
 #[cfg(all(test, unix))]
+mod failure_tests;
+
+#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
