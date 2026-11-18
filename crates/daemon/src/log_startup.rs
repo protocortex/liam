@@ -7,11 +7,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use liam_log::compactor::{ChannelSink, Compactor};
+use liam_log::compactor::{ChannelSink, Compactor, CompactorTask};
 use liam_log::crypto::KeyRegistry;
 use liam_model::Embedder;
 use liam_store::{DefaultGraph, SharedLog};
-use tokio::task::JoinHandle;
 
 use liam_daemon::config::Config;
 use liam_daemon::event_log;
@@ -23,7 +22,7 @@ use crate::shutdown::Shutdown;
 /// into Parquet for as long as the store lives.
 pub struct StartedStore {
     pub store: DefaultGraph,
-    pub compactor: JoinHandle<()>,
+    pub compactor: CompactorTask,
     /// The log the store writes through, kept so a rollback can reopen the
     /// store on the same writer.
     pub log: SharedLog,
@@ -72,7 +71,7 @@ pub async fn open_store_with_log(
         let sealed = store.backfill_node_keys_if_empty().await?;
         tracing::debug!(sealed, "key groups checked against the sealed log");
     }
-    let compactor = compactor_for(log_dir)?.spawn(closed_segments);
+    let compactor = compactor_for(log_dir)?.spawn_stoppable(closed_segments);
     Ok(StartedStore {
         store,
         compactor,

@@ -693,11 +693,15 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
                 &config.embedder.cache_dir,
                 &home,
             )?;
-            let path = liam_model::gguf_path_from_hub(spec, &cache_dir)?;
+            let path = liam_model::gguf_path_from_hub(
+                spec,
+                &cache_dir,
+                liam_model::NoticeCaller::FetchModels,
+            )?;
             liam_model::verify_gguf_file(spec, &path)?;
             println!("  sha256 verified: {}", spec.sha256);
         }
-        let _embedder = models::build_embedder(config)?;
+        let _embedder = models::build_embedder_for(config, liam_model::NoticeCaller::FetchModels)?;
         println!("embedder: ready");
     }
 
@@ -712,7 +716,7 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
         // macOS check that a backend actually resolved to Metal runs here as
         // well. A fetch that quietly verified a CPU-only load would promise
         // a start the daemon then refuses.
-        let _llm = models::build_llm(config)?;
+        let _llm = models::build_llm_for(config, liam_model::NoticeCaller::FetchModels)?;
         println!("llm: ready");
     }
 

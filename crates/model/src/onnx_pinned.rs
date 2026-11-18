@@ -126,13 +126,25 @@ fn embed_error(message: String) -> ModelError {
 /// `factory`. `fetch` returns the local path of a file (downloading it on a
 /// miss) and `verify` takes that path, the pinned size and the pinned sha256.
 /// A file that is missing or fails `verify` stops the load before `factory`
-/// runs.
+/// runs. When `is_cached` finds a file missing, `announce` runs once, before
+/// the first fetch, with the total size of the missing files.
 pub(crate) fn load_pinned<T>(
     model: &PinnedOnnxModel,
+    is_cached: impl Fn(&PinnedFile) -> bool,
+    announce: impl FnOnce(u64),
     fetch: impl Fn(&PinnedFile) -> Result<PathBuf>,
     verify: impl Fn(&Path, u64, &str) -> Result<()>,
     factory: impl FnOnce(PinnedPaths) -> Result<T>,
 ) -> Result<T> {
+    let missing_bytes: u64 = model
+        .files()
+        .into_iter()
+        .filter(|file| !is_cached(file))
+        .map(|file| file.size)
+        .sum();
+    if missing_bytes > 0 {
+        announce(missing_bytes);
+    }
     let resolve = |pinned: &PinnedFile| -> Result<PathBuf> {
         let path = fetch(pinned)?;
         verify(&path, pinned.size, pinned.sha256)?;
@@ -231,6 +243,8 @@ mod tests {
         // Act
         let result = load_pinned(
             &ARCTIC_EMBED_M_V2,
+            |_| true,
+            |_| {},
             |pinned| Err(ModelError::Embed(format!("{} is missing", pinned.name))),
             |_, _, _| Ok(()),
             |_| {
@@ -255,6 +269,8 @@ mod tests {
         // Act
         let result = load_pinned(
             &ARCTIC_EMBED_M_V2,
+            |_| true,
+            |_| {},
             |_| Ok(stray.clone()),
             crate::verify_pinned_file,
             |_| {
@@ -277,6 +293,8 @@ mod tests {
         // Act
         let paths = load_pinned(
             &ARCTIC_EMBED_M_V2,
+            |_| true,
+            |_| {},
             |pinned| Ok(PathBuf::from(pinned.name)),
             |_, _, _| Ok(()),
             |paths| {
@@ -290,5 +308,58 @@ mod tests {
         assert_eq!(paths.onnx, PathBuf::from("model_int8.onnx"));
         assert_eq!(paths.tokenizer, PathBuf::from("tokenizer.json"));
         assert_eq!(factory_calls.get(), 1);
+    }
+
+    #[test]
+    fn missing_files_announce_once_with_their_size_before_the_first_fetch() {
+        // Arrange
+        let events = std::cell::RefCell::new(Vec::new());
+        let missing_name = ARCTIC_EMBED_M_V2.config.name;
+
+        // Act
+        load_pinned(
+            &ARCTIC_EMBED_M_V2,
+            |pinned| pinned.name != missing_name,
+            |bytes| events.borrow_mut().push(format!("announce {bytes}")),
+            |pinned| {
+                events.borrow_mut().push(format!("fetch {}", pinned.name));
+                Ok(PathBuf::from(pinned.name))
+            },
+            |_, _, _| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        // Assert
+        let events = events.into_inner();
+        let announced: Vec<_> = events
+            .iter()
+            .filter(|e| e.starts_with("announce"))
+            .collect();
+        assert_eq!(
+            announced,
+            [&format!("announce {}", ARCTIC_EMBED_M_V2.config.size)]
+        );
+        assert!(events[0].starts_with("announce"), "{events:?}");
+    }
+
+    #[test]
+    fn cached_files_announce_nothing() {
+        // Arrange
+        let announcements = Cell::new(0);
+
+        // Act
+        load_pinned(
+            &ARCTIC_EMBED_M_V2,
+            |_| true,
+            |_| announcements.set(announcements.get() + 1),
+            |pinned| Ok(PathBuf::from(pinned.name)),
+            |_, _, _| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(announcements.get(), 0);
     }
 }

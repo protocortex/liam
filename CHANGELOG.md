@@ -20,6 +20,21 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- `liamd` now logs one info line before it downloads a model that is not in the cache, naming the model, the
+  directory and, where known, the size, and pointing to `liam fetch-models` (`liam fetch-models` itself leaves
+  that hint out). It checks for the files the model loads, in `HF_HOME` when that is set, so a download that was
+  interrupted gets the notice again. Nothing is logged when the files are already there.
+- A config that still names the previous default embedder (`Qwen/Qwen3-Embedding-0.6B-GGUF`) now gets one info
+  line at start saying the default changed and how to switch or stay. It keeps working.
+- A clean shutdown no longer waits up to 3 seconds and logs `compaction was still queued at exit`. Closed
+  segments that were not compacted yet stay as WAL files, and the next start compacts them. A compaction that
+  is already running still gets up to 3 seconds to finish.
+- A socket path longer than the platform limit is refused before anything is created, with a message that gives
+  its length and the limit and says to set `socket_path` to a shorter path.
+- The warning about a relative `socket_path` now prints the path and the directory it resolves against instead
+  of an empty `dir=`.
+- The refusal for an embedder mismatch is now a few short sentences: what differs, the `liam rebuild` command,
+  and what happens if you do nothing. It is still one log event.
 - Errors from the store, the log, the models and the sidecar now keep their underlying error as a source. The
   store can report a busy or locked database apart from other engine failures, and the dedup step logs one
   warning when embedding fails.

@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 
 use crate::blocking::with_model_blocking;
+use crate::download_notice::NoticeCaller;
 use crate::error::Result;
 use crate::llm::DevicePreference;
 
@@ -227,6 +228,9 @@ fn device_error(what: &str, e: impl std::fmt::Display) -> crate::error::ModelErr
     crate::error::ModelError::Embed(format!("candle {what} device: {e}"))
 }
 
+/// The files `FastEmbedEmbedder::load` fetches, in the order it fetches them.
+const QWEN3_HUB_FILES: [&str; 3] = ["config.json", "model.safetensors", "tokenizer.json"];
+
 impl FastEmbedEmbedder {
     /// Load a model by Hugging Face id (e.g. "Qwen/Qwen3-Embedding-0.6B") into
     /// `cache_dir`, truncating its output to `dims` via Matryoshka (see
@@ -245,8 +249,20 @@ impl FastEmbedEmbedder {
         dims: usize,
         cache_dir: &str,
         preference: DevicePreference,
+        caller: NoticeCaller,
     ) -> Result<Self> {
         let (device, label) = candle_device(preference)?;
+        crate::download_notice::log_unless_cached(
+            crate::download_notice::hub_files_cached(
+                cache_dir,
+                model_id,
+                QWEN3_HUB_FILES.iter().copied(),
+            ),
+            model_id,
+            cache_dir,
+            None,
+            caller,
+        );
         let api = hf_hub::api::sync::ApiBuilder::new()
             .with_cache_dir(std::path::PathBuf::from(cache_dir))
             .build()
@@ -633,6 +649,7 @@ mod tests {
             native_dims,
             cache_dir.0.to_str().unwrap(),
             DevicePreference::Cpu,
+            crate::NoticeCaller::Daemon,
         )
         .expect("load real embedder into a fresh cache dir");
 
