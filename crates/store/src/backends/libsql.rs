@@ -1101,7 +1101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_transaction_never_yields_between_begin_and_commit() {
+    async fn a_transaction_never_yields_between_begin_and_its_end() {
         // Arrange: a caller dropped at a suspension point between a log append
         // and the commit would leave the log ahead of the graph, so every step
         // of a transaction must finish in the poll that starts it.
@@ -1118,10 +1118,15 @@ mod tests {
         let read = ready_on_first_poll(tx.query("SELECT COUNT(*) FROM gate", &[]));
         let committed = ready_on_first_poll(tx.commit());
 
+        let second = ready_on_first_poll(backend.begin());
+        let second = second.expect("second begin yielded").unwrap();
+        let rolled_back = ready_on_first_poll(second.rollback());
+
         // Assert
         assert_eq!(wrote.expect("execute yielded").unwrap(), 1);
         assert_eq!(read.expect("query yielded").unwrap().len(), 1);
         committed.expect("commit yielded").unwrap();
+        rolled_back.expect("rollback yielded").unwrap();
     }
 
     /// The read-during-write test must prove OVERLAP, not merely that the
