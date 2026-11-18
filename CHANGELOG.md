@@ -86,6 +86,10 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Fixed
 
+- Atomic multi-statement database writes, checkpoints, segment compaction and the stale sidecar sweep now run on
+  blocking threads instead of the async runtime's workers, so a wait on a lock no longer stalls other requests or
+  their deadline timers. Transactions and single statements stay on the runtime thread, so a cancelled request cannot
+  leave the event log ahead of the graph.
 - State directories are now created owner-only (0700) and the files `liamd` creates (WAL segments, lock files,
   state files) owner-only (0600), instead of taking the umask. `liamd` and `liam` also set the process umask to 077
   at start, so the database and its snapshots are never wider than their owner, even while the store opens. At start

@@ -125,7 +125,7 @@ impl FreeRam for SystemRam {
 pub struct Deps {
     pub free_ram: Box<dyn FreeRam>,
     pub next_port: Box<dyn FnMut() -> io::Result<u16> + Send>,
-    pub processes: Box<dyn ProcessTable>,
+    pub processes: Arc<dyn ProcessTable>,
     /// Records the running child so a later daemon can clear it.
     pub pidfile: PathBuf,
     /// The executable a stale pidfile must name before its process is killed.
@@ -136,7 +136,7 @@ impl Deps {
     pub fn system(config: &ExtractionConfig, pidfile: &Path, server_exe: &Path) -> Self {
         let (host, fixed_port) = (config.host.clone(), config.port);
         Self {
-            processes: Box::new(SystemProcesses),
+            processes: Arc::new(SystemProcesses),
             pidfile: pidfile.to_path_buf(),
             server_exe: server_exe.to_path_buf(),
             free_ram: Box::new(SystemRam),
@@ -357,7 +357,20 @@ impl SidecarGuard {
         mut deps: Deps,
     ) -> Result<Self, SidecarError> {
         // Before the RAM gate: a stale server holds the memory the gate reads.
-        let swept = stale::sweep(&deps.pidfile, &deps.server_exe, deps.processes.as_ref());
+        // The sweep polls with `std::thread::sleep` for up to two seconds, so it
+        // runs on a blocking thread.
+        let swept = {
+            let (pidfile, server_exe) = (deps.pidfile.clone(), deps.server_exe.clone());
+            let processes = Arc::clone(&deps.processes);
+            tokio::task::spawn_blocking(move || {
+                stale::sweep(&pidfile, &server_exe, processes.as_ref())
+            })
+            .await
+            .map_err(|error| {
+                warn!(%error, "the stale sidecar sweep did not finish");
+                SidecarError::Setup(Box::new(error))
+            })?
+        };
         debug!(?swept, "swept the previous sidecar");
         let free_mb = deps.free_ram.free_mb();
         if free_mb < config.ram_budget_mb {

@@ -295,12 +295,21 @@ pub(crate) fn archived_parquet_bytes(
 ///
 /// The store's `put` publishes the whole object at once, so a reader never
 /// sees a partial file.
+#[cfg(test)]
 pub(crate) async fn write_parquet(
     store: &dyn ObjectStore,
     sequence: u64,
     events: &[LogEvent],
 ) -> Result<(), CompactError> {
-    let bytes = segment_parquet_bytes(sequence, events)?;
+    put_parquet(store, sequence, segment_parquet_bytes(sequence, events)?).await
+}
+
+/// Stores already encoded Parquet `bytes` for segment `sequence`.
+async fn put_parquet(
+    store: &dyn ObjectStore,
+    sequence: u64,
+    bytes: Vec<u8>,
+) -> Result<(), CompactError> {
     store
         .put(&object_path(sequence), PutPayload::from(bytes))
         .await?;
@@ -586,7 +595,7 @@ impl Compactor {
                 Err(reason) => rewrite(reason),
             },
         };
-        self.publish(segment, sequence, &events).await?;
+        self.publish(segment, sequence, Arc::new(events)).await?;
         Ok(Some(recovered))
     }
 
@@ -601,11 +610,16 @@ impl Compactor {
                 segment: segment.to_path_buf(),
             }
         })?;
-        self.ensure_closed(segment, sequence)?;
-        let Some(events) = read_closed_segment(segment)? else {
+        let (dir, path) = (self.dir.clone(), segment.to_path_buf());
+        let read = off_runtime(move || {
+            ensure_closed(&dir, &path, sequence)?;
+            read_closed_segment(&path)
+        })
+        .await?;
+        let Some(events) = read else {
             return Ok(Compaction::AlreadyCompacted);
         };
-        self.publish(segment, sequence, &events).await?;
+        self.publish(segment, sequence, Arc::new(events)).await?;
         Ok(Compaction::Compacted)
     }
 
@@ -615,10 +629,12 @@ impl Compactor {
         &self,
         segment: &Path,
         sequence: u64,
-        events: &[LogEvent],
+        events: Arc<Vec<LogEvent>>,
     ) -> Result<(), CompactError> {
-        write_parquet(self.store.as_ref(), sequence, events).await?;
-        self.verify(sequence, events).await?;
+        let to_encode = Arc::clone(&events);
+        let bytes = off_runtime(move || segment_parquet_bytes(sequence, &to_encode)).await?;
+        put_parquet(self.store.as_ref(), sequence, bytes).await?;
+        self.verify(sequence, &events).await?;
         self.remove(segment)
     }
 
@@ -642,24 +658,6 @@ impl Compactor {
                     source,
                 },
             })
-    }
-
-    /// The live path never compacts the open segment. The writer always has a
-    /// successor open once it closes a segment, so the highest-numbered file is
-    /// treated as open; recovery gets the exact sequence from the caller instead.
-    ///
-    /// Unlike the reader this does not also hold back the segment below an empty
-    /// highest file: the writer notifies a segment the moment it rotates, when
-    /// its successor is still empty, so that rule would refuse every notification.
-    fn ensure_closed(&self, segment: &Path, sequence: u64) -> Result<(), CompactError> {
-        let segments = segment_paths(&self.dir).map_err(WalError::Io)?;
-        let newest = segments.last().map(|(newest, _)| *newest);
-        match split_open(segments, newest).1 {
-            Some((open, _)) if open == sequence => Err(CompactError::OpenSegment {
-                segment: segment.to_path_buf(),
-            }),
-            _ => Ok(()),
-        }
     }
 
     /// Compacts every notified segment until all senders are gone, then stops.
@@ -686,6 +684,34 @@ impl Compactor {
             }
         })
     }
+}
+
+/// The live path never compacts the open segment. The writer always has a
+/// successor open once it closes a segment, so the highest-numbered file is
+/// treated as open; recovery gets the exact sequence from the caller instead.
+///
+/// Unlike the reader this does not also hold back the segment below an empty
+/// highest file: the writer notifies a segment the moment it rotates, when
+/// its successor is still empty, so that rule would refuse every notification.
+fn ensure_closed(dir: &Path, segment: &Path, sequence: u64) -> Result<(), CompactError> {
+    let segments = segment_paths(dir).map_err(WalError::Io)?;
+    let newest = segments.last().map(|(newest, _)| *newest);
+    match split_open(segments, newest).1 {
+        Some((open, _)) if open == sequence => Err(CompactError::OpenSegment {
+            segment: segment.to_path_buf(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Runs file reads and encoding on a blocking thread, so a large segment does
+/// not hold a runtime worker.
+async fn off_runtime<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, CompactError> + Send + 'static,
+) -> Result<T, CompactError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| WalError::Io(io::Error::other(error)))?
 }
 
 type Segment = (u64, PathBuf);
@@ -1564,6 +1590,41 @@ mod tests {
         );
         assert!(!segment.path.exists(), "wal segment is removed");
         assert_parquet_holds(&store, segment).await;
+    }
+
+    // A current-thread runtime starts no thread of its own, so a thread start
+    // can only be a `spawn_blocking` thread: the read and the encode left the
+    // runtime's own thread.
+    #[test]
+    fn compacting_a_segment_reads_and_encodes_on_the_blocking_pool() {
+        // Arrange
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&started);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .build()
+            .unwrap();
+        let log = write_log(1);
+        let segment = &log.closed[0];
+        // An in-memory store, since the local one also uses blocking threads.
+        let compactor = Compactor::new(
+            log.dir.path(),
+            Arc::new(object_store::memory::InMemory::new()),
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+
+        // Act
+        let outcome = runtime.block_on(compactor.compact_segment(&segment.path));
+
+        // Assert
+        assert!(
+            matches!(outcome, Ok(Compaction::Compacted)),
+            "outcome {outcome:?}"
+        );
+        assert!(started.load(Ordering::SeqCst) > 0);
     }
 
     #[tokio::test]

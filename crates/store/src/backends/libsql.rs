@@ -6,6 +6,11 @@
 //! VERSION CHECK: the libSQL parameter-binding call (`params_from_iter`) and the
 //! row accessors (`column_count`, `get_value`) are the surface to confirm against
 //! the version you pin.
+//!
+//! Only the single-call writes that are atomic by themselves (`execute_atomic`,
+//! `wal_checkpoint`) run on blocking threads. A transaction and a plain
+//! `execute` stay inline so there is no cancellation point between a log
+//! append and its commit.
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -247,7 +252,7 @@ pub struct LibsqlBackend {
     /// `execute_atomic`, and every vector-writing method. Guarding it with a
     /// mutex serializes writes at the application level instead of letting
     /// them race on `SQLITE_BUSY` and hoping `busy_timeout` sorts it out.
-    write: Mutex<Connection>,
+    write: Arc<Mutex<Connection>>,
     /// Connections used for reads (`query`, `vector_search`). Reads never
     /// take `write`'s lock, so a read completes even while a write is in
     /// flight; that is the entire reason this pool exists separately from
@@ -492,7 +497,7 @@ impl Backend for LibsqlBackend {
         };
 
         Ok(Self {
-            write: Mutex::new(write_conn),
+            write: Arc::new(Mutex::new(write_conn)),
             read_pool,
             #[cfg(test)]
             hooks: ReadHooks::none(),
@@ -520,26 +525,30 @@ impl Backend for LibsqlBackend {
         mode: CheckpointMode,
         wait: Duration,
     ) -> Result<CheckpointResult> {
-        let conn = self.write.lock().await;
-        conn.query(&format!("PRAGMA busy_timeout = {}", wait.as_millis()), ())
-            .await
-            .map_err(err)?;
-        let checkpoint = conn.query(mode.pragma(), ()).await.map_err(err);
-        // The wait is restored whether or not the checkpoint ran.
-        let restored = conn
-            .query(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"), ())
-            .await
-            .map_err(err);
-        let rows = read_rows(checkpoint?, &ReadHooks::none()).await?;
-        restored?;
-        let row = rows
-            .first()
-            .ok_or_else(|| Error::Backend("wal_checkpoint returned no row".to_owned()))?;
-        Ok(CheckpointResult {
-            busy: row.get_i64(0)? != 0,
-            log_frames: row.get_i64(1)?,
-            checkpointed: row.get_i64(2)?,
+        self.write_blocking(move |runtime, conn| {
+            runtime.block_on(async {
+                conn.query(&format!("PRAGMA busy_timeout = {}", wait.as_millis()), ())
+                    .await
+                    .map_err(err)?;
+                let checkpoint = conn.query(mode.pragma(), ()).await.map_err(err);
+                // The wait is restored whether or not the checkpoint ran.
+                let restored = conn
+                    .query(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"), ())
+                    .await
+                    .map_err(err);
+                let rows = read_rows(checkpoint?, &ReadHooks::none()).await?;
+                restored?;
+                let row = rows
+                    .first()
+                    .ok_or_else(|| Error::Backend("wal_checkpoint returned no row".to_owned()))?;
+                Ok(CheckpointResult {
+                    busy: row.get_i64(0)? != 0,
+                    log_frames: row.get_i64(1)?,
+                    checkpointed: row.get_i64(2)?,
+                })
+            })
         })
+        .await
     }
 
     async fn set_secure_delete(&self, on: bool) -> Result<bool> {
@@ -557,14 +566,22 @@ impl Backend for LibsqlBackend {
     }
 
     async fn execute_atomic(&self, statements: &[(String, Vec<Value>)]) -> Result<()> {
-        let conn = self.write.lock().await;
-        let tx = conn.transaction().await.map_err(err)?;
-        for (sql, params) in statements {
-            tx.execute(sql, libsql::params_from_iter(bind(params)))
-                .await
-                .map_err(err)?;
-        }
-        tx.commit().await.map_err(err)
+        let statements: Vec<(String, Vec<libsql::Value>)> = statements
+            .iter()
+            .map(|(sql, params)| (sql.clone(), bind(params)))
+            .collect();
+        self.write_blocking(move |runtime, conn| {
+            runtime.block_on(async {
+                let tx = conn.transaction().await.map_err(err)?;
+                for (sql, params) in statements {
+                    tx.execute(&sql, libsql::params_from_iter(params))
+                        .await
+                        .map_err(err)?;
+                }
+                tx.commit().await.map_err(err)
+            })
+        })
+        .await
     }
 
     fn vector_ddl(&self, dims: usize) -> String {
@@ -775,7 +792,28 @@ impl<'a> BackendTx for LibsqlTx<'a> {
     }
 }
 
+fn write_task_failed(error: tokio::task::JoinError) -> Error {
+    Error::Backend(format!("the write task failed: {error}"))
+}
+
 impl LibsqlBackend {
+    /// Runs one write on a blocking thread, holding the write lock from before
+    /// the thread starts until it ends. The lock is taken first, on the
+    /// runtime, so waiting for it never uses up a blocking thread, and a caller
+    /// dropped while waiting leaves nothing behind. A caller dropped after the
+    /// thread started does not stop it: the write finishes, and the lock
+    /// releases only then.
+    async fn write_blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Handle, &Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let guard = Arc::clone(&self.write).lock_owned().await;
+        let runtime = Handle::current();
+        tokio::task::spawn_blocking(move || work(&runtime, &guard))
+            .await
+            .map_err(write_task_failed)?
+    }
+
     /// Runs one read on a pooled connection, on a blocking thread. A store
     /// that shares one connection with its writer (in-memory and `file:`
     /// paths) has a pool of one, so its reads run one at a time. If the
@@ -1050,6 +1088,101 @@ mod tests {
             .await
             .expect("open file-backed backend");
         (dir, backend)
+    }
+
+    // The first test holds SQLite's write lock from a second connection, so a
+    // write on the backend has to wait for it. The releasing task runs on the
+    // same single-threaded runtime: a write that blocked that thread (as an
+    // inline call does) would never let it run and would fail with a busy
+    // error once the shortened wait ran out, so passing means the wait
+    // happened off the runtime thread. No timer decides the outcome.
+
+    /// The wait, in ms, that an inline write would burn before failing.
+    const SHORT_BUSY_WAIT_MS: u32 = 300;
+
+    /// A file store with a `gate` table, plus a second connection that holds
+    /// the write lock until `release` runs.
+    async fn store_with_write_lock_held_elsewhere() -> (TempDir, LibsqlBackend, Connection) {
+        let (dir, backend) = file_backend_at("gate.db", ARBITRARY_POOL_SIZE).await;
+        backend
+            .execute_batch(&format!(
+                "CREATE TABLE gate (x INTEGER); PRAGMA busy_timeout = {SHORT_BUSY_WAIT_MS};"
+            ))
+            .await
+            .expect("create the table and shorten the wait");
+        let other = Builder::new_local(dir.path().join("gate.db"))
+            .build()
+            .await
+            .expect("open the second handle")
+            .connect()
+            .expect("connect");
+        other
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .expect("take the write lock");
+        (dir, backend, other)
+    }
+
+    async fn release(other: &Connection) {
+        tokio::task::yield_now().await;
+        other.execute("COMMIT", ()).await.expect("release the lock");
+    }
+
+    #[tokio::test]
+    async fn an_atomic_write_waiting_on_the_database_lock_does_not_block_the_runtime_thread() {
+        // Arrange
+        let (_dir, backend, other) = store_with_write_lock_held_elsewhere().await;
+        let statements = vec![("INSERT INTO gate (x) VALUES (1)".to_owned(), Vec::new())];
+
+        // Act
+        let (written, ()) = tokio::join!(backend.execute_atomic(&statements), release(&other));
+
+        // Assert
+        written.expect("the write got the lock once it was freed");
+        let rows = backend
+            .query("SELECT COUNT(*) FROM gate", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get_i64(0).unwrap(), 1);
+    }
+
+    /// Polls `future` once with a waker that does nothing. `Some` means it
+    /// finished without ever yielding to the runtime.
+    fn ready_on_first_poll<T>(future: impl std::future::Future<Output = T>) -> Option<T> {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(future).poll(&mut context) {
+            std::task::Poll::Ready(value) => Some(value),
+            std::task::Poll::Pending => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transaction_never_yields_between_begin_and_its_end() {
+        // Arrange: a caller dropped at a suspension point between a log append
+        // and the commit would leave the log ahead of the graph, so every step
+        // of a transaction must finish in the poll that starts it.
+        let (_dir, backend) = file_backend_at("tx.db", ARBITRARY_POOL_SIZE).await;
+        backend
+            .execute_batch("CREATE TABLE gate (x INTEGER)")
+            .await
+            .unwrap();
+
+        // Act
+        let tx = ready_on_first_poll(backend.begin());
+        let mut tx = tx.expect("begin yielded").unwrap();
+        let wrote = ready_on_first_poll(tx.execute("INSERT INTO gate (x) VALUES (1)", &[]));
+        let read = ready_on_first_poll(tx.query("SELECT COUNT(*) FROM gate", &[]));
+        let committed = ready_on_first_poll(tx.commit());
+
+        let second = ready_on_first_poll(backend.begin());
+        let second = second.expect("second begin yielded").unwrap();
+        let rolled_back = ready_on_first_poll(second.rollback());
+
+        // Assert
+        assert_eq!(wrote.expect("execute yielded").unwrap(), 1);
+        assert_eq!(read.expect("query yielded").unwrap().len(), 1);
+        committed.expect("commit yielded").unwrap();
+        rolled_back.expect("rollback yielded").unwrap();
     }
 
     /// The read-during-write test must prove OVERLAP, not merely that the
