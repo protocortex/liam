@@ -322,6 +322,49 @@ pub fn build_serving_llm(config: &Config) -> anyhow::Result<ServingLlm> {
     })
 }
 
+/// The warning for a configured llama.cpp model that is not in the cache, or
+/// `None` when it is there or the provider is not llama.cpp. A file check
+/// only: it loads and hashes nothing.
+pub fn missing_model_warning(config: &Config) -> Option<String> {
+    if config.llm.provider != LLAMA_PROVIDER {
+        return None;
+    }
+    let settings = llama_settings(config).ok()?;
+    let cached = liam_model::LlamaCppLlm::cached_gguf_path(
+        &config.llm.model,
+        &config.llm.gguf_file,
+        &settings.cache_dir,
+    );
+    cached.is_none().then(|| {
+        format!(
+            "llm model {} file {} is not in the cache {}; ask will fail until `liam fetch-models` runs",
+            config.llm.model, config.llm.gguf_file, settings.cache_dir
+        )
+    })
+}
+
+/// What the daemon does with the LLM at start. With `warmup` it loads the
+/// model and stops the daemon when the load fails; the warmup run after a
+/// good load only warns. Without it nothing loads, and a model that is
+/// missing from the cache is a single warning.
+pub async fn prepare_llm_at_start(config: &Config, llm: &dyn Llm) -> anyhow::Result<()> {
+    if !config.llm.warmup {
+        if let Some(warning) = missing_model_warning(config) {
+            tracing::warn!("{warning}");
+        }
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    llm.ensure_loaded()
+        .await
+        .map_err(|e| anyhow::anyhow!("llm.warmup is true and the model did not load: {e}"))?;
+    match llm.warmup().await {
+        Ok(()) => tracing::info!(elapsed = ?started.elapsed(), "llm warmed up"),
+        Err(e) => tracing::warn!(error = %e, "llm warmup failed"),
+    }
+    Ok(())
+}
+
 /// Applies `macos_backend_error` on macOS and does nothing elsewhere.
 fn reject_unexpected_cpu_backend(backend: &str, device: DevicePreference) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
@@ -367,6 +410,77 @@ fn macos_backend_error(backend: &str, device: DevicePreference) -> Option<String
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn llama_config(cache_dir: &Path, warmup: bool) -> Config {
+        let mut config = Config::default();
+        config.llm.provider = LLAMA_PROVIDER.to_string();
+        config.llm.cache_dir = cache_dir.to_string_lossy().into_owned();
+        config.llm.warmup = warmup;
+        config
+    }
+
+    #[test]
+    fn a_llama_model_missing_from_the_cache_gets_one_warning_naming_it() {
+        // Arrange
+        let cache = tempfile::tempdir().unwrap();
+        let config = llama_config(cache.path(), false);
+
+        // Act
+        let warning = missing_model_warning(&config).expect("an empty cache has no model");
+
+        // Assert
+        assert!(warning.contains(&config.llm.model), "{warning}");
+        assert!(warning.contains(&config.llm.gguf_file), "{warning}");
+        assert!(warning.contains("liam fetch-models"), "{warning}");
+    }
+
+    #[test]
+    fn the_mock_provider_has_no_model_to_miss() {
+        // Arrange
+        let config = Config::default();
+
+        // Act / Assert
+        assert!(missing_model_warning(&config).is_none());
+    }
+
+    struct FailingLoadLlm;
+
+    #[async_trait]
+    impl Llm for FailingLoadLlm {
+        async fn ensure_loaded(&self) -> liam_model::Result<()> {
+            Err(liam_model::ModelError::Llm("no weights".into()))
+        }
+
+        async fn complete(&self, _system: &str, _prompt: &str) -> liam_model::Result<String> {
+            unreachable!("start never generates")
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_stops_the_start_when_the_model_does_not_load() {
+        // Arrange
+        let config = llama_config(Path::new("/unused"), true);
+
+        // Act
+        let result = prepare_llm_at_start(&config, &FailingLoadLlm).await;
+
+        // Assert
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("no weights"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn without_warmup_a_model_that_cannot_load_does_not_stop_the_start() {
+        // Arrange
+        let cache = tempfile::tempdir().unwrap();
+        let config = llama_config(cache.path(), false);
+
+        // Act
+        let result = prepare_llm_at_start(&config, &FailingLoadLlm).await;
+
+        // Assert
+        assert!(result.is_ok());
+    }
 
     /// The model cache dirs are the two paths that were NOT being expanded,
     /// while `socket_path` and `database_path` always were. Left raw, fastembed

@@ -41,13 +41,16 @@ different: every `recall` and `remember` needs it, so it stays loaded.
    ready.
 3. **Unload when idle.** A task checks every 30 s and drops the model after
    `llm.idle_unload_secs` (default `300`) without a generation. `0` never
-   unloads. A call in flight keeps its own handle, so the model is freed after
-   that call ends. The task stops with the daemon's shutdown token.
+   unloads. The task waits for calls in flight: it never unloads while one holds
+   the model, and the idle period counts from the end of the last call, even when
+   a request is cancelled mid call. The task stops with the daemon's shutdown token.
 4. **`llm.warmup` now defaults to `false`.** With `true` the model loads at start
    and still unloads when idle.
-5. **Counting tokens needs a loaded model.** While the model is unloaded the
-   count is the existing character based estimate, as for any provider that
-   cannot count. `liam fetch-models` still loads the model, since it exists to
+5. **Counting tokens needs a loaded model.** `ask` and entity synthesis load the
+   model, inside the request deadline, before they count tokens and trim evidence
+   and before the generation timer starts, so the count is the model's own and
+   the load time stays out of the concurrency tuner's window. The character
+   based estimate remains for a provider that cannot count. `liam fetch-models` still loads the model, since it exists to
    prove that it loads.
 
 ## Consequences
@@ -55,9 +58,13 @@ different: every `recall` and `remember` needs it, so it stays loaded.
 - **The first request after an idle period is slower** by the load time. The
   operator who wants the old behaviour sets `llm.warmup = true` and
   `llm.idle_unload_secs = 0`.
-- **Memory returns to the system after the idle period.** Measured numbers will
-  be added here once they are measured.
-- **Prompt trimming on that first request uses an estimate** and not the model's
-  tokenizer, because the model is not loaded yet when the evidence is trimmed.
+- **Memory returns to the system after the idle period.** On an M1 Pro with
+  Qwen2.5-1.5B Q4, a mock embedder and a debug build, the daemon held 64 MB at
+  start and 1,195 MB after one ask. After the idle limit it held 64 MB again,
+  and the reload on the next ask took about 0.3 s.
+- **A bad or missing model file is found later.** Start used to fail on it. With
+  `warmup = false` it is found on the first ask, and start only logs one warning
+  when the model file is missing from the cache. With `warmup = true` a model
+  that fails to load still stops the daemon at start.
 - **A cold tuning run loads the model at start.** With no cached concurrency
   result, the one time benchmark generates, so it loads the model once.

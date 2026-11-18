@@ -54,7 +54,8 @@ use config::Config;
 use consolidation_job::{ConsolidationJob, JobSetup};
 use liam_daemon::consolidation::maintenance::standard_steps;
 use liam_daemon::models::{
-    build_embedder, build_serving_llm, resolve_config_path, resolve_log_dir, ServingLlm,
+    build_embedder, build_serving_llm, prepare_llm_at_start, resolve_config_path, resolve_log_dir,
+    ServingLlm,
 };
 use liam_daemon::{embedder_fingerprint, storelock, telemetry};
 use liam_model::{Embedder, Llm};
@@ -186,15 +187,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     let store = Arc::new(store);
 
     let ServingLlm { llm, lazy } = build_serving_llm(&config)?;
-    if config.llm.warmup {
-        let started = std::time::Instant::now();
-        match llm.warmup().await {
-            Ok(()) => tracing::info!(elapsed = ?started.elapsed(), "llm warmed up"),
-            // A failed warmup is not fatal: the first real call will simply pay
-            // the cost, or fail with a better message than this one would.
-            Err(e) => tracing::warn!(error = %e, "llm warmup failed"),
-        }
-    }
+    prepare_llm_at_start(&config, llm.as_ref()).await?;
 
     let idle_unloader = lazy
         .and_then(|lazy| lazy.spawn_idle_unloader(config.llm.idle_unload_secs, shutdown.token()));

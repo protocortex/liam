@@ -125,8 +125,7 @@ impl LazyLlm {
                     last_used,
                     in_flight: 0,
                     ..
-                } if self.state.clock.now().saturating_duration_since(*last_used) >= limit =>
-                {
+                } if self.state.clock.now().saturating_duration_since(*last_used) >= limit => {
                     std::mem::replace(&mut *slot, Slot::NotLoaded)
                 }
                 _ => return false,
@@ -537,17 +536,17 @@ mod tests {
         }
     }
 
+    struct BlockingLazy {
+        lazy: Arc<LazyLlm>,
+        clock: Arc<FakeClock>,
+        dropped: Arc<AtomicBool>,
+        release: mpsc::Sender<()>,
+        started: mpsc::Receiver<()>,
+    }
+
     /// A lazy wrapper whose model blocks (or hangs) inside a call and reports
     /// when the call has started.
-    fn blocking_lazy(
-        hang: bool,
-    ) -> (
-        Arc<LazyLlm>,
-        Arc<FakeClock>,
-        Arc<AtomicBool>,
-        mpsc::Sender<()>,
-        mpsc::Receiver<()>,
-    ) {
+    fn blocking_lazy(hang: bool) -> BlockingLazy {
         let (release, gate) = mpsc::channel();
         let (started_tx, started) = mpsc::channel();
         let dropped = Arc::new(AtomicBool::new(false));
@@ -571,13 +570,25 @@ mod tests {
             })
         };
         let lazy = Arc::new(LazyLlm::with_clock(loader, "test", clock.clone()));
-        (lazy, clock, dropped, release, started)
+        BlockingLazy {
+            lazy,
+            clock,
+            dropped,
+            release,
+            started,
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_call_in_flight_blocks_the_unload_until_it_ends() {
         // Arrange: a model whose call blocks until released.
-        let (lazy, clock, dropped, release, started) = blocking_lazy(false);
+        let BlockingLazy {
+            lazy,
+            clock,
+            dropped,
+            release,
+            started,
+        } = blocking_lazy(false);
         let caller = {
             let lazy = Arc::clone(&lazy);
             tokio::spawn(async move { lazy.complete("s", "p").await })
@@ -598,7 +609,10 @@ mod tests {
         // Assert
         assert!(!unloaded_during_call, "a call is still using the model");
         assert_eq!(reply.unwrap(), REPLY);
-        assert!(!unloaded_at_once, "the idle period restarts when the call ends");
+        assert!(
+            !unloaded_at_once,
+            "the idle period restarts when the call ends"
+        );
         assert!(unloaded_after_limit);
         assert!(dropped.load(Ordering::SeqCst));
     }
@@ -606,7 +620,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dropped_call_leaves_no_call_in_flight_and_the_model_unloads() {
         // Arrange: a call that never finishes, then cancelled mid-flight.
-        let (lazy, clock, dropped, _release, started) = blocking_lazy(true);
+        let BlockingLazy {
+            lazy,
+            clock,
+            dropped,
+            started,
+            ..
+        } = blocking_lazy(true);
         let caller = {
             let lazy = Arc::clone(&lazy);
             tokio::spawn(async move { lazy.complete("s", "p").await })
