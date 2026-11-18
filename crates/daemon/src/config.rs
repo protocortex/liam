@@ -497,7 +497,13 @@ impl Config {
     /// `load` with the home directory passed in, so `~` expansion is testable
     /// without mutating the process environment.
     fn load_with_home(path: &Path, home: &str) -> anyhow::Result<Self> {
-        if !path.exists() {
+        let exists = path.try_exists().map_err(|error| {
+            anyhow::anyhow!(
+                "could not check whether the config file {} exists: {error}",
+                path.display()
+            )
+        })?;
+        if !exists {
             return Ok(Self {
                 missing_file: Some(path.to_path_buf()),
                 ..Self::default()
@@ -719,6 +725,22 @@ mod tests {
         assert!(warning.contains("mock models"), "{warning}");
         assert!(warning.contains("--config"), "{warning}");
         assert!(warning.contains("LIAM_CONFIG"), "{warning}");
+    }
+
+    #[test]
+    fn a_config_path_that_cannot_be_checked_is_an_error_not_a_missing_file() {
+        // Arrange: a path below a regular file, which the OS refuses to look up
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain");
+        std::fs::write(&file, "").unwrap();
+        let path = file.join("liam.toml");
+
+        // Act
+        let result = Config::load_with_home(&path, "/home/alice");
+
+        // Assert
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("could not check"), "{message}");
     }
 
     #[test]

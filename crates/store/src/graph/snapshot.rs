@@ -15,7 +15,7 @@ use std::future::Future;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use liam_log::private_fs::{create_private_dir_all, private_file_options};
+use liam_log::private_fs::{create_private_dir_all, narrow_to_owner, private_file_options};
 use liam_log::wal::{sync_dir_for, write_atomically, FileOps};
 use liam_log::LogOffset;
 use serde::{Deserialize, Serialize};
@@ -220,6 +220,8 @@ impl<B: Backend> Graph<B> {
                     target.display()
                 ))
             })?;
+        // SQLite creates the copy with the process mask's mode.
+        narrow_to_owner(target).map_err(snapshot_io("restrict the copy to its owner", target))?;
         Ok(log)
     }
 

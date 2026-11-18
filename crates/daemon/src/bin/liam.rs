@@ -169,6 +169,9 @@ struct RebuildArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Before any thread starts: the mask is process-wide, and it keeps what
+    // `rebuild` and `fetch-models` create owner-only from the first byte.
+    liam_log::private_fs::restrict_umask();
     let cli = Cli::parse();
     let config_path = resolve_config_source(
         cli.config.as_deref(),

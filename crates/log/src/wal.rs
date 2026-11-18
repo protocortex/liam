@@ -828,6 +828,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         use super::*;
+        use crate::private_fs::with_umask;
 
         fn mode_of(path: &Path) -> u32 {
             fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -839,11 +840,13 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("liam.log");
             let clock = FakeClock::default();
-            let mut writer = open(&dir, 1, &clock);
 
-            // Act
-            writer.append(&event(0)).unwrap();
-            writer.append(&event(1)).unwrap();
+            // Act: a mask that hides nothing, so only the explicit modes can narrow
+            with_umask(0, || {
+                let mut writer = open(&dir, 1, &clock);
+                writer.append(&event(0)).unwrap();
+                writer.append(&event(1)).unwrap();
+            });
 
             // Assert
             let segments = segment_files(&dir);

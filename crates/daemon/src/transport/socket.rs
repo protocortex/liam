@@ -46,13 +46,15 @@ const SOCKET_MODE: u32 = 0o600;
 /// to `max_concurrent_generations`.
 const MIN_MAX_CONNECTIONS: usize = 1;
 
-/// Ensures a parent directory exists (owner-only when this creates it, which
-/// is what keeps the socket unreachable by others between `bind` and the
-/// `chmod`), decides what to do about whatever is
+/// Ensures a parent directory exists, decides what to do about whatever is
 /// already at `path` (see [`prepare_existing_path`] for the order that
 /// matters), binds a fresh listener there, and locks its permissions down
 /// to owner-only. Always returns [`ListenerSource::Bound`]: this process
 /// bound the socket itself, so it is the one that owns the file.
+///
+/// A parent this call creates is owner-only, so nobody else can reach the
+/// socket between the bind and the `chmod`. A parent that already exists keeps
+/// its mode, so the window stays open when that mode is wider.
 ///
 /// Reached through [`crate::transport::activation::resolve`], which only
 /// calls this when no supervisor handed a socket over.
@@ -535,15 +537,20 @@ mod tests {
         assert!(path.is_dir(), "the directory must survive the failed bind");
     }
 
-    #[tokio::test]
-    async fn a_parent_directory_created_for_the_socket_is_owner_only() {
+    #[test]
+    fn a_parent_directory_created_for_the_socket_is_owner_only() {
         // Given a socket path whose parent does not exist yet
         let root = TestPath::new();
         let parent = root.join("state");
         let path = parent.join("liamd.sock");
 
-        // When the socket is bound
-        let source = bind(&path).await.expect("bind");
+        // When the socket is bound under a mask that hides nothing
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let source =
+            liam_log::private_fs::with_umask(0, || runtime.block_on(bind(&path)).expect("bind"));
 
         // Then the new parent is 0700, so the socket was never reachable by
         // others, even before its own chmod

@@ -123,8 +123,10 @@ mod tests {
         let state = root.path().join("state");
         let database_path = state.join("liam.db");
 
-        // Act
-        let _lock = StoreLock::acquire(&database_path).expect("acquire");
+        // Act: a mask that hides nothing, so only the explicit modes can narrow
+        let _lock = liam_log::private_fs::with_umask(0, || {
+            StoreLock::acquire(&database_path).expect("acquire")
+        });
 
         // Assert
         let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;

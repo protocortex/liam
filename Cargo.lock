@@ -2468,6 +2468,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hmac",
+ "libc",
  "object_store",
  "parquet",
  "postcard",

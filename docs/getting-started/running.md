@@ -56,12 +56,23 @@ already listening, and replaces the socket only when it is stale.
 
 The state lives under `~/.liam`: the database, the event log, the socket and the
 model cache. Memory is stored in plain text unless `[encryption]` is on, so
-`liamd` creates its state directories as owner-only (0700) and the files it
-creates as owner-only (0600), whatever the umask says. At start it tightens an
-existing `~/.liam` that is wider, and the database files too. If you point a path
-at a directory of your own, `liamd` never changes that directory's mode: it logs a
-warning when the directory is readable by others, and you can fix it with `chmod 700`.
-The model cache holds public files and keeps the default mode.
+`liamd` and the `liam` command set the process umask to 077 as their first step,
+and create their directories as owner-only (0700) and their files as owner-only
+(0600) whatever the umask was. That includes the database, which the store
+creates itself, so it is never wider than its owner, not even while it opens.
+The model cache holds public files and only this user reads it, so it is
+owner-only too.
+
+At start `liamd` also tightens what an older start left wider, for these
+directories only: the database directory, the event log directory, the snapshot
+directory (`consolidation.snapshot_dir`, by default beside the database) and the
+parent directory of the socket. It narrows a directory only when it lies inside
+`~/.liam`, after resolving `.` and `..`, and no part of its path from `~/.liam`
+down is a symbolic link. The database file and its `-wal` and `-shm` files are
+tightened as well, unless they are symbolic links. For any other directory, such
+as a path you pointed at outside `~/.liam`, `liamd` never changes the mode: it logs
+one warning when the directory is readable by others, and you can fix it with
+`chmod 700`.
 
 If `liam.toml` is not found, `liamd` runs with mock models and logs one warning
 that names the path it looked for. Pass `--config <path>` or set `LIAM_CONFIG`.
