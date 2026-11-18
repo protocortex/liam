@@ -177,6 +177,13 @@ mod tests {
     }
 
     #[test]
+    fn each_trigger_is_named_by_its_signal() {
+        // Act / Assert
+        assert_eq!(Trigger::Term.as_str(), "SIGTERM");
+        assert_eq!(Trigger::Int.as_str(), "SIGINT");
+    }
+
+    #[test]
     fn the_drain_deadline_stays_under_the_supervisor_grace_period() {
         // Given the shipped launchd job's ExitTimeOut
         const PLIST: &str = include_str!("../../../../packaging/dev.protocortex.liamd.plist");
