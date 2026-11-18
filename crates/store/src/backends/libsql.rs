@@ -6,6 +6,11 @@
 //! VERSION CHECK: the libSQL parameter-binding call (`params_from_iter`) and the
 //! row accessors (`column_count`, `get_value`) are the surface to confirm against
 //! the version you pin.
+//!
+//! Only the single-call writes that are atomic by themselves (`execute_atomic`,
+//! `wal_checkpoint`) run on blocking threads. A transaction and a plain
+//! `execute` stay inline so there is no cancellation point between a log
+//! append and its commit.
 
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
 use std::time::Duration;
@@ -13,7 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use libsql::{Builder, Connection, Database};
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use crate::backend::{Backend, BackendTx, CheckpointMode, CheckpointResult};
 use crate::error::{Error, Result};
@@ -489,13 +494,10 @@ impl Backend for LibsqlBackend {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
-        let (sql, params) = (sql.to_owned(), bind(params));
-        self.write_blocking(move |runtime, conn| {
-            runtime
-                .block_on(conn.execute(&sql, libsql::params_from_iter(params)))
-                .map_err(err)
-        })
-        .await
+        let conn = self.write.lock().await;
+        conn.execute(sql, libsql::params_from_iter(bind(params)))
+            .await
+            .map_err(err)
     }
 
     async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
@@ -503,14 +505,8 @@ impl Backend for LibsqlBackend {
     }
 
     async fn execute_batch(&self, sql: &str) -> Result<()> {
-        let sql = sql.to_owned();
-        self.write_blocking(move |runtime, conn| {
-            runtime
-                .block_on(conn.execute_batch(&sql))
-                .map(|_| ())
-                .map_err(err)
-        })
-        .await
+        let conn = self.write.lock().await;
+        conn.execute_batch(sql).await.map(|_| ()).map_err(err)
     }
 
     async fn wal_checkpoint(
@@ -545,21 +541,17 @@ impl Backend for LibsqlBackend {
     }
 
     async fn set_secure_delete(&self, on: bool) -> Result<bool> {
-        self.write_blocking(move |runtime, conn| {
-            runtime.block_on(async {
-                let set = if on { "ON" } else { "OFF" };
-                conn.query(&format!("PRAGMA secure_delete = {set}"), ())
-                    .await
-                    .map_err(err)?;
-                let rows = conn.query("PRAGMA secure_delete", ()).await.map_err(err)?;
-                let rows = read_rows(rows, &ReadHooks::none()).await?;
-                let value = rows
-                    .first()
-                    .ok_or_else(|| Error::Backend("secure_delete returned no row".to_owned()))?;
-                Ok(value.get_i64(0)? != 0)
-            })
-        })
-        .await
+        let conn = self.write.lock().await;
+        let set = if on { "ON" } else { "OFF" };
+        conn.query(&format!("PRAGMA secure_delete = {set}"), ())
+            .await
+            .map_err(err)?;
+        let rows = conn.query("PRAGMA secure_delete", ()).await.map_err(err)?;
+        let rows = read_rows(rows, &ReadHooks::none()).await?;
+        let value = rows
+            .first()
+            .ok_or_else(|| Error::Backend("secure_delete returned no row".to_owned()))?;
+        Ok(value.get_i64(0)? != 0)
     }
 
     async fn execute_atomic(&self, statements: &[(String, Vec<Value>)]) -> Result<()> {
@@ -591,39 +583,33 @@ impl Backend for LibsqlBackend {
     }
 
     async fn vector_upsert(&self, node_id: &str, embedding: &[f32]) -> Result<()> {
-        let params = vec![
-            libsql::Value::Text(node_id.to_string()),
-            libsql::Value::Blob(le_bytes(embedding)),
-        ];
-        self.write_blocking(move |runtime, conn| {
-            runtime
-                .block_on(conn.execute(
-                    "INSERT INTO node_vectors (node_id, embedding) VALUES (?1, ?2)
+        let conn = self.write.lock().await;
+        conn.execute(
+            "INSERT INTO node_vectors (node_id, embedding) VALUES (?1, ?2)
                  ON CONFLICT(node_id) DO UPDATE SET embedding = excluded.embedding",
-                    libsql::params_from_iter(params),
-                ))
-                .map(|_| ())
-                .map_err(err)
-        })
+            libsql::params_from_iter(vec![
+                libsql::Value::Text(node_id.to_string()),
+                libsql::Value::Blob(le_bytes(embedding)),
+            ]),
+        )
         .await
+        .map_err(err)?;
+        Ok(())
     }
 
     async fn vector_insert_if_absent(&self, node_id: &str, embedding: &[f32]) -> Result<bool> {
-        let params = vec![
-            libsql::Value::Text(node_id.to_string()),
-            libsql::Value::Blob(le_bytes(embedding)),
-        ];
-        let inserted = self
-            .write_blocking(move |runtime, conn| {
-                runtime
-                    .block_on(conn.execute(
-                        "INSERT INTO node_vectors (node_id, embedding) VALUES (?1, ?2)
+        let conn = self.write.lock().await;
+        let inserted = conn
+            .execute(
+                "INSERT INTO node_vectors (node_id, embedding) VALUES (?1, ?2)
                  ON CONFLICT(node_id) DO NOTHING",
-                        libsql::params_from_iter(params),
-                    ))
-                    .map_err(err)
-            })
-            .await?;
+                libsql::params_from_iter(vec![
+                    libsql::Value::Text(node_id.to_string()),
+                    libsql::Value::Blob(le_bytes(embedding)),
+                ]),
+            )
+            .await
+            .map_err(err)?;
         Ok(inserted > 0)
     }
 
@@ -640,14 +626,14 @@ impl Backend for LibsqlBackend {
     }
 
     async fn vector_delete(&self, node_id: &str) -> Result<()> {
-        let params = vec![libsql::Value::Text(node_id.to_string())];
-        self.write_blocking(move |runtime, conn| {
-            runtime
-                .block_on(conn.execute(VECTOR_DELETE_SQL, libsql::params_from_iter(params)))
-                .map(|_| ())
-                .map_err(err)
-        })
+        let conn = self.write.lock().await;
+        conn.execute(
+            VECTOR_DELETE_SQL,
+            libsql::params_from_iter(vec![libsql::Value::Text(node_id.to_string())]),
+        )
         .await
+        .map_err(err)?;
+        Ok(())
     }
 
     async fn vector_get(&self, node_id: &str, dims: usize) -> Result<Option<Vec<f32>>> {
@@ -728,134 +714,70 @@ impl Backend for LibsqlBackend {
     }
 
     async fn vector_sweep_orphans(&self) -> Result<u64> {
-        self.write_blocking(|runtime, conn| {
-            runtime
-                .block_on(conn.execute(
-                    "DELETE FROM node_vectors WHERE node_id NOT IN (SELECT id FROM nodes)",
-                    libsql::params_from_iter(Vec::<libsql::Value>::new()),
-                ))
-                .map_err(err)
-        })
+        let conn = self.write.lock().await;
+        conn.execute(
+            "DELETE FROM node_vectors WHERE node_id NOT IN (SELECT id FROM nodes)",
+            libsql::params_from_iter(Vec::<libsql::Value>::new()),
+        )
         .await
+        .map_err(err)
     }
 
     async fn begin(&self) -> Result<Box<dyn BackendTx + '_>> {
-        let guard = Arc::clone(&self.write).lock_owned().await;
-        let runtime = Handle::current();
-        let open = tokio::task::spawn_blocking(move || {
-            let transaction = runtime.block_on(guard.transaction()).map_err(err)?;
-            Ok::<_, Error>(OpenTx { transaction, guard })
-        })
-        .await
-        .map_err(write_task_failed)??;
-        Ok(Box::new(LibsqlTx { open: Some(open) }))
+        let guard = self.write.lock().await;
+        let transaction = guard.transaction().await.map_err(err)?;
+        Ok(Box::new(LibsqlTx { transaction, guard }))
     }
 }
 
-/// An open transaction on `LibsqlBackend`'s write connection, with the write
-/// lock it holds.
+/// An open transaction on `LibsqlBackend`'s write connection.
 ///
 /// Field order matters for Drop safety and MUST stay `transaction` before
 /// `guard`: Rust drops struct fields in declaration order. An implicit drop
 /// (an early `?` return from a caller, or a bug that never calls
 /// `commit`/`rollback`) must run the transaction's own rollback-on-drop
 /// BEFORE the write lock releases, so no other writer can touch the
-/// connection while that rollback is still in flight.
-struct OpenTx {
+/// connection while that rollback is still in flight. Declaring `guard`
+/// first would let the lock release while the transaction is still rolling
+/// back underneath it.
+struct LibsqlTx<'a> {
     transaction: libsql::Transaction,
-    // Never read directly: held so the write lock stays taken for this
-    // transaction's whole lifetime.
+    // Never read directly: held purely so the write lock stays taken for
+    // this transaction's whole lifetime and releases, via `Drop`, exactly
+    // when `transaction` (declared above, so it drops first) is gone.
     #[allow(dead_code)]
-    guard: OwnedMutexGuard<Connection>,
-}
-
-/// A transaction whose statements each run on a blocking thread. The
-/// transaction and its lock travel into that thread together and come back
-/// with the result, so no other task can use the connection while a statement
-/// runs, even if the caller is dropped mid-statement: the thread then finishes
-/// the statement and drops both, which rolls the transaction back before the
-/// lock is released.
-struct LibsqlTx {
-    /// `None` only while a statement is running, or after a panic lost it.
-    open: Option<OpenTx>,
-}
-
-impl LibsqlTx {
-    async fn step<T: Send + 'static>(
-        &mut self,
-        work: impl FnOnce(&Handle, &libsql::Transaction) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let open = self.take_open()?;
-        let runtime = Handle::current();
-        let (open, result) = tokio::task::spawn_blocking(move || {
-            let result = work(&runtime, &open.transaction);
-            (open, result)
-        })
-        .await
-        .map_err(write_task_failed)?;
-        self.open = Some(open);
-        result
-    }
-
-    fn take_open(&mut self) -> Result<OpenTx> {
-        self.open.take().ok_or_else(|| {
-            Error::Backend("the transaction was lost by a failed statement".to_owned())
-        })
-    }
-
-    /// Ends the transaction on a blocking thread, then releases the lock.
-    async fn finish(
-        mut self: Box<Self>,
-        end: impl FnOnce(&Handle, libsql::Transaction) -> Result<()> + Send + 'static,
-    ) -> Result<()> {
-        let OpenTx { transaction, guard } = self.take_open()?;
-        let runtime = Handle::current();
-        tokio::task::spawn_blocking(move || {
-            let result = end(&runtime, transaction);
-            drop(guard);
-            result
-        })
-        .await
-        .map_err(write_task_failed)?
-    }
+    guard: MutexGuard<'a, Connection>,
 }
 
 #[async_trait]
-impl BackendTx for LibsqlTx {
+impl<'a> BackendTx for LibsqlTx<'a> {
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         // `Transaction` derefs to `Connection`, so this is the same call
-        // `LibsqlBackend::execute` makes, against the transaction's connection.
-        let (sql, params) = (sql.to_owned(), bind(params));
-        self.step(move |runtime, transaction| {
-            runtime
-                .block_on(transaction.execute(&sql, libsql::params_from_iter(params)))
-                .map_err(err)
-        })
-        .await
+        // `LibsqlBackend::execute` makes, just against the transaction's
+        // connection instead of the shared write connection directly.
+        self.transaction
+            .execute(sql, libsql::params_from_iter(bind(params)))
+            .await
+            .map_err(err)
     }
 
     async fn query(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-        let (sql, params) = (sql.to_owned(), bind(params));
-        self.step(move |runtime, transaction| {
-            runtime.block_on(async {
-                let rows = transaction
-                    .query(&sql, libsql::params_from_iter(params))
-                    .await
-                    .map_err(err)?;
-                read_rows(rows, &ReadHooks::none()).await
-            })
-        })
-        .await
+        let rows = self
+            .transaction
+            .query(sql, libsql::params_from_iter(bind(params)))
+            .await
+            .map_err(err)?;
+        read_rows(rows, &ReadHooks::none()).await
     }
 
     async fn commit(self: Box<Self>) -> Result<()> {
-        self.finish(|runtime, transaction| runtime.block_on(transaction.commit()).map_err(err))
-            .await
+        // `self` (and with it `self.guard`) drops when this returns,
+        // releasing the write lock exactly once, on completion.
+        self.transaction.commit().await.map_err(err)
     }
 
     async fn rollback(self: Box<Self>) -> Result<()> {
-        self.finish(|runtime, transaction| runtime.block_on(transaction.rollback()).map_err(err))
-            .await
+        self.transaction.rollback().await.map_err(err)
     }
 }
 
@@ -1112,7 +1034,7 @@ mod tests {
         (dir, backend)
     }
 
-    // The tests below hold SQLite's write lock from a second connection, so a
+    // The first test holds SQLite's write lock from a second connection, so a
     // write on the backend has to wait for it. The releasing task runs on the
     // same single-threaded runtime: a write that blocked that thread (as an
     // inline call does) would never let it run and would fail with a busy
@@ -1121,7 +1043,6 @@ mod tests {
 
     /// The wait, in ms, that an inline write would burn before failing.
     const SHORT_BUSY_WAIT_MS: u32 = 300;
-    const OTHER_WRITE_SQL: &str = "INSERT INTO gate (x) VALUES (2)";
 
     /// A file store with a `gate` table, plus a second connection that holds
     /// the write lock until `release` runs.
@@ -1151,77 +1072,56 @@ mod tests {
         other.execute("COMMIT", ()).await.expect("release the lock");
     }
 
-    async fn gate_rows(backend: &LibsqlBackend) -> i64 {
+    #[tokio::test]
+    async fn an_atomic_write_waiting_on_the_database_lock_does_not_block_the_runtime_thread() {
+        // Arrange
+        let (_dir, backend, other) = store_with_write_lock_held_elsewhere().await;
+        let statements = vec![("INSERT INTO gate (x) VALUES (1)".to_owned(), Vec::new())];
+
+        // Act
+        let (written, ()) = tokio::join!(backend.execute_atomic(&statements), release(&other));
+
+        // Assert
+        written.expect("the write got the lock once it was freed");
         let rows = backend
             .query("SELECT COUNT(*) FROM gate", &[])
             .await
             .unwrap();
-        rows[0].get_i64(0).unwrap()
+        assert_eq!(rows[0].get_i64(0).unwrap(), 1);
     }
 
-    #[tokio::test]
-    async fn a_write_waiting_on_the_database_lock_does_not_block_the_runtime_thread() {
-        // Arrange
-        let (_dir, backend, other) = store_with_write_lock_held_elsewhere().await;
-
-        // Act
-        let (written, ()) = tokio::join!(
-            backend.execute("INSERT INTO gate (x) VALUES (1)", &[]),
-            release(&other)
-        );
-
-        // Assert
-        assert_eq!(
-            written.expect("the write got the lock once it was freed"),
-            1
-        );
-        assert_eq!(gate_rows(&backend).await, 1);
-    }
-
-    #[tokio::test]
-    async fn a_transaction_statement_waiting_on_the_database_lock_does_not_block_the_runtime_thread(
-    ) {
-        // Arrange
-        let (_dir, backend, other) = store_with_write_lock_held_elsewhere().await;
-        let mut tx = backend.begin().await.unwrap();
-
-        // Act
-        let (written, ()) = tokio::join!(
-            tx.execute("INSERT INTO gate (x) VALUES (1)", &[]),
-            release(&other)
-        );
-        written.expect("the statement got the lock once it was freed");
-        tx.commit().await.unwrap();
-
-        // Assert
-        assert_eq!(gate_rows(&backend).await, 1);
-    }
-
-    #[tokio::test]
-    async fn dropping_a_transaction_statement_mid_flight_rolls_back_and_frees_the_write_lock() {
-        // Arrange
-        let (_dir, backend, other) = store_with_write_lock_held_elsewhere().await;
-        let mut tx = backend.begin().await.unwrap();
-
-        // Act: the statement starts, waits for the other connection's lock, and
-        // its caller is dropped.
-        let mut statement = Box::pin(tx.execute(OTHER_WRITE_SQL, &[]));
-        tokio::select! {
-            biased;
-            _ = &mut statement => panic!("the statement finished while the lock was held"),
-            () = std::future::ready(()) => {}
+    /// Polls `future` once with a waker that does nothing. `Some` means it
+    /// finished without ever yielding to the runtime.
+    fn ready_on_first_poll<T>(future: impl std::future::Future<Output = T>) -> Option<T> {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(future).poll(&mut context) {
+            std::task::Poll::Ready(value) => Some(value),
+            std::task::Poll::Pending => None,
         }
-        drop(statement);
-        drop(tx);
-        release(&other).await;
-        let later = backend
-            .execute("INSERT INTO gate (x) VALUES (3)", &[])
-            .await;
+    }
 
-        // Assert: the abandoned statement's transaction was rolled back before
-        // the lock was handed on, so only the later write is there.
-        later.expect("the lock was freed");
-        assert_eq!(gate_rows(&backend).await, 1);
+    #[tokio::test]
+    async fn a_transaction_never_yields_between_begin_and_commit() {
+        // Arrange: a caller dropped at a suspension point between a log append
+        // and the commit would leave the log ahead of the graph, so every step
+        // of a transaction must finish in the poll that starts it.
+        let (_dir, backend) = file_backend_at("tx.db", ARBITRARY_POOL_SIZE).await;
+        backend
+            .execute_batch("CREATE TABLE gate (x INTEGER)")
+            .await
+            .unwrap();
+
+        // Act
+        let tx = ready_on_first_poll(backend.begin());
+        let mut tx = tx.expect("begin yielded").unwrap();
+        let wrote = ready_on_first_poll(tx.execute("INSERT INTO gate (x) VALUES (1)", &[]));
+        let read = ready_on_first_poll(tx.query("SELECT COUNT(*) FROM gate", &[]));
+        let committed = ready_on_first_poll(tx.commit());
+
+        // Assert
+        assert_eq!(wrote.expect("execute yielded").unwrap(), 1);
+        assert_eq!(read.expect("query yielded").unwrap().len(), 1);
+        committed.expect("commit yielded").unwrap();
     }
 
     /// The read-during-write test must prove OVERLAP, not merely that the

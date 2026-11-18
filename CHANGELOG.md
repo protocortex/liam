@@ -83,9 +83,10 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Fixed
 
-- Database writes, transactions and checkpoints, segment compaction and the stale sidecar sweep now run on blocking
-  threads instead of the async runtime's workers, so a write waiting on a lock no longer stalls other requests or
-  their deadline timers.
+- Atomic multi-statement database writes, checkpoints, segment compaction and the stale sidecar sweep now run on
+  blocking threads instead of the async runtime's workers, so a wait on a lock no longer stalls other requests or
+  their deadline timers. Transactions and single statements stay on the runtime thread, so a cancelled request cannot
+  leave the event log ahead of the graph.
 - The daemon now refuses a `gc.episode_retention_days outside 1 to 36500 and a `gc.interval_hours` outside 1 to 8760
   at config load. Before, `0` days deleted every episode at the next sweep and `0` hours stopped maintenance. A
   maintenance task that ends abnormally is now logged at error level at shutdown.
