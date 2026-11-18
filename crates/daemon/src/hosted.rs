@@ -233,6 +233,9 @@ impl FreeRam for NoRamLimit {
 }
 
 #[cfg(test)]
+mod other_providers_tests;
+
+#[cfg(test)]
 pub(crate) mod test_support;
 
 #[cfg(test)]

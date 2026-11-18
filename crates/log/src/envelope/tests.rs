@@ -12,6 +12,8 @@ use crate::reader::SequentialScanReader;
 use crate::wal::{WalConfig, WalWriter};
 use crate::LogWriter;
 
+mod hint_tests;
+
 const SCOPE: &str = "work";
 
 fn registry(dir: &std::path::Path) -> Arc<KeyRegistry> {

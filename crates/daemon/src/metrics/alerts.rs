@@ -217,4 +217,7 @@ pub fn evaluate_run(
 }
 
 #[cfg(test)]
+mod state_file_tests;
+
+#[cfg(test)]
 mod tests;

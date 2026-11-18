@@ -295,6 +295,9 @@ impl JsonExtractor for SidecarClient {
 }
 
 #[cfg(test)]
+mod error_text_tests;
+
+#[cfg(test)]
 pub use mock::MockExtractor;
 
 #[cfg(test)]

@@ -364,4 +364,7 @@ fn date_millis(text: &str) -> Option<Millis> {
 }
 
 #[cfg(test)]
+mod error_text_tests;
+
+#[cfg(test)]
 mod tests;

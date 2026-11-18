@@ -550,3 +550,17 @@ async fn remember_without_episode_is_unchanged() {
         .unwrap();
     assert_eq!(hits.len(), 1);
 }
+
+#[tokio::test]
+async fn a_second_producer_stamp_is_refused_and_the_first_stays() {
+    // Arrange
+    let server = plain_server().await;
+    assert_eq!(server.producer(), DEFAULT_PRODUCER);
+    server.set_producer("agent-a");
+
+    // Act
+    server.set_producer("agent-b");
+
+    // Assert
+    assert_eq!(server.producer(), "agent-a");
+}

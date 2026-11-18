@@ -137,6 +137,9 @@ async fn time_queries(store: &DefaultGraph, dims: usize) -> LatencyMs {
     }
 }
 
+#[cfg(test)]
+mod helper_tests;
+
 #[tokio::test]
 #[ignore = "inserts up to 100k vectors; see the module doc for the run command"]
 async fn scale_probe() {

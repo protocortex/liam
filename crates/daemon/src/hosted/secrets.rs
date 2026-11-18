@@ -136,6 +136,9 @@ fn read_keychain(keychain: &dyn KeychainItems, service: &str) -> Result<SecretSt
 }
 
 #[cfg(test)]
+mod display_tests;
+
+#[cfg(test)]
 mod tests {
     use liam_log::crypto::MemoryKeychain;
 

@@ -20,6 +20,8 @@ use liam_store::{
 };
 use tempfile::TempDir;
 
+mod resume_tests;
+
 use super::*;
 use crate::deletion::job::MILLIS_PER_DAY;
 use crate::deletion::send_ledger::{send_ledger_path_for, SendLedger, SendRow};

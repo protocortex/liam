@@ -432,6 +432,9 @@ fn macos_backend_error(backend: &str, device: DevicePreference) -> Option<String
 }
 
 #[cfg(test)]
+mod serving_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;

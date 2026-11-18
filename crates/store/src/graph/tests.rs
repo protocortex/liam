@@ -45,6 +45,7 @@ mod same_as_bridge;
 mod scrub;
 mod sealed;
 mod snapshot;
+mod snapshot_meta;
 mod soak;
 mod stats;
 mod summaries;

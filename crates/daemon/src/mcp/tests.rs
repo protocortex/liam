@@ -15,6 +15,7 @@ mod ask_tool;
 mod clusters_and_timeline;
 mod entity_pages_and_modes;
 mod entity_synthesis;
+mod error_replies;
 mod query_limits_and_embed_kinds;
 mod recall_filters_and_format;
 mod relate;

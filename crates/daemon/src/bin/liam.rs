@@ -975,6 +975,59 @@ mod tests {
         assert!(text.ends_with('\n'));
     }
 
+    const BENCH_MODEL: &str = "bench-model";
+    const BENCH_FACTS: usize = 12;
+
+    fn bench_report() -> BenchReport {
+        BenchReport {
+            model_id: BENCH_MODEL.to_string(),
+            backend: "cpu".to_string(),
+            device: "auto".to_string(),
+            dims: DIMS,
+            vector_bytes: DIMS * 4,
+            facts: BENCH_FACTS,
+            questions: 3,
+            load_ms: 1.5,
+            overall: None,
+            per_category: Default::default(),
+            query_latency: None,
+            batch_items: 4,
+            batch_ms: 2.0,
+            batch_items_per_sec: 2000.0,
+            peak_rss_mb: 10.0,
+            vectors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_text_bench_report_is_the_harness_rendering() {
+        // Arrange
+        let report = bench_report();
+
+        // Act
+        let text = render_bench_report(&report, false).expect("renders");
+
+        // Assert
+        assert_eq!(text, report.render());
+    }
+
+    #[test]
+    fn the_json_bench_report_is_the_serde_shape_and_leaves_out_the_vectors() {
+        // Arrange
+        let mut report = bench_report();
+        report.vectors = vec![vec![1.0; DIMS]];
+
+        // Act
+        let text = render_bench_report(&report, true).expect("renders");
+
+        // Assert
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["model_id"], BENCH_MODEL);
+        assert_eq!(value["facts"], BENCH_FACTS);
+        assert!(value.get("vectors").is_none());
+        assert!(text.ends_with('\n'));
+    }
+
     /// A bare `liam` must not do anything. `liamd` treats no subcommand as
     /// "serve stdio" for backwards compatibility with existing MCP client
     /// configs; the CLI has no such history and no safe default, so it shows

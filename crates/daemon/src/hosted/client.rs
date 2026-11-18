@@ -184,6 +184,9 @@ impl<T: HttpTransport> HostedClient<T> {
 }
 
 #[cfg(test)]
+mod error_text_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};

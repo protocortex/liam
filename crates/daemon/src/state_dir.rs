@@ -452,6 +452,12 @@ fn secure_state_files_with_home(
 }
 
 #[cfg(all(test, unix))]
+mod failure_tests;
+
+#[cfg(all(test, unix))]
+mod secure_dirs_tests;
+
+#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -982,7 +988,9 @@ mod tests {
     #[test]
     fn failing_files_in_one_directory_make_one_summary_with_a_count() {
         // Arrange: a mode with no owner read bit makes the open fail
-        if unsafe { libc::geteuid() } == 0 {
+        if liam_log::private_fs::skipped_as_root(
+            "failing_files_in_one_directory_make_one_summary_with_a_count",
+        ) {
             return;
         }
         let layout = Layout::new();

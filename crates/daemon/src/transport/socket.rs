@@ -345,6 +345,9 @@ async fn handle_connection(
 }
 
 #[cfg(test)]
+mod bind_failure_tests;
+
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

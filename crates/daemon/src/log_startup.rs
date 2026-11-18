@@ -409,6 +409,9 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+mod foreign_log_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;

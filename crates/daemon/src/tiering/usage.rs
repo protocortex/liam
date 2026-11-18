@@ -406,6 +406,9 @@ impl UsageFlush {
 }
 
 #[cfg(test)]
+mod shared_store_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 

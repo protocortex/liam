@@ -168,6 +168,9 @@ impl BatchStore {
 }
 
 #[cfg(test)]
+mod file_error_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 

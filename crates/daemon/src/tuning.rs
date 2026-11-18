@@ -519,6 +519,9 @@ pub(crate) fn save_cache(
 }
 
 #[cfg(test)]
+mod best_effort_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;

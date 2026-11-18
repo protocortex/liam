@@ -52,33 +52,61 @@ impl Trigger {
     }
 }
 
-/// Resolves when SIGTERM or SIGINT arrives, whichever lands first.
+/// SIGTERM and SIGINT handlers, installed. Once this exists a signal is held
+/// for [`SignalWatch::wait`] instead of ending the process, so it is made
+/// before the socket appears: a stop that arrives right after a client can
+/// connect must still run the orderly shutdown.
 ///
-/// Both map to the same [`Trigger`] handling on purpose: an operator
+/// Both signals map to the same [`Trigger`] handling on purpose: an operator
 /// pressing Ctrl-C and launchd stopping the job want the same thing, and
 /// having two shutdown paths is how one of them rots untested.
-///
-/// Installing the handlers can fail (the process is out of signal handler
-/// slots, or the platform refuses), and that is surfaced rather than
-/// swallowed: a daemon that silently cannot hear SIGTERM would be SIGKILLed
-/// on every stop and lose in-flight work every time.
-///
-/// Deliberately NOT exercised by raising a real signal in the test suite.
-/// Signal disposition is process-global and `cargo test` runs every test in
-/// one process, so a test that raised SIGTERM would race every other test
-/// in the binary. The orderly shutdown this triggers is tested directly
-/// instead, through `drain` and `unlink_owned_socket`, which is where the
-/// behaviour that can actually break lives.
-pub async fn signal() -> std::io::Result<Trigger> {
-    use tokio::signal::unix::{signal as unix_signal, SignalKind};
+pub struct SignalWatch {
+    term: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
 
-    let mut term = unix_signal(SignalKind::terminate())?;
-    let mut interrupt = unix_signal(SignalKind::interrupt())?;
+impl SignalWatch {
+    /// Installing the handlers can fail (the process is out of signal handler
+    /// slots, or the platform refuses), and that is surfaced rather than
+    /// swallowed: a daemon that silently cannot hear SIGTERM would be SIGKILLed
+    /// on every stop and lose in-flight work every time.
+    pub fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
 
-    tokio::select! {
-        _ = term.recv() => Ok(Trigger::Term),
-        _ = interrupt.recv() => Ok(Trigger::Int),
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
     }
+
+    /// Resolves when SIGTERM or SIGINT arrives, whichever lands first.
+    ///
+    /// Tested by a child process of the test binary that raises SIGTERM at
+    /// itself, because signal disposition is process-wide and would race the
+    /// other tests in a shared process. `tests/liamd_commands.rs` also stops a
+    /// real daemon with SIGTERM.
+    pub async fn wait(mut self) -> Trigger {
+        tokio::select! {
+            _ = self.term.recv() => Trigger::Term,
+            _ = self.interrupt.recv() => Trigger::Int,
+        }
+    }
+}
+
+/// Installs the signal handlers, and only then runs `resolve`, the step that
+/// makes the socket appear. The order is what lets a stop that lands as soon
+/// as a client can connect run the orderly shutdown instead of ending the
+/// process. The install result is returned as is, for the caller to report.
+pub async fn watch_signals_before<T, E, F, Fut>(
+    resolve: F,
+) -> Result<(std::io::Result<SignalWatch>, T), E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let signals = SignalWatch::install();
+    let resolved = resolve().await?;
+    Ok((signals, resolved))
 }
 
 /// Waits for every live session to finish, then aborts whatever is left
@@ -161,7 +189,9 @@ pub fn unlink_owned_socket(source: &ListenerSource) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     use tokio::net::UnixListener;
 
@@ -174,6 +204,109 @@ mod tests {
             "/tmp/liam-shutdown-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    const CHILD_MARKER: &str = "LIAM_SIGNAL_ORDER_CHILD";
+    const CHILD_TEST: &str = "transport::shutdown::tests::a_stop_during_listener_setup_is_held";
+    const HELD_LINE: &str = "held SIGTERM";
+    /// Longest the child may take to see the signal it sent itself.
+    const HELD_DEADLINE: Duration = Duration::from_secs(10);
+    /// How often the parent looks at the child again.
+    const EXIT_POLL: Duration = Duration::from_millis(20);
+    /// Longest the parent waits for the child process to end.
+    const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
+    /// A SIGTERM raised while the listener is still being set up must be held
+    /// for the shutdown. Run in a child of the test binary: with the handlers
+    /// installed after setup, the signal would end the process, and a signal
+    /// disposition is process-wide, so it cannot be tried inside the shared
+    /// test process.
+    #[tokio::test]
+    async fn a_stop_during_listener_setup_is_held() {
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+
+        let (signals, ()) = watch_signals_before(|| async {
+            // SAFETY: raising a signal at this process has no preconditions.
+            let raised = unsafe { libc::raise(libc::SIGTERM) };
+            assert_eq!(raised, 0);
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .expect("setup");
+        let trigger = tokio::time::timeout(HELD_DEADLINE, signals.expect("install").wait()).await;
+
+        println!("{HELD_LINE}: {trigger:?}");
+    }
+
+    /// Reads a pipe to its end on its own thread, so a full pipe never blocks
+    /// the child.
+    fn drain_pipe(
+        mut pipe: impl std::io::Read + Send + 'static,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    }
+
+    #[test]
+    fn a_stop_during_listener_setup_runs_the_ordered_shutdown_path() {
+        // Arrange
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_MARKER, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the child test");
+        let stdout_reader = drain_pipe(child.stdout.take().expect("piped stdout"));
+        let stderr_reader = drain_pipe(child.stderr.take().expect("piped stderr"));
+
+        // Act
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = stderr_reader.join().expect("stderr reader");
+                panic!(
+                    "the child test was still running after {CHILD_DEADLINE:?} and was killed:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            std::thread::park_timeout(EXIT_POLL);
+        };
+        let output = Output {
+            status,
+            stdout: stdout_reader.join().expect("stdout reader"),
+            stderr: stderr_reader.join().expect("stderr reader"),
+        };
+
+        // Assert
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{:?}\n{stdout}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("{HELD_LINE}: Ok(Term)")),
+            "{stdout}"
+        );
+    }
+
+    #[test]
+    fn each_trigger_is_named_by_its_signal() {
+        // Act / Assert
+        assert_eq!(Trigger::Term.as_str(), "SIGTERM");
+        assert_eq!(Trigger::Int.as_str(), "SIGINT");
     }
 
     #[test]
