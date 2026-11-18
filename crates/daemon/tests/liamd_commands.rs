@@ -3,23 +3,33 @@
 //! in a scratch directory, so the exit code and the text are the shipped ones.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{
-    Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio,
-};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 const FAILURE_EXIT: i32 = 1;
 const READY_LINE: &str = "socket listener started";
 const SHUTDOWN_LINE: &str = "shutting down";
 const SOCKET_NAME: &str = "s.sock";
+/// How long a spawned `liamd` may live before it is killed: every read and
+/// wait on it ends once it is gone, so none of them can hang the test run.
+const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a daemon may take to log that it listens.
+const READY_DEADLINE: Duration = Duration::from_secs(30);
+/// Prefix of the scratch directories, kept short for the socket path limit.
+const SCRATCH_PREFIX: &str = "liam-it-";
+/// Short base for the scratch directories: a socket path inside the system
+/// temp directory can pass the address length limit on macOS.
+const SCRATCH_BASE: &str = "/tmp";
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"liamd-test","version":"0"}}}"#;
 const INITIALIZED_NOTIFICATION: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
 const LIST_TOOLS: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
 
-/// A short directory under `/tmp`: a socket path inside the system temp
-/// directory can pass the address length limit on macOS.
-struct Scratch(PathBuf);
+/// A scratch directory with a config file, removed when dropped.
+struct Scratch(tempfile::TempDir);
 
 impl Scratch {
     fn new() -> Self {
@@ -28,16 +38,16 @@ impl Scratch {
 
     /// `extra` is appended to the config, for the tables it opens.
     fn with_config(extra: &str) -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!("/tmp/liam-it-{}-{unique}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(SCRATCH_PREFIX)
+            .tempdir_in(SCRATCH_BASE)
+            .expect("create the scratch directory");
         std::fs::write(
-            dir.join("liam.toml"),
+            dir.path().join("liam.toml"),
             format!(
                 "embedding_dims = 8\ndatabase_path = \"{0}/liam.db\"\n\
                  socket_path = \"{0}/{SOCKET_NAME}\"\nlog_filter = \"info\"\n{extra}",
-                dir.display()
+                dir.path().display()
             ),
         )
         .unwrap();
@@ -45,7 +55,7 @@ impl Scratch {
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        self.0.path()
     }
 
     fn liamd(&self, args: &[&str]) -> Command {
@@ -57,31 +67,152 @@ impl Scratch {
         command
             .args(["--config", config])
             .args(args)
-            .current_dir(&self.0)
-            .env("HOME", &self.0)
+            .current_dir(self.path())
+            .env("HOME", self.path())
             .env_remove("LIAM_CONFIG")
             .stdin(Stdio::null());
         command
     }
 
+    /// Runs `liamd` to its end, bounded by [`CHILD_DEADLINE`].
     fn run(&self, args: &[&str]) -> Output {
-        self.liamd(args).output().expect("run liamd")
+        self.run_command(self.liamd(args))
+    }
+
+    fn run_command(&self, mut command: Command) -> Output {
+        let mut child = Running::spawn(command.stdout(Stdio::piped()));
+        let mut stdout = child.child.stdout.take().expect("piped stdout");
+        let collected = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        });
+        let status = child.wait();
+        Output {
+            status,
+            stdout: collected.join().expect("stdout reader thread"),
+            stderr: child.log.text().into_bytes(),
+        }
     }
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+/// What a child's stderr said so far, and whether it has ended.
+#[derive(Default)]
+struct LogState {
+    text: String,
+    ended: bool,
+}
+
+/// The child's stderr, read on its own thread so a full pipe never blocks it
+/// and a test can wait for a line with a deadline.
+#[derive(Clone, Default)]
+struct Log(Arc<(Mutex<LogState>, Condvar)>);
+
+impl Log {
+    fn text(&self) -> String {
+        self.0 .0.lock().unwrap().text.clone()
+    }
+
+    /// Waits until the log holds `needle`; the error is the log so far.
+    fn wait_for(&self, needle: &str, deadline: Duration) -> Result<(), String> {
+        let (lock, changed) = &*self.0;
+        let (state, _) = changed
+            .wait_timeout_while(lock.lock().unwrap(), deadline, |state| {
+                !state.text.contains(needle) && !state.ended
+            })
+            .unwrap();
+        if state.text.contains(needle) {
+            Ok(())
+        } else {
+            Err(state.text.clone())
+        }
     }
 }
 
-/// Kills the daemon if a test fails before it was stopped.
-struct Running(Child);
+/// A spawned `liamd` that is killed and reaped on every exit path, and by a
+/// watchdog once [`CHILD_DEADLINE`] passes.
+struct Running {
+    child: Child,
+    log: Log,
+    reader: Option<JoinHandle<()>>,
+    watchdog: Option<(mpsc::Sender<()>, JoinHandle<bool>)>,
+}
+
+impl Running {
+    fn spawn(command: &mut Command) -> Self {
+        let mut child = command.stderr(Stdio::piped()).spawn().expect("start liamd");
+        let log = Log::default();
+        let stderr = child.stderr.take().expect("piped stderr");
+        let reader_log = log.clone();
+        let reader = std::thread::spawn(move || {
+            let (lock, changed) = &*reader_log.0;
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut state = lock.lock().unwrap();
+                state.text.push_str(&line);
+                state.text.push('\n');
+                changed.notify_all();
+            }
+            lock.lock().unwrap().ended = true;
+            changed.notify_all();
+        });
+        let pid = child.id() as libc::pid_t;
+        let (disarm, armed) = mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let expired = armed.recv_timeout(CHILD_DEADLINE) == Err(RecvTimeoutError::Timeout);
+            if expired {
+                // SAFETY: the child is reaped only after the watchdog is
+                // disarmed and joined, so the pid is still its own.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            expired
+        });
+        Self {
+            child,
+            log,
+            reader: Some(reader),
+            watchdog: Some((disarm, watchdog)),
+        }
+    }
+
+    /// Stops the watchdog and says whether it had to kill the child.
+    fn disarm(&mut self) -> bool {
+        self.watchdog
+            .take()
+            .map(|(disarm, watchdog)| {
+                drop(disarm);
+                watchdog.join().expect("watchdog thread")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Waits for the child to end. A child that outlived the deadline was
+    /// killed, and that fails the test with its log.
+    fn wait(&mut self) -> ExitStatus {
+        let status = self.child.wait().expect("wait for liamd");
+        if let Some(reader) = self.reader.take() {
+            reader.join().expect("log reader thread");
+        }
+        assert!(
+            !self.disarm(),
+            "liamd was still running after {CHILD_DEADLINE:?} and was killed:\n{}",
+            self.log.text()
+        );
+        status
+    }
+
+    fn pid(&self) -> libc::pid_t {
+        self.child.id() as libc::pid_t
+    }
+}
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        self.disarm();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -89,21 +220,29 @@ impl Drop for Running {
 struct Session {
     to_server: ChildStdin,
     replies: BufReader<ChildStdout>,
+    log: Log,
 }
 
 impl Session {
-    fn over(child: &mut Child) -> Self {
+    fn over(running: &mut Running) -> Self {
         Self {
-            to_server: child.stdin.take().expect("piped stdin"),
-            replies: BufReader::new(child.stdout.take().expect("piped stdout")),
+            to_server: running.child.stdin.take().expect("piped stdin"),
+            replies: BufReader::new(running.child.stdout.take().expect("piped stdout")),
+            log: running.log.clone(),
         }
     }
 
-    /// Sends a request and returns the one line that answers it.
+    /// Sends a request and returns the one line that answers it. The read
+    /// ends when the watchdog kills a child that never replies.
     fn request(&mut self, message: &str) -> String {
         self.notify(message);
         let mut reply = String::new();
         self.replies.read_line(&mut reply).expect("read a reply");
+        assert!(
+            !reply.is_empty(),
+            "no reply to {message}; the daemon log:\n{}",
+            self.log.text()
+        );
         reply
     }
 
@@ -193,56 +332,25 @@ fn a_stdio_session_closed_before_it_starts_is_an_error() {
 }
 
 /// A `liamd serve` that has logged that it listens.
-struct Daemon {
-    process: Running,
-    log: BufReader<ChildStderr>,
-    seen: String,
-}
+struct Daemon(Running);
 
 impl Daemon {
     fn start(scratch: &Scratch) -> Self {
-        let mut child = scratch
-            .liamd(&["serve"])
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start liamd");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let mut daemon = Self {
-            process: Running(child),
-            log: BufReader::new(stderr),
-            seen: String::new(),
-        };
-        loop {
-            let mut line = String::new();
-            let read = daemon
-                .log
-                .read_line(&mut line)
-                .expect("read the daemon log");
-            assert!(
-                read > 0,
-                "the daemon ended before it listened:\n{}",
-                daemon.seen
-            );
-            daemon.seen.push_str(&line);
-            if line.contains(READY_LINE) {
-                break;
-            }
+        let process = Running::spawn(&mut scratch.liamd(&["serve"]));
+        if let Err(seen) = process.log.wait_for(READY_LINE, READY_DEADLINE) {
+            panic!("the daemon did not listen within {READY_DEADLINE:?}:\n{seen}");
         }
         assert!(scratch.path().join(SOCKET_NAME).exists());
-        daemon
+        Self(process)
     }
 
-    /// Sends SIGTERM and returns the exit status with the rest of the log.
+    /// Sends SIGTERM and returns the exit status with the whole log.
     fn stop_with_sigterm(&mut self) -> (ExitStatus, String) {
         // SAFETY: the pid is that of the child this test started and still holds.
-        let sent = unsafe { libc::kill(self.process.0.id() as libc::pid_t, libc::SIGTERM) };
+        let sent = unsafe { libc::kill(self.0.pid(), libc::SIGTERM) };
         assert_eq!(sent, 0);
-        let mut rest = String::new();
-        self.log
-            .read_to_string(&mut rest)
-            .expect("read the rest of the log");
-        let status = self.process.0.wait().expect("wait for liamd");
-        (status, rest)
+        let status = self.0.wait();
+        (status, self.0.log.text())
     }
 }
 
@@ -256,7 +364,7 @@ fn serve_then_stop_with_sigterm(scratch: &Scratch) {
     let (status, rest) = daemon.stop_with_sigterm();
 
     // Assert
-    assert!(status.success(), "{status:?}\n{}{rest}", daemon.seen);
+    assert!(status.success(), "{status:?}\n{rest}");
     assert!(rest.contains(SHUTDOWN_LINE), "{rest}");
     assert!(
         !scratch.path().join(SOCKET_NAME).exists(),
@@ -284,16 +392,13 @@ fn a_client_behind_the_proxy_can_list_the_daemons_tools() {
     // Arrange
     let scratch = Scratch::new();
     let mut daemon = Daemon::start(&scratch);
-    let mut proxy = Running(
+    let mut proxy = Running::spawn(
         scratch
             .liamd(&["proxy"])
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start the proxy"),
+            .stdout(Stdio::piped()),
     );
-    let mut session = Session::over(&mut proxy.0);
+    let mut session = Session::over(&mut proxy);
 
     // Act
     let (initialized, tools) = session.open_and_list_tools();
@@ -303,7 +408,7 @@ fn a_client_behind_the_proxy_can_list_the_daemons_tools() {
     assert!(tools.contains("\"name\":\"remember\""), "{tools}");
     assert!(tools.contains("\"name\":\"recall\""), "{tools}");
     drop(session);
-    let proxy_status = proxy.0.wait().expect("wait for the proxy");
+    let proxy_status = proxy.wait();
     let (status, _) = daemon.stop_with_sigterm();
     assert!(proxy_status.success(), "{proxy_status:?}");
     assert!(status.success(), "{status:?}");
@@ -315,10 +420,7 @@ fn a_config_file_that_does_not_exist_is_said_to_mean_mock_models() {
     let scratch = Scratch::new();
 
     // Act
-    let output = scratch
-        .liamd_with_config("absent.toml", &[])
-        .output()
-        .expect("run liamd");
+    let output = scratch.run_command(scratch.liamd_with_config("absent.toml", &[]));
 
     // Assert
     let stderr = text(&output.stderr);
@@ -333,21 +435,18 @@ fn a_config_file_that_does_not_exist_is_said_to_mean_mock_models() {
 fn a_stdio_session_lists_the_tools_and_ends_when_the_client_closes_its_input() {
     // Arrange
     let scratch = Scratch::new();
-    let mut daemon = Running(
+    let mut daemon = Running::spawn(
         scratch
             .liamd(&[])
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start liamd"),
+            .stdout(Stdio::piped()),
     );
-    let mut session = Session::over(&mut daemon.0);
+    let mut session = Session::over(&mut daemon);
 
     // Act
     let (initialized, tools) = session.open_and_list_tools();
     drop(session);
-    let status = daemon.0.wait().expect("wait for liamd");
+    let status = daemon.wait();
 
     // Assert
     assert!(initialized.contains("\"serverInfo\""), "{initialized}");
