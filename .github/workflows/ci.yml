@@ -160,10 +160,10 @@ jobs:
       # covered by manual review notes in deny.toml, not by this job.
       - run: cargo deny check
 
-  # Blocking: fails below FLOOR. FLOOR is set from the real baseline, minus a
-  # few points of margin, so it catches a real regression without failing on
-  # normal day-to-day noise. Ratchet it up over time; never lower it without a
-  # documented reason.
+  # Blocking: fails when line coverage is below FLOOR, which is 95. The tool
+  # does not count test files under `tests/` folders, so the number is the
+  # coverage of the shipped code alone. A change that makes the number fall is
+  # fixed by adding tests for the code it touched. The floor is never lowered.
   coverage:
     needs: changes
     if: needs.changes.outputs.code == 'true'
