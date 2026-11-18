@@ -3,6 +3,8 @@
 
 use std::os::unix::fs::PermissionsExt;
 
+use liam_log::private_fs::skipped_as_root;
+
 use super::*;
 
 const READ_ONLY_DIR: u32 = 0o500;
@@ -41,17 +43,6 @@ impl Drop for ScratchDir {
         let _ =
             std::fs::set_permissions(self.path(), std::fs::Permissions::from_mode(OWNER_ONLY_DIR));
     }
-}
-
-/// True, with a line saying so, when the test cannot show a refusal because
-/// root passes every permission check.
-fn skipped_as_root(test: &str) -> bool {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let root = unsafe { libc::geteuid() == 0 };
-    if root {
-        eprintln!("SKIPPED {test}: running as root, which ignores directory permission bits");
-    }
-    root
 }
 
 async fn refusal(path: &Path) -> String {

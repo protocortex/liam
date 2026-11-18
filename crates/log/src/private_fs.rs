@@ -60,6 +60,18 @@ pub fn with_umask<R>(mask: libc::mode_t, run: impl FnOnce() -> R) -> R {
     run()
 }
 
+/// True, with a line saying so, when a test cannot show a permission refusal
+/// because root passes every permission check.
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub fn skipped_as_root(test: &str) -> bool {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let root = unsafe { libc::geteuid() } == 0;
+    if root {
+        eprintln!("SKIPPED {test}: running as root, which ignores permission bits");
+    }
+    root
+}
+
 /// Creates `dir` and every missing ancestor, each with mode 0700. A directory
 /// that already exists keeps its mode. The mode applies at creation, so there
 /// is no moment when a new directory is wider.

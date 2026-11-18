@@ -4,21 +4,12 @@
 
 use std::os::unix::fs::PermissionsExt;
 
+use liam_log::private_fs::skipped_as_root;
+
 use super::*;
 
 const NO_ACCESS: u32 = 0o000;
 const OWNER_ONLY: u32 = 0o700;
-
-/// True, with a line saying so, when the test cannot show a refusal because
-/// root passes every permission check.
-fn skipped_as_root(test: &str) -> bool {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let root = unsafe { libc::geteuid() == 0 };
-    if root {
-        eprintln!("SKIPPED {test}: running as root, which ignores permission bits");
-    }
-    root
-}
 
 /// A directory under a state root, set to `mode` and restored on drop so the
 /// temporary directory can be removed.
