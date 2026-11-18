@@ -9,6 +9,7 @@ use super::*;
 use liam_store::{FixedClock, GraphConfig, Millis, HANDLE_LEN};
 use serde_json::json;
 
+mod argument_errors;
 mod as_of_and_round_trips;
 mod ask_tool;
 mod clusters_and_timeline;

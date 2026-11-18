@@ -29,8 +29,10 @@ use crate::event::{EventError, LogEvent};
 use crate::private_fs::{create_private_dir_all, private_file_options};
 use crate::{LogOffset, LogWriter};
 
-pub(crate) const SEGMENT_EXTENSION: &str = "wal";
-pub(crate) const PARQUET_EXTENSION: &str = "parquet";
+/// The extension of a WAL segment file.
+pub const SEGMENT_EXTENSION: &str = "wal";
+/// The extension of a compacted segment.
+pub const PARQUET_EXTENSION: &str = "parquet";
 /// The file that marks a directory as a log: it holds the log's identity.
 pub const MANIFEST_NAME: &str = "log.id";
 /// The file a writer keeps locked while it is alive, so one directory never has

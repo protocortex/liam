@@ -39,6 +39,7 @@ use liam_daemon::models::{self, StoreEmbedder};
 use liam_daemon::retrieval_eval::{
     run_embedder_bench, run_retrieval_eval, BenchReport, EvalModel, EvalReport,
 };
+use liam_daemon::state_dir;
 use liam_daemon::storelock::StoreLock;
 use liam_daemon::telemetry;
 
@@ -153,9 +154,10 @@ struct RetrievalArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 struct RebuildArgs {
-    /// The database to rebuild. It is created when it does not exist.
+    /// The database to rebuild. Defaults to `database_path` from the config,
+    /// the one `liamd` opens. It is created when it does not exist.
     #[arg(long, value_name = "PATH")]
-    database: PathBuf,
+    database: Option<PathBuf>,
 
     /// The event log directory. Defaults to `[log] dir` from the config, else
     /// `<database stem>.log` beside the database.
@@ -290,8 +292,9 @@ fn try_consolidate(
         &database,
         embedder,
         &mut std::io::stdout(),
-    ))?;
-    Ok(Some(outcome))
+    ));
+    state_dir::secure_state_files_for(config, &database, None);
+    Ok(Some(outcome?))
 }
 
 fn consolidate_exit_code(outcome: Option<RunOutcome>) -> i32 {
@@ -346,9 +349,36 @@ const REBUILD_WAL: WalConfig = WalConfig {
 
 /// A sweep is tombstoned only when the store has a log attached; any other
 /// sweep is invisible to a rebuild.
-const GC_WARNING: &str = "warning: GC sweeps made without a log attached are not in the log, so a \
-     rebuild can bring back the rows they removed. Back up the database before relying on a \
-     rebuild.";
+fn gc_warning(database: &Path) -> String {
+    format!(
+        "warning: the database {} already holds rows, and a rebuild replaces them with \
+         what the log records. A GC sweep made while no log was attached is not in the log, so the \
+         rebuild can bring back rows that sweep removed. Copy the database file first if you may \
+         need its current rows.",
+        database.display()
+    )
+}
+
+/// The database `liam rebuild` works on: `--database`, else the one the config
+/// names, resolved the way `liamd` resolves it.
+fn rebuild_database(args: &RebuildArgs, config: &Config) -> anyhow::Result<PathBuf> {
+    match &args.database {
+        Some(path) => expand_home("--database", path),
+        None => models::resolve_config_path("database_path", &config.database_path),
+    }
+}
+
+/// The log `liam rebuild` reads: `--log-dir`, else the one the config names.
+fn rebuild_log_dir(
+    args: &RebuildArgs,
+    config: &Config,
+    database: &Path,
+) -> anyhow::Result<PathBuf> {
+    match &args.log_dir {
+        Some(dir) => expand_home("--log-dir", dir),
+        None => models::resolve_log_dir(config, database),
+    }
+}
 
 /// Expands `~` in a path flag the way the daemon does for its configured paths.
 fn expand_home(flag: &str, path: &Path) -> anyhow::Result<PathBuf> {
@@ -373,7 +403,13 @@ async fn rebuild(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    match try_rebuild(args, config, config_path, embedder_for, out, err).await {
+    let result = try_rebuild(args, config, config_path, embedder_for, out, err).await;
+    // The store has created or rewritten its files by now, whatever the outcome.
+    if let Ok(database) = rebuild_database(args, config) {
+        let log_dir = rebuild_log_dir(args, config, &database).ok();
+        state_dir::secure_state_files_for(config, &database, log_dir.as_deref());
+    }
+    match result {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(err, "liam rebuild: {error:#}");
@@ -401,17 +437,20 @@ async fn try_rebuild(
          restored node with the mock embedder; pass --config or set LIAM_CONFIG",
         config_path.display()
     );
-    let database = expand_home("--database", &args.database)?;
-    let log_dir = match &args.log_dir {
-        Some(dir) => expand_home("--log-dir", dir)?,
-        None => models::resolve_log_dir(config, &database)?,
-    };
+    let database = rebuild_database(args, config)?;
+    let log_dir = rebuild_log_dir(args, config, &database)?;
     anyhow::ensure!(
         event_log::holds_log(&log_dir),
         "{} is not an event log, it has no {MANIFEST_NAME} file; pass --log-dir if the log \
          lives elsewhere",
         log_dir.display()
     );
+    writeln!(
+        err,
+        "rebuilding {} with {}",
+        database.display(),
+        embedder_name(config)
+    )?;
     let _lock = StoreLock::acquire(&database)
         .context("liam rebuild needs the store to itself: stop liamd, then rerun")?;
     tracing::debug!("rebuild: store lock taken");
@@ -440,14 +479,7 @@ async fn try_rebuild(
         err,
     )
     .await?;
-    print_report(
-        out,
-        config_path,
-        &config.embedder.provider,
-        &database,
-        &log_dir,
-        &report,
-    )?;
+    print_report(out, config_path, config, &database, &log_dir, &report)?;
 
     let failed = report.replayed.reembedded.failed;
     anyhow::ensure!(
@@ -511,7 +543,9 @@ async fn replay_log(
         RebuildMode::ResetChecked
     };
 
-    writeln!(err, "{GC_WARNING}")?;
+    if mode != RebuildMode::RequireEmpty {
+        writeln!(err, "{}", gc_warning(database))?;
+    }
     let rebuilt = match graph.rebuild_from_log(log.clone(), mode).await {
         Err(refusal) if force && is_forceable(&refusal) => {
             writeln!(err, "{}", force_warning(&refusal))?;
@@ -615,14 +649,13 @@ fn explain_refusal(error: StoreError) -> anyhow::Error {
 fn print_report(
     out: &mut dyn Write,
     config_path: &Path,
-    provider: &str,
+    config: &Config,
     database: &Path,
     log_dir: &Path,
     report: &RebuildReport,
 ) -> std::io::Result<()> {
     let (replayed, embedded) = (&report.replayed, &report.replayed.reembedded);
     writeln!(out, "config: {}", config_path.display())?;
-    writeln!(out, "embedder: {provider}")?;
     writeln!(
         out,
         "rebuilt {} from {}",
@@ -638,9 +671,22 @@ fn print_report(
     )?;
     writeln!(
         out,
-        "embeddings: {} restored, {} failed, {} pending",
-        embedded.re_embedded, embedded.failed, embedded.pending
+        "embeddings: re-embedded {} nodes and summaries with {} at {} dimensions, {} failed, {} pending",
+        embedded.re_embedded,
+        embedder_name(config),
+        config.embedding_dims,
+        embedded.failed,
+        embedded.pending
     )
+}
+
+/// What to call the configured embedder in a report. A mock has no model.
+fn embedder_name(config: &Config) -> &str {
+    if config.embedder.provider == models::MOCK_PROVIDER {
+        "the mock embedder"
+    } else {
+        &config.embedder.model
+    }
 }
 
 /// Fetches the weights the config asks for, through the daemon's own loaders.
@@ -1069,13 +1115,12 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_requires_a_database_argument() {
-        let error = Cli::try_parse_from(["liam", "rebuild"])
-            .expect_err("a rebuild with no database must not parse");
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+    fn rebuild_without_a_database_argument_parses_and_leaves_the_choice_to_the_config() {
+        // Act
+        let args = rebuild_args(parse(&["liam", "rebuild"]));
+
+        // Assert
+        assert_eq!(args.database, None);
     }
 
     #[test]
@@ -1092,7 +1137,7 @@ mod tests {
         ]));
 
         // Assert
-        assert_eq!(bare.database, PathBuf::from("/data/liam.db"));
+        assert_eq!(bare.database, Some(PathBuf::from("/data/liam.db")));
         assert_eq!(bare.log_dir, None);
         assert!(!bare.force);
         assert_eq!(with_log.log_dir, Some(PathBuf::from("/elsewhere/log")));
@@ -1283,7 +1328,7 @@ mod tests {
 
     fn rebuild_of(database: &Path, log_dir: Option<&Path>) -> RebuildArgs {
         RebuildArgs {
-            database: database.to_path_buf(),
+            database: Some(database.to_path_buf()),
             log_dir: log_dir.map(Path::to_path_buf),
             force: false,
         }
@@ -1312,15 +1357,14 @@ mod tests {
             lines[0],
             format!("config: {}", dir.path().join("liam.toml").display())
         );
-        assert_eq!(lines[1], "embedder: mock");
-        assert!(lines[2].starts_with("rebuilt "), "{out}");
+        assert!(lines[1].starts_with("rebuilt "), "{out}");
         assert_eq!(
-            lines[3..],
+            lines[2..],
             [
                 "nodes: 2",
                 "edges: 2",
                 "events: 4 applied, 0 voided, 0 quarantined",
-                "embeddings: 2 restored, 0 failed, 0 pending",
+                "embeddings: re-embedded 2 nodes and summaries with the mock embedder at 8 dimensions, 0 failed, 0 pending",
             ],
             "{out}"
         );
@@ -1556,11 +1600,63 @@ mod tests {
 
         // Assert
         assert_eq!(code, 0, "stderr: {err}");
+        assert!(err.contains("while no log was attached"), "{err}");
+        assert!(err.contains("Copy the database file"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_into_an_empty_database_does_not_warn_about_rows_it_would_replace() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("liam.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        delete_database(dir.path());
+
+        // Act
+        let (code, _out, err) =
+            run_rebuild(dir.path(), &rebuild_of(&database, Some(&log_dir))).await;
+
+        // Assert
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(!err.contains("warning"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_without_a_database_flag_uses_the_database_the_config_names() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (database, log_dir) = (dir.path().join("named.db"), dir.path().join("wal"));
+        logged_store(&database, &log_dir).await;
+        let mut named = config_with_log_dir(&log_dir);
+        named.database_path = database.to_str().unwrap().to_string();
+        let args = RebuildArgs {
+            database: None,
+            log_dir: None,
+            force: false,
+        };
+
+        // Act
+        let (code, out, err) = run_with_config(&named, dir.path(), &args).await;
+
+        // Assert
+        assert_eq!(code, 0, "stderr: {err}");
         assert!(
-            err.contains("GC sweeps made without a log attached"),
-            "{err}"
+            out.contains(&format!("rebuilt {} from", database.display())),
+            "{out}"
         );
-        assert!(err.contains("Back up"), "{err}");
+        assert!(out.contains("nodes: 2"), "{out}");
+    }
+
+    #[test]
+    fn the_report_names_the_model_of_a_real_embedder_and_not_one_for_a_mock() {
+        // Arrange
+        let mut local = config();
+        local.embedder.provider = models::LOCAL_PROVIDER.to_string();
+        local.embedder.model = "org/model".to_string();
+
+        // Act / Assert
+        assert_eq!(embedder_name(&local), "org/model");
+        assert_eq!(embedder_name(&config()), "the mock embedder");
     }
 
     #[tokio::test]
@@ -1657,7 +1753,9 @@ mod tests {
         // Assert: the rows are restored and reported, and the run says it is incomplete
         assert_eq!(code, 1);
         assert!(
-            out.contains("embeddings: 0 restored, 2 failed, 0 pending"),
+            out.contains(
+                "0 nodes and summaries with the mock embedder at 8 dimensions, 2 failed, 0 pending"
+            ),
             "{out}"
         );
         assert!(

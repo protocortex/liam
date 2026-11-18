@@ -20,6 +20,26 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- `liamd` now tightens the files it owns inside `~/.liam` to owner-only (0600) when an older start left them
+  wider: the sidecars named after the database, the log's WAL and Parquet files, `log.id`, `log.lock`, the key
+  registry, and the snapshot files. It runs at start, and `liam rebuild`, `liam consolidate`, `liamd delete`
+  and `liamd encrypt-log` do the same when they finish, so `liam.db` is no longer left at 0644 after a
+  rebuild. The other files are only touched inside `~/.liam`. The database and its `-wal` and `-shm` files are
+  narrowed at any path, because the user pointed the tool at them, for example with
+  `liam rebuild --database /elsewhere/copy.db`, and that holds even when `HOME` is unset. Symbolic links and
+  files with other names are left alone, and a hard link is narrowed like any other file the same user owns.
+  `liam.toml` is never changed; it holds no secrets.
+- `liam rebuild` uses `database_path` from the config when `--database` is not given. The flag still overrides it.
+  Before it opens the store it prints the database it will rebuild and the embedder it will re-embed with.
+- The `liam rebuild` report now says `embeddings: re-embedded N nodes and summaries with MODEL at D dimensions`
+  instead of `N restored`. The warning about GC sweeps that are not in the log is now printed only when the
+  database already holds rows that the rebuild will replace, and it says what to do about it.
+- `liam fetch-models`, `liam devices` and `liamd` no longer print llama.cpp and Metal log lines. They go to the
+  log at their own levels and only warnings show by default. Set `RUST_LOG=info,llama-cpp-2=debug` to see them.
+- An MCP call that leaves out a required field now gets a message that names the field, for example
+  "remember needs the field kind, the kind of memory. The common kinds are decision, fact, symbol, episode, but
+  any label is stored", instead of the raw
+  `failed to deserialize parameters` text. What the tools accept is unchanged.
 - `liamd` now logs one info line before it downloads a model that is not in the cache, naming the model, the
   directory and, where known, the size, and pointing to `liam fetch-models` (`liam fetch-models` itself leaves
   that hint out). It checks for the files the model loads, in `HF_HOME` when that is set, so a download that was

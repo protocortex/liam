@@ -25,7 +25,7 @@ If the log is poisoned, which a failed disk write does, `liamd` logs `the event
 log is poisoned; restart liamd to replay it` at error level and exits with a
 failure. Restarting replays the log into the database.
 
-`liam rebuild --database PATH [--log-dir DIR] [--force]` recreates the nodes and
+`liam rebuild [--database PATH] [--log-dir DIR] [--force]` recreates the nodes and
 edges from the log and checks the result against it, row by row. It needs the
 store to itself, so stop `liamd` first. The log directory is `--log-dir`, else
 `log.dir` from the config, else the default beside `--database`.

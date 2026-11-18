@@ -85,6 +85,54 @@ async fn a_rebuild_that_succeeds_exits_zero() {
 }
 
 #[tokio::test]
+async fn a_rebuild_without_a_database_flag_uses_the_configured_database_and_tightens_its_files() {
+    // Arrange: the state lives in `<home>/.liam`, which is where the default
+    // `database_path` points, and its files are world readable
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join(".liam");
+    std::fs::create_dir(&state).unwrap();
+    fixture(&state).await;
+    let sidecar = state.join("liam.db.consolidation.json");
+    std::fs::write(&sidecar, "{}").unwrap();
+    let wal = std::fs::read_dir(state.join("liam.log"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
+        .expect("a wal segment");
+    let wide = [state.join("liam.db"), sidecar, wal];
+    for file in &wide {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let config = state.join("liam.toml");
+
+    // Act
+    let output = liam(
+        home.path(),
+        &["--config", config.to_str().unwrap(), "rebuild"],
+    );
+
+    // Assert
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).contains("nodes: 1"));
+    let database = state.join("liam.db").display().to_string();
+    assert!(
+        text(&output.stderr).contains(&format!("rebuilding {database} with")),
+        "{}",
+        text(&output.stderr)
+    );
+    assert!(
+        text(&output.stderr).contains(&format!("the database {database} already holds rows")),
+        "{}",
+        text(&output.stderr)
+    );
+    for file in &wide {
+        let mode = std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{}", file.display());
+    }
+}
+
+#[tokio::test]
 async fn a_refused_rebuild_exits_one() {
     // Arrange: a row only the database holds, which the log cannot account for
     let dir = tempfile::tempdir().unwrap();

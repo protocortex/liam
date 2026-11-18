@@ -127,14 +127,38 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
     }
 
     if mode == cli::Mode::EncryptLog {
-        return deletion::encrypt_log(&config).await;
+        let result = deletion::encrypt_log(&config).await;
+        secure_state_files_after_command(&config).await;
+        return result;
     }
 
     if let cli::Mode::Delete(action) = mode {
-        return deletion::delete_command(&config, action, &mut std::io::stdout()).await;
+        let result = deletion::delete_command(&config, action, &mut std::io::stdout()).await;
+        secure_state_files_after_command(&config).await;
+        return result;
     }
 
     serve_with_store(mode, config).await
+}
+
+/// A command that opens the store may leave files wider than their owner,
+/// whatever its outcome.
+async fn secure_state_files_after_command(config: &Config) {
+    if let Ok(database) = resolve_config_path("database_path", &config.database_path) {
+        secure_state_files_off_runtime(config, database).await;
+    }
+}
+
+/// The walk reads every directory entry, which can take a while for a large log
+/// directory, so it runs on a blocking thread and leaves the async workers free.
+async fn secure_state_files_off_runtime(config: &Config, database: std::path::PathBuf) {
+    let config = config.clone();
+    let walk = tokio::task::spawn_blocking(move || {
+        state_dir::secure_state_files_for(&config, &database, None);
+    });
+    if let Err(error) = walk.await {
+        tracing::warn!(%error, "the check of the state files did not finish");
+    }
 }
 
 /// Tightens the state directories left over from an earlier start, before the
@@ -221,8 +245,8 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         &shutdown,
     )
     .await?;
-    // The store has created its files by now, with the umask's mode.
-    state_dir::secure_database_files(&database_path);
+    // The store has created its files by now, and an older start left others wider.
+    secure_state_files_off_runtime(&config, database_path.clone()).await;
     if let Some(fingerprint) = fingerprint {
         fingerprint.commit()?;
     }

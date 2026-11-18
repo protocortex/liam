@@ -15,6 +15,7 @@
 mod admin;
 #[cfg(test)]
 mod admin_tests;
+mod argument_errors;
 mod consolidate;
 #[cfg(test)]
 mod deadline_tests;
@@ -1858,6 +1859,17 @@ impl MemoryServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let tool = request.name.to_string();
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let response = self.tool_router.call(call).await?;
+        Ok(argument_errors::clarify(&tool, response))
+    }
+
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
