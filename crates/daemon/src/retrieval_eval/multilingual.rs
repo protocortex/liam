@@ -292,6 +292,9 @@ fn render_table(baseline: &BTreeMap<Language, f64>, measured: &BTreeMap<Language
 }
 
 #[cfg(test)]
+mod table_tests;
+
+#[cfg(test)]
 mod tests {
     use async_trait::async_trait;
 
