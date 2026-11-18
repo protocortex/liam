@@ -194,6 +194,9 @@ fn write_notices(job: &DeleteJob, out: &mut impl Write) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+mod status_tests;
+
+#[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
