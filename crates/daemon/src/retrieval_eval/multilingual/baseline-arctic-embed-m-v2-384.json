@@ -1,0 +1,14 @@
+{
+  "embedder": "Snowflake/snowflake-arctic-embed-m-v2.0",
+  "dims": 384,
+  "ndcg_at_10": {
+    "en": 0.959,
+    "pt": 0.968,
+    "es": 0.925,
+    "zh": 0.880,
+    "fr": 0.949,
+    "de": 0.894,
+    "ja": 0.890,
+    "ar": 0.811
+  }
+}

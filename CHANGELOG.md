@@ -8,6 +8,8 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Added
 
+- An embedder-only multilingual retrieval check in eight languages, with a gate on English, Portuguese
+  and Spanish. It runs as an ignored test. See [Evaluating retrieval](docs/development/evaluating-retrieval.md#multilingual-embedder-check).
 - `recall_timeout_secs` (default `10`) bounds how long `recall` and `ask` spend retrieving. Past it they reply
   with a timeout. Cancelling a request now stops retrieval with a `cancelled` reply; the `ask` model call that
   follows retrieval still runs until `ask_timeout_secs`.
