@@ -2,15 +2,18 @@
 //! `liamd` as a supervisor or a person runs it: the real binary on mock models
 //! in a scratch directory, so the exit code and the text are the shipped ones.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, ChildStderr, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const FAILURE_EXIT: i32 = 1;
 const READY_LINE: &str = "socket listener started";
 const SHUTDOWN_LINE: &str = "shutting down";
 const SOCKET_NAME: &str = "s.sock";
+const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"liamd-test","version":"0"}}}"#;
+const INITIALIZED_NOTIFICATION: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+const LIST_TOOLS: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
 
 /// A short directory under `/tmp`: a socket path inside the system temp
 /// directory can pass the address length limit on macOS.
@@ -149,43 +152,71 @@ fn a_stdio_session_closed_before_it_starts_is_an_error() {
     );
 }
 
+/// A `liamd serve` that has logged that it listens.
+struct Daemon {
+    process: Running,
+    log: BufReader<ChildStderr>,
+    seen: String,
+}
+
+impl Daemon {
+    fn start(scratch: &Scratch) -> Self {
+        let mut child = scratch
+            .liamd(&["serve"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start liamd");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let mut daemon = Self {
+            process: Running(child),
+            log: BufReader::new(stderr),
+            seen: String::new(),
+        };
+        loop {
+            let mut line = String::new();
+            let read = daemon
+                .log
+                .read_line(&mut line)
+                .expect("read the daemon log");
+            assert!(
+                read > 0,
+                "the daemon ended before it listened:\n{}",
+                daemon.seen
+            );
+            daemon.seen.push_str(&line);
+            if line.contains(READY_LINE) {
+                break;
+            }
+        }
+        assert!(scratch.path().join(SOCKET_NAME).exists());
+        daemon
+    }
+
+    /// Sends SIGTERM and returns the exit status with the rest of the log.
+    fn stop_with_sigterm(&mut self) -> (ExitStatus, String) {
+        // SAFETY: the pid is that of the child this test started and still holds.
+        let sent = unsafe { libc::kill(self.process.0.id() as libc::pid_t, libc::SIGTERM) };
+        assert_eq!(sent, 0);
+        let mut rest = String::new();
+        self.log
+            .read_to_string(&mut rest)
+            .expect("read the rest of the log");
+        let status = self.process.0.wait().expect("wait for liamd");
+        (status, rest)
+    }
+}
+
 /// Starts `liamd serve` in `scratch`, stops it with SIGTERM once it listens,
 /// and checks the orderly exit.
 fn serve_then_stop_with_sigterm(scratch: &Scratch) {
     // Arrange
-    let mut child = scratch
-        .liamd(&["serve"])
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start liamd");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let pid = child.id();
-    let mut daemon = Running(child);
-    let mut lines = BufReader::new(stderr);
-    let mut seen = String::new();
-    loop {
-        let mut line = String::new();
-        let read = lines.read_line(&mut line).expect("read the daemon log");
-        assert!(read > 0, "the daemon ended before it listened:\n{seen}");
-        seen.push_str(&line);
-        if line.contains(READY_LINE) {
-            break;
-        }
-    }
-    assert!(scratch.path().join(SOCKET_NAME).exists());
+    let mut daemon = Daemon::start(scratch);
 
     // Act
-    // SAFETY: the pid is that of the child this test started and still holds.
-    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    let mut rest = String::new();
-    lines
-        .read_to_string(&mut rest)
-        .expect("read the rest of the log");
-    let status = daemon.0.wait().expect("wait for liamd");
+    let (status, rest) = daemon.stop_with_sigterm();
 
     // Assert
-    assert_eq!(sent, 0);
-    assert!(status.success(), "{status:?}\n{seen}{rest}");
+    assert!(status.success(), "{status:?}\n{}{rest}", daemon.seen);
     assert!(rest.contains(SHUTDOWN_LINE), "{rest}");
     assert!(
         !scratch.path().join(SOCKET_NAME).exists(),
@@ -206,4 +237,45 @@ fn a_daemon_with_tiering_and_a_tuned_generation_limit_also_stops_cleanly() {
     );
 
     serve_then_stop_with_sigterm(&scratch);
+}
+
+#[test]
+fn a_client_behind_the_proxy_can_list_the_daemons_tools() {
+    // Arrange
+    let scratch = Scratch::new();
+    let mut daemon = Daemon::start(&scratch);
+    let mut proxy = Running(
+        scratch
+            .liamd(&["proxy"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the proxy"),
+    );
+    let mut to_daemon = proxy.0.stdin.take().expect("piped stdin");
+    let mut replies = BufReader::new(proxy.0.stdout.take().expect("piped stdout"));
+    let mut request = |message: &str| -> Option<String> {
+        writeln!(to_daemon, "{message}").expect("write to the proxy");
+        message.contains("\"id\"").then(|| {
+            let mut reply = String::new();
+            replies.read_line(&mut reply).expect("read from the proxy");
+            reply
+        })
+    };
+
+    // Act
+    let initialized = request(INITIALIZE).expect("initialize has a reply");
+    request(INITIALIZED_NOTIFICATION);
+    let tools = request(LIST_TOOLS).expect("tools/list has a reply");
+
+    // Assert
+    assert!(initialized.contains("\"serverInfo\""), "{initialized}");
+    assert!(tools.contains("\"name\":\"remember\""), "{tools}");
+    assert!(tools.contains("\"name\":\"recall\""), "{tools}");
+    drop(to_daemon);
+    let proxy_status = proxy.0.wait().expect("wait for the proxy");
+    let (status, _) = daemon.stop_with_sigterm();
+    assert!(proxy_status.success(), "{proxy_status:?}");
+    assert!(status.success(), "{status:?}");
 }
