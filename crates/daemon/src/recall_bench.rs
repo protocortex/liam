@@ -381,6 +381,9 @@ fn read_stages(sink: &MemorySink) -> Vec<StageLatency> {
 }
 
 #[cfg(test)]
+mod pairs_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
