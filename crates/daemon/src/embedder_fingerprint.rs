@@ -20,7 +20,7 @@ use liam_log::wal::{write_atomically, OsFileOps};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::models::MOCK_PROVIDER;
+use crate::models::{LOCAL_PROVIDER, MOCK_PROVIDER};
 
 /// Version of the convention that turns text into model input (prefixes and
 /// the like). Bump it whenever that convention changes for a model, since the
@@ -104,6 +104,30 @@ impl EmbedderFingerprint {
             prompt_scheme: LEGACY_PROMPT_SCHEME,
         }
     }
+}
+
+/// The model id `embedder.model` selected by default before the current
+/// default.
+const PREVIOUS_DEFAULT_MODEL_ID: &str = liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID;
+
+/// The info line for a local embedder pinned to the previous default, or
+/// `None` for the current default and any other model. The pinned model keeps
+/// working, so this only says a newer default exists.
+pub fn superseded_default_notice(config: &Config, database_path: &Path) -> Option<String> {
+    let is_previous_default = config.embedder.provider == LOCAL_PROVIDER
+        && canonical_model_id(&config.embedder.model)
+            == canonical_model_id(PREVIOUS_DEFAULT_MODEL_ID);
+    is_previous_default.then(|| {
+        format!(
+            "the default embedder is now {current}; this config keeps {configured}, which is \
+             still supported. To switch, remove `model` from [embedder] (or set it to {current}) \
+             and `embedding_dims`, then run `liam rebuild --database {database}`. To stay, change \
+             nothing.",
+            current = liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            configured = config.embedder.model,
+            database = database_path.display(),
+        )
+    })
 }
 
 /// The file's contents: the fingerprint under a layout version.
@@ -252,25 +276,25 @@ fn mismatch_message(
 ) -> String {
     let origin = if legacy {
         format!(
-            "has no embedder record at {fingerprint}, so it predates them and is taken to hold",
+            "has no embedder record at {fingerprint}, so it is taken to have been built with",
             fingerprint = path.display()
         )
     } else {
         format!(
-            "recorded in {fingerprint} that it was embedded with",
+            "recorded in {fingerprint} that it was built with",
             fingerprint = path.display()
         )
     };
     format!(
-        "the embedder fingerprint does not match: the store at {database} {origin} provider \
+        "the embedder fingerprint does not match. The store at {database} {origin} provider \
          {recorded_provider:?}, model {recorded_model:?}, {recorded_dims} dimensions, prompt \
-         scheme {recorded_scheme}, but liam.toml now asks for provider {configured_provider:?}, \
-         model {configured_model:?}, {configured_dims} dimensions, prompt scheme \
-         {configured_scheme}. Mixing them would corrupt search. To change the embedder, stop \
-         liamd and run `liam rebuild --database {database}`: it re-embeds every node with the \
-         configured embedder, resizes the vector table and records the new embedder. Deleting \
-         {fingerprint} is not a fix, the old vectors would remain. Otherwise restore the \
-         previous embedder settings.",
+         scheme {recorded_scheme}. liam.toml asks for provider {configured_provider:?}, model \
+         {configured_model:?}, {configured_dims} dimensions, prompt scheme {configured_scheme}. \
+         To switch to the configured embedder, stop liamd and run `liam rebuild --database \
+         {database}`. It re-embeds every node and records the new embedder. To keep the old \
+         embedder, restore the previous embedder settings in liam.toml. Deleting {fingerprint} \
+         does not help, the old vectors would remain. If you do nothing, liamd refuses to start \
+         and the store is not changed.",
         database = database_path.display(),
         recorded_provider = recorded.provider,
         recorded_model = recorded.model,
@@ -323,6 +347,82 @@ mod tests {
         // Assert
         assert_eq!(exact, lowered);
         assert_eq!(lowered.model, liam_model::DEFAULT_EMBEDDER_MODEL_ID);
+    }
+
+    fn config_with_embedder(provider: &str, model: &str) -> Config {
+        let mut config = Config::default();
+        config.embedder.provider = provider.to_string();
+        config.embedder.model = model.to_string();
+        config
+    }
+
+    #[test]
+    fn the_previous_default_in_either_spelling_gets_one_notice_naming_the_new_default() {
+        for model in [
+            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
+            "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0",
+        ] {
+            // Arrange
+            let config = config_with_embedder("local", model);
+            let database = Path::new("/data/liam.db");
+
+            // Act
+            let notice = superseded_default_notice(&config, database).expect("a notice");
+
+            // Assert
+            assert!(
+                notice.contains(liam_model::DEFAULT_EMBEDDER_MODEL_ID),
+                "{notice}"
+            );
+            assert!(
+                notice.contains("liam rebuild --database /data/liam.db"),
+                "{notice}"
+            );
+            assert!(notice.contains("still supported"), "{notice}");
+        }
+    }
+
+    #[test]
+    fn the_current_default_and_other_models_get_no_notice() {
+        for model in [
+            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
+            liam_model::QWEN3_EMBEDDING_MODEL_ID,
+            "BAAI/bge-small-en-v1.5",
+        ] {
+            // Arrange
+            let config = config_with_embedder("local", model);
+
+            // Act / Assert
+            assert_eq!(
+                superseded_default_notice(&config, Path::new("/data/liam.db")),
+                None,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_is_one_line_in_the_order_problem_fix_consequence() {
+        // Arrange
+        let recorded = fingerprint("model-a", 768, 1);
+        let configured = fingerprint("model-b", 384, 1);
+        let database = Path::new("/data/liam.db");
+
+        // Act
+        let text = mismatch_message(
+            &fingerprint_path_for(database),
+            false,
+            &recorded,
+            &configured,
+            database,
+        );
+
+        // Assert
+        assert!(!text.contains('\n'), "{text}");
+        let problem = text.find("does not match").unwrap();
+        let fix = text.find("liam rebuild --database /data/liam.db").unwrap();
+        let consequence = text.find("If you do nothing").unwrap();
+        assert!(problem < fix && fix < consequence, "{text}");
     }
 
     fn fingerprint(model: &str, dims: usize, prompt_scheme: u32) -> EmbedderFingerprint {

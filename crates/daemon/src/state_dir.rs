@@ -31,6 +31,8 @@ const SNAPSHOT_FILE_EXTENSIONS: [&str; 2] = ["db", "json"];
 const GROUP_AND_OTHER_BITS: u32 = 0o077;
 /// Where a bare file name sits.
 const CURRENT_DIR: &str = ".";
+/// How the empty parent of a bare file name is shown.
+const CURRENT_DIR_LABEL: &str = ".";
 
 /// Error kinds that mean the directory is not there, or is not a directory.
 const NOT_THERE: [std::io::ErrorKind; 2] = [
@@ -193,6 +195,25 @@ fn first_report(dir: &Path) -> bool {
         .insert(dir.to_path_buf())
 }
 
+/// `dir` as written, with the empty parent of a bare file name shown as the
+/// current directory.
+fn dir_label(dir: &Path) -> String {
+    if dir.as_os_str().is_empty() {
+        CURRENT_DIR_LABEL.to_string()
+    } else {
+        dir.display().to_string()
+    }
+}
+
+/// The directory a relative `dir` resolves against, or `None` for an absolute
+/// one.
+fn resolved_against(dir: &Path, cwd: Option<&Path>) -> Option<String> {
+    if dir.is_absolute() {
+        return None;
+    }
+    cwd.map(|cwd| cwd.display().to_string())
+}
+
 /// Secures each directory and logs what changed. A failure is a warning: the
 /// daemon runs with the modes it found rather than refusing to start.
 /// `risk` says what a wide directory exposes, and is added to the warning.
@@ -201,17 +222,18 @@ pub fn secure_dirs(dirs: &[&Path], state_root: &Path, risk: &str) {
         match secure_dir(dir, state_root) {
             Ok(DirOutcome::Untouched) => {}
             Ok(DirOutcome::Tightened(from)) => {
-                tracing::info!(dir = %dir.display(), from = format!("{from:o}"), "restricted the state directory to its owner");
+                tracing::info!(dir = %dir_label(dir), from = format!("{from:o}"), "restricted the state directory to its owner");
             }
             Ok(DirOutcome::WideAndNotOwned(mode)) if first_report(dir) => {
-                tracing::warn!(dir = %dir.display(), mode = format!("{mode:o}"), risk, "this directory is readable by other users and is not LIAM's own state directory, so its mode was left as it is");
+                tracing::warn!(dir = %dir_label(dir), mode = format!("{mode:o}"), risk, "this directory is readable by other users and is not LIAM's own state directory, so its mode was left as it is");
             }
             Ok(DirOutcome::Skipped(skip)) if first_report(dir) => {
-                tracing::warn!(dir = %dir.display(), reason = skip.reason(), risk, "this directory could not be shown to be LIAM's own state directory, so its mode was left as it is");
+                let cwd = std::env::current_dir().ok();
+                tracing::warn!(dir = %dir_label(dir), resolves_against = resolved_against(dir, cwd.as_deref()), reason = skip.reason(), risk, "this directory could not be shown to be LIAM's own state directory, so its mode was left as it is");
             }
             Ok(DirOutcome::WideAndNotOwned(_) | DirOutcome::Skipped(_)) => {}
             Err(error) if first_report(dir) => {
-                tracing::warn!(dir = %dir.display(), %error, "could not secure this directory");
+                tracing::warn!(dir = %dir_label(dir), %error, "could not secure this directory");
             }
             Err(_) => {}
         }
@@ -638,6 +660,29 @@ mod tests {
 
         // Assert
         assert_eq!(mode_of(&wal), 0o644);
+    }
+
+    #[test]
+    fn a_bare_file_names_parent_is_shown_as_the_current_directory() {
+        // Arrange
+        let parent = Path::new("s.sock").parent().unwrap();
+
+        // Act / Assert
+        assert_eq!(dir_label(parent), CURRENT_DIR_LABEL);
+        assert_eq!(dir_label(Path::new("run/dir")), "run/dir");
+    }
+
+    #[test]
+    fn a_relative_directory_names_what_it_resolves_against_and_an_absolute_one_does_not() {
+        // Arrange
+        let cwd = Path::new("/work");
+
+        // Act / Assert
+        assert_eq!(
+            resolved_against(Path::new("run"), Some(cwd)).as_deref(),
+            Some("/work")
+        );
+        assert_eq!(resolved_against(Path::new("/run"), Some(cwd)), None);
     }
 
     #[test]

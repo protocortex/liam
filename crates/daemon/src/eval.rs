@@ -368,6 +368,7 @@ mod run {
                 &cache_dir,
                 shipped.context_tokens as u32,
                 device,
+                liam_model::NoticeCaller::Daemon,
             )
             .expect("load local model"),
         );
