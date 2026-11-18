@@ -786,9 +786,39 @@ fn a_secret_cut_by_the_cap_leaves_no_fragment() {
     assert!(!text.contains("DEFGH"), "a fragment of the secret survived");
 }
 
+const LEAK_ENTRY_TEST: &str = "extraction::sidecar::tests::leak_probe_entry";
+const LEAK_CHECKED_LINE: &str = "leak probe checked";
+
+/// The parent gives its child a variable outside the allowlist through
+/// `Command::env`, so this process's own environment is never written.
 #[test]
 fn the_child_inherits_only_the_allowlist_and_its_own_secrets() {
     // Arrange
+    let mut rerun = std::process::Command::new(std::env::current_exe().unwrap());
+    rerun
+        .args([
+            "--exact",
+            LEAK_ENTRY_TEST,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(LEAK_PROBE, "leaked");
+
+    // Act
+    let output = rerun.output().unwrap();
+
+    // Assert
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{printed}");
+    assert!(printed.contains(LEAK_CHECKED_LINE), "{printed}");
+}
+
+/// Runs only as the child of the test above, where the probe variable is set.
+#[test]
+fn leak_probe_entry() {
+    if std::env::var_os(LEAK_PROBE).is_none() {
+        return;
+    }
     let dir = TempDir::new().unwrap();
     let script = dir.path().join("print-env");
     std::fs::write(&script, "#!/bin/sh\nenv\n").unwrap();
@@ -803,14 +833,11 @@ fn the_child_inherits_only_the_allowlist_and_its_own_secrets() {
         probe_key: "the-probe",
         key: "the-key",
     };
-    std::env::set_var(LEAK_PROBE, "leaked");
 
-    // Act
     let output = server_command(&ExtractionConfig::default(), &paths, &launch)
         .output()
         .unwrap();
 
-    // Assert
     let printed = String::from_utf8_lossy(&output.stdout);
     assert!(
         printed.contains("LLAMA_API_KEY=the-probe,the-key"),
@@ -818,6 +845,7 @@ fn the_child_inherits_only_the_allowlist_and_its_own_secrets() {
     );
     assert!(printed.contains("PATH="), "{printed}");
     assert!(!printed.contains(LEAK_PROBE), "{printed}");
+    println!("{LEAK_CHECKED_LINE}");
 }
 
 #[test]
