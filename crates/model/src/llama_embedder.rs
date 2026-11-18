@@ -226,7 +226,7 @@ impl LlamaEmbedder {
         } else {
             "llama.cpp/cpu"
         };
-        if model.n_embd_out() as usize != spec.native_dims {
+        if usize::try_from(model.n_embd_out()).ok() != Some(spec.native_dims) {
             return Err(ModelError::Embed(format!(
                 "{gguf_path} has width {}, expected {}",
                 model.n_embd_out(),

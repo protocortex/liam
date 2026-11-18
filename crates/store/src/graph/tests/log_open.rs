@@ -336,8 +336,8 @@ async fn the_last_applied_offset_follows_the_log_cursor() {
     assert_eq!(
         after,
         Some(LogOffset {
-            segment: segment as u64,
-            index: index as u64
+            segment: u64::try_from(segment).unwrap(),
+            index: u64::try_from(index).unwrap()
         })
     );
 }

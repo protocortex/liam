@@ -40,7 +40,7 @@ const QUANT_COLUMNS: &str = "node_id, bin, i8, scale, quant_version";
 pub(super) type IndexGate = Arc<tokio::sync::Mutex<()>>;
 
 fn quant_params(node_id: &str, quantized: &Quantized) -> Vec<Value> {
-    let int8 = quantized.i8.iter().map(|c| *c as u8).collect();
+    let int8 = quantized.i8.iter().map(|c| c.cast_unsigned()).collect();
     vec![
         node_id.into(),
         words_to_bytes(&quantized.bin).into(),
@@ -210,7 +210,7 @@ impl<B: Backend> Graph<B> {
                     "UPDATE node_quant SET i8 = ?2, scale = ?3 WHERE node_id = ?1 AND i8 IS NULL",
                     &[
                         node_id.as_str().into(),
-                        Value::Blob(quantized.i8.iter().map(|c| *c as u8).collect()),
+                        Value::Blob(quantized.i8.iter().map(|c| c.cast_unsigned()).collect()),
                         f64::from(quantized.scale).into(),
                     ],
                 )

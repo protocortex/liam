@@ -127,9 +127,14 @@ async fn seed_chain(g: &DefaultGraph, clock: &FixedClock) {
         .unwrap();
 }
 
+/// The row count of `table`, as a length.
+async fn rows_of(g: &DefaultGraph, table: &str) -> usize {
+    usize::try_from(count(g, table).await).unwrap()
+}
+
 /// Every node and edge row, closed ones included.
 async fn all_rows(g: &DefaultGraph) -> usize {
-    (count(g, "nodes").await + count(g, "edges").await) as usize
+    rows_of(g, "nodes").await + rows_of(g, "edges").await
 }
 
 // ---- reading the store and the log back ----
@@ -685,7 +690,7 @@ async fn backfill_indexes_every_row_so_a_later_identical_insert_is_a_duplicate()
 
     // Assert: the index and the filter know every hash the log now holds.
     assert_eq!(
-        count(&logged.graph, "log_hash_index").await as usize,
+        rows_of(&logged.graph, "log_hash_index").await,
         STANDARD_ROWS
     );
     for event in &backfilled {
@@ -705,7 +710,7 @@ async fn backfill_indexes_every_row_so_a_later_identical_insert_is_a_duplicate()
 
     // Assert: the first carrier answers, and the log says so.
     assert_eq!(again.as_str(), original.id);
-    assert_eq!(count(&logged.graph, "nodes").await as usize, first.len());
+    assert_eq!(rows_of(&logged.graph, "nodes").await, first.len());
     let events = logged_events(&env).await;
     assert_eq!(events.len(), STANDARD_ROWS + 1);
     let first_event = backfilled
@@ -925,7 +930,7 @@ async fn backfill_does_not_log_a_row_twice_that_the_log_holds_ahead_of_the_state
         );
         assert_each_row_logged_once(&logged_events(&env).await, STANDARD_ROWS);
         assert_eq!(
-            count(&resumed.graph, "log_hash_index").await as usize,
+            rows_of(&resumed.graph, "log_hash_index").await,
             STANDARD_ROWS,
             "{case}: every row is indexed"
         );
@@ -1306,10 +1311,7 @@ async fn a_node_written_without_a_valid_time_is_not_deduplicated_against_its_bac
     let again = logged.graph.insert(fact("node-5")).await.unwrap();
 
     // Assert: the accepted limitation is a second row, not a duplicate.
-    assert_eq!(
-        count(&logged.graph, "nodes").await as usize,
-        STANDARD_NODES + 1
-    );
+    assert_eq!(rows_of(&logged.graph, "nodes").await, STANDARD_NODES + 1);
     let events = logged_events(&env).await;
     assert!(
         matches!(&events.last().unwrap().payload, LogPayload::NodeWrite(row) if row.id == again.as_str()),

@@ -2497,7 +2497,7 @@ fn cold_start_due(last_cold_start_at: Millis, now: Millis) -> bool {
 fn build_seed(labels: &[String], stored: &[(NodeId, i64)]) -> Vec<usize> {
     let by_id: HashMap<&str, usize> = stored
         .iter()
-        .map(|(id, community)| (id.as_str(), (*community).max(0) as usize))
+        .map(|(id, community)| (id.as_str(), usize::try_from(*community).unwrap_or(0)))
         .collect();
     // Stored ids are non-negative and this is their maximum, so every fresh id
     // below is above all of them.
@@ -6413,7 +6413,10 @@ mod tests {
 
         let seed = build_seed(&labels, &stored);
 
-        let stored_ids: HashSet<usize> = stored.iter().map(|(_, c)| *c as usize).collect();
+        let stored_ids: HashSet<usize> = stored
+            .iter()
+            .map(|(_, c)| usize::try_from(*c).unwrap())
+            .collect();
         let fresh: Vec<usize> = seed[3..].to_vec();
         assert!(
             fresh.iter().all(|f| !stored_ids.contains(f)),

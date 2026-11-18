@@ -1,8 +1,10 @@
 [package]
 name = "liam-model"
 version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
 description = "In-process embedding and generation for liam, via fastembed-rs."
 
 [dependencies]
@@ -64,3 +66,6 @@ cuda = ["candle-core/cuda"]
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true

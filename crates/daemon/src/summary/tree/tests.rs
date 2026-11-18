@@ -425,7 +425,11 @@ fn many_small_changes_leave_the_baseline_until_they_add_up_to_a_full_build() {
 
     // Act
     for n in 0..5 {
-        points.push(point(&format!("new{n}"), axis(n as usize % 3), 30 + n));
+        points.push(point(
+            &format!("new{n}"),
+            axis(usize::try_from(n).unwrap() % 3),
+            30 + n,
+        ));
         let planned = replan(&points, &previous, &state, NOW);
         full_builds.push((planned.full_build, planned.next_state.clone()));
         previous = stored(&planned);

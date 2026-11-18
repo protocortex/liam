@@ -129,6 +129,7 @@ async fn time_queries(store: &DefaultGraph, dims: usize) -> LatencyMs {
     }
     samples.sort();
     let mean = samples.iter().sum::<Duration>() / TIMED_QUERIES as u32;
+    #[allow(clippy::cast_sign_loss, reason = "the percentile is positive")]
     let tail_index = ((samples.len() as f64 * TAIL_PERCENTILE) as usize).min(samples.len() - 1);
     LatencyMs {
         mean: mean.as_secs_f64() * MS_PER_SEC,

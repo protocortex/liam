@@ -24,6 +24,9 @@ episode_retention_days = 30
 interval_hours         = 6
 reclaim                = true
 run_on_start           = false
+max_resynth_per_tick   = 5      # entities re-synthesized per maintenance tick, at most
+full_synthesis_mention_threshold = 8    # live mentions at which a resynthesis gets the full token budget
+full_synthesis_max_new_tokens    = 512  # output token budget for a full-tier resynthesis
 
 # Every write is recorded in an event log before it reaches the database. The
 # database is a projection of that log and `liam rebuild` can recreate it.
@@ -187,6 +190,7 @@ version = ""
 provider  = "local"                      # "local" (in-process) or "mock" (tests and dev)
 model     = "Snowflake/snowflake-arctic-embed-m-v2.0" # int8 ONNX on the CPU; "Qwen/Qwen3-Embedding-0.6B-GGUF" selects Qwen3 on llama.cpp
 cache_dir = "~/.liam/models"       # the embedder's files land here
+device    = "auto"                 # auto | cpu | metal | cuda; not part of the embedder fingerprint
 
 [llm]
 provider        = "llama-cpp"                       # "llama-cpp" (in-process llama.cpp) or "mock" (tests and dev)

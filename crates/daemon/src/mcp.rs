@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! MCP tool surface: `remember`, `recall`, `relate`, `ask`, `clusters`,
-//! `timeline`, and `facts`, wiring the store and the model.
+//! `timeline`, `facts`, `feedback`, `summaries`, `delete`, `consolidate` and
+//! `metrics`, wiring the store and the model.
 //!
 //! VERSION CHECK: the rmcp macro surface (`#[tool_router]`, `#[tool]`,
 //! `#[tool_handler]`, `Parameters`) moves across releases. Confirmed unchanged
-//! from 2.x through rmcp 3.1.2, the version pinned in `Cargo.toml`; re-confirm
-//! against the rmcp version you pin before bumping again.
+//! from 2.x through rmcp 3.9.0, the version `Cargo.lock` resolves; re-confirm
+//! against the rmcp version you resolve before bumping again.
+//!
+//! The daemon sets no cap on the size of an incoming message line. It relies on
+//! rmcp's default of 16 MiB (`DEFAULT_MAX_LINE_LENGTH`, added in 3.6.0), so a
+//! rmcp release that lowers or removes it changes what a client may send.
 
 mod admin;
 #[cfg(test)]

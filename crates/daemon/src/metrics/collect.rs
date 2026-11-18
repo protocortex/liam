@@ -92,6 +92,7 @@ pub fn ece(pairs: &[(f64, bool)], min_pairs: usize, at: Millis) -> Option<Sample
     let mut bins = [(0u64, 0.0f64, 0u64); CALIBRATION_BINS];
     for &(confidence, correct) in pairs {
         let last = CALIBRATION_BINS - 1;
+        #[allow(clippy::cast_sign_loss, reason = "the confidence is clamped to 0..=1")]
         let index = ((confidence.clamp(0.0, 1.0) * CALIBRATION_BINS as f64) as usize).min(last);
         bins[index].0 += 1;
         bins[index].1 += confidence;

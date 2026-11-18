@@ -387,7 +387,7 @@ async fn collect_rows(
         let Some(row) = rows.next().await.map_err(err)? else {
             break;
         };
-        let mut values = Vec::with_capacity(cols as usize);
+        let mut values = Vec::with_capacity(usize::try_from(cols).unwrap_or(0));
         for i in 0..cols {
             values.push(from_libsql(row.get_value(i).map_err(err)?));
         }

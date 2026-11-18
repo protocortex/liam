@@ -70,6 +70,11 @@ impl<B: Backend> Graph<B> {
         self.check_dims(embedding)?;
         let signature = quantize::quantize(embedding)?.bin;
         let bits = embedding.len() as f64;
+        // Config validates the ratio to a fraction, so the cutoff is at most the bit count.
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "the ratio is validated to be positive"
+        )]
         let cutoff = (self.cold_arm.max_hamming_ratio * bits).floor() as u32;
         let mut wanted = pool.saturating_mul(self.cold_arm.oversample);
         let mut passing = Vec::new();

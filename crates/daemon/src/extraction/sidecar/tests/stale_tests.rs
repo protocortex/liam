@@ -181,7 +181,7 @@ fn an_unreadable_port_is_compared_by_exe_and_start_time_only() {
 fn this_process_and_its_parent_are_never_killed_even_when_the_record_matches() {
     // Arrange
     // SAFETY: `getppid` has no preconditions.
-    let parent = unsafe { libc::getppid() } as u32;
+    let parent = unsafe { libc::getppid() }.cast_unsigned();
     let dir = TempDir::new().unwrap();
 
     for pid in [std::process::id(), parent] {
