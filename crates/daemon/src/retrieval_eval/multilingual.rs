@@ -25,6 +25,8 @@ const PAIRS_JSON: &str = include_str!("multilingual/pairs.json");
 const BASELINE_JSON: &str = include_str!("multilingual/baseline-arctic-embed-m-v2-384.json");
 
 const QUERIES_PER_LANGUAGE: usize = 30;
+#[cfg(test)]
+const FACTS_PER_LANGUAGE: usize = 287;
 
 /// A gating language may fall this far below its baseline.
 const LANGUAGE_TOLERANCE: f64 = 0.05;
@@ -239,6 +241,13 @@ fn gate(baseline: &BTreeMap<Language, f64>, measured: &BTreeMap<Language, f64>) 
             reasons.push(format!("{}: no baseline or no score", language.code()));
             continue;
         };
+        if !now.is_finite() {
+            reasons.push(format!(
+                "{}: the score {now} is not a number",
+                language.code()
+            ));
+            continue;
+        }
         baseline_gating.push(base);
         measured_gating.push(now);
         if now < base - LANGUAGE_TOLERANCE - FLOAT_SLACK {
@@ -406,6 +415,7 @@ mod tests {
 
             // Assert
             assert!(data.facts.keys().eq(reference.facts.keys()), "{language:?}");
+            assert_eq!(data.facts.len(), FACTS_PER_LANGUAGE, "{language:?}");
             let query_ids: HashSet<&String> = data.queries.keys().collect();
             let pair_ids: HashSet<&String> = pairs.iter().map(|p| &p.qid).collect();
             assert_eq!(query_ids, pair_ids, "{language:?}");
@@ -514,6 +524,40 @@ mod tests {
         let outcome = gate(&uniform(BASE_SCORE), &measured);
 
         // Assert: the mean drops by less than its own tolerance.
+        assert!(outcome.passed(), "{:?}", outcome.reasons);
+    }
+
+    #[test]
+    fn the_gate_fails_on_a_score_that_is_not_a_number() {
+        for language in Language::GATING {
+            // Arrange
+            let measured = with(uniform(BASE_SCORE), language, f64::NAN);
+
+            // Act
+            let outcome = gate(&uniform(BASE_SCORE), &measured);
+
+            // Assert
+            assert!(!outcome.passed(), "{language:?}");
+            assert!(
+                outcome.reasons[0].starts_with(language.code()),
+                "{:?}",
+                outcome.reasons
+            );
+        }
+    }
+
+    #[test]
+    fn the_gate_passes_a_mean_drop_of_exactly_the_mean_tolerance() {
+        // Arrange: every language drops by the mean tolerance, below its own.
+        let mut measured = uniform(BASE_SCORE);
+        for language in Language::GATING {
+            measured.insert(language, BASE_SCORE - MEAN_TOLERANCE);
+        }
+
+        // Act
+        let outcome = gate(&uniform(BASE_SCORE), &measured);
+
+        // Assert
         assert!(outcome.passed(), "{:?}", outcome.reasons);
     }
 
@@ -634,8 +678,10 @@ mod tests {
         // Arrange
         let mut config = crate::config::Config::default();
         config.embedder.provider = crate::models::LOCAL_PROVIDER.into();
-        if let Ok(dir) = std::env::var(CACHE_DIR_ENV) {
-            config.embedder.cache_dir = dir;
+        if let Some(dir) = std::env::var_os(CACHE_DIR_ENV) {
+            config.embedder.cache_dir = dir
+                .into_string()
+                .unwrap_or_else(|raw| panic!("{CACHE_DIR_ENV} is not valid UTF-8: {raw:?}"));
         }
         let baseline = Baseline::load().unwrap();
         if let Err(message) = baseline.check_matches(&config.embedder.model, config.embedding_dims)
