@@ -84,6 +84,8 @@ All notable changes to LIAM are recorded here. The format follows
 - The daemon now refuses a `gc.episode_retention_days` outside 1 to 36500 and a `gc.interval_hours` outside 1 to 8760
   at config load. Before, `0` days deleted every episode at the next sweep and `0` hours stopped maintenance. A
   maintenance task that ends abnormally is now logged at error level at shutdown.
+- Batch embedding with the default embedder failed above 16 texts. The default embedder now embeds one text per
+  call, so a text gets the same vector alone or in a batch.
 
 ### Upgrading
 
