@@ -34,6 +34,13 @@ pub trait Llm: Send + Sync {
         "mock"
     }
 
+    /// Make the provider ready to answer, so a caller can count tokens and
+    /// start its generation timer afterwards. Default: always ready. A
+    /// provider that loads on first use loads here.
+    async fn ensure_loaded(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Pay a provider's one-time initialization cost before serving traffic.
     /// Default: nothing to do; a real backend pays the cost that makes this
     /// worth calling, e.g. GPU kernel compilation on the first generation.

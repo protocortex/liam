@@ -39,9 +39,8 @@ impl Clock for SystemClock {
     }
 }
 
-/// What every caller waiting on one load receives. The error is text because a
-/// `ModelError` cannot be cloned to each waiter.
-type LoadResult = Result<Arc<dyn Llm>, String>;
+/// What every caller waiting on one load receives.
+type LoadResult = Result<Arc<dyn Llm>, ModelError>;
 
 enum Slot {
     NotLoaded,
@@ -49,7 +48,30 @@ enum Slot {
     Loaded {
         llm: Arc<dyn Llm>,
         last_used: Instant,
+        /// Calls that hold the model right now. The idle unload waits for zero.
+        in_flight: usize,
     },
+}
+
+/// Held for the length of one call. Dropping it, even from a cancelled
+/// future, ends the call and restarts the idle period.
+struct CallGuard {
+    state: Arc<State>,
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        let now = self.state.clock.now();
+        if let Slot::Loaded {
+            last_used,
+            in_flight,
+            ..
+        } = &mut *self.state.lock()
+        {
+            *in_flight = in_flight.saturating_sub(1);
+            *last_used = now;
+        }
+    }
 }
 
 struct State {
@@ -99,8 +121,11 @@ impl LazyLlm {
         let released = {
             let mut slot = self.state.lock();
             match &*slot {
-                Slot::Loaded { last_used, .. }
-                    if self.state.clock.now().saturating_duration_since(*last_used) >= limit =>
+                Slot::Loaded {
+                    last_used,
+                    in_flight: 0,
+                    ..
+                } if self.state.clock.now().saturating_duration_since(*last_used) >= limit =>
                 {
                     std::mem::replace(&mut *slot, Slot::NotLoaded)
                 }
@@ -137,32 +162,41 @@ impl LazyLlm {
         }))
     }
 
-    /// The loaded model, loading it first when absent. Concurrent callers share
-    /// one load.
-    async fn acquire(&self) -> Result<Arc<dyn Llm>, ModelError> {
-        let mut pending = {
-            let mut slot = self.state.lock();
-            match &mut *slot {
-                Slot::Loaded { llm, last_used } => {
-                    *last_used = self.state.clock.now();
-                    return Ok(Arc::clone(llm));
+    /// The loaded model and a guard that keeps it from being unloaded, loading
+    /// the model first when absent. Concurrent callers share one load.
+    async fn acquire(&self) -> Result<(Arc<dyn Llm>, CallGuard), ModelError> {
+        loop {
+            let mut pending = {
+                let mut slot = self.state.lock();
+                match &mut *slot {
+                    Slot::Loaded {
+                        llm,
+                        last_used,
+                        in_flight,
+                    } => {
+                        *in_flight += 1;
+                        *last_used = self.state.clock.now();
+                        let guard = CallGuard {
+                            state: Arc::clone(&self.state),
+                        };
+                        return Ok((Arc::clone(llm), guard));
+                    }
+                    Slot::Loading(pending) => pending.clone(),
+                    Slot::NotLoaded => {
+                        let pending = self.start_load();
+                        *slot = Slot::Loading(pending.clone());
+                        pending
+                    }
                 }
-                Slot::Loading(pending) => pending.clone(),
-                Slot::NotLoaded => {
-                    let pending = self.start_load();
-                    *slot = Slot::Loading(pending.clone());
-                    pending
-                }
-            }
-        };
-        let outcome = pending
-            .wait_for(|result| result.is_some())
-            .await
-            .map_err(|_| ModelError::Llm("the model load stopped before it finished".into()))?
-            .clone();
-        outcome
-            .expect("wait_for returned a finished load")
-            .map_err(ModelError::Llm)
+            };
+            let outcome = pending
+                .wait_for(|result| result.is_some())
+                .await
+                .map_err(|_| ModelError::Llm("the model load stopped before it finished".into()))?
+                .clone();
+            outcome.expect("wait_for returned a finished load")?;
+            // Loaded: take the model through the slot so the call is counted.
+        }
     }
 
     /// Run the loader on a blocking thread, as its own task. The task records
@@ -175,14 +209,16 @@ impl LazyLlm {
             let started = Instant::now();
             let loader = Arc::clone(&state.loader);
             let result: LoadResult = match tokio::task::spawn_blocking(move || loader()).await {
-                Ok(Ok(llm)) => Ok(llm),
-                Ok(Err(ModelError::Llm(message) | ModelError::Embed(message))) => Err(message),
-                Err(error) => Err(format!("the model load task failed: {error}")),
+                Ok(result) => result,
+                Err(error) => Err(ModelError::Llm(format!(
+                    "the model load task failed: {error}"
+                ))),
             };
             *state.lock() = match &result {
                 Ok(llm) => Slot::Loaded {
                     llm: Arc::clone(llm),
                     last_used: state.clock.now(),
+                    in_flight: 0,
                 },
                 Err(_) => Slot::NotLoaded,
             };
@@ -196,14 +232,6 @@ impl LazyLlm {
         pending
     }
 
-    /// Mark the model as just used, so the idle period counts from the end of
-    /// a call and not from its start.
-    fn touch(&self) {
-        if let Slot::Loaded { last_used, .. } = &mut *self.state.lock() {
-            *last_used = self.state.clock.now();
-        }
-    }
-
     fn loaded(&self) -> Option<Arc<dyn Llm>> {
         match &*self.state.lock() {
             Slot::Loaded { llm, .. } => Some(Arc::clone(llm)),
@@ -215,10 +243,8 @@ impl LazyLlm {
 #[async_trait]
 impl Llm for LazyLlm {
     async fn complete(&self, system: &str, prompt: &str) -> liam_model::Result<String> {
-        let llm = self.acquire().await?;
-        let reply = llm.complete(system, prompt).await;
-        self.touch();
-        reply
+        let (llm, _call) = self.acquire().await?;
+        llm.complete(system, prompt).await
     }
 
     async fn complete_capped(
@@ -227,10 +253,8 @@ impl Llm for LazyLlm {
         prompt: &str,
         max_new_tokens: usize,
     ) -> liam_model::Result<String> {
-        let llm = self.acquire().await?;
-        let reply = llm.complete_capped(system, prompt, max_new_tokens).await;
-        self.touch();
-        reply
+        let (llm, _call) = self.acquire().await?;
+        llm.complete_capped(system, prompt, max_new_tokens).await
     }
 
     fn backend(&self) -> &'static str {
@@ -238,10 +262,12 @@ impl Llm for LazyLlm {
     }
 
     async fn warmup(&self) -> liam_model::Result<()> {
-        let llm = self.acquire().await?;
-        let result = llm.warmup().await;
-        self.touch();
-        result
+        let (llm, _call) = self.acquire().await?;
+        llm.warmup().await
+    }
+
+    async fn ensure_loaded(&self) -> liam_model::Result<()> {
+        self.acquire().await.map(|_| ())
     }
 
     /// Counts only while the model is loaded. Loading is blocking and this call
@@ -294,6 +320,7 @@ mod tests {
         dropped: Arc<AtomicBool>,
         gate: Option<Mutex<mpsc::Receiver<()>>>,
         started: Option<mpsc::Sender<()>>,
+        hang: bool,
     }
 
     impl Drop for Inner {
@@ -311,6 +338,9 @@ mod tests {
             if let Some(gate) = &self.gate {
                 let gate = gate.lock().unwrap();
                 tokio::task::block_in_place(|| gate.recv().unwrap());
+            }
+            if self.hang {
+                std::future::pending::<()>().await;
             }
             Ok(REPLY.to_string())
         }
@@ -350,6 +380,7 @@ mod tests {
                     dropped: Arc::clone(&dropped),
                     gate: None,
                     started: None,
+                    hang: false,
                 }) as Arc<dyn Llm>)
             })
         };
@@ -499,9 +530,24 @@ mod tests {
         assert!(fixture.dropped.load(Ordering::SeqCst));
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_call_in_flight_finishes_and_the_model_is_freed_after_it_ends() {
-        // Arrange: a model whose call blocks until released.
+    fn calls_in_flight(lazy: &LazyLlm) -> usize {
+        match &*lazy.state.lock() {
+            Slot::Loaded { in_flight, .. } => *in_flight,
+            _ => 0,
+        }
+    }
+
+    /// A lazy wrapper whose model blocks (or hangs) inside a call and reports
+    /// when the call has started.
+    fn blocking_lazy(
+        hang: bool,
+    ) -> (
+        Arc<LazyLlm>,
+        Arc<FakeClock>,
+        Arc<AtomicBool>,
+        mpsc::Sender<()>,
+        mpsc::Receiver<()>,
+    ) {
         let (release, gate) = mpsc::channel();
         let (started_tx, started) = mpsc::channel();
         let dropped = Arc::new(AtomicBool::new(false));
@@ -513,12 +559,25 @@ mod tests {
             Arc::new(move || {
                 Ok(Arc::new(Inner {
                     dropped: Arc::clone(&dropped),
-                    gate: gate.lock().unwrap().take().map(Mutex::new),
+                    gate: gate
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .filter(|_| !hang)
+                        .map(Mutex::new),
                     started: started_tx.lock().unwrap().take(),
+                    hang,
                 }) as Arc<dyn Llm>)
             })
         };
         let lazy = Arc::new(LazyLlm::with_clock(loader, "test", clock.clone()));
+        (lazy, clock, dropped, release, started)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_in_flight_blocks_the_unload_until_it_ends() {
+        // Arrange: a model whose call blocks until released.
+        let (lazy, clock, dropped, release, started) = blocking_lazy(false);
         let caller = {
             let lazy = Arc::clone(&lazy);
             tokio::spawn(async move { lazy.complete("s", "p").await })
@@ -529,16 +588,58 @@ mod tests {
         clock.advance(Duration::from_secs(IDLE_SECS));
 
         // Act: the tick runs while the call is still inside the model.
-        let unloaded = lazy.unload_if_idle(IDLE_SECS);
-        let freed_during_call = dropped.load(Ordering::SeqCst);
+        let unloaded_during_call = lazy.unload_if_idle(IDLE_SECS);
         release.send(()).unwrap();
         let reply = caller.await.unwrap();
+        let unloaded_at_once = lazy.unload_if_idle(IDLE_SECS);
+        clock.advance(Duration::from_secs(IDLE_SECS));
+        let unloaded_after_limit = lazy.unload_if_idle(IDLE_SECS);
 
         // Assert
-        assert!(unloaded);
-        assert!(!freed_during_call, "the call still holds the model");
+        assert!(!unloaded_during_call, "a call is still using the model");
         assert_eq!(reply.unwrap(), REPLY);
-        assert!(dropped.load(Ordering::SeqCst), "freed once the call ended");
+        assert!(!unloaded_at_once, "the idle period restarts when the call ends");
+        assert!(unloaded_after_limit);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_call_leaves_no_call_in_flight_and_the_model_unloads() {
+        // Arrange: a call that never finishes, then cancelled mid-flight.
+        let (lazy, clock, dropped, _release, started) = blocking_lazy(true);
+        let caller = {
+            let lazy = Arc::clone(&lazy);
+            tokio::spawn(async move { lazy.complete("s", "p").await })
+        };
+        tokio::task::spawn_blocking(move || started.recv().unwrap())
+            .await
+            .unwrap();
+        let during = calls_in_flight(&lazy);
+
+        // Act
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        clock.advance(Duration::from_secs(IDLE_SECS));
+        let unloaded = lazy.unload_if_idle(IDLE_SECS);
+
+        // Assert
+        assert_eq!(during, 1);
+        assert_eq!(calls_in_flight(&lazy), 0);
+        assert!(unloaded);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_load_error_keeps_its_variant() {
+        // Arrange
+        let loader: Loader = Arc::new(|| Err(ModelError::Embed("bad vectors".into())));
+        let lazy = LazyLlm::new(loader, "test");
+
+        // Act
+        let error = lazy.ensure_loaded().await.unwrap_err();
+
+        // Assert
+        assert!(matches!(error, ModelError::Embed(message) if message == "bad vectors"));
     }
 
     #[tokio::test]

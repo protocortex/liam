@@ -3,7 +3,7 @@
 
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ModelError {
     #[error("embedder: {0}")]
     Embed(String),
