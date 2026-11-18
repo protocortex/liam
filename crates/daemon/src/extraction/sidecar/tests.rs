@@ -40,6 +40,8 @@ const FAKE_BIND_FAIL_CODE: i32 = 4;
 const FAKE_READY_FILE: &str = "FAKE_READY_FILE";
 const GONE_POLL: Duration = Duration::from_millis(20);
 const GONE_WAIT: Duration = Duration::from_secs(5);
+/// How long a re-run of this test binary may take before it is killed.
+const RERUN_DEADLINE: Duration = Duration::from_secs(60);
 const CHAT_BODY: &str = r#"{"choices":[{"message":{"content":"{}"}}]}"#;
 const LOOPBACK: &str = "127.0.0.1";
 const LEAK_PROBE: &str = "LIAM_TEST_SIDECAR_LEAK";
@@ -120,6 +122,46 @@ async fn started(factory: impl Fn(&LaunchParams) -> Command) -> SidecarGuard {
 fn process_exists(pid: u32) -> bool {
     // SAFETY: signal 0 only checks that the pid exists; a zombie still counts.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Runs `command` and collects its output, killing it and failing the test
+/// when it is still running after `deadline`.
+fn output_within(mut command: Command, deadline: Duration) -> std::process::Output {
+    use std::io::Read;
+
+    fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    }
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
+    let give_up = Instant::now() + deadline;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= give_up {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let printed = String::from_utf8_lossy(&stdout.join().unwrap()).into_owned();
+            panic!("the re-run of the test binary was still running after {deadline:?} and was killed:\n{printed}");
+        }
+        std::thread::sleep(GONE_POLL);
+    };
+    std::process::Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
 }
 
 fn wait_until_gone(pid: u32) -> bool {
@@ -252,15 +294,27 @@ fn serve(stream: TcpStream, mode: &str, keys: &str, alias: &str) {
 }
 
 #[test]
+#[should_panic(expected = "was killed")]
+fn a_rerun_that_outlives_its_deadline_is_killed_and_fails_the_test() {
+    // Arrange
+    const RUNS_FOR_SECS: &str = "30";
+    const SHORT_DEADLINE: Duration = Duration::from_millis(100);
+    let mut sleeper = Command::new("sleep");
+    sleeper.arg(RUNS_FOR_SECS);
+
+    // Act
+    output_within(sleeper, SHORT_DEADLINE);
+}
+
+#[test]
 fn the_entry_constant_names_a_real_test() {
     // Arrange
     let exe = std::env::current_exe().unwrap();
 
     // Act
-    let listing = Command::new(exe)
-        .args(["--list", "--exact", ENTRY_TEST])
-        .output()
-        .unwrap();
+    let mut list = Command::new(exe);
+    list.args(["--list", "--exact", ENTRY_TEST]);
+    let listing = output_within(list, RERUN_DEADLINE);
 
     // Assert
     let text = String::from_utf8_lossy(&listing.stdout);
@@ -786,9 +840,39 @@ fn a_secret_cut_by_the_cap_leaves_no_fragment() {
     assert!(!text.contains("DEFGH"), "a fragment of the secret survived");
 }
 
+const LEAK_ENTRY_TEST: &str = "extraction::sidecar::tests::leak_probe_entry";
+const LEAK_CHECKED_LINE: &str = "leak probe checked";
+
+/// The parent gives its child a variable outside the allowlist through
+/// `Command::env`, so this process's own environment is never written.
 #[test]
 fn the_child_inherits_only_the_allowlist_and_its_own_secrets() {
     // Arrange
+    let mut rerun = std::process::Command::new(std::env::current_exe().unwrap());
+    rerun
+        .args([
+            "--exact",
+            LEAK_ENTRY_TEST,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(LEAK_PROBE, "leaked");
+
+    // Act
+    let output = output_within(rerun, RERUN_DEADLINE);
+
+    // Assert
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{printed}");
+    assert!(printed.contains(LEAK_CHECKED_LINE), "{printed}");
+}
+
+/// Runs only as the child of the test above, where the probe variable is set.
+#[test]
+fn leak_probe_entry() {
+    if std::env::var_os(LEAK_PROBE).is_none() {
+        return;
+    }
     let dir = TempDir::new().unwrap();
     let script = dir.path().join("print-env");
     std::fs::write(&script, "#!/bin/sh\nenv\n").unwrap();
@@ -803,14 +887,11 @@ fn the_child_inherits_only_the_allowlist_and_its_own_secrets() {
         probe_key: "the-probe",
         key: "the-key",
     };
-    std::env::set_var(LEAK_PROBE, "leaked");
 
-    // Act
     let output = server_command(&ExtractionConfig::default(), &paths, &launch)
         .output()
         .unwrap();
 
-    // Assert
     let printed = String::from_utf8_lossy(&output.stdout);
     assert!(
         printed.contains("LLAMA_API_KEY=the-probe,the-key"),
@@ -818,6 +899,7 @@ fn the_child_inherits_only_the_allowlist_and_its_own_secrets() {
     );
     assert!(printed.contains("PATH="), "{printed}");
     assert!(!printed.contains(LEAK_PROBE), "{printed}");
+    println!("{LEAK_CHECKED_LINE}");
 }
 
 #[test]

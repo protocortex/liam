@@ -5,6 +5,8 @@
 use crate::ids::Millis;
 use std::sync::Mutex;
 
+use crate::sync::lock;
+
 pub trait Clock: Send + Sync {
     fn now(&self) -> Millis;
 }
@@ -26,12 +28,38 @@ impl FixedClock {
         Self(Mutex::new(at))
     }
     pub fn set(&self, at: Millis) {
-        *self.0.lock().expect("clock poisoned") = at;
+        *lock(&self.0) = at;
     }
 }
 
 impl Clock for FixedClock {
     fn now(&self) -> Millis {
-        *self.0.lock().expect("clock poisoned")
+        *lock(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_poisoned_clock_still_reads_and_moves() {
+        // Arrange
+        let clock = FixedClock::new(Millis(1));
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = clock.0.lock().unwrap();
+                    panic!("poison the clock");
+                })
+                .join();
+        });
+        assert!(clock.0.is_poisoned());
+
+        // Act
+        clock.set(Millis(7));
+
+        // Assert
+        assert_eq!(clock.now(), Millis(7));
     }
 }

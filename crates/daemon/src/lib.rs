@@ -38,6 +38,7 @@ pub mod fetch;
 pub mod lazy_llm;
 pub mod models;
 pub mod retrieval_eval;
+pub mod state_dir;
 pub mod store_open;
 pub mod storelock;
 pub mod telemetry;

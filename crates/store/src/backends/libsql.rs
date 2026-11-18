@@ -12,7 +12,7 @@
 //! `execute` stay inline so there is no cancellation point between a log
 //! append and its commit.
 
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,6 +24,7 @@ use crate::backend::{Backend, BackendTx, CheckpointMode, CheckpointResult};
 use crate::error::{Error, Result};
 use crate::graph::scope_within;
 use crate::ids::{Millis, NodeId, FOREVER};
+use crate::sync::lock;
 use crate::types::Derivation;
 use crate::value::{Row, Value};
 
@@ -74,11 +75,6 @@ const VECTOR_DROP_SQL: &str = "DROP TABLE IF EXISTS node_vectors";
 /// unrecognised spelling must cost performance, never correctness.
 fn can_pool_reads(path: &str) -> bool {
     path != ":memory:" && !path.starts_with("file:")
-}
-
-/// Locks a std mutex, recovering the data if a panicking read poisoned it.
-fn lock<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Read connections, one semaphore permit per connection: a read waits for

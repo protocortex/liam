@@ -95,6 +95,8 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 raunch = "1.0.1"
 
 [dev-dependencies]
+# Mode tests run file creation under a chosen umask.
+liam-log = { path = "../log", features = ["test-support"] }
 # Tests build typed hits and text without a store.
 liam-store = { path = "../store", features = ["test-support"] }
 # storelock tests need an isolated, disposable directory per test.

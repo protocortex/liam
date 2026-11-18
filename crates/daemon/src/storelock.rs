@@ -11,8 +11,10 @@
 //! A process takes it once, before its first store open. Taking it again in the
 //! same process fails against itself.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
+
+use liam_log::private_fs::{create_private_dir_all, private_file_options};
 
 /// Holds the exclusive lock on `<database_path>.lock` for as long as it is
 /// alive. Dropping it releases the lock immediately, since the OS unlocks on
@@ -38,7 +40,7 @@ impl StoreLock {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            std::fs::create_dir_all(parent).map_err(|source| {
+            create_private_dir_all(parent).map_err(|source| {
                 anyhow::anyhow!(
                     "failed to create the database directory {}: {source}",
                     parent.display()
@@ -46,7 +48,7 @@ impl StoreLock {
             })?;
         }
         let lock_path = lock_path_for(database_path);
-        let file = OpenOptions::new()
+        let file = private_file_options()
             .create(true)
             .truncate(false)
             .write(true)
@@ -110,6 +112,27 @@ fn lock_failure_message(lock_path: &Path, error: &std::fs::TryLockError) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_state_directory_and_the_lock_file_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Arrange
+        let root = tempfile::tempdir().expect("temp dir");
+        let state = root.path().join("state");
+        let database_path = state.join("liam.db");
+
+        // Act: a mask that hides nothing, so only the explicit modes can narrow
+        let _lock = liam_log::private_fs::with_umask(0, || {
+            StoreLock::acquire(&database_path).expect("acquire")
+        });
+
+        // Assert
+        let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&state), 0o700);
+        assert_eq!(mode_of(&lock_path_for(&database_path)), 0o600);
+    }
 
     #[test]
     fn acquiring_with_no_lock_held_succeeds() {

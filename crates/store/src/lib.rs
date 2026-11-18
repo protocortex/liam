@@ -9,6 +9,7 @@
 mod graph;
 mod migrate;
 mod schema;
+mod sync;
 
 pub mod backend;
 pub mod backends;

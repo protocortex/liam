@@ -13,7 +13,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 
 use super::http::{self, Limits, Request};
 use crate::config::ExtractionConfig;
+use crate::sync::lock;
 use stale::{Pidfile, ProcessTable, SweepOutcome, SystemProcesses};
 
 pub mod stale;
@@ -280,10 +281,6 @@ impl StderrTail {
         }
         text
     }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A cheap view of whether the child still runs, for code that does not own
