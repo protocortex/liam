@@ -42,7 +42,8 @@ const CRC_BYTES: usize = 4;
 pub(crate) const HEADER_BYTES: usize = LENGTH_PREFIX_BYTES + 2 * CRC_BYTES;
 const SEQUENCE_DIGITS: usize = 20;
 
-/// Why a WAL operation failed.
+/// Why a WAL operation failed. `Display` includes the cause on purpose,
+/// because most callers print the plain form.
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
     #[error("wal io failed: {0}")]

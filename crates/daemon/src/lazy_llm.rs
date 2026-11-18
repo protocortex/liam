@@ -209,9 +209,7 @@ impl LazyLlm {
             let loader = Arc::clone(&state.loader);
             let result: LoadResult = match tokio::task::spawn_blocking(move || loader()).await {
                 Ok(result) => result,
-                Err(error) => Err(ModelError::Llm(format!(
-                    "the model load task failed: {error}"
-                ))),
+                Err(error) => Err(ModelError::llm_failed("the model load task failed", error)),
             };
             *state.lock() = match &result {
                 Ok(llm) => Slot::Loaded {

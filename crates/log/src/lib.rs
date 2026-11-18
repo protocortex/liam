@@ -19,6 +19,9 @@ pub mod private_fs;
 pub mod reader;
 pub mod wal;
 
+#[cfg(test)]
+mod error_chain_tests;
+
 use std::fmt;
 
 use uuid::Uuid;

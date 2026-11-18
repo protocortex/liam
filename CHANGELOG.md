@@ -20,6 +20,9 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- Errors from the store, the log, the models and the sidecar now keep their underlying error as a source. The
+  store can report a busy or locked database apart from other engine failures, and the dedup step logs one
+  warning when embedding fails.
 - The toolchain is pinned to Rust 1.99.1 in `rust-toolchain.toml`, CI installs it from that file, and the
   workspace declares a minimum Rust version of 1.89.
 - The answer LLM now loads on first use and unloads after 5 minutes idle, so a daemon nobody is asking holds

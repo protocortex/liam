@@ -53,9 +53,12 @@ const STDERR_CAP_BYTES: usize = 16 * 1024;
 const STDERR_READ_CHUNK: usize = 4096;
 const REDACTED: &str = "[redacted]";
 const EXECUTABLE_BITS: u32 = 0o111;
+const START_TIMEOUT_TOO_LARGE: &str = "extraction.start_timeout_secs is too large to add to now";
+const CHILD_NOT_INSPECTABLE: &str = "the started sidecar has no process record to read";
 
 /// Why the sidecar could not be started. Carries no event text or secret.
-#[derive(Debug, PartialEq, Eq)]
+/// `Display` includes the cause on purpose, because most callers print the plain form.
+#[derive(Debug)]
 pub enum SidecarError {
     /// A configured path is missing or unusable; names the config key.
     BadPath {
@@ -67,8 +70,8 @@ pub enum SidecarError {
         budget_mb: u64,
     },
     /// No random bytes, no loopback address, or no free port.
-    Setup(io::ErrorKind),
-    Spawn(io::ErrorKind),
+    Setup(Box<dyn std::error::Error + Send + Sync>),
+    Spawn(io::Error),
     /// The child ended before it was ready; `None` means a signal killed it.
     Exited(Option<i32>),
     StartTimeout,
@@ -82,8 +85,8 @@ impl fmt::Display for SidecarError {
                 f,
                 "{free_mb} MB of RAM is free, below extraction.ram_budget_mb of {budget_mb} MB"
             ),
-            Self::Setup(kind) => write!(f, "could not prepare the sidecar start: {kind}"),
-            Self::Spawn(kind) => write!(f, "could not start the sidecar process: {kind}"),
+            Self::Setup(source) => write!(f, "could not prepare the sidecar start: {source}"),
+            Self::Spawn(source) => write!(f, "could not start the sidecar process: {source}"),
             Self::Exited(Some(code)) => write!(f, "the sidecar exited with code {code} at start"),
             Self::Exited(None) => write!(f, "the sidecar was killed by a signal at start"),
             Self::StartTimeout => write!(f, "the sidecar was not ready in time"),
@@ -91,7 +94,15 @@ impl fmt::Display for SidecarError {
     }
 }
 
-impl std::error::Error for SidecarError {}
+impl std::error::Error for SidecarError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Setup(source) => Some(source.as_ref()),
+            Self::Spawn(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Free memory, behind a trait so a test can set it.
 pub trait FreeRam: Send {
@@ -140,7 +151,7 @@ impl Deps {
 fn free_loopback_port(host: &str) -> io::Result<u16> {
     let ip: IpAddr = host
         .parse()
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     // The port is released before the child binds it; a lost race shows as an
     // early exit and is retried.
     Ok(TcpListener::bind((ip, 0))?.local_addr()?.port())
@@ -178,6 +189,10 @@ impl Paths {
         }
         Ok(Self { server, model })
     }
+}
+
+fn setup_failure(reason: &'static str) -> SidecarError {
+    SidecarError::Setup(Box::new(io::Error::other(reason)))
 }
 
 fn bad_path(key: &'static str, why: &'static str) -> SidecarError {
@@ -367,13 +382,13 @@ impl SidecarGuard {
         let ip: IpAddr = config
             .host
             .parse()
-            .map_err(|_| SidecarError::Setup(io::ErrorKind::InvalidInput))?;
+            .map_err(|e: std::net::AddrParseError| SidecarError::Setup(Box::new(e)))?;
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(config.start_timeout_secs))
-            .ok_or(SidecarError::Setup(io::ErrorKind::InvalidInput))?;
+            .ok_or_else(|| setup_failure(START_TIMEOUT_TOO_LARGE))?;
         let (key, alias) = (random_hex(KEY_BYTES)?, random_hex(ALIAS_BYTES)?);
         for attempt in 1..=MAX_START_ATTEMPTS {
-            let port = (deps.next_port)().map_err(|e| SidecarError::Setup(e.kind()))?;
+            let port = (deps.next_port)().map_err(|e| SidecarError::Setup(Box::new(e)))?;
             // Fresh per attempt, so a listener that kept one learns nothing
             // about the next.
             let probe_key = random_hex(KEY_BYTES)?;
@@ -407,7 +422,7 @@ impl SidecarGuard {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|e| SidecarError::Spawn(e.kind()))?;
+        let mut child = command.spawn().map_err(SidecarError::Spawn)?;
         let stderr = Arc::new(Mutex::new(StderrTail::default()));
         if let Some(pipe) = child.stderr.take() {
             capture_stderr(pipe, Arc::clone(&stderr));
@@ -431,7 +446,7 @@ impl SidecarGuard {
         let start_time = recorder
             .processes
             .inspect(guard.pid)
-            .ok_or(SidecarError::Setup(io::ErrorKind::NotFound))?
+            .ok_or_else(|| setup_failure(CHILD_NOT_INSPECTABLE))?
             .start_time;
         let record = Pidfile {
             pid: guard.pid,
@@ -440,7 +455,7 @@ impl SidecarGuard {
         };
         record
             .write(recorder.pidfile)
-            .map_err(|e| SidecarError::Setup(e.kind()))?;
+            .map_err(|e| SidecarError::Setup(Box::new(e)))?;
         match guard.wait_ready(deadline).await {
             Ok(()) => {
                 info!(pid = guard.pid, port = guard.addr.port(), "sidecar ready");
@@ -604,7 +619,7 @@ fn random_hex(len: usize) -> Result<String, SidecarError> {
     let mut bytes = vec![0u8; len];
     std::fs::File::open(Path::new(URANDOM))
         .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|e| SidecarError::Setup(e.kind()))?;
+        .map_err(|e| SidecarError::Setup(Box::new(e)))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
