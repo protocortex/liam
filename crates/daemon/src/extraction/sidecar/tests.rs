@@ -923,7 +923,7 @@ fn the_random_values_differ_and_are_hex() {
 mod provider_tests;
 
 #[tokio::test]
-async fn a_host_that_is_not_an_address_fails_setup_and_keeps_the_parse_error() {
+async fn a_host_that_is_not_an_address_fails_setup_and_shows_the_parse_error() {
     // Arrange
     let (factory, spawns) = fake("", None);
     let config = ExtractionConfig {
@@ -944,6 +944,19 @@ async fn a_host_that_is_not_an_address_fails_setup_and_keeps_the_parse_error() {
         source.to_string().contains("invalid IP address"),
         "{source}"
     );
-    assert!(!error.to_string().contains("invalid IP address"), "{error}");
+    assert!(error.to_string().contains("invalid IP address"), "{error}");
     assert_eq!(spawns.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_spawn_failure_keeps_the_io_error_and_prints_it() {
+    // Arrange
+    let error = SidecarError::Spawn(std::io::Error::other("no such binary"));
+
+    // Act
+    let text = error.to_string();
+
+    // Assert
+    assert!(std::error::Error::source(&error).is_some());
+    assert_eq!(text, "could not start the sidecar process: no such binary");
 }

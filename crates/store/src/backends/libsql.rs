@@ -917,7 +917,7 @@ mod tests {
         let holder = open().await;
         let waiter = open().await;
         holder.execute("BEGIN IMMEDIATE", ()).await.unwrap();
-        waiter.execute("PRAGMA busy_timeout = 0", ()).await.ok();
+        waiter.query("PRAGMA busy_timeout = 0", ()).await.unwrap();
 
         // Act
         let refused = waiter.execute("BEGIN IMMEDIATE", ()).await.unwrap_err();
@@ -927,7 +927,7 @@ mod tests {
         assert!(mapped.is_busy(), "{mapped:?}");
         let source = std::error::Error::source(&mapped).expect("the engine error is kept");
         assert!(source.to_string().contains("locked"), "{source}");
-        assert!(!mapped.to_string().contains("locked"), "{mapped}");
+        assert_eq!(mapped.to_string(), format!("backend: {source}"));
     }
 
     #[test]

@@ -93,7 +93,7 @@ pub struct KeyHints {
 pub enum SealError {
     #[error(transparent)]
     Crypto(#[from] CryptoError),
-    #[error("row of event {event_id} could not be encoded")]
+    #[error("row of event {event_id} could not be encoded: {source}")]
     Encode {
         event_id: String,
         source: postcard::Error,
@@ -106,7 +106,7 @@ pub enum OpenError {
     KeyMissing { key_id: KeyId },
     #[error("sealed record {event_id} failed authentication: it was altered or moved")]
     Authentication { event_id: String },
-    #[error("sealed record {event_id} holds a row that could not be decoded")]
+    #[error("sealed record {event_id} holds a row that could not be decoded: {source}")]
     Decode {
         event_id: String,
         source: postcard::Error,

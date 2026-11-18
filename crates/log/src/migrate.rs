@@ -33,7 +33,7 @@ const ZERO_CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrateError {
-    #[error("log io failed")]
+    #[error("log io failed: {0}")]
     Io(#[from] io::Error),
     #[error(transparent)]
     Wal(#[from] WalError),

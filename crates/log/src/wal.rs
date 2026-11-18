@@ -42,18 +42,19 @@ const CRC_BYTES: usize = 4;
 pub(crate) const HEADER_BYTES: usize = LENGTH_PREFIX_BYTES + 2 * CRC_BYTES;
 const SEQUENCE_DIGITS: usize = 20;
 
-/// Why a WAL operation failed.
+/// Why a WAL operation failed. `Display` includes the cause on purpose,
+/// because most callers print the plain form.
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
-    #[error("wal io failed")]
+    #[error("wal io failed: {0}")]
     Io(#[from] io::Error),
-    #[error("wal record could not be encoded")]
+    #[error("wal record could not be encoded: {0}")]
     Encode(#[from] EventError),
     #[error("wal record of {0} bytes exceeds the 4 byte length prefix")]
     RecordTooLarge(usize),
     #[error("wal segment {} has a corrupt record at offset {offset}", segment.display())]
     Corrupt { segment: PathBuf, offset: u64 },
-    #[error("wal segment {} has an undecodable record at offset {offset}", segment.display())]
+    #[error("wal segment {} has an undecodable record at offset {offset}: {source}", segment.display())]
     Decode {
         segment: PathBuf,
         offset: u64,
@@ -74,7 +75,7 @@ pub enum WalError {
     )]
     LogInUse { dir: PathBuf },
     #[error(
-        "the log in {} could not be locked; the filesystem may not support \
+        "the log in {} could not be locked ({source}); the filesystem may not support \
          advisory locks, which network mounts often lack, so keep the log on a local disk",
         dir.display()
     )]

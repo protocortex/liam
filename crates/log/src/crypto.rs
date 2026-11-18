@@ -66,7 +66,7 @@ pub enum CryptoError {
     Random(String),
     #[error("registry record could not be decoded: {0}")]
     Decode(postcard::Error),
-    #[error("key storage io failed")]
+    #[error("key storage io failed: {0}")]
     Io(#[from] io::Error),
 }
 

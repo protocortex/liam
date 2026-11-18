@@ -3,6 +3,8 @@
 //! `Engine`, which keeps the native error as a boxed source, or into
 //! `Backend(String)` when the failure is built from text only, so the crate's
 //! public API does not name any one engine's error type.
+//!
+//! `Display` includes the cause on purpose, because most callers print the plain form.
 
 use thiserror::Error;
 
@@ -13,14 +15,14 @@ pub enum Error {
 
     /// The engine failed a statement. The source is the engine's own error;
     /// `busy` is true when it means the database was busy or locked.
-    #[error("database engine failed")]
+    #[error("backend: {source}")]
     Engine {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
         busy: bool,
     },
 
-    #[error("serialize attributes")]
+    #[error("serialize attributes: {0}")]
     Attributes(#[from] serde_json::Error),
 
     #[error("embedding dimension mismatch: expected {expected}, got {got}")]
@@ -103,7 +105,7 @@ pub enum Error {
 
     /// The event log refused an append. The source keeps the writer's own
     /// error, so a poisoned writer stays distinguishable from an I/O failure.
-    #[error("event log append failed")]
+    #[error("event log append failed: {0}")]
     LogAppend(#[from] liam_log::wal::WalError),
 
     /// A write targets a key group that is being deleted or is deleted.
@@ -146,11 +148,11 @@ pub enum Error {
     },
 
     /// The dedup filter file could not be written.
-    #[error("dedup filter file")]
+    #[error("dedup filter file: {0}")]
     FilterFile(#[from] std::io::Error),
 
     /// The dedup filter could not be sized for the hash index.
-    #[error("dedup filter sizing is invalid")]
+    #[error("dedup filter sizing is invalid: {0}")]
     BloomConfig(#[from] liam_log::dedup::BloomConfigError),
 
     /// The store was last written through a different log, so its cursor
@@ -174,7 +176,7 @@ pub enum Error {
     },
 
     /// The log could not be scanned.
-    #[error("event log read failed")]
+    #[error("event log read failed: {0}")]
     LogRead(#[from] liam_log::reader::ReaderError),
 
     /// Replay found some rows of an event in the store and others missing, which
@@ -285,7 +287,7 @@ pub enum Error {
 
     /// One fact of a batch was refused, so none of the batch was written.
     /// `index` is the fact's position in the batch.
-    #[error("fact {index} of the batch was refused")]
+    #[error("fact {index} of the batch was refused: {source}")]
     FactInBatch {
         index: usize,
         #[source]
@@ -420,7 +422,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_wrapped_cause_is_the_source_and_is_not_repeated_in_the_message() {
+    fn a_wrapped_cause_is_the_source_and_is_in_the_plain_text() {
         // Arrange
         let cause = std::io::Error::other("disk is full");
 
@@ -430,8 +432,7 @@ mod tests {
         // Assert
         let source = std::error::Error::source(&error).expect("the io error is the source");
         assert!(source.to_string().contains("disk is full"));
-        assert!(!error.to_string().contains("disk is full"), "{error}");
-        assert_eq!(chain(&error).matches("disk is full").count(), 1);
+        assert!(error.to_string().contains("disk is full"), "{error}");
     }
 
     #[test]
@@ -443,16 +444,12 @@ mod tests {
         };
 
         // Act
-        let text = chain(&error);
+        let text = error.to_string();
 
         // Assert
         let source = std::error::Error::source(&error).expect("the inner error is the source");
         assert!(source.to_string().contains("at least one source event"));
-        assert_eq!(
-            text.matches("at least one source event").count(),
-            1,
-            "{text}"
-        );
+        assert!(text.contains("at least one source event"), "{text}");
     }
 
     #[test]
@@ -468,25 +465,30 @@ mod tests {
         };
 
         // Act
-        let chains = (chain(&busy), chain(&other));
+        let texts = (busy.to_string(), other.to_string());
 
         // Assert
         assert!(busy.is_busy());
         assert!(!other.is_busy());
         assert!(std::error::Error::source(&busy).is_some());
-        assert_eq!(chains.0, "database engine failed: database is locked");
+        assert!(texts.0.contains("database is locked"), "{}", texts.0);
+        assert!(texts.1.contains("disk image is malformed"), "{}", texts.1);
         assert!(!Error::Backend("database is locked".into()).is_busy());
     }
 
-    /// The text `{:#}` prints for an `anyhow` wrapper: each cause once, joined by `: `.
-    fn chain(error: &dyn std::error::Error) -> String {
-        let mut parts = vec![error.to_string()];
-        let mut next = error.source();
-        while let Some(cause) = next {
-            parts.push(cause.to_string());
-            next = cause.source();
-        }
-        parts.join(": ")
+    #[test]
+    fn a_locked_database_prints_the_text_it_always_did() {
+        // Arrange
+        let error = Error::Engine {
+            source: Box::new(std::io::Error::other("database is locked")),
+            busy: true,
+        };
+
+        // Act
+        let text = error.to_string();
+
+        // Assert
+        assert_eq!(text, "backend: database is locked");
     }
 
     #[test]

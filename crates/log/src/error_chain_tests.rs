@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Each error that wraps a cause keeps it as the source, and its own message
-//! stays short so `{:#}` prints the cause once.
+//! Each error that wraps a cause keeps it as the source, and its plain text
+//! also names the cause, because most callers print the plain form.
 
 use std::error::Error;
 use std::io;
@@ -21,22 +21,22 @@ fn io_cause() -> io::Error {
     io::Error::other(CAUSE)
 }
 
-/// The text `{:#}` prints for an `anyhow` wrapper: each cause once, joined by `: `.
-fn chain(error: &dyn Error) -> String {
-    let mut parts = vec![error.to_string()];
-    let mut next = error.source();
-    while let Some(cause) = next {
-        parts.push(cause.to_string());
-        next = cause.source();
-    }
-    parts.join(": ")
-}
-
-fn assert_cause_once(error: &dyn Error) {
+fn assert_cause_kept(error: &dyn Error) {
     let source = error.source().expect("the cause is the source");
     assert!(source.to_string().contains(CAUSE), "{source}");
-    assert!(!error.to_string().contains(CAUSE), "{error}");
-    assert_eq!(chain(error).matches(CAUSE).count(), 1, "{}", chain(error));
+    assert!(error.to_string().contains(CAUSE), "{error}");
+}
+
+#[test]
+fn an_io_failure_on_append_prints_the_text_it_always_did() {
+    // Arrange
+    let error = WalError::Io(io::Error::other("No space left on device"));
+
+    // Act
+    let text = error.to_string();
+
+    // Assert
+    assert_eq!(text, "wal io failed: No space left on device");
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn a_wal_io_failure_keeps_its_cause() {
     let error = WalError::Io(io_cause());
 
     // Act / Assert
-    assert_cause_once(&error);
+    assert_cause_kept(&error);
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn a_wal_lock_failure_keeps_its_cause() {
     };
 
     // Act / Assert
-    assert_cause_once(&error);
+    assert_cause_kept(&error);
 }
 
 #[test]
@@ -70,11 +70,11 @@ fn a_wal_decode_failure_keeps_the_event_error() {
     };
 
     // Act
-    let text = chain(&error);
+    let text = error.to_string();
 
     // Assert
     assert!(error.source().is_some());
-    assert_eq!(text.matches("3 unexpected bytes").count(), 1, "{text}");
+    assert!(text.contains("3 unexpected bytes"), "{text}");
 }
 
 #[test]
@@ -87,11 +87,11 @@ fn a_compaction_failure_keeps_the_wal_error_and_the_removal_cause() {
     };
 
     // Act
-    let wal_chain = chain(&wal);
+    let wal_text = wal.to_string();
 
     // Assert
-    assert_eq!(wal_chain.matches(CAUSE).count(), 1, "{wal_chain}");
-    assert_cause_once(&removal);
+    assert!(wal_text.contains(CAUSE), "{wal_text}");
+    assert_cause_kept(&removal);
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn a_migration_io_failure_keeps_its_cause() {
     let error = MigrateError::Io(io_cause());
 
     // Act / Assert
-    assert_cause_once(&error);
+    assert_cause_kept(&error);
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn an_archive_io_failure_keeps_its_cause() {
     let error = ArchiveError::Io(io_cause());
 
     // Act / Assert
-    assert_cause_once(&error);
+    assert_cause_kept(&error);
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn a_crypto_io_failure_keeps_its_cause() {
     let error = CryptoError::Io(io_cause());
 
     // Act / Assert
-    assert_cause_once(&error);
+    assert_cause_kept(&error);
 }
 
 #[test]
@@ -132,12 +132,12 @@ fn a_reader_failure_keeps_the_cause_through_every_wrapper() {
     let archive = ReaderError::Archive(ArchiveError::Io(io_cause()));
 
     // Act
-    let chains = [chain(&io), chain(&wal), chain(&archive)];
+    let texts = [io.to_string(), wal.to_string(), archive.to_string()];
 
     // Assert
-    assert_cause_once(&io);
-    for text in chains {
-        assert_eq!(text.matches(CAUSE).count(), 1, "{text}");
+    assert_cause_kept(&io);
+    for text in texts {
+        assert!(text.contains(CAUSE), "{text}");
     }
 }
 
@@ -156,11 +156,11 @@ fn a_sealed_record_failure_keeps_the_codec_error() {
     };
 
     // Act
-    let (open_chain, seal_chain) = (chain(&open), chain(&seal));
+    let (open_text, seal_text) = (open.to_string(), seal.to_string());
 
     // Assert
     assert!(open.source().is_some());
     assert!(seal.source().is_some());
-    assert_eq!(open_chain.matches(&decode_text).count(), 1, "{open_chain}");
-    assert_eq!(seal_chain.matches(&encode_text).count(), 1, "{seal_chain}");
+    assert!(open_text.contains(&decode_text), "{open_text}");
+    assert!(seal_text.contains(&encode_text), "{seal_text}");
 }

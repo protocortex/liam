@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Model-side errors: embedding and generation failures.
+//! `Display` includes the cause on purpose, because most callers print the plain form.
 
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ pub enum ModelError {
     Llm(String),
 
     /// An embedding step failed on an underlying error, kept as the source.
-    #[error("embedder: {context}")]
+    #[error("embedder: {context}: {source}")]
     EmbedFailed {
         context: String,
         #[source]
@@ -27,7 +28,7 @@ pub enum ModelError {
     },
 
     /// A generation step failed on an underlying error, kept as the source.
-    #[error("llm: {context}")]
+    #[error("llm: {context}: {source}")]
     LlmFailed {
         context: String,
         #[source]
@@ -68,7 +69,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_failure_with_a_cause_keeps_it_as_the_source_and_prints_it_once() {
+    fn a_failure_with_a_cause_keeps_it_as_the_source_and_in_the_plain_text() {
         // Arrange
         let cause = std::io::Error::other("weights file is truncated");
 
@@ -78,8 +79,19 @@ mod tests {
         // Assert
         let source = error.source().expect("the cause is the source");
         assert!(source.to_string().contains("weights file is truncated"));
-        assert_eq!(error.to_string(), "embedder: load bge-m3");
-        assert!(!error.to_string().contains("weights file"));
+        assert!(error.to_string().contains("weights file is truncated"));
+    }
+
+    #[test]
+    fn a_failed_load_prints_the_text_it_always_did() {
+        // Arrange
+        let cause = std::io::Error::other("weights file is truncated");
+
+        // Act
+        let text = ModelError::embed_failed("load bge-m3", cause).to_string();
+
+        // Assert
+        assert_eq!(text, "embedder: load bge-m3: weights file is truncated");
     }
 
     #[test]
@@ -92,5 +104,6 @@ mod tests {
 
         // Assert
         assert!(copy.source().unwrap().to_string().contains("no memory"));
+        assert_eq!(copy.to_string(), "llm: load: no memory");
     }
 }

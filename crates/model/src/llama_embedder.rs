@@ -335,7 +335,7 @@ impl Inner {
             .with_n_threads_batch(threads);
         self.model
             .new_context(&self.backend, params)
-            .map_err(|e| ModelError::embed_failed("create the context", e))
+            .map_err(|e| ModelError::embed_failed("context", e))
     }
 
     fn decode_run(&mut self, run: &[Vec<LlamaToken>]) -> Result<Vec<Vec<f32>>> {
@@ -344,7 +344,7 @@ impl Inner {
         for (seq, tokens) in run.iter().enumerate() {
             batch
                 .add_sequence(tokens, seq as i32, false)
-                .map_err(|e| ModelError::embed_failed("build the batch", e))?;
+                .map_err(|e| ModelError::embed_failed("batch", e))?;
         }
         if total > BATCH_TOKEN_BUDGET {
             let mut one_off = self.new_context(total)?;
@@ -372,12 +372,12 @@ fn read_vectors(
     dims: usize,
 ) -> Result<Vec<Vec<f32>>> {
     ctx.decode(batch)
-        .map_err(|e| ModelError::embed_failed("decode the batch", e))?;
+        .map_err(|e| ModelError::embed_failed("decode", e))?;
     (0..sequences)
         .map(|seq| {
             let pooled = ctx
                 .embeddings_seq_ith(seq as i32)
-                .map_err(|e| ModelError::embed_failed("read the embedding", e))?;
+                .map_err(|e| ModelError::embed_failed("read embedding", e))?;
             finish_vector(pooled.to_vec(), dims)
         })
         .collect()

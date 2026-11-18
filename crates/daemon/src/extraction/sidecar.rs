@@ -57,6 +57,7 @@ const START_TIMEOUT_TOO_LARGE: &str = "extraction.start_timeout_secs is too larg
 const CHILD_NOT_INSPECTABLE: &str = "the started sidecar has no process record to read";
 
 /// Why the sidecar could not be started. Carries no event text or secret.
+/// `Display` includes the cause on purpose, because most callers print the plain form.
 #[derive(Debug)]
 pub enum SidecarError {
     /// A configured path is missing or unusable; names the config key.
@@ -84,8 +85,8 @@ impl fmt::Display for SidecarError {
                 f,
                 "{free_mb} MB of RAM is free, below extraction.ram_budget_mb of {budget_mb} MB"
             ),
-            Self::Setup(_) => write!(f, "could not prepare the sidecar start"),
-            Self::Spawn(_) => write!(f, "could not start the sidecar process"),
+            Self::Setup(source) => write!(f, "could not prepare the sidecar start: {source}"),
+            Self::Spawn(source) => write!(f, "could not start the sidecar process: {source}"),
             Self::Exited(Some(code)) => write!(f, "the sidecar exited with code {code} at start"),
             Self::Exited(None) => write!(f, "the sidecar was killed by a signal at start"),
             Self::StartTimeout => write!(f, "the sidecar was not ready in time"),
