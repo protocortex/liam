@@ -52,6 +52,33 @@ reach the file can act as any client; owner-only is what makes "can reach it"
 mean "is already you". `liamd serve` refuses to start if another daemon is
 already listening, and replaces the socket only when it is stale.
 
+## Where LIAM keeps its files
+
+The state lives under `~/.liam`: the database, the event log, the socket and the
+model cache. Memory is stored in plain text unless `[encryption]` is on, so
+`liamd` and the `liam` command set the process umask to 077 as their first step,
+and create their directories as owner-only (0700) and their files as owner-only
+(0600) whatever the umask was. That includes the database, which the store
+creates itself, so it is never wider than its owner, not even while it opens.
+The model cache holds public files and only this user reads it, so it is
+owner-only too. The umask applies to the whole process, so a file the `liam`
+command writes to a path you choose, for example with `--vectors-out`, is
+created owner-only, and child processes inherit the umask.
+
+At start `liamd` also tightens what an older start left wider, for these
+directories only: the database directory, the event log directory, the snapshot
+directory (`consolidation.snapshot_dir`, by default beside the database) and the
+parent directory of the socket. It narrows a directory only when it lies inside
+`~/.liam`, after resolving `.` and `..`, and no part of its path from `~/.liam`
+down is a symbolic link. The database file and its `-wal` and `-shm` files are
+tightened as well, unless they are symbolic links. For any other directory, such
+as a path you pointed at outside `~/.liam`, `liamd` never changes the mode: it logs
+one warning when the directory is readable by others, and you can fix it with
+`chmod 700`.
+
+If `liam.toml` is not found, `liamd` runs with mock models and logs one warning
+that names the path it looked for. Pass `--config <path>` or set `LIAM_CONFIG`.
+
 The tools a client sees, with their fields, are listed in
 [Tools](../reference/tools.md).
 

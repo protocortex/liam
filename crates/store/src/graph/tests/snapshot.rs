@@ -182,6 +182,36 @@ impl SnapshotOps for Faults {
 
 /// A closed store with a WAL the database file does not hold yet, and a
 /// snapshot of it taken earlier.
+#[cfg(unix)]
+#[test]
+fn a_snapshot_and_its_directory_are_owner_only_even_when_the_mask_allows_more() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Arrange
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let env = Env::new();
+    let dir = TempDir::new().unwrap();
+    let target = snapshot_dir(&dir);
+
+    // Act: a mask that hides nothing, so only LIAM's own modes can narrow
+    let taken = liam_log::private_fs::with_umask(0, || {
+        runtime.block_on(async {
+            let (graph, _log) = open(&env, "live.db").await;
+            graph.insert(fact("before")).await.unwrap();
+            graph.snapshot(&target).await.unwrap()
+        })
+    });
+
+    // Assert
+    let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode_of(&target), 0o700);
+    assert_eq!(mode_of(&taken.database_path), 0o600);
+    assert_eq!(mode_of(&taken.meta_path), 0o600);
+}
+
 struct Restorable {
     _env: Env,
     _dir: TempDir,

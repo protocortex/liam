@@ -15,6 +15,7 @@ use std::future::Future;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use liam_log::private_fs::{create_private_dir_all, narrow_to_owner, private_file_options};
 use liam_log::wal::{sync_dir_for, write_atomically, FileOps};
 use liam_log::LogOffset;
 use serde::{Deserialize, Serialize};
@@ -160,7 +161,7 @@ impl<B: Backend> Graph<B> {
         let snapshot_id = ulid::Ulid::gen().to_string();
         let paths = SnapshotPaths::new(dir, &snapshot_id);
         tracing::debug!(%snapshot_id, "snapshot: copying the database under the log lock");
-        fs::create_dir_all(dir).map_err(snapshot_io("create the snapshot directory", dir))?;
+        create_private_dir_all(dir).map_err(snapshot_io("create the snapshot directory", dir))?;
         sweep_leftovers(dir, &mut ops);
         let log = match self.copy_database(&paths.partial_database, between).await {
             Ok(log) => log,
@@ -219,6 +220,8 @@ impl<B: Backend> Graph<B> {
                     target.display()
                 ))
             })?;
+        // SQLite creates the copy with the process mask's mode.
+        narrow_to_owner(target).map_err(snapshot_io("restrict the copy to its owner", target))?;
         Ok(log)
     }
 
@@ -397,7 +400,12 @@ fn stage_verified(
 ) -> Result<()> {
     let mut source =
         File::open(snapshot_file).map_err(snapshot_io("open the snapshot file", snapshot_file))?;
-    let mut target = File::create(staged).map_err(restore_io("create", staged))?;
+    let mut target = private_file_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(staged)
+        .map_err(restore_io("create", staged))?;
     let (sha256, bytes) = copy_hashed(&mut source, |chunk| ops.write_all(&mut target, chunk))
         .map_err(restore_io("copy to", staged))?;
     if bytes != meta.bytes || sha256 != meta.sha256 {

@@ -15,6 +15,7 @@ pub mod event;
 pub mod filter_file;
 pub mod hash;
 pub mod migrate;
+pub mod private_fs;
 pub mod reader;
 pub mod wal;
 
