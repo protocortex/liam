@@ -160,17 +160,21 @@ jobs:
       # covered by manual review notes in deny.toml, not by this job.
       - run: cargo deny check
 
-  # Blocking: fails below FLOOR. FLOOR is set from the real baseline measured
-  # 2026-09-29 (96.55% line coverage), minus a few points of margin, so it
-  # catches a real regression without failing on normal day-to-day noise.
-  # Ratchet it up over time; never lower it without a documented reason.
+  # Blocking: fails below FLOOR. FLOOR is set from the real baseline, minus a
+  # few points of margin, so it catches a real regression without failing on
+  # normal day-to-day noise. Ratchet it up over time; never lower it without a
+  # documented reason.
+  # 2026-11-18: lowered from 95 to 93. The inline tests of graph.rs and mcp.rs
+  # moved into tests/ folders, which cargo-llvm-cov leaves out of the report.
+  # About 10,000 fully covered test lines left the total, so the same code
+  # measures 94.88% where it measured 95.47%. Missed lines did not grow.
   coverage:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      FLOOR: "95"
+      FLOOR: "93"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
