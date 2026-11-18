@@ -484,7 +484,7 @@ mod tests {
         let swept = insert("fact", "beta").await.unwrap();
         let vanished = insert("other", "gamma").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let policy = |kind| liam_store::RetentionPolicy::keep(kind, Millis(0)).without_reclaim();
+        let policy = |kind| liam_store::RetentionPolicy::keep(kind, Millis(1)).without_reclaim();
         store.gc(&policy("fact")).await.unwrap();
         store.gc(&policy("other")).await.unwrap();
         let probe = |name: &str, id: &NodeId| Probe {

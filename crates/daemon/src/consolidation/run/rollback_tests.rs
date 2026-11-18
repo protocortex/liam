@@ -82,7 +82,7 @@ impl ProbeRunner for ProbesWithClient {
                     store.insert(note(text)).await.unwrap();
                 }
                 Client::SweepsScrap => {
-                    let policy = RetentionPolicy::keep(SCRAP, Millis(0)).without_reclaim();
+                    let policy = RetentionPolicy::keep(SCRAP, Millis(1)).without_reclaim();
                     store.gc(&policy).await.unwrap();
                 }
             }
@@ -140,7 +140,7 @@ impl Maintenance for TickPath {
     async fn run(&self, store: &DefaultGraph, source: &str) -> anyhow::Result<()> {
         let worked = match self.path {
             Path::Sweep => {
-                let policy = RetentionPolicy::keep(SCRAP, Millis(0)).without_reclaim();
+                let policy = RetentionPolicy::keep(SCRAP, Millis(1)).without_reclaim();
                 store.gc_from(&policy, source).await.unwrap().nodes_removed > 0
             }
             Path::Repair => store.repair_superseded_mentions_from(source).await.unwrap() > 0,
@@ -676,7 +676,7 @@ struct SweepsKind {
 impl Maintenance for SweepsKind {
     async fn run(&self, store: &DefaultGraph, source: &str) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let policy = RetentionPolicy::keep(self.kind, Millis(0)).without_reclaim();
+        let policy = RetentionPolicy::keep(self.kind, Millis(1)).without_reclaim();
         if self.anonymous {
             store.gc(&policy).await.unwrap();
         } else {

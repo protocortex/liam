@@ -377,28 +377,39 @@ async fn stop_background_tasks(
         usage_flush.stop(USAGE_FLUSH_DEADLINE).await;
     }
     shutdown.token().cancel();
-    if tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, maintenance)
-        .await
-        .is_err()
-    {
-        tracing::warn!("the maintenance loop is still running; leaving it to the exit");
+    match tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, maintenance).await {
+        Ok(joined) => log_task_failure("maintenance loop", &joined),
+        Err(_) => tracing::warn!("the maintenance loop is still running; leaving it to the exit"),
     }
     if let Some(idle_unloader) = idle_unloader {
         // The cancelled token ends this task at its next check.
-        if tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, idle_unloader)
-            .await
-            .is_err()
-        {
-            tracing::warn!("the llm idle task is still running; leaving it to the exit");
+        match tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, idle_unloader).await {
+            Ok(joined) => log_task_failure("llm idle task", &joined),
+            Err(_) => tracing::warn!("the llm idle task is still running; leaving it to the exit"),
         }
     }
     match tokio::time::timeout(COMPACTOR_DRAIN_DEADLINE, &mut compactor).await {
         Ok(Ok(())) => tracing::info!("compactor stopped"),
-        Ok(Err(error)) => tracing::warn!(%error, "compactor task failed"),
+        Ok(joined) => log_task_failure("compactor", &joined),
         Err(_) => {
             compactor.abort();
             tracing::warn!("compaction was still queued at exit; the next start recovers it");
         }
+    }
+}
+
+/// The message to log when a joined background task ended in a panic or was
+/// cancelled, or `None` when it finished cleanly.
+fn task_failure_message(task: &str, joined: &Result<(), tokio::task::JoinError>) -> Option<String> {
+    joined
+        .as_ref()
+        .err()
+        .map(|error| format!("the {task} ended abnormally: {error}"))
+}
+
+fn log_task_failure(task: &str, joined: &Result<(), tokio::task::JoinError>) {
+    if let Some(message) = task_failure_message(task, joined) {
+        tracing::error!("{message}");
     }
 }
 
@@ -691,6 +702,31 @@ mod tests {
     use liam_store::{
         relation, Fingerprint, FixedClock, GraphConfig, Millis, NewEdge, NewNode, RetentionPolicy,
     };
+
+    #[tokio::test]
+    async fn a_panicked_task_yields_an_error_message_naming_it() {
+        // Arrange
+        let joined = tokio::spawn(async { panic!("boom") }).await;
+
+        // Act
+        let message = task_failure_message("maintenance loop", &joined);
+
+        // Assert
+        let message = message.expect("a panic must be reported");
+        assert!(message.contains("maintenance loop"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_task_that_finished_cleanly_yields_no_message() {
+        // Arrange
+        let joined = tokio::spawn(async {}).await;
+
+        // Act
+        let message = task_failure_message("maintenance loop", &joined);
+
+        // Assert
+        assert_eq!(message, None);
+    }
 
     async fn seeded_pair(t0: Millis) -> (DefaultGraph, std::sync::Arc<FixedClock>) {
         let clock = std::sync::Arc::new(FixedClock::new(t0));
