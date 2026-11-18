@@ -459,7 +459,8 @@ impl<B: Backend> Graph<B> {
             .first()
             .ok_or_else(|| Error::Backend("a count query returned no row".into()))?
             .get_i64(0)?;
-        Ok(count as usize)
+        usize::try_from(count)
+            .map_err(|_| Error::Backend("a count query returned a negative count".into()))
     }
 
     async fn begin_saving(&self, progress: Option<&Progress>) -> Result<Box<dyn BackendTx + '_>> {

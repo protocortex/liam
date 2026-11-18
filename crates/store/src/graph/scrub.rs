@@ -79,7 +79,7 @@ impl<B: Backend> Graph<B> {
     async fn file_bytes(&self) -> Result<u64> {
         let pages = self.backend.query(PAGE_COUNT, &[]).await?[0].get_i64(0)?;
         let size = self.backend.query(PAGE_SIZE, &[]).await?[0].get_i64(0)?;
-        Ok((pages * size).max(0) as u64)
+        Ok(u64::try_from(pages * size).unwrap_or(0))
     }
 }
 

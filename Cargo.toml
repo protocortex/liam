@@ -5,6 +5,14 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
+# File::try_lock (std, 1.89) is the newest std API the crates call.
+rust-version = "1.89"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+cast_sign_loss = "warn"
 
 [workspace.dependencies]
 async-trait = "0.1"

@@ -690,7 +690,7 @@ fn resynthesis_budget(
     light_budget: usize,
 ) -> usize {
     match fingerprint {
-        Ok(f) if f.edge_count as usize >= threshold => full_budget,
+        Ok(f) if usize::try_from(f.edge_count).is_ok_and(|edges| edges >= threshold) => full_budget,
         _ => light_budget,
     }
 }

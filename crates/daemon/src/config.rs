@@ -53,6 +53,7 @@ const REMOVED_RERANKER_WARNING: &str =
     "the reranker was removed and the [reranker] section is ignored: delete it from your liam.toml";
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub database_path: String,
@@ -120,6 +121,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct LogConfig {
     /// Where the log lives. Unset means `<database stem>.log` beside the
@@ -137,6 +139,7 @@ pub struct LogConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct GcConfig {
     pub episode_retention_days: i64,
@@ -153,6 +156,7 @@ pub struct GcConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbedderConfig {
     /// "mock" (tests and dev) or "local" (in-process fastembed).
@@ -170,6 +174,7 @@ pub struct EmbedderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
     /// "mock" (tests and dev) or "llama-cpp" (in-process llama.cpp).
@@ -207,6 +212,7 @@ pub struct LlmConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
 pub struct ProducersConfig {
     /// Producer id recorded for a connecting MCP client whose name is not a

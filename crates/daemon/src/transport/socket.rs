@@ -279,7 +279,7 @@ pub async fn accept_loop(
 ///
 /// This is where WU-8's wiring lives: `serve` does not return a
 /// `RunningService` until the MCP `initialize` handshake is complete (rmcp
-/// 3.1.2's `serve_server_with_ct_inner` sends the initialize response
+/// 3.9.0's `serve_server_with_ct_inner` sends the initialize response
 /// before constructing it), so the connecting client's declared name is
 /// available the instant `serve` resolves. `producer::resolve` turns that
 /// name into a canonical producer id via `producers`, and

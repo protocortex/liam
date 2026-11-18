@@ -1,8 +1,10 @@
 [package]
 name = "liam-daemon"
 version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
 description = "MCP server exposing liam memory to agents."
 
 # Two binaries, one crate, on purpose. `liamd` is the daemon; `liam` is the
@@ -81,15 +83,15 @@ libc = "0.2"
 # not its process/CPU/disk features.
 sysinfo = "0.37"
 
-# launchd socket activation (WU-6b). macOS-only BY TARGET, not by cargo feature:
-# `launch_activate_socket` is a libSystem call that exists nowhere else, so a
-# Linux build must never see this crate. Same pattern liam-model uses for Metal.
 # The only HTTPS client of the daemon, used by the hosted adapters. MIT OR
 # Apache-2.0. It is linked in every build; whether anything is sent is decided
 # at runtime by the privacy gate and the host allowlist.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# launchd socket activation. macOS-only BY TARGET, not by cargo feature:
+# `launch_activate_socket` is a libSystem call that exists nowhere else, so a
+# Linux build must never see this crate. Same pattern liam-model uses for Metal.
 raunch = "1.0.1"
 
 [dev-dependencies]
@@ -121,3 +123,6 @@ default = []
 # Opt-in NVIDIA support; needs the CUDA toolkit at build time. Apple GPU support
 # is automatic on macOS, see liam-model's target-specific dependencies.
 cuda = ["liam-model/cuda"]
+
+[lints]
+workspace = true

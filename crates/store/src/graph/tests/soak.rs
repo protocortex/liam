@@ -180,7 +180,7 @@ async fn ingest_and_rebuild(rows: usize, registry: Option<&Arc<KeyRegistry>>) {
         removed.nodes_removed
     );
     assert_eq!(
-        stored as u64,
+        u64::try_from(stored).unwrap(),
         written.rows as u64 - removed.nodes_removed - removed.edges_removed,
         "rows written, swept and stored disagree"
     );

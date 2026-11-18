@@ -145,6 +145,10 @@ fn latency_stats(calls: &[Duration]) -> Option<LatencyStats> {
     }
     let mut ms: Vec<f64> = calls.iter().map(|d| d.as_secs_f64() * MS_PER_SEC).collect();
     ms.sort_by(f64::total_cmp);
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "q is a fraction in 0..=1, so the index is not negative"
+    )]
     let at = |q: f64| ms[((ms.len() - 1) as f64 * q).round() as usize];
     Some(LatencyStats {
         calls: ms.len(),

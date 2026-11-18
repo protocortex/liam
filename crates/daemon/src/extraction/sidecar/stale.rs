@@ -231,7 +231,7 @@ fn wait_for_exit(pid: u32) {
 
 fn is_killable(record: &Pidfile, server_exe: &Path, table: &dyn ProcessTable, uid: u32) -> bool {
     // SAFETY: `getppid` has no preconditions and cannot fail.
-    let parent = unsafe { libc::getppid() } as u32;
+    let parent = unsafe { libc::getppid() }.cast_unsigned();
     if record.pid == std::process::id() || record.pid == parent {
         return false;
     }

@@ -5,17 +5,36 @@
 
 use serde_json::Value;
 
-use super::{
-    AdminConfig, ArchiveConfig, DeletionConfig, EncryptionConfig, HostedConfig, MetricsConfig,
-};
+use super::Config;
 
-/// Each section with its default config as JSON, and each table nested in one
-/// as a section of its own (`hosted.privacy`). A key whose default is `None`
-/// stays visible as `null`.
-fn sections() -> Vec<(String, Value)> {
-    fn json<T: serde::Serialize>(value: T) -> Value {
-        serde_json::to_value(value).unwrap()
+/// The name `sections` gives the keys that sit above every table.
+const ROOT_SECTION: &str = "";
+
+/// Keys kept only so an old `liam.toml` still loads, so no page documents them.
+const REMOVED_KEYS: [&str; 1] = ["reranker"];
+
+/// Sections whose keys a concept page documents and its own test guards.
+const SECTIONS_ON_OWN_PAGES: [&str; 3] = ["extraction", "summary", "tiering"];
+
+/// Whether the configuration page owes rows for `section`.
+fn on_configuration_page(section: &str) -> bool {
+    let top = section.split('.').next().unwrap_or(section);
+    !SECTIONS_ON_OWN_PAGES.contains(&top)
+}
+
+/// The name a page or `liam.toml` gives `key` of `section`.
+fn qualified(section: &str, key: &str) -> String {
+    if section == ROOT_SECTION {
+        key.to_owned()
+    } else {
+        format!("{section}.{key}")
     }
+}
+
+/// The root keys and every table of the default `Config` as JSON, each table
+/// nested in one a section of its own (`hosted.privacy`). A key whose default is
+/// `None` stays visible as `null`.
+fn sections() -> Vec<(String, Value)> {
     fn with_tables(name: &str, value: Value, found: &mut Vec<(String, Value)>) {
         let tables: Vec<(String, Value)> = value
             .as_object()
@@ -29,16 +48,12 @@ fn sections() -> Vec<(String, Value)> {
             with_tables(&table, inner, found);
         }
     }
-    let mut found = Vec::new();
-    for (name, value) in [
-        ("encryption", json(EncryptionConfig::default())),
-        ("deletion", json(DeletionConfig::default())),
-        ("admin", json(AdminConfig::default())),
-        ("archive", json(ArchiveConfig::default())),
-        ("metrics", json(MetricsConfig::default())),
-        ("hosted", json(HostedConfig::default())),
-    ] {
-        with_tables(name, value, &mut found);
+    let root = serde_json::to_value(Config::default()).unwrap();
+    let mut found = vec![(ROOT_SECTION.to_owned(), root.clone())];
+    for (name, value) in root.as_object().unwrap() {
+        if value.is_object() {
+            with_tables(name, value.clone(), &mut found);
+        }
     }
     found
 }
@@ -50,7 +65,7 @@ fn keys_of(value: &Value) -> Vec<String> {
         .as_object()
         .expect("a section serialises as a table")
         .iter()
-        .filter(|(_, inner)| !inner.is_object())
+        .filter(|(key, inner)| !inner.is_object() && !REMOVED_KEYS.contains(&key.as_str()))
         .map(|(key, _)| key.clone())
         .collect()
 }
@@ -82,8 +97,15 @@ pub(super) fn page_body(text: &str, title_heading: &str) -> Vec<String> {
         .collect()
 }
 
-/// The lines of the `[section]` table, up to the next table.
+/// The lines of the `[section]` table, up to the next table. The root section
+/// is the lines before the first table.
 fn toml_table<'a>(text: &'a str, section: &str) -> Vec<&'a str> {
+    if section == ROOT_SECTION {
+        return text
+            .lines()
+            .take_while(|line| !line.starts_with('['))
+            .collect();
+    }
     let header = format!("[{section}]");
     text.lines()
         .skip_while(|line| line.trim_end() != header)
@@ -102,16 +124,17 @@ fn assigns(line: &str, key: &str) -> bool {
 fn missing_from_toml(text: &str) -> Vec<String> {
     let mut missing = Vec::new();
     for (section, value) in sections() {
-        if !text
-            .lines()
-            .any(|line| line.trim_end() == format!("[{section}]"))
+        if section != ROOT_SECTION
+            && !text
+                .lines()
+                .any(|line| line.trim_end() == format!("[{section}]"))
         {
             missing.push(format!("[{section}]"));
         }
         let table = toml_table(text, &section);
         for key in keys_of(&value) {
             if !table.iter().any(|line| assigns(line, &key)) {
-                missing.push(format!("{section}.{key}"));
+                missing.push(qualified(&section, &key));
             }
         }
     }
@@ -121,9 +144,12 @@ fn missing_from_toml(text: &str) -> Vec<String> {
 fn missing_from_page(text: &str) -> Vec<String> {
     let mut missing = Vec::new();
     for (section, value) in sections() {
+        if !on_configuration_page(&section) {
+            continue;
+        }
         let mut named: Vec<String> = keys_of(&value)
             .into_iter()
-            .map(|key| format!("{section}.{key}"))
+            .map(|key| qualified(&section, &key))
             .collect();
         // A nested table has a row of its own, besides its keys.
         if section.contains('.') {

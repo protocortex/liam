@@ -119,7 +119,7 @@ async fn rebuild_bloom<B: Backend>(backend: &B, configured: &BloomConfig) -> Res
         .query("SELECT COUNT(*) FROM log_hash_index", &[])
         .await?[0]
         .get_i64(0)?;
-    let mut bloom = HashBloom::new(configured.grown_to(rows.max(0) as usize));
+    let mut bloom = HashBloom::new(configured.grown_to(usize::try_from(rows).unwrap_or(0)));
     // The empty blob sorts before every hash.
     let mut after: Vec<u8> = Vec::new();
     loop {
