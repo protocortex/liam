@@ -9,9 +9,15 @@ use super::*;
 const NO_ACCESS: u32 = 0o000;
 const OWNER_ONLY: u32 = 0o700;
 
-fn running_as_root() -> bool {
+/// True, with a line saying so, when the test cannot show a refusal because
+/// root passes every permission check.
+fn skipped_as_root(test: &str) -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() == 0 }
+    let root = unsafe { libc::geteuid() == 0 };
+    if root {
+        eprintln!("SKIPPED {test}: running as root, which ignores permission bits");
+    }
+    root
 }
 
 /// A directory under a state root, set to `mode` and restored on drop so the
@@ -63,7 +69,7 @@ fn a_step_that_failed_keeps_the_error_kind_and_names_the_step() {
 
 #[test]
 fn a_path_that_cannot_be_searched_is_an_error_not_a_pass() {
-    if running_as_root() {
+    if skipped_as_root("a_path_that_cannot_be_searched_is_an_error_not_a_pass") {
         return;
     }
     // Arrange
@@ -88,7 +94,7 @@ fn a_path_that_cannot_be_searched_is_an_error_not_a_pass() {
 
 #[test]
 fn a_directory_that_cannot_be_listed_is_an_error() {
-    if running_as_root() {
+    if skipped_as_root("a_directory_that_cannot_be_listed_is_an_error") {
         return;
     }
     // Arrange
