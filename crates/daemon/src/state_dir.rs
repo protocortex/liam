@@ -10,12 +10,24 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+use liam_log::crypto::REGISTRY_FILE;
 use liam_log::private_fs::{narrow_dir_to_owner, narrow_to_owner};
+use liam_log::wal::{LOCK_NAME, MANIFEST_NAME, PARQUET_EXTENSION, SEGMENT_EXTENSION};
+
+use crate::config::Config;
+use crate::models;
 
 /// The folder under the home directory that holds LIAM's default state.
 const STATE_DIR_NAME: &str = ".liam";
 /// Suffixes of the files SQLite keeps beside the database.
 const DATABASE_SIDE_FILES: [&str; 2] = ["-wal", "-shm"];
+/// Extensions of the files LIAM writes beside the database, after the database
+/// file name: its sidecars, lock and staging files.
+const DATABASE_SIDECAR_EXTENSIONS: [&str; 5] = ["json", "jsonl", "lock", "pid", "tmp"];
+/// Extensions of the snapshot files: the copied database and its metadata.
+const SNAPSHOT_FILE_EXTENSIONS: [&str; 2] = ["db", "json"];
+/// Where a bare file name sits.
+const CURRENT_DIR: &str = ".";
 
 /// Error kinds that mean the directory is not there, or is not a directory.
 const NOT_THERE: [std::io::ErrorKind; 2] = [
@@ -225,6 +237,128 @@ pub fn secure_database_files(database: &Path) {
     }
 }
 
+/// Whether `name` is a sidecar the daemon writes next to the database `db_name`,
+/// such as `liam.db.embedder.json`. `liam.toml` and other files do not match.
+fn is_database_sidecar(db_name: &str, name: &str) -> bool {
+    name.strip_prefix(db_name)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|rest| has_extension(rest, &DATABASE_SIDECAR_EXTENSIONS))
+}
+
+/// Whether `name` is a file the event log keeps in its directory.
+fn is_log_file(name: &str) -> bool {
+    [MANIFEST_NAME, LOCK_NAME, REGISTRY_FILE].contains(&name)
+        || has_extension(name, &[SEGMENT_EXTENSION, PARQUET_EXTENSION])
+}
+
+fn is_snapshot_file(name: &str) -> bool {
+    has_extension(name, &SNAPSHOT_FILE_EXTENSIONS)
+}
+
+fn has_extension(name: &str, extensions: &[&str]) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extensions.contains(&extension))
+}
+
+/// Narrows the regular files directly in `dir` that `is_own` accepts, and
+/// returns how many were wider. Nothing happens for a directory outside
+/// `state_root` or one reached through a symbolic link, because only the state
+/// root is known to hold nothing but LIAM's files. A file that is a symbolic
+/// link is skipped, and a file already owner-only is left as it is.
+fn secure_files_in(
+    dir: &Path,
+    state_root: &Path,
+    is_own: impl Fn(&str) -> bool,
+) -> std::io::Result<usize> {
+    let (Ok(dir), Ok(root)) = (normalise(dir), normalise(state_root)) else {
+        return Ok(0);
+    };
+    if !dir.starts_with(&root)
+        || has_symlink_from(&root, &dir)
+            .map_err(|error| failed("check for symbolic links in", error))?
+    {
+        return Ok(0);
+    }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if NOT_THERE.contains(&error.kind()) => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut tightened = 0;
+    for entry in entries {
+        let entry = entry?;
+        let is_regular_file = entry.file_type().is_ok_and(|kind| kind.is_file());
+        let name = entry.file_name();
+        if !is_regular_file || !name.to_str().is_some_and(&is_own) {
+            continue;
+        }
+        match narrow_to_owner(&entry.path()) {
+            Ok(Some(_)) => tightened += 1,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(file = %entry.path().display(), %error, "could not restrict this file to its owner");
+            }
+        }
+    }
+    Ok(tightened)
+}
+
+/// Restricts the files the daemon keeps to the owner: the database and its
+/// sidecars, the event log's files and the snapshot files. Run after the store
+/// has opened, and at the end of a command that opened it. Files outside
+/// `state_root` and files that are not LIAM's by name are never touched, and a
+/// failure is a warning, not a failed start.
+pub fn secure_state_files(database: &Path, log_dir: &Path, snapshot_dir: &Path, state_root: &Path) {
+    secure_database_files(database);
+    let db_name = database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let database_dir = database
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new(CURRENT_DIR));
+    secure_group(database_dir, state_root, |name| {
+        is_database_sidecar(&db_name, name)
+    });
+    secure_group(log_dir, state_root, is_log_file);
+    secure_group(snapshot_dir, state_root, is_snapshot_file);
+}
+
+/// `secure_files_in`, with what it did logged.
+fn secure_group(dir: &Path, state_root: &Path, is_own: impl Fn(&str) -> bool) {
+    match secure_files_in(dir, state_root, is_own) {
+        Ok(0) => {}
+        Ok(count) => {
+            tracing::info!(dir = %dir.display(), count, "restricted the state files to their owner");
+        }
+        Err(error) => {
+            tracing::warn!(dir = %dir.display(), %error, "could not secure the files in this directory");
+        }
+    }
+}
+
+/// `secure_state_files` for the directories `config` names around `database`.
+/// Does nothing when `HOME` gives no state root.
+pub fn secure_state_files_for(config: &Config, database: &Path) {
+    let Some(state_root) = state_root_from_home(std::env::var_os("HOME")) else {
+        return;
+    };
+    let dirs = models::resolve_log_dir(config, database)
+        .and_then(|log| Ok((log, models::resolve_snapshot_dir(config, database)?)));
+    match dirs {
+        Ok((log_dir, snapshot_dir)) => {
+            secure_state_files(database, &log_dir, &snapshot_dir, &state_root);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not work out the state directories, so their files were not checked");
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
@@ -238,6 +372,202 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A state root with the database, sidecars, log and snapshot files, every
+    /// file 0644.
+    struct Layout {
+        _home: tempfile::TempDir,
+        root: PathBuf,
+        database: PathBuf,
+        log_dir: PathBuf,
+        snapshot_dir: PathBuf,
+    }
+
+    impl Layout {
+        fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let root = default_state_dir(home.path());
+            let log_dir = root.join("liam.log");
+            let snapshot_dir = root.join("liam.snapshots");
+            for dir in [&root, &log_dir, &snapshot_dir] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            let layout = Self {
+                database: root.join("liam.db"),
+                _home: home,
+                root,
+                log_dir,
+                snapshot_dir,
+            };
+            for file in layout.state_files() {
+                layout.write_wide(&file);
+            }
+            layout
+        }
+
+        fn state_files(&self) -> Vec<PathBuf> {
+            vec![
+                self.database.clone(),
+                self.root.join("liam.db.embedder.json"),
+                self.root.join("liam.db.consolidation.dedup.json"),
+                self.log_dir.join("00000000000000000000.wal"),
+                self.log_dir.join("00000000000000000001.parquet"),
+                self.log_dir.join(MANIFEST_NAME),
+                self.snapshot_dir.join("01ABC.db"),
+                self.snapshot_dir.join("01ABC.json"),
+            ]
+        }
+
+        fn write_wide(&self, file: &Path) {
+            fs::write(file, b"data").unwrap();
+            set_mode(file, 0o644);
+        }
+
+        fn secure(&self) {
+            secure_state_files(
+                &self.database,
+                &self.log_dir,
+                &self.snapshot_dir,
+                &self.root,
+            );
+        }
+    }
+
+    #[test]
+    fn a_sidecar_is_created_owner_only_even_with_no_umask() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("liam.db");
+        let fingerprint = crate::embedder_fingerprint::EmbedderFingerprint {
+            provider: "mock".to_string(),
+            model: "m".to_string(),
+            dims: 8,
+            prompt_scheme: 1,
+        };
+
+        // Act: a mask that hides nothing, so only the explicit mode can narrow
+        liam_log::private_fs::with_umask(0, || {
+            crate::embedder_fingerprint::record(&database, &fingerprint).unwrap();
+            crate::consolidation::tier_history::save(
+                &crate::consolidation::tier_history::history_path_for(&database),
+                &Default::default(),
+            )
+            .unwrap();
+        });
+
+        // Assert
+        for path in [
+            crate::embedder_fingerprint::fingerprint_path_for(&database),
+            crate::consolidation::tier_history::history_path_for(&database),
+        ] {
+            assert_eq!(mode_of(&path), 0o600, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn wide_state_files_become_owner_only() {
+        // Arrange
+        let layout = Layout::new();
+
+        // Act
+        layout.secure();
+
+        // Assert
+        for file in layout.state_files() {
+            assert_eq!(mode_of(&file), 0o600, "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn a_file_already_narrower_than_owner_only_is_left_as_it_is() {
+        // Arrange
+        let layout = Layout::new();
+        let sidecar = layout.root.join("liam.db.embedder.json");
+        set_mode(&sidecar, 0o400);
+
+        // Act
+        layout.secure();
+
+        // Assert
+        assert_eq!(mode_of(&sidecar), 0o400);
+    }
+
+    #[test]
+    fn a_symbolic_link_is_skipped_and_its_target_is_not_changed() {
+        // Arrange
+        let layout = Layout::new();
+        let target = tempfile::NamedTempFile::new().unwrap();
+        set_mode(target.path(), 0o644);
+        let link = layout.root.join("liam.db.metrics-state.json");
+        symlink(target.path(), &link).unwrap();
+
+        // Act
+        layout.secure();
+
+        // Assert
+        assert_eq!(mode_of(target.path()), 0o644);
+    }
+
+    #[test]
+    fn files_in_a_directory_outside_the_state_root_are_not_touched() {
+        // Arrange
+        let layout = Layout::new();
+        let outside = tempfile::tempdir().unwrap();
+        let database = outside.path().join("liam.db");
+        let sidecar = outside.path().join("liam.db.embedder.json");
+        let wal = outside.path().join("00000000000000000000.wal");
+        for file in [&sidecar, &wal] {
+            layout.write_wide(file);
+        }
+
+        // Act
+        secure_state_files(&database, outside.path(), outside.path(), &layout.root);
+
+        // Assert
+        assert_eq!(mode_of(&sidecar), 0o644);
+        assert_eq!(mode_of(&wal), 0o644);
+    }
+
+    #[test]
+    fn a_file_that_is_not_one_of_the_daemons_own_is_not_touched() {
+        // Arrange
+        let layout = Layout::new();
+        let others = [
+            layout.root.join("liam.toml"),
+            layout.root.join("notes.json"),
+            layout.root.join("liam.db.backup"),
+            layout.log_dir.join("notes.txt"),
+            layout.snapshot_dir.join("readme.md"),
+        ];
+        for file in &others {
+            layout.write_wide(file);
+        }
+
+        // Act
+        layout.secure();
+
+        // Assert
+        for file in &others {
+            assert_eq!(mode_of(file), 0o644, "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn a_state_directory_reached_through_a_symbolic_link_is_not_followed() {
+        // Arrange
+        let layout = Layout::new();
+        let real = tempfile::tempdir().unwrap();
+        let wal = real.path().join("00000000000000000000.wal");
+        layout.write_wide(&wal);
+        let link = layout.root.join("linked.log");
+        symlink(real.path(), &link).unwrap();
+
+        // Act
+        secure_state_files(&layout.database, &link, &layout.snapshot_dir, &layout.root);
+
+        // Assert
+        assert_eq!(mode_of(&wal), 0o644);
     }
 
     #[test]

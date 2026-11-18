@@ -20,6 +20,21 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- `liamd` now tightens the files it owns inside `~/.liam` to owner-only (0600) when an older start left them
+  wider: the sidecars named after the database, the log's WAL and Parquet files, `log.id`, `log.lock`, the key
+  registry, and the snapshot files. It runs at start, and `liam rebuild`, `liam consolidate`, `liamd delete`
+  and `liamd encrypt-log` do the same when they finish, so `liam.db` is no longer left at 0644 after a
+  rebuild. Symbolic links, files outside `~/.liam` and files with other names are left alone. `liam.toml` is
+  never changed; it holds no secrets.
+- `liam rebuild` uses `database_path` from the config when `--database` is not given. The flag still overrides it.
+- The `liam rebuild` report now says `embeddings: re-embedded N nodes and summaries with MODEL at D dimensions`
+  instead of `N restored`. The warning about GC sweeps that are not in the log is now printed only when the
+  database already holds rows that the rebuild will replace, and it says what to do about it.
+- `liam fetch-models`, `liam devices` and `liamd` no longer print llama.cpp and Metal log lines. They go to the
+  log at their own levels and only warnings show by default. Set `RUST_LOG=llama-cpp-2=debug` to see them.
+- An MCP call that leaves out a required field now gets a message that names the field, for example
+  "remember needs the field kind, the kind of memory: one of decision, fact, symbol, episode", instead of the raw
+  `failed to deserialize parameters` text. What the tools accept is unchanged.
 - Errors from the store, the log, the models and the sidecar now keep their underlying error as a source. The
   store can report a busy or locked database apart from other engine failures, and the dedup step logs one
   warning when embedding fails.

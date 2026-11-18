@@ -296,6 +296,9 @@ pub(crate) fn shared_backend() -> Result<Arc<LlamaBackend>> {
         std::sync::OnceLock::new();
     BACKEND
         .get_or_init(|| {
+            // Before the init, which already logs. The lines go to tracing,
+            // where the subscriber's filter decides what a person sees.
+            llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
             LlamaBackend::init()
                 .map(Arc::new)
                 .map_err(|e| format!("llama backend: {e}"))

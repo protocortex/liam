@@ -71,10 +71,21 @@ directory (`consolidation.snapshot_dir`, by default beside the database) and the
 parent directory of the socket. It narrows a directory only when it lies inside
 `~/.liam`, after resolving `.` and `..`, and no part of its path from `~/.liam`
 down is a symbolic link. The database file and its `-wal` and `-shm` files are
-tightened as well, unless they are symbolic links. For any other directory, such
+tightened as well, unless they are symbolic links. In the same directories,
+inside `~/.liam`, it also narrows the files it keeps itself that an older start left
+wider: the sidecars named after the database (`liam.db.*.json`, `.jsonl`, `.lock`),
+the log's `.wal` and `.parquet` segments, `log.id`, `log.lock` and `keys.registry`,
+and the snapshot `.db` and `.json` files. It only removes group and other access,
+never adds any, and skips symbolic links and every file with another name. The
+`liam rebuild` and `liam consolidate` commands and the `liamd delete` and
+`liamd encrypt-log` commands do the same when they finish. For any other directory, such
 as a path you pointed at outside `~/.liam`, `liamd` never changes the mode: it logs
 one warning when the directory is readable by others, and you can fix it with
 `chmod 700`.
+
+`liam.toml` is your file, so LIAM never changes its mode. It holds paths and
+settings and no secrets: a hosted provider key is read from a key file that must be
+owner-only, or from the Keychain, and a key written into `liam.toml` is rejected.
 
 If `liam.toml` is not found, `liamd` runs with mock models and logs one warning
 that names the path it looked for. Pass `--config <path>` or set `LIAM_CONFIG`.
