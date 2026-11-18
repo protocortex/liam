@@ -81,11 +81,10 @@ impl SignalWatch {
 
     /// Resolves when SIGTERM or SIGINT arrives, whichever lands first.
     ///
-    /// Not exercised by raising a signal inside the unit test process: signal
-    /// disposition is process-global and `cargo test` runs every test in one
-    /// process, so it would race the others. `tests/liamd_commands.rs` stops
-    /// a real daemon process with SIGTERM instead, and the orderly shutdown
-    /// is tested directly through `drain` and `unlink_owned_socket`.
+    /// Tested by a child process of the test binary that raises SIGTERM at
+    /// itself, because signal disposition is process-wide and would race the
+    /// other tests in a shared process. `tests/liamd_commands.rs` also stops a
+    /// real daemon with SIGTERM.
     pub async fn wait(mut self) -> Trigger {
         tokio::select! {
             _ = self.term.recv() => Trigger::Term,
@@ -190,8 +189,9 @@ pub fn unlink_owned_socket(source: &ListenerSource) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::process::Command;
+    use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     use tokio::net::UnixListener;
 
@@ -211,6 +211,8 @@ mod tests {
     const HELD_LINE: &str = "held SIGTERM";
     /// Longest the child may take to see the signal it sent itself.
     const HELD_DEADLINE: Duration = Duration::from_secs(10);
+    /// How often the parent looks at the child again.
+    const EXIT_POLL: Duration = Duration::from_millis(20);
     /// Longest the parent waits for the child process to end.
     const CHILD_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -238,31 +240,53 @@ mod tests {
         println!("{HELD_LINE}: {trigger:?}");
     }
 
+    /// Reads a pipe to its end on its own thread, so a full pipe never blocks
+    /// the child.
+    fn drain_pipe(
+        mut pipe: impl std::io::Read + Send + 'static,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    }
+
     #[test]
     fn a_stop_during_listener_setup_runs_the_ordered_shutdown_path() {
         // Arrange
-        let child = Command::new(std::env::current_exe().expect("test binary"))
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
             .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD_MARKER, "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("start the child test");
-        let pid = child.id();
-        let (done, finished) = std::sync::mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            if finished.recv_timeout(CHILD_DEADLINE)
-                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            {
-                // SAFETY: the child is not reaped before `done` is dropped.
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            }
-        });
+        let stdout_reader = drain_pipe(child.stdout.take().expect("piped stdout"));
+        let stderr_reader = drain_pipe(child.stderr.take().expect("piped stderr"));
 
         // Act
-        let output = child.wait_with_output().expect("wait for the child");
-        drop(done);
-        watchdog.join().expect("watchdog");
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = stderr_reader.join().expect("stderr reader");
+                panic!(
+                    "the child test was still running after {CHILD_DEADLINE:?} and was killed:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            std::thread::park_timeout(EXIT_POLL);
+        };
+        let output = Output {
+            status,
+            stdout: stdout_reader.join().expect("stdout reader"),
+            stderr: stderr_reader.join().expect("stderr reader"),
+        };
 
         // Assert
         let stdout = String::from_utf8_lossy(&output.stdout);
