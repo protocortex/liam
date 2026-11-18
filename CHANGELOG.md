@@ -87,7 +87,8 @@ All notable changes to LIAM are recorded here. The format follows
   state files) owner-only (0600), instead of taking the umask. `liamd` and `liam` also set the process umask to 077
   at start, so the database and its snapshots are never wider than their owner, even while the store opens. At start
   `liamd` tightens an existing `~/.liam`, the snapshot directory and the database files that are wider, never through
-  a symbolic link or a `..` out of `~/.liam`, and only warns for a directory you pointed it at.
+  a symbolic link or a `..` out of `~/.liam`, and only warns for a directory you pointed it at. The umask applies to the whole process, so a file `liam` writes to a
+  path you choose (for example `--vectors-out`) is created owner-only, and child processes inherit it.
 - `liamd` now logs one warning at start when `liam.toml` is not found, naming the path and saying that mock models
   are in use. Before, it ran with mock models and said nothing.
 - The daemon now refuses a `gc.episode_retention_days` outside 1 to 36500 and a `gc.interval_hours` outside 1 to 8760

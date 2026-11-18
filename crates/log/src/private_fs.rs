@@ -109,7 +109,17 @@ fn open_without_following(path: &Path, extra_flags: libc::c_int) -> io::Result<s
         libc::O_NOFOLLOW | extra_flags,
     )
     .open(path)
-    .map_err(|error| step_failed("open without following links", error))
+    .map_err(|error| {
+        let error = step_failed("open without following links", error);
+        // A symlink fails the open with ELOOP; say what the user can do about it.
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return io::Error::new(
+                error.kind(),
+                format!("{error}; if the real path should be owner-only, run `chmod 700` on it yourself"),
+            );
+        }
+        error
+    })
 }
 
 /// Keeps the error's kind and says which step failed.

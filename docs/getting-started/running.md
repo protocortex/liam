@@ -61,7 +61,9 @@ and create their directories as owner-only (0700) and their files as owner-only
 (0600) whatever the umask was. That includes the database, which the store
 creates itself, so it is never wider than its owner, not even while it opens.
 The model cache holds public files and only this user reads it, so it is
-owner-only too.
+owner-only too. The umask applies to the whole process, so a file the `liam`
+command writes to a path you choose, for example with `--vectors-out`, is
+created owner-only, and child processes inherit the umask.
 
 At start `liamd` also tightens what an older start left wider, for these
 directories only: the database directory, the event log directory, the snapshot

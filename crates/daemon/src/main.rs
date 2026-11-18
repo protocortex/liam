@@ -74,7 +74,7 @@ const USAGE_FLUSH_DEADLINE: Duration = Duration::from_secs(2);
 /// What a directory readable by others exposes, for the start-up warning.
 const STORED_DATA_RISK: &str = "other local users may be able to read the memory stored in it";
 const SOCKET_RISK: &str =
-    "other local users may be able to connect to the socket before its mode is set";
+    "the socket is owner-only from creation, but others can still see its name in this directory";
 
 fn main() -> anyhow::Result<()> {
     // Before any thread starts: the mask is process-wide, and it closes the

@@ -53,7 +53,7 @@ impl Skip {
         match self {
             Self::NotAbsolute => "the path is not absolute",
             Self::EscapesRoot => "the path climbs above the filesystem root",
-            Self::Symlink => "a part of the path is a symbolic link",
+            Self::Symlink => "a part of the path is a symbolic link, so if you want the real directory owner-only, run `chmod 700` on it yourself",
         }
     }
 }

@@ -52,9 +52,8 @@ const MIN_MAX_CONNECTIONS: usize = 1;
 /// to owner-only. Always returns [`ListenerSource::Bound`]: this process
 /// bound the socket itself, so it is the one that owns the file.
 ///
-/// A parent this call creates is owner-only, so nobody else can reach the
-/// socket between the bind and the `chmod`. A parent that already exists keeps
-/// its mode, so the window stays open when that mode is wider.
+/// `liamd` sets a 0o077 umask, so `bind` creates the socket owner-only from the
+/// start. A parent directory that others can read still shows the socket's name.
 ///
 /// Reached through [`crate::transport::activation::resolve`], which only
 /// calls this when no supervisor handed a socket over.
