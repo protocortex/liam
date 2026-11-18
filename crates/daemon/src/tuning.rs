@@ -15,6 +15,7 @@ use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::ask::estimate_tokens;
+use crate::sync::lock;
 
 /// Entries a `RollingWindow` keeps before the oldest is evicted.
 const ROLLING_WINDOW_CAPACITY: usize = 50;
@@ -107,7 +108,7 @@ pub(crate) fn record_and_maybe_evaluate(
     context_tokens: usize,
 ) {
     let averages = {
-        let mut window = window.lock().expect("rolling window mutex poisoned");
+        let mut window = lock(window);
         window.record(queue_wait, generation_time);
         window
             .should_evaluate()
@@ -242,11 +243,7 @@ async fn decide(
         panic!("decide poisoned for test");
     }
 
-    let previous = handles
-        .previous_window_average
-        .lock()
-        .expect("previous window average mutex poisoned")
-        .replace(window_total);
+    let previous = lock(&handles.previous_window_average).replace(window_total);
 
     if handles.granted_capacity.load(Ordering::Relaxed) > ceiling {
         reconcile_capacity(
@@ -286,10 +283,7 @@ fn shrink_bar(prev: Duration) -> Duration {
 /// Releases a held-back permit if there is one, returning whether it did.
 /// Never touches `granted_capacity`: a held permit was already counted in it.
 fn release_held_permit(handles: &AimdHandles) -> bool {
-    let mut held = handles
-        .held_permit
-        .lock()
-        .expect("held permit mutex poisoned");
+    let mut held = lock(&handles.held_permit);
     held.take().is_some()
 }
 
@@ -306,19 +300,13 @@ fn grow_new_capacity(handles: &AimdHandles, ceiling: usize) {
 /// `granted_capacity`. A no-op if already shrunk or already at the floor.
 async fn shrink(handles: &AimdHandles) {
     {
-        let held = handles
-            .held_permit
-            .lock()
-            .expect("held permit mutex poisoned");
+        let held = lock(&handles.held_permit);
         if held.is_some() || handles.granted_capacity.load(Ordering::Relaxed) <= 1 {
             return;
         }
     }
     if let Ok(permit) = handles.generation_permits.clone().acquire_owned().await {
-        *handles
-            .held_permit
-            .lock()
-            .expect("held permit mutex poisoned") = Some(permit);
+        *lock(&handles.held_permit) = Some(permit);
     }
 }
 
@@ -1490,5 +1478,79 @@ pub(crate) mod tests {
         // Then it grows only up to the ceiling, not past it
         assert_eq!(handle.available_permits(), ceiling);
         assert_eq!(granted_capacity.load(Ordering::Relaxed), ceiling);
+    }
+
+    fn poison<T: Send + 'static>(mutex: &Arc<Mutex<T>>) {
+        let held = mutex.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+        assert!(mutex.is_poisoned());
+    }
+
+    #[test]
+    fn recording_into_a_poisoned_window_does_not_panic_and_keeps_the_sample() {
+        // Arrange
+        let window = Arc::new(Mutex::new(RollingWindow::new()));
+        poison(&window);
+        let handles = test_handles(Arc::new(Semaphore::new(1)), 1);
+
+        // Act
+        record_and_maybe_evaluate(
+            &window,
+            handles,
+            Duration::from_millis(5),
+            Duration::from_millis(7),
+            8192,
+        );
+
+        // Assert
+        assert_eq!(lock(&window).average_latency(), Duration::from_millis(12));
+    }
+
+    #[test]
+    fn a_poisoned_held_permit_slot_is_still_released() {
+        // Arrange
+        let handles = test_handles(Arc::new(Semaphore::new(1)), 1);
+        let permit = handles
+            .generation_permits
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        *lock(&handles.held_permit) = Some(permit);
+        poison(&handles.held_permit);
+
+        // Act
+        let released = release_held_permit(&handles);
+
+        // Assert
+        assert!(released);
+        assert_eq!(handles.generation_permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn a_poisoned_previous_average_is_still_replaced_by_decide() {
+        // Arrange
+        let handles = test_handles(Arc::new(Semaphore::new(1)), 1);
+        poison(&handles.previous_window_average);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // Act
+        runtime.block_on(decide(
+            &handles,
+            Duration::ZERO,
+            Duration::from_millis(9),
+            1,
+        ));
+
+        // Assert
+        assert_eq!(
+            *lock(&handles.previous_window_average),
+            Some(Duration::from_millis(9))
+        );
     }
 }
