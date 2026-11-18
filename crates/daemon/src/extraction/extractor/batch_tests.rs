@@ -23,6 +23,8 @@ const WINDOW: LogOffset = LogOffset {
     index: 100,
 };
 
+mod state_tests;
+
 type Behaviour = Box<dyn Fn(&str, &ExtractRequest) -> Option<RemoteResult> + Send + Sync>;
 
 /// A provider that holds batches and answers them when told to.
