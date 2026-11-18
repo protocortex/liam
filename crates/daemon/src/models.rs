@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use liam_model::llm::DevicePreference;
-use liam_model::{Embedder, Llm, MockEmbedder, MockLlm, TextKind};
+use liam_model::{Embedder, Llm, MockEmbedder, MockLlm, NoticeCaller, TextKind};
 use liam_store::{ContentEmbedder, EmbedError};
 
 use crate::config::{self, Config};
@@ -141,8 +141,16 @@ pub const LLAMA_PROVIDER: &str = "llama-cpp";
 /// provider loads fastembed in-process. Any other name is an error, so a typo
 /// cannot quietly select the mock.
 pub fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
+    build_embedder_for(config, NoticeCaller::Daemon)
+}
+
+/// `build_embedder`, where `caller` decides what the download notice says.
+pub fn build_embedder_for(
+    config: &Config,
+    caller: NoticeCaller,
+) -> anyhow::Result<Arc<dyn Embedder>> {
     if config.embedder.provider == LOCAL_PROVIDER {
-        return build_local_embedder(config);
+        return build_local_embedder(config, caller);
     }
     if config.embedder.provider == MOCK_PROVIDER {
         return Ok(Arc::new(MockEmbedder::new(config.embedding_dims)));
@@ -172,7 +180,10 @@ pub fn embedder_device(config: &Config) -> anyhow::Result<DevicePreference> {
     })
 }
 
-fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
+fn build_local_embedder(
+    config: &Config,
+    caller: NoticeCaller,
+) -> anyhow::Result<Arc<dyn Embedder>> {
     use liam_model::{BgeM3Embedder, FastEmbedEmbedder, LlamaEmbedder, OnnxEmbedder};
     let device = embedder_device(config)?;
     let home = std::env::var("HOME").unwrap_or_default();
@@ -182,6 +193,7 @@ fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
         return Ok(Arc::new(BgeM3Embedder::load(
             config.embedding_dims,
             &cache_dir,
+            caller,
         )?));
     }
     if let Some(spec) = liam_model::onnx_model_spec(&config.embedder.model) {
@@ -189,6 +201,7 @@ fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
             spec,
             config.embedding_dims,
             &cache_dir,
+            caller,
         )?));
     }
     if liam_model::gguf_embedder_spec(&config.embedder.model).is_some() {
@@ -197,6 +210,7 @@ fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
             config.embedding_dims,
             &cache_dir,
             device,
+            caller,
         )?));
     }
     Ok(Arc::new(FastEmbedEmbedder::load(
@@ -204,6 +218,7 @@ fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
         config.embedding_dims,
         &cache_dir,
         device,
+        caller,
     )?))
 }
 
@@ -212,8 +227,13 @@ fn build_local_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
 /// retired candle provider: an operator who still has it in their liam.toml
 /// gets an actionable error instead of a silent downgrade to mock.
 pub fn build_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
+    build_llm_for(config, NoticeCaller::Daemon)
+}
+
+/// `build_llm`, where `caller` decides what the download notice says.
+pub fn build_llm_for(config: &Config, caller: NoticeCaller) -> anyhow::Result<Arc<dyn Llm>> {
     let llm: Arc<dyn Llm> = if config.llm.provider == LLAMA_PROVIDER {
-        build_llama_llm(config)?
+        build_llama_llm(config, caller)?
     } else if config.llm.provider == "local" {
         anyhow::bail!(
             "llm.provider = \"local\" was removed: the candle provider is gone, \
@@ -272,7 +292,11 @@ fn llama_settings(config: &Config) -> anyhow::Result<LlamaSettings> {
     Ok(LlamaSettings { device, cache_dir })
 }
 
-fn load_llama(config: &Config, settings: &LlamaSettings) -> liam_model::Result<Arc<dyn Llm>> {
+fn load_llama(
+    config: &Config,
+    settings: &LlamaSettings,
+    caller: NoticeCaller,
+) -> liam_model::Result<Arc<dyn Llm>> {
     use liam_model::LlamaCppLlm;
     Ok(Arc::new(LlamaCppLlm::load_from_hub(
         &config.llm.model,
@@ -280,12 +304,13 @@ fn load_llama(config: &Config, settings: &LlamaSettings) -> liam_model::Result<A
         &settings.cache_dir,
         config.llm.context_tokens as u32,
         settings.device,
+        caller,
     )?))
 }
 
-fn build_llama_llm(config: &Config) -> anyhow::Result<Arc<dyn Llm>> {
+fn build_llama_llm(config: &Config, caller: NoticeCaller) -> anyhow::Result<Arc<dyn Llm>> {
     let settings = llama_settings(config)?;
-    Ok(load_llama(config, &settings)?)
+    Ok(load_llama(config, &settings, caller)?)
 }
 
 /// The LLM the daemon serves with, plus the handle that unloads it when idle.
@@ -312,7 +337,7 @@ pub fn build_serving_llm(config: &Config) -> anyhow::Result<ServingLlm> {
     reject_unexpected_cpu_backend(backend, settings.device)?;
     let loader: Loader = {
         let config = config.clone();
-        Arc::new(move || load_llama(&config, &settings))
+        Arc::new(move || load_llama(&config, &settings, NoticeCaller::Daemon))
     };
     let lazy = Arc::new(LazyLlm::new(loader, backend));
     tracing::info!(backend, "llm ready, loads on first use");

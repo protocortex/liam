@@ -9,7 +9,7 @@
 //! or a pinned download for a model fastembed does not list.
 
 use crate::blocking::with_model_blocking;
-use crate::download_notice;
+use crate::download_notice::{self, NoticeCaller};
 use crate::error::{ModelError, Result};
 use crate::onnx_pinned::{self, PinnedOnnxModel, ARCTIC_EMBED_M_V2};
 use crate::TextKind;
@@ -205,11 +205,15 @@ pub struct OnnxEmbedder {
 
 impl OnnxEmbedder {
     /// Load `spec` into `cache_dir`, producing vectors `dims` wide.
-    pub fn load(spec: &'static OnnxModelSpec, dims: usize, cache_dir: &str) -> Result<Self> {
+    pub fn load(
+        spec: &'static OnnxModelSpec,
+        dims: usize,
+        cache_dir: &str,
+        caller: NoticeCaller,
+    ) -> Result<Self> {
         validate_onnx_dims(spec, dims)?;
-        if let Some(hf_home) =
-            hf_home_override(spec, std::env::var("HF_HOME").ok().as_deref(), cache_dir)
-        {
+        let hf_home = std::env::var("HF_HOME").ok();
+        if let Some(hf_home) = hf_home_override(spec, hf_home.as_deref(), cache_dir) {
             tracing::warn!(
                 hf_home,
                 cache_dir,
@@ -221,10 +225,15 @@ impl OnnxEmbedder {
             OnnxSource::Fastembed(variant) => {
                 if let Ok(info) = fastembed::TextEmbedding::get_model_info(variant) {
                     download_notice::log_unless_cached(
-                        download_notice::hub_repo_cached(cache_dir, &info.model_code),
+                        download_notice::fastembed_model_cached(
+                            hf_home.as_deref(),
+                            cache_dir,
+                            info,
+                        ),
                         spec.id,
-                        cache_dir,
+                        download_notice::fastembed_cache_dir(hf_home.as_deref(), cache_dir),
                         None,
+                        caller,
                     );
                 }
                 let options = fastembed::TextInitOptions::new(variant.clone())
@@ -243,7 +252,15 @@ impl OnnxEmbedder {
                         file.remote_path,
                     )
                 },
-                |bytes| download_notice::log_unless_cached(false, spec.id, cache_dir, Some(bytes)),
+                |bytes| {
+                    download_notice::log_unless_cached(
+                        false,
+                        spec.id,
+                        cache_dir,
+                        Some(bytes),
+                        caller,
+                    )
+                },
                 |file| onnx_pinned::fetch_from_hub(pinned, cache_dir, file),
                 crate::verify_pinned_file,
                 |paths| onnx_pinned::fastembed_session(pinned, spec.max_tokens, paths),
@@ -589,8 +606,13 @@ mod tests {
         // Arrange
         let bge = spec("BAAI/bge-small-en-v1.5");
         let cache_dir = std::env::temp_dir().join("liam-onnx-test-cache");
-        let embedder = super::OnnxEmbedder::load(bge, bge.native_dims, cache_dir.to_str().unwrap())
-            .expect("load bge-small");
+        let embedder = super::OnnxEmbedder::load(
+            bge,
+            bge.native_dims,
+            cache_dir.to_str().unwrap(),
+            crate::NoticeCaller::Daemon,
+        )
+        .expect("load bge-small");
         let texts = [
             "where do I live".to_string(),
             "I live in Lisbon, Portugal".to_string(),
@@ -620,7 +642,9 @@ mod tests {
         // Arrange
         let cache_dir = std::env::var("LIAM_MODEL_CACHE").expect("set LIAM_MODEL_CACHE");
         let arctic = spec(super::DEFAULT_EMBEDDER_MODEL_ID);
-        let embedder = super::OnnxEmbedder::load(arctic, 384, &cache_dir).expect("load arctic");
+        let embedder =
+            super::OnnxEmbedder::load(arctic, 384, &cache_dir, crate::NoticeCaller::Daemon)
+                .expect("load arctic");
         let documents = [
             "The mitochondria is the powerhouse of the cell".to_string(),
             "I live in Lisbon, Portugal".to_string(),
@@ -670,7 +694,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_dir);
 
         // Act
-        let result = super::OnnxEmbedder::load(bge, 128, cache_dir.to_str().unwrap());
+        let result = super::OnnxEmbedder::load(
+            bge,
+            128,
+            cache_dir.to_str().unwrap(),
+            crate::NoticeCaller::Daemon,
+        );
 
         // Assert
         assert!(result.is_err());

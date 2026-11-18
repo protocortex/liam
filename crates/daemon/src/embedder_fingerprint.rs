@@ -113,7 +113,7 @@ const PREVIOUS_DEFAULT_MODEL_ID: &str = liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID
 /// The info line for a local embedder pinned to the previous default, or
 /// `None` for the current default and any other model. The pinned model keeps
 /// working, so this only says a newer default exists.
-pub fn superseded_default_notice(config: &Config) -> Option<String> {
+pub fn superseded_default_notice(config: &Config, database_path: &Path) -> Option<String> {
     let is_previous_default = config.embedder.provider == LOCAL_PROVIDER
         && canonical_model_id(&config.embedder.model)
             == canonical_model_id(PREVIOUS_DEFAULT_MODEL_ID);
@@ -121,9 +121,11 @@ pub fn superseded_default_notice(config: &Config) -> Option<String> {
         format!(
             "the default embedder is now {current}; this config keeps {configured}, which is \
              still supported. To switch, remove `model` from [embedder] (or set it to {current}) \
-             and `embedding_dims`, then run `liam rebuild`. To stay, change nothing.",
+             and `embedding_dims`, then run `liam rebuild --database {database}`. To stay, change \
+             nothing.",
             current = liam_model::DEFAULT_EMBEDDER_MODEL_ID,
             configured = config.embedder.model,
+            database = database_path.display(),
         )
     })
 }
@@ -362,16 +364,20 @@ mod tests {
         ] {
             // Arrange
             let config = config_with_embedder("local", model);
+            let database = Path::new("/data/liam.db");
 
             // Act
-            let notice = superseded_default_notice(&config).expect("a notice");
+            let notice = superseded_default_notice(&config, database).expect("a notice");
 
             // Assert
             assert!(
                 notice.contains(liam_model::DEFAULT_EMBEDDER_MODEL_ID),
                 "{notice}"
             );
-            assert!(notice.contains("liam rebuild"), "{notice}");
+            assert!(
+                notice.contains("liam rebuild --database /data/liam.db"),
+                "{notice}"
+            );
             assert!(notice.contains("still supported"), "{notice}");
         }
     }
@@ -387,7 +393,11 @@ mod tests {
             let config = config_with_embedder("local", model);
 
             // Act / Assert
-            assert_eq!(superseded_default_notice(&config), None, "{model}");
+            assert_eq!(
+                superseded_default_notice(&config, Path::new("/data/liam.db")),
+                None,
+                "{model}"
+            );
         }
     }
 

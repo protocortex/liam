@@ -21,8 +21,9 @@ All notable changes to LIAM are recorded here. The format follows
 ### Changed
 
 - `liamd` now logs one info line before it downloads a model that is not in the cache, naming the model, the
-  directory and, where known, the size, and pointing to `liam fetch-models`. Nothing is logged when the files
-  are already there.
+  directory and, where known, the size, and pointing to `liam fetch-models` (`liam fetch-models` itself leaves
+  that hint out). It checks for the files the model loads, in `HF_HOME` when that is set, so a download that was
+  interrupted gets the notice again. Nothing is logged when the files are already there.
 - A config that still names the previous default embedder (`Qwen/Qwen3-Embedding-0.6B-GGUF`) now gets one info
   line at start saying the default changed and how to switch or stay. It keeps working.
 - A clean shutdown no longer waits up to 3 seconds and logs `compaction was still queued at exit`. Closed

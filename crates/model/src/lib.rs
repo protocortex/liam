@@ -29,6 +29,7 @@ pub use onnx::{
 pub use onnx_pinned::{PinnedFile, PinnedOnnxModel, ARCTIC_EMBED_M_V2};
 
 pub use bge::BgeM3Embedder;
+pub use download_notice::NoticeCaller;
 pub use embedder::FastEmbedEmbedder;
 pub use onnx::OnnxEmbedder;
 

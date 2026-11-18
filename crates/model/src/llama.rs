@@ -35,6 +35,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
+use crate::download_notice::NoticeCaller;
 use crate::error::{ModelError, Result};
 use crate::hardware::{resolve_device, Engine, ResolvedDevice, SystemFacts};
 use crate::llm::{strip_reasoning, CancelFlag, DevicePreference, Llm};
@@ -115,12 +116,14 @@ impl LlamaCppLlm {
         cache_dir: &str,
         context_tokens: u32,
         device: DevicePreference,
+        caller: NoticeCaller,
     ) -> Result<Self> {
         crate::download_notice::log_unless_cached(
             Self::cached_gguf_path(model_id, gguf_file, cache_dir).is_some(),
             &format!("{model_id} ({gguf_file})"),
             cache_dir,
             None,
+            caller,
         );
         let api = hf_hub::api::sync::ApiBuilder::new()
             .with_cache_dir(std::path::PathBuf::from(cache_dir))

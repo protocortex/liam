@@ -208,10 +208,10 @@ pub fn secure_dirs(dirs: &[&Path], state_root: &Path, risk: &str) {
         match secure_dir(dir, state_root) {
             Ok(DirOutcome::Untouched) => {}
             Ok(DirOutcome::Tightened(from)) => {
-                tracing::info!(dir = %dir.display(), from = format!("{from:o}"), "restricted the state directory to its owner");
+                tracing::info!(dir = %dir_label(dir), from = format!("{from:o}"), "restricted the state directory to its owner");
             }
             Ok(DirOutcome::WideAndNotOwned(mode)) if first_report(dir) => {
-                tracing::warn!(dir = %dir.display(), mode = format!("{mode:o}"), risk, "this directory is readable by other users and is not LIAM's own state directory, so its mode was left as it is");
+                tracing::warn!(dir = %dir_label(dir), mode = format!("{mode:o}"), risk, "this directory is readable by other users and is not LIAM's own state directory, so its mode was left as it is");
             }
             Ok(DirOutcome::Skipped(skip)) if first_report(dir) => {
                 let cwd = std::env::current_dir().ok();
@@ -219,7 +219,7 @@ pub fn secure_dirs(dirs: &[&Path], state_root: &Path, risk: &str) {
             }
             Ok(DirOutcome::WideAndNotOwned(_) | DirOutcome::Skipped(_)) => {}
             Err(error) if first_report(dir) => {
-                tracing::warn!(dir = %dir.display(), %error, "could not secure this directory");
+                tracing::warn!(dir = %dir_label(dir), %error, "could not secure this directory");
             }
             Err(_) => {}
         }

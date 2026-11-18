@@ -178,6 +178,7 @@ mod real_tier {
                 dims,
                 &cache_dir,
                 liam_model::llm::DevicePreference::Cpu,
+                liam_model::NoticeCaller::Daemon,
             )
             .expect(
                 "load real embedder (Qwen3); requires network access for first-time model \

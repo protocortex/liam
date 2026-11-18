@@ -29,6 +29,7 @@ use llama_cpp_2::token::LlamaToken;
 use tokio::sync::Mutex;
 
 use crate::blocking::with_model_blocking;
+use crate::download_notice::NoticeCaller;
 use crate::embedder::{
     mrl_truncate, qwen3_input, validate_dims, Embedder, TextKind, EMBED_MAX_INPUT_TOKENS,
 };
@@ -254,11 +255,12 @@ impl LlamaEmbedder {
         dims: usize,
         cache_dir: &str,
         device: DevicePreference,
+        caller: NoticeCaller,
     ) -> Result<Self> {
         let spec = gguf_embedder_spec(model_id).ok_or_else(|| {
             ModelError::Embed(format!("{model_id} is not a known GGUF embedding model"))
         })?;
-        let path = gguf_path_from_hub(spec, cache_dir)?;
+        let path = gguf_path_from_hub(spec, cache_dir, caller)?;
         verify_gguf_file(spec, &path)?;
         Self::load(model_id, &path.to_string_lossy(), dims, device)
     }
@@ -271,12 +273,17 @@ pub fn verify_gguf_file(spec: &GgufEmbedderSpec, path: &std::path::Path) -> Resu
 }
 
 /// Where the pinned file lives under `cache_dir`, downloading on a miss.
-pub fn gguf_path_from_hub(spec: &GgufEmbedderSpec, cache_dir: &str) -> Result<std::path::PathBuf> {
+pub fn gguf_path_from_hub(
+    spec: &GgufEmbedderSpec,
+    cache_dir: &str,
+    caller: NoticeCaller,
+) -> Result<std::path::PathBuf> {
     crate::download_notice::log_unless_cached(
         crate::download_notice::hub_file_cached(cache_dir, spec.repo, spec.revision, spec.file),
         spec.id,
         cache_dir,
         Some(spec.size_bytes),
+        caller,
     );
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(std::path::PathBuf::from(cache_dir))
@@ -522,6 +529,7 @@ mod tests {
             384,
             &cache,
             DevicePreference::Cpu,
+            NoticeCaller::Daemon,
         )
         .unwrap();
 

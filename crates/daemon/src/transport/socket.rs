@@ -39,10 +39,12 @@ use crate::transport::ListenerSource;
 const SOCKET_MODE: u32 = 0o600;
 
 /// Bytes in `sockaddr_un.sun_path`, which holds the path and its closing NUL.
-#[cfg(target_os = "macos")]
-const SUN_PATH_CAPACITY: usize = 104;
-#[cfg(not(target_os = "macos"))]
+/// Linux and Android have 108. macOS and the BSDs have 104, and 104 is also the
+/// safe choice for any other unix, since a path that fits in 104 fits in both.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const SUN_PATH_CAPACITY: usize = 108;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const SUN_PATH_CAPACITY: usize = 104;
 
 /// Longest socket path, in bytes, that `bind` accepts.
 const MAX_SOCKET_PATH_BYTES: usize = SUN_PATH_CAPACITY - 1;

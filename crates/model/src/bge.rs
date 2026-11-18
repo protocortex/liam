@@ -10,6 +10,7 @@
 //! the input convention and the fixed width.
 
 use crate::blocking::with_model_blocking;
+use crate::download_notice::{self, NoticeCaller};
 use crate::error::{ModelError, Result};
 use crate::TextKind;
 use async_trait::async_trait;
@@ -59,23 +60,27 @@ pub struct BgeM3Embedder {
 
 impl BgeM3Embedder {
     /// Load BGE-M3 into `cache_dir`. `dims` must be `BGE_M3_DIMS`, the model's own width.
-    pub fn load(dims: usize, cache_dir: &str) -> Result<Self> {
+    pub fn load(dims: usize, cache_dir: &str, caller: NoticeCaller) -> Result<Self> {
         validate_bge_m3_dims(dims)?;
-        if let Some(hf_home) =
-            hf_home_overriding(std::env::var("HF_HOME").ok().as_deref(), cache_dir)
-        {
+        let hf_home = std::env::var("HF_HOME").ok();
+        if let Some(hf_home) = hf_home_overriding(hf_home.as_deref(), cache_dir) {
             tracing::warn!(
                 hf_home,
                 cache_dir,
                 "HF_HOME is set, so {BGE_M3_MODEL_ID} is stored under HF_HOME, not embedder.cache_dir"
             );
         }
-        crate::download_notice::log_unless_cached(
-            crate::download_notice::hub_repo_cached(cache_dir, BGE_M3_MODEL_ID),
-            BGE_M3_MODEL_ID,
-            cache_dir,
-            None,
-        );
+        if let Ok(info) =
+            fastembed::TextEmbedding::get_model_info(&fastembed::EmbeddingModel::BGEM3)
+        {
+            download_notice::log_unless_cached(
+                download_notice::fastembed_model_cached(hf_home.as_deref(), cache_dir, info),
+                BGE_M3_MODEL_ID,
+                download_notice::fastembed_cache_dir(hf_home.as_deref(), cache_dir),
+                None,
+                caller,
+            );
+        }
         let options = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::BGEM3)
             .with_cache_dir(std::path::PathBuf::from(cache_dir))
             .with_max_length(crate::embedder::EMBED_MAX_INPUT_TOKENS);
@@ -144,8 +149,12 @@ mod tests {
 
         // Arrange
         let cache_dir = std::env::temp_dir().join("liam-bge-m3-test-cache");
-        let embedder = super::BgeM3Embedder::load(BGE_M3_DIMS, cache_dir.to_str().unwrap())
-            .expect("load BGE-M3");
+        let embedder = super::BgeM3Embedder::load(
+            BGE_M3_DIMS,
+            cache_dir.to_str().unwrap(),
+            crate::NoticeCaller::Daemon,
+        )
+        .expect("load BGE-M3");
 
         // Act
         let vector = embedder
@@ -169,8 +178,12 @@ mod tests {
 
         // Arrange
         let cache_dir = std::env::temp_dir().join("liam-bge-m3-test-cache");
-        let embedder = super::BgeM3Embedder::load(BGE_M3_DIMS, cache_dir.to_str().unwrap())
-            .expect("load BGE-M3");
+        let embedder = super::BgeM3Embedder::load(
+            BGE_M3_DIMS,
+            cache_dir.to_str().unwrap(),
+            crate::NoticeCaller::Daemon,
+        )
+        .expect("load BGE-M3");
         let texts = [
             "where do I live".to_string(),
             "I live in Lisbon, Portugal".to_string(),
@@ -200,7 +213,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_dir);
 
         // Act
-        let err = match super::BgeM3Embedder::load(BGE_M3_DIMS / 2, cache_dir.to_str().unwrap()) {
+        let err = match super::BgeM3Embedder::load(
+            BGE_M3_DIMS / 2,
+            cache_dir.to_str().unwrap(),
+            crate::NoticeCaller::Daemon,
+        ) {
             Ok(_) => panic!("a non-native width must be refused"),
             Err(err) => err.to_string(),
         };

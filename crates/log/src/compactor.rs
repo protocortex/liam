@@ -1310,6 +1310,11 @@ mod tests {
         PanicOnce(AtomicBool),
         /// Stores these bytes instead of what was put.
         Substitute(PutPayload),
+        /// Tells `entered` the put has started, then holds it until `release`.
+        Gate {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        },
     }
 
     impl fmt::Display for FaultyStore {
@@ -1338,6 +1343,11 @@ mod tests {
                 }
                 PutFault::PanicOnce(_) => payload,
                 PutFault::Substitute(other) => other.clone(),
+                PutFault::Gate { entered, release } => {
+                    entered.notify_one();
+                    release.notified().await;
+                    payload
+                }
             };
             self.inner.put_opts(location, payload, opts).await
         }
@@ -1777,6 +1787,67 @@ mod tests {
             .expect("recovery");
         assert_eq!(report.compacted, vec![0]);
         assert_eq!(file_names(dir.path(), ".parquet"), vec![parquet_name(0)]);
+    }
+
+    #[tokio::test]
+    async fn a_compaction_already_running_when_stop_is_requested_finishes_its_segment_and_then_the_task_ends(
+    ) {
+        // Arrange: two closed segments, with the first held inside its put
+        let log = write_log(2);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let compactor = faulty(
+            &log.dir,
+            PutFault::Gate {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+        );
+        let (sink, receiver) = ChannelSink::channel();
+        for segment in &log.closed {
+            sink.segment_closed(&segment.path);
+        }
+        let mut task = compactor.spawn_stoppable(receiver);
+        entered.notified().await;
+
+        // Act: ask for the stop while the first compaction is still running
+        task.request_stop();
+        release.notify_one();
+        tokio::time::timeout(TASK_TIMEOUT, &mut task.join)
+            .await
+            .expect("the task ends once the running compaction is done")
+            .expect("compactor task does not panic");
+
+        // Assert: the running segment is complete, and the queued one is left
+        let first = &log.closed[0];
+        assert!(!first.path.exists(), "the running segment was compacted");
+        assert_parquet_holds(&local_store(&log.dir), first).await;
+        assert!(log.closed[1].path.exists(), "the queued segment is kept");
+        assert_eq!(
+            file_names(log.dir.path(), ".parquet"),
+            vec![parquet_name(0)]
+        );
+        drop(sink);
+    }
+
+    #[tokio::test]
+    async fn asking_a_compactor_to_stop_twice_is_harmless() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (sink, receiver) = ChannelSink::channel();
+        let mut task = local_compactor(dir.path()).spawn_stoppable(receiver);
+
+        // Act
+        task.request_stop();
+        task.request_stop();
+        let first = tokio::time::timeout(TASK_TIMEOUT, &mut task.join)
+            .await
+            .expect("the task stops");
+        task.request_stop();
+
+        // Assert
+        assert!(first.is_ok(), "the task does not panic");
+        drop(sink);
     }
 
     #[test]
