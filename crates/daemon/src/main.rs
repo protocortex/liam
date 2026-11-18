@@ -57,7 +57,7 @@ use liam_daemon::models::{
     build_embedder, build_serving_llm, prepare_llm_at_start, resolve_config_path, resolve_log_dir,
     ServingLlm,
 };
-use liam_daemon::{embedder_fingerprint, storelock, telemetry};
+use liam_daemon::{embedder_fingerprint, state_dir, storelock, telemetry};
 use liam_model::{Embedder, Llm};
 use log_startup::StartedStore;
 use mcp::MemoryServer;
@@ -128,6 +128,21 @@ async fn run(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
     serve_with_store(mode, config).await
 }
 
+/// Tightens the state directories left over from an earlier start, before the
+/// first file is created in them. New ones are created private.
+fn secure_existing_state_dirs(database_path: &std::path::Path, log_dir: &std::path::Path) {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let Some(home) = home else {
+        return;
+    };
+    let state_root = state_dir::default_state_dir(&home);
+    let database_dir = database_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty());
+    let dirs: Vec<&std::path::Path> = database_dir.into_iter().chain([log_dir]).collect();
+    state_dir::secure_dirs(&dirs, &state_root);
+}
+
 /// Everything that needs the store and the models: the stdio server and the
 /// socket daemon. Both take the per-process store lock.
 async fn serve_with_store(mode: cli::Mode, config: Config) -> anyhow::Result<()> {
@@ -146,6 +161,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     // a PID file.
     let database_path = resolve_config_path("database_path", &config.database_path)?;
     let log_dir = resolve_log_dir(&config, &database_path)?;
+    secure_existing_state_dirs(&database_path, &log_dir);
     let _lock = storelock::StoreLock::acquire(&database_path).context(
         "liamd needs the store to itself; if the holder is another liamd, `liamd proxy` \
          shuttles to it and opens no store",
@@ -167,6 +183,9 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     if let Some(warning) = config.removed_reranker_warning() {
         tracing::warn!("{warning}");
     }
+    if let Some(warning) = config.missing_config_warning() {
+        tracing::warn!("{warning}");
+    }
     let embedder = build_embedder(&config)?;
     let StartedStore {
         store,
@@ -181,6 +200,8 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         &shutdown,
     )
     .await?;
+    // The store has created its files by now, with the umask's mode.
+    state_dir::secure_database_files(&database_path);
     if let Some(fingerprint) = fingerprint {
         fingerprint.commit()?;
     }
@@ -467,6 +488,10 @@ async fn serve_socket(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let socket_path = resolve_config_path("socket_path", &config.socket_path)?;
+    if let (Some(parent), Some(home)) = (socket_path.parent(), std::env::var_os("HOME")) {
+        let state_root = state_dir::default_state_dir(std::path::Path::new(&home));
+        state_dir::secure_dirs(&[parent], &state_root);
+    }
     let source = transport::activation::resolve(&socket_path).await?;
 
     // Signals are watched on their own task so the accept loop owns the

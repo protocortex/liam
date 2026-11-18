@@ -52,6 +52,20 @@ reach the file can act as any client; owner-only is what makes "can reach it"
 mean "is already you". `liamd serve` refuses to start if another daemon is
 already listening, and replaces the socket only when it is stale.
 
+## Where LIAM keeps its files
+
+The state lives under `~/.liam`: the database, the event log, the socket and the
+model cache. Memory is stored in plain text unless `[encryption]` is on, so
+`liamd` creates its state directories as owner-only (0700) and the files it
+creates as owner-only (0600), whatever the umask says. At start it tightens an
+existing `~/.liam` that is wider, and the database files too. If you point a path
+at a directory of your own, `liamd` never changes that directory's mode: it logs a
+warning when the directory is readable by others, and you can fix it with `chmod 700`.
+The model cache holds public files and keeps the default mode.
+
+If `liam.toml` is not found, `liamd` runs with mock models and logs one warning
+that names the path it looked for. Pass `--config <path>` or set `LIAM_CONFIG`.
+
 The tools a client sees, with their fields, are listed in
 [Tools](../reference/tools.md).
 

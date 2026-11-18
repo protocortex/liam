@@ -118,6 +118,10 @@ pub struct Config {
     pub reranker: Option<toml::Value>,
     /// Calls to hosted model providers. Off by default.
     pub hosted: HostedConfig,
+    /// The config path `load` looked for and did not find, so the values are
+    /// the built-in defaults. Never read from a file.
+    #[serde(skip)]
+    pub missing_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -257,6 +261,7 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             reranker: None,
             hosted: HostedConfig::default(),
+            missing_file: None,
         }
     }
 }
@@ -493,7 +498,10 @@ impl Config {
     /// without mutating the process environment.
     fn load_with_home(path: &Path, home: &str) -> anyhow::Result<Self> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(Self {
+                missing_file: Some(path.to_path_buf()),
+                ..Self::default()
+            });
         }
         let text = std::fs::read_to_string(path)?;
 
@@ -551,6 +559,19 @@ impl Config {
     /// section, which no longer does anything.
     pub fn removed_reranker_warning(&self) -> Option<&'static str> {
         self.reranker.as_ref().map(|_| REMOVED_RERANKER_WARNING)
+    }
+
+    /// The warning to log at start when no config file was found, so the
+    /// built-in defaults, which use mock models, are in effect.
+    pub fn missing_config_warning(&self) -> Option<String> {
+        let path = self.missing_file.as_deref()?;
+        let looked_in = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        Some(format!(
+            "no config file at {}, so the built-in defaults are used with mock models: \
+             embeddings and answers are not real. Point at a config with --config <path> \
+             or the LIAM_CONFIG environment variable",
+            looked_in.display()
+        ))
     }
 
     pub fn gc_policy(&self) -> RetentionPolicy {
@@ -681,6 +702,37 @@ mod tests {
         let warning = config.removed_reranker_warning().unwrap();
         assert!(warning.contains("reranker was removed"), "{warning}");
         assert!(warning.contains("delete it"), "{warning}");
+    }
+
+    #[test]
+    fn a_missing_config_file_yields_one_warning_naming_the_path_and_the_fix() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.toml");
+
+        // Act
+        let config = Config::load_with_home(&path, "/home/alice").unwrap();
+
+        // Assert
+        let warning = config.missing_config_warning().unwrap();
+        assert!(warning.contains(&*path.to_string_lossy()), "{warning}");
+        assert!(warning.contains("mock models"), "{warning}");
+        assert!(warning.contains("--config"), "{warning}");
+        assert!(warning.contains("LIAM_CONFIG"), "{warning}");
+    }
+
+    #[test]
+    fn a_present_config_file_yields_no_missing_file_warning() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("liam.toml");
+        std::fs::write(&path, "").unwrap();
+
+        // Act
+        let config = Config::load_with_home(&path, "/home/alice").unwrap();
+
+        // Assert
+        assert_eq!(config.missing_config_warning(), None);
     }
 
     #[test]
