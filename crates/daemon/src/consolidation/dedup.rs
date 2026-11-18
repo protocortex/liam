@@ -220,6 +220,22 @@ async fn scan(
     Ok(out)
 }
 
+/// Embeddings of older nodes, kept across items, and what went wrong while
+/// making them so the run can report it once.
+#[derive(Default)]
+struct OlderEmbeddings {
+    vectors: HashMap<String, Option<Vec<f32>>>,
+    failures: usize,
+    first_failure: Option<String>,
+}
+
+impl OlderEmbeddings {
+    fn record_failure(&mut self, reason: String) {
+        self.failures += 1;
+        self.first_failure.get_or_insert(reason);
+    }
+}
+
 /// The best older node of `item`'s own scope and producer, found by a bounded
 /// vector search over the whole store. `batch` holds the ids compared in-batch,
 /// and `embedded` caches embeddings across items.
@@ -230,7 +246,7 @@ async fn older_match(
     batch: &HashSet<&str>,
     as_of: Millis,
     threshold: f32,
-    embedded: &mut HashMap<String, Option<Vec<f32>>>,
+    embedded: &mut OlderEmbeddings,
 ) -> liam_store::Result<Option<MergePair>> {
     let mut query = Query::vector(item.embedding.clone())
         .with_k(OLDER_NEIGHBOURS)
@@ -253,11 +269,19 @@ async fn older_match(
         {
             continue;
         }
-        if !embedded.contains_key(node.id.as_str()) {
-            let vector = embedder.embed(node.retrieved.as_text()).await.ok();
-            embedded.insert(node.id.as_str().to_string(), vector);
+        if !embedded.vectors.contains_key(node.id.as_str()) {
+            let vector = match embedder.embed(node.retrieved.as_text()).await {
+                Ok(vector) => Some(vector),
+                Err(reason) => {
+                    embedded.record_failure(reason.to_string());
+                    None
+                }
+            };
+            embedded
+                .vectors
+                .insert(node.id.as_str().to_string(), vector);
         }
-        let Some(Some(vector)) = embedded.get(node.id.as_str()) else {
+        let Some(Some(vector)) = embedded.vectors.get(node.id.as_str()) else {
             continue;
         };
         let similarity = cosine(vector, &item.embedding);
@@ -308,7 +332,7 @@ pub async fn merge_near_duplicates(
         .collect();
     let mut pairs = plan_merges(&scan.items, threshold);
     let paired: HashSet<&str> = pairs.iter().map(|p| p.duplicate.as_str()).collect();
-    let mut embedded = HashMap::new();
+    let mut embedded = OlderEmbeddings::default();
     let mut older = Vec::new();
     for item in scan
         .items
@@ -326,6 +350,13 @@ pub async fn merge_near_duplicates(
         )
         .await?;
         older.extend(found);
+    }
+    if let Some(reason) = &embedded.first_failure {
+        tracing::warn!(
+            failed = embedded.failures,
+            %reason,
+            "dedup: older nodes the embedder failed on were not compared"
+        );
     }
     pairs.extend(older);
     pairs.sort_by_key(|pair| index[pair.duplicate.as_str()]);

@@ -59,15 +59,19 @@ pub async fn add_column_if_missing<B: Backend>(
         // race's loser is. Without this, the losing process's `ALTER TABLE`
         // fails and it never starts.
         //
-        // Every backend maps its native error into the opaque
-        // `Error::Backend(String)` (see `error.rs`), specifically so this
-        // crate never depends on one engine's error type. That is exactly
-        // what forces the string match below: there is no typed
-        // duplicate-column variant to match on instead, and there
-        // deliberately will not be one, so this is not a shortcut to clean
-        // up into a typed match later, it is the only match the trait as
-        // designed allows.
-        Err(Error::Backend(msg)) if msg.contains("duplicate column name") => Ok(()),
+        // Every backend maps its native error into the opaque `Error::Engine`
+        // (see `error.rs`), specifically so this crate never names one
+        // engine's error type. That is exactly what forces the string match
+        // below: there is no typed duplicate-column variant to match on
+        // instead, and there deliberately will not be one, so this is not a
+        // shortcut to clean up into a typed match later, it is the only match
+        // the trait as designed allows.
+        Err(e)
+            if e.engine_message()
+                .is_some_and(|msg| msg.contains("duplicate column name")) =>
+        {
+            Ok(())
+        }
         Err(e) => Err(e),
     }
 }
@@ -668,7 +672,9 @@ mod tests {
             .expect_err("second alter should fail");
 
         // Assert
-        assert!(matches!(err, Error::Backend(ref msg) if msg.contains("duplicate column name")));
+        assert!(err
+            .engine_message()
+            .is_some_and(|msg| msg.contains("duplicate column name")));
     }
 
     // ---- ensure_cascade (ADR-0003) ----

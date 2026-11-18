@@ -60,15 +60,15 @@ mod column {
 /// Why a segment could not be compacted, or a Parquet file could not be read.
 #[derive(Debug, thiserror::Error)]
 pub enum CompactError {
-    #[error("arrow conversion failed: {0}")]
+    #[error("arrow conversion failed")]
     Arrow(#[from] ArrowError),
-    #[error("parquet encoding failed: {0}")]
+    #[error("parquet encoding failed")]
     Parquet(#[from] parquet::errors::ParquetError),
-    #[error("object store operation failed: {0}")]
+    #[error("object store operation failed")]
     Store(#[from] object_store::Error),
     #[error("payload could not be decoded: {0}")]
     Payload(postcard::Error),
-    #[error("wal segment could not be read: {0}")]
+    #[error("wal segment could not be read")]
     Wal(#[from] WalError),
     #[error("column {name} is missing or has an unexpected type")]
     Column { name: &'static str },
@@ -93,9 +93,9 @@ pub enum CompactError {
     IncompleteSegment { segment: PathBuf },
     #[error("wal segment {} is the open segment and is not compacted", segment.display())]
     OpenSegment { segment: PathBuf },
-    #[error("wal segment {} could not be removed: {source}", segment.display())]
+    #[error("wal segment {} could not be removed", segment.display())]
     Remove { segment: PathBuf, source: io::Error },
-    #[error("wal segment {} was unlinked but the directory sync failed, so the removal is not confirmed durable: {source}", segment.display())]
+    #[error("wal segment {} was unlinked but the directory sync failed, so the removal is not confirmed durable", segment.display())]
     RemoveNotDurable { segment: PathBuf, source: io::Error },
     #[error("{} is not a wal segment name", segment.display())]
     NotASegment { segment: PathBuf },

@@ -215,12 +215,13 @@ impl LlamaEmbedder {
         validate_dims(model_id, dims, spec.native_dims)?;
         let resolved = resolve_device(Engine::LlamaEmbedder, device, &SystemFacts)
             .map_err(ModelError::Embed)?;
-        let backend = shared_backend().map_err(|e| ModelError::Embed(e.to_string()))?;
+        let backend =
+            shared_backend().map_err(|e| ModelError::embed_failed("start the llama backend", e))?;
         let offload = resolved.device != ResolvedDevice::Cpu;
         let layers = if offload { ALL_GPU_LAYERS } else { 0 };
         let params = LlamaModelParams::default().with_n_gpu_layers(layers);
         let model = LlamaModel::load_from_file(&backend, gguf_path, &params)
-            .map_err(|e| ModelError::Embed(format!("load {gguf_path}: {e}")))?;
+            .map_err(|e| ModelError::embed_failed(format!("load {gguf_path}"), e))?;
         let label = if offload {
             runtime_backend(&backend)
         } else {
@@ -274,14 +275,14 @@ pub fn gguf_path_from_hub(spec: &GgufEmbedderSpec, cache_dir: &str) -> Result<st
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(std::path::PathBuf::from(cache_dir))
         .build()
-        .map_err(|e| ModelError::Embed(format!("hf-hub api for {}: {e}", spec.repo)))?;
+        .map_err(|e| ModelError::embed_failed(format!("hf-hub api for {}", spec.repo), e))?;
     api.repo(hf_hub::Repo::with_revision(
         spec.repo.to_string(),
         hf_hub::RepoType::Model,
         spec.revision.to_string(),
     ))
     .get(spec.file)
-    .map_err(|e| ModelError::Embed(format!("fetch {} from {}: {e}", spec.file, spec.repo)))
+    .map_err(|e| ModelError::embed_failed(format!("fetch {} from {}", spec.file, spec.repo), e))
 }
 
 impl Inner {
@@ -334,7 +335,7 @@ impl Inner {
             .with_n_threads_batch(threads);
         self.model
             .new_context(&self.backend, params)
-            .map_err(|e| ModelError::Embed(format!("context: {e}")))
+            .map_err(|e| ModelError::embed_failed("create the context", e))
     }
 
     fn decode_run(&mut self, run: &[Vec<LlamaToken>]) -> Result<Vec<Vec<f32>>> {
@@ -343,7 +344,7 @@ impl Inner {
         for (seq, tokens) in run.iter().enumerate() {
             batch
                 .add_sequence(tokens, seq as i32, false)
-                .map_err(|e| ModelError::Embed(format!("batch: {e}")))?;
+                .map_err(|e| ModelError::embed_failed("build the batch", e))?;
         }
         if total > BATCH_TOKEN_BUDGET {
             let mut one_off = self.new_context(total)?;
@@ -371,12 +372,12 @@ fn read_vectors(
     dims: usize,
 ) -> Result<Vec<Vec<f32>>> {
     ctx.decode(batch)
-        .map_err(|e| ModelError::Embed(format!("decode: {e}")))?;
+        .map_err(|e| ModelError::embed_failed("decode the batch", e))?;
     (0..sequences)
         .map(|seq| {
             let pooled = ctx
                 .embeddings_seq_ith(seq as i32)
-                .map_err(|e| ModelError::Embed(format!("read embedding: {e}")))?;
+                .map_err(|e| ModelError::embed_failed("read the embedding", e))?;
             finish_vector(pooled.to_vec(), dims)
         })
         .collect()

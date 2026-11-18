@@ -20,6 +20,8 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- Errors now keep the underlying cause as their source instead of copying its text, so a failure's full chain
+  is printed once. The store reports a busy or locked database apart from other engine failures.
 - The toolchain is pinned to Rust 1.99.1 in `rust-toolchain.toml`, CI installs it from that file, and the
   workspace declares a minimum Rust version of 1.89.
 - The answer LLM now loads on first use and unloads after 5 minutes idle, so a daemon nobody is asking holds

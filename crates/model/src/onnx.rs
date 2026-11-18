@@ -222,7 +222,7 @@ impl OnnxEmbedder {
                     .with_cache_dir(std::path::PathBuf::from(cache_dir))
                     .with_max_length(spec.max_tokens);
                 fastembed::TextEmbedding::try_new(options)
-                    .map_err(|e| ModelError::Embed(format!("load {}: {e}", spec.id)))?
+                    .map_err(|e| ModelError::embed_failed(format!("load {}", spec.id), e))?
             }
             OnnxSource::Pinned(pinned) => onnx_pinned::load_pinned(
                 pinned,
@@ -262,7 +262,7 @@ impl crate::Embedder for OnnxEmbedder {
         with_model_blocking(model, ModelError::Embed, move |m| {
             let full = embed_inputs(&inputs, spec.allows_batching(), |chunk, batch_size| {
                 m.embed(chunk, batch_size)
-                    .map_err(|e| ModelError::Embed(e.to_string()))
+                    .map_err(|e| ModelError::embed_failed("embedding failed", e))
             })?;
             Ok(full
                 .iter()

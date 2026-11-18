@@ -365,11 +365,13 @@ async fn too_little_free_ram_refuses_before_spawning() {
     let result = SidecarGuard::start_with(&config, factory, low).await;
 
     // Assert
-    let gate = SidecarError::RamGate {
-        free_mb: 100,
-        budget_mb: 4096,
-    };
-    assert_eq!(result.err(), Some(gate));
+    assert!(matches!(
+        result.err(),
+        Some(SidecarError::RamGate {
+            free_mb: 100,
+            budget_mb: 4096
+        })
+    ));
     assert_eq!(spawns.load(Ordering::SeqCst), 0);
 }
 
@@ -386,7 +388,7 @@ async fn a_server_that_never_loads_times_out_and_is_killed() {
     let result = SidecarGuard::start_with(&config, factory, deps(vec![free_port()])).await;
 
     // Assert
-    assert_eq!(result.err(), Some(SidecarError::StartTimeout));
+    assert!(matches!(result.err(), Some(SidecarError::StartTimeout)));
     assert!(begun.elapsed() < Duration::from_secs(SHORT_TIMEOUT_SECS * TIMEOUT_SLACK_FACTOR));
     let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
     assert!(wait_until_gone(pid));
@@ -402,8 +404,10 @@ async fn a_server_that_exits_at_once_fails_after_the_attempt_budget() {
     let result = SidecarGuard::start_with(&config(START_TIMEOUT_SECS), factory, deps(ports)).await;
 
     // Assert
-    let exited = SidecarError::Exited(Some(FAKE_EXIT_CODE));
-    assert_eq!(result.err(), Some(exited));
+    assert!(matches!(
+        result.err(),
+        Some(SidecarError::Exited(Some(FAKE_EXIT_CODE)))
+    ));
     assert_eq!(spawns.load(Ordering::SeqCst), MAX_START_ATTEMPTS as usize);
 }
 
@@ -573,7 +577,7 @@ async fn the_alias_cannot_be_read_without_the_probe_key() {
     let result = SidecarGuard::start_with(&config, factory, deps(vec![free_port()])).await;
 
     // Assert
-    assert_eq!(result.err(), Some(SidecarError::StartTimeout));
+    assert!(matches!(result.err(), Some(SidecarError::StartTimeout)));
 }
 
 #[tokio::test]
@@ -624,7 +628,7 @@ async fn a_server_that_lists_the_alias_but_reports_unhealthy_is_not_ready() {
     .await;
 
     // Assert
-    assert_eq!(result.err(), Some(SidecarError::StartTimeout));
+    assert!(matches!(result.err(), Some(SidecarError::StartTimeout)));
 }
 
 #[tokio::test]
@@ -641,7 +645,7 @@ async fn a_server_that_ignores_the_key_is_never_trusted() {
     .await;
 
     // Assert
-    assert_eq!(result.err(), Some(SidecarError::StartTimeout));
+    assert!(matches!(result.err(), Some(SidecarError::StartTimeout)));
 }
 
 #[tokio::test]
@@ -917,3 +921,29 @@ fn the_random_values_differ_and_are_hex() {
 }
 
 mod provider_tests;
+
+#[tokio::test]
+async fn a_host_that_is_not_an_address_fails_setup_and_keeps_the_parse_error() {
+    // Arrange
+    let (factory, spawns) = fake("", None);
+    let config = ExtractionConfig {
+        host: "not-an-address".to_string(),
+        ..config(START_TIMEOUT_SECS)
+    };
+
+    // Act
+    let result = SidecarGuard::start_with(&config, factory, deps(vec![])).await;
+
+    // Assert
+    let Err(error) = result else {
+        panic!("a bad host is refused");
+    };
+    assert!(matches!(error, SidecarError::Setup(_)));
+    let source = std::error::Error::source(&error).expect("the parse error is the source");
+    assert!(
+        source.to_string().contains("invalid IP address"),
+        "{source}"
+    );
+    assert!(!error.to_string().contains("invalid IP address"), "{error}");
+    assert_eq!(spawns.load(Ordering::SeqCst), 0);
+}

@@ -63,13 +63,13 @@ impl LogRecord {
 /// mode. A shredded row is not one of them: it is a normal record property.
 #[derive(Debug, thiserror::Error)]
 pub enum ReaderError {
-    #[error("wal segment {sequence} could not be read: {source}")]
+    #[error("wal segment {sequence} could not be read")]
     Wal { sequence: u64, source: WalError },
-    #[error("parquet segment {sequence} could not be read: {source}")]
+    #[error("parquet segment {sequence} could not be read")]
     Parquet { sequence: u64, source: CompactError },
-    #[error("object store failed: {0}")]
+    #[error("object store failed")]
     Store(#[from] object_store::Error),
-    #[error("log io failed: {0}")]
+    #[error("log io failed")]
     Io(#[from] io::Error),
     #[error(
         "key {key_id} is not in the key registry, so a record cannot be told from a shredded one"
@@ -80,14 +80,14 @@ pub enum ReaderError {
         first_segment: u64,
         last_segment: u64,
     },
-    #[error("sealed record {event_id} could not be opened: {source}")]
+    #[error("sealed record {event_id} could not be opened")]
     Sealed {
         event_id: String,
         source: crate::envelope::OpenError,
     },
     #[error("segment {sequence} is missing from the log")]
     MissingSegment { sequence: u64 },
-    #[error("the archive of the log cannot be read: {0}")]
+    #[error("the archive of the log cannot be read")]
     Archive(#[from] ArchiveError),
     #[error(
         "segment {sequence} holds {wal_events} events in its wal but its parquet is stamped with {parquet_events}"

@@ -280,8 +280,23 @@ fn err(e: libsql::Error) -> Error {
         {
             Error::Constraint(message)
         }
-        other => Error::Backend(other.to_string()),
+        other => Error::Engine {
+            busy: is_busy_error(&other),
+            source: Box::new(other),
+        },
     }
+}
+
+/// SQLite reports a busy or locked database with one of these primary codes.
+fn is_busy_error(error: &libsql::Error) -> bool {
+    matches!(
+        error,
+        libsql::Error::SqliteFailure(code, _)
+            if matches!(
+                code & PRIMARY_CODE_MASK,
+                libsql::ffi::SQLITE_BUSY | libsql::ffi::SQLITE_LOCKED
+            )
+    )
 }
 
 /// Applies the pragmas that describe connection state rather than database
@@ -883,6 +898,51 @@ mod tests {
                 is_constraint,
                 "code {code}: {mapped:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_writer_on_a_held_database_maps_to_a_busy_error_with_the_engine_as_source() {
+        // Arrange
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("busy.db");
+        let open = || async {
+            libsql::Builder::new_local(&path)
+                .build()
+                .await
+                .unwrap()
+                .connect()
+                .unwrap()
+        };
+        let holder = open().await;
+        let waiter = open().await;
+        holder.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        waiter.execute("PRAGMA busy_timeout = 0", ()).await.ok();
+
+        // Act
+        let refused = waiter.execute("BEGIN IMMEDIATE", ()).await.unwrap_err();
+        let mapped = err(refused);
+
+        // Assert
+        assert!(mapped.is_busy(), "{mapped:?}");
+        let source = std::error::Error::source(&mapped).expect("the engine error is kept");
+        assert!(source.to_string().contains("locked"), "{source}");
+        assert!(!mapped.to_string().contains("locked"), "{mapped}");
+    }
+
+    #[test]
+    fn only_a_busy_or_locked_code_is_busy() {
+        for (code, busy) in [
+            (libsql::ffi::SQLITE_BUSY, true),
+            (libsql::ffi::SQLITE_LOCKED, true),
+            (libsql::ffi::SQLITE_BUSY | (2 << 8), true),
+            (libsql::ffi::SQLITE_IOERR, false),
+        ] {
+            // Act
+            let mapped = err(libsql::Error::SqliteFailure(code, "failed".into()));
+
+            // Assert
+            assert_eq!(mapped.is_busy(), busy, "code {code}");
         }
     }
 

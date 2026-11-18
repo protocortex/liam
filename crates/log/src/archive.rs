@@ -35,7 +35,7 @@ const TEMP_SUFFIX: &str = ".archiving";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
-    #[error("archive io failed: {0}")]
+    #[error("archive io failed")]
     Io(#[from] io::Error),
     #[error(transparent)]
     Wal(#[from] WalError),

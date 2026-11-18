@@ -45,15 +45,15 @@ const SEQUENCE_DIGITS: usize = 20;
 /// Why a WAL operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
-    #[error("wal io failed: {0}")]
+    #[error("wal io failed")]
     Io(#[from] io::Error),
-    #[error("wal record could not be encoded: {0}")]
+    #[error("wal record could not be encoded")]
     Encode(#[from] EventError),
     #[error("wal record of {0} bytes exceeds the 4 byte length prefix")]
     RecordTooLarge(usize),
     #[error("wal segment {} has a corrupt record at offset {offset}", segment.display())]
     Corrupt { segment: PathBuf, offset: u64 },
-    #[error("wal segment {} has an undecodable record at offset {offset}: {source}", segment.display())]
+    #[error("wal segment {} has an undecodable record at offset {offset}", segment.display())]
     Decode {
         segment: PathBuf,
         offset: u64,
@@ -74,7 +74,7 @@ pub enum WalError {
     )]
     LogInUse { dir: PathBuf },
     #[error(
-        "the log in {} could not be locked ({source}); the filesystem may not support \
+        "the log in {} could not be locked; the filesystem may not support \
          advisory locks, which network mounts often lack, so keep the log on a local disk",
         dir.display()
     )]
