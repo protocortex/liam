@@ -14,8 +14,8 @@ use crate::onnx_pinned::{self, PinnedOnnxModel, ARCTIC_EMBED_M_V2};
 use crate::TextKind;
 use async_trait::async_trait;
 
-/// Inputs per ONNX run. fastembed's default of 256 pads the whole batch to its
-/// longest input; a small batch bounds that.
+/// Inputs per ONNX run on the batched path. fastembed's default of 256 pads the
+/// whole batch to its longest input; a small batch bounds that.
 const EMBED_BATCH_SIZE: usize = 16;
 
 /// The model accepts 8192 tokens. Stored facts are short, so 512 bounds the
@@ -55,6 +55,20 @@ pub struct OnnxModelSpec {
     /// Written before stored text. Empty when the model takes none.
     pub document_prefix: &'static str,
     pub source: OnnxSource,
+}
+
+impl OnnxModelSpec {
+    /// Whether one model call may hold several texts. Dynamic quantisation
+    /// scales its data range to each batch, so a text's vector would depend on
+    /// the texts beside it.
+    pub fn allows_batching(&self) -> bool {
+        match &self.source {
+            OnnxSource::Fastembed(_) => true,
+            OnnxSource::Pinned(pinned) => {
+                !matches!(pinned.quantization, fastembed::QuantizationMode::Dynamic)
+            }
+        }
+    }
 }
 
 /// All of the models this module loads, in the order the docs list them.
@@ -246,9 +260,10 @@ impl crate::Embedder for OnnxEmbedder {
         let dims = self.dims;
         let inputs: Vec<String> = texts.iter().map(|t| onnx_input(spec, t, kind)).collect();
         with_model_blocking(model, ModelError::Embed, move |m| {
-            let full = m
-                .embed(&inputs, Some(EMBED_BATCH_SIZE))
-                .map_err(|e| ModelError::Embed(e.to_string()))?;
+            let full = embed_inputs(&inputs, spec.allows_batching(), |chunk, batch_size| {
+                m.embed(chunk, batch_size)
+                    .map_err(|e| ModelError::Embed(e.to_string()))
+            })?;
             Ok(full
                 .iter()
                 .map(|v| crate::embedder::mrl_truncate(v, dims))
@@ -258,13 +273,119 @@ impl crate::Embedder for OnnxEmbedder {
     }
 }
 
+/// Runs `embed` over `inputs`, in order. When batching is not allowed each text
+/// gets its own call, so its vector never depends on its neighbours.
+fn embed_inputs<E>(inputs: &[String], batching: bool, mut embed: E) -> Result<Vec<Vec<f32>>>
+where
+    E: FnMut(&[String], Option<usize>) -> Result<Vec<Vec<f32>>>,
+{
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if batching {
+        return embed(inputs, Some(EMBED_BATCH_SIZE));
+    }
+    let mut vectors = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        vectors.extend(embed(std::slice::from_ref(input), None)?);
+    }
+    Ok(vectors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        hf_home_override, onnx_input, onnx_model_spec, validate_onnx_dims, OnnxModelSpec,
-        BGE_STYLE_QUERY_PREFIX, ONNX_MODELS,
+        embed_inputs, hf_home_override, onnx_input, onnx_model_spec, validate_onnx_dims,
+        OnnxModelSpec, BGE_STYLE_QUERY_PREFIX, EMBED_BATCH_SIZE, ONNX_MODELS,
     };
     use crate::TextKind;
+
+    const TEXT_COUNT: usize = 40;
+    const FAILING_TEXT_INDEX: usize = 2;
+    const EMBED_EPSILON: f32 = 1e-4;
+    const BATCH_TEXT_COUNT: usize = 20;
+
+    fn texts(count: usize) -> Vec<String> {
+        (0..count).map(|i| i.to_string()).collect()
+    }
+
+    /// Records each call as (texts in the call, batch size) and answers every
+    /// text with a one-element vector holding its number.
+    fn recording(
+        calls: &mut Vec<(usize, Option<usize>)>,
+    ) -> impl FnMut(&[String], Option<usize>) -> crate::Result<Vec<Vec<f32>>> + '_ {
+        move |chunk, batch_size| {
+            calls.push((chunk.len(), batch_size));
+            Ok(chunk.iter().map(|t| vec![t.parse().unwrap()]).collect())
+        }
+    }
+
+    #[test]
+    fn a_dynamic_spec_embeds_one_text_per_call_and_keeps_the_order() {
+        // Arrange
+        assert!(!spec(super::DEFAULT_EMBEDDER_MODEL_ID).allows_batching());
+        let inputs = texts(TEXT_COUNT);
+        let mut calls = Vec::new();
+
+        // Act
+        let vectors = embed_inputs(&inputs, false, recording(&mut calls)).unwrap();
+
+        // Assert
+        assert_eq!(calls.len(), TEXT_COUNT);
+        assert!(calls.iter().all(|(len, _)| *len == 1), "{calls:?}");
+        let expected: Vec<Vec<f32>> = (0..TEXT_COUNT).map(|i| vec![i as f32]).collect();
+        assert_eq!(vectors, expected);
+    }
+
+    #[test]
+    fn a_non_dynamic_spec_embeds_in_one_batched_call() {
+        // Arrange
+        assert!(spec("BAAI/bge-small-en-v1.5").allows_batching());
+        let inputs = texts(TEXT_COUNT);
+        let mut calls = Vec::new();
+
+        // Act
+        let vectors = embed_inputs(&inputs, true, recording(&mut calls)).unwrap();
+
+        // Assert
+        assert_eq!(calls, vec![(TEXT_COUNT, Some(EMBED_BATCH_SIZE))]);
+        assert_eq!(vectors.len(), TEXT_COUNT);
+    }
+
+    #[test]
+    fn an_empty_input_returns_no_vectors_and_makes_no_call() {
+        for batching in [false, true] {
+            // Arrange
+            let mut calls = Vec::new();
+
+            // Act
+            let vectors = embed_inputs(&[], batching, recording(&mut calls)).unwrap();
+
+            // Assert
+            assert!(vectors.is_empty());
+            assert!(calls.is_empty(), "{calls:?}");
+        }
+    }
+
+    #[test]
+    fn an_error_on_the_third_text_is_returned_and_stops_the_run() {
+        // Arrange
+        let inputs = texts(TEXT_COUNT);
+        let mut calls = 0;
+
+        // Act
+        let result = embed_inputs(&inputs, false, |chunk, _| {
+            if calls == FAILING_TEXT_INDEX {
+                return Err(crate::ModelError::Embed("boom".into()));
+            }
+            calls += 1;
+            Ok(chunk.iter().map(|_| vec![0.0]).collect())
+        });
+
+        // Assert
+        assert!(matches!(result, Err(crate::ModelError::Embed(m)) if m == "boom"));
+        assert_eq!(calls, FAILING_TEXT_INDEX);
+    }
 
     fn spec(id: &str) -> &'static OnnxModelSpec {
         onnx_model_spec(id).expect("a listed model")
@@ -458,12 +579,30 @@ mod tests {
             .embed_batch(&documents, TextKind::Document)
             .await
             .expect("embed documents");
+        let many: Vec<String> = (0..BATCH_TEXT_COUNT)
+            .map(|i| format!("{} {i}", documents[i % documents.len()]))
+            .collect();
+        let many_vectors = embedder
+            .embed_batch(&many, TextKind::Document)
+            .await
+            .expect("embed more documents than one batch");
+        let alone = embedder
+            .embed(&many[0], TextKind::Document)
+            .await
+            .expect("embed one document");
 
         // Assert
         let cosine = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         let scores: Vec<f32> = vectors.iter().map(|v| cosine(&query, v)).collect();
         assert_eq!(query.len(), 384);
         assert!(scores[1] > scores[0] && scores[1] > scores[2], "{scores:?}");
+        assert_eq!(many_vectors.len(), BATCH_TEXT_COUNT);
+        let drift = many_vectors[0]
+            .iter()
+            .zip(&alone)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(drift < EMBED_EPSILON, "{drift}");
     }
 
     #[test]
