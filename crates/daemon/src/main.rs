@@ -53,7 +53,10 @@ pub use liam_daemon::config;
 use config::Config;
 use consolidation_job::{ConsolidationJob, JobSetup};
 use liam_daemon::consolidation::maintenance::standard_steps;
-use liam_daemon::models::{build_embedder, build_llm, resolve_config_path, resolve_log_dir};
+use liam_daemon::models::{
+    build_embedder, build_serving_llm, prepare_llm_at_start, resolve_config_path, resolve_log_dir,
+    ServingLlm,
+};
 use liam_daemon::{embedder_fingerprint, storelock, telemetry};
 use liam_model::{Embedder, Llm};
 use log_startup::StartedStore;
@@ -183,16 +186,11 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     }
     let store = Arc::new(store);
 
-    let llm = build_llm(&config)?;
-    if config.llm.warmup {
-        let started = std::time::Instant::now();
-        match llm.warmup().await {
-            Ok(()) => tracing::info!(elapsed = ?started.elapsed(), "llm warmed up"),
-            // A failed warmup is not fatal: the first real call will simply pay
-            // the cost, or fail with a better message than this one would.
-            Err(e) => tracing::warn!(error = %e, "llm warmup failed"),
-        }
-    }
+    let ServingLlm { llm, lazy } = build_serving_llm(&config)?;
+    prepare_llm_at_start(&config, llm.as_ref()).await?;
+
+    let idle_unloader = lazy
+        .and_then(|lazy| lazy.spawn_idle_unloader(config.llm.idle_unload_secs, shutdown.token()));
 
     let job_embedder = embedder.clone();
     let server = if config.llm.max_concurrent_generations == 0 {
@@ -333,7 +331,14 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         ),
         cli::Mode::Stdio => serve_stdio(server, shutdown.token()).await,
     };
-    stop_background_tasks(&shutdown, usage_flush, maintenance, compactor).await;
+    stop_background_tasks(
+        &shutdown,
+        usage_flush,
+        maintenance,
+        idle_unloader,
+        compactor,
+    )
+    .await;
     match (served, shutdown.failure()) {
         (Err(error), _) | (Ok(()), Some(error)) => Err(error),
         (Ok(()), None) => Ok(()),
@@ -357,13 +362,14 @@ async fn serve_stdio(server: MemoryServer, shutdown: CancellationToken) -> anyho
 
 /// Flushes the usage counts once the transports have drained, then stops the
 /// maintenance loop, whose server handle is the last one that keeps
-/// the store alive, then waits for the compactor, which finishes the segments
+/// the store alive, then the idle unloader, then waits for the compactor, which finishes the segments
 /// already queued once the store and its log writer are gone. Both are bounded:
 /// an interrupted compaction is redone by the next start.
 async fn stop_background_tasks(
     shutdown: &Shutdown,
     usage_flush: Option<UsageFlush>,
     maintenance: JoinHandle<()>,
+    idle_unloader: Option<JoinHandle<()>>,
     mut compactor: JoinHandle<()>,
 ) {
     // The transports have drained by now, and the store is still open.
@@ -376,6 +382,15 @@ async fn stop_background_tasks(
         .is_err()
     {
         tracing::warn!("the maintenance loop is still running; leaving it to the exit");
+    }
+    if let Some(idle_unloader) = idle_unloader {
+        // The cancelled token ends this task at its next check.
+        if tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, idle_unloader)
+            .await
+            .is_err()
+        {
+            tracing::warn!("the llm idle task is still running; leaving it to the exit");
+        }
     }
     match tokio::time::timeout(COMPACTOR_DRAIN_DEADLINE, &mut compactor).await {
         Ok(Ok(())) => tracing::info!("compactor stopped"),

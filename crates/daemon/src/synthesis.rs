@@ -110,6 +110,17 @@ pub async fn synthesize_entity(
             }
         };
     let queue_wait = acquire_start.elapsed();
+    // Load before the timer starts, so a cold model does not skew the tuner's
+    // generation window, and before counting, so trimming uses the real count.
+    match tokio::time::timeout_at(deadline, llm.ensure_loaded()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error),
+        Err(_) => {
+            return Err(ModelError::Llm(
+                "timed out loading the model for the entity synthesis".to_string(),
+            ))
+        }
+    }
     let generation_start = tokio::time::Instant::now();
 
     let mentions = fit_evidence_to_budget(
@@ -263,6 +274,52 @@ mod tests {
                 .push(prompt.to_string());
             Ok("Ada Lovelace works as an engineer.".to_string())
         }
+    }
+
+    const LOAD_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Takes `LOAD_DELAY` to become ready, then answers at once.
+    struct SlowToLoadLlm;
+
+    #[async_trait::async_trait]
+    impl liam_model::Llm for SlowToLoadLlm {
+        async fn ensure_loaded(&self) -> liam_model::Result<()> {
+            tokio::time::sleep(LOAD_DELAY).await;
+            Ok(())
+        }
+
+        async fn complete(&self, _system: &str, _prompt: &str) -> liam_model::Result<String> {
+            Ok("Ada Lovelace works as an engineer.".to_string())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_first_call_does_not_record_the_load_time() {
+        // Arrange
+        let mentions = vec![mention("fact", "Role", "Works as an engineer.", 0)];
+        let aimd = test_handles(Arc::new(Semaphore::new(1)), 1);
+        let window = Arc::new(Mutex::new(RollingWindow::new()));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // Act
+        synthesize_entity(
+            &SlowToLoadLlm,
+            &aimd,
+            &window,
+            deadline,
+            "person",
+            "Ada Lovelace",
+            &mentions,
+            1,
+            64,
+        )
+        .await
+        .expect("the load fits inside the deadline");
+
+        // Assert
+        let window = window.lock().unwrap();
+        assert_eq!(window.len(), 1);
+        assert!(window.average_latency() < LOAD_DELAY);
     }
 
     /// Always errors, so a test can assert the failure propagates.

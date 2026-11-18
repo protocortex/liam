@@ -127,6 +127,19 @@ impl LlamaCppLlm {
         Self::load(&weights_path.to_string_lossy(), context_tokens, device)
     }
 
+    /// Where `load_from_hub` finds the GGUF without the network, or `None`
+    /// when it is not in the cache yet. Looks only at the cache layout: it
+    /// does not read or hash the file.
+    pub fn cached_gguf_path(
+        model_id: &str,
+        gguf_file: &str,
+        cache_dir: &str,
+    ) -> Option<std::path::PathBuf> {
+        hf_hub::Cache::new(std::path::PathBuf::from(cache_dir))
+            .model(model_id.to_string())
+            .get(gguf_file)
+    }
+
     /// Render a system and user turn with the template embedded in the GGUF:
     /// the model states its own format instead of this crate maintaining a
     /// hand-written table per architecture.
@@ -335,6 +348,14 @@ pub(crate) fn runtime_backend(backend: &LlamaBackend) -> &'static str {
     runtime_label(compiled_backend(), backend.supports_gpu_offload())
 }
 
+/// The backend label a loaded `LlamaCppLlm` will report, without loading any
+/// weights. Initialising the process-global backend is cheap, so a caller that
+/// loads the model later can still check and log the backend at startup.
+pub fn llama_runtime_backend() -> Result<&'static str> {
+    let backend = shared_backend()?;
+    Ok(runtime_backend(&backend))
+}
+
 #[async_trait]
 impl Llm for LlamaCppLlm {
     async fn complete(&self, system: &str, prompt: &str) -> Result<String> {
@@ -378,6 +399,31 @@ impl Llm for LlamaCppLlm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MODEL_ID: &str = "acme/tiny-gguf";
+    const GGUF_FILE: &str = "tiny.gguf";
+    const COMMIT: &str = "0123abcd";
+
+    #[test]
+    fn the_cached_path_is_found_only_when_the_file_is_in_the_cache() {
+        // Arrange: an empty cache, then one holding the file in hf-hub's layout.
+        let cache = tempfile::tempdir().unwrap();
+        let cache_dir = cache.path().to_str().unwrap();
+        let missing = LlamaCppLlm::cached_gguf_path(MODEL_ID, GGUF_FILE, cache_dir);
+        let repo = cache.path().join("models--acme--tiny-gguf");
+        let snapshot = repo.join("snapshots").join(COMMIT);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs").join("main"), COMMIT).unwrap();
+        std::fs::write(snapshot.join(GGUF_FILE), b"weights").unwrap();
+
+        // Act
+        let found = LlamaCppLlm::cached_gguf_path(MODEL_ID, GGUF_FILE, cache_dir);
+
+        // Assert
+        assert!(missing.is_none());
+        assert_eq!(found, Some(snapshot.join(GGUF_FILE)));
+    }
 
     #[tokio::test]
     #[ignore = "needs the extraction GGUF from `liam fetch-models`"]
@@ -425,6 +471,18 @@ mod tests {
             let metal = LlamaCppLlm::load("missing.gguf", 512, DevicePreference::Metal);
             assert!(metal.err().unwrap().to_string().contains("macOS"));
         }
+    }
+
+    #[test]
+    fn the_runtime_backend_probe_matches_the_label_a_loaded_model_reports() {
+        // Arrange
+        let backend = shared_backend().expect("backend init");
+
+        // Act
+        let probed = llama_runtime_backend().expect("probe");
+
+        // Assert
+        assert_eq!(probed, runtime_backend(&backend));
     }
 
     #[test]

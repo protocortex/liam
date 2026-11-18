@@ -1567,6 +1567,17 @@ impl MemoryServer {
         }
     }
 
+    /// Loads the model within the shared `deadline`, so the token count and the
+    /// generation timer that follow start on a ready model. The error is the
+    /// reason text `ask` hands to `fallback_answer`.
+    async fn ensure_llm_loaded(&self, deadline: tokio::time::Instant) -> Result<(), &'static str> {
+        match tokio::time::timeout_at(deadline, self.llm.ensure_loaded()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err("the model could not be loaded"),
+            Err(_) => Err("timed out loading the model"),
+        }
+    }
+
     /// Runs the sufficiency pre-pass against the shared `deadline`: does the
     /// evidence actually contain the answer? `true` means proceed to
     /// synthesis; only an explicit parsed "no" returns `false`, so a
@@ -1734,11 +1745,25 @@ impl MemoryServer {
                 retrieval_reasons,
             );
         }
+        // One deadline for the stages after retrieval (retrieval has its own
+        // `recall_timeout_secs` budget): the permit acquire, the
+        // sufficiency pre-pass, and synthesis below all race against this
+        // same instant instead of each getting its own fresh
+        // `ask_timeout_secs`, so a slow stage eats into the budget the later
+        // stages get rather than tripling the wall-clock cap. `max(1)` guards
+        // against an operator typo of `ask_timeout_secs = 0`, which would
+        // otherwise make the whole request time out immediately.
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.ask_timeout_secs.max(1));
+
         // Trim ONCE, before the sufficiency pre-pass, and reuse this same
         // slice for both prompts below. Trimming twice, or only for the
         // answer prompt, would let the pre-pass vouch for evidence the answer
-        // never sees. The closure prefers the model's real count and only
-        // falls back to the estimate when the provider cannot count.
+        // never sees. The model loads first, inside the request deadline, so
+        // the count below is the real one. The closure prefers the model's
+        // real count and only falls back to the estimate when the provider
+        // cannot count.
+        let loaded = self.ensure_llm_loaded(deadline).await;
         let evidence = fit_evidence_to_budget(
             |slice| build_ask_prompt(&args.question, slice),
             &evidence,
@@ -1752,17 +1777,18 @@ impl MemoryServer {
 
         // Every reply from here on shows these results, with their handles.
         self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
-
-        // One deadline for the stages after retrieval (retrieval has its own
-        // `recall_timeout_secs` budget): the permit acquire, the
-        // sufficiency pre-pass, and synthesis below all race against this
-        // same instant instead of each getting its own fresh
-        // `ask_timeout_secs`, so a slow stage eats into the budget the later
-        // stages get rather than tripling the wall-clock cap. `max(1)` guards
-        // against an operator typo of `ask_timeout_secs = 0`, which would
-        // otherwise make the whole request time out immediately.
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(self.ask_timeout_secs.max(1));
+        if let Err(reason) = loaded {
+            return with_reasons(
+                ToolReply::ok(fallback_answer(
+                    reason,
+                    evidence,
+                    self.max_basis_ids_rendered,
+                )),
+                retrieval_reasons
+                    .into_iter()
+                    .chain([Some(Degraded::SynthesisUnavailable)]),
+            );
+        }
 
         // Bound concurrent generation before either model call below: both
         // the sufficiency pre-pass and synthesis hit the model, so a permit

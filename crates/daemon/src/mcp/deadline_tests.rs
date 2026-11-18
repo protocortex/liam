@@ -658,3 +658,98 @@ async fn ask_keeps_the_embed_reason_when_the_pre_pass_refuses() {
     );
     assert!(text.contains("does not contain an answer"), "{text}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_ask_whose_deadline_passes_during_the_model_load_takes_the_synthesis_fallback() {
+    // Arrange: a lazy model whose load stays blocked until the gate closes.
+    // The paused clock does not advance while a blocking load runs, so the
+    // test moves it by hand once the load has started.
+    let (open, gate) = std::sync::mpsc::channel::<()>();
+    let (started_tx, started) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    let loader: liam_daemon::lazy_llm::Loader = Arc::new(move || {
+        started_tx.send(()).ok();
+        gate.lock().unwrap().recv().ok();
+        Ok(Arc::new(CannedLlm {
+            reply: Some(GROUNDED_ANSWER),
+        }) as Arc<dyn Llm>)
+    });
+    let lazy = Arc::new(liam_daemon::lazy_llm::LazyLlm::new(loader, "test"));
+    let server = server_with_ask_timeout(
+        Arc::new(MockEmbedder::new(DIMS)),
+        lazy.clone(),
+        ASK_TIMEOUT_SECS,
+    )
+    .await;
+    seed_facts(&server).await;
+
+    // Act: the first ask times out inside the load, then the load finishes.
+    let (slow, ()) = tokio::join!(
+        server.ask_with(ask_args(), CancellationToken::new()),
+        async {
+            tokio::task::spawn_blocking(move || started.recv().unwrap())
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(ASK_TIMEOUT_SECS + 1)).await;
+        }
+    );
+    drop(open);
+    lazy.warmup()
+        .await
+        .expect("the load finishes after the deadline");
+    let ready = server.ask_with(ask_args(), CancellationToken::new()).await;
+
+    // Assert
+    let text = wire_text(slow, &["synthesis_unavailable"], false);
+    assert_eq!(
+        text.lines().next(),
+        Some(marker_for("synthesis_unavailable").as_str())
+    );
+    assert_eq!(text.matches(" note ").count(), K, "{text}");
+    wire_text(ready, NO_REASONS, false);
+}
+
+const EXACT_TOKENS_PER_CHAR: usize = 20;
+const NOTE_MARKER: &str = " note ";
+
+/// Counts far more tokens per character than the chars/4 estimate and keeps
+/// the prompts it receives.
+struct ExactCountLlm {
+    prompts: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl Llm for ExactCountLlm {
+    async fn complete(&self, _system: &str, prompt: &str) -> liam_model::Result<String> {
+        self.prompts.lock().unwrap().push(prompt.to_string());
+        Ok(GROUNDED_ANSWER.to_string())
+    }
+
+    fn count_tokens(&self, text: &str) -> Option<usize> {
+        Some(text.len() * EXACT_TOKENS_PER_CHAR)
+    }
+}
+
+#[tokio::test]
+async fn the_first_ask_on_an_unloaded_model_trims_with_the_exact_count() {
+    // Arrange: a lazy model that has not loaded yet, over a counting double.
+    let inner = Arc::new(ExactCountLlm {
+        prompts: std::sync::Mutex::new(Vec::new()),
+    });
+    let loader: liam_daemon::lazy_llm::Loader = {
+        let inner = Arc::clone(&inner);
+        Arc::new(move || Ok(Arc::clone(&inner) as Arc<dyn Llm>))
+    };
+    let lazy = Arc::new(liam_daemon::lazy_llm::LazyLlm::new(loader, "test"));
+    let server = server_with_models(Arc::new(MockEmbedder::new(DIMS)), lazy).await;
+    seed_facts(&server).await;
+
+    // Act
+    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
+
+    // Assert: the exact count leaves room for one item, the estimate for K.
+    wire_text(out, NO_REASONS, false);
+    let prompts = inner.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].matches(NOTE_MARKER).count(), 1, "{}", prompts[0]);
+}

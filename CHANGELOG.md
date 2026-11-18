@@ -18,6 +18,14 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- The answer LLM now loads on first use and unloads after 5 minutes idle, so a daemon nobody is asking holds
+  no model memory (about 1.0 to 1.3 GB). The first `ask` after an idle period is slower by the load time. A new
+  `llm.idle_unload_secs` key (default `300`, `0` never unloads) sets the idle period, and the default of
+  `llm.warmup` is now `false`. For the old behaviour set `llm.warmup = true` and `llm.idle_unload_secs = 0`.
+  With `warmup = false` a model that cannot load is reported on the first `ask`, and at start only as a
+  warning when the model file is missing from the cache; before, the daemon refused to start. With
+  `warmup = true` a model that fails to load still stops the daemon at start.
+  See [ADR 0015](docs/adr/0015-load-the-llm-on-first-use-and-unload-it-when-idle.md).
 - **Breaking:** the default `embedder.model` is now `Snowflake/snowflake-arctic-embed-m-v2.0`, an int8 ONNX
   model on the CPU (311 MB, cut to 384 dimensions). On English, Portuguese and Spanish it matches or beats the
   previous default, Qwen3 Q8 on llama.cpp (nDCG@10 0.949 against 0.932 on the English 340 question set, 0.966
