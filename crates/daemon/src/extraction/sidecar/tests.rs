@@ -816,6 +816,65 @@ fn bad_paths_are_typed_errors_naming_the_key() {
 }
 
 #[test]
+fn an_executable_server_and_a_model_file_resolve_to_those_paths() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let model = dir.path().join("model.gguf");
+    std::fs::write(&model, "x").unwrap();
+    let config = ExtractionConfig {
+        llama_server_path: Some("/bin/sh".into()),
+        model_gguf: Some(model.to_str().unwrap().into()),
+        ..ExtractionConfig::default()
+    };
+
+    // Act
+    let paths = Paths::resolve(&config).expect("both paths are usable");
+
+    // Assert
+    assert_eq!(paths.server, Path::new("/bin/sh"));
+    assert_eq!(paths.model, model);
+}
+
+#[tokio::test]
+async fn starting_with_the_system_wiring_reports_a_server_that_exits_at_once() {
+    // Arrange: a server path that is a real executable and ends at once
+    let dir = TempDir::new().unwrap();
+    let model = dir.path().join("model.gguf");
+    std::fs::write(&model, "x").unwrap();
+    let server = dir.path().join("llama-server");
+    std::fs::write(&server, "#!/bin/sh\nexit 3\n").unwrap();
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = ExtractionConfig {
+        llama_server_path: Some(server.to_str().unwrap().into()),
+        model_gguf: Some(model.to_str().unwrap().into()),
+        ram_budget_mb: 0,
+        ..ExtractionConfig::default()
+    };
+
+    // Act
+    let result = SidecarGuard::start(&config, &dir.path().join("pid")).await;
+
+    // Assert
+    assert!(
+        matches!(result.err(), Some(SidecarError::Exited(Some(3)))),
+        "the server's own exit code is reported"
+    );
+}
+
+#[test]
+fn the_alive_handle_prints_without_exposing_the_child() {
+    // Arrange
+    let child = Command::new("true").spawn().expect("start a child");
+    let handle = AliveHandle(Arc::new(Mutex::new(child)));
+
+    // Act
+    let printed = format!("{handle:?}");
+
+    // Assert
+    assert_eq!(printed, "AliveHandle");
+}
+
+#[test]
 fn stderr_keeps_only_the_tail_and_never_the_secrets() {
     // Arrange
     let mut tail = StderrTail::default();
