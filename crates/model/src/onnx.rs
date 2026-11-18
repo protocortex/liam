@@ -9,6 +9,7 @@
 //! or a pinned download for a model fastembed does not list.
 
 use crate::blocking::with_model_blocking;
+use crate::download_notice;
 use crate::error::{ModelError, Result};
 use crate::onnx_pinned::{self, PinnedOnnxModel, ARCTIC_EMBED_M_V2};
 use crate::TextKind;
@@ -218,6 +219,14 @@ impl OnnxEmbedder {
         }
         let model = match &spec.source {
             OnnxSource::Fastembed(variant) => {
+                if let Ok(info) = fastembed::TextEmbedding::get_model_info(variant) {
+                    download_notice::log_unless_cached(
+                        download_notice::hub_repo_cached(cache_dir, &info.model_code),
+                        spec.id,
+                        cache_dir,
+                        None,
+                    );
+                }
                 let options = fastembed::TextInitOptions::new(variant.clone())
                     .with_cache_dir(std::path::PathBuf::from(cache_dir))
                     .with_max_length(spec.max_tokens);
@@ -226,6 +235,15 @@ impl OnnxEmbedder {
             }
             OnnxSource::Pinned(pinned) => onnx_pinned::load_pinned(
                 pinned,
+                |file| {
+                    download_notice::hub_file_cached(
+                        cache_dir,
+                        pinned.repo,
+                        pinned.revision,
+                        file.remote_path,
+                    )
+                },
+                |bytes| download_notice::log_unless_cached(false, spec.id, cache_dir, Some(bytes)),
                 |file| onnx_pinned::fetch_from_hub(pinned, cache_dir, file),
                 crate::verify_pinned_file,
                 |paths| onnx_pinned::fastembed_session(pinned, spec.max_tokens, paths),

@@ -272,6 +272,12 @@ pub fn verify_gguf_file(spec: &GgufEmbedderSpec, path: &std::path::Path) -> Resu
 
 /// Where the pinned file lives under `cache_dir`, downloading on a miss.
 pub fn gguf_path_from_hub(spec: &GgufEmbedderSpec, cache_dir: &str) -> Result<std::path::PathBuf> {
+    crate::download_notice::log_unless_cached(
+        crate::download_notice::hub_file_cached(cache_dir, spec.repo, spec.revision, spec.file),
+        spec.id,
+        cache_dir,
+        Some(spec.size_bytes),
+    );
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(std::path::PathBuf::from(cache_dir))
         .build()

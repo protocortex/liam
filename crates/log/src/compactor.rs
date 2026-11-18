@@ -28,6 +28,7 @@ use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::ChunkReader;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::event::{decode_payload, LogEvent, CURRENT_SCHEMA_VERSION};
@@ -664,10 +665,33 @@ impl Compactor {
     ///
     /// Each segment runs in its own task, so a failure or panic is logged and
     /// leaves the segment on disk without stopping later notifications.
-    pub fn spawn(self, mut notifications: UnboundedReceiver<PathBuf>) -> JoinHandle<()> {
+    pub fn spawn(self, notifications: UnboundedReceiver<PathBuf>) -> JoinHandle<()> {
+        self.spawn_stoppable(notifications).join
+    }
+
+    /// Like `spawn`, and also stops when `CompactorTask::request_stop` is
+    /// called, which does not need the senders to be gone.
+    ///
+    /// A compaction already running finishes first. Segments still queued are
+    /// left as WAL files: the WAL is the record and the Parquet is derived from
+    /// it, so `recover` compacts them at the next start.
+    pub fn spawn_stoppable(self, mut notifications: UnboundedReceiver<PathBuf>) -> CompactorTask {
+        let stop = Arc::new(Notify::new());
+        let stop_requested = Arc::clone(&stop);
         let compactor = Arc::new(self);
-        tokio::spawn(async move {
-            while let Some(segment) = notifications.recv().await {
+        let join = tokio::spawn(async move {
+            loop {
+                let segment = tokio::select! {
+                    biased;
+                    () = stop_requested.notified() => {
+                        log_left_queued(&mut notifications);
+                        break;
+                    }
+                    next = notifications.recv() => match next {
+                        Some(segment) => segment,
+                        None => break,
+                    },
+                };
                 let compactor = Arc::clone(&compactor);
                 let path = segment.clone();
                 match tokio::spawn(async move { compactor.compact_segment(&path).await }).await {
@@ -682,7 +706,35 @@ impl Compactor {
                     }
                 }
             }
-        })
+        });
+        CompactorTask { join, stop }
+    }
+}
+
+/// A running compactor and the means to ask it to stop.
+pub struct CompactorTask {
+    pub join: JoinHandle<()>,
+    stop: Arc<Notify>,
+}
+
+impl CompactorTask {
+    /// Asks the task to stop after the compaction it is running, if any.
+    /// Safe to call before the task reaches its next wait.
+    pub fn request_stop(&self) {
+        self.stop.notify_one();
+    }
+}
+
+fn log_left_queued(notifications: &mut UnboundedReceiver<PathBuf>) {
+    let mut left = 0usize;
+    while notifications.try_recv().is_ok() {
+        left += 1;
+    }
+    if left > 0 {
+        tracing::info!(
+            segments = left,
+            "stopping with closed segments not yet compacted; the next start compacts them"
+        );
     }
 }
 
@@ -1676,6 +1728,55 @@ mod tests {
             &read,
             &(0..EVENTS_PER_SEGMENT).map(event).collect::<Vec<_>>(),
         );
+    }
+
+    #[tokio::test]
+    async fn a_stop_request_ends_an_idle_compactor_while_a_sender_is_still_alive() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (sink, receiver) = ChannelSink::channel();
+        let task = local_compactor(dir.path()).spawn_stoppable(receiver);
+
+        // Act
+        task.request_stop();
+
+        // Assert
+        tokio::time::timeout(TASK_TIMEOUT, task.join)
+            .await
+            .expect("an idle compactor stops at once when asked")
+            .expect("compactor task does not panic");
+        drop(sink);
+    }
+
+    #[tokio::test]
+    async fn a_stop_request_leaves_queued_segments_on_disk_for_the_next_recovery() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (sink, receiver) = ChannelSink::channel();
+        let mut writer = open_writer(dir.path()).with_sink(Box::new(sink));
+        append_events(&mut writer, 0..EVENTS_PER_SEGMENT);
+        let task = local_compactor(dir.path()).spawn_stoppable(receiver);
+
+        // Act: the stop permit is stored before the task first runs, so the
+        // queued segment is never started.
+        task.request_stop();
+        tokio::time::timeout(TASK_TIMEOUT, task.join)
+            .await
+            .expect("the compactor stops when asked")
+            .expect("compactor task does not panic");
+
+        // Assert
+        assert_eq!(
+            file_names(dir.path(), ".wal").first(),
+            Some(&segment_name(0))
+        );
+        assert!(file_names(dir.path(), ".parquet").is_empty());
+        let report = local_compactor(dir.path())
+            .recover(Some(writer.open_sequence()))
+            .await
+            .expect("recovery");
+        assert_eq!(report.compacted, vec![0]);
+        assert_eq!(file_names(dir.path(), ".parquet"), vec![parquet_name(0)]);
     }
 
     #[test]

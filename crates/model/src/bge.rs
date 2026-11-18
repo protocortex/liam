@@ -70,6 +70,12 @@ impl BgeM3Embedder {
                 "HF_HOME is set, so {BGE_M3_MODEL_ID} is stored under HF_HOME, not embedder.cache_dir"
             );
         }
+        crate::download_notice::log_unless_cached(
+            crate::download_notice::hub_repo_cached(cache_dir, BGE_M3_MODEL_ID),
+            BGE_M3_MODEL_ID,
+            cache_dir,
+            None,
+        );
         let options = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::BGEM3)
             .with_cache_dir(std::path::PathBuf::from(cache_dir))
             .with_max_length(crate::embedder::EMBED_MAX_INPUT_TOKENS);

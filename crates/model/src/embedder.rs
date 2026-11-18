@@ -247,6 +247,12 @@ impl FastEmbedEmbedder {
         preference: DevicePreference,
     ) -> Result<Self> {
         let (device, label) = candle_device(preference)?;
+        crate::download_notice::log_unless_cached(
+            crate::download_notice::hub_repo_cached(cache_dir, model_id),
+            model_id,
+            cache_dir,
+            None,
+        );
         let api = hf_hub::api::sync::ApiBuilder::new()
             .with_cache_dir(std::path::PathBuf::from(cache_dir))
             .build()

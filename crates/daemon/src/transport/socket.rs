@@ -38,6 +38,15 @@ use crate::transport::ListenerSource;
 /// the file" mean "already this user."
 const SOCKET_MODE: u32 = 0o600;
 
+/// Bytes in `sockaddr_un.sun_path`, which holds the path and its closing NUL.
+#[cfg(target_os = "macos")]
+const SUN_PATH_CAPACITY: usize = 104;
+#[cfg(not(target_os = "macos"))]
+const SUN_PATH_CAPACITY: usize = 108;
+
+/// Longest socket path, in bytes, that `bind` accepts.
+const MAX_SOCKET_PATH_BYTES: usize = SUN_PATH_CAPACITY - 1;
+
 /// Smallest connection cap `accept_loop` will ever honour. A `Semaphore`
 /// started with zero permits never issues one, so the loop's very first
 /// permit acquire, which happens before it ever calls `accept()`, would
@@ -58,6 +67,7 @@ const MIN_MAX_CONNECTIONS: usize = 1;
 /// Reached through [`crate::transport::activation::resolve`], which only
 /// calls this when no supervisor handed a socket over.
 pub async fn bind(path: &Path) -> anyhow::Result<ListenerSource> {
+    ensure_path_fits_a_socket_address(path, MAX_SOCKET_PATH_BYTES)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             create_private_dir_all(parent).map_err(|source| {
@@ -92,6 +102,19 @@ pub async fn bind(path: &Path) -> anyhow::Result<ListenerSource> {
         listener,
         path: path.to_path_buf(),
     })
+}
+
+/// Refuses a path the kernel would cut short, before anything is created. The
+/// OS error for it says nothing about length.
+fn ensure_path_fits_a_socket_address(path: &Path, max_bytes: usize) -> anyhow::Result<()> {
+    let bytes = path.as_os_str().len();
+    anyhow::ensure!(
+        bytes <= max_bytes,
+        "the socket path {} is {bytes} bytes long, but the limit is {max_bytes} bytes. Set \
+         `socket_path` in liam.toml to a shorter path",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Decides what to do about a path that may already exist, in the order
@@ -556,6 +579,45 @@ mod tests {
         let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         drop(source);
+    }
+
+    #[tokio::test]
+    async fn a_path_over_the_limit_is_refused_with_its_length_and_never_reaches_bind() {
+        // Arrange: a parent that does not exist, so any step past the length
+        // check would create it.
+        let parent = TestPath::new();
+        let path = parent
+            .join("d".repeat(MAX_SOCKET_PATH_BYTES))
+            .join("s.sock");
+
+        // Act
+        let message = bind(&path).await.err().expect("must refuse").to_string();
+
+        // Assert
+        assert!(
+            message.contains(&format!("is {} bytes long", path.as_os_str().len())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("the limit is {MAX_SOCKET_PATH_BYTES} bytes")),
+            "{message}"
+        );
+        assert!(message.contains("`socket_path`"), "{message}");
+        assert!(!parent.exists(), "nothing may be created before the check");
+    }
+
+    #[test]
+    fn a_path_of_exactly_the_limit_fits() {
+        // Arrange
+        let path = "a".repeat(MAX_SOCKET_PATH_BYTES);
+
+        // Act / Assert
+        assert!(ensure_path_fits_a_socket_address(Path::new(&path), MAX_SOCKET_PATH_BYTES).is_ok());
+        assert!(ensure_path_fits_a_socket_address(
+            Path::new(&format!("{path}a")),
+            MAX_SOCKET_PATH_BYTES
+        )
+        .is_err());
     }
 
     #[tokio::test]

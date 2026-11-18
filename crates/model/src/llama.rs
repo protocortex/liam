@@ -116,6 +116,12 @@ impl LlamaCppLlm {
         context_tokens: u32,
         device: DevicePreference,
     ) -> Result<Self> {
+        crate::download_notice::log_unless_cached(
+            Self::cached_gguf_path(model_id, gguf_file, cache_dir).is_some(),
+            &format!("{model_id} ({gguf_file})"),
+            cache_dir,
+            None,
+        );
         let api = hf_hub::api::sync::ApiBuilder::new()
             .with_cache_dir(std::path::PathBuf::from(cache_dir))
             .build()

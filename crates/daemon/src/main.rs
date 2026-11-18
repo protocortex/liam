@@ -59,6 +59,7 @@ use liam_daemon::models::{
     resolve_snapshot_dir, ServingLlm,
 };
 use liam_daemon::{embedder_fingerprint, state_dir, storelock, telemetry};
+use liam_log::compactor::CompactorTask;
 use liam_model::{Embedder, Llm};
 use log_startup::StartedStore;
 use mcp::MemoryServer;
@@ -197,6 +198,9 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         &embedder_fingerprint::EmbedderFingerprint::from_config(&config),
     )?;
 
+    if let Some(notice) = embedder_fingerprint::superseded_default_notice(&config) {
+        tracing::info!("{notice}");
+    }
     if let Some(warning) = config.removed_reranker_warning() {
         tracing::warn!("{warning}");
     }
@@ -403,16 +407,16 @@ async fn serve_stdio(server: MemoryServer, shutdown: CancellationToken) -> anyho
 /// Flushes the usage counts once the transports have drained, then stops the
 /// maintenance loop, whose server handle is the last one that keeps
 /// the store alive, then the idle unloader, then stops the autotune benchmark,
-/// then waits for the compactor, which finishes the segments
-/// already queued once the store and its log writer are gone. Both are bounded:
-/// an interrupted compaction is redone by the next start.
+/// then asks the compactor to stop and waits for the compaction it is running.
+/// Both are bounded: a queued or interrupted compaction is redone by the next
+/// start.
 async fn stop_background_tasks(
     shutdown: &Shutdown,
     usage_flush: Option<UsageFlush>,
     maintenance: JoinHandle<()>,
     idle_unloader: Option<JoinHandle<()>>,
     autotune: Option<JoinHandle<()>>,
-    mut compactor: JoinHandle<()>,
+    mut compactor: CompactorTask,
 ) {
     // The transports have drained by now, and the store is still open.
     if let Some(usage_flush) = usage_flush {
@@ -442,12 +446,15 @@ async fn stop_background_tasks(
             }
         }
     }
-    match tokio::time::timeout(COMPACTOR_DRAIN_DEADLINE, &mut compactor).await {
+    // Segments still queued stay on disk as WAL files and are compacted by
+    // the next start, so only the compaction already running is waited for.
+    compactor.request_stop();
+    match tokio::time::timeout(COMPACTOR_DRAIN_DEADLINE, &mut compactor.join).await {
         Ok(Ok(())) => tracing::info!("compactor stopped"),
         Ok(joined) => log_task_failure("compactor", &joined),
         Err(_) => {
-            compactor.abort();
-            tracing::warn!("compaction was still queued at exit; the next start recovers it");
+            compactor.join.abort();
+            tracing::warn!("a compaction was still running at exit; the next start redoes it");
         }
     }
 }
@@ -784,7 +791,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let maintenance = tokio::spawn(async {});
-        let compactor = tokio::spawn(async {});
+        let (_sink, compactor) = idle_compactor();
         // Let the benchmark start, so the abort has a running task to end.
         tokio::task::yield_now().await;
 
@@ -801,6 +808,38 @@ mod tests {
 
         // Assert
         assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A compactor with nothing queued whose sender is still alive, as at a
+    /// real shutdown: its channel never closes on its own.
+    fn idle_compactor() -> (liam_log::compactor::ChannelSink, CompactorTask) {
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, receiver) = liam_log::compactor::ChannelSink::channel();
+        let compactor = liam_log::compactor::Compactor::local(dir.path()).unwrap();
+        (sink, compactor.spawn_stoppable(receiver))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_does_not_wait_out_the_compactor_deadline_when_nothing_is_running() {
+        // Arrange
+        let (_sink, compactor) = idle_compactor();
+        let maintenance = tokio::spawn(async {});
+        let started = tokio::time::Instant::now();
+
+        // Act
+        stop_background_tasks(
+            &Shutdown::default(),
+            None,
+            maintenance,
+            None,
+            None,
+            compactor,
+        )
+        .await;
+
+        // Assert: the paused clock only advances when every task is idle, so a
+        // wait for the deadline would show here.
+        assert!(started.elapsed() < COMPACTOR_DRAIN_DEADLINE);
     }
 
     #[tokio::test]

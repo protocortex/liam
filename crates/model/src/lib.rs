@@ -7,6 +7,7 @@
 
 mod bge;
 mod blocking;
+mod download_notice;
 pub mod embedder;
 pub mod error;
 mod gguf_verify;
