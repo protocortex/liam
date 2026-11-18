@@ -70,7 +70,7 @@ fn deps(ports: Vec<u16>) -> Deps {
     Deps {
         free_ram: Box::new(FixedRam(ENOUGH_RAM_MB)),
         next_port: Box::new(move || Ok(ports.next().expect("a port was scripted"))),
-        processes: Box::new(SystemProcesses),
+        processes: Arc::new(SystemProcesses),
         pidfile: PIDFILE_DIR.with(|dir| dir.path().join("sidecar.pid")),
         server_exe: std::env::current_exe().unwrap(),
     }

@@ -10,6 +10,8 @@ use crate::extraction::sidecar::stale::{
 
 const MATCHING_START: u64 = 777;
 const RECORDED_PORT: u16 = 4242;
+const UNRELATED_PID: u32 = 4_000_000;
+const GATE_WAIT: Duration = Duration::from_secs(5);
 
 struct Scripted(Option<ProcessInfo>);
 
@@ -307,7 +309,7 @@ async fn start_clears_a_matching_stale_sidecar_before_it_reads_free_ram() {
     let (factory, _) = fake("", None);
     let was_gone = Arc::new(AtomicBool::new(false));
     let scripted = Deps {
-        processes: Box::new(matching_table()),
+        processes: Arc::new(matching_table()),
         pidfile,
         free_ram: Box::new(RamAfterSweep {
             stale_pid: orphan.pid(),
@@ -326,6 +328,61 @@ async fn start_clears_a_matching_stale_sidecar_before_it_reads_free_ram() {
         was_gone.load(Ordering::SeqCst),
         "RAM was read before the stale exit"
     );
+}
+
+/// A process table whose first lookup, the sweep's, blocks its thread until
+/// the test lets it go. Later lookups answer from the real table.
+struct GatedTable {
+    gate: Mutex<std::sync::mpsc::Receiver<()>>,
+    gated: AtomicBool,
+    released_in_time: AtomicBool,
+}
+
+impl ProcessTable for GatedTable {
+    fn inspect(&self, pid: u32) -> Option<ProcessInfo> {
+        if !self.gated.swap(true, Ordering::SeqCst) {
+            // Bounded so a regression fails the assertion below, not hangs.
+            let released = self.gate.lock().unwrap().recv_timeout(GATE_WAIT).is_ok();
+            self.released_in_time.store(released, Ordering::SeqCst);
+        }
+        stale::SystemProcesses.inspect(pid)
+    }
+}
+
+#[tokio::test]
+async fn the_stale_sweep_does_not_hold_the_runtime_thread() {
+    // Arrange: one runtime thread, and a process lookup that blocks until a
+    // task on that same thread releases it.
+    let dir = TempDir::new().unwrap();
+    let pidfile = write_record(&dir, UNRELATED_PID);
+    let (release, gate) = std::sync::mpsc::channel();
+    let table = Arc::new(GatedTable {
+        gate: Mutex::new(gate),
+        gated: AtomicBool::new(false),
+        released_in_time: AtomicBool::new(false),
+    });
+    let scripted = Deps {
+        processes: table.clone(),
+        pidfile,
+        ..deps(vec![free_port()])
+    };
+    let (factory, _) = fake("", None);
+    let config = config(START_TIMEOUT_SECS);
+    let start = SidecarGuard::start_with(&config, factory, scripted);
+    let releaser = async {
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+    };
+
+    // Act
+    let (guard, ()) = tokio::join!(start, releaser);
+
+    // Assert
+    assert!(
+        table.released_in_time.load(Ordering::SeqCst),
+        "the sweep blocked the thread the releasing task needed"
+    );
+    assert!(guard.unwrap().is_alive());
 }
 
 #[tokio::test]
@@ -366,7 +423,7 @@ async fn a_child_the_table_cannot_describe_fails_the_start_and_is_killed() {
     let (pid_file, pidfile) = (dir.path().join("child-pid"), dir.path().join("sidecar.pid"));
     let (factory, spawns) = fake("", Some(pid_file.clone()));
     let blind = Deps {
-        processes: Box::new(Scripted(None)),
+        processes: Arc::new(Scripted(None)),
         pidfile: pidfile.clone(),
         ..deps(vec![free_port()])
     };
