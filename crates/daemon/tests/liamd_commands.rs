@@ -4,7 +4,9 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, Command, ExitStatus, Output, Stdio};
+use std::process::{
+    Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const FAILURE_EXIT: i32 = 1;
@@ -47,9 +49,13 @@ impl Scratch {
     }
 
     fn liamd(&self, args: &[&str]) -> Command {
+        self.liamd_with_config("liam.toml", args)
+    }
+
+    fn liamd_with_config(&self, config: &str, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_liamd"));
         command
-            .args(["--config", "liam.toml"])
+            .args(["--config", config])
             .args(args)
             .current_dir(&self.0)
             .env("HOME", &self.0)
@@ -76,6 +82,40 @@ impl Drop for Running {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// The client side of an MCP session over a child's piped stdin and stdout.
+struct Session {
+    to_server: ChildStdin,
+    replies: BufReader<ChildStdout>,
+}
+
+impl Session {
+    fn over(child: &mut Child) -> Self {
+        Self {
+            to_server: child.stdin.take().expect("piped stdin"),
+            replies: BufReader::new(child.stdout.take().expect("piped stdout")),
+        }
+    }
+
+    /// Sends a request and returns the one line that answers it.
+    fn request(&mut self, message: &str) -> String {
+        self.notify(message);
+        let mut reply = String::new();
+        self.replies.read_line(&mut reply).expect("read a reply");
+        reply
+    }
+
+    fn notify(&mut self, message: &str) {
+        writeln!(self.to_server, "{message}").expect("write a message");
+    }
+
+    /// Opens the session and returns what `tools/list` says.
+    fn open_and_list_tools(&mut self) -> (String, String) {
+        let initialized = self.request(INITIALIZE);
+        self.notify(INITIALIZED_NOTIFICATION);
+        (initialized, self.request(LIST_TOOLS))
     }
 }
 
@@ -253,29 +293,64 @@ fn a_client_behind_the_proxy_can_list_the_daemons_tools() {
             .spawn()
             .expect("start the proxy"),
     );
-    let mut to_daemon = proxy.0.stdin.take().expect("piped stdin");
-    let mut replies = BufReader::new(proxy.0.stdout.take().expect("piped stdout"));
-    let mut request = |message: &str| -> Option<String> {
-        writeln!(to_daemon, "{message}").expect("write to the proxy");
-        message.contains("\"id\"").then(|| {
-            let mut reply = String::new();
-            replies.read_line(&mut reply).expect("read from the proxy");
-            reply
-        })
-    };
+    let mut session = Session::over(&mut proxy.0);
 
     // Act
-    let initialized = request(INITIALIZE).expect("initialize has a reply");
-    request(INITIALIZED_NOTIFICATION);
-    let tools = request(LIST_TOOLS).expect("tools/list has a reply");
+    let (initialized, tools) = session.open_and_list_tools();
 
     // Assert
     assert!(initialized.contains("\"serverInfo\""), "{initialized}");
     assert!(tools.contains("\"name\":\"remember\""), "{tools}");
     assert!(tools.contains("\"name\":\"recall\""), "{tools}");
-    drop(to_daemon);
+    drop(session);
     let proxy_status = proxy.0.wait().expect("wait for the proxy");
     let (status, _) = daemon.stop_with_sigterm();
     assert!(proxy_status.success(), "{proxy_status:?}");
+    assert!(status.success(), "{status:?}");
+}
+
+#[test]
+fn a_config_file_that_does_not_exist_is_said_to_mean_mock_models() {
+    // Arrange
+    let scratch = Scratch::new();
+
+    // Act
+    let output = scratch
+        .liamd_with_config("absent.toml", &[])
+        .output()
+        .expect("run liamd");
+
+    // Assert
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("no config file at")
+            && stderr.contains("so the built-in defaults are used with mock models"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_stdio_session_lists_the_tools_and_ends_when_the_client_closes_its_input() {
+    // Arrange
+    let scratch = Scratch::new();
+    let mut daemon = Running(
+        scratch
+            .liamd(&[])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start liamd"),
+    );
+    let mut session = Session::over(&mut daemon.0);
+
+    // Act
+    let (initialized, tools) = session.open_and_list_tools();
+    drop(session);
+    let status = daemon.0.wait().expect("wait for liamd");
+
+    // Assert
+    assert!(initialized.contains("\"serverInfo\""), "{initialized}");
+    assert!(tools.contains("\"name\":\"remember\""), "{tools}");
     assert!(status.success(), "{status:?}");
 }
