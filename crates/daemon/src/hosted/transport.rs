@@ -72,18 +72,32 @@ pub struct UreqTransport {
 
 /// The agent's settings, in one place so a test can read them back.
 pub(crate) fn agent_config(timeout: Duration) -> ureq::config::Config {
+    agent_config_builder(timeout).build()
+}
+
+fn agent_config_builder(
+    timeout: Duration,
+) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
     ureq::Agent::config_builder()
         .https_only(true)
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_global(Some(timeout))
-        .build()
 }
 
 impl UreqTransport {
     pub fn new(timeout: Duration) -> Self {
         Self {
             agent: ureq::Agent::new_with_config(agent_config(timeout)),
+        }
+    }
+
+    /// The same settings with no proxy, so a test that connects to a local
+    /// address does not depend on the proxy variables of the machine it runs on.
+    #[cfg(test)]
+    pub(crate) fn without_proxy(timeout: Duration) -> Self {
+        Self {
+            agent: ureq::Agent::new_with_config(agent_config_builder(timeout).proxy(None).build()),
         }
     }
 }
@@ -175,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_connection_is_reported_by_kind_without_the_url() {
         // Arrange
-        let transport = UreqTransport::new(TIMEOUT);
+        let transport = UreqTransport::without_proxy(TIMEOUT);
         let request = HttpRequest {
             method: Method::Post,
             url: "https://127.0.0.1:1/v1?key=url-secret".into(),

@@ -53,7 +53,7 @@ fn each_failure_kind_has_its_own_plain_description() {
 #[tokio::test]
 async fn get_and_delete_requests_fail_by_kind_when_nothing_listens() {
     // Arrange
-    let transport = UreqTransport::new(TIMEOUT);
+    let transport = UreqTransport::without_proxy(TIMEOUT);
 
     for method in [Method::Get, Method::Delete] {
         // Act
@@ -77,7 +77,7 @@ async fn get_and_delete_requests_fail_by_kind_when_nothing_listens() {
 #[tokio::test]
 async fn a_plain_http_address_is_refused_for_every_method() {
     // Arrange
-    let transport = UreqTransport::new(TIMEOUT);
+    let transport = UreqTransport::without_proxy(TIMEOUT);
 
     for method in [Method::Get, Method::Post, Method::Delete] {
         // Act
