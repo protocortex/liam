@@ -18,6 +18,11 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
+        Self::with_config("")
+    }
+
+    /// `extra` is appended to the config, for the tables it opens.
+    fn with_config(extra: &str) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = PathBuf::from(format!("/tmp/liam-it-{}-{unique}", std::process::id()));
@@ -26,7 +31,7 @@ impl Scratch {
             dir.join("liam.toml"),
             format!(
                 "embedding_dims = 8\ndatabase_path = \"{0}/liam.db\"\n\
-                 socket_path = \"{0}/{SOCKET_NAME}\"\nlog_filter = \"info\"\n",
+                 socket_path = \"{0}/{SOCKET_NAME}\"\nlog_filter = \"info\"\n{extra}",
                 dir.display()
             ),
         )
@@ -144,10 +149,10 @@ fn a_stdio_session_closed_before_it_starts_is_an_error() {
     );
 }
 
-#[test]
-fn a_serving_daemon_stops_cleanly_on_sigterm_and_removes_its_socket() {
+/// Starts `liamd serve` in `scratch`, stops it with SIGTERM once it listens,
+/// and checks the orderly exit.
+fn serve_then_stop_with_sigterm(scratch: &Scratch) {
     // Arrange
-    let scratch = Scratch::new();
     let mut child = scratch
         .liamd(&["serve"])
         .stderr(Stdio::piped())
@@ -186,4 +191,19 @@ fn a_serving_daemon_stops_cleanly_on_sigterm_and_removes_its_socket() {
         !scratch.path().join(SOCKET_NAME).exists(),
         "the socket is removed"
     );
+}
+
+#[test]
+fn a_serving_daemon_stops_cleanly_on_sigterm_and_removes_its_socket() {
+    serve_then_stop_with_sigterm(&Scratch::new());
+}
+
+#[test]
+fn a_daemon_with_tiering_and_a_tuned_generation_limit_also_stops_cleanly() {
+    // A generation limit of zero asks the daemon to measure its own capacity.
+    let scratch = Scratch::with_config(
+        "[llm]\nmax_concurrent_generations = 0\n\n[tiering]\nenabled = true\n",
+    );
+
+    serve_then_stop_with_sigterm(&scratch);
 }
