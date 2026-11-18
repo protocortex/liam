@@ -46,7 +46,9 @@ async fn metadata_in_another_format_is_refused_as_corrupt() {
 
     // Assert
     match result {
-        Err(Error::SnapshotCorrupt(text)) => assert!(text.contains("has format 9999"), "{text}"),
+        Err(Error::SnapshotCorrupt(text)) => {
+            assert!(text.contains(&UNKNOWN_FORMAT.to_string()), "{text}")
+        }
         other => panic!("expected a corrupt snapshot, got {other:?}"),
     }
 }

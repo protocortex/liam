@@ -7,6 +7,7 @@ use super::*;
 const UNSUPPORTED_VERSION: u32 = MANIFEST_VERSION + 1;
 const SHIFTED_EVENTS: usize = 100;
 const LISTED_EVENTS: u64 = 2;
+const GARBAGE: [u8; 3] = [0xFF; 3];
 
 fn write_manifest_bytes(env: &Env, bytes: &[u8]) {
     fs::write(env.log().join(MANIFEST_FILE), bytes).unwrap();
@@ -35,13 +36,27 @@ fn a_log_without_a_manifest_has_archived_nothing() {
 fn a_manifest_of_garbage_bytes_is_unreadable() {
     // Arrange
     let env = Env::new();
-    write_manifest_bytes(&env, &[0xFF; 3]);
+    write_manifest_bytes(&env, &GARBAGE);
 
     // Act
     let result = read_manifest(env.log());
 
     // Assert
-    assert!(!unreadable_reason(result).is_empty());
+    let decode_error = match postcard::from_bytes::<ManifestFile>(&GARBAGE) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the garbage bytes decoded"),
+    };
+    match result {
+        Err(error @ ArchiveError::ManifestUnreadable { .. }) => {
+            let ArchiveError::ManifestUnreadable { path, reason } = &error else {
+                unreachable!()
+            };
+            assert_eq!(path, &env.log().join(MANIFEST_FILE));
+            assert_eq!(reason, &decode_error);
+            assert!(error.to_string().contains(MANIFEST_FILE), "{error}");
+        }
+        other => panic!("expected ManifestUnreadable, got {other:?}"),
+    }
 }
 
 #[test]
