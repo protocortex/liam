@@ -221,6 +221,9 @@ pub fn forget_expected_ids(path: &Path, ids: &HashSet<String>) -> anyhow::Result
 }
 
 #[cfg(test)]
+mod file_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::consolidation::probes::ProbeScore;

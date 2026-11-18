@@ -395,6 +395,9 @@ pub async fn merge_near_duplicates(
 }
 
 #[cfg(test)]
+mod pure_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::event_log;
