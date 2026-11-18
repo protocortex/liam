@@ -152,6 +152,9 @@ fn classify(error: ureq::Error) -> TransportError {
 }
 
 #[cfg(test)]
+mod classify_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
