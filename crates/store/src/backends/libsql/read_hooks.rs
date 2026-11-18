@@ -252,6 +252,13 @@ mod test_hooks {
                 Err(Error::Backend(message)) if message.contains("interrupt") => {
                     ReadEvent::Interrupted
                 }
+                Err(error)
+                    if error
+                        .engine_message()
+                        .is_some_and(|message| message.contains("interrupt")) =>
+                {
+                    ReadEvent::Interrupted
+                }
                 Err(_) => ReadEvent::Failed,
             };
             self.send(event);

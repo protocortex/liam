@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! One error type, backend-neutral. Backends map their native error into
-//! `Backend(String)`, so the crate does not depend on any one engine's error.
+//! One error type, backend-neutral. A backend maps its native error into
+//! `Engine`, which keeps the native error as a boxed source, or into
+//! `Backend(String)` when the failure is built from text only, so the crate's
+//! public API does not name any one engine's error type.
+//!
+//! `Display` includes the cause on purpose, because most callers print the plain form.
 
 use thiserror::Error;
 
@@ -8,6 +12,15 @@ use thiserror::Error;
 pub enum Error {
     #[error("backend: {0}")]
     Backend(String),
+
+    /// The engine failed a statement. The source is the engine's own error;
+    /// `busy` is true when it means the database was busy or locked.
+    #[error("backend: {source}")]
+    Engine {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+        busy: bool,
+    },
 
     #[error("serialize attributes: {0}")]
     Attributes(#[from] serde_json::Error),
@@ -382,6 +395,23 @@ fn log_end(head: &Option<liam_log::LogOffset>) -> String {
     }
 }
 
+impl Error {
+    /// True when the database was busy or locked by another connection, so
+    /// the same statement may succeed if it is tried again later.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Engine { busy: true, .. })
+    }
+
+    /// The engine's message when this error came from the engine.
+    pub(crate) fn engine_message(&self) -> Option<String> {
+        match self {
+            Self::Engine { source, .. } => Some(source.to_string()),
+            _ => None,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
@@ -390,6 +420,76 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn a_wrapped_cause_is_the_source_and_is_in_the_plain_text() {
+        // Arrange
+        let cause = std::io::Error::other("disk is full");
+
+        // Act
+        let error = Error::FilterFile(cause);
+
+        // Assert
+        let source = std::error::Error::source(&error).expect("the io error is the source");
+        assert!(source.to_string().contains("disk is full"));
+        assert!(error.to_string().contains("disk is full"), "{error}");
+    }
+
+    #[test]
+    fn a_batch_refusal_keeps_the_inner_error_as_its_source() {
+        // Arrange
+        let error = Error::FactInBatch {
+            index: 2,
+            source: Box::new(Error::FactWithoutSource),
+        };
+
+        // Act
+        let text = error.to_string();
+
+        // Assert
+        let source = std::error::Error::source(&error).expect("the inner error is the source");
+        assert!(source.to_string().contains("at least one source event"));
+        assert!(text.contains("at least one source event"), "{text}");
+    }
+
+    #[test]
+    fn an_engine_error_keeps_its_source_and_reports_busy_only_when_flagged() {
+        // Arrange
+        let busy = Error::Engine {
+            source: Box::new(std::io::Error::other("database is locked")),
+            busy: true,
+        };
+        let other = Error::Engine {
+            source: Box::new(std::io::Error::other("disk image is malformed")),
+            busy: false,
+        };
+
+        // Act
+        let texts = (busy.to_string(), other.to_string());
+
+        // Assert
+        assert!(busy.is_busy());
+        assert!(!other.is_busy());
+        assert!(std::error::Error::source(&busy).is_some());
+        assert!(texts.0.contains("database is locked"), "{}", texts.0);
+        assert!(texts.1.contains("disk image is malformed"), "{}", texts.1);
+        assert!(!Error::Backend("database is locked".into()).is_busy());
+    }
+
+    #[test]
+    fn a_locked_database_prints_the_text_it_always_did() {
+        // Arrange
+        let error = Error::Engine {
+            source: Box::new(std::io::Error::other("database is locked")),
+            busy: true,
+        };
+
+        // Act
+        let text = error.to_string();
+
+        // Assert
+        assert_eq!(text, "backend: database is locked");
+    }
 
     #[test]
     fn a_cursor_beyond_an_empty_log_names_the_log_as_empty_and_says_what_to_do() {

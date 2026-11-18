@@ -74,7 +74,7 @@ impl BgeM3Embedder {
             .with_cache_dir(std::path::PathBuf::from(cache_dir))
             .with_max_length(crate::embedder::EMBED_MAX_INPUT_TOKENS);
         let model = fastembed::TextEmbedding::try_new(options)
-            .map_err(|e| ModelError::Embed(format!("load {BGE_M3_MODEL_ID}: {e}")))?;
+            .map_err(|e| ModelError::embed_failed(format!("load {BGE_M3_MODEL_ID}"), e))?;
         Ok(Self {
             model: std::sync::Arc::new(tokio::sync::Mutex::new(model)),
         })
@@ -104,7 +104,7 @@ impl crate::Embedder for BgeM3Embedder {
             .collect();
         with_model_blocking(model, ModelError::Embed, move |m| {
             m.embed(&inputs, Some(EMBED_BATCH_SIZE))
-                .map_err(|e| ModelError::Embed(e.to_string()))
+                .map_err(|e| ModelError::embed_failed("embedding failed", e))
         })
         .await
     }

@@ -133,11 +133,13 @@ async fn a_server_that_cannot_start_is_an_error_naming_why() {
     let error = provider(starter).open(&config).await.err().unwrap();
 
     // Assert
-    let gate = SidecarError::RamGate {
-        free_mb: 100,
-        budget_mb: 4096,
-    };
-    assert_eq!(error.downcast_ref::<SidecarError>(), Some(&gate));
+    assert!(matches!(
+        error.downcast_ref::<SidecarError>(),
+        Some(SidecarError::RamGate {
+            free_mb: 100,
+            budget_mb: 4096
+        })
+    ));
     assert_eq!(spawns.load(Ordering::SeqCst), 0);
 }
 
