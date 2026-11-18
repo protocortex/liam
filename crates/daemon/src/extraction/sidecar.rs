@@ -368,7 +368,7 @@ impl SidecarGuard {
             .await
             .map_err(|error| {
                 warn!(%error, "the stale sidecar sweep did not finish");
-                SidecarError::Setup(io::ErrorKind::Other)
+                SidecarError::Setup(Box::new(error))
             })?
         };
         debug!(?swept, "swept the previous sidecar");
