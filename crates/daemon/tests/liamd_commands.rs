@@ -2,11 +2,14 @@
 //! `liamd` as a supervisor or a person runs it: the real binary on mock models
 //! in a scratch directory, so the exit code and the text are the shipped ones.
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const FAILURE_EXIT: i32 = 1;
+const READY_LINE: &str = "socket listener started";
+const SHUTDOWN_LINE: &str = "shutting down";
 const SOCKET_NAME: &str = "s.sock";
 
 /// A short directory under `/tmp`: a socket path inside the system temp
@@ -55,6 +58,16 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Kills the daemon if a test fails before it was stopped.
+struct Running(Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -128,5 +141,49 @@ fn a_stdio_session_closed_before_it_starts_is_an_error() {
         text(&output.stderr).contains("connection closed: initialize request"),
         "{}",
         text(&output.stderr)
+    );
+}
+
+#[test]
+fn a_serving_daemon_stops_cleanly_on_sigterm_and_removes_its_socket() {
+    // Arrange
+    let scratch = Scratch::new();
+    let mut child = scratch
+        .liamd(&["serve"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start liamd");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let pid = child.id();
+    let mut daemon = Running(child);
+    let mut lines = BufReader::new(stderr);
+    let mut seen = String::new();
+    loop {
+        let mut line = String::new();
+        let read = lines.read_line(&mut line).expect("read the daemon log");
+        assert!(read > 0, "the daemon ended before it listened:\n{seen}");
+        seen.push_str(&line);
+        if line.contains(READY_LINE) {
+            break;
+        }
+    }
+    assert!(scratch.path().join(SOCKET_NAME).exists());
+
+    // Act
+    // SAFETY: the pid is that of the child this test started and still holds.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let mut rest = String::new();
+    lines
+        .read_to_string(&mut rest)
+        .expect("read the rest of the log");
+    let status = daemon.0.wait().expect("wait for liamd");
+
+    // Assert
+    assert_eq!(sent, 0);
+    assert!(status.success(), "{status:?}\n{seen}{rest}");
+    assert!(rest.contains(SHUTDOWN_LINE), "{rest}");
+    assert!(
+        !scratch.path().join(SOCKET_NAME).exists(),
+        "the socket is removed"
     );
 }

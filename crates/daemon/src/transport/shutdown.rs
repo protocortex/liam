@@ -52,32 +52,45 @@ impl Trigger {
     }
 }
 
-/// Resolves when SIGTERM or SIGINT arrives, whichever lands first.
+/// SIGTERM and SIGINT handlers, installed. Once this exists a signal is held
+/// for [`SignalWatch::wait`] instead of ending the process, so it is made
+/// before the socket appears: a stop that arrives right after a client can
+/// connect must still run the orderly shutdown.
 ///
-/// Both map to the same [`Trigger`] handling on purpose: an operator
+/// Both signals map to the same [`Trigger`] handling on purpose: an operator
 /// pressing Ctrl-C and launchd stopping the job want the same thing, and
 /// having two shutdown paths is how one of them rots untested.
-///
-/// Installing the handlers can fail (the process is out of signal handler
-/// slots, or the platform refuses), and that is surfaced rather than
-/// swallowed: a daemon that silently cannot hear SIGTERM would be SIGKILLed
-/// on every stop and lose in-flight work every time.
-///
-/// Deliberately NOT exercised by raising a real signal in the test suite.
-/// Signal disposition is process-global and `cargo test` runs every test in
-/// one process, so a test that raised SIGTERM would race every other test
-/// in the binary. The orderly shutdown this triggers is tested directly
-/// instead, through `drain` and `unlink_owned_socket`, which is where the
-/// behaviour that can actually break lives.
-pub async fn signal() -> std::io::Result<Trigger> {
-    use tokio::signal::unix::{signal as unix_signal, SignalKind};
+pub struct SignalWatch {
+    term: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
 
-    let mut term = unix_signal(SignalKind::terminate())?;
-    let mut interrupt = unix_signal(SignalKind::interrupt())?;
+impl SignalWatch {
+    /// Installing the handlers can fail (the process is out of signal handler
+    /// slots, or the platform refuses), and that is surfaced rather than
+    /// swallowed: a daemon that silently cannot hear SIGTERM would be SIGKILLed
+    /// on every stop and lose in-flight work every time.
+    pub fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
 
-    tokio::select! {
-        _ = term.recv() => Ok(Trigger::Term),
-        _ = interrupt.recv() => Ok(Trigger::Int),
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Resolves when SIGTERM or SIGINT arrives, whichever lands first.
+    ///
+    /// Not exercised by raising a signal inside the unit test process: signal
+    /// disposition is process-global and `cargo test` runs every test in one
+    /// process, so it would race the others. `tests/liamd_commands.rs` stops
+    /// a real daemon process with SIGTERM instead, and the orderly shutdown
+    /// is tested directly through `drain` and `unlink_owned_socket`.
+    pub async fn wait(mut self) -> Trigger {
+        tokio::select! {
+            _ = self.term.recv() => Trigger::Term,
+            _ = self.interrupt.recv() => Trigger::Int,
+        }
     }
 }
 

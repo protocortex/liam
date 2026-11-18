@@ -121,6 +121,8 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Fixed
 
+- `liamd serve` now catches SIGTERM and SIGINT from the moment its socket exists. Before, a stop sent right after a
+  client could connect could end the process without the orderly shutdown, leaving the socket file behind.
 - Atomic multi-statement database writes, checkpoints, segment compaction and the stale sidecar sweep now run on
   blocking threads instead of the async runtime's workers, so a wait on a lock no longer stalls other requests or
   their deadline timers. Transactions and single statements stay on the runtime thread, so a cancelled request cannot

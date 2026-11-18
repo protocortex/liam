@@ -559,6 +559,9 @@ async fn serve_socket(
     ) {
         state_dir::secure_dirs(&[parent], &state_root, SOCKET_RISK);
     }
+    // Before the socket exists, so a stop sent as soon as a client can connect
+    // is already caught.
+    let signals = transport::shutdown::SignalWatch::install();
     let source = transport::activation::resolve(&socket_path).await?;
 
     // Signals are watched on their own task so the accept loop owns the
@@ -566,8 +569,9 @@ async fn serve_socket(
     // unlink belong to the accept loop's shutdown path.
     let signal_cancel = cancel.clone();
     tokio::spawn(async move {
-        match transport::shutdown::signal().await {
-            Ok(trigger) => {
+        match signals {
+            Ok(signals) => {
+                let trigger = signals.wait().await;
                 tracing::info!(signal = trigger.as_str(), "shutting down");
                 signal_cancel.cancel();
             }
