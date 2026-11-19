@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use liam_model::llm::DevicePreference;
-use liam_model::{Embedder, Llm, MockEmbedder, MockLlm, NoticeCaller, TextKind};
+use liam_model::{ArcticEmbedder, Embedder, Llm, MockEmbedder, MockLlm, NoticeCaller, TextKind};
 use liam_store::{ContentEmbedder, EmbedError};
 
 use crate::config::{self, Config};
@@ -138,8 +138,8 @@ pub const MOCK_PROVIDER: &str = "mock";
 pub const LLAMA_PROVIDER: &str = "llama-cpp";
 
 /// Choose the embedder from config. `mock` is for tests and dev; the `local`
-/// provider loads fastembed in-process. Any other name is an error, so a typo
-/// cannot quietly select the mock.
+/// provider loads the arctic ONNX model in-process. Any other name is an error,
+/// so a typo cannot quietly select the mock.
 pub fn build_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
     build_embedder_for(config, NoticeCaller::Daemon)
 }
@@ -161,63 +161,16 @@ pub fn build_embedder_for(
     )
 }
 
-/// Whether `model` names BGE-M3, which loads through its own embedder. A model
-/// in `liam_model::ONNX_MODELS` loads through the ONNX embedder; every other
-/// id goes to the Qwen3 loader. Hugging Face ids are case-insensitive, so the
-/// match is too.
-fn is_bge_m3(model: &str) -> bool {
-    model.eq_ignore_ascii_case(liam_model::BGE_M3_MODEL_ID)
-}
-
-/// The device `embedder.device` names. An unknown value is an error, so a typo
-/// cannot quietly pick the slowest backend.
-pub fn embedder_device(config: &Config) -> anyhow::Result<DevicePreference> {
-    DevicePreference::parse(&config.embedder.device).ok_or_else(|| {
-        anyhow::anyhow!(
-            "embedder.device = {:?} is not one of auto, metal, cuda, cpu",
-            config.embedder.device
-        )
-    })
-}
-
 fn build_local_embedder(
     config: &Config,
     caller: NoticeCaller,
 ) -> anyhow::Result<Arc<dyn Embedder>> {
-    use liam_model::{BgeM3Embedder, FastEmbedEmbedder, LlamaEmbedder, OnnxEmbedder};
-    let device = embedder_device(config)?;
     let home = std::env::var("HOME").unwrap_or_default();
     let cache_dir =
         resolve_path_with_home("embedder.cache_dir", &config.embedder.cache_dir, &home)?;
-    if is_bge_m3(&config.embedder.model) {
-        return Ok(Arc::new(BgeM3Embedder::load(
-            config.embedding_dims,
-            &cache_dir,
-            caller,
-        )?));
-    }
-    if let Some(spec) = liam_model::onnx_model_spec(&config.embedder.model) {
-        return Ok(Arc::new(OnnxEmbedder::load(
-            spec,
-            config.embedding_dims,
-            &cache_dir,
-            caller,
-        )?));
-    }
-    if liam_model::gguf_embedder_spec(&config.embedder.model).is_some() {
-        return Ok(Arc::new(LlamaEmbedder::load_from_hub(
-            &config.embedder.model,
-            config.embedding_dims,
-            &cache_dir,
-            device,
-            caller,
-        )?));
-    }
-    Ok(Arc::new(FastEmbedEmbedder::load(
-        &config.embedder.model,
+    Ok(Arc::new(ArcticEmbedder::load(
         config.embedding_dims,
         &cache_dir,
-        device,
         caller,
     )?))
 }
@@ -439,6 +392,9 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// The arctic model's own output width.
+    const ARCTIC_NATIVE_DIMS: usize = 768;
+
     fn llama_config(cache_dir: &Path, warmup: bool) -> Config {
         let mut config = Config::default();
         config.llm.provider = LLAMA_PROVIDER.to_string();
@@ -511,8 +467,8 @@ mod tests {
     }
 
     /// The model cache dirs are the two paths that were NOT being expanded,
-    /// while `socket_path` and `database_path` always were. Left raw, fastembed
-    /// and hf-hub treat `~/.liam/models` as a relative path and download
+    /// while `socket_path` and `database_path` always were. Left raw, hf-hub
+    /// treats `~/.liam/models` as a relative path and downloads
     /// gigabytes into a directory named `~`, under the launchd job's
     /// `WorkingDirectory`. The shipped mock defaults hid this because a mock
     /// embedder never opens the cache dir.
@@ -528,81 +484,26 @@ mod tests {
         );
     }
 
+    /// The local provider must reach the arctic loader: its width check fails
+    /// before any download, so this runs with no network and leaves the cache
+    /// empty.
     #[test]
-    fn embedder_device_accepts_the_known_names_and_rejects_typos() {
-        // Arrange
-        let mut config = Config::default();
-
-        // Act / Assert
-        for (text, want) in [
-            ("auto", DevicePreference::Auto),
-            ("cpu", DevicePreference::Cpu),
-            ("metal", DevicePreference::Metal),
-            ("cuda", DevicePreference::Cuda),
-        ] {
-            config.embedder.device = text.into();
-            assert_eq!(embedder_device(&config).unwrap(), want);
-        }
-        config.embedder.device = "metl".into();
-        let error = embedder_device(&config).unwrap_err().to_string();
-        assert!(
-            error.contains("embedder.device") && error.contains("metl"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn only_the_bge_m3_model_id_selects_the_bge_m3_embedder() {
-        // Arrange / Act / Assert
-        assert!(is_bge_m3("BAAI/bge-m3"));
-        assert!(is_bge_m3("baai/BGE-M3"));
-        assert!(!is_bge_m3(liam_model::QWEN3_EMBEDDING_MODEL_ID));
-        assert!(!is_bge_m3("BAAI/bge-m3-unsupervised"));
-    }
-
-    /// A BGE-M3 id must reach the BGE-M3 loader: its dims check fails before any
-    /// download, whereas the Qwen3 loader would start fetching weights first.
-    #[test]
-    fn the_bge_m3_model_id_is_routed_to_the_bge_m3_loader() {
+    fn the_local_provider_loads_the_arctic_embedder() {
         // Arrange
         let cache = tempfile::tempdir().unwrap();
         let mut config = Config::default();
-        config.embedder.provider = "local".to_string();
-        config.embedder.model = liam_model::BGE_M3_MODEL_ID.to_string();
+        config.embedder.provider = LOCAL_PROVIDER.to_string();
         config.embedder.cache_dir = cache.path().to_string_lossy().into_owned();
-        config.embedding_dims = 512;
+        config.embedding_dims = ARCTIC_NATIVE_DIMS + 1;
 
         // Act
         let error = match build_embedder(&config) {
-            Ok(_) => panic!("a 512-wide BGE-M3 config must be refused"),
+            Ok(_) => panic!("a width beyond the model's own must be refused"),
             Err(error) => error.to_string(),
         };
 
         // Assert
-        assert!(error.contains("fixed output width"), "{error}");
-        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
-    }
-
-    /// An ONNX model id must reach the ONNX loader: its dims check fails before
-    /// any download, whereas the Qwen3 loader would start fetching weights.
-    #[test]
-    fn an_onnx_model_id_is_routed_to_the_onnx_loader() {
-        // Arrange
-        let cache = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.embedder.provider = "local".to_string();
-        config.embedder.model = "BAAI/bge-small-en-v1.5".to_string();
-        config.embedder.cache_dir = cache.path().to_string_lossy().into_owned();
-        config.embedding_dims = 768;
-
-        // Act
-        let error = match build_embedder(&config) {
-            Ok(_) => panic!("a 768-wide bge-small config must be refused"),
-            Err(error) => error.to_string(),
-        };
-
-        // Assert
-        assert!(error.contains("fixed output width"), "{error}");
+        assert!(error.contains(liam_model::EMBEDDER_MODEL_ID), "{error}");
         assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
     }
 
@@ -932,5 +833,65 @@ mod tests {
 
         // Assert
         assert_eq!(dir, PathBuf::from("/data/events"));
+    }
+
+    const BATCH_TEXT_COUNT: usize = 20;
+    const EMBED_EPSILON: f32 = 1e-4;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    /// Loads the real model through `build_embedder`. It reads the pinned files
+    /// from the directory `LIAM_MODEL_CACHE` names and downloads the missing
+    /// ones (311 MB). Run with
+    /// `LIAM_MODEL_CACHE=/path/to/cache cargo test -p liam-daemon --lib -- --ignored arctic_ranks`.
+    #[tokio::test]
+    #[ignore = "needs the arctic weights (311 MB) in LIAM_MODEL_CACHE or a download"]
+    async fn arctic_ranks_the_relevant_document_first() {
+        // Arrange
+        let mut config = Config::default();
+        config.embedder.provider = LOCAL_PROVIDER.to_string();
+        config.embedder.cache_dir =
+            std::env::var("LIAM_MODEL_CACHE").expect("set LIAM_MODEL_CACHE");
+        let embedder = build_embedder(&config).expect("load arctic");
+        let documents = [
+            "The mitochondria is the powerhouse of the cell".to_string(),
+            "I live in Lisbon, Portugal".to_string(),
+            "The stock market closed higher on Tuesday".to_string(),
+        ];
+        let many: Vec<String> = (0..BATCH_TEXT_COUNT)
+            .map(|i| format!("{} {i}", documents[i % documents.len()]))
+            .collect();
+
+        // Act
+        let query = embedder
+            .embed("where do I live", TextKind::Query)
+            .await
+            .expect("embed query");
+        let vectors = embedder
+            .embed_batch(&documents, TextKind::Document)
+            .await
+            .expect("embed documents");
+        let many_vectors = embedder
+            .embed_batch(&many, TextKind::Document)
+            .await
+            .expect("embed more documents than one call");
+        let alone = embedder
+            .embed(&many[0], TextKind::Document)
+            .await
+            .expect("embed one document");
+
+        // Assert
+        let scores: Vec<f32> = vectors.iter().map(|v| cosine(&query, v)).collect();
+        assert_eq!(query.len(), config.embedding_dims);
+        assert!(scores[1] > scores[0] && scores[1] > scores[2], "{scores:?}");
+        assert_eq!(many_vectors.len(), BATCH_TEXT_COUNT);
+        let drift = many_vectors[0]
+            .iter()
+            .zip(&alone)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(drift < EMBED_EPSILON, "{drift}");
     }
 }

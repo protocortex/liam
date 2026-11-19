@@ -6,10 +6,10 @@ yanked = "deny"
 ignore = [
     # RUSTSEC-2024-0436: `paste` is unmaintained. This is an unmaintained
     # advisory, not a known vulnerability. It reaches this project only
-    # transitively, through the candle and fastembed dependency tree; nothing
-    # this project calls directly depends on `paste`. Revisit and drop this
-    # ignore once fastembed and its candle dependencies move off `paste`.
-    { id = "RUSTSEC-2024-0436", reason = "unmaintained, pulled in transitively by the candle and fastembed tree, not used directly" },
+    # transitively, through fastembed and its tokenizers crate; nothing this
+    # project calls directly depends on `paste`. Revisit and drop this ignore
+    # once tokenizers moves off `paste`.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained, pulled in transitively by fastembed through tokenizers, not used directly" },
     # RUSTSEC-2026-0543: `chrono` is unmaintained. This is an unmaintained
     # advisory, not a known vulnerability, and it names no fixed version. It
     # reaches this project only transitively, through arrow, parquet,

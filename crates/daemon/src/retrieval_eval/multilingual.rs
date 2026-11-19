@@ -668,16 +668,16 @@ mod tests {
 
     const CACHE_DIR_ENV: &str = "LIAM_EVAL_CACHE_DIR";
 
-    /// Scores all eight languages with the default embedder and applies the
+    /// Scores all eight languages with the embedder and applies the
     /// gate. The first run downloads the model, about 311 MB. Set
     /// `LIAM_EVAL_CACHE_DIR` to keep the files out of `embedder.cache_dir`.
     /// Run with `cargo test --release -p liam-daemon --lib -- --ignored
-    /// --nocapture multilingual::tests::the_default_embedder_meets_the_multilingual_baseline`.
+    /// --nocapture multilingual::tests::the_embedder_meets_the_multilingual_baseline`.
     /// To re-measure after a deliberate change, run it and copy the printed
     /// `ndcg@10` column into `multilingual/baseline-arctic-embed-m-v2-384.json`.
     #[tokio::test]
     #[ignore = "downloads embedder weights; see the doc comment for the run command"]
-    async fn the_default_embedder_meets_the_multilingual_baseline() {
+    async fn the_embedder_meets_the_multilingual_baseline() {
         // Arrange
         let mut config = crate::config::Config::default();
         config.embedder.provider = crate::models::LOCAL_PROVIDER.into();

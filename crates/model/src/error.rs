@@ -74,7 +74,7 @@ mod tests {
         let cause = std::io::Error::other("weights file is truncated");
 
         // Act
-        let error = ModelError::embed_failed("load bge-m3", cause);
+        let error = ModelError::embed_failed("load arctic", cause);
 
         // Assert
         let source = error.source().expect("the cause is the source");
@@ -88,10 +88,10 @@ mod tests {
         let cause = std::io::Error::other("weights file is truncated");
 
         // Act
-        let text = ModelError::embed_failed("load bge-m3", cause).to_string();
+        let text = ModelError::embed_failed("load arctic", cause).to_string();
 
         // Assert
-        assert_eq!(text, "embedder: load bge-m3: weights file is truncated");
+        assert_eq!(text, "embedder: load arctic: weights file is truncated");
     }
 
     #[test]

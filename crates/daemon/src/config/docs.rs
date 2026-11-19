@@ -11,7 +11,7 @@ use super::Config;
 const ROOT_SECTION: &str = "";
 
 /// Keys kept only so an old `liam.toml` still loads, so no page documents them.
-const REMOVED_KEYS: [&str; 1] = ["reranker"];
+const REMOVED_KEYS: [&str; 2] = ["reranker", "embedder.device"];
 
 /// Sections whose keys a concept page documents and its own test guards.
 const SECTIONS_ON_OWN_PAGES: [&str; 3] = ["extraction", "summary", "tiering"];
@@ -60,12 +60,14 @@ fn sections() -> Vec<(String, Value)> {
 
 /// The keys a section assigns itself. The tables nested in it are sections of
 /// their own.
-fn keys_of(value: &Value) -> Vec<String> {
+fn keys_of(section: &str, value: &Value) -> Vec<String> {
     value
         .as_object()
         .expect("a section serialises as a table")
         .iter()
-        .filter(|(key, inner)| !inner.is_object() && !REMOVED_KEYS.contains(&key.as_str()))
+        .filter(|(key, inner)| {
+            !inner.is_object() && !REMOVED_KEYS.contains(&qualified(section, key).as_str())
+        })
         .map(|(key, _)| key.clone())
         .collect()
 }
@@ -132,7 +134,7 @@ fn missing_from_toml(text: &str) -> Vec<String> {
             missing.push(format!("[{section}]"));
         }
         let table = toml_table(text, &section);
-        for key in keys_of(&value) {
+        for key in keys_of(&section, &value) {
             if !table.iter().any(|line| assigns(line, &key)) {
                 missing.push(qualified(&section, &key));
             }
@@ -147,7 +149,7 @@ fn missing_from_page(text: &str) -> Vec<String> {
         if !on_configuration_page(&section) {
             continue;
         }
-        let mut named: Vec<String> = keys_of(&value)
+        let mut named: Vec<String> = keys_of(&section, &value)
             .into_iter()
             .map(|key| qualified(&section, &key))
             .collect();
@@ -224,7 +226,7 @@ fn the_getting_started_pages_name_the_default_embedder() {
         let text = read_root(page);
 
         // Act
-        let names_default = text.contains(liam_model::DEFAULT_EMBEDDER_MODEL_ID);
+        let names_default = text.contains(liam_model::EMBEDDER_MODEL_ID);
 
         // Assert
         assert!(names_default, "{page} must name the default embedder");

@@ -17,6 +17,7 @@ mod consolidation;
 mod deletion;
 #[cfg(test)]
 mod docs;
+mod embedder;
 mod encryption;
 mod extraction;
 mod hosted;
@@ -31,6 +32,7 @@ pub use archive::ArchiveConfig;
 pub(crate) use consolidation::default_snapshot_dir;
 pub use consolidation::ConsolidationConfig;
 pub use deletion::DeletionConfig;
+pub use embedder::EmbedderConfig;
 pub use encryption::{EncryptionConfig, MasterKeySource};
 pub use extraction::{
     declared_predicates, resolve_vocabulary, ExtractionConfig, PredicateOverride,
@@ -162,24 +164,6 @@ pub struct GcConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
-pub struct EmbedderConfig {
-    /// "mock" (tests and dev) or "local" (in-process fastembed).
-    pub provider: String,
-    /// Hugging Face model id for the local provider.
-    pub model: String,
-    /// Where the model's files live, under their own `models--Org--Name`
-    /// subdirectory.
-    pub cache_dir: String,
-    /// Compute device for the local embedder: "auto" (default), "cpu", "metal"
-    /// or "cuda". `auto` is Metal on macOS for both the llama.cpp GGUF models and
-    /// candle, and the CPU elsewhere. Not part of the embedder fingerprint: the device changes
-    /// speed, not what the vectors mean.
-    pub device: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
     /// "mock" (tests and dev) or "llama-cpp" (in-process llama.cpp).
     /// "local" was the retired candle provider.
@@ -194,8 +178,8 @@ pub struct LlmConfig {
     pub cache_dir: String,
     /// Compute backend: "auto" (default), "metal", "cuda", or "cpu". `auto` takes
     /// the fastest backend compiled into this binary and falls back to CPU. macOS
-    /// builds include Metal automatically; CUDA needs `--features cuda` at build
-    /// time. See `liam_model::llm::DevicePreference`.
+    /// builds include Metal automatically; CUDA is not built and is refused.
+    /// See `liam_model::llm::DevicePreference`.
     pub device: String,
     /// Load the model and generate one throwaway token at startup, so the
     /// backend's first-call cost (on Metal, ~10s of GPU kernel compilation) is
@@ -374,17 +358,6 @@ impl Default for GcConfig {
     }
 }
 
-impl Default for EmbedderConfig {
-    fn default() -> Self {
-        Self {
-            provider: "mock".into(),
-            model: liam_model::DEFAULT_EMBEDDER_MODEL_ID.into(),
-            cache_dir: "~/.liam/models".into(),
-            device: "auto".into(),
-        }
-    }
-}
-
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -448,9 +421,9 @@ pub const MAX_GC_INTERVAL_HOURS: u64 = 8760;
 
 const SECS_PER_HOUR: u64 = 3600;
 
-/// Default vector width: the default embedder (Snowflake arctic-embed-m-v2.0,
-/// int8 ONNX) truncated to 384 dims (MRL). Qwen3-Embedding-0.6B stays
-/// selectable at the same width. See `docs/specs/2026-11-06-embedder-speed-evaluation.md`.
+/// Default vector width: the embedder (Snowflake arctic-embed-m-v2.0, int8
+/// ONNX) truncated to 384 dims (MRL). See
+/// `docs/specs/2026-11-06-embedder-speed-evaluation.md`.
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 /// Default seconds `recall` and `ask` may spend retrieving.
@@ -530,6 +503,7 @@ impl Config {
         }
 
         let mut config: Self = toml::from_str(&text)?;
+        config.embedder.validate()?;
         config.extraction.expand_paths(home)?;
         config.encryption.expand_paths(home)?;
         config.archive.expand_paths(home)?;
@@ -942,48 +916,6 @@ mod tests {
             Some(liam_model::llm::DevicePreference::Auto)
         );
         assert!(!c.llm.warmup, "the model loads on first use by default");
-    }
-
-    #[test]
-    fn embedder_model_defaults_to_arctic_and_the_qwen3_builds_stay_selectable() {
-        // Arrange
-        let absent = write_temp_toml("[gc]\n");
-        let candle = write_temp_toml("[embedder]\nmodel = \"Qwen/Qwen3-Embedding-0.6B\"\n");
-        let gguf = write_temp_toml("[embedder]\nmodel = \"Qwen/Qwen3-Embedding-0.6B-GGUF\"\n");
-
-        // Act
-        let loaded_default = Config::load(&absent).unwrap();
-        let loaded_candle = Config::load(&candle).unwrap();
-        let loaded_gguf = Config::load(&gguf).unwrap();
-
-        // Assert
-        let default = Config::default().embedder.model;
-        assert_eq!(default, "Snowflake/snowflake-arctic-embed-m-v2.0");
-        assert_eq!(default, liam_model::DEFAULT_EMBEDDER_MODEL_ID);
-        assert_eq!(loaded_default.embedder.model, default);
-        assert!(liam_model::onnx_model_spec(&default).is_some());
-        assert_eq!(
-            loaded_candle.embedder.model,
-            liam_model::QWEN3_EMBEDDING_MODEL_ID
-        );
-        assert_eq!(
-            loaded_gguf.embedder.model,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID
-        );
-        assert!(liam_model::gguf_embedder_spec(&loaded_gguf.embedder.model).is_some());
-    }
-
-    #[test]
-    fn embedder_device_defaults_to_auto_and_reads_from_toml() {
-        // Arrange
-        let path = write_temp_toml("[embedder]\ndevice = \"metal\"\n");
-
-        // Act
-        let loaded = Config::load(&path).unwrap();
-
-        // Assert
-        assert_eq!(Config::default().embedder.device, "auto");
-        assert_eq!(loaded.embedder.device, "metal");
     }
 
     #[test]

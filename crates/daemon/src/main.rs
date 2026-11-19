@@ -222,10 +222,10 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         &embedder_fingerprint::EmbedderFingerprint::from_config(&config),
     )?;
 
-    if let Some(notice) = embedder_fingerprint::superseded_default_notice(&config, &database_path) {
-        tracing::info!("{notice}");
-    }
     if let Some(warning) = config.removed_reranker_warning() {
+        tracing::warn!("{warning}");
+    }
+    if let Some(warning) = config.embedder.removed_device_warning() {
         tracing::warn!("{warning}");
     }
     if let Some(warning) = config.missing_config_warning() {

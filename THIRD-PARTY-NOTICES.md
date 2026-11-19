@@ -55,6 +55,9 @@ sha256 first.
   <https://github.com/ggml-org/llama.cpp/releases/tag/b12173>.
 - **Qwen3.5-4B, Q4_K_M GGUF** (unsloth/Qwen3.5-4B-GGUF): Apache-2.0, model
   weights. Source: <https://huggingface.co/unsloth/Qwen3.5-4B-GGUF>.
+- **snowflake-arctic-embed-m-v2.0, int8 ONNX** (Snowflake/snowflake-arctic-embed-m-v2.0):
+  Apache-2.0, the embedding model weights. They are fetched when `embedder.provider`
+  is `local`. Source: <https://huggingface.co/Snowflake/snowflake-arctic-embed-m-v2.0>.
 
 The download uses the system `curl` rather than an HTTP client crate. `ureq` and
 `rustls` are in the dependency tree only through `hf-hub` (the embedder's model
@@ -66,68 +69,62 @@ stack and a CA bundle in every default build for a download only
 
 Every crate below was confirmed present in the resolved dependency tree for
 `cargo build --workspace`, and every license name comes straight from that crate's
-`license` field in `cargo metadata`, not from assumption. 421 Rust crates
+`license` field in `cargo metadata`, not from assumption. 394 Rust crates
 ship in total.
 
-### MIT OR Apache-2.0 (234 crates)
+### MIT OR Apache-2.0 (226 crates)
 
-accelerate-src, aead, aes, aes-gcm, ahash, aligned, allocator-api2,
-anstream, anstyle, anstyle-parse, anstyle-query, anyhow, arrayvec, as-slice,
-async-trait, atomic-waker, autocfg, base64, base64ct, bit_field, bitflags,
-bitstream-io, block-buffer, candle-core, candle-metal-kernels, candle-nn,
-cc, cexpr, cfg-if, chacha20, chrono, cipher, clap, clap_builder,
-clap_derive, clap_lex, cmake, cmov, cobs, colorchoice, core-foundation,
-core-foundation-sys, cpubits, cpufeatures, crc32fast, crossbeam-deque,
-crossbeam-epoch, crossbeam-utils, crypto-common, ctr, ctutils, dary_heap,
-der, deranged, derive_builder, derive_builder_core, derive_builder_macro,
-digest, dirs, dirs-sys, displaydoc, dyn-clone, either, enum-as-inner,
-enumflags2, enumflags2_derive, equivalent, errno, fastbloom, fastrand,
-fdeflate, find-msvc-tools, find_cuda_helper, fixedbitset, flate2, fnv,
-form_urlencoded, futures, futures-channel, futures-core, futures-executor,
-futures-io, futures-macro, futures-sink, futures-task, futures-util,
-getrandom, ghash, gif, glob, half, hashbrown, heck, hmac, home, http,
-httparse, humantime, hybrid-array, hyper-tls, iana-time-zone, ident_case,
-idna, idna_adapter, image, image-webp, indexmap, inout, ipnet,
+aead, aes, aes-gcm, ahash, aligned, allocator-api2, anstream, anstyle,
+anstyle-parse, anstyle-query, anyhow, arrayvec, as-slice, async-trait, atomic-
+waker, autocfg, base64, base64ct, bit_field, bitflags, bitstream-io, block-
+buffer, cc, cexpr, cfg-if, chacha20, chrono, cipher, clap, clap_builder,
+clap_derive, clap_lex, cmake, cmov, cobs, colorchoice, core-foundation, core-
+foundation-sys, cpubits, cpufeatures, crc32fast, crossbeam-deque, crossbeam-
+epoch, crossbeam-utils, crypto-common, ctr, ctutils, dary_heap, der, deranged,
+derive_builder, derive_builder_core, derive_builder_macro, digest, dirs, dirs-
+sys, displaydoc, dyn-clone, either, enumflags2, enumflags2_derive, equivalent,
+errno, fastbloom, fastrand, fdeflate, find-msvc-tools, find_cuda_helper,
+fixedbitset, flate2, fnv, form_urlencoded, futures, futures-channel, futures-
+core, futures-executor, futures-io, futures-macro, futures-sink, futures-task,
+futures-util, getrandom, ghash, gif, glob, half, hashbrown, heck, hmac, home,
+http, httparse, humantime, hybrid-array, hyper-tls, iana-time-zone,
+ident_case, idna, idna_adapter, image, image-webp, indexmap, inout, ipnet,
 is_terminal_polyfill, itertools, itoa, jobserver, lazy_static, lazycell,
-leiden-rs, libc, llama-cpp-2, llama-cpp-sys-2, lock_api, log,
-matrixmultiply, memmap2, mime, minimal-lexical, monostate, monostate-impl,
-native-tls, ndarray, no_std_io2, num-bigint, num-complex, num-conv,
-num-derive, num-integer, num-rational, num-traits, num_cpus, object_store,
-once_cell, ort, ort-sys, parking_lot, parking_lot_core, paste, pastey,
-peeking_take_while, pem-rfc7468, percent-encoding, pin-project-lite,
-pkg-config, png, polyval, portable-atomic, postcard, powerfmt, ppv-lite86,
-prettyplease, proc-macro2, profiling, profiling-procmacros, qoi,
-quick-error, quote, rand, rand_chacha, rand_core, rand_distr, raunch,
-rawpointer, rayon, rayon-cond, rayon-core, ref-cast, ref-cast-impl, regex,
-regex-automata, regex-syntax, reqwest, rustc-hash, rustc_version,
-rustls-pki-types, rustversion, scopeguard, security-framework,
-security-framework-sys, semver, seq-macro, serde, serde_core, serde_derive,
+leiden-rs, libc, llama-cpp-2, llama-cpp-sys-2, lock_api, log, matrixmultiply,
+mime, minimal-lexical, monostate, monostate-impl, native-tls, ndarray,
+no_std_io2, num-bigint, num-complex, num-conv, num-derive, num-integer, num-
+rational, num-traits, num_cpus, object_store, once_cell, ort, ort-sys,
+parking_lot, parking_lot_core, paste, pastey, peeking_take_while, pem-rfc7468,
+percent-encoding, pin-project-lite, pkg-config, png, polyval, portable-atomic,
+postcard, powerfmt, ppv-lite86, prettyplease, proc-macro2, profiling,
+profiling-procmacros, qoi, quick-error, quote, rand, rand_chacha, rand_core,
+raunch, rawpointer, rayon, rayon-cond, rayon-core, ref-cast, ref-cast-impl,
+regex, regex-automata, regex-syntax, reqwest, rustc-hash, rustc_version,
+rustls-pki-types, rustversion, scopeguard, security-framework, security-
+framework-sys, semver, seq-macro, serde, serde_core, serde_derive,
 serde_derive_internals, serde_json, serde_spanned, serde_urlencoded, sha2,
 shlex, signal-hook-registry, siphasher, smallvec, socket2, socks,
-stable_deref_trait, static_assertions, syn, system-configuration,
-system-configuration-sys, tempfile, thiserror, thiserror-impl, thread_local,
-time, time-core, toml, toml_datetime, toml_parser, toml_writer, typed-path,
-typenum, unicode-normalization-alignments, unicode-segmentation,
-unicode-width, unicode_categories, universal-hash, ureq, ureq-proto, url,
-utf8-zero, utf8_iter, utf8parse, uuid, version_check, weezl, zeroize.
+stable_deref_trait, static_assertions, syn, system-configuration, system-
+configuration-sys, tempfile, thiserror, thiserror-impl, thread_local, time,
+time-core, toml, toml_datetime, toml_parser, toml_writer, typenum, unicode-
+normalization-alignments, unicode-segmentation, unicode-width,
+unicode_categories, universal-hash, ureq, ureq-proto, url, utf8-zero,
+utf8_iter, utf8parse, uuid, version_check, weezl, zeroize.
 
-### MIT (95 crates)
+### MIT (79 crates)
 
-aligned-vec, arg_enum_proc_macro, av-scenechange, bitvec, block2, built,
-bytes, castaway, cfg_aliases, color_quant, compact_str, console, darling,
-darling_core, darling_macro, dyn-stack, dyn-stack-macros, equator,
-equator-macro, fax, float8, funty, gemm, gemm-c32, gemm-c64, gemm-common,
-gemm-f16, gemm-f32, gemm-f64, h2, http-body, http-body-util, hyper,
-hyper-util, indicatif, libm, libsql, libsql-ffi, libsql-sys, loop9,
-matchers, maybe-rayon, mio, new_debug_unreachable, nix, nom,
-noop_proc_macro, nu-ansi-term, objc2, objc2-encode, objc2-foundation, onig,
-onig_sys, pulp, pulp-wasm-simd-flag, radium, raw-cpuid, reborrow, rgb,
-schemars, schemars_derive, sharded-slab, simd-adler32, simd_helpers, slab,
-strsim, synstructure, sysctl, sysinfo, tap, tiff, tokio, tokio-macros,
-tokio-native-tls, tokio-util, tower, tower-http, tower-layer, tower-service,
-tracing, tracing-attributes, tracing-core, tracing-log, tracing-subscriber,
-try-lock, twox-hash, ulid, unit-prefix, want, which, winnow, wyz, y4m, zip,
-zmij.
+aligned-vec, arg_enum_proc_macro, av-scenechange, bitvec, built, bytes,
+castaway, cfg_aliases, color_quant, compact_str, console, darling,
+darling_core, darling_macro, equator, equator-macro, fax, funty, h2, http-
+body, http-body-util, hyper, hyper-util, indicatif, libm, libsql, libsql-ffi,
+libsql-sys, loop9, matchers, maybe-rayon, mio, new_debug_unreachable, nix,
+nom, noop_proc_macro, nu-ansi-term, onig, onig_sys, pulp, pulp-wasm-simd-flag,
+radium, raw-cpuid, reborrow, rgb, schemars, schemars_derive, sharded-slab,
+simd-adler32, simd_helpers, slab, strsim, synstructure, sysinfo, tap, tiff,
+tokio, tokio-macros, tokio-native-tls, tokio-util, tower, tower-http, tower-
+layer, tower-service, tracing, tracing-attributes, tracing-core, tracing-log,
+tracing-subscriber, try-lock, twox-hash, ulid, unit-prefix, want, which,
+winnow, wyz, y4m, zmij.
 
 ### Apache-2.0 (19 crates)
 
@@ -142,12 +139,11 @@ icu_properties, icu_properties_data, icu_provider, litemap, potential_utf,
 tinystr, writeable, yoke, yoke-derive, zerofrom, zerofrom-derive, zerotrie,
 zerovec, zerovec-derive.
 
-### Other permissive licenses (55 crates)
+### Other permissive licenses (52 crates)
 
-- MIT OR Apache-2.0 OR Zlib: bytemuck, bytemuck_derive, dispatch2,
-  macro_rules_attribute, macro_rules_attribute-proc_macro, miniz_oxide,
-  objc2-core-foundation, objc2-io-kit, objc2-metal, tinyvec, zune-core,
-  zune-inflate, zune-jpeg.
+- MIT OR Apache-2.0 OR Zlib: bytemuck, macro_rules_attribute,
+  macro_rules_attribute-proc_macro, miniz_oxide, objc2-core-foundation,
+  objc2-io-kit, tinyvec, zune-core, zune-inflate, zune-jpeg.
 - MIT OR Unlicense: aho-corasick, byteorder, byteorder-lite, gryf,
   gryf-derive, memchr, same-file, walkdir.
 - BSD-3-Clause: avif-serialize, bindgen, exr, lebe, ravif, subtle, zstd,
@@ -177,10 +173,11 @@ where each one landed, confirmed against the current tree rather than
 assumed:
 
 - **llama.cpp**: vendored C++, MIT. See the callout above.
-- **candle**: `candle-core`, `candle-nn`, and `candle-metal-kernels` are
-  still in the tree, all MIT OR Apache-2.0. Candle's text-generation code
-  path was removed when LIAM moved generation to llama.cpp; candle remains
-  only as the runtime behind the local embedder.
+- **candle**: `candle-core`, `candle-nn` and `candle-metal-kernels` are no
+  longer in the tree. Candle's text-generation code path was removed when LIAM
+  moved generation to llama.cpp, and the Qwen3 and BGE-M3 embedders that ran
+  on it were removed when the Snowflake arctic ONNX model became the only
+  embedder.
 - **fastembed and ort**: `fastembed` (Apache-2.0) and `ort` plus `ort-sys`
   (MIT OR Apache-2.0) are still in the tree; they run the local embedding
   models.

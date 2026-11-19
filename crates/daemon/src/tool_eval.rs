@@ -13,26 +13,20 @@
 //! - **Mock tier, always-on:** `MockEmbedder` and `MockLlm`, no model
 //!   download. A plain `#[tokio::test]`, runs under
 //!   `cargo test -p liam-daemon --bin liamd tool_eval`.
-//! - **Real-tier, gated + `#[ignore]`d:** the actual local embedder
-//!   (`FastEmbedEmbedder`, Qwen3), downloading weights on first run:
+//! - **Real-tier, gated + `#[ignore]`d:** the actual local embedder, built by
+//!   the daemon's own `build_embedder`, downloading weights on first run:
 //!
 //!   ```text
 //!   cargo test --release -p liam-daemon --bin liamd -- --ignored --nocapture semantic_paraphrase
 //!   ```
 //!
-//!   Env override: `LIAM_TOOL_EVAL_MODEL`, mirroring `eval.rs`'s
-//!   `LIAM_EVAL_MODEL` and `retrieval_eval.rs`'s `LIAM_RETRIEVAL_EVAL_MODEL`
-//!   for a local A/B run against a different embedding model.
-//!
-//! # Real-tier baseline (2026-08-31, Apple M1 Pro, macOS 15.7.5,
-//! # Qwen/Qwen3-Embedding-0.6B, 768 dims, `cargo test --release -p liam-daemon
-//! # --bin liamd -- --ignored --nocapture semantic_paraphrase`)
+//! # Real-tier expectation
 //!
 //! `semantic_paraphrase_recovers_the_remembered_fact`: recalling with the
 //! paraphrase query "Will they fix it for free if liquid gets inside
 //! accidentally?" against the sole seeded fact "Nightjar's warranty only
 //! covers manufacturing defects, never water damage." (zero shared
-//! non-stopword tokens between query and fact content) returned that fact,
+//! non-stopword tokens between query and fact content) must return that fact,
 //! label "Nightjar warranty terms", as the only and top hit (reciprocal rank
 //! 1.0), confirming the real embedder alone, with no lexical overlap to lean
 //! on, recovers the fact.
@@ -141,51 +135,23 @@ mod real_tier {
     use super::*;
     use crate::mcp::RecallArgs;
 
-    /// Read an env override, falling back to `default` when unset. Same
-    /// small shape as `eval.rs`'s and `retrieval_eval.rs`'s own `env_or`;
-    /// redefined locally rather than shared across modules, per those
-    /// modules' own doc comments, since it is a two-line function with no
-    /// state to keep in sync.
-    fn env_or(key: &str, default: &str) -> String {
-        std::env::var(key).unwrap_or_else(|_| default.to_string())
-    }
-
-    /// Loads a real `FastEmbedEmbedder` (Qwen3), returning it alongside the
-    /// configured embedding dims that `build_server` also needs.
+    /// Loads the real embedder through the daemon's own `build_embedder`,
+    /// returning it alongside the configured embedding dims that
+    /// `build_server` also needs.
     ///
     /// WHY this returns a freshly LOADED embedder rather than a
     /// shared/cached one: this only dedupes the loading CODE across the two
     /// `#[tokio::test]` functions in this module, not the loaded INSTANCE.
     /// Each test still calls this helper independently and gets its own
-    /// `FastEmbedEmbedder`, per this module's doc comment on no
-    /// cross-test-function shared state; do not "simplify" this into a
-    /// `once_cell`/`lazy_static` shared across tests.
+    /// embedder, per this module's doc comment on no cross-test-function
+    /// shared state; do not "simplify" this into a `once_cell`/`lazy_static`
+    /// shared across tests.
     fn load_real_embedder() -> (Arc<dyn liam_model::Embedder>, usize) {
-        let model_id = env_or(
-            "LIAM_TOOL_EVAL_MODEL",
-            &crate::config::Config::default().embedder.model,
-        );
-        let dims = crate::config::Config::default().embedding_dims;
-        let cache_dir = liam_daemon::models::resolve_path_with_home(
-            "embedder.cache_dir",
-            &crate::config::Config::default().embedder.cache_dir,
-            &std::env::var("HOME").unwrap_or_default(),
-        )
-        .expect("resolve embedder.cache_dir");
-        let embedder: Arc<dyn liam_model::Embedder> = Arc::new(
-            liam_model::FastEmbedEmbedder::load(
-                &model_id,
-                dims,
-                &cache_dir,
-                liam_model::llm::DevicePreference::Cpu,
-                liam_model::NoticeCaller::Daemon,
-            )
-            .expect(
-                "load real embedder (Qwen3); requires network access for first-time model \
-                 download",
-            ),
-        );
-        (embedder, dims)
+        let mut config = crate::config::Config::default();
+        config.embedder.provider = liam_daemon::models::LOCAL_PROVIDER.into();
+        let embedder = liam_daemon::models::build_embedder(&config)
+            .expect("load the real embedder; needs network access for the first download");
+        (embedder, config.embedding_dims)
     }
 
     /// Label of the sole fact seeded for

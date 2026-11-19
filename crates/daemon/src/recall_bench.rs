@@ -15,8 +15,8 @@
 //!   `cargo test -p liam-daemon --bin liamd recall_bench`.
 //! - **Real tier, `#[ignore]`d:** the local embedder, downloading
 //!   weights on first run. Reads the pair file named by `LIAM_RECALL_BENCH_PAIRS`
-//!   (default: a small built-in set) and `LIAM_RECALL_BENCH_RUNS` (default 50),
-//!   and the embedder from `LIAM_TOOL_EVAL_MODEL` like `tool_eval`. The store
+//!   (default: a small built-in set) and `LIAM_RECALL_BENCH_RUNS` (default 50).
+//!   The embedder is built by the daemon's own `build_embedder`. The store
 //!   is isolated in a temporary directory, but the model weights are read from
 //!   and may be downloaded into the configured `embedder.cache_dir`;
 //!   `LIAM_RECALL_BENCH_CACHE_DIR` overrides that directory:
@@ -527,9 +527,6 @@ mod tests {
         // Arrange
         let mut daemon_config = Config::default();
         daemon_config.embedder.provider = liam_daemon::models::LOCAL_PROVIDER.into();
-        if let Ok(model_id) = std::env::var("LIAM_TOOL_EVAL_MODEL") {
-            daemon_config.embedder.model = model_id;
-        }
         if let Ok(dir) = std::env::var(CACHE_DIR_ENV) {
             daemon_config.embedder.cache_dir = dir;
         }

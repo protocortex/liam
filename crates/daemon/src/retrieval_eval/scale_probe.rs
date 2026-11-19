@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use liam_store::{Backend, DefaultBackend, DefaultGraph, GraphConfig, NewNode, Query};
 
-/// Embedding widths to probe: LIAM's configured Qwen3 width and BGE-M3's.
-const PROBE_DIMS: [usize; 2] = [768, 1024];
+/// Embedding widths to probe: the shipped width and the model's own.
+const PROBE_DIMS: [usize; 2] = [384, 768];
 
 /// Store sizes to probe; the last is the ceiling the ANN decision cares about.
 const PROBE_SIZES: [usize; 5] = [1_000, 10_000, 25_000, 50_000, 100_000];

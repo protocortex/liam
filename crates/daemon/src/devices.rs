@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `liam devices`: what this machine and this build can compute on, and what
-//! `auto` resolves to for the embedder and the LLM under a config.
+//! `auto` resolves to for the LLM under a config. The embedder runs on the CPU
+//! and has no device to report.
 //!
 //! The probing sits behind `HardwareProbe` so the report and the resolution
 //! are tested with fakes, since a test host cannot stand in for every
@@ -8,21 +9,19 @@
 
 use std::fmt::Write as _;
 
-use liam_model::hardware::{
-    resolve_device, BackendDevice, CoreCounts, Engine, HardwareFacts, SystemFacts,
-};
+use liam_model::hardware::{resolve_device, BackendDevice, CoreCounts, HardwareFacts, SystemFacts};
 use liam_model::llm::DevicePreference;
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::models::{LLAMA_PROVIDER, LOCAL_PROVIDER};
+use crate::models::LLAMA_PROVIDER;
 
 const BYTES_PER_MB: usize = 1024 * 1024;
 const BACKEND_METAL: &str = "metal";
-const BACKEND_CUDA: &str = "cuda";
 const BACKEND_CPU: &str = "cpu";
 const NOT_REPORTED: &str = "not reported";
 const MACOS: &str = "macos";
+const LLM_ENGINE: &str = "llama.cpp";
 
 /// What the machine and the binary can say about themselves.
 pub trait HardwareProbe: HardwareFacts {
@@ -42,9 +41,6 @@ impl HardwareFacts for SystemProbe {
     }
     fn metal_usable(&self) -> bool {
         SystemFacts.metal_usable()
-    }
-    fn cuda_built(&self) -> bool {
-        SystemFacts.cuda_built()
     }
 }
 
@@ -90,7 +86,6 @@ pub struct DevicesReport {
     pub metal_usable: bool,
     pub built_backends: Vec<String>,
     pub llama_devices: Option<Vec<DeviceRow>>,
-    pub embedder: Resolution,
     pub llm: Resolution,
 }
 
@@ -100,24 +95,16 @@ fn built_backends(probe: &dyn HardwareProbe) -> Vec<String> {
     if probe.os() == MACOS {
         built.push(BACKEND_METAL.to_owned());
     }
-    if probe.cuda_built() {
-        built.push(BACKEND_CUDA.to_owned());
-    }
     built.push(BACKEND_CPU.to_owned());
     built
 }
 
 /// Resolve one `device` value with the same function the loaders call.
-fn resolve(
-    probe: &dyn HardwareProbe,
-    configured: &str,
-    engine: Engine,
-    engine_name: &str,
-) -> Resolution {
+fn resolve(probe: &dyn HardwareProbe, configured: &str) -> Resolution {
     let make = |resolved: &str, note: Option<String>| Resolution {
         configured: configured.to_owned(),
         resolved: resolved.to_owned(),
-        engine: engine_name.to_owned(),
+        engine: LLM_ENGINE.to_owned(),
         note,
     };
     match DevicePreference::parse(configured) {
@@ -125,7 +112,7 @@ fn resolve(
             "invalid",
             Some("not one of auto, metal, cuda, cpu".to_owned()),
         ),
-        Some(preference) => match resolve_device(engine, preference, probe) {
+        Some(preference) => match resolve_device(preference, probe) {
             Ok(resolution) => make(resolution.device.as_str(), resolution.note),
             Err(refusal) => make("unavailable", Some(refusal)),
         },
@@ -141,41 +128,12 @@ fn not_used(configured: &str, provider: &str) -> Resolution {
     }
 }
 
-/// The engine an embedder model id loads on. `None` for models that ignore the device.
-fn embedder_engine(model: &str) -> Option<(Engine, &'static str)> {
-    if liam_model::gguf_embedder_spec(model).is_some() {
-        Some((Engine::LlamaEmbedder, "llama.cpp"))
-    } else if liam_model::onnx_model_spec(model).is_some()
-        || model.eq_ignore_ascii_case(liam_model::BGE_M3_MODEL_ID)
-    {
-        None
-    } else {
-        Some((Engine::Candle, "candle"))
-    }
-}
-
-fn resolve_embedder(probe: &dyn HardwareProbe, config: &Config) -> Resolution {
-    let configured = &config.embedder.device;
-    if config.embedder.provider != LOCAL_PROVIDER {
-        return not_used(configured, &config.embedder.provider);
-    }
-    match embedder_engine(&config.embedder.model) {
-        Some((engine, name)) => resolve(probe, configured, engine, name),
-        None => Resolution {
-            configured: configured.clone(),
-            resolved: BACKEND_CPU.to_owned(),
-            engine: "onnx".to_owned(),
-            note: Some("this model ignores embedder.device".to_owned()),
-        },
-    }
-}
-
 fn resolve_llm(probe: &dyn HardwareProbe, config: &Config) -> Resolution {
     let configured = &config.llm.device;
     if config.llm.provider != LLAMA_PROVIDER {
         return not_used(configured, &config.llm.provider);
     }
-    resolve(probe, configured, Engine::LlamaLlm, "llama.cpp")
+    resolve(probe, configured)
 }
 
 /// Gather everything `liam devices` prints.
@@ -200,7 +158,6 @@ pub fn report(probe: &dyn HardwareProbe, config: &Config) -> DevicesReport {
                 })
                 .collect()
         }),
-        embedder: resolve_embedder(probe, config),
         llm: resolve_llm(probe, config),
     }
 }
@@ -249,7 +206,6 @@ pub fn format_text(report: &DevicesReport) -> String {
         format!("metal: {metal}"),
         format!("built backends: {}", report.built_backends.join(", ")),
         format!("llama.cpp devices: {llama}"),
-        resolution_line("embedder.device", &report.embedder),
         resolution_line("llm.device", &report.llm),
     ]
     .join("\n")
@@ -267,7 +223,6 @@ mod tests {
     struct Fake {
         os: &'static str,
         metal: bool,
-        cuda: bool,
         split: bool,
         devices: Option<Vec<BackendDevice>>,
     }
@@ -276,7 +231,6 @@ mod tests {
         Fake {
             os: MACOS,
             metal: true,
-            cuda: false,
             split: true,
             devices: Some(vec![BackendDevice {
                 name: "MTL0".into(),
@@ -291,7 +245,6 @@ mod tests {
         Fake {
             os: "linux",
             metal: false,
-            cuda: false,
             split: false,
             devices: None,
         }
@@ -303,9 +256,6 @@ mod tests {
         }
         fn metal_usable(&self) -> bool {
             self.metal
-        }
-        fn cuda_built(&self) -> bool {
-            self.cuda
         }
     }
 
@@ -328,31 +278,21 @@ mod tests {
         }
     }
 
-    fn config(provider: &str, model: &str, device: &str) -> Config {
+    fn config(llm_device: &str) -> Config {
         let mut config = Config::default();
-        config.embedder.provider = provider.into();
-        config.embedder.model = model.into();
-        config.embedder.device = device.into();
         config.llm.provider = LLAMA_PROVIDER.into();
+        config.llm.device = llm_device.into();
         config
     }
 
     #[test]
     fn auto_is_metal_on_a_mac_with_a_metal_device() {
-        // Arrange
-        let config = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "auto",
-        );
-
         // Act
-        let report = report(&mac(), &config);
+        let report = report(&mac(), &config("auto"));
 
         // Assert
-        assert_eq!(report.embedder.resolved, "metal");
-        assert_eq!(report.embedder.engine, "llama.cpp");
         assert_eq!(report.llm.resolved, "metal");
+        assert_eq!(report.llm.engine, "llama.cpp");
     }
 
     #[test]
@@ -362,145 +302,53 @@ mod tests {
             metal: false,
             ..mac()
         };
-        let config = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "auto",
-        );
 
         // Act
-        let report = report(&probe, &config);
+        let report = report(&probe, &config("auto"));
 
         // Assert
-        assert_eq!(report.embedder.resolved, "cpu");
-        assert!(report.embedder.note.unwrap().contains("Metal"));
+        assert_eq!(report.llm.resolved, "cpu");
+        assert!(report.llm.note.unwrap().contains("Metal"));
     }
 
     #[test]
     fn auto_is_the_cpu_off_macos() {
-        // Arrange
-        let config = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "auto",
-        );
-
         // Act
-        let report = report(&linux(), &config);
+        let report = report(&linux(), &config("auto"));
 
         // Assert
-        assert_eq!(report.embedder.resolved, "cpu");
-        assert_eq!(report.embedder.note, None);
+        assert_eq!(report.llm.resolved, "cpu");
+        assert_eq!(report.llm.note, None);
         assert_eq!(report.built_backends, ["cpu"]);
     }
 
     #[test]
     fn explicit_devices_are_checked_against_the_platform_and_the_build() {
-        // Arrange
-        let metal = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "metal",
-        );
-        let cuda = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "cuda",
-        );
-        let candle_cuda = config(LOCAL_PROVIDER, liam_model::QWEN3_EMBEDDING_MODEL_ID, "cuda");
-        let cuda_build = Fake {
-            cuda: true,
-            ..linux()
-        };
-
-        // Act and assert
-        assert_eq!(report(&linux(), &metal).embedder.resolved, "unavailable");
-        assert_eq!(report(&cuda_build, &cuda).embedder.resolved, "unavailable");
-        assert_eq!(report(&cuda_build, &candle_cuda).embedder.resolved, "cuda");
-        assert_eq!(
-            report(&cuda_build, &candle_cuda).built_backends,
-            ["cuda", "cpu"]
-        );
-    }
-
-    #[test]
-    fn the_llm_report_matches_what_the_llama_cpp_loader_refuses() {
-        // Arrange
-        let mut cuda = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "auto",
-        );
-        cuda.llm.device = "cuda".into();
-        let mut metal = cuda.clone();
-        metal.llm.device = "metal".into();
-        let cuda_build = Fake {
-            cuda: true,
-            ..linux()
-        };
-
         // Act
-        let cuda = report(&cuda_build, &cuda).llm;
-        let metal = report(&linux(), &metal).llm;
+        let metal = report(&linux(), &config("metal")).llm;
+        let cuda = report(&mac(), &config("cuda")).llm;
 
         // Assert
+        assert_eq!(metal.resolved, "unavailable");
         assert_eq!(cuda.resolved, "unavailable");
         assert!(cuda.note.unwrap().contains("not built into llama.cpp"));
-        assert_eq!(metal.resolved, "unavailable");
-    }
-
-    #[test]
-    fn candle_and_onnx_models_resolve_on_their_own_engines() {
-        // Arrange
-        let candle = config(LOCAL_PROVIDER, liam_model::QWEN3_EMBEDDING_MODEL_ID, "auto");
-        let onnx = config(LOCAL_PROVIDER, "BAAI/bge-small-en-v1.5", "metal");
-
-        // Act
-        let candle = report(&mac(), &candle).embedder;
-        let onnx = report(&mac(), &onnx).embedder;
-
-        // Assert
-        assert_eq!(
-            (candle.engine.as_str(), candle.resolved.as_str()),
-            ("candle", "metal")
-        );
-        assert_eq!(
-            (onnx.engine.as_str(), onnx.resolved.as_str()),
-            ("onnx", "cpu")
-        );
     }
 
     #[test]
     fn a_mock_provider_and_a_typo_are_reported_plainly() {
-        // Arrange
-        let mock = Config::default();
-        let typo = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "gpux",
-        );
-
         // Act
-        let mock = report(&mac(), &mock);
-        let typo = report(&mac(), &typo);
+        let mock = report(&mac(), &Config::default());
+        let typo = report(&mac(), &config("gpux"));
 
         // Assert
-        assert_eq!(mock.embedder.resolved, "not used");
         assert_eq!(mock.llm.resolved, "not used");
-        assert_eq!(typo.embedder.resolved, "invalid");
+        assert_eq!(typo.llm.resolved, "invalid");
     }
 
     #[test]
-    fn text_names_the_core_split_the_devices_and_the_resolutions() {
-        // Arrange
-        let config = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "auto",
-        );
-
+    fn text_names_the_core_split_the_devices_and_the_resolution() {
         // Act
-        let text = format_text(&report(&mac(), &config));
+        let text = format_text(&report(&mac(), &config("auto")));
 
         // Assert
         assert!(text.contains("platform: macos aarch64"));
@@ -508,20 +356,14 @@ mod tests {
         assert!(text.contains("metal: usable"));
         assert!(text.contains("built backends: metal, cpu"));
         assert!(text.contains("MTL0: Apple M1 Pro (Metal, 10922 MB)"));
-        assert!(text.contains("embedder.device auto resolves to metal (llama.cpp)"));
+        assert!(text.contains("llm.device auto resolves to metal (llama.cpp)"));
+        assert!(!text.contains("embedder"), "{text}");
     }
 
     #[test]
     fn text_says_not_reported_and_uses_logical_cores_when_nothing_is_known() {
-        // Arrange
-        let config = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "auto",
-        );
-
         // Act
-        let text = format_text(&report(&linux(), &config));
+        let text = format_text(&report(&linux(), &config("auto")));
 
         // Assert
         assert!(text.contains("cpu cores: 10 logical"));
@@ -531,21 +373,15 @@ mod tests {
 
     #[test]
     fn json_carries_the_same_facts() {
-        // Arrange
-        let config = config(
-            LOCAL_PROVIDER,
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "auto",
-        );
-
         // Act
         let json: serde_json::Value =
-            serde_json::from_str(&format_json(&report(&mac(), &config))).unwrap();
+            serde_json::from_str(&format_json(&report(&mac(), &config("auto")))).unwrap();
 
         // Assert
         assert_eq!(json["performance_cores"], 8);
         assert_eq!(json["metal_usable"], true);
-        assert_eq!(json["embedder"]["resolved"], "metal");
+        assert_eq!(json["llm"]["resolved"], "metal");
         assert_eq!(json["llama_devices"][0]["memory_mb"], 10_922);
+        assert!(json.get("embedder").is_none());
     }
 }

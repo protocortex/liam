@@ -4,13 +4,7 @@
 
 use async_trait::async_trait;
 
-use crate::blocking::with_model_blocking;
-use crate::download_notice::NoticeCaller;
 use crate::error::Result;
-use crate::llm::DevicePreference;
-
-/// The default Qwen3 embedding model id.
-pub const QWEN3_EMBEDDING_MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
 
 /// The role a text plays in retrieval. Asymmetric models embed a search query
 /// differently from the content it is matched against.
@@ -24,8 +18,8 @@ pub enum TextKind {
 #[async_trait]
 pub trait Embedder: Send + Sync {
     fn dims(&self) -> usize;
-    /// The engine and device that run the model, for example `candle/cpu` or
-    /// `llama.cpp/metal`. Reported by the benchmark.
+    /// The engine and device that run the model, for example `onnx/cpu`.
+    /// Reported by the benchmark.
     fn backend(&self) -> &str {
         "unspecified"
     }
@@ -65,49 +59,12 @@ impl Embedder for MockEmbedder {
     }
 }
 
-/// The task line of the Qwen3 query format, which the model card asks callers
-/// to write for their own retrieval task. Documents get no instruction.
-const QWEN3_QUERY_TASK: &str =
-    "Given a web search query, retrieve relevant passages that answer the query";
-
-/// The exact string handed to the Qwen3 model for `text` in its `kind` role:
-/// `Instruct: <task>\nQuery:<query>` for a query, plain text for a document.
-pub(crate) fn qwen3_input(text: &str, kind: TextKind) -> String {
-    match kind {
-        TextKind::Query => format!("Instruct: {QWEN3_QUERY_TASK}\nQuery:{text}"),
-        TextKind::Document => text.to_string(),
-    }
-}
-
-/// Tokenizer input cap, in tokens. This is fastembed's own `max_length`
-/// parameter on the tokenizer, unrelated to the output embedding width
-/// below (an earlier version of this file conflated the two, see
-/// `mrl_truncate`). 8192 comfortably holds any realistic remembered fact or
-/// episode item, well under Qwen3-Embedding's 32,768-token native context,
-/// so it bounds worst-case latency without silently cutting off normal
-/// content. It is also BGE-M3's maximum input length.
-pub(crate) const EMBED_MAX_INPUT_TOKENS: usize = 8192;
-
 /// Shrink an already-normalized embedding to its first `dims` entries and
 /// re-normalize to a unit vector.
 ///
-/// Matryoshka-trained models (Qwen3-Embedding among them) are trained so a
-/// truncated prefix of the full vector is still a meaningful embedding, but
-/// fastembed 5.17.3 does not implement that truncation: `Qwen3TextEmbedding
-/// ::embed` always returns the model's full native width (1024 for the
-/// 0.6B default), and the argument that looks like an MRL length
-/// (`from_hf`'s 4th parameter) is actually the tokenizer's own `max_length`,
-/// which caps the *input*, not the output. Passing the store's configured
-/// `embedding_dims` into that parameter silently truncated long input
-/// instead of shrinking the output, and every real embedding call then
-/// failed the store's dimension check (expected `embedding_dims`, got the
-/// model's native width). This function does the truncation fastembed does
-/// not, so `FastEmbedEmbedder::dims()` and the actual vector length agree.
-///
-/// Pure (no model, no candle, no fastembed): compiled whenever `local` is
-/// enabled (its real caller) or under `cfg(test)` (so its own unit tests
-/// below build and run without any downloaded
-/// weights).
+/// Matryoshka-trained models are trained so a truncated prefix of the full
+/// vector is still a meaningful embedding, but the ONNX runtime always returns
+/// the model's full native width, so the cut is done here.
 pub(crate) fn mrl_truncate(full: &[f32], dims: usize) -> Vec<f32> {
     if dims >= full.len() {
         return full.to_vec();
@@ -125,8 +82,7 @@ pub(crate) fn mrl_truncate(full: &[f32], dims: usize) -> Vec<f32> {
 /// Reject a requested Matryoshka output width the model cannot honor: zero
 /// (silently produces empty vectors, since `mrl_truncate` has nothing to
 /// truncate to and nothing to renormalize) or larger than the model's native
-/// width (Matryoshka only shrinks). Pure and gated the same as `mrl_truncate`,
-/// so both bounds are unit tested without a real model.
+/// width (Matryoshka only shrinks).
 pub(crate) fn validate_dims(model_id: &str, dims: usize, native_dims: usize) -> Result<()> {
     if dims == 0 {
         return Err(crate::error::ModelError::Embed(format!(
@@ -143,235 +99,9 @@ pub(crate) fn validate_dims(model_id: &str, dims: usize, native_dims: usize) -> 
     Ok(())
 }
 
-/// Parse `config.json` bytes as a Qwen3 embedding config. Sharded and
-/// Qwen3-VL checkpoints nest their fields under `text_config` instead of at
-/// the top level, so they fail this parse rather than being silently
-/// mis-loaded; see `load`'s scope note on why they are not ported.
-fn parse_qwen3_config(model_id: &str, bytes: &[u8]) -> Result<fastembed::Qwen3Config> {
-    serde_json::from_slice(bytes).map_err(|e| {
-        crate::error::ModelError::Embed(format!(
-            "{model_id}'s config.json does not parse as a Qwen3 embedding config ({e}); \
-             sharded and Qwen3-VL checkpoints are not supported by this loader; the \
-             other supported model ids are {} and the ONNX models in `ONNX_MODELS`",
-            crate::BGE_M3_MODEL_ID
-        ))
-    })
-}
-
-/// The weight-fetch failure message: named so its wording is pinned by a
-/// test, unlike this file's usual inline `ModelError::Embed` formatting.
-fn weight_fetch_error(model_id: &str, cause: &str) -> crate::error::ModelError {
-    crate::error::ModelError::Embed(format!(
-        "failed to fetch model.safetensors for {model_id}: {cause}; if {model_id} is a \
-         sharded or Qwen3-VL checkpoint, this loader does not support that shape"
-    ))
-}
-
-/// In-process embedder over fastembed-rs. Runs a Qwen3
-/// embedding model with candle; no server, offline once the model is cached.
-/// The sync fastembed call runs on a blocking thread so the async runtime stays
-/// free. `dims` is the output embedding width after Matryoshka truncation
-/// (see `mrl_truncate`); it must not exceed the model's native hidden size.
-pub struct FastEmbedEmbedder {
-    model: std::sync::Arc<tokio::sync::Mutex<fastembed::Qwen3TextEmbedding>>,
-    dims: usize,
-    label: &'static str,
-}
-
-/// The candle device for a preference. `Auto` is Metal on macOS, falling back
-/// to the CPU when no Metal device opens: the benchmark spec shows candle's
-/// Metal path returns the same vectors as its CPU path (cosine 1.0000) and
-/// answers a query about 2.5 times faster. Elsewhere `Auto` is the CPU.
-fn candle_device(preference: DevicePreference) -> Result<(candle_core::Device, &'static str)> {
-    use crate::hardware::{resolve_device, Engine, ResolvedDevice, SystemFacts};
-    let resolved = resolve_device(Engine::Candle, preference, &SystemFacts)
-        .map_err(crate::error::ModelError::Embed)?;
-    if let Some(note) = &resolved.note {
-        tracing::warn!(
-            note,
-            "no Metal device for the candle embedder, using the CPU"
-        );
-    }
-    match resolved.device {
-        ResolvedDevice::Cpu => Ok((candle_core::Device::Cpu, "candle/cpu")),
-        ResolvedDevice::Metal => {
-            #[cfg(target_os = "macos")]
-            {
-                let device =
-                    candle_core::Device::new_metal(0).map_err(|e| device_error("metal", e))?;
-                Ok((device, "candle/metal"))
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err(device_error("metal", NOT_IN_BUILD))
-            }
-        }
-        ResolvedDevice::Cuda => {
-            #[cfg(feature = "cuda")]
-            {
-                let device =
-                    candle_core::Device::new_cuda(0).map_err(|e| device_error("cuda", e))?;
-                Ok((device, "candle/cuda"))
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                Err(device_error("cuda", NOT_IN_BUILD))
-            }
-        }
-    }
-}
-
-/// What a guard arm says: the resolver never returns a device this build lacks.
-const NOT_IN_BUILD: &str = "not in this build";
-
-fn device_error(what: &str, e: impl std::fmt::Display) -> crate::error::ModelError {
-    crate::error::ModelError::Embed(format!("candle {what} device: {e}"))
-}
-
-/// The files `FastEmbedEmbedder::load` fetches, in the order it fetches them.
-const QWEN3_HUB_FILES: [&str; 3] = ["config.json", "model.safetensors", "tokenizer.json"];
-
-impl FastEmbedEmbedder {
-    /// Load a model by Hugging Face id (e.g. "Qwen/Qwen3-Embedding-0.6B") into
-    /// `cache_dir`, truncating its output to `dims` via Matryoshka (see
-    /// `mrl_truncate`).
-    ///
-    /// Ported from fastembed v5.17.3's `Qwen3TextEmbedding::from_hf`
-    /// (`qwen3.rs:1010-1087`), which builds its `hf_hub` API with no cache
-    /// directory, so its weights always land under the OS default
-    /// `~/.cache/huggingface/hub` regardless of this project's configured
-    /// `embedder.cache_dir`. This body is the same steps with an explicit
-    /// `with_cache_dir`, only a single unsharded `model.safetensors` and a
-    /// plain (non-VL) `Qwen3Config` supported; see `parse_qwen3_config` and
-    /// `weight_fetch_error` for the two rejected shapes.
-    pub fn load(
-        model_id: &str,
-        dims: usize,
-        cache_dir: &str,
-        preference: DevicePreference,
-        caller: NoticeCaller,
-    ) -> Result<Self> {
-        let (device, label) = candle_device(preference)?;
-        crate::download_notice::log_unless_cached(
-            crate::download_notice::hub_files_cached(
-                cache_dir,
-                model_id,
-                QWEN3_HUB_FILES.iter().copied(),
-            ),
-            model_id,
-            cache_dir,
-            None,
-            caller,
-        );
-        let api = hf_hub::api::sync::ApiBuilder::new()
-            .with_cache_dir(std::path::PathBuf::from(cache_dir))
-            .build()
-            .map_err(|e| {
-                crate::error::ModelError::Embed(format!("hf-hub api for {model_id}: {e}"))
-            })?;
-        let repo = api.model(model_id.to_string());
-
-        let config_path = repo.get("config.json").map_err(|e| {
-            crate::error::ModelError::Embed(format!("fetch config.json for {model_id}: {e}"))
-        })?;
-        let config_bytes = std::fs::read(&config_path).map_err(|e| {
-            crate::error::ModelError::Embed(format!("read config.json for {model_id}: {e}"))
-        })?;
-        let cfg = parse_qwen3_config(model_id, &config_bytes)?;
-        validate_dims(model_id, dims, cfg.hidden_size)?;
-
-        let weight_path = repo
-            .get("model.safetensors")
-            .map_err(|e| weight_fetch_error(model_id, &e.to_string()))?;
-
-        // SAFETY: hf-hub stores each blob at a content-addressed path never
-        // mutated in place, so no concurrent write can invalidate this mmap.
-        let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(
-                &[weight_path],
-                candle_core::DType::F32,
-                &device,
-            )
-        }
-        .map_err(|e| {
-            crate::error::ModelError::Embed(format!("load weights for {model_id}: {e}"))
-        })?;
-        let qwen3_model = fastembed::Qwen3Model::new(cfg, vb).map_err(|e| {
-            crate::error::ModelError::Embed(format!("build model for {model_id}: {e}"))
-        })?;
-
-        let tokenizer_path = repo.get("tokenizer.json").map_err(|e| {
-            crate::error::ModelError::Embed(format!("fetch tokenizer.json for {model_id}: {e}"))
-        })?;
-        let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-            crate::error::ModelError::Embed(format!("load tokenizer for {model_id}: {e}"))
-        })?;
-        let _ = tokenizer.with_padding(Some(tokenizers::PaddingParams {
-            strategy: tokenizers::PaddingStrategy::BatchLongest,
-            direction: tokenizers::PaddingDirection::Left,
-            ..Default::default()
-        }));
-        let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
-            max_length: EMBED_MAX_INPUT_TOKENS,
-            ..Default::default()
-        }));
-
-        let model = fastembed::Qwen3TextEmbedding::new(qwen3_model, tokenizer);
-        Ok(Self {
-            model: std::sync::Arc::new(tokio::sync::Mutex::new(model)),
-            dims,
-            label,
-        })
-    }
-}
-
-#[async_trait]
-impl Embedder for FastEmbedEmbedder {
-    fn dims(&self) -> usize {
-        self.dims
-    }
-    fn backend(&self) -> &str {
-        self.label
-    }
-    async fn embed(&self, text: &str, kind: TextKind) -> Result<Vec<f32>> {
-        let model = self.model.clone();
-        let input = qwen3_input(text, kind);
-        let dims = self.dims;
-        with_model_blocking(model, crate::error::ModelError::Embed, move |m| {
-            let vecs = m
-                .embed(&[input.as_str()])
-                .map_err(|e| crate::error::ModelError::Embed(e.to_string()))?;
-            let full = vecs
-                .into_iter()
-                .next()
-                .ok_or_else(|| crate::error::ModelError::Embed("empty embedding".into()))?;
-            Ok(mrl_truncate(&full, dims))
-        })
-        .await
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::DevicePreference;
-    use super::{mrl_truncate, qwen3_input, validate_dims, Embedder, MockEmbedder, TextKind};
-    use super::{parse_qwen3_config, weight_fetch_error};
-
-    #[test]
-    fn candle_auto_is_metal_on_macos_and_cpu_elsewhere() {
-        // Arrange / Act
-        let (auto, label) = super::candle_device(DevicePreference::Auto).unwrap();
-        let (cpu, cpu_label) = super::candle_device(DevicePreference::Cpu).unwrap();
-
-        // Assert
-        assert!(cpu.is_cpu());
-        assert_eq!(cpu_label, "candle/cpu");
-        if cfg!(target_os = "macos") {
-            assert!(label == "candle/metal" || label == "candle/cpu");
-        } else {
-            assert!(auto.is_cpu());
-        }
-    }
+    use super::{mrl_truncate, validate_dims, Embedder, MockEmbedder, TextKind};
 
     #[test]
     fn mrl_truncate_shrinks_and_renormalizes() {
@@ -459,115 +189,6 @@ mod tests {
         assert!(err.contains("exceeds"), "unexpected message: {err}");
     }
 
-    /// A minimal, well-formed Qwen3 embedding config: every field
-    /// `fastembed::Qwen3Config` requires without a `#[serde(default)]` or
-    /// `Option` type, so this parses on its own and also nests under
-    /// `text_config` to build a VL-shaped fixture below.
-    const VALID_QWEN3_CONFIG_JSON: &str = r#"{
-        "attention_bias": false,
-        "attention_dropout": 0.0,
-        "hidden_act": "silu",
-        "hidden_size": 1024,
-        "intermediate_size": 3072,
-        "max_position_embeddings": 32768,
-        "num_attention_heads": 16,
-        "num_hidden_layers": 28,
-        "num_key_value_heads": 8,
-        "rms_norm_eps": 1e-6,
-        "rope_theta": 1000000.0,
-        "tie_word_embeddings": true,
-        "vocab_size": 151936
-    }"#;
-
-    #[test]
-    fn parse_qwen3_config_parses_a_well_formed_config() {
-        // Arrange / Act
-        let cfg = parse_qwen3_config("test-model", VALID_QWEN3_CONFIG_JSON.as_bytes())
-            .expect("a well-formed Qwen3 config must parse");
-
-        // Assert
-        assert_eq!(cfg.hidden_size, 1024);
-    }
-
-    #[test]
-    fn parse_qwen3_config_rejects_unsupported_shapes_naming_the_model() {
-        // Arrange: malformed JSON, and a VL-shaped config nesting every field
-        // under text_config instead of at the top level, the real shape of a
-        // Qwen3-VL checkpoint's config.json.
-        let malformed = b"not json";
-        let vl_shaped = format!(r#"{{"text_config": {VALID_QWEN3_CONFIG_JSON}}}"#);
-
-        // Act
-        let malformed_err = parse_qwen3_config("test-model", malformed)
-            .unwrap_err()
-            .to_string();
-        let vl_err = parse_qwen3_config("Qwen/Qwen3-VL-Embedding-2B", vl_shaped.as_bytes())
-            .unwrap_err()
-            .to_string();
-
-        // Assert: both name the model id and state the same limitation.
-        assert!(
-            malformed_err.contains("test-model"),
-            "message: {malformed_err}"
-        );
-        assert!(
-            malformed_err.contains("sharded"),
-            "message: {malformed_err}"
-        );
-        assert!(
-            vl_err.contains("Qwen/Qwen3-VL-Embedding-2B"),
-            "message: {vl_err}"
-        );
-        assert!(vl_err.contains("VL"), "message: {vl_err}");
-
-        // ...for different reasons: malformed bytes never parse as JSON at
-        // all, the VL fixture is valid JSON missing required fields.
-        assert!(
-            !malformed_err.contains("missing field"),
-            "message: {malformed_err}"
-        );
-        assert!(vl_err.contains("missing field"), "message: {vl_err}");
-    }
-
-    #[test]
-    fn weight_fetch_error_names_the_model_the_cause_and_the_limitation() {
-        // Arrange / Act
-        let err = weight_fetch_error("test-model", "404 not found").to_string();
-
-        // Assert
-        assert!(err.contains("test-model"), "message: {err}");
-        assert!(err.contains("404 not found"), "message: {err}");
-        assert!(err.contains("sharded"), "message: {err}");
-    }
-
-    #[test]
-    fn qwen3_input_wraps_a_query_in_the_instruct_format() {
-        // Arrange
-        let text = "where do I live";
-
-        // Act
-        let input = qwen3_input(text, TextKind::Query);
-
-        // Assert
-        assert_eq!(
-            input,
-            "Instruct: Given a web search query, retrieve relevant passages that answer \
-             the query\nQuery:where do I live"
-        );
-    }
-
-    #[test]
-    fn qwen3_input_leaves_a_document_unprefixed() {
-        // Arrange
-        let text = "I live in Lisbon";
-
-        // Act
-        let input = qwen3_input(text, TextKind::Document);
-
-        // Assert
-        assert_eq!(input, text);
-    }
-
     #[tokio::test]
     async fn mock_embedder_ignores_the_text_kind() {
         // Arrange
@@ -613,75 +234,5 @@ mod tests {
                 vec![("alpha".to_string(), kind), ("beta".to_string(), kind)]
             );
         }
-    }
-
-    /// Real-tier regression pin for issue #112: a fresh temp dir per run
-    /// means this can only pass if `with_cache_dir` genuinely took effect,
-    /// since the old bare `from_hf` call would leave it empty. Gated and
-    /// ignored the same way as `tool_eval.rs`'s and `retrieval_eval.rs`'s own
-    /// real-tier tests: `cargo test -p liam-model -- --ignored`.
-    #[tokio::test]
-    #[ignore = "downloads embedder weights; see module doc for the run command"]
-    async fn load_downloads_weights_into_the_configured_cache_dir() {
-        use crate::{Embedder, TextKind};
-
-        // Arrange: removed on drop, even on an early panic below.
-        struct CleanupOnDrop(std::path::PathBuf);
-        impl Drop for CleanupOnDrop {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let cache_dir = CleanupOnDrop(std::env::temp_dir().join(format!(
-            "liam-embedder-cache-dir-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-        )));
-        let model_id = "Qwen/Qwen3-Embedding-0.6B";
-        let native_dims = 1024;
-
-        // Act
-        let embedder = super::FastEmbedEmbedder::load(
-            model_id,
-            native_dims,
-            cache_dir.0.to_str().unwrap(),
-            DevicePreference::Cpu,
-            crate::NoticeCaller::Daemon,
-        )
-        .expect("load real embedder into a fresh cache dir");
-
-        // Assert: the fetched files landed somewhere under the fresh cache dir.
-        for file in ["config.json", "model.safetensors", "tokenizer.json"] {
-            assert!(
-                file_exists_under(&cache_dir.0, file),
-                "{file} should exist under {:?} after load",
-                cache_dir.0
-            );
-        }
-        let vector = embedder
-            .embed("hello world", TextKind::Query)
-            .await
-            .expect("embed after load");
-        assert_eq!(vector.len(), native_dims);
-    }
-
-    fn file_exists_under(dir: &std::path::Path, name: &str) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if file_exists_under(&path, name) {
-                    return true;
-                }
-            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
-                return true;
-            }
-        }
-        false
     }
 }

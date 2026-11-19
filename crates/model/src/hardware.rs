@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! What this machine and this build can compute on, for `liam devices`.
 //!
-//! Every function here only reads: it counts cores, opens a Metal device and
-//! drops it, or asks llama.cpp to list its backend devices.
+//! Every function here only reads: it counts cores or asks llama.cpp whether it
+//! found a GPU and to list its backend devices.
 
 use crate::llm::DevicePreference;
 
@@ -13,9 +13,6 @@ const PERFORMANCE_CORES_SYSCTL: &std::ffi::CStr = c"hw.perflevel0.logicalcpu";
 /// The sysctl naming the efficiency cores of an Apple Silicon chip.
 #[cfg(target_os = "macos")]
 const EFFICIENCY_CORES_SYSCTL: &std::ffi::CStr = c"hw.perflevel1.logicalcpu";
-
-/// Whether this binary was built with CUDA, which only the `cuda` feature does.
-pub const CUDA_BUILT: bool = cfg!(feature = "cuda");
 
 /// CPU core counts. The split is known on Apple Silicon only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,11 +77,11 @@ pub fn core_counts() -> CoreCounts {
     }
 }
 
-/// Whether a Metal device opens through candle.
+/// Whether llama.cpp found a Metal device it can offload to.
 pub fn metal_usable() -> bool {
     #[cfg(target_os = "macos")]
     {
-        candle_core::Device::new_metal(0).is_ok()
+        crate::llama::shared_backend().is_ok_and(|backend| backend.supports_gpu_offload())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -108,41 +105,13 @@ pub fn llama_backend_devices() -> Option<Vec<BackendDevice>> {
     )
 }
 
-/// The loaders an `embedder.device` or `llm.device` value reaches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Engine {
-    Candle,
-    LlamaEmbedder,
-    LlamaLlm,
-}
-
-impl Engine {
-    /// The config key that names this engine's device, for error messages.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Candle | Self::LlamaEmbedder => "embedder.device",
-            Self::LlamaLlm => "llm.device",
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Candle => "candle",
-            Self::LlamaEmbedder | Self::LlamaLlm => "llama.cpp",
-        }
-    }
-
-    /// Only candle has a CUDA path, behind the `cuda` feature.
-    fn has_cuda_path(self) -> bool {
-        self == Self::Candle
-    }
-}
+/// The config key that names the device, for error messages.
+const DEVICE_KEY: &str = "llm.device";
 
 /// What the machine and the build offer, behind a trait so tests can fake it.
 pub trait HardwareFacts {
     fn is_macos(&self) -> bool;
     fn metal_usable(&self) -> bool;
-    fn cuda_built(&self) -> bool;
 }
 
 /// The facts of the running machine.
@@ -154,9 +123,6 @@ impl HardwareFacts for SystemFacts {
     }
     fn metal_usable(&self) -> bool {
         metal_usable()
-    }
-    fn cuda_built(&self) -> bool {
-        CUDA_BUILT
     }
 }
 
@@ -185,30 +151,23 @@ pub struct DeviceResolution {
     pub note: Option<String>,
 }
 
-/// The one place a device setting becomes a device. The loaders call it to pick
-/// their backend and `liam devices` calls it to report, so the two cannot differ.
-/// An explicit device the engine cannot run is an error, never a quiet CPU run.
+/// The one place a device setting becomes a device. The loader calls it to pick
+/// its backend and `liam devices` calls it to report, so the two cannot differ.
+/// An explicit device llama.cpp cannot run is an error, never a quiet CPU run.
 pub fn resolve_device(
-    engine: Engine,
     preference: DevicePreference,
     facts: &dyn HardwareFacts,
 ) -> Result<DeviceResolution, String> {
-    let key = engine.key();
     let ok = |device, note| Ok(DeviceResolution { device, note });
     match preference {
         DevicePreference::Cpu => ok(ResolvedDevice::Cpu, None),
-        DevicePreference::Metal if !facts.is_macos() => {
-            Err(format!("{key} = \"metal\" is only available on macOS"))
-        }
-        DevicePreference::Metal if engine == Engine::Candle && !facts.metal_usable() => Err(
-            format!("{key} = \"metal\" found no Metal device for candle"),
-        ),
-        DevicePreference::Metal => ok(ResolvedDevice::Metal, None),
-        DevicePreference::Cuda if !(engine.has_cuda_path() && facts.cuda_built()) => Err(format!(
-            "{key} = \"cuda\" is not built into {} in this build",
-            engine.name()
+        DevicePreference::Metal if !facts.is_macos() => Err(format!(
+            "{DEVICE_KEY} = \"metal\" is only available on macOS"
         )),
-        DevicePreference::Cuda => ok(ResolvedDevice::Cuda, None),
+        DevicePreference::Metal => ok(ResolvedDevice::Metal, None),
+        DevicePreference::Cuda => Err(format!(
+            "{DEVICE_KEY} = \"cuda\" is not built into llama.cpp in this build"
+        )),
         DevicePreference::Auto if facts.is_macos() && facts.metal_usable() => {
             ok(ResolvedDevice::Metal, None)
         }
@@ -239,7 +198,6 @@ mod tests {
     struct Fake {
         macos: bool,
         metal: bool,
-        cuda: bool,
     }
 
     impl HardwareFacts for Fake {
@@ -249,104 +207,75 @@ mod tests {
         fn metal_usable(&self) -> bool {
             self.metal
         }
-        fn cuda_built(&self) -> bool {
-            self.cuda
-        }
     }
 
     const MAC: Fake = Fake {
         macos: true,
         metal: true,
-        cuda: false,
     };
     const LINUX: Fake = Fake {
         macos: false,
         metal: false,
-        cuda: false,
     };
 
-    fn device(
-        engine: Engine,
-        pref: DevicePreference,
-        facts: &Fake,
-    ) -> Result<ResolvedDevice, String> {
-        resolve_device(engine, pref, facts).map(|r| r.device)
+    fn device(pref: DevicePreference, facts: &Fake) -> Result<ResolvedDevice, String> {
+        resolve_device(pref, facts).map(|r| r.device)
     }
 
     #[test]
-    fn auto_is_metal_on_a_mac_with_metal_and_the_cpu_otherwise_for_every_engine() {
-        for engine in [Engine::Candle, Engine::LlamaEmbedder, Engine::LlamaLlm] {
-            // Act and assert
-            assert_eq!(
-                device(engine, DevicePreference::Auto, &MAC),
-                Ok(ResolvedDevice::Metal)
-            );
-            assert_eq!(
-                device(engine, DevicePreference::Auto, &LINUX),
-                Ok(ResolvedDevice::Cpu)
-            );
-            let no_metal = Fake {
-                metal: false,
-                ..MAC
-            };
-            let fallback = resolve_device(engine, DevicePreference::Auto, &no_metal).unwrap();
-            assert_eq!(fallback.device, ResolvedDevice::Cpu);
-            assert!(fallback.note.unwrap().contains("Metal"));
-        }
-    }
-
-    #[test]
-    fn metal_is_refused_off_macos_for_every_engine() {
-        for engine in [Engine::Candle, Engine::LlamaEmbedder, Engine::LlamaLlm] {
-            // Act
-            let error = device(engine, DevicePreference::Metal, &LINUX).unwrap_err();
-
-            // Assert
-            assert!(error.contains("only available on macOS"), "{error}");
-            assert!(error.contains(engine.key()), "{error}");
-        }
-    }
-
-    #[test]
-    fn cuda_is_refused_for_llama_cpp_always_and_for_candle_without_the_feature() {
-        // Arrange
-        let cuda_host = Fake {
-            cuda: true,
-            ..LINUX
-        };
-
-        // Act and assert
-        for engine in [Engine::LlamaEmbedder, Engine::LlamaLlm] {
-            let error = device(engine, DevicePreference::Cuda, &cuda_host).unwrap_err();
-            assert!(error.contains("not built into llama.cpp"), "{error}");
-        }
-        assert_eq!(
-            device(Engine::Candle, DevicePreference::Cuda, &cuda_host),
-            Ok(ResolvedDevice::Cuda)
-        );
-        assert!(device(Engine::Candle, DevicePreference::Cuda, &LINUX).is_err());
-    }
-
-    #[test]
-    fn cpu_and_candle_metal_follow_the_probe() {
+    fn auto_is_metal_on_a_mac_with_metal_and_the_cpu_otherwise() {
         // Arrange
         let no_metal = Fake {
             metal: false,
             ..MAC
         };
 
+        // Act
+        let fallback = resolve_device(DevicePreference::Auto, &no_metal).unwrap();
+
+        // Assert
+        assert_eq!(
+            device(DevicePreference::Auto, &MAC),
+            Ok(ResolvedDevice::Metal)
+        );
+        assert_eq!(
+            device(DevicePreference::Auto, &LINUX),
+            Ok(ResolvedDevice::Cpu)
+        );
+        assert_eq!(fallback.device, ResolvedDevice::Cpu);
+        assert!(fallback.note.unwrap().contains("Metal"));
+    }
+
+    #[test]
+    fn metal_is_refused_off_macos() {
+        // Act
+        let error = device(DevicePreference::Metal, &LINUX).unwrap_err();
+
+        // Assert
+        assert!(error.contains("only available on macOS"), "{error}");
+        assert!(error.contains(DEVICE_KEY), "{error}");
+    }
+
+    #[test]
+    fn cuda_is_always_refused() {
+        for facts in [&MAC, &LINUX] {
+            // Act
+            let error = device(DevicePreference::Cuda, facts).unwrap_err();
+
+            // Assert
+            assert!(error.contains("not built into llama.cpp"), "{error}");
+        }
+    }
+
+    #[test]
+    fn cpu_and_metal_on_a_mac_are_taken_as_asked() {
         // Act and assert
         assert_eq!(
-            device(Engine::LlamaLlm, DevicePreference::Cpu, &LINUX),
+            device(DevicePreference::Cpu, &LINUX),
             Ok(ResolvedDevice::Cpu)
         );
         assert_eq!(
-            device(Engine::Candle, DevicePreference::Metal, &MAC),
-            Ok(ResolvedDevice::Metal)
-        );
-        assert!(device(Engine::Candle, DevicePreference::Metal, &no_metal).is_err());
-        assert_eq!(
-            device(Engine::LlamaLlm, DevicePreference::Metal, &MAC),
+            device(DevicePreference::Metal, &MAC),
             Ok(ResolvedDevice::Metal)
         );
     }

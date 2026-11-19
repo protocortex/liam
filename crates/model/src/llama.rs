@@ -37,7 +37,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::download_notice::NoticeCaller;
 use crate::error::{ModelError, Result};
-use crate::hardware::{resolve_device, Engine, ResolvedDevice, SystemFacts};
+use crate::hardware::{resolve_device, ResolvedDevice, SystemFacts};
 use crate::llm::{strip_reasoning, CancelFlag, DevicePreference, Llm};
 
 /// Cap on generated tokens so a model with no natural stop token cannot hang a
@@ -77,8 +77,7 @@ impl LlamaCppLlm {
     /// to say so explicitly; nothing here probes for a GPU and picks CPU on
     /// its own.
     pub fn load(gguf_path: &str, context_tokens: u32, device: DevicePreference) -> Result<Self> {
-        let resolved =
-            resolve_device(Engine::LlamaLlm, device, &SystemFacts).map_err(ModelError::Llm)?;
+        let resolved = resolve_device(device, &SystemFacts).map_err(ModelError::Llm)?;
         let backend = shared_backend()?;
         // With no GPU compiled in, 1000 layers is ignored and the model
         // stays on CPU regardless; 0 is what makes an explicit CPU request
