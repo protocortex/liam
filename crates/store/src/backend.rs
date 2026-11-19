@@ -13,6 +13,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::ids::{Millis, NodeId};
+use crate::types::InferredRows;
 use crate::value::{Row, Value};
 
 /// **Concurrency contract.** Writes serialize; reads do not.
@@ -107,7 +108,7 @@ pub trait Backend: Send + Sync + Sized {
 
     /// Read. Nearest node ids to `query`, restricted to the live set at
     /// `as_of` and, when given, to `kind` and `scope`. Inferred nodes are left
-    /// out unless `include_inferred`, so a strict read never ranks them. Each
+    /// out unless `inferred` allows them, and kept alone when it is `Only`. Each
     /// backend applies the filter in its own layout. Does not serialize with
     /// writes or with other reads; see the trait's concurrency contract above.
     async fn vector_search(
@@ -117,7 +118,7 @@ pub trait Backend: Send + Sync + Sized {
         kind: Option<&str>,
         scope: Option<&str>,
         as_of: Millis,
-        include_inferred: bool,
+        inferred: InferredRows,
     ) -> Result<Vec<NodeId>>;
 
     /// Read. Ids of the live nodes (not superseded or closed) that have no

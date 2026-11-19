@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 use crate::graph::scope_within;
 use crate::ids::{Millis, NodeId, FOREVER};
 use crate::sync::lock;
-use crate::types::Derivation;
+use crate::types::{Derivation, InferredRows};
 use crate::value::{Row, Value};
 
 mod read_hooks;
@@ -666,7 +666,7 @@ impl Backend for LibsqlBackend {
         kind: Option<&str>,
         scope: Option<&str>,
         as_of: Millis,
-        include_inferred: bool,
+        inferred: InferredRows,
     ) -> Result<Vec<NodeId>> {
         let mut params = vec![
             libsql::Value::Text(vector_literal(query)),
@@ -685,8 +685,12 @@ impl Backend for LibsqlBackend {
             params.push(libsql::Value::Text(scope.to_string()));
             next += 1;
         }
-        if !include_inferred {
-            filters.push_str(&format!(" AND n.derivation != ?{next}"));
+        if let Some(comparison) = match inferred {
+            InferredRows::Include => None,
+            InferredRows::Exclude => Some("!="),
+            InferredRows::Only => Some("="),
+        } {
+            filters.push_str(&format!(" AND n.derivation {comparison} ?{next}"));
             params.push(libsql::Value::Text(
                 Derivation::Inferred.as_str().to_string(),
             ));

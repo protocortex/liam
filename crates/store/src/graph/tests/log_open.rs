@@ -483,10 +483,10 @@ impl Backend for Probed {
         kind: Option<&str>,
         scope: Option<&str>,
         as_of: Millis,
-        include_inferred: bool,
+        inferred: InferredRows,
     ) -> Result<Vec<NodeId>> {
         self.inner
-            .vector_search(query, k, kind, scope, as_of, include_inferred)
+            .vector_search(query, k, kind, scope, as_of, inferred)
             .await
     }
     async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>> {

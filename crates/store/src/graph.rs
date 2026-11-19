@@ -45,8 +45,8 @@ use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
 use crate::schema::schema;
 use crate::types::{
     Basis, Change, ClusterMember, ClusterState, Derivation, EpisodeEdge, EpisodeRef, EpisodeResult,
-    ExplainedHit, Fingerprint, GraphConfig, Hit, InferredHit, InferredText, NewEdge, NewNode,
-    Query, RecordedHit, RecordedText, Retrieved,
+    ExplainedHit, Fingerprint, GraphConfig, Hit, InferredHit, InferredRows, InferredText, NewEdge,
+    NewNode, Query, RecordedHit, RecordedText, Retrieved,
 };
 use crate::value::{Row, Value};
 
@@ -330,7 +330,7 @@ fn by_subject_query(
     // deterministically (tie-break by id) rather than an arbitrary row.
     let sql = format!(
         "SELECT id, tx_from FROM nodes WHERE subject = ?1 AND {liveness}{filters}
-         ORDER BY tx_from DESC, id DESC LIMIT 1",
+         ORDER BY tx_from DESC, id DESC",
     );
     (sql, params)
 }
@@ -1110,7 +1110,7 @@ impl<B: Backend> Graph<B> {
                 let filter = Filter {
                     kind,
                     scope,
-                    include_inferred: q.include_inferred,
+                    inferred: q.inferred,
                 };
                 self.lexical(text, filter, now, pool).await?
             }
@@ -1121,7 +1121,7 @@ impl<B: Backend> Graph<B> {
         let vector = match q.embedding.as_deref() {
             Some(embedding) => {
                 self.backend
-                    .vector_search(embedding, pool, kind, scope, now, q.include_inferred)
+                    .vector_search(embedding, pool, kind, scope, now, q.inferred)
                     .await?
             }
             None => Vec::new(),
@@ -1136,7 +1136,7 @@ impl<B: Backend> Graph<B> {
                     kind,
                     scope,
                     as_of: now,
-                    include_inferred: q.include_inferred,
+                    inferred: q.inferred,
                 };
                 self.cold_probe(embedding, arm).await?
             }
@@ -1162,15 +1162,12 @@ impl<B: Backend> Graph<B> {
             .map(|id| NodeId::from_raw(id.clone()))
             .collect();
         for seed_id in &seed_ids {
-            for n in self
-                .neighbors_where(seed_id, now, q.include_inferred)
-                .await?
-            {
+            for n in self.neighbors_where(seed_id, now, q.inferred).await? {
                 expanded.insert(n.as_str().to_string());
             }
         }
         let same_as_ids: HashSet<String> = self
-            .same_as_closure(&seed_ids, now, q.include_inferred)
+            .same_as_closure(&seed_ids, now, q.inferred)
             .await?
             .into_iter()
             .map(|n| n.as_str().to_string())
@@ -1205,8 +1202,10 @@ impl<B: Backend> Graph<B> {
         }
         // Backstop for the filters above: an inferred row must not take a ranked
         // slot, so it goes before the cut to `k`.
-        if !q.include_inferred {
-            rows.retain(|c| !c.retrieved.is_inferred());
+        match q.inferred {
+            InferredRows::Exclude => rows.retain(|c| !c.retrieved.is_inferred()),
+            InferredRows::Only => rows.retain(|c| c.retrieved.is_inferred()),
+            InferredRows::Include => {}
         }
 
         let out = score_and_rank(
@@ -1223,20 +1222,18 @@ impl<B: Backend> Graph<B> {
     }
 
     pub async fn neighbors(&self, seed: &NodeId, as_of: Millis) -> Result<Vec<NodeId>> {
-        self.neighbors_where(seed, as_of, true).await
+        self.neighbors_where(seed, as_of, InferredRows::Include)
+            .await
     }
 
-    /// `neighbors`, leaving out inferred nodes unless `include_inferred`.
+    /// `neighbors`, stepping only onto the derivations `inferred` allows.
     async fn neighbors_where(
         &self,
         seed: &NodeId,
         as_of: Millis,
-        include_inferred: bool,
+        inferred: InferredRows,
     ) -> Result<Vec<NodeId>> {
-        let (dst_ok, src_ok) = (
-            not_inferred("dst", include_inferred),
-            not_inferred("src", include_inferred),
-        );
+        let (dst_ok, src_ok) = (not_inferred("dst", inferred), not_inferred("src", inferred));
         let rows = self
             .backend
             .query(
@@ -1257,17 +1254,14 @@ impl<B: Backend> Graph<B> {
     /// seeds at once still pays for at most a handful of round trips rather
     /// than one per seed.
     ///
-    /// Does not step onto an inferred node unless `include_inferred`.
+    /// Steps only onto the derivations `inferred` allows.
     pub(crate) async fn same_as_closure(
         &self,
         seeds: &[NodeId],
         as_of: Millis,
-        include_inferred: bool,
+        inferred: InferredRows,
     ) -> Result<HashSet<NodeId>> {
-        let (dst_ok, src_ok) = (
-            not_inferred("dst", include_inferred),
-            not_inferred("src", include_inferred),
-        );
+        let (dst_ok, src_ok) = (not_inferred("dst", inferred), not_inferred("src", inferred));
         let mut visited: HashSet<NodeId> = seeds.iter().cloned().collect();
         let mut frontier: Vec<NodeId> = seeds.to_vec();
         while !frontier.is_empty() {
@@ -1306,7 +1300,7 @@ impl<B: Backend> Graph<B> {
         let Filter {
             kind,
             scope,
-            include_inferred,
+            inferred,
         } = filter;
         // FTS5 parses the MATCH value as its own query expression, so a raw
         // question (`?`, apostrophes, bare operators) is a syntax error that
@@ -1329,7 +1323,7 @@ impl<B: Backend> Graph<B> {
             filters.push_str(&format!(" AND {}", scope_within("n.scope", next)));
             params.push(scope.into());
         }
-        filters.push_str(&row_not_inferred("n", include_inferred));
+        filters.push_str(&row_derivation("n", inferred));
         let sql = format!(
             "SELECT n.id FROM nodes_fts
              JOIN nodes n ON n.rowid = nodes_fts.rowid
@@ -1760,6 +1754,45 @@ impl<B: Backend> Graph<B> {
             .take(limit)
             .map(|c| (c.id, c.subject, c.scope))
             .collect())
+    }
+
+    /// The live entity pages whose attributes lack the key `marker`, one per
+    /// `(subject, scope)` and the newest of its rows, oldest first, up to
+    /// `limit`. A page with no text is not listed: it was never written.
+    pub async fn pages_without_marker(
+        &self,
+        marker: &str,
+        limit: usize,
+        as_of: Millis,
+    ) -> Result<Vec<(NodeId, String, Option<String>)>> {
+        let sql = format!(
+            "SELECT n.id, n.subject, n.scope FROM nodes n
+             WHERE n.derivation = '{inferred}' AND n.subject IS NOT NULL AND n.content != ''
+               AND json_type(n.attributes, ?2) IS NULL AND {live}
+               AND n.id = (SELECT m.id FROM nodes m
+                           WHERE m.subject = n.subject AND m.scope IS n.scope
+                             AND m.derivation = '{inferred}' AND {live_m}
+                           ORDER BY m.tx_from DESC, m.id DESC LIMIT 1)
+             ORDER BY n.rowid LIMIT ?3",
+            inferred = Derivation::Inferred.as_str(),
+            live = live_at("n", 1),
+            live_m = live_at("m", 1),
+        );
+        let path = format!("$.{marker}");
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self
+            .backend
+            .query(&sql, &[as_of.into(), path.into(), limit.into()])
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    NodeId::from_raw(row.get_string(0)?),
+                    row.get_string(1)?,
+                    opt_string(row, 2)?,
+                ))
+            })
+            .collect()
     }
 
     /// Reattach mentions still pointing at a superseded node, and the
@@ -2242,7 +2275,7 @@ impl<B: Backend> Graph<B> {
               WHERE {live}{strict}
               ORDER BY nc.community, n.id",
             live = live_at("n", 1),
-            strict = row_not_inferred("n", include_inferred),
+            strict = row_derivation("n", include_inferred.into()),
         );
         let rows = self.backend.query(&sql, &[now.into()]).await?;
 
@@ -2283,29 +2316,33 @@ impl<B: Backend> Graph<B> {
 struct Filter<'a> {
     kind: Option<&'a str>,
     scope: Option<&'a str>,
-    include_inferred: bool,
+    inferred: InferredRows,
 }
 
-/// A predicate that leaves out an inferred node named by `column`, an edge end,
-/// or nothing when inferred nodes are wanted. The derivation is a store
-/// constant, so it is written into the statement rather than bound.
-fn not_inferred(column: &str, include_inferred: bool) -> String {
-    if include_inferred {
-        return String::new();
-    }
+/// A predicate on the derivation of the node named by `column`, an edge end:
+/// none when `inferred` allows both kinds. The derivation is a store constant,
+/// so it is written into the statement rather than bound.
+fn not_inferred(column: &str, inferred: InferredRows) -> String {
+    let membership = match inferred {
+        InferredRows::Include => return String::new(),
+        InferredRows::Exclude => "NOT IN",
+        InferredRows::Only => "IN",
+    };
     format!(
-        " AND {column} NOT IN (SELECT id FROM nodes WHERE derivation = '{}')",
+        " AND {column} {membership} (SELECT id FROM nodes WHERE derivation = '{}')",
         Derivation::Inferred.as_str()
     )
 }
 
 /// `not_inferred` for a query that already reads the `nodes` row as `alias`.
-fn row_not_inferred(alias: &str, include_inferred: bool) -> String {
-    if include_inferred {
-        return String::new();
-    }
+fn row_derivation(alias: &str, inferred: InferredRows) -> String {
+    let comparison = match inferred {
+        InferredRows::Include => return String::new(),
+        InferredRows::Exclude => "!=",
+        InferredRows::Only => "=",
+    };
     format!(
-        " AND {alias}.derivation != '{}'",
+        " AND {alias}.derivation {comparison} '{}'",
         Derivation::Inferred.as_str()
     )
 }

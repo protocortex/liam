@@ -201,3 +201,67 @@ async fn cluster_groups_leave_out_a_page_when_strict_and_keep_the_stored_assignm
     assert!(strict.iter().flatten().all(|m| m.id != page));
     assert_eq!(g.communities().await.unwrap(), before);
 }
+
+#[tokio::test]
+async fn an_inferred_only_query_ranks_pages_by_text_and_by_vector_and_never_a_fact() {
+    // Arrange: a fact and a page that both match, each with a vector
+    let g = open().await;
+    let axis = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    g.insert(fact("zorbnax met the team").with_embedding(axis.clone()))
+        .await
+        .unwrap();
+    g.insert(page("Zorbnax", "zorbnax profile").with_embedding(axis.clone()))
+        .await
+        .unwrap();
+    let query = Query::text("zorbnax").with_embedding(axis);
+
+    // Act
+    let only_pages = g
+        .query_explained(&query.clone().inferred_only())
+        .await
+        .unwrap();
+    let both = g.query_explained(&query.with_inferred(true)).await.unwrap();
+
+    // Assert
+    assert_eq!(texts(&only_pages), ["zorbnax profile"]);
+    assert_eq!(both.len(), 2);
+}
+
+#[tokio::test]
+async fn an_inferred_only_query_does_not_pull_in_the_facts_a_page_mentions() {
+    // Arrange: a page that mentions a fact the query's words do not match
+    let g = open().await;
+    let note = g.insert(fact("tea in the morning")).await.unwrap();
+    let page = g.insert(page("Zorbnax", "zorbnax profile")).await.unwrap();
+    g.relate(&page, &note, MENTIONS).await.unwrap();
+    let query = Query::text("zorbnax");
+
+    // Act
+    let only_pages = g
+        .query_explained(&query.clone().inferred_only())
+        .await
+        .unwrap();
+    let both = g.query_explained(&query.with_inferred(true)).await.unwrap();
+
+    // Assert
+    assert_eq!(texts(&only_pages), ["zorbnax profile"]);
+    assert_eq!(texts(&both), ["tea in the morning", "zorbnax profile"]);
+}
+
+#[tokio::test]
+async fn a_strict_query_does_not_pull_in_a_page_that_mentions_a_matched_fact() {
+    // Arrange: a page that mentions the fact the query matches
+    let g = open().await;
+    let matched = g.insert(fact("zorbnax likes tea")).await.unwrap();
+    let page = g.insert(page("Kim", "kim profile")).await.unwrap();
+    g.relate(&page, &matched, MENTIONS).await.unwrap();
+    let query = Query::text("zorbnax");
+
+    // Act
+    let strict = g.query_explained(&query).await.unwrap();
+    let inferring = g.query_explained(&query.with_inferred(true)).await.unwrap();
+
+    // Assert
+    assert_eq!(texts(&strict), ["zorbnax likes tea"]);
+    assert_eq!(texts(&inferring), ["kim profile", "zorbnax likes tea"]);
+}

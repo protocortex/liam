@@ -480,7 +480,7 @@ async fn vectors_are_written_after_commit_for_every_embedded_node() {
     // Assert
     let hits1 = g
         .backend
-        .vector_search(&e1, 5, None, None, Millis(1000), true)
+        .vector_search(&e1, 5, None, None, Millis(1000), InferredRows::Include)
         .await
         .unwrap();
     assert!(
@@ -489,7 +489,7 @@ async fn vectors_are_written_after_commit_for_every_embedded_node() {
     );
     let hits2 = g
         .backend
-        .vector_search(&e2, 5, None, None, Millis(1000), true)
+        .vector_search(&e2, 5, None, None, Millis(1000), InferredRows::Include)
         .await
         .unwrap();
     assert!(
@@ -538,7 +538,7 @@ async fn a_vector_upsert_failure_does_not_fail_the_call_or_orphan_later_vectors(
     // past node 1's failure instead of aborting.
     let hits2 = g
         .backend
-        .vector_search(&e2, 5, None, None, Millis(1000), true)
+        .vector_search(&e2, 5, None, None, Millis(1000), InferredRows::Include)
         .await
         .unwrap();
     assert!(
@@ -547,7 +547,7 @@ async fn a_vector_upsert_failure_does_not_fail_the_call_or_orphan_later_vectors(
     );
     let hits3 = g
         .backend
-        .vector_search(&e3, 5, None, None, Millis(1000), true)
+        .vector_search(&e3, 5, None, None, Millis(1000), InferredRows::Include)
         .await
         .unwrap();
     assert!(
@@ -628,7 +628,14 @@ async fn vector_search_scope_filter_includes_descendant_scopes() {
     // Act: search with the ancestor scope.
     let hits = g
         .backend
-        .vector_search(&e, 10, None, Some("work"), Millis(1000), true)
+        .vector_search(
+            &e,
+            10,
+            None,
+            Some("work"),
+            Millis(1000),
+            InferredRows::Include,
+        )
         .await
         .unwrap();
 

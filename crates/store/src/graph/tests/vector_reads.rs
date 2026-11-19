@@ -140,12 +140,12 @@ async fn a_vector_search_leaves_inferred_nodes_out_unless_asked() {
     // Act
     let strict = g
         .backend
-        .vector_search(&query, 5, None, None, AS_OF, false)
+        .vector_search(&query, 5, None, None, AS_OF, InferredRows::Exclude)
         .await
         .unwrap();
     let all = g
         .backend
-        .vector_search(&query, 5, None, None, AS_OF, true)
+        .vector_search(&query, 5, None, None, AS_OF, InferredRows::Include)
         .await
         .unwrap();
 
@@ -215,17 +215,24 @@ async fn a_scoped_vector_search_still_leaves_inferred_nodes_out() {
     // Act
     let strict = g
         .backend
-        .vector_search(&query, 5, None, Some("work"), AS_OF, false)
+        .vector_search(&query, 5, None, Some("work"), AS_OF, InferredRows::Exclude)
         .await
         .unwrap();
     let strict_kind = g
         .backend
-        .vector_search(&query, 5, Some("fact"), Some("work"), AS_OF, false)
+        .vector_search(
+            &query,
+            5,
+            Some("fact"),
+            Some("work"),
+            AS_OF,
+            InferredRows::Exclude,
+        )
         .await
         .unwrap();
     let all = g
         .backend
-        .vector_search(&query, 5, None, Some("work"), AS_OF, true)
+        .vector_search(&query, 5, None, Some("work"), AS_OF, InferredRows::Include)
         .await
         .unwrap();
 

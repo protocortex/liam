@@ -262,10 +262,14 @@ async fn same_as_edge_to_superseded_node_is_dropped_gracefully() {
     // traversed, so the assertions below prove it gets filtered as dead
     // data, not that it was simply never reached.
     assert!(
-        g.same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
-            .await
-            .unwrap()
-            .contains(&b),
+        g.same_as_closure(
+            std::slice::from_ref(&a),
+            Millis(1000),
+            InferredRows::Include
+        )
+        .await
+        .unwrap()
+        .contains(&b),
         "premise: the same_as edge to the superseded node must still be live"
     );
 
@@ -520,7 +524,11 @@ async fn same_as_closure_with_no_edges_returns_only_the_seed() {
 
     // Act
     let closure = g
-        .same_as_closure(std::slice::from_ref(&seed), Millis(1000), true)
+        .same_as_closure(
+            std::slice::from_ref(&seed),
+            Millis(1000),
+            InferredRows::Include,
+        )
         .await
         .unwrap();
 
@@ -538,11 +546,19 @@ async fn same_as_closure_traverses_both_directions_of_one_edge() {
 
     // Act
     let from_a = g
-        .same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
+        .same_as_closure(
+            std::slice::from_ref(&a),
+            Millis(1000),
+            InferredRows::Include,
+        )
         .await
         .unwrap();
     let from_b = g
-        .same_as_closure(std::slice::from_ref(&b), Millis(1000), true)
+        .same_as_closure(
+            std::slice::from_ref(&b),
+            Millis(1000),
+            InferredRows::Include,
+        )
         .await
         .unwrap();
 
@@ -566,7 +582,11 @@ async fn same_as_closure_traverses_full_chain() {
 
     // Act
     let closure = g
-        .same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
+        .same_as_closure(
+            std::slice::from_ref(&a),
+            Millis(1000),
+            InferredRows::Include,
+        )
         .await
         .unwrap();
 
@@ -588,7 +608,11 @@ fn same_as_closure_terminates_on_cycle() {
         g.relate(&a, &b, relation::SAME_AS).await.unwrap();
         g.relate(&b, &a, relation::SAME_AS).await.unwrap();
         let closure = g
-            .same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
+            .same_as_closure(
+                std::slice::from_ref(&a),
+                Millis(1000),
+                InferredRows::Include,
+            )
             .await
             .unwrap();
         (closure, a, b)
@@ -617,7 +641,11 @@ fn same_as_closure_terminates_on_three_node_cycle() {
         g.relate(&b, &c, relation::SAME_AS).await.unwrap();
         g.relate(&c, &a, relation::SAME_AS).await.unwrap();
         let closure = g
-            .same_as_closure(std::slice::from_ref(&a), Millis(1000), true)
+            .same_as_closure(
+                std::slice::from_ref(&a),
+                Millis(1000),
+                InferredRows::Include,
+            )
             .await
             .unwrap();
         (closure, a, b, c)
@@ -644,7 +672,11 @@ async fn same_as_closure_respects_as_of() {
 
     // Act: as_of a time before the edge existed.
     let closure = g
-        .same_as_closure(std::slice::from_ref(&seed), Millis(1500), true)
+        .same_as_closure(
+            std::slice::from_ref(&seed),
+            Millis(1500),
+            InferredRows::Include,
+        )
         .await
         .unwrap();
 

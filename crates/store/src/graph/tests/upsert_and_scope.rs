@@ -869,3 +869,133 @@ async fn a_fact_sharing_the_subject_of_an_entity_page_is_not_taken_for_it() {
     assert_ne!(page, fact);
     assert!(g.exists_as_of(&fact, Millis(1000)).await.unwrap());
 }
+
+/// A page as an older store wrote it: text in `content`, and no attribute that
+/// says which builder wrote it.
+fn written_page(name: &str, text: &str) -> NewNode {
+    let mut page = NewNode::entity("person", name);
+    page.content = text.to_string();
+    page
+}
+
+async fn live_pages_named(g: &DefaultGraph, name: &str, at: Millis) -> Vec<NodeId> {
+    g.query_explained(
+        &Query::text(name)
+            .with_inferred(true)
+            .with_k(10)
+            .with_as_of(at),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .filter(|hit| hit.hit.label == name)
+    .map(|hit| hit.hit.id)
+    .collect()
+}
+
+#[tokio::test]
+async fn rewriting_a_page_closes_every_live_row_of_the_entity() {
+    // Arrange: three live pages for one entity, as an older store could leave
+    let clock = Arc::new(FixedClock::new(Millis(1000)));
+    let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+        .await
+        .unwrap();
+    for (at, text) in [
+        (1000, "Kim likes tea."),
+        (2000, "Kim likes jam."),
+        (3000, "Kim likes figs."),
+    ] {
+        clock.set(Millis(at));
+        g.insert(written_page("Kim", text)).await.unwrap();
+    }
+    assert_eq!(live_pages_named(&g, "Kim", Millis(3000)).await.len(), 3);
+
+    // Act
+    clock.set(Millis(4000));
+    let rewritten = g
+        .upsert_by(written_page("Kim", "Kim likes plums."))
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(live_pages_named(&g, "Kim", Millis(4000)).await, [rewritten]);
+}
+
+#[tokio::test]
+async fn rewriting_a_fact_still_closes_only_the_newest_row_of_its_key() {
+    // Arrange: two live facts under one key, which `insert` does not prevent
+    let clock = Arc::new(FixedClock::new(Millis(1000)));
+    let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+        .await
+        .unwrap();
+    let older = g
+        .insert(NewNode::now("fact", "a", "price 10").with_subject("price"))
+        .await
+        .unwrap();
+    clock.set(Millis(2000));
+    g.insert(NewNode::now("fact", "b", "price 20").with_subject("price"))
+        .await
+        .unwrap();
+
+    // Act
+    clock.set(Millis(3000));
+    g.upsert_by(NewNode::now("fact", "c", "price 30").with_subject("price"))
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(g.exists_as_of(&older, Millis(3000)).await.unwrap());
+}
+
+#[tokio::test]
+async fn pages_without_the_marker_lists_the_newest_written_page_of_each_entity_once() {
+    // Arrange: a stamped page, two unstamped rows of one entity, a page with no
+    // text, and an unstamped page in a scope
+    let clock = Arc::new(FixedClock::new(Millis(1000)));
+    let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+        .await
+        .unwrap();
+    g.insert(
+        written_page("Stamped", "Stamped likes tea.")
+            .with_attributes(serde_json::json!({"mark": true})),
+    )
+    .await
+    .unwrap();
+    g.insert(written_page("Kim", "older")).await.unwrap();
+    clock.set(Millis(2000));
+    let newest = g.insert(written_page("Kim", "newer")).await.unwrap();
+    g.insert(NewNode::entity("person", "Blank")).await.unwrap();
+    let scoped = g
+        .insert(written_page("Kim", "scoped").with_scope("work"))
+        .await
+        .unwrap();
+
+    // Act
+    let listed = g
+        .pages_without_marker("mark", 10, Millis(2000))
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(listed.contains(&(newest, "kim".to_string(), None)));
+    assert!(listed.contains(&(scoped, "kim".to_string(), Some("work".to_string()))));
+}
+
+#[tokio::test]
+async fn pages_without_the_marker_respects_the_limit() {
+    // Arrange
+    let g = graph_at(Millis(1000)).await;
+    for name in ["A", "B", "C"] {
+        g.insert(written_page(name, "text")).await.unwrap();
+    }
+
+    // Act
+    let listed = g
+        .pages_without_marker("mark", 2, Millis(1000))
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(listed.len(), 2);
+}
