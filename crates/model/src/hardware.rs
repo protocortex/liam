@@ -130,7 +130,6 @@ impl HardwareFacts for SystemFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedDevice {
     Metal,
-    Cuda,
     Cpu,
 }
 
@@ -138,7 +137,6 @@ impl ResolvedDevice {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Metal => "metal",
-            Self::Cuda => "cuda",
             Self::Cpu => "cpu",
         }
     }
@@ -182,6 +180,26 @@ pub fn resolve_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_on_this_machine_picks_cpu_unless_metal_is_usable() {
+        // Arrange
+        let metal = metal_usable();
+
+        // Act
+        let resolved = resolve_device(DevicePreference::Auto, &SystemFacts).unwrap();
+
+        // Assert
+        let expected = if cfg!(target_os = "macos") && metal {
+            ResolvedDevice::Metal
+        } else {
+            ResolvedDevice::Cpu
+        };
+        assert_eq!(resolved.device, expected);
+        if !cfg!(target_os = "macos") {
+            assert!(!metal);
+        }
+    }
 
     #[test]
     fn core_counts_report_at_least_one_logical_core() {
