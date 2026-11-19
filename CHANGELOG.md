@@ -41,6 +41,13 @@ All notable changes to LIAM are recorded here. The format follows
     tokens. A very large listing can show a different number of clusters, and still never fewer than one.
   - Consolidation runs no longer record an LLM identity, so a run is no longer refused for a changed generation
     model. A saved run that still holds the old field loads.
+  - The permit that sidecar extraction, tiering and summary calls share is now fixed at 1 (`MODEL_CALL_PERMITS`).
+    The old default autotuned and could grow, so this is a lower ceiling on a machine that had tuned up: those
+    calls take turns.
+  - A daemon older than this version cannot resume an extraction or consolidation run saved by this version,
+    because the manifest lost `llm_model_fingerprint`. Old manifests still load.
+  - Summaries the local model already wrote stay stored and the `summaries` tool still returns them. No new ones
+    are written unless a hosted provider is configured.
   - The extraction sidecar is unchanged: it runs its own `llama-server` and model, and is off by default.
   See [ADR 0019](docs/adr/0019-remove-the-local-generation-model.md).
 - Entity pages are built from the stored sentences of an entity without a model, and `timeline` shows them as

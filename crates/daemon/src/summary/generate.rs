@@ -331,7 +331,7 @@ enum Unanswered {
 
 impl Generator<'_> {
     /// Writes the summary for the child set `child_hash` from `items`, using
-    /// one generation permit for the model call and none after it.
+    /// one model-call permit for the model call and none after it.
     pub async fn generate(
         &self,
         child_hash: &str,

@@ -88,6 +88,16 @@ does not use `llama-cpp-2`.
   through ONNX Runtime and has no device to choose.
 - **Local summaries are gone.** A user who wanted them needs a hosted provider
   and `[hosted]`, and turns `metrics.enabled` on.
+- **One model call at a time.** The permit that sidecar extraction, tiering and
+  summary calls share is now fixed at 1 (`MODEL_CALL_PERMITS`). The old default
+  autotuned and could grow, so this is a lower ceiling on a machine that had
+  tuned up: those calls take turns.
+- **Stored summaries stay.** Summaries the local model already wrote remain
+  stored and the `summaries` tool still returns them. No new ones are written
+  unless a hosted provider is configured.
+- **Older daemons cannot resume newer runs.** The run manifest lost
+  `llm_model_fingerprint`, so a daemon older than this version cannot resume an
+  extraction or consolidation run saved by this version. Old manifests still load.
 - **`liam devices` is gone.** Nothing chooses a device any more.
 - **Old files stay on disk.** `~/.liam/models` may hold the old GGUF. LIAM no
   longer reads it, and the user may delete it.

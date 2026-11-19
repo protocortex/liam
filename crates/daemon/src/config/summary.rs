@@ -94,6 +94,7 @@ impl Default for SummaryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            // `local` is the unset value: no hosted provider, so summaries stay off.
             provider: Provider::Local,
             local_provider_removed: false,
             knn: DEFAULT_KNN,

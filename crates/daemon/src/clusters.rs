@@ -4,10 +4,17 @@
 
 use liam_store::ClusterMember;
 
-/// The most characters a `clusters` listing may hold. It is a tenth of an
-/// 8,192-token context at four characters a token, the share of a window a
-/// listing tool is allowed to take.
-pub const CLUSTERS_BUDGET_CHARS: usize = 3_276;
+const REFERENCE_CONTEXT_TOKENS: usize = 8_192;
+/// A listing may take one tenth of the context window.
+const LISTING_SHARE_DIVISOR: usize = 10;
+const CHARS_PER_TOKEN: usize = 4;
+
+/// The most characters a `clusters` listing may hold: a tenth of an 8,192-token
+/// context at four characters a token, which is 3,276. Portuguese and Spanish
+/// carry fewer characters per token than English, so the same character cap is
+/// looser for them than the old token cap was.
+pub const CLUSTERS_BUDGET_CHARS: usize =
+    REFERENCE_CONTEXT_TOKENS / LISTING_SHARE_DIVISOR * CHARS_PER_TOKEN;
 
 /// Resolve a caller's `k`/`members` argument: absent means "no narrowing",
 /// `0` is clamped to `1` (an explicit "show nothing" request is not
@@ -18,7 +25,7 @@ fn clamp_narrow(n: Option<usize>) -> Option<usize> {
 }
 
 /// Apply the caller's `k` (cluster count) and `members` (per-cluster member
-/// count) requests. Both only narrow: the token budget in `render_clusters`
+/// count) requests. Both only narrow: the character budget in `render_clusters`
 /// is the one thing allowed to shrink the result further, and neither
 /// argument can grow it past what `groups` already holds.
 pub fn narrow_groups(
@@ -133,8 +140,33 @@ mod tests {
     }
 
     #[test]
+    fn the_budget_counts_characters_not_bytes() {
+        // Arrange: accented Portuguese labels, two bytes for most vowels, so a
+        // byte count would cut earlier than a character count.
+        let label = "ação rápida pública ".repeat(5);
+        let groups: Vec<Vec<ClusterMember>> = (0..3)
+            .map(|n| {
+                vec![member(
+                    &format!("01ABCDEFGHJKMNPQRST000{n}A"),
+                    "fact",
+                    &label,
+                )]
+            })
+            .collect();
+        let all = render_clusters(&groups, usize::MAX);
+        assert!(all.len() > chars(&all), "the fixture must be multibyte");
+        let budget = chars(&all);
+
+        // Act
+        let out = render_clusters(&groups, budget);
+
+        // Assert: it fits by characters even though it exceeds that in bytes.
+        assert_eq!(out, all);
+    }
+
+    #[test]
     fn a_budget_too_small_for_even_one_cluster_still_shows_that_one() {
-        // Arrange: a single oversized cluster, budget of 1 token.
+        // Arrange: a single oversized cluster, budget of 1 character.
         let groups = vec![vec![member("01ABCDEFGHJKMNPQRST0000A", "fact", "solo")]];
 
         // Act
