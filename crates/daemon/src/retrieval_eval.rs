@@ -16,20 +16,15 @@
 //!   `#[tokio::test]`, so it runs under plain `cargo test -p liam-daemon` and
 //!   the existing CI `test` job, with no model download.
 //! - **Real-embedder, `#[ignore]`d:** `run_retrieval_eval` loads the actual
-//!   local embedder
-//!   and scores `VectorSemantic` too. `evaluate_embedder` is the same run
+//!   local embedder and scores `VectorSemantic` too. `evaluate_embedder` is the same run
 //!   over any `Embedder`, which the mock-embedder test uses. Downloads model
 //!   weights on first run and is slow, like `eval.rs`'s own gated tier, so
 //!   its test is `#[ignore]`d rather than part of plain
 //!   `cargo test -p liam-daemon`:
 //!
 //!   ```text
-//!   cargo test -p liam-daemon -- --ignored --nocapture retrieval
+//!   cargo test --release -p liam-daemon --lib -- --ignored --nocapture real_embedder_run
 //!   ```
-//!
-//!   Env override: `LIAM_RETRIEVAL_EVAL_MODEL`, mirroring `eval.rs`'s
-//!   `LIAM_EVAL_MODEL` for local A/B runs against a different embedding
-//!   model.
 //!
 //! # Metrics
 //!
@@ -102,37 +97,14 @@
 //! `Confidence` also equals the 40-question value, and `Confidence` rose from
 //! 0.8 to 0.9 as the set grew. A drop in any category fails the build.
 //!
-//! # Real-embedder baseline (2026-08-30, 40-question set, Apple M1 Pro,
-//! # macOS 15.7.5, Qwen/Qwen3-Embedding-0.6B, 768 dims, `cargo test --release
-//! # ... --ignored --nocapture retrieval`)
+//! # Real-embedder tier
 //!
-//! This table predates the 80-question golden set and is NOT recomputed: it
-//! needs a model download and a manual run. Treat it as historical until the
-//! next real-embedder run replaces it.
-//!
-//! | category       | n | precision@4 | precision@8 | recall@4 | recall@8 | recall@10 | nDCG@10 | MRR   |
-//! |----------------|---|-------------|-------------|----------|----------|-----------|---------|-------|
-//! | Lexical        | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
-//! | VectorSemantic | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
-//! | GraphExpansion | 5 | 0.450       | 0.225       | 0.900    | 0.900    | -         | -       | 1.000 |
-//! | KindFilter     | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
-//! | ScopeFilter    | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
-//! | Decay          | 5 | 0.100       | 0.125       | 0.400    | 1.000    | -         | -       | 0.302 |
-//! | Confidence     | 5 | 0.050       | 0.050       | 0.200    | 0.400    | -         | -       | 0.150 |
-//! | AsOf           | 5 | 0.250       | 0.125       | 1.000    | 1.000    | -         | -       | 1.000 |
-//!
-//! The recall@10 and nDCG@10 columns were added after this baseline was
-//! taken, so they read `-` until the next real-embedder run fills them in.
-//!
-//! `VectorSemantic` (the category this tier adds over the text-only one)
-//! lands at a perfect 1.000 recall/MRR on this small, single-narrative
-//! corpus: every paraphrase question's expected fact is the sole real
-//! semantic match in the corpus for that paraphrase, so once the real
-//! embedder is in the loop there is no other candidate for it to lose rank
-//! to. `Confidence` is the harness's weakest category here, which is a
-//! property of the small fixed corpus and `HARNESS_K` (every fact is
-//! observable, so a competing lower-confidence version of the same subject
-//! can outrank the expected one), not a regression to chase.
+//! The real-embedder tier has no recorded baseline: it needs the model
+//! download and a manual run, which prints the per-category table. The
+//! `Confidence` category is the harness's weakest, a property of the small
+//! fixed corpus and `HARNESS_K` (every fact is observable, so a competing
+//! lower-confidence version of the same subject can outrank the expected one),
+//! not a regression to chase.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -738,114 +710,26 @@ impl EvalReport {
 /// initialisation does not inflate the first timed call.
 const WARM_UP_TEXT: &str = "warm-up";
 
-/// The embedding models the harness can load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvalModel {
-    Qwen3,
-    BgeM3,
-    Onnx(&'static liam_model::OnnxModelSpec),
-    /// A GGUF model that runs on llama.cpp.
-    Gguf(&'static liam_model::GgufEmbedderSpec),
-}
-
-impl EvalModel {
-    /// Every model, the two dedicated loaders first, then the ONNX table.
-    pub fn all() -> impl Iterator<Item = EvalModel> {
-        [EvalModel::Qwen3, EvalModel::BgeM3]
-            .into_iter()
-            .chain(liam_model::ONNX_MODELS.iter().map(EvalModel::Onnx))
-            .chain(liam_model::GGUF_EMBEDDERS.iter().map(EvalModel::Gguf))
-    }
-
-    /// The Hugging Face id the model loads under.
-    pub fn id(self) -> &'static str {
-        match self {
-            EvalModel::Qwen3 => liam_model::QWEN3_EMBEDDING_MODEL_ID,
-            EvalModel::BgeM3 => liam_model::BGE_M3_MODEL_ID,
-            EvalModel::Onnx(spec) => spec.id,
-            EvalModel::Gguf(spec) => spec.id,
-        }
-    }
-
-    /// The embedding width to run at. Qwen3 and Matryoshka ONNX models run at
-    /// the configured one (truncation); every other model has one fixed width.
-    pub fn dims(self, configured: usize) -> usize {
-        match self {
-            EvalModel::Qwen3 | EvalModel::Gguf(_) => configured,
-            EvalModel::BgeM3 => liam_model::BGE_M3_DIMS,
-            EvalModel::Onnx(spec) if spec.matryoshka => configured,
-            EvalModel::Onnx(spec) => spec.native_dims,
-        }
-    }
-
-    /// The width to run at when the caller asked for `requested`, or the
-    /// `configured` one when it did not. Refuses a request a fixed width model
-    /// would silently ignore.
-    ///
-    /// # Errors
-    ///
-    /// Fails when `requested` differs from the width the model is fixed at.
-    pub fn resolve_dims(
-        self,
-        configured: usize,
-        requested: Option<usize>,
-    ) -> std::result::Result<usize, String> {
-        let Some(requested) = requested else {
-            return Ok(self.dims(configured));
-        };
-        let actual = self.dims(requested);
-        if actual == requested {
-            Ok(requested)
-        } else {
-            Err(format!(
-                "{} has a fixed output width of {actual}; it cannot run at {requested}",
-                self.id()
-            ))
-        }
-    }
-}
-
-impl std::str::FromStr for EvalModel {
-    type Err = String;
-
-    /// Hugging Face ids are case-insensitive, so the match is too.
-    fn from_str(id: &str) -> std::result::Result<Self, Self::Err> {
-        Self::all()
-            .find(|model| model.id().eq_ignore_ascii_case(id))
-            .ok_or_else(|| {
-                let supported: Vec<&str> = Self::all().map(|m| m.id()).collect();
-                format!(
-                    "unknown embedding model {id:?}; supported models: {}",
-                    supported.join(", ")
-                )
-            })
-    }
-}
-
-/// Loads `model` and runs the benchmark with it. This is the entry point for
-/// callers that only have a model choice.
-///
-/// Reads the Qwen3 width and the cache directory from `config`, so the
-/// harness measures what the daemon with that config would run.
+/// Loads the embedder `config` describes, in-process whatever its provider,
+/// and runs the benchmark with it. This is the entry point for callers that
+/// only have a config.
 ///
 /// # Errors
 ///
 /// Fails when the model cannot be loaded.
-pub async fn run_retrieval_eval(model: EvalModel, config: &Config) -> anyhow::Result<EvalReport> {
-    let embedder = load_embedder(model, config)?;
-    evaluate_embedder(embedder.as_ref(), model.id()).await
+pub async fn run_retrieval_eval(config: &Config) -> anyhow::Result<EvalReport> {
+    let embedder = load_embedder(config)?;
+    evaluate_embedder(embedder.as_ref(), liam_model::EMBEDDER_MODEL_ID).await
 }
 
-fn load_embedder(model: EvalModel, config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
-    models::build_embedder(&eval_config(model, config))
+fn load_embedder(config: &Config) -> anyhow::Result<Arc<dyn Embedder>> {
+    models::build_embedder(&eval_config(config))
 }
 
-/// `config` rewritten to load `model` in-process at the width it runs at.
-fn eval_config(model: EvalModel, config: &Config) -> Config {
+/// `config` rewritten to load the model in-process.
+fn eval_config(config: &Config) -> Config {
     let mut config = config.clone();
     config.embedder.provider = LOCAL_PROVIDER.to_string();
-    config.embedder.model = model.id().to_string();
-    config.embedding_dims = model.dims(config.embedding_dims);
     config
 }
 
@@ -2204,113 +2088,19 @@ mod tests {
     }
 
     #[test]
-    fn eval_model_parses_each_supported_id_case_insensitively() {
-        // Arrange
-        let cases = [
-            (liam_model::QWEN3_EMBEDDING_MODEL_ID, EvalModel::Qwen3),
-            ("qwen/qwen3-embedding-0.6b", EvalModel::Qwen3),
-            (liam_model::BGE_M3_MODEL_ID, EvalModel::BgeM3),
-            ("baai/BGE-M3", EvalModel::BgeM3),
-        ];
-
-        for (id, expected) in cases {
-            // Act
-            let parsed: EvalModel = id.parse().expect("a supported id parses");
-
-            // Assert
-            assert_eq!(parsed, expected, "{id}");
-        }
-    }
-
-    #[test]
-    fn eval_model_round_trips_through_its_canonical_id() {
-        for model in EvalModel::all() {
-            // Act
-            let parsed: EvalModel = model.id().parse().expect("a canonical id parses");
-
-            // Assert
-            assert_eq!(parsed, model);
-        }
-    }
-
-    #[test]
-    fn an_unknown_model_id_is_refused_naming_it_and_the_supported_ids() {
-        // Act
-        let err = "BAAI/bge-m3-unsupervised"
-            .parse::<EvalModel>()
-            .expect_err("an unknown id must not parse");
-
-        // Assert
-        assert!(err.contains("BAAI/bge-m3-unsupervised"), "{err}");
-        assert!(err.contains(liam_model::QWEN3_EMBEDDING_MODEL_ID), "{err}");
-        assert!(err.contains(liam_model::BGE_M3_MODEL_ID), "{err}");
-    }
-
-    #[test]
-    fn bge_m3_runs_at_its_native_width_and_qwen3_at_the_configured_one() {
-        // Arrange
-        let configured = 768;
-
-        // Act / Assert
-        assert_eq!(EvalModel::Qwen3.dims(configured), configured);
-        assert_eq!(EvalModel::BgeM3.dims(configured), liam_model::BGE_M3_DIMS);
-    }
-
-    fn onnx(id: &str) -> EvalModel {
-        EvalModel::Onnx(liam_model::onnx_model_spec(id).expect("a listed model"))
-    }
-
-    #[test]
-    fn onnx_models_parse_and_run_at_native_or_configured_width() {
-        // Arrange
-        let nomic = onnx("nomic-ai/nomic-embed-text-v1.5");
-        let bge_small = onnx("BAAI/bge-small-en-v1.5");
-
-        // Act / Assert
-        assert_eq!("baai/bge-small-en-v1.5".parse::<EvalModel>(), Ok(bge_small));
-        assert_eq!(nomic.dims(256), 256);
-        assert_eq!(bge_small.dims(768), 384);
-    }
-
-    #[test]
-    fn a_requested_width_is_refused_when_the_model_is_fixed_at_another() {
-        // Arrange
-        let bge_small = onnx("BAAI/bge-small-en-v1.5");
-
-        // Act
-        let err = bge_small.resolve_dims(768, Some(256)).unwrap_err();
-
-        // Assert
-        assert!(err.contains("384") && err.contains("256"), "{err}");
-        assert_eq!(bge_small.resolve_dims(768, Some(384)), Ok(384));
-        assert_eq!(bge_small.resolve_dims(768, None), Ok(384));
-        assert_eq!(EvalModel::Qwen3.resolve_dims(768, Some(256)), Ok(256));
-        assert_eq!(EvalModel::Qwen3.resolve_dims(768, None), Ok(768));
-        assert!(EvalModel::BgeM3.resolve_dims(768, Some(512)).is_err());
-    }
-
-    #[test]
-    fn eval_config_selects_the_local_provider_model_and_width_for_each_model() {
+    fn eval_config_selects_the_local_provider_and_keeps_the_rest() {
         // Arrange
         let mut base = Config::default();
         base.embedder.provider = "mock".to_string();
-        base.embedder.model = "other".to_string();
-        base.embedding_dims = 768;
+        base.embedding_dims = 256;
 
-        for model in EvalModel::all() {
-            // Act
-            let config = eval_config(model, &base);
+        // Act
+        let config = eval_config(&base);
 
-            // Assert
-            assert_eq!(config.embedder.provider, LOCAL_PROVIDER);
-            assert_eq!(config.embedder.model, model.id());
-            assert_eq!(config.embedding_dims, model.dims(base.embedding_dims));
-        }
-        assert_eq!(
-            eval_config(EvalModel::BgeM3, &base).embedding_dims,
-            liam_model::BGE_M3_DIMS
-        );
-        assert_eq!(eval_config(EvalModel::Qwen3, &base).embedding_dims, 768);
+        // Assert
+        assert_eq!(config.embedder.provider, LOCAL_PROVIDER);
+        assert_eq!(config.embedder.model, liam_model::EMBEDDER_MODEL_ID);
+        assert_eq!(config.embedding_dims, 256);
     }
 
     /// The report fields that depend on wall-clock time: every key of
@@ -2495,15 +2285,6 @@ mod tests {
 mod real_embedder_run {
     use super::*;
 
-    /// `LIAM_RETRIEVAL_EVAL_MODEL` overrides the model for a local A/B run,
-    /// mirroring `eval.rs`'s `LIAM_EVAL_MODEL`.
-    fn model() -> EvalModel {
-        std::env::var("LIAM_RETRIEVAL_EVAL_MODEL")
-            .unwrap_or_else(|_| Config::default().embedder.model)
-            .parse()
-            .expect("LIAM_RETRIEVAL_EVAL_MODEL names a supported model")
-    }
-
     /// Given the seeded fixtures and a real local embedder, when every
     /// question runs including `VectorSemantic`, then every metric lands in
     /// `[0.0, 1.0]`, every `GraphExpansion` question shows expansion, and the
@@ -2512,7 +2293,7 @@ mod real_embedder_run {
     #[ignore = "downloads embedder weights; see module doc for the run command"]
     async fn real_embedder_tier_scores_every_category_including_vector_semantic() {
         // Act
-        let report = run_retrieval_eval(model(), &Config::default())
+        let report = run_retrieval_eval(&Config::default())
             .await
             .expect("real embedder run");
         let text = report.render();
@@ -2559,8 +2340,8 @@ mod real_embedder_run {
         let config = Config::default();
 
         // Act
-        let first = run_retrieval_eval(model(), &config).await.expect("run 1");
-        let second = run_retrieval_eval(model(), &config).await.expect("run 2");
+        let first = run_retrieval_eval(&config).await.expect("run 1");
+        let second = run_retrieval_eval(&config).await.expect("run 2");
 
         // Assert
         let (a, b) = (

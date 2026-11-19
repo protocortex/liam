@@ -68,5 +68,5 @@ a guide.
 
 - [Architecture decision records](adr/): one file per decision.
 - [Specs](specs/): design documents and evaluations.
-  - [llama.cpp embedder benchmark](specs/2026-11-09-llama-embedder-benchmark.md): candle and llama.cpp Qwen3 embedding on CPU and Metal, plus the Neural Engine probe.
+  - [llama.cpp embedder benchmark](specs/2026-11-09-llama-embedder-benchmark.md): candle and llama.cpp Qwen3 embedding on CPU and Metal, plus the Neural Engine probe. Historical: those embedders were removed by [ADR 0016](adr/0016-arctic-is-the-only-embedder.md).
 - [Plans](plans/): implementation plans.

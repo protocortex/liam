@@ -188,9 +188,8 @@ version = ""
 
 [embedder]
 provider  = "local"                      # "local" (in-process) or "mock" (tests and dev)
-model     = "Snowflake/snowflake-arctic-embed-m-v2.0" # int8 ONNX on the CPU; "Qwen/Qwen3-Embedding-0.6B-GGUF" selects Qwen3 on llama.cpp
+model     = "Snowflake/snowflake-arctic-embed-m-v2.0" # the only embedder: int8 ONNX on the CPU; leave this line out
 cache_dir = "~/.liam/models"       # the embedder's files land here
-device    = "auto"                 # auto | cpu | metal | cuda; not part of the embedder fingerprint
 
 [llm]
 provider        = "llama-cpp"                       # "llama-cpp" (in-process llama.cpp) or "mock" (tests and dev)

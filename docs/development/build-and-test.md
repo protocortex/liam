@@ -9,7 +9,7 @@ cargo build --workspace
 cargo test  --workspace          # libSQL backend, in-memory
 ```
 
-Every build includes the in-process model stack (fastembed, candle, ONNX
-runtime, llama.cpp). Tests use the mock embedder and LLM
+Every build includes the in-process model stack (fastembed with the ONNX
+runtime, and llama.cpp). Tests use the mock embedder and LLM
 (`provider = "mock"`), so they download no model. The tests that load real
 models are `#[ignore]`d and run only when you ask for them.

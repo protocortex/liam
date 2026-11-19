@@ -5,63 +5,32 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 license.workspace = true
-description = "In-process embedding and generation for liam, via fastembed-rs."
+description = "In-process embedding and generation for liam, via fastembed-rs and llama.cpp."
 
 [dependencies]
 async-trait = "0.1"
 thiserror = "2"
 
-# In-process local models (embedder). No server, offline after the
-# model is present. Confirm the fastembed v5 API surface with `cargo add fastembed`.
-fastembed = { version = "5", features = ["qwen3"] }
-# Tracks the candle-core 0.11 line; fastembed 5.17.3+ itself moved onto
-# candle-core 0.11, so this stays in lockstep with what fastembed resolves.
-candle-core = "0.11"
-# Builds the VarBuilder that loads the Qwen3 embedder's weights from
-# safetensors, mirroring the candle-core line above.
-candle-nn = "0.11"
-# Tokenizes embedder input. "onig" matches fastembed's own default tokenizer
-# backend, so this stays in lockstep with what fastembed already resolves.
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-# Parses config.json into fastembed::Qwen3Config. fastembed already depends on
-# it to parse the same file internally; this makes it directly callable here.
-serde_json = "1"
+# In-process ONNX embedder. No server, offline after the model is present.
+fastembed = "5"
 # "rt" for spawn_blocking: the embedder and llama.cpp provider both
 # run blocking model calls on it instead of the async runtime.
 tokio = { version = "1", features = ["rt", "sync"] }
 tracing = { workspace = true }
 
-# hf-hub downloads GGUF weights for the llama.cpp provider.
-# anyhow keeps that loader's error handling simple; the `Llm` impl converts to
-# `ModelError::Llm` at the trait boundary. Version matches what fastembed
-# 5.17 already pulls in (hf-hub 0.5), so the llama provider does not duplicate the dep tree.
+# hf-hub downloads the pinned embedder files and the GGUF weights. Version
+# matches what fastembed 5.17 already pulls in (hf-hub 0.5), so it does not
+# duplicate the dep tree.
 hf-hub = "0.5"
-anyhow = "1"
 
 # llama.cpp bindings for the Llm trait. `encoding_rs`
 # because `token_to_piece` streams bytes through a decoder of that crate's type.
 llama-cpp-2 = { version = "0.1.161", default-features = false, features = ["common"] }
 encoding_rs = { version = "0.8" }
-# sysctl for the performance core count the llama.cpp embedder sizes its threads by.
+# sysctl for the core counts `liam devices` reports.
 libc = "0.2"
-# Hashes a cached GGUF once before llama.cpp opens it.
+# Hashes a pinned embedder file once before the ONNX session reads it.
 sha2 = { version = "0.11.0", default-features = false }
-
-# Best available backend per host, unioned into the deps above. WHY here and not
-# in `[features]`: this is the only way a macOS user gets GPU
-# decode without passing an extra flag, while a Linux user is not asked for a
-# CUDA toolchain they may not have. Metal and Accelerate are system frameworks on
-# macOS, so this adds no download and no toolchain requirement.
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.11", features = ["metal", "accelerate"] }
-
-[features]
-default = []
-# GPU decode. Metal needs NO feature: the macOS target block above always builds
-# candle with it, and the code selects it by `cfg(target_os = "macos")`. CUDA is
-# opt-in because it needs the CUDA toolkit and nvcc at BUILD time, which no
-# default build may assume.
-cuda = ["candle-core/cuda"]
 
 [dev-dependencies]
 tempfile = "3"

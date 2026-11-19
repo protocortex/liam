@@ -1,8 +1,8 @@
 # ADR-0013: arctic-embed-m-v2.0 is the default embedder, and the reranker is off by default
 
-- **Status:** Accepted. Supersedes in part [ADR-0012](0012-llama-cpp-default-embedder-and-hardware-support.md): the llama.cpp embedder stays, and it is no longer the default. Superseded in part by [ADR-0014](0014-remove-the-reranker.md): the embedder decision stands, and the reranker decision and its addendum no longer apply because the reranker was removed.
+- **Status:** Accepted. Supersedes in part [ADR-0012](0012-llama-cpp-default-embedder-and-hardware-support.md): the llama.cpp embedder stays, and it is no longer the default. Superseded in part by [ADR-0014](0014-remove-the-reranker.md): the embedder decision stands, and the reranker decision and its addendum no longer apply because the reranker was removed. Superseded in part by [ADR-0016](0016-arctic-is-the-only-embedder.md): arctic stays, and the other embedders this ADR kept selectable were removed.
 - **Date created:** 2026-11-17
-- **Date modified:** 2026-11-18
+- **Date modified:** 2026-11-19
 
 ## Context
 

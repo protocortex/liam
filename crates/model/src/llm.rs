@@ -165,10 +165,9 @@ pub fn strip_reasoning(s: &str) -> &str {
 /// without a model and is testable without a model.
 ///
 /// `Auto` takes the fastest backend COMPILED INTO this binary and falls back to
-/// CPU when the hardware or driver is missing at runtime. What is compiled in is
-/// per platform on purpose: macOS builds get Metal and Accelerate automatically
-/// (system frameworks, no toolchain cost), while CUDA is opt-in because it needs
-/// nvcc at build time.
+/// CPU when the hardware or driver is missing at runtime. Only macOS builds
+/// carry a GPU backend, Metal, which is a system framework and costs no
+/// toolchain. `Cuda` parses so the loader can refuse it with a clear message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DevicePreference {
     #[default]

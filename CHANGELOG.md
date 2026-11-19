@@ -20,6 +20,16 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- **Breaking:** Snowflake arctic-embed-m-v2.0 is now the only embedder. Any other `embedder.model`, for
+  example `Qwen/Qwen3-Embedding-0.6B-GGUF` or `BAAI/bge-m3`, stops `liamd` and `liam` at start with a message
+  that names the value and says to delete the line, and a store built with another embedder is refused until
+  `liam rebuild`. The other embedders were not the default and the owner chose to keep one, so one model
+  gives a lighter daemon and a smaller build. Removing them raised line coverage from 95.69% to 96.47%. Arctic matches or beats Qwen3 on English, Portuguese and Spanish
+  and is weaker on Arabic and Chinese.
+  Removed with them: the `embedder.device` key (an old `device` line is ignored and logs one warning), the
+  `--model` and `--device` flags of `liam eval retrieval` and `liam eval embedder`, the embedder line of
+  `liam devices`, the `cuda` build feature and the candle dependency.
+  See [ADR 0016](docs/adr/0016-arctic-is-the-only-embedder.md).
 - `liamd` now tightens the files it owns inside `~/.liam` to owner-only (0600) when an older start left them
   wider: the sidecars named after the database, the log's WAL and Parquet files, `log.id`, `log.lock`, the key
   registry, and the snapshot files. It runs at start, and `liam rebuild`, `liam consolidate`, `liamd delete`
@@ -44,8 +54,6 @@ All notable changes to LIAM are recorded here. The format follows
   directory and, where known, the size, and pointing to `liam fetch-models` (`liam fetch-models` itself leaves
   that hint out). It checks for the files the model loads, in `HF_HOME` when that is set, so a download that was
   interrupted gets the notice again. Nothing is logged when the files are already there.
-- A config that still names the previous default embedder (`Qwen/Qwen3-Embedding-0.6B-GGUF`) now gets one info
-  line at start saying the default changed and how to switch or stay. It keeps working.
 - A clean shutdown no longer waits up to 3 seconds and logs `compaction was still queued at exit`. Closed
   segments that were not compacted yet stay as WAL files, and the next start compacts them. A compaction that
   is already running still gets up to 3 seconds to finish.
@@ -74,8 +82,7 @@ All notable changes to LIAM are recorded here. The format follows
   against 0.935 on Portuguese, 0.931 against 0.924 on Spanish), and answers a query in about 8 ms against 37 ms.
   Qwen3 is better on Arabic and Chinese. A store built with the old default is refused at start with a message
   that names `liam rebuild --database PATH`; run it with `liamd` stopped, then `liam fetch-models` downloads the
-  new model. To keep the old model set `embedder.model = "Qwen/Qwen3-Embedding-0.6B-GGUF"`. See
-  [ADR 0013](docs/adr/0013-arctic-default-embedder-and-reranker-off.md).
+  new model. See [ADR 0013](docs/adr/0013-arctic-default-embedder-and-reranker-off.md).
 - A store with data and no `<database>.embedder.json` is now taken to hold the vectors of the default from before fingerprints,
   `Qwen/Qwen3-Embedding-0.6B` at 768 dimensions, instead of the configured embedder's. Opened under any other
   model or width, including the new default, it is refused with the same message that names `liam rebuild`.
@@ -106,7 +113,7 @@ All notable changes to LIAM are recorded here. The format follows
 - The `local`, `llama`, `hosted` and `backend-libsql` build flags are removed. Every build now
   includes the local models, llama.cpp and the hosted-provider code, so `cargo install` and
   `cargo build` need no `--features`. Hosted calls stay off until `[hosted]` is configured.
-  `cuda` and the two `test-support` flags remain.
+  The two `test-support` flags remain.
 - The default `embedder.model` is now `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0 on llama.cpp, on Metal
   on macOS). In the benchmark in `docs/specs/2026-11-09-llama-embedder-benchmark.md` it answers a
   query 8 times faster than candle on the CPU (23 ms against 183 ms median, the behaviour of
@@ -149,8 +156,7 @@ All notable changes to LIAM are recorded here. The format follows
   command. The copy and the rebuild both read every row, so a large store takes a while: the
   rebuild re-embeds every live node with the configured embedder.
 - A store built with the old default embedder is refused at start with a message that names
-  `liam rebuild --database PATH`. Run it with `liamd` stopped, or set
-  `embedder.model = "Qwen/Qwen3-Embedding-0.6B"` to keep the old candle model.
+  `liam rebuild --database PATH`. Run it with `liamd` stopped.
 - The event schema is now version 7.
 - The embedder prompt scheme is now 2, which wraps Qwen3 search queries in the model's
   instruction format. A store written under scheme 1 needs the same `liam rebuild` once.

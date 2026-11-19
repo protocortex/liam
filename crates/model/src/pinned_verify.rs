@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Integrity check for a cached GGUF before llama.cpp opens it.
+//! Integrity check for a cached model file before the ONNX session reads it.
 //!
 //! The size is checked on every start. The sha256 of a file that is hundreds of
 //! megabytes takes seconds, so it runs once per file: a small marker beside the
@@ -111,7 +111,7 @@ pub fn verify_pinned_file(path: &Path, size_bytes: u64, sha256: &str) -> Result<
 mod tests {
     use super::*;
 
-    const BODY: &[u8] = b"pretend gguf";
+    const BODY: &[u8] = b"pretend model";
     // sha256 of BODY
     fn body_hash() -> String {
         let mut h = Sha256::new();
@@ -123,7 +123,7 @@ mod tests {
     fn a_matching_file_passes_and_leaves_a_marker_that_skips_the_hash() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("m.gguf");
+        let path = dir.path().join("m.onnx");
         fs::write(&path, BODY).unwrap();
 
         // Act
@@ -141,7 +141,7 @@ mod tests {
     fn a_wrong_size_deletes_the_file_and_its_marker() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("m.gguf");
+        let path = dir.path().join("m.onnx");
         fs::write(&path, BODY).unwrap();
 
         // Act
@@ -162,7 +162,7 @@ mod tests {
         // Arrange: a hub style layout, a link pointing at a blob.
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("blob");
-        let link = dir.path().join("snapshot.gguf");
+        let link = dir.path().join("snapshot.onnx");
         fs::write(&blob, BODY).unwrap();
         std::os::unix::fs::symlink(&blob, &link).unwrap();
 
@@ -180,7 +180,7 @@ mod tests {
     fn a_changed_file_is_hashed_again_despite_an_old_marker() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("m.gguf");
+        let path = dir.path().join("m.onnx");
         fs::write(&path, BODY).unwrap();
         verify_pinned_file(&path, BODY.len() as u64, &body_hash()).unwrap();
         fs::write(&path, b"other bytes!").unwrap();

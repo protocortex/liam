@@ -9,8 +9,8 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const MOCK_CONFIG: &str = "embedding_dims = 8\n";
-const QWEN3: &str = "Qwen/Qwen3-Embedding-0.6B";
 const FAILURE_EXIT: i32 = 1;
+const USAGE_EXIT: i32 = 2;
 
 fn liam(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_liam"))
@@ -49,10 +49,7 @@ fn devices_prints_the_platform_and_says_mock_providers_load_no_model() {
         )),
         "{stdout}"
     );
-    assert!(
-        stdout.contains("embedder.device auto resolves to not used (provider mock)"),
-        "{stdout}"
-    );
+    assert!(!stdout.contains("embedder.device"), "{stdout}");
     assert!(
         stdout.contains("llm.device auto resolves to not used (provider mock)"),
         "{stdout}"
@@ -60,7 +57,7 @@ fn devices_prints_the_platform_and_says_mock_providers_load_no_model() {
 }
 
 #[test]
-fn devices_as_json_is_one_document_naming_the_platform_and_both_resolutions() {
+fn devices_as_json_is_one_document_naming_the_platform_and_the_llm_resolution() {
     // Arrange
     let dir = tempfile::tempdir().unwrap();
 
@@ -73,7 +70,7 @@ fn devices_as_json_is_one_document_naming_the_platform_and_both_resolutions() {
         serde_json::from_slice(&output.stdout).expect("one JSON document");
     assert_eq!(report["os"], std::env::consts::OS);
     assert_eq!(report["arch"], std::env::consts::ARCH);
-    assert_eq!(report["embedder"]["configured"], "auto");
+    assert!(report.get("embedder").is_none());
     assert_eq!(report["llm"]["configured"], "auto");
 }
 
@@ -160,14 +157,7 @@ fn a_retrieval_eval_refuses_the_vectors_flag_before_loading_any_model() {
     // Act
     let output = liam(
         dir.path(),
-        &[
-            "eval",
-            "retrieval",
-            "--model",
-            QWEN3,
-            "--vectors-out",
-            "vectors.json",
-        ],
+        &["eval", "retrieval", "--vectors-out", "vectors.json"],
     );
 
     // Assert
@@ -181,25 +171,23 @@ fn a_retrieval_eval_refuses_the_vectors_flag_before_loading_any_model() {
 }
 
 #[test]
-fn an_eval_with_an_unknown_device_is_refused_before_loading_any_model() {
+fn an_eval_with_a_removed_model_or_device_flag_is_refused_before_loading_any_model() {
     // Arrange
     let dir = tempfile::tempdir().unwrap();
 
     for command in ["retrieval", "embedder"] {
-        // Act
-        let output = liam(
-            dir.path(),
-            &["eval", command, "--model", QWEN3, "--device", "bogus"],
-        );
+        for flag in [["--model", "acme/embed-9000"], ["--device", "cpu"]] {
+            // Act
+            let output = liam(dir.path(), &["eval", command, flag[0], flag[1]]);
 
-        // Assert
-        assert_eq!(output.status.code(), Some(FAILURE_EXIT), "{command}");
-        assert!(
-            text(&output.stderr)
-                .contains(r#"embedder.device = "bogus" is not one of auto, metal, cuda, cpu"#),
-            "{command}: {}",
-            text(&output.stderr)
-        );
+            // Assert
+            assert_eq!(output.status.code(), Some(USAGE_EXIT), "{command} {flag:?}");
+            assert!(
+                text(&output.stderr).contains(flag[0]),
+                "{command}: {}",
+                text(&output.stderr)
+            );
+        }
     }
 }
 

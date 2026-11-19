@@ -7,8 +7,8 @@
 //!
 //! Each generation opens a fresh context rather than reusing one. That is
 //! deliberate: a per-call context makes stale-KV-cache bugs structurally
-//! impossible instead of something a caller has to remember to clear. The
-//! candle path already shipped exactly that bug, a model answering from a
+//! impossible instead of something a caller has to remember to clear. Reusing
+//! a context has shipped exactly that bug before, a model answering from a
 //! previous question's keys, which is why this module does not take the
 //! shortcut.
 //!
@@ -37,12 +37,11 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::download_notice::NoticeCaller;
 use crate::error::{ModelError, Result};
-use crate::hardware::{resolve_device, Engine, ResolvedDevice, SystemFacts};
+use crate::hardware::{resolve_device, ResolvedDevice, SystemFacts};
 use crate::llm::{strip_reasoning, CancelFlag, DevicePreference, Llm};
 
 /// Cap on generated tokens so a model with no natural stop token cannot hang a
-/// caller. Matches the candle path's cap so callers see the same behavior
-/// regardless of which engine answered.
+/// caller.
 const MAX_NEW_TOKENS: usize = 512;
 
 /// Floor for `context_tokens` when a caller passes 0. Large enough for the
@@ -77,8 +76,7 @@ impl LlamaCppLlm {
     /// to say so explicitly; nothing here probes for a GPU and picks CPU on
     /// its own.
     pub fn load(gguf_path: &str, context_tokens: u32, device: DevicePreference) -> Result<Self> {
-        let resolved =
-            resolve_device(Engine::LlamaLlm, device, &SystemFacts).map_err(ModelError::Llm)?;
+        let resolved = resolve_device(device, &SystemFacts).map_err(ModelError::Llm)?;
         let backend = shared_backend()?;
         // With no GPU compiled in, 1000 layers is ignored and the model
         // stays on CPU regardless; 0 is what makes an explicit CPU request
@@ -274,8 +272,7 @@ impl LlamaCppLlm {
         let user = user.to_string();
         let cancel_for_worker = cancel.clone();
 
-        // Same shape as the candle path: the sync decode loop runs off the
-        // async runtime. Rebuilding `Self` here is cheap; every field is an
+        // The sync decode loop runs off the async runtime. Rebuilding `Self` here is cheap; every field is an
         // `Arc`, a `Copy` integer, or a `'static` label.
         let out = tokio::task::spawn_blocking(move || {
             let this = LlamaCppLlm {
@@ -291,7 +288,7 @@ impl LlamaCppLlm {
 
         // Reasoning models answer after a `<think>` block even when the
         // template asks them not to; strip it so callers get the answer, not
-        // the scratchpad, matching the candle path.
+        // the scratchpad.
         Ok(strip_reasoning(&out).to_string())
     }
 }
@@ -317,7 +314,7 @@ pub(crate) fn shared_backend() -> Result<Arc<LlamaBackend>> {
 }
 
 /// Which llama.cpp backend this binary was built with. Compile-time, because
-/// llama.cpp picks its GPU backend at build time, like candle does. Metal is
+/// llama.cpp picks its GPU backend at build time. Metal is
 /// keyed on the TARGET, not a cargo feature: `llama-cpp-sys-2` compiles Metal
 /// in for every macOS build regardless of feature flags, and this project has
 /// already lost a measurement to a Metal check keyed on the wrong feature, so
@@ -388,8 +385,7 @@ impl Llm for LlamaCppLlm {
     }
 
     /// Generate one token and throw it away, to pay the backend's first-call
-    /// kernel-compile cost before a user is waiting, same reason as the
-    /// candle path's `warmup`.
+    /// kernel-compile cost before a user is waiting.
     async fn warmup(&self) -> Result<()> {
         self.generate("You are a warmup probe.", "ok", 1)
             .await

@@ -20,7 +20,7 @@ use liam_log::wal::{write_atomically, OsFileOps};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::models::{LOCAL_PROVIDER, MOCK_PROVIDER};
+use crate::models::MOCK_PROVIDER;
 
 /// Version of the convention that turns text into model input (prefixes and
 /// the like). Bump it whenever that convention changes for a model, since the
@@ -34,10 +34,9 @@ pub const PROMPT_SCHEME: u32 = 2;
 /// under. It stays 0 however far `PROMPT_SCHEME` moves.
 const LEGACY_PROMPT_SCHEME: u32 = 0;
 
-/// The model every store written before fingerprints held vectors from: the
-/// default then. It is fixed, whatever the default is now, because those
-/// stores never change.
-const LEGACY_MODEL_ID: &str = liam_model::QWEN3_EMBEDDING_MODEL_ID;
+/// The model every store written before fingerprints held vectors from. It is
+/// fixed, whatever embedder runs now, because those stores never change.
+const LEGACY_MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
 
 /// The width of those stores' vectors, the default `embedding_dims` then.
 const LEGACY_DIMS: usize = 768;
@@ -71,23 +70,12 @@ impl EmbedderFingerprint {
     }
 }
 
-/// The id a model is recorded under. A GGUF id has two spellings for the same
-/// file (`repo` and `repo:Q8_0`), and an ONNX id matches without regard to
-/// case, so each is stored as its spec's id; every other id is stored as
-/// written, which keeps existing fingerprints valid.
-fn canonical_model_id(model: &str) -> String {
-    if let Some(spec) = liam_model::gguf_embedder_spec(model) {
-        return spec.id.to_string();
-    }
-    liam_model::onnx_model_spec(model).map_or_else(|| model.to_string(), |spec| spec.id.to_string())
-}
-
 impl EmbedderFingerprint {
     /// The fingerprint the configured embedder would write.
     pub fn from_config(config: &Config) -> Self {
         Self {
             provider: config.embedder.provider.clone(),
-            model: canonical_model_id(&config.embedder.model),
+            model: config.embedder.model.clone(),
             dims: config.embedding_dims,
             prompt_scheme: PROMPT_SCHEME,
         }
@@ -104,30 +92,6 @@ impl EmbedderFingerprint {
             prompt_scheme: LEGACY_PROMPT_SCHEME,
         }
     }
-}
-
-/// The model id `embedder.model` selected by default before the current
-/// default.
-const PREVIOUS_DEFAULT_MODEL_ID: &str = liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID;
-
-/// The info line for a local embedder pinned to the previous default, or
-/// `None` for the current default and any other model. The pinned model keeps
-/// working, so this only says a newer default exists.
-pub fn superseded_default_notice(config: &Config, database_path: &Path) -> Option<String> {
-    let is_previous_default = config.embedder.provider == LOCAL_PROVIDER
-        && canonical_model_id(&config.embedder.model)
-            == canonical_model_id(PREVIOUS_DEFAULT_MODEL_ID);
-    is_previous_default.then(|| {
-        format!(
-            "the default embedder is now {current}; this config keeps {configured}, which is \
-             still supported. To switch, remove `model` from [embedder] (or set it to {current}) \
-             and `embedding_dims`, then run `liam rebuild --database {database}`. To stay, change \
-             nothing.",
-            current = liam_model::DEFAULT_EMBEDDER_MODEL_ID,
-            configured = config.embedder.model,
-            database = database_path.display(),
-        )
-    })
 }
 
 /// The file's contents: the fingerprint under a layout version.
@@ -291,8 +255,8 @@ fn mismatch_message(
          scheme {recorded_scheme}. liam.toml asks for provider {configured_provider:?}, model \
          {configured_model:?}, {configured_dims} dimensions, prompt scheme {configured_scheme}. \
          To switch to the configured embedder, stop liamd and run `liam rebuild --database \
-         {database}`. It re-embeds every node and records the new embedder. To keep the old \
-         embedder, restore the previous embedder settings in liam.toml. Deleting {fingerprint} \
+         {database}`. It re-embeds every node and records the new embedder. The old \
+         vectors can only be served by the liam build that wrote them. Deleting {fingerprint} \
          does not help, the old vectors would remain. If you do nothing, liamd refuses to start \
          and the store is not changed.",
         database = database_path.display(),
@@ -313,96 +277,11 @@ mod io_error_tests;
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn both_spellings_of_a_gguf_model_share_one_fingerprint_and_other_ids_are_unchanged() {
-        // Arrange
-        let with = |model: &str| {
-            let mut config = Config::default();
-            config.embedder.model = model.to_string();
-            EmbedderFingerprint::from_config(&config)
-        };
-
-        // Act / Assert
-        let bare = with("Qwen/Qwen3-Embedding-0.6B-GGUF");
-        assert_eq!(bare, with("Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0"));
-        assert_ne!(bare, with("Qwen/Qwen3-Embedding-0.6B-GGUF:F16"));
-        assert_eq!(
-            with("Qwen/Qwen3-Embedding-0.6B").model,
-            "Qwen/Qwen3-Embedding-0.6B"
-        );
-    }
-
     use super::*;
 
-    #[test]
-    fn every_spelling_of_an_onnx_model_id_shares_one_fingerprint() {
-        // Arrange
-        let with = |model: &str| {
-            let mut config = Config::default();
-            config.embedder.model = model.to_string();
-            EmbedderFingerprint::from_config(&config)
-        };
-
-        // Act
-        let exact = with(liam_model::DEFAULT_EMBEDDER_MODEL_ID);
-        let lowered = with(&liam_model::DEFAULT_EMBEDDER_MODEL_ID.to_lowercase());
-
-        // Assert
-        assert_eq!(exact, lowered);
-        assert_eq!(lowered.model, liam_model::DEFAULT_EMBEDDER_MODEL_ID);
-    }
-
-    fn config_with_embedder(provider: &str, model: &str) -> Config {
-        let mut config = Config::default();
-        config.embedder.provider = provider.to_string();
-        config.embedder.model = model.to_string();
-        config
-    }
-
-    #[test]
-    fn the_previous_default_in_either_spelling_gets_one_notice_naming_the_new_default() {
-        for model in [
-            liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID,
-            "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0",
-        ] {
-            // Arrange
-            let config = config_with_embedder("local", model);
-            let database = Path::new("/data/liam.db");
-
-            // Act
-            let notice = superseded_default_notice(&config, database).expect("a notice");
-
-            // Assert
-            assert!(
-                notice.contains(liam_model::DEFAULT_EMBEDDER_MODEL_ID),
-                "{notice}"
-            );
-            assert!(
-                notice.contains("liam rebuild --database /data/liam.db"),
-                "{notice}"
-            );
-            assert!(notice.contains("still supported"), "{notice}");
-        }
-    }
-
-    #[test]
-    fn the_current_default_and_other_models_get_no_notice() {
-        for model in [
-            liam_model::DEFAULT_EMBEDDER_MODEL_ID,
-            liam_model::QWEN3_EMBEDDING_MODEL_ID,
-            "BAAI/bge-small-en-v1.5",
-        ] {
-            // Arrange
-            let config = config_with_embedder("local", model);
-
-            // Act / Assert
-            assert_eq!(
-                superseded_default_notice(&config, Path::new("/data/liam.db")),
-                None,
-                "{model}"
-            );
-        }
-    }
+    /// Ids of embedders that no longer exist, as an old store recorded them.
+    const QWEN3_MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
+    const QWEN3_GGUF_MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0";
 
     #[test]
     fn the_refusal_is_one_line_in_the_order_problem_fix_consequence() {
@@ -545,10 +424,7 @@ mod tests {
         // Assert
         assert!(error.contains("liam rebuild"), "{error}");
         assert!(error.contains(LEGACY_MODEL_ID), "{error}");
-        assert!(
-            error.contains(liam_model::DEFAULT_EMBEDDER_MODEL_ID),
-            "{error}"
-        );
+        assert!(error.contains(liam_model::EMBEDDER_MODEL_ID), "{error}");
         assert!(!sidecar.exists(), "a refusal must write nothing");
     }
 
@@ -572,7 +448,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("liam.db");
         std::fs::write(&database, b"").unwrap();
-        let current = fingerprint(liam_model::DEFAULT_EMBEDDER_MODEL_ID, 384, PROMPT_SCHEME);
+        let current = fingerprint(liam_model::EMBEDDER_MODEL_ID, 384, PROMPT_SCHEME);
 
         // Act
         start(&database, &current).unwrap();
@@ -787,8 +663,8 @@ mod tests {
     #[test]
     fn an_old_mock_record_is_accepted_under_the_new_default_model_and_a_local_one_is_refused() {
         // Arrange
-        let old_default = liam_model::QWEN3_EMBEDDING_MODEL_ID;
-        let new_default = liam_model::DEFAULT_EMBEDDER_MODEL_ID;
+        let old_default = QWEN3_MODEL_ID;
+        let new_default = liam_model::EMBEDDER_MODEL_ID;
         let mock_with = |model: &str| EmbedderFingerprint {
             provider: MOCK_PROVIDER.to_string(),
             ..fingerprint(model, 384, PROMPT_SCHEME)
@@ -820,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn a_store_made_with_the_qwen3_gguf_default_is_refused_under_arctic_with_a_rebuild_hint() {
+    fn a_store_made_with_another_embedder_is_refused_under_arctic_with_a_rebuild_hint() {
         // Arrange
         let local = |model: &str| {
             let mut config = Config::default();
@@ -830,49 +706,18 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("liam.db");
-        start(&database, &local(liam_model::QWEN3_GGUF_EMBEDDER_MODEL_ID)).unwrap();
+        start(&database, &local(QWEN3_GGUF_MODEL_ID)).unwrap();
         std::fs::write(&database, b"existing vectors").unwrap();
 
         // Act
-        let error = verify(&database, &local(liam_model::DEFAULT_EMBEDDER_MODEL_ID))
-            .expect_err("the new default must not read the old default's vectors")
+        let error = verify(&database, &local(liam_model::EMBEDDER_MODEL_ID))
+            .expect_err("arctic must not read another embedder's vectors")
             .to_string();
 
         // Assert
         assert!(error.contains("liam rebuild"), "{error}");
         assert!(error.contains("snowflake-arctic-embed-m-v2.0"), "{error}");
-        assert!(error.contains("Qwen3-Embedding-0.6B-GGUF:Q8_0"), "{error}");
-    }
-
-    #[test]
-    fn switching_from_qwen3_to_bge_m3_is_refused_by_the_model_alone() {
-        // Arrange: both models are 1024 wide, so only the model id differs.
-        let local_config = |model: &str| {
-            let mut config = Config::default();
-            config.embedder.provider = "local".to_string();
-            config.embedder.model = model.to_string();
-            config.embedding_dims = 1024;
-            EmbedderFingerprint::from_config(&config)
-        };
-        let qwen3 = local_config(liam_model::QWEN3_EMBEDDING_MODEL_ID);
-        let bge_m3 = local_config(liam_model::BGE_M3_MODEL_ID);
-        let dir = tempfile::tempdir().unwrap();
-        let database = dir.path().join("liam.db");
-        start(&database, &qwen3).unwrap();
-        std::fs::write(&database, b"existing vectors").unwrap();
-
-        // Act
-        let error = verify(&database, &bge_m3)
-            .expect_err("a different model must not start")
-            .to_string();
-
-        // Assert
-        assert_eq!(qwen3.dims, bge_m3.dims);
-        assert!(error.contains(liam_model::BGE_M3_MODEL_ID), "{error}");
-        assert!(
-            error.contains(liam_model::QWEN3_EMBEDDING_MODEL_ID),
-            "{error}"
-        );
+        assert!(error.contains(QWEN3_GGUF_MODEL_ID), "{error}");
     }
 
     #[test]

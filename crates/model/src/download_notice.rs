@@ -6,9 +6,6 @@ use std::path::PathBuf;
 
 const BYTES_PER_MB: u64 = 1_000_000;
 const FETCH_MODELS_HINT: &str = "`liam fetch-models` downloads it ahead of time";
-/// The revision fastembed and the candle loader fetch: they ask hf-hub for the
-/// repo's default branch.
-pub(crate) const HUB_DEFAULT_REVISION: &str = "main";
 
 /// Who is loading the model, which decides whether the notice points at
 /// `liam fetch-models`.
@@ -77,54 +74,19 @@ pub(crate) fn hub_file_cached(cache_dir: &str, repo: &str, revision: &str, file:
         .is_some()
 }
 
-/// Whether every one of `files` of `repo` is cached. A repo directory left by
-/// an interrupted download does not count, because the model is only whole when
-/// each file it loads is there.
-pub(crate) fn hub_files_cached<'a>(
-    cache_dir: &str,
-    repo: &str,
-    files: impl IntoIterator<Item = &'a str>,
-) -> bool {
-    files
-        .into_iter()
-        .all(|file| hub_file_cached(cache_dir, repo, HUB_DEFAULT_REVISION, file))
-}
-
-/// The directory fastembed downloads into: `HF_HOME` when it is set, ahead of
-/// the configured `cache_dir`.
-pub(crate) fn fastembed_cache_dir<'a>(hf_home: Option<&'a str>, cache_dir: &'a str) -> &'a str {
-    crate::bge::hf_home_overriding(hf_home, cache_dir).unwrap_or(cache_dir)
-}
-
-/// Whether the fastembed built-in model `info` is cached, looking in the
-/// directory fastembed uses.
-pub(crate) fn fastembed_model_cached(
-    hf_home: Option<&str>,
-    cache_dir: &str,
-    info: &fastembed::ModelInfo<fastembed::EmbeddingModel>,
-) -> bool {
-    let files = std::iter::once(&info.model_file)
-        .chain(&info.additional_files)
-        .map(String::as_str);
-    hub_files_cached(
-        fastembed_cache_dir(hf_home, cache_dir),
-        &info.model_code,
-        files,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const REPO: &str = "org/m";
+    const REVISION: &str = "main";
     const COMMIT: &str = "abc123";
 
     /// Lays out `files` of `REPO` the way hf-hub caches them.
     fn cache_files(cache: &std::path::Path, files: &[&str]) {
         let repo = cache.join("models--org--m");
         std::fs::create_dir_all(repo.join("refs")).unwrap();
-        std::fs::write(repo.join("refs").join(HUB_DEFAULT_REVISION), COMMIT).unwrap();
+        std::fs::write(repo.join("refs").join(REVISION), COMMIT).unwrap();
         for file in files {
             let path = repo.join("snapshots").join(COMMIT).join(file);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -189,69 +151,30 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_directory_with_a_file_missing_is_not_cached() {
+    fn a_file_missing_from_a_repo_directory_is_not_cached() {
         // Arrange: an interrupted download left the repo directory and one file
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().to_str().unwrap();
         cache_files(dir.path(), &["config.json"]);
 
         // Act
-        let cached = hub_files_cached(cache, REPO, ["config.json", "model.onnx"]);
+        let cached = hub_file_cached(cache, REPO, REVISION, "model.onnx");
 
         // Assert
         assert!(!cached);
     }
 
     #[test]
-    fn a_repo_with_every_file_is_cached() {
+    fn a_file_in_the_repo_directory_is_cached() {
         // Arrange
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().to_str().unwrap();
         cache_files(dir.path(), &["config.json", "onnx/model.onnx"]);
 
         // Act
-        let cached = hub_files_cached(cache, REPO, ["config.json", "onnx/model.onnx"]);
+        let cached = hub_file_cached(cache, REPO, REVISION, "onnx/model.onnx");
 
         // Assert
         assert!(cached);
-    }
-
-    #[test]
-    fn hf_home_is_the_directory_to_check_when_it_is_set() {
-        // Arrange / Act / Assert
-        assert_eq!(fastembed_cache_dir(Some("/hf"), "/cache"), "/hf");
-        assert_eq!(fastembed_cache_dir(None, "/cache"), "/cache");
-        assert_eq!(fastembed_cache_dir(Some(""), "/cache"), "/cache");
-        assert_eq!(fastembed_cache_dir(Some("/cache"), "/cache"), "/cache");
-    }
-
-    #[test]
-    fn a_model_cached_under_hf_home_is_found_there_and_not_in_the_cache_dir() {
-        // Arrange: the files are under HF_HOME, and the configured cache is empty
-        let hf_home = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        cache_files(hf_home.path(), &["config.json"]);
-        let mut info = fastembed_info();
-        info.model_code = REPO.to_string();
-        info.model_file = "config.json".to_string();
-        info.additional_files.clear();
-
-        // Act
-        let with_hf_home = fastembed_model_cached(
-            hf_home.path().to_str(),
-            cache.path().to_str().unwrap(),
-            &info,
-        );
-        let without = fastembed_model_cached(None, cache.path().to_str().unwrap(), &info);
-
-        // Assert
-        assert!(with_hf_home);
-        assert!(!without);
-    }
-
-    fn fastembed_info() -> fastembed::ModelInfo<fastembed::EmbeddingModel> {
-        fastembed::TextEmbedding::get_model_info(&fastembed::EmbeddingModel::BGEM3)
-            .expect("BGE-M3 is listed")
-            .clone()
     }
 }

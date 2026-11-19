@@ -159,14 +159,12 @@ fn latency_stats(calls: &[Duration]) -> Option<LatencyStats> {
     })
 }
 
-/// One model's result on the embedder benchmark. Timing fields are wall clock.
+/// The embedder's result on the benchmark. Timing fields are wall clock.
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchReport {
     pub model_id: String,
     /// The engine and device that ran the model, as the embedder reports it.
     pub backend: String,
-    /// The `embedder.device` value the run asked for.
-    pub device: String,
     pub dims: usize,
     pub vector_bytes: usize,
     pub facts: usize,
@@ -195,11 +193,10 @@ impl BenchReport {
         // `write!` into a `String` never fails.
         let _ = writeln!(
             out,
-            "model: {} on {} (device {}), {} dims, {} B per vector, {} facts, {} questions, \
+            "model: {} on {}, {} dims, {} B per vector, {} facts, {} questions, \
              load {:.0} ms, peak RSS {:.0} MiB",
             self.model_id,
             self.backend,
-            self.device,
             self.dims,
             self.vector_bytes,
             self.facts,
@@ -262,20 +259,21 @@ fn rank(query: &[f32], facts: &[BenchFact], vectors: &[Vec<f32>]) -> Vec<String>
         .collect()
 }
 
-/// Loads `model` (timing the load), then runs the benchmark with it.
+/// Loads the embedder `config` describes (timing the load), then runs the
+/// benchmark with it.
 ///
 /// # Errors
 ///
 /// Fails when the model cannot be loaded, or on an embedder error.
-pub async fn run_embedder_bench(
-    model: super::EvalModel,
-    config: &Config,
-) -> anyhow::Result<BenchReport> {
+pub async fn run_embedder_bench(config: &Config) -> anyhow::Result<BenchReport> {
     let started = Instant::now();
-    let embedder = super::load_embedder(model, config)?;
-    let mut report = bench_embedder(embedder.as_ref(), model.id(), started.elapsed()).await?;
-    report.device = config.embedder.device.clone();
-    Ok(report)
+    let embedder = super::load_embedder(config)?;
+    bench_embedder(
+        embedder.as_ref(),
+        liam_model::EMBEDDER_MODEL_ID,
+        started.elapsed(),
+    )
+    .await
 }
 
 /// Bytes in a MiB.
@@ -352,7 +350,6 @@ pub async fn bench_embedder(
     Ok(BenchReport {
         model_id: model_id.to_string(),
         backend: embedder.backend().to_string(),
-        device: String::new(),
         peak_rss_mb: peak_rss_mb(),
         vectors,
         dims,

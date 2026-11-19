@@ -12,15 +12,7 @@ file `version`:
 | `provider` | `embedder.provider` |
 | `model` | `embedder.model` |
 | `dims` | `embedding_dims` |
-| `prompt_scheme` | A number built into the binary: the version of the convention that turns text into model input. Scheme 2 wraps Qwen3 search queries as `Instruct: <task>\nQuery:<query>`, the format on the model card, and leaves stored text plain; BGE-M3 and the mock embedder get no wrapper, and each small ONNX model gets the prefix on its model card. Scheme 1 used a `query: ` prefix instead. |
-
-The Qwen3 query text is `Instruct: Given a web search query, retrieve relevant
-passages that answer the query` and a newline, `Query:` and the question.
-Documents are embedded as they are. `liam eval retrieval` scores the same on
-this format as on the old `query: ` prefix (recall@10 0.975, nDCG@10 0.836, MRR
-0.817 either way), because the golden set is too easy to tell them apart. The
-format was adopted for matching what the model was trained on, and the scheme
-bump makes every store written under scheme 1 go through `liam rebuild` once.
+| `prompt_scheme` | A number built into the binary: the version of the convention that turns text into model input. Scheme 2 is the current one: search queries get the `query: ` prefix of the arctic model card and stored text stays plain. Scheme 1 gave the same prefix to the model that was the default then, and scheme 2 first wrapped that model's queries as `Instruct: <task>\nQuery:<query>`. Any store written under an older scheme goes through `liam rebuild` once. |
 
 Every start of `liamd` and `liamd serve` compares the record with the
 configured values before the store opens. `liamd proxy` opens no store and
@@ -31,9 +23,9 @@ skips the check.
   behind.
 - **No record, and a database that holds data:** a store from before
   fingerprints. It is taken to hold the vectors of the default from that time,
-  `Qwen/Qwen3-Embedding-0.6B` at 768 dimensions, under prompt scheme 0, whatever
-  the default is now. So it fails the check under any other model or width, and
-  under the current binary too (it is on scheme 2). `liam rebuild` clears this and needs an event log. A store that
+  `Qwen/Qwen3-Embedding-0.6B` at 768 dimensions, under prompt scheme 0. That
+  model no longer exists in this build, so it fails the check under the current
+  binary (it is on scheme 2). `liam rebuild` clears this and needs an event log. A store that
   predates the log has none, so `liamd` copies its rows into a new log before
   it runs the check. The start is still refused, but the log now exists: run
   `liam rebuild --database PATH` and start again.
@@ -44,13 +36,14 @@ skips the check.
   with a message distinct from the mismatch one. The file is never overwritten,
   because that could hide a change of embedder.
 
-The default `embedder.model` is `Snowflake/snowflake-arctic-embed-m-v2.0` (int8 ONNX on the CPU). A
-store built with an earlier default, `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0 on llama.cpp) or
-`Qwen/Qwen3-Embedding-0.6B` (candle), is refused at start. Run `liam rebuild`, or set `embedder.model` to the
-old id to keep the old model. Both spellings of the GGUF id (`...-GGUF` and `...-GGUF:Q8_0`) record as one
-model.
+`embedder.model` is `Snowflake/snowflake-arctic-embed-m-v2.0` (int8 ONNX on the CPU),
+the only embedder. A store built with an earlier one, such as
+`Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0 on llama.cpp) or `Qwen/Qwen3-Embedding-0.6B`
+(candle), is refused at start. Run `liam rebuild` to re-embed it with arctic.
+The id is recorded as the model library spells it, whatever the letter case in
+`liam.toml`.
 
-To change `embedder.provider`, `embedder.model` or `embedding_dims`, stop
+To change `embedder.provider` or `embedding_dims`, stop
 `liamd`, edit `liam.toml`, and run:
 
 ```sh
@@ -61,5 +54,6 @@ It re-embeds every live node with the configured embedder, resizes the vector
 table, and records the new fingerprint, but only when no embedding failed. Do
 not delete the `.embedder.json` file to get past the error: the old vectors
 would stay in `node_vectors`, mixed with the new ones. Deleting the file is
-safe only after the vectors are cleared or re-embedded. The other way out is to
-restore the previous `liam.toml` settings.
+safe only after the vectors are cleared or re-embedded. For a change of
+`embedder.provider` or `embedding_dims`, the other way out is to restore the
+previous `liam.toml` settings.

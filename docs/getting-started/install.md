@@ -37,13 +37,11 @@ that. Running it again is safe.
 truncated file downloads happily and only fails when something tries to use it,
 which would otherwise be a user's first `recall`, long after the install.
 
-With the default config the embedder is `Snowflake/snowflake-arctic-embed-m-v2.0`, an int8 ONNX model
-that runs on the CPU (about 311 MB, checked against a pinned sha256). Qwen3-Embedding-0.6B stays
-selectable: its Q8_0 GGUF (about 0.6 GB, run by llama.cpp) is downloaded only when
-`embedder.model = "Qwen/Qwen3-Embedding-0.6B-GGUF"`, and the candle safetensors (about 2.4 GB) only when
-`embedder.model = "Qwen/Qwen3-Embedding-0.6B"`.
+The embedder is `Snowflake/snowflake-arctic-embed-m-v2.0`, an int8 ONNX model
+that runs on the CPU (about 311 MB, checked against a pinned sha256). It is the
+only embedder, so there is nothing to choose.
 
-Both models land under `embedder.cache_dir`, each in its own `models--Org--Name`
+The embedder lands under `embedder.cache_dir`, in its own `models--Org--Name`
 subdirectory. That makes a bundle-in-release option possible (ship the weights
 in the tarball, pointed at by that same directory), though fetch-on-install is
 still the route the current release workflow takes.

@@ -37,7 +37,7 @@ use liam_daemon::event_log;
 use liam_daemon::fetch;
 use liam_daemon::models::{self, StoreEmbedder};
 use liam_daemon::retrieval_eval::{
-    run_embedder_bench, run_retrieval_eval, BenchReport, EvalModel, EvalReport,
+    run_embedder_bench, run_retrieval_eval, BenchReport, EvalReport,
 };
 use liam_daemon::state_dir;
 use liam_daemon::storelock::StoreLock;
@@ -67,13 +67,13 @@ enum Command {
     /// start is not also the first download.
     FetchModels,
     /// Show the cores, the compute backends this build has, and what `auto`
-    /// resolves to for the embedder and the LLM under the config.
+    /// resolves to for the LLM under the config.
     Devices(DevicesArgs),
     /// Rebuild a store's nodes and edges from its event log, then check the
     /// result against the log row by row. Refuses while a daemon holds the
     /// store.
     Rebuild(RebuildArgs),
-    /// Measure how well the local models retrieve, on a fixed synthetic
+    /// Measure how well the local embedder retrieves, on a fixed synthetic
     /// question set.
     Eval(EvalArgs),
     /// Run the consolidation job once over a store no daemon holds: snapshot,
@@ -113,37 +113,25 @@ struct EvalArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum EvalCommand {
-    /// Score retrieval quality, embedder latency and throughput for one
-    /// embedding model. Downloads the model on first use.
+    /// Score retrieval quality, embedder latency and throughput. Downloads
+    /// the model on first use.
     Retrieval(RetrievalArgs),
-    /// Score one embedding model alone on the larger embedder benchmark:
-    /// retrieval quality, load time, query latency and batch throughput.
-    /// Downloads the model on first use.
+    /// Score the embedder alone on the larger embedder benchmark: retrieval
+    /// quality, load time, query latency and batch throughput. Downloads the
+    /// model on first use.
     Embedder(RetrievalArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 struct RetrievalArgs {
-    /// The embedding model to evaluate: Qwen/Qwen3-Embedding-0.6B,
-    /// BAAI/bge-m3 or one of the ONNX models listed in the error for an
-    /// unknown id.
-    #[arg(long, value_name = "ID")]
-    model: EvalModel,
-
     /// Run at this output width instead of `embedding_dims` from the config.
-    /// Only Qwen3 and Matryoshka models can run narrower than their own width.
+    /// The model can run narrower than its own width of 768, not wider.
     #[arg(long, value_name = "N")]
     dims: Option<usize>,
 
     /// Print the report as JSON instead of text. Latencies are milliseconds.
     #[arg(long)]
     json: bool,
-
-    /// Run on this device instead of `embedder.device` from the config:
-    /// auto, cpu, metal or cuda. Applies to the Qwen3 (candle) and GGUF
-    /// (llama.cpp) models; the others ignore it.
-    #[arg(long, value_name = "DEVICE")]
-    device: Option<String>,
 
     /// Write the fact vectors then the question vectors to this file as JSON,
     /// so two runs can be compared. Overwrites an existing file. Only
@@ -227,20 +215,20 @@ fn main() -> anyhow::Result<()> {
                 args.vectors_out.is_none(),
                 "--vectors-out is only supported by `liam eval embedder`"
             );
-            tracing::debug!(model = args.model.id(), "eval retrieval: starting");
-            let config = eval_config_for(&args, &config)?;
+            tracing::debug!("eval retrieval: starting");
+            let config = eval_config_for(&args, &config);
             let runtime = tokio::runtime::Runtime::new()?;
-            let report = runtime.block_on(run_retrieval_eval(args.model, &config))?;
+            let report = runtime.block_on(run_retrieval_eval(&config))?;
             print!("{}", render_eval_report(&report, args.json)?);
             Ok(())
         }
         Command::Eval(EvalArgs {
             command: EvalCommand::Embedder(args),
         }) => {
-            tracing::debug!(model = args.model.id(), "eval embedder: starting");
-            let config = eval_config_for(&args, &config)?;
+            tracing::debug!("eval embedder: starting");
+            let config = eval_config_for(&args, &config);
             let runtime = tokio::runtime::Runtime::new()?;
-            let report = runtime.block_on(run_embedder_bench(args.model, &config))?;
+            let report = runtime.block_on(run_embedder_bench(&config))?;
             if let Some(path) = &args.vectors_out {
                 let json = serde_json::to_vec(&report.vectors).context("serializing vectors")?;
                 std::fs::write(path, json)
@@ -305,20 +293,13 @@ fn consolidate_exit_code(outcome: Option<RunOutcome>) -> i32 {
     }
 }
 
-/// The report as `liam eval retrieval` prints it: the harness's text table, or
-/// its serde shape as pretty JSON.
 /// `config` with the output width the eval run asked for.
-fn eval_config_for(args: &RetrievalArgs, config: &Config) -> anyhow::Result<Config> {
+fn eval_config_for(args: &RetrievalArgs, config: &Config) -> Config {
     let mut config = config.clone();
-    config.embedding_dims = args
-        .model
-        .resolve_dims(config.embedding_dims, args.dims)
-        .map_err(anyhow::Error::msg)?;
-    if let Some(device) = &args.device {
-        config.embedder.device = device.clone();
+    if let Some(dims) = args.dims {
+        config.embedding_dims = dims;
     }
-    models::embedder_device(&config)?;
-    Ok(config)
+    config
 }
 
 /// The embedder benchmark as `liam eval embedder` prints it: text or pretty JSON.
@@ -331,6 +312,8 @@ fn render_bench_report(report: &BenchReport, json: bool) -> anyhow::Result<Strin
     Ok(text)
 }
 
+/// The report as `liam eval retrieval` prints it: the harness's text table, or
+/// its serde shape as pretty JSON.
 fn render_eval_report(report: &EvalReport, json: bool) -> anyhow::Result<String> {
     if !json {
         return Ok(report.render());
@@ -732,21 +715,6 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
     }
     if plan.embedder {
         println!("embedder: {}", config.embedder.model);
-        // A GGUF is downloaded and checked before anything loads it.
-        if let Some(spec) = liam_model::gguf_embedder_spec(&config.embedder.model) {
-            let cache_dir = models::resolve_path_with_home(
-                "embedder.cache_dir",
-                &config.embedder.cache_dir,
-                &home,
-            )?;
-            let path = liam_model::gguf_path_from_hub(
-                spec,
-                &cache_dir,
-                liam_model::NoticeCaller::FetchModels,
-            )?;
-            liam_model::verify_gguf_file(spec, &path)?;
-            println!("  sha256 verified: {}", spec.sha256);
-        }
         let _embedder = models::build_embedder_for(config, liam_model::NoticeCaller::FetchModels)?;
         println!("embedder: ready");
     }
@@ -824,34 +792,21 @@ mod tests {
     }
 
     #[test]
-    fn eval_retrieval_takes_a_model_and_prints_text_by_default() {
+    fn eval_retrieval_prints_text_at_the_configured_width_by_default() {
         // Arrange / Act
-        let args = retrieval_args(parse(&[
-            "liam",
-            "eval",
-            "retrieval",
-            "--model",
-            "BAAI/bge-m3",
-        ]));
+        let args = retrieval_args(parse(&["liam", "eval", "retrieval"]));
 
         // Assert
-        assert_eq!(args.model, EvalModel::BgeM3);
         assert!(!args.json);
         assert_eq!(args.dims, None);
+        let config = eval_config_for(&args, &Config::default());
+        assert_eq!(config.embedding_dims, Config::default().embedding_dims);
     }
 
     #[test]
-    fn eval_embedder_takes_a_model_and_a_width() {
+    fn eval_embedder_takes_a_width() {
         // Arrange / Act
-        let cli = parse(&[
-            "liam",
-            "eval",
-            "embedder",
-            "--model",
-            "Qwen/Qwen3-Embedding-0.6B",
-            "--dims",
-            "256",
-        ]);
+        let cli = parse(&["liam", "eval", "embedder", "--dims", "256"]);
 
         // Assert
         let Command::Eval(EvalArgs {
@@ -860,82 +815,31 @@ mod tests {
         else {
             panic!("expected the eval embedder subcommand");
         };
-        assert_eq!(args.model, EvalModel::Qwen3);
         assert_eq!(args.dims, Some(256));
-        let config = eval_config_for(&args, &Config::default()).unwrap();
+        let config = eval_config_for(&args, &Config::default());
         assert_eq!(config.embedding_dims, 256);
-    }
-
-    #[test]
-    fn eval_refuses_a_width_the_model_is_fixed_away_from() {
-        // Arrange
-        let cli = parse(&[
-            "liam",
-            "eval",
-            "embedder",
-            "--model",
-            "BAAI/bge-m3",
-            "--dims",
-            "256",
-        ]);
-        let Command::Eval(EvalArgs {
-            command: EvalCommand::Embedder(args),
-        }) = cli.command
-        else {
-            panic!("expected the eval embedder subcommand");
-        };
-
-        // Act
-        let error = eval_config_for(&args, &Config::default()).unwrap_err();
-
-        // Assert
-        assert!(error.to_string().contains("1024"), "{error}");
     }
 
     #[test]
     fn eval_retrieval_takes_a_json_flag() {
         // Arrange / Act
-        let args = retrieval_args(parse(&[
-            "liam",
-            "eval",
-            "retrieval",
-            "--model",
-            "Qwen/Qwen3-Embedding-0.6B",
-            "--json",
-        ]));
+        let args = retrieval_args(parse(&["liam", "eval", "retrieval", "--json"]));
 
         // Assert
-        assert_eq!(args.model, EvalModel::Qwen3);
         assert!(args.json);
     }
 
     #[test]
-    fn eval_retrieval_requires_a_model() {
-        // Act
-        let error = Cli::try_parse_from(["liam", "eval", "retrieval"])
-            .expect_err("a run with no model must not parse");
+    fn eval_no_longer_takes_a_model_or_a_device() {
+        for flag in [["--model", "acme/embed-9000"], ["--device", "metal"]] {
+            // Act
+            let error = Cli::try_parse_from(["liam", "eval", "retrieval", flag[0], flag[1]])
+                .expect_err("a removed flag must not parse");
 
-        // Assert
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-        assert_eq!(error.exit_code(), 2);
-    }
-
-    #[test]
-    fn eval_retrieval_refuses_an_unknown_model_naming_it_and_the_supported_ones() {
-        // Act
-        let error =
-            Cli::try_parse_from(["liam", "eval", "retrieval", "--model", "acme/embed-9000"])
-                .expect_err("an unknown model must not parse");
-
-        // Assert
-        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-        assert_eq!(error.exit_code(), 2);
-        let message = error.to_string();
-        assert!(message.contains("acme/embed-9000"), "{message}");
-        assert!(message.contains("BAAI/bge-m3"), "{message}");
+            // Assert
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            assert_eq!(error.exit_code(), 2);
+        }
     }
 
     async fn mock_report() -> EvalReport {
@@ -982,7 +886,6 @@ mod tests {
         BenchReport {
             model_id: BENCH_MODEL.to_string(),
             backend: "cpu".to_string(),
-            device: "auto".to_string(),
             dims: DIMS,
             vector_bytes: DIMS * 4,
             facts: BENCH_FACTS,
@@ -1705,10 +1608,9 @@ mod tests {
         // Arrange
         let mut local = config();
         local.embedder.provider = models::LOCAL_PROVIDER.to_string();
-        local.embedder.model = "org/model".to_string();
 
         // Act / Assert
-        assert_eq!(embedder_name(&local), "org/model");
+        assert_eq!(embedder_name(&local), liam_model::EMBEDDER_MODEL_ID);
         assert_eq!(embedder_name(&config()), "the mock embedder");
     }
 
