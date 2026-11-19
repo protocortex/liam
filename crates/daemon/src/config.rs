@@ -66,6 +66,16 @@ const REMOVED_FULL_SYNTHESIS_MAX_NEW_TOKENS_WARNING: &str =
 const REMOVED_RERANKER_WARNING: &str =
     "the reranker was removed and the [reranker] section is ignored: delete it from your liam.toml";
 
+const REMOVED_LLM_WARNING: &str =
+    "the local generation model was removed and the [llm] section is ignored: delete it from \
+     your liam.toml. You may also delete the old model file from the models directory, \
+     which LIAM no longer reads";
+
+const REMOVED_LOCAL_SUMMARY_WARNING: &str =
+    "summary.provider = \"local\" no longer works because the local generation model was \
+     removed, so summaries are off. To write summaries, set summary.provider to a hosted \
+     provider, add a [hosted] section and turn metrics.enabled on";
+
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
@@ -76,7 +86,8 @@ pub struct Config {
     pub gc: GcConfig,
     pub embedder: EmbedderConfig,
     /// The removed `[llm]` section. Kept so an old `liam.toml` still loads, since
-    /// `deny_unknown_fields` would reject it. Its content is ignored.
+    /// `deny_unknown_fields` would reject it. Its content is ignored, see
+    /// `removed_llm_warning`.
     #[doc(hidden)]
     pub llm: Option<toml::Value>,
     /// Wall-clock cap on one batch of entity-page syntheses. The key keeps the
@@ -442,7 +453,20 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)?;
 
+        // Parse into a permissive `toml::Value` first so we can name a removed
+        // key with a helpful error before the strict parse below rejects it as
+        // just another unknown field. We check the parsed value rather than
+        // matching on toml's error string: error text is not part of the
+        // crate's stability contract, so a string match would silently stop
+        // catching this the next time the `toml` dependency is upgraded.
+        let value: toml::Value = toml::from_str(&text)?;
         let mut config: Self = toml::from_str(&text)?;
+        let named_local = value
+            .get("summary")
+            .and_then(|summary| summary.get("provider"))
+            .and_then(toml::Value::as_str)
+            == Some(Provider::Local.name());
+        config.summary.drop_removed_local_provider(named_local);
         config.embedder.validate()?;
         config.extraction.expand_paths(home)?;
         config.encryption.expand_paths(home)?;
@@ -478,32 +502,63 @@ impl Config {
     /// The warning to log at start when the config still has a `[reranker]`
     /// section, which no longer does anything.
     pub fn removed_reranker_warning(&self) -> Option<&'static str> {
-        self.reranker.as_ref().map(|_| REMOVED_RERANKER_WARNING)
+        removed_key(&self.reranker, REMOVED_RERANKER_WARNING)
     }
 
     /// The warning to log at start when the config still has the removed
     /// `ask_sufficiency_check` key.
     pub fn removed_ask_sufficiency_check_warning(&self) -> Option<&'static str> {
-        self.ask_sufficiency_check
-            .as_ref()
-            .map(|_| REMOVED_ASK_SUFFICIENCY_CHECK_WARNING)
+        removed_key(
+            &self.ask_sufficiency_check,
+            REMOVED_ASK_SUFFICIENCY_CHECK_WARNING,
+        )
+    }
+
+    /// The warning to log at start when the config still has an `[llm]`
+    /// section, which no longer does anything.
+    pub fn removed_llm_warning(&self) -> Option<&'static str> {
+        removed_key(&self.llm, REMOVED_LLM_WARNING)
     }
 
     /// The warnings to log at start for each removed `[gc]` key the config
     /// still sets, one per key, in a fixed order.
     pub fn removed_gc_page_warnings(&self) -> Vec<&'static str> {
         [
-            (
+            removed_key(
                 &self.gc.full_synthesis_mention_threshold,
                 REMOVED_FULL_SYNTHESIS_MENTION_THRESHOLD_WARNING,
             ),
-            (
+            removed_key(
                 &self.gc.full_synthesis_max_new_tokens,
                 REMOVED_FULL_SYNTHESIS_MAX_NEW_TOKENS_WARNING,
             ),
         ]
         .into_iter()
-        .filter_map(|(value, warning)| value.as_ref().map(|_| warning))
+        .flatten()
+        .collect()
+    }
+
+    /// The warning to log at start when the config asked for summaries from the
+    /// removed local model.
+    pub fn removed_local_summary_warning(&self) -> Option<&'static str> {
+        self.summary
+            .local_provider_removed
+            .then_some(REMOVED_LOCAL_SUMMARY_WARNING)
+    }
+
+    /// Every warning to log at start for a removed key the config still sets,
+    /// one per key, in a fixed order.
+    pub fn removed_key_warnings(&self) -> Vec<&'static str> {
+        [
+            self.removed_reranker_warning(),
+            self.embedder.removed_device_warning(),
+            self.removed_ask_sufficiency_check_warning(),
+            self.removed_llm_warning(),
+            self.removed_local_summary_warning(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.removed_gc_page_warnings())
         .collect()
     }
 
@@ -514,7 +569,7 @@ impl Config {
         let looked_in = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         Some(format!(
             "no config file at {}, so the built-in defaults are used with mock models: \
-             embeddings and answers are not real. Point at a config with --config <path> \
+             embeddings are not real. Point at a config with --config <path> \
              or the LIAM_CONFIG environment variable",
             looked_in.display()
         ))
@@ -528,6 +583,12 @@ impl Config {
     pub fn gc_interval(&self) -> Duration {
         Duration::from_secs(self.gc.interval_hours.saturating_mul(SECS_PER_HOUR))
     }
+}
+
+/// The warning for a removed key that is still set. Its value is never read:
+/// the key only has to load, since `deny_unknown_fields` would reject it.
+fn removed_key(value: &Option<toml::Value>, warning: &'static str) -> Option<&'static str> {
+    value.as_ref().map(|_| warning)
 }
 
 // Small ergonomic shim so config reads naturally.
@@ -852,6 +913,131 @@ mod tests {
             c.producers.clients.get("ai-notetaker"),
             Some(&"notetaker".to_string())
         );
+    }
+
+    const OLD_LLM_SECTION: &str = "[llm]\nprovider = \"llama-cpp\"\n\
+        model = \"Qwen/Qwen2.5-1.5B-Instruct-GGUF\"\ngguf_file = \"qwen2.5-1.5b-instruct-q4_k_m.gguf\"\n\
+        cache_dir = \"~/.liam/models\"\ndevice = \"auto\"\nwarmup = true\nidle_unload_secs = 300\n\
+        context_tokens = 8192\nmax_concurrent_generations = 0\ntokenizer_model = \"Qwen/Qwen2.5\"\n";
+
+    #[test]
+    fn an_old_llm_section_loads_and_yields_one_removal_warning() {
+        // Arrange
+        let text = format!("[embedder]\nprovider = \"mock\"\n\n{OLD_LLM_SECTION}");
+
+        // Act
+        let config = load_text(&text, "/home/alice").unwrap();
+
+        // Assert
+        let warning = config.removed_llm_warning().unwrap();
+        assert!(warning.contains("[llm] section is ignored"), "{warning}");
+        assert!(warning.contains("delete it"), "{warning}");
+        let all = config.removed_key_warnings();
+        assert_eq!(all.iter().filter(|w| w.contains("[llm]")).count(), 1);
+        assert_eq!(all.len(), 1, "{all:?}");
+    }
+
+    #[test]
+    fn a_config_without_an_llm_section_has_no_llm_warning() {
+        // Act
+        let loaded = load_text("[gc]\n", "/home/alice").unwrap();
+
+        // Assert
+        assert_eq!(loaded.removed_llm_warning(), None);
+        assert!(loaded.removed_key_warnings().is_empty());
+        assert!(Config::default().removed_key_warnings().is_empty());
+    }
+
+    #[test]
+    fn every_removed_key_gives_its_own_warning_in_a_fixed_order() {
+        // Arrange
+        let text = "ask_sufficiency_check = true\n[reranker]\nmodel = \"x\"\n\
+                    [embedder]\ndevice = \"cpu\"\n\
+                    [llm]\nwarmup = true\n\
+                    [summary]\nprovider = \"local\"\n\
+                    [gc]\nfull_synthesis_mention_threshold = 1\nfull_synthesis_max_new_tokens = 2\n";
+
+        // Act
+        let warnings = load_text(text, "/home/alice")
+            .unwrap()
+            .removed_key_warnings();
+
+        // Assert
+        let leads: Vec<&str> = [
+            "the reranker was removed",
+            "embedder.device was removed",
+            "ask_sufficiency_check was removed",
+            "the local generation model was removed",
+            "summary.provider = \"local\"",
+            "gc.full_synthesis_mention_threshold was removed",
+            "gc.full_synthesis_max_new_tokens was removed",
+        ]
+        .to_vec();
+        assert_eq!(warnings.len(), leads.len(), "{warnings:?}");
+        for (warning, lead) in warnings.iter().zip(leads) {
+            assert!(
+                warning.starts_with(lead),
+                "{warning} should start with {lead}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_summary_provider_of_local_loads_with_summaries_off_and_one_warning() {
+        for enabled in ["true", "false"] {
+            // Arrange
+            let text = format!("[summary]\nenabled = {enabled}\nprovider = \"local\"\n");
+
+            // Act
+            let config = load_text(&text, "/home/alice").unwrap();
+
+            // Assert
+            assert!(!config.summary.enabled);
+            let warning = config.removed_local_summary_warning().unwrap();
+            assert!(warning.contains("summaries are off"), "{warning}");
+            assert!(warning.contains("hosted"), "{warning}");
+            assert_eq!(config.removed_key_warnings(), vec![warning]);
+        }
+    }
+
+    #[test]
+    fn summaries_turned_on_with_the_old_default_provider_load_off_with_one_warning() {
+        // Arrange: a file that relied on the default provider, which was local.
+        let config = load_text("[summary]\nenabled = true\n", "/home/alice").unwrap();
+
+        // Assert
+        assert!(!config.summary.enabled);
+        assert!(config.removed_local_summary_warning().is_some());
+    }
+
+    #[test]
+    fn the_default_summary_config_is_off_and_gives_no_warning() {
+        // Arrange
+        let config = load_text("", "/home/alice").unwrap();
+
+        // Assert
+        assert!(!config.summary.enabled);
+        assert_eq!(config.removed_local_summary_warning(), None);
+    }
+
+    #[test]
+    fn a_hosted_summary_provider_keeps_summaries_on_and_gives_no_warning() {
+        // Arrange
+        let text = "[summary]\nenabled = true\nprovider = \"anthropic\"\n\
+                    [metrics]\nenabled = true\n\
+                    [hosted]\nenabled = true\nallowed_hosts = [\"api.anthropic.com\"]\n[hosted.models]\nanthropic = \"claude-sonnet-4-5-20250929\"\n\
+                    [hosted.prices]\nversion = \"v\"\n[hosted.prices.models.claude-sonnet-4-5-20250929]\n\
+                    input_micro_per_mtok = 1\noutput_micro_per_mtok = 1\n\
+                    cached_input_micro_per_mtok = 1\nbatch_input_micro_per_mtok = 1\n\
+                    batch_output_micro_per_mtok = 1\n";
+
+        // Act
+        let config = load_text(text, "/home/alice").unwrap();
+
+        // Assert
+        assert!(config.summary.enabled);
+        assert_eq!(config.summary.provider, Provider::Anthropic);
+        assert_eq!(config.removed_local_summary_warning(), None);
     }
 
     #[test]

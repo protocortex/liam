@@ -44,9 +44,14 @@ const MAX_RECLUSTER_INTERVAL_DAYS: u64 = 365 * 10;
 pub struct SummaryConfig {
     /// False makes the whole hook a no-op.
     pub enabled: bool,
-    /// Who writes the summaries: the local model, or a hosted provider (which
-    /// also needs `[hosted]`). Entity synthesis always stays local.
+    /// Who writes the summaries: a hosted provider, which also needs `[hosted]`.
+    /// `local` is the removed in-process model and keeps summaries off, see
+    /// `drop_removed_local_provider`.
     pub provider: Provider,
+    /// Set at load when the config asked for summaries from the removed local
+    /// model, so the daemon can say once that they are off. Never read from a file.
+    #[serde(skip)]
+    pub local_provider_removed: bool,
     /// Nearest neighbours considered for each item.
     pub knn: usize,
     /// Least cosine similarity at which two items are linked.
@@ -90,6 +95,7 @@ impl Default for SummaryConfig {
         Self {
             enabled: false,
             provider: Provider::Local,
+            local_provider_removed: false,
             knn: DEFAULT_KNN,
             min_similarity: DEFAULT_MIN_SIMILARITY,
             time_window_hours: DEFAULT_TIME_WINDOW_HOURS,
@@ -113,6 +119,18 @@ impl Default for SummaryConfig {
 }
 
 impl SummaryConfig {
+    /// Turns summaries off when the provider is the removed local model, and
+    /// notes it for a warning when the config asked for them: `named` is set
+    /// when the file wrote `provider = "local"`, and `enabled` alone covers a
+    /// file that relied on the old default.
+    pub(super) fn drop_removed_local_provider(&mut self, named: bool) {
+        if self.provider != Provider::Local {
+            return;
+        }
+        self.local_provider_removed = named || self.enabled;
+        self.enabled = false;
+    }
+
     /// Rejects values the tree cannot be built with, naming the key to fix.
     pub fn validate(&self) -> anyhow::Result<()> {
         for (key, value) in [

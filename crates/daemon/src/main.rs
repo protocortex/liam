@@ -218,16 +218,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         &embedder_fingerprint::EmbedderFingerprint::from_config(&config),
     )?;
 
-    if let Some(warning) = config.removed_reranker_warning() {
-        tracing::warn!("{warning}");
-    }
-    if let Some(warning) = config.embedder.removed_device_warning() {
-        tracing::warn!("{warning}");
-    }
-    if let Some(warning) = config.removed_ask_sufficiency_check_warning() {
-        tracing::warn!("{warning}");
-    }
-    for warning in config.removed_gc_page_warnings() {
+    for warning in config.removed_key_warnings() {
         tracing::warn!("{warning}");
     }
     if let Some(warning) = config.missing_config_warning() {

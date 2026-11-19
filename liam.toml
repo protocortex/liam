@@ -7,7 +7,7 @@
 #   liamd serve    socket daemon: everything, including socket_path.
 #   liamd proxy    stdio-to-socket shuttle: socket_path ONLY. It opens no
 #                  store and loads no model, so database_path, [embedder],
-#                  [llm], and [gc] are all ignored.
+#                  and [gc] are all ignored.
 
 database_path  = "liam.db"
 log_filter     = "info,liam=debug"   # RUST_LOG overrides when set
@@ -45,10 +45,11 @@ probe_count                = 20     # most probes drawn from the store to gate a
 # snapshot_dir             = "~/.liam/liam.snapshots"   # default: <database stem>.snapshots beside the database
 
 # Summaries of clusters of recorded nodes, built level by level by the
-# consolidation job. Off until enabled. Needs a real llm provider, not the mock.
+# consolidation job. Off until enabled, and only a hosted provider writes them:
+# `provider = "local"` was the removed in-process model and keeps summaries off.
 [summary]
 enabled                 = false   # false makes the whole hook a no-op
-provider                = "local"  # who writes summaries: local, or a hosted provider (needs [hosted])
+# provider              = "anthropic"   # who writes summaries: a hosted provider (needs [hosted] and [metrics])
 knn                     = 8       # nearest neighbours considered for each item
 min_similarity          = 0.5     # least cosine similarity at which two items are linked
 time_window_hours       = 720     # items further apart than this are not linked
@@ -187,19 +188,6 @@ version = ""
 provider  = "local"                      # "local" (in-process) or "mock" (tests and dev)
 model     = "Snowflake/snowflake-arctic-embed-m-v2.0" # the only embedder: int8 ONNX on the CPU; leave this line out
 cache_dir = "~/.liam/models"       # the embedder's files land here
-
-[llm]
-provider        = "llama-cpp"                       # "llama-cpp" (in-process llama.cpp) or "mock" (tests and dev)
-model           = "Qwen/Qwen2.5-1.5B-Instruct-GGUF" # weights repo (quant files only)
-gguf_file       = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
-# Architecture is auto-detected from the GGUF metadata: qwen2, qwen3, gemma/2/3,
-# llama, mistral, phi3 all work.
-cache_dir       = "~/.liam/models"
-device          = "auto"   # auto | metal | cuda | cpu; auto = fastest compiled in, else cpu
-warmup          = false    # true loads the model at start and pays Metal's ~10s first-call kernel compile then; false loads it on first use
-idle_unload_secs = 300     # unload the model after this many idle seconds to free its memory; 0 never unloads
-context_tokens  = 8192     # sizes the llama.cpp context and the budget of clusters
-max_concurrent_generations = 0   # 0 = auto-tune from a one-time benchmark; set a fixed number to disable
 
 # Derives subject/predicate/object facts from the log. Off until enabled.
 [extraction]
