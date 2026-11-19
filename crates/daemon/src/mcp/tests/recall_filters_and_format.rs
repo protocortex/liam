@@ -75,6 +75,60 @@ async fn recall_filters_by_scope() {
     assert!(!out.contains("runs weekly"), "scope filter leaked: {out}");
 }
 
+async fn recall_in(server: &MemoryServer, scope: &str) -> String {
+    server
+        .recall(Parameters(RecallArgs {
+            query: "zorbnax queue".to_string(),
+            kind: None,
+            scope: Some(scope.to_string()),
+            k: None,
+            as_of: None,
+            mode: None,
+        }))
+        .await
+}
+
+#[tokio::test]
+async fn recall_for_each_of_two_producers_returns_only_what_its_scope_allows() {
+    // Arrange: two connections over one store, each writing in its own
+    // child of a shared parent scope.
+    let template = plain_server().await;
+    let server_a = template.clone();
+    server_a.set_producer("agent-a");
+    let server_b = template.clone();
+    server_b.set_producer("agent-b");
+    seed_scoped(
+        &server_a,
+        "fact",
+        "From a",
+        "the zorbnax queue is drained by a",
+        Some("team/a"),
+    )
+    .await;
+    seed_scoped(
+        &server_b,
+        "fact",
+        "From b",
+        "the zorbnax queue is drained by b",
+        Some("team/b"),
+    )
+    .await;
+    // Act
+    let own_a = recall_in(&server_a, "team/a").await;
+    let own_b = recall_in(&server_b, "team/b").await;
+    let parent = recall_in(&server_a, "team").await;
+
+    // Assert: a child scope shows only its own writes, the parent shows both.
+    assert!(own_a.contains("drained by a"), "missing a: {own_a}");
+    assert!(!own_a.contains("drained by b"), "scope leaked: {own_a}");
+    assert!(own_b.contains("drained by b"), "missing b: {own_b}");
+    assert!(!own_b.contains("drained by a"), "scope leaked: {own_b}");
+    assert!(
+        parent.contains("drained by a") && parent.contains("drained by b"),
+        "the parent scope must read its descendants: {parent}"
+    );
+}
+
 #[tokio::test]
 async fn recall_respects_k() {
     // Arrange: three nodes all matching the query term.
