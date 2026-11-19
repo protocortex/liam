@@ -41,18 +41,11 @@ impl Fixture {
             Vec::new(),
         )
         .unwrap();
-        let server = MemoryServer::new(
-            Arc::clone(&subjects.store),
-            embedder(),
-            Arc::new(liam_model::MockLlm),
-            30,
-            8192,
-            1,
-        )
-        .with_admin(AdminConfig {
-            producers: admins.iter().map(|name| (*name).to_owned()).collect(),
-        })
-        .with_delete_preview(Arc::new(preview));
+        let server = MemoryServer::new(Arc::clone(&subjects.store), embedder(), 30)
+            .with_admin(AdminConfig {
+                producers: admins.iter().map(|name| (*name).to_owned()).collect(),
+            })
+            .with_delete_preview(Arc::new(preview));
         Self {
             dir,
             subjects,

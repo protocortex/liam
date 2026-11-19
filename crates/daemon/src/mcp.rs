@@ -35,12 +35,11 @@ mod test_doubles;
 #[cfg(test)]
 mod usage_tests;
 
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use liam_daemon::consolidation::shared_store::SharedStore;
-use liam_model::{Embedder, Llm, TextKind};
+use liam_model::{Embedder, TextKind};
 use liam_store::types::{EpisodeEdge, EpisodeRef};
 use liam_store::{
     relation, DefaultGraph, EventRef, EventRole, Millis, NewNode, NodeId, Query, Vocabulary,
@@ -50,7 +49,6 @@ use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use self::delete::DeleteArgs;
@@ -60,7 +58,7 @@ use self::feedback::{Feedback, FeedbackArgs};
 use self::metrics::MetricsArgs;
 use self::reply::ToolReply;
 use self::summaries::SummariesArgs;
-use crate::clusters::{narrow_groups, render_clusters};
+use crate::clusters::{narrow_groups, render_clusters, CLUSTERS_BUDGET_CHARS};
 use crate::config::{
     resolve_vocabulary, AdminConfig, ExtractionConfig, DEFAULT_MAX_BASIS_IDS_RENDERED,
     DEFAULT_MIN_SUMMARY_SIMILARITY, DEFAULT_RECALL_TIMEOUT_SECS,
@@ -71,7 +69,6 @@ use crate::deletion::DeletePreview;
 use crate::entity_page;
 use crate::metrics::recorder::{Metrics, ToolTimer};
 use crate::metrics::sink::{Stage, Tool};
-use crate::prompt::estimate_tokens;
 use crate::recall::{candidate_pool, clamp_recall_k};
 use crate::render;
 use crate::tiering::usage::UsageRecorder;
@@ -404,30 +401,18 @@ pub struct MemoryServer {
     /// slot: reach it through `store()`, never keeping the guard across calls.
     store: Arc<SharedStore>,
     embedder: Arc<dyn Embedder>,
-    llm: Arc<dyn Llm>,
     /// Wall-clock deadline for one batch of entity-page builds (embedding the
     /// mentions and the page); see `config::Config::ask_timeout_secs`, whose
     /// name predates the removal of `ask`.
     synthesis_timeout_secs: u64,
     /// Seconds `recall` may spend retrieving; see `retrieval_deadline`.
     recall_timeout_secs: u64,
-    /// The model's context window in tokens, see `config::LlmConfig::context_tokens`.
-    /// `clusters` takes one tenth of it as its output budget (ADR-0002 S4).
-    context_tokens: usize,
     /// Event ids a provenance line lists before it counts the rest; see
     /// `config::SummaryConfig::max_basis_ids_rendered`.
     max_basis_ids_rendered: usize,
     /// Least similarity of a query to a summary for `summaries` to list it; see
     /// `config::SummaryConfig::min_summary_similarity`.
     min_summary_similarity: f32,
-    /// Bounds how many generations may be inside a model call at once; see
-    /// `config::LlmConfig::max_concurrent_generations`. A semaphore, not a
-    /// lock, so an operator with memory headroom can raise the limit above 1
-    /// instead of every request serializing permanently.
-    generation_permits: Arc<Semaphore>,
-    /// Authoritative total permit count the cold-start benchmark sets, distinct
-    /// from `generation_permits.available_permits()`.
-    granted_capacity: Arc<AtomicUsize>,
     /// Producer id stamped on every node this connection's `remember` calls
     /// write. Per-CONNECTION, unlike every field above it, which is set once
     /// for the process's whole lifetime: that mismatch is why this is not a
@@ -547,34 +532,18 @@ fn with_reasons(
 
 #[tool_router]
 impl MemoryServer {
-    // Each argument is a distinct config field threaded straight through, the
-    // established pattern in this constructor (see `synthesis_timeout_secs`
-    // and `context_tokens` above); a config struct
-    // parameter would hide which fields `MemoryServer` actually depends on.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<DefaultGraph>,
         embedder: Arc<dyn Embedder>,
-        llm: Arc<dyn Llm>,
         synthesis_timeout_secs: u64,
-        context_tokens: usize,
-        max_concurrent_generations: usize,
     ) -> Self {
-        // `Semaphore::new(0)` would deadlock every entity synthesis forever. `0` means
-        // auto-tune (see `main.rs::build_autotuned_server`); this floor only
-        // matters for a direct explicit-`0` construction that bypasses it.
-        let max_concurrent_generations = max_concurrent_generations.max(1);
         Self {
             store: Arc::new(SharedStore::from_arc(store)),
             embedder,
-            llm,
             synthesis_timeout_secs,
             recall_timeout_secs: DEFAULT_RECALL_TIMEOUT_SECS,
-            context_tokens,
             max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
             min_summary_similarity: DEFAULT_MIN_SUMMARY_SIMILARITY,
-            generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
-            granted_capacity: Arc::new(AtomicUsize::new(max_concurrent_generations)),
             producer: OnceLock::new(),
             shutdown: CancellationToken::new(),
             vocabulary: Arc::new(resolve_vocabulary(&ExtractionConfig::default())),
@@ -741,24 +710,6 @@ impl MemoryServer {
                  producer and its writes are misattributed"
             );
         }
-    }
-
-    /// Shares this server's language model, so a job that generates text takes
-    /// turns on the same permits as the server does.
-    pub(crate) fn llm_handle(&self) -> Arc<dyn Llm> {
-        self.llm.clone()
-    }
-
-    /// Shares this server's generation semaphore so startup can grow it
-    /// once the auto-tune benchmark learns the real ceiling.
-    pub(crate) fn generation_permits_handle(&self) -> Arc<Semaphore> {
-        self.generation_permits.clone()
-    }
-
-    /// Shares this server's authoritative granted-capacity counter, so a
-    /// cold-start benchmark that grows the semaphore can keep it in step.
-    pub(crate) fn granted_capacity_handle(&self) -> Arc<AtomicUsize> {
-        self.granted_capacity.clone()
     }
 
     /// Shares this server's store slot with the consolidation job, whose
@@ -1351,15 +1302,7 @@ impl MemoryServer {
             Err(e) => return format!("clusters failed: {e}"),
         };
         let narrowed = narrow_groups(&groups, args.k, args.members);
-        // One tenth of the configured context (ADR-0002 S4): the operator's
-        // declared "how much text is reasonable on this machine", not a
-        // promise about the MCP client's own context.
-        let budget = self.context_tokens / 10;
-        render_clusters(&narrowed, budget, |s| {
-            self.llm
-                .count_tokens(s)
-                .unwrap_or_else(|| estimate_tokens(s))
-        })
+        render_clusters(&narrowed, CLUSTERS_BUDGET_CHARS)
     }
 
     #[tool(

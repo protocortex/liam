@@ -58,15 +58,7 @@ async fn staged() -> Staged {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .unwrap();
-    let server = MemoryServer::new(
-        Arc::new(store),
-        embedder(),
-        Arc::new(liam_model::MockLlm),
-        30,
-        8192,
-        1,
-    )
-    .with_metrics(metrics.clone());
+    let server = MemoryServer::new(Arc::new(store), embedder(), 30).with_metrics(metrics.clone());
     Staged {
         metrics,
         sink,

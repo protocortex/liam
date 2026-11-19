@@ -155,9 +155,9 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-deny
-      # cargo-deny reads Cargo metadata only, so it cannot see the vendored
-      # llama.cpp C++ sources, libgomp, or libstdc++. That C/C++ blind spot is
-      # covered by manual review notes in deny.toml, not by this job.
+      # cargo-deny reads Cargo metadata only, so it cannot see the native
+      # libraries a dependency links. That blind spot is covered by the manual
+      # review note in deny.toml, not by this job.
       - run: cargo deny check
 
   # Blocking: fails when line coverage is below FLOOR, which is 95. The tool
@@ -204,11 +204,6 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
     timeout-minutes: 25
-    env:
-      # The runner image now ships Homebrew OpenSSL 4, which llama.cpp's CMake
-      # finds but cannot link, so a cold build fails. The vendored server's
-      # HTTPS support is unused here.
-      CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: "ON"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -219,8 +214,7 @@ jobs:
           save-if: ${{ env.CACHE_SAVE_IF }}
       - name: Test
         run: cargo test --workspace
-      # Metal is compiled in by target inside llama-cpp-sys-2's build script,
-      # so it needs no extra setup. The tests that need model weights are
-      # #[ignore]d, so this downloads nothing and needs no GPU.
+      # The tests that need model weights are #[ignore]d, so this downloads
+      # nothing.
       - name: Build
         run: cargo build -p liam-daemon

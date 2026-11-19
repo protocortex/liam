@@ -46,7 +46,6 @@ pub struct RunManifest {
     pub run_id: String,
     pub seed: u64,
     pub embedder: EmbedderFingerprint,
-    pub llm_model_fingerprint: String,
     pub created_at: Millis,
     pub snapshot_log_offset: Option<u64>,
     /// The snapshot's metadata file, which a rollback restores from.
@@ -84,10 +83,6 @@ pub enum ResumeRefused {
         recorded: Box<EmbedderFingerprint>,
         current: Box<EmbedderFingerprint>,
     },
-    LlmChanged {
-        recorded: String,
-        current: String,
-    },
     ExtractionModelChanged {
         recorded: Box<ExtractionModel>,
         current: Option<Box<ExtractionModel>>,
@@ -101,11 +96,6 @@ impl std::fmt::Display for ResumeRefused {
                 f,
                 "the interrupted run used embedder {recorded:?} but the configured one is \
                  {current:?}; finish or discard that run first"
-            ),
-            Self::LlmChanged { recorded, current } => write!(
-                f,
-                "the interrupted run used LLM {recorded} but the configured one is {current}; \
-                 finish or discard that run first"
             ),
             Self::ExtractionModelChanged { recorded, current } => write!(
                 f,
@@ -139,14 +129,12 @@ impl RunManifest {
         run_id: String,
         seed: u64,
         embedder: EmbedderFingerprint,
-        llm_model_fingerprint: String,
         created_at: Millis,
     ) -> Self {
         Self {
             run_id,
             seed,
             embedder,
-            llm_model_fingerprint,
             created_at,
             snapshot_log_offset: None,
             snapshot_meta_path: None,
@@ -219,26 +207,19 @@ impl RunManifest {
         self.save(path)
     }
 
-    /// Refuses to resume under a different embedder, LLM or extraction model
+    /// Refuses to resume under a different embedder or extraction model
     /// than the run began with, since steps already done would then mix two
     /// models' output. A run that has not started extracting has no extraction
     /// model to keep.
     pub fn check_resumable(
         &self,
         embedder: &EmbedderFingerprint,
-        llm_model_fingerprint: &str,
         extraction_model: Option<&ExtractionModel>,
     ) -> Result<(), ResumeRefused> {
         if &self.embedder != embedder {
             return Err(ResumeRefused::EmbedderChanged {
                 recorded: Box::new(self.embedder.clone()),
                 current: Box::new(embedder.clone()),
-            });
-        }
-        if self.llm_model_fingerprint != llm_model_fingerprint {
-            return Err(ResumeRefused::LlmChanged {
-                recorded: self.llm_model_fingerprint.clone(),
-                current: llm_model_fingerprint.to_owned(),
             });
         }
         if let Some(recorded) = &self.extraction_model {
@@ -280,13 +261,7 @@ mod tests {
     }
 
     fn manifest() -> RunManifest {
-        RunManifest::new(
-            "run-1".into(),
-            42,
-            fingerprint(),
-            "llm/model.gguf".into(),
-            Millis(1_000),
-        )
+        RunManifest::new("run-1".into(), 42, fingerprint(), Millis(1_000))
     }
 
     const STEPS: [&str; 5] = ["snapshot", "dedup", "maintenance", "hooks", "probes"];
@@ -309,6 +284,26 @@ mod tests {
 
         // Act
         original.save(&path).unwrap();
+        let loaded = RunManifest::load(&path).unwrap();
+
+        // Assert
+        assert_eq!(loaded, Some(original));
+    }
+
+    #[test]
+    fn a_manifest_an_older_daemon_wrote_with_an_llm_fingerprint_still_loads() {
+        // Arrange: the file an earlier version saved, which named the
+        // generation model the run was made under.
+        let dir = tempfile::tempdir().unwrap();
+        let path = manifest_path_for(&dir.path().join("liam.db"));
+        let original = manifest();
+        original.save(&path).unwrap();
+        let mut saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        saved["llm_model_fingerprint"] = "Qwen/Qwen2.5-1.5B-Instruct-GGUF/model.gguf".into();
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+        // Act
         let loaded = RunManifest::load(&path).unwrap();
 
         // Assert
@@ -422,7 +417,7 @@ mod tests {
         run.extraction_model = Some(extraction("a"));
 
         // Act
-        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", Some(&extraction("b")));
+        let result = run.check_resumable(&fingerprint(), Some(&extraction("b")));
 
         // Assert
         assert!(matches!(
@@ -438,7 +433,7 @@ mod tests {
         run.extraction_model = Some(extraction("a"));
 
         // Act
-        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", None);
+        let result = run.check_resumable(&fingerprint(), None);
 
         // Assert
         assert!(result.is_err());
@@ -450,7 +445,7 @@ mod tests {
         let run = manifest();
 
         // Act
-        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", Some(&extraction("b")));
+        let result = run.check_resumable(&fingerprint(), Some(&extraction("b")));
 
         // Assert
         assert_eq!(result, Ok(()));
@@ -463,7 +458,7 @@ mod tests {
         run.extraction_model = Some(extraction("a"));
 
         // Act
-        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", Some(&extraction("a")));
+        let result = run.check_resumable(&fingerprint(), Some(&extraction("a")));
 
         // Assert
         assert_eq!(result, Ok(()));
@@ -545,7 +540,7 @@ mod tests {
         let run = manifest();
 
         // Act
-        let result = run.check_resumable(&fingerprint(), "llm/model.gguf", None);
+        let result = run.check_resumable(&fingerprint(), None);
 
         // Assert
         assert_eq!(result, Ok(()));
@@ -559,7 +554,7 @@ mod tests {
         other.model = "other-model".into();
 
         // Act
-        let result = run.check_resumable(&other, "llm/model.gguf", None);
+        let result = run.check_resumable(&other, None);
 
         // Assert
         assert_eq!(
@@ -567,24 +562,6 @@ mod tests {
             Err(ResumeRefused::EmbedderChanged {
                 recorded: Box::new(fingerprint()),
                 current: Box::new(other),
-            })
-        );
-    }
-
-    #[test]
-    fn resuming_with_a_changed_llm_is_refused() {
-        // Arrange
-        let run = manifest();
-
-        // Act
-        let result = run.check_resumable(&fingerprint(), "llm/other.gguf", None);
-
-        // Assert
-        assert_eq!(
-            result,
-            Err(ResumeRefused::LlmChanged {
-                recorded: "llm/model.gguf".into(),
-                current: "llm/other.gguf".into(),
             })
         );
     }

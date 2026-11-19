@@ -75,7 +75,10 @@ pub struct Config {
     pub embedding_dims: usize,
     pub gc: GcConfig,
     pub embedder: EmbedderConfig,
-    pub llm: LlmConfig,
+    /// The removed `[llm]` section. Kept so an old `liam.toml` still loads, since
+    /// `deny_unknown_fields` would reject it. Its content is ignored.
+    #[doc(hidden)]
+    pub llm: Option<toml::Value>,
     /// Wall-clock cap on one batch of entity-page syntheses. The key keeps the
     /// name it had when `ask` shared it, so an existing `liam.toml` still loads.
     pub ask_timeout_secs: u64,
@@ -180,44 +183,6 @@ pub struct GcConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, deny_unknown_fields)]
-pub struct LlmConfig {
-    /// "mock" (tests and dev) or "llama-cpp" (in-process llama.cpp).
-    /// "local" was the retired candle provider.
-    pub provider: String,
-    /// Hugging Face model id (GGUF repo) for the local provider.
-    pub model: String,
-    /// GGUF filename within the repo (GGUF repos host multiple quant variants,
-    /// so the file must be named explicitly). Consumed by the llama.cpp
-    /// provider's loader.
-    pub gguf_file: String,
-    /// Where model files live (offline after first fetch).
-    pub cache_dir: String,
-    /// Compute backend: "auto" (default), "metal", "cuda", or "cpu". `auto` takes
-    /// the fastest backend compiled into this binary and falls back to CPU. macOS
-    /// builds include Metal automatically; CUDA is not built and is refused.
-    /// See `liam_model::llm::DevicePreference`.
-    pub device: String,
-    /// Load the model and generate one throwaway token at startup, so the
-    /// backend's first-call cost (on Metal, ~10s of GPU kernel compilation) is
-    /// paid before a user waits. Off by default: the model then loads on the
-    /// first call that needs it.
-    pub warmup: bool,
-    /// Seconds without a generation after which the model is unloaded to give
-    /// its memory back; the next call loads it again. `0` never unloads.
-    pub idle_unload_secs: u64,
-    /// The model's context window. Sizes both the llama.cpp context and the
-    /// mention trimming in entity synthesis, because those two have to agree: if
-    /// they disagreed a full-size prompt would overflow the context and decode
-    /// would fail.
-    pub context_tokens: usize,
-    /// Each concurrent context costs about 110MB of KV cache. `0`, the
-    /// default, means auto-tune; set explicitly to use a fixed limit instead.
-    pub max_concurrent_generations: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[serde(default, deny_unknown_fields)]
 pub struct ProducersConfig {
     /// Producer id recorded for a connecting MCP client whose name is not a
     /// key in `clients`. Defaults to "unknown", the same fallback
@@ -241,7 +206,7 @@ impl Default for Config {
             embedding_dims: DEFAULT_EMBEDDING_DIMS,
             gc: GcConfig::default(),
             embedder: EmbedderConfig::default(),
-            llm: LlmConfig::default(),
+            llm: None,
             ask_timeout_secs: 30,
             recall_timeout_secs: DEFAULT_RECALL_TIMEOUT_SECS,
             ask_sufficiency_check: None,
@@ -374,24 +339,6 @@ impl Default for GcConfig {
     }
 }
 
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            provider: "mock".into(),
-            // Small enough to load on a CPU-only machine, and Apache-2.0 at
-            // this size (the 3B is not).
-            model: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".into(),
-            gguf_file: "qwen2.5-1.5b-instruct-q4_k_m.gguf".into(),
-            cache_dir: "~/.liam/models".into(),
-            device: "auto".into(),
-            warmup: false,
-            idle_unload_secs: DEFAULT_LLM_IDLE_UNLOAD_SECS,
-            context_tokens: 8192,
-            max_concurrent_generations: 0,
-        }
-    }
-}
-
 /// Expands a leading `~` to `home`. A bare `~` becomes `home`; `~/rest`
 /// becomes `{home}/rest`; anything else, including a path with no leading
 /// `~`, is returned unchanged. Takes `home` explicitly rather than reading
@@ -442,9 +389,6 @@ pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 /// Default seconds `recall` may spend retrieving.
 pub const DEFAULT_RECALL_TIMEOUT_SECS: u64 = 10;
-
-/// Default seconds the LLM may sit unused before it is unloaded.
-pub const DEFAULT_LLM_IDLE_UNLOAD_SECS: u64 = 300;
 
 /// The config file read when neither `--config` nor `LIAM_CONFIG` says
 /// otherwise.
@@ -497,24 +441,6 @@ impl Config {
             });
         }
         let text = std::fs::read_to_string(path)?;
-
-        // Parse into a permissive `toml::Value` first so we can name a removed
-        // key with a helpful error before the strict parse below rejects it as
-        // just another unknown field. We check the parsed value rather than
-        // matching on toml's error string: error text is not part of the
-        // crate's stability contract, so a string match would silently stop
-        // catching this the next time the `toml` dependency is upgraded.
-        let value: toml::Value = toml::from_str(&text)?;
-        if value
-            .get("llm")
-            .and_then(|llm| llm.get("tokenizer_model"))
-            .is_some()
-        {
-            anyhow::bail!(
-                "llm.tokenizer_model was removed: llama.cpp reads the tokenizer \
-                 from the GGUF, delete this line from your liam.toml"
-            );
-        }
 
         let mut config: Self = toml::from_str(&text)?;
         config.embedder.validate()?;
@@ -905,54 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn the_llm_loads_on_first_use_and_unloads_after_five_idle_minutes_by_default() {
-        // Arrange
-        let path = write_temp_toml("");
-
-        // Act
-        let c = Config::load(&path).expect("empty config parses");
-
-        // Assert
-        assert!(!c.llm.warmup);
-        assert_eq!(c.llm.idle_unload_secs, 300);
-    }
-
-    #[test]
-    fn an_explicit_idle_unload_and_warmup_round_trip() {
-        // Arrange
-        let path = write_temp_toml("[llm]\nwarmup = true\nidle_unload_secs = 0\n");
-
-        // Act
-        let c = Config::load(&path).expect("config with the keys parses");
-
-        // Assert
-        assert!(c.llm.warmup);
-        assert_eq!(c.llm.idle_unload_secs, 0);
-    }
-
-    #[test]
-    fn a_bad_idle_unload_value_fails_the_config_load() {
-        // Arrange
-        let cases = ["\"soon\"", "-1", "1.5"];
-
-        for bad in cases {
-            let path = write_temp_toml(&format!("[llm]\nidle_unload_secs = {bad}\n"));
-
-            // Act
-            let result = Config::load(&path);
-
-            // Assert
-            assert!(result.is_err(), "{bad} must be refused");
-        }
-    }
-
-    #[test]
-    fn llm_defaults_to_mock() {
-        let c = Config::default();
-        assert_eq!(c.llm.provider, "mock");
-    }
-
-    #[test]
     fn shipped_liam_toml_parses() {
         // WHY: `deny_unknown_fields` plus TOML's table scoping (a top-level key
         // written after a `[table]` header belongs to that table) make it easy to
@@ -962,8 +840,6 @@ mod tests {
         let c = Config::load(path).expect("shipped liam.toml must parse");
         assert_eq!(c.ask_timeout_secs, 30);
         assert!(c.removed_ask_sufficiency_check_warning().is_none());
-        assert_eq!(c.llm.context_tokens, 8192);
-        assert_eq!(c.llm.max_concurrent_generations, 0);
         assert_eq!(c.socket_path, "~/.liam/liamd.sock");
         // The SHIPPED liam.toml is the dev config and keeps a relative
         // database next to the checkout, which is what `cargo run` wants.
@@ -976,43 +852,6 @@ mod tests {
             c.producers.clients.get("ai-notetaker"),
             Some(&"notetaker".to_string())
         );
-    }
-
-    #[test]
-    fn llm_device_default_is_a_value_the_model_crate_accepts() {
-        // The daemon rejects an unparseable device at startup, so the shipped
-        // default must parse. This catches a typo in our own default.
-        let c = Config::default();
-        assert_eq!(
-            liam_model::llm::DevicePreference::parse(&c.llm.device),
-            Some(liam_model::llm::DevicePreference::Auto)
-        );
-        assert!(!c.llm.warmup, "the model loads on first use by default");
-    }
-
-    #[test]
-    fn stale_tokenizer_model_key_names_itself_and_the_fix() {
-        let path = write_temp_toml("[llm]\ntokenizer_model = \"Qwen/Qwen2.5-1.5B-Instruct\"\n");
-        let err = Config::load(&path).expect_err("stale tokenizer_model must be rejected");
-        let message = err.to_string();
-        assert!(
-            message.contains("llm.tokenizer_model"),
-            "error should name the removed key: {message}"
-        );
-        assert!(
-            message.contains("delete"),
-            "error should say to delete the line: {message}"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn llm_context_and_concurrency_default_when_absent() {
-        let path = write_temp_toml("[llm]\nprovider = \"mock\"\n");
-        let c = Config::load(&path).expect("config without the new llm keys must still parse");
-        assert_eq!(c.llm.context_tokens, 8192);
-        assert_eq!(c.llm.max_concurrent_generations, 0);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

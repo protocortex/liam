@@ -596,18 +596,6 @@ fn an_unknown_provider_is_refused_instead_of_planning_nothing() {
     // Assert
     assert!(err.contains("embedder.provider"), "{err}");
     assert!(err.contains("\"loca\""), "{err}");
-
-    // Arrange
-    let mut config = Config::default();
-    config.llm.provider = "llama".to_string();
-
-    // Act
-    let err = plan_for(&config, "macos", "aarch64")
-        .unwrap_err()
-        .to_string();
-
-    // Assert
-    assert!(err.contains("llm.provider"), "{err}");
 }
 
 #[test]
@@ -615,14 +603,13 @@ fn only_extraction_enabled_plans_the_extraction_files_with_mock_providers() {
     // Arrange
     let config = config_with(extraction(true, true));
     assert_eq!(config.embedder.provider, "mock");
-    assert_eq!(config.llm.provider, "mock");
 
     // Act
     let plan = plan_for(&config, "macos", "aarch64").unwrap();
 
     // Assert
     assert!(!plan.is_empty());
-    assert!(!plan.embedder && !plan.llm);
+    assert!(!plan.embedder);
     assert_eq!(
         plan.extraction,
         Some(ExtractionTargets {
@@ -630,6 +617,48 @@ fn only_extraction_enabled_plans_the_extraction_files_with_mock_providers() {
             model: Target::Install(default_model_path("/home/test")),
         })
     );
+}
+
+#[test]
+fn an_old_config_naming_the_removed_generation_model_plans_only_the_embedder() {
+    // Arrange: the config an earlier version shipped, which asked for the
+    // llama.cpp model and its GGUF file.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("liam.toml");
+    std::fs::write(
+        &path,
+        "[embedder]\nprovider = \"local\"\n\n[llm]\nprovider = \"llama-cpp\"\n\
+         gguf_file = \"qwen2.5-1.5b-instruct-q4_k_m.gguf\"\n",
+    )
+    .unwrap();
+    let config = Config::load(&path).unwrap();
+
+    // Act
+    let plan = plan_for(&config, "macos", "aarch64").unwrap();
+
+    // Assert: the arctic embedder is the only model it fetches.
+    assert_eq!(
+        plan,
+        FetchPlan {
+            embedder: true,
+            extraction: None
+        }
+    );
+}
+
+#[test]
+fn an_old_config_with_only_the_removed_generation_model_has_nothing_to_fetch() {
+    // Arrange
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("liam.toml");
+    std::fs::write(&path, "[llm]\nprovider = \"llama-cpp\"\n").unwrap();
+    let config = Config::load(&path).unwrap();
+
+    // Act
+    let plan = plan_for(&config, "macos", "aarch64").unwrap();
+
+    // Assert
+    assert!(plan.is_empty());
 }
 
 #[test]

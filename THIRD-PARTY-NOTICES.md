@@ -8,15 +8,14 @@ where to find those.
 
 LIAM's own licensing terms are in this repository's LICENSE file.
 
-## llama.cpp and ggml
+## Native code in the binary
 
-LIAM links llama.cpp and its ggml tensor library directly into the binary.
-They are vendored C++ sources built by the `llama-cpp-sys-2` crate, not a
-system library and not downloaded at runtime. Both llama.cpp and ggml are
-MIT licensed. It is the largest bundled native (non-Rust) code in LIAM, and
-the entry most readers checking this file are looking for. The `zstd-sys`
-crate also compiles the zstd C library (BSD-3-Clause) into the binary, for the
-log archive; see "zstd" below.
+LIAM no longer links llama.cpp or ggml: the in-process generation model was
+removed. The `zstd-sys` crate compiles the zstd C library (BSD-3-Clause) into
+the binary, for the log archive; see "zstd" below. The ONNX Runtime library
+that `ort` loads runs the embedder. llama.cpp still appears as the separate
+`llama-server` program that extraction downloads, see "Components fetched at
+install".
 
 ## zstd
 
@@ -82,15 +81,15 @@ clap_derive, clap_lex, cmake, cmov, cobs, colorchoice, core-foundation, core-
 foundation-sys, cpubits, cpufeatures, crc32fast, crossbeam-deque, crossbeam-
 epoch, crossbeam-utils, crypto-common, ctr, ctutils, dary_heap, der, deranged,
 derive_builder, derive_builder_core, derive_builder_macro, digest, dirs, dirs-
-sys, displaydoc, dyn-clone, either, enumflags2, enumflags2_derive, equivalent,
-errno, fastbloom, fastrand, fdeflate, find-msvc-tools, find_cuda_helper,
+sys, displaydoc, dyn-clone, either, equivalent,
+errno, fastbloom, fastrand, fdeflate, find-msvc-tools,
 fixedbitset, flate2, fnv, form_urlencoded, futures, futures-channel, futures-
 core, futures-executor, futures-io, futures-macro, futures-sink, futures-task,
 futures-util, getrandom, ghash, gif, glob, half, hashbrown, heck, hmac, home,
 http, httparse, humantime, hybrid-array, hyper-tls, iana-time-zone,
 ident_case, idna, idna_adapter, image, image-webp, indexmap, inout, ipnet,
 is_terminal_polyfill, itertools, itoa, jobserver, lazy_static, lazycell,
-leiden-rs, libc, llama-cpp-2, llama-cpp-sys-2, lock_api, log, matrixmultiply,
+leiden-rs, libc, lock_api, log, matrixmultiply,
 mime, minimal-lexical, monostate, monostate-impl, native-tls, ndarray,
 no_std_io2, num-bigint, num-complex, num-conv, num-derive, num-integer, num-
 rational, num-traits, num_cpus, object_store, once_cell, ort, ort-sys,
@@ -172,12 +171,13 @@ The plan for this migration calls out a few dependencies by name. Here is
 where each one landed, confirmed against the current tree rather than
 assumed:
 
-- **llama.cpp**: vendored C++, MIT. See the callout above.
+- **llama.cpp**: no longer linked. `llama-cpp-2` and `llama-cpp-sys-2` were
+  removed with the in-process generation model. The `llama-server` that
+  extraction downloads is a separate program, listed under "Components fetched
+  at install".
 - **candle**: `candle-core`, `candle-nn` and `candle-metal-kernels` are no
-  longer in the tree. Candle's text-generation code path was removed when LIAM
-  moved generation to llama.cpp, and the Qwen3 and BGE-M3 embedders that ran
-  on it were removed when the Snowflake arctic ONNX model became the only
-  embedder.
+  longer in the tree. The Qwen3 and BGE-M3 embedders that ran on it were
+  removed when the Snowflake arctic ONNX model became the only embedder.
 - **fastembed and ort**: `fastembed` (Apache-2.0) and `ort` plus `ort-sys`
   (MIT OR Apache-2.0) are still in the tree; they run the local embedding
   models.
@@ -192,8 +192,8 @@ GPL, LGPL, or AGPL license.
 The full text of each Rust crate's license is available in that crate's own
 repository (linked from its crates.io page) or inside the crate's source,
 which `cargo vendor` or `cargo package --list` can retrieve locally. The
-full text of llama.cpp's and ggml's MIT licenses is available in their
-upstream repositories. For LIAM's own license terms, see this repository's
+full text of the MIT license of llama.cpp, the `llama-server` that extraction
+downloads, is kept beside that binary. For LIAM's own license terms, see this repository's
 LICENSE file.
 
 ## Regenerating this list

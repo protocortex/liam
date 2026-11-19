@@ -155,7 +155,6 @@ async fn an_unfinished_run_is_resumed_not_restarted() {
         "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_owned(),
         3,
         identity(config).embedder,
-        identity(config).llm_model,
         Millis(1),
     );
     unfinished
@@ -205,7 +204,6 @@ async fn a_run_is_refused_while_the_last_one_ended_restore_failed() {
         "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_owned(),
         3,
         identity(&setup.config).embedder,
-        identity(&setup.config).llm_model,
         Millis(1),
     );
     failed.outcome = Some(RunOutcome::RestoreFailed);

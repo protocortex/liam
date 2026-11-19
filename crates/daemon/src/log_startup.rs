@@ -215,8 +215,6 @@ pub(crate) mod test_support {
             embedding_dims: DIMS,
             ..Config::default()
         };
-        config.llm.warmup = false;
-        config.llm.max_concurrent_generations = 1;
         config.log.dir = Some(log_dir_in(dir).to_str().unwrap().to_string());
         config
     }

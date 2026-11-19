@@ -37,14 +37,7 @@ async fn server_over(embedder: Arc<dyn Embedder>) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .expect("open in-memory store");
-    MemoryServer::new(
-        Arc::new(store),
-        embedder,
-        Arc::new(liam_model::MockLlm),
-        30,
-        8192,
-        1,
-    )
+    MemoryServer::new(Arc::new(store), embedder, 30)
 }
 
 async fn stored_matches(server: &MemoryServer, text: &str) -> usize {

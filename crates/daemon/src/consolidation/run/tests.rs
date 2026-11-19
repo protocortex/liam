@@ -405,7 +405,6 @@ impl Env {
         };
         let identity = Identity {
             embedder: fingerprint(),
-            llm_model: "llm/model.gguf".into(),
         };
         let parts = Parts {
             embedder: self.embedder.clone(),

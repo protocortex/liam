@@ -33,6 +33,9 @@ use super::tree::{
 };
 use crate::extraction::gate::{Decision, GateItem, ProviderGate};
 
+/// The context window a summary request is sized for, in tokens: the prompt
+/// is trimmed to what is left after the reply's share.
+const SUMMARY_CONTEXT_TOKENS: usize = 8192;
 /// Tokens a summary may run to: two to four sentences, with room to spare.
 const SUMMARY_MAX_NEW_TOKENS: usize = 512;
 const MILLIS_PER_HOUR: i64 = 3_600_000;
@@ -47,12 +50,10 @@ pub struct SummaryHooks {
     pub summariser: Arc<dyn Summariser>,
     /// Set for a hosted provider: what it may be sent.
     pub gate: Option<Arc<ProviderGate>>,
-    /// The daemon's generation permits, shared with the other model users.
+    /// The daemon's model-call permits, shared with the other model users.
     pub permits: Arc<Semaphore>,
     pub cache: Arc<dyn SummaryCache>,
     pub embedder: Arc<dyn ContentEmbedder>,
-    /// The model's context window, in tokens.
-    pub context_tokens: usize,
 }
 
 /// An item of one level, with what a summary of it needs.
@@ -204,7 +205,7 @@ impl<'a> Run<'a> {
                 max_unattached: config.max_unattached,
             },
             settings: GenerateSettings {
-                context_tokens: hooks.context_tokens.saturating_sub(SUMMARY_MAX_NEW_TOKENS),
+                context_tokens: SUMMARY_CONTEXT_TOKENS - SUMMARY_MAX_NEW_TOKENS,
                 max_new_tokens: SUMMARY_MAX_NEW_TOKENS,
                 min_grounded_share: config.min_grounded_share,
                 max_summary_failures: config.max_summary_failures,

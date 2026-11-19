@@ -131,18 +131,11 @@ jobs:
         with:
           lookup-only: true
 
-      # llama-cpp-sys-2 compiles llama.cpp from C++ via CMake. This is slow on a
-      # cold cache, so expect a slow run rather than treating it as stuck. A
-      # release builds a profile that ordinary CI does not, so its cache key
-      # rarely matches one CI just populated. Metal is enabled by target inside
-      # that build script.
+      # A release builds a profile that ordinary CI does not, so its cache key
+      # rarely matches one CI just populated and a cold run is slow.
       # Builds both binaries the package declares: `liamd`, the daemon, and
       # `liam`, the CLI that fetches models at install time.
       - name: Build release binaries
-        env:
-          # Homebrew OpenSSL 4 on the runner breaks llama.cpp's CMake; its
-          # HTTPS support is unused.
-          CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: "ON"
         run: cargo build --release -p liam-daemon
 
       # Cheapest possible proof that each binary links and starts. Worth
@@ -189,7 +182,6 @@ jobs:
           mkdir -p dist/staging
           cp liam.toml dist/staging/liam.toml
           grep -Eq '^provider[[:space:]]*=[[:space:]]*"local"' dist/staging/liam.toml
-          grep -Eq '^provider[[:space:]]*=[[:space:]]*"llama-cpp"' dist/staging/liam.toml
           if grep -Eq '^provider[[:space:]]*=[[:space:]]*"mock"' dist/staging/liam.toml; then
             echo "release config still selects a mock provider" >&2
             exit 1

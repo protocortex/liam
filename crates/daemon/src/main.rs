@@ -32,7 +32,6 @@ mod tiering;
 #[cfg(test)]
 mod tool_eval;
 mod transport;
-mod tuning;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,12 +53,10 @@ use config::Config;
 use consolidation_job::{ConsolidationJob, JobSetup};
 use liam_daemon::consolidation::maintenance::standard_steps;
 use liam_daemon::models::{
-    build_embedder, build_serving_llm, prepare_llm_at_start, resolve_config_path, resolve_log_dir,
-    resolve_snapshot_dir, ServingLlm,
+    build_embedder, resolve_config_path, resolve_log_dir, resolve_snapshot_dir,
 };
 use liam_daemon::{embedder_fingerprint, state_dir, storelock, telemetry};
 use liam_log::compactor::CompactorTask;
-use liam_model::{Embedder, Llm};
 use log_startup::StartedStore;
 use mcp::MemoryServer;
 use shutdown::Shutdown;
@@ -257,40 +254,8 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     }
     let store = Arc::new(store);
 
-    let ServingLlm { llm, lazy } = build_serving_llm(&config)?;
-    prepare_llm_at_start(&config, llm.as_ref()).await?;
-
-    let idle_unloader = lazy
-        .and_then(|lazy| lazy.spawn_idle_unloader(config.llm.idle_unload_secs, shutdown.token()));
-
     let job_embedder = embedder.clone();
-    let (server, autotune) = if config.llm.max_concurrent_generations == 0 {
-        let cache_dir = resolve_config_path("llm.cache_dir", &config.llm.cache_dir)?
-            .to_string_lossy()
-            .into_owned();
-        let model_fingerprint = format!("{}/{}", config.llm.model, config.llm.gguf_file);
-        let backend = llm.backend().to_string();
-        build_autotuned_server(
-            store,
-            embedder,
-            llm,
-            config.ask_timeout_secs,
-            config.llm.context_tokens,
-            cache_dir,
-            model_fingerprint,
-            backend,
-        )
-    } else {
-        let server = MemoryServer::new(
-            store,
-            embedder,
-            llm,
-            config.ask_timeout_secs,
-            config.llm.context_tokens,
-            config.llm.max_concurrent_generations,
-        );
-        (server, None)
-    };
+    let server = MemoryServer::new(store, embedder, config.ask_timeout_secs);
 
     let usage = config
         .tiering
@@ -401,15 +366,7 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
         ),
         cli::Mode::Stdio => serve_stdio(server, shutdown.token()).await,
     };
-    stop_background_tasks(
-        &shutdown,
-        usage_flush,
-        maintenance,
-        idle_unloader,
-        autotune,
-        compactor,
-    )
-    .await;
+    stop_background_tasks(&shutdown, usage_flush, maintenance, compactor).await;
     match (served, shutdown.failure()) {
         (Err(error), _) | (Ok(()), Some(error)) => Err(error),
         (Ok(()), None) => Ok(()),
@@ -433,16 +390,13 @@ async fn serve_stdio(server: MemoryServer, shutdown: CancellationToken) -> anyho
 
 /// Flushes the usage counts once the transports have drained, then stops the
 /// maintenance loop, whose server handle is the last one that keeps
-/// the store alive, then the idle unloader, then stops the autotune benchmark,
-/// then asks the compactor to stop and waits for the compaction it is running.
+/// the store alive, then asks the compactor to stop and waits for the compaction it is running.
 /// Both are bounded: a queued or interrupted compaction is redone by the next
 /// start.
 async fn stop_background_tasks(
     shutdown: &Shutdown,
     usage_flush: Option<UsageFlush>,
     maintenance: JoinHandle<()>,
-    idle_unloader: Option<JoinHandle<()>>,
-    autotune: Option<JoinHandle<()>>,
     mut compactor: CompactorTask,
 ) {
     // The transports have drained by now, and the store is still open.
@@ -453,25 +407,6 @@ async fn stop_background_tasks(
     match tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, maintenance).await {
         Ok(joined) => log_task_failure("maintenance loop", &joined),
         Err(_) => tracing::warn!("the maintenance loop is still running; leaving it to the exit"),
-    }
-    if let Some(idle_unloader) = idle_unloader {
-        // The cancelled token ends this task at its next check.
-        match tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, idle_unloader).await {
-            Ok(joined) => log_task_failure("llm idle task", &joined),
-            Err(_) => tracing::warn!("the llm idle task is still running; leaving it to the exit"),
-        }
-    }
-    if let Some(autotune) = autotune {
-        // The benchmark does not watch the shutdown token, and its result is
-        // only a cache entry that the next start recomputes.
-        autotune.abort();
-        match tokio::time::timeout(MAINTENANCE_STOP_DEADLINE, autotune).await {
-            Ok(Err(error)) if error.is_cancelled() => {}
-            Ok(joined) => log_task_failure("autotune benchmark", &joined),
-            Err(_) => {
-                tracing::warn!("the autotune benchmark is still running; leaving it to the exit");
-            }
-        }
     }
     // Segments still queued stay on disk as WAL files and are compacted by
     // the next start, so only the compaction already running is waited for.
@@ -499,50 +434,6 @@ fn log_task_failure(task: &str, joined: &Result<(), tokio::task::JoinError>) {
     if let Some(message) = task_failure_message(task, joined) {
         tracing::error!("{message}");
     }
-}
-
-/// Builds the server for the `max_concurrent_generations == 0` sentinel: a
-/// cache hit constructs at that value; a miss floors to 1, then grows it later.
-/// On a miss it also returns the benchmark task, for shutdown to stop.
-#[allow(clippy::too_many_arguments)]
-fn build_autotuned_server(
-    store: Arc<DefaultGraph>,
-    embedder: Arc<dyn Embedder>,
-    llm: Arc<dyn Llm>,
-    synthesis_timeout_secs: u64,
-    context_tokens: usize,
-    cache_dir: String,
-    model_fingerprint: String,
-    backend: String,
-) -> (MemoryServer, Option<JoinHandle<()>>) {
-    let ceiling = tuning::memory_ceiling(context_tokens);
-    let cached = tuning::load_cached(&cache_dir, &model_fingerprint, &backend, context_tokens);
-    let server = MemoryServer::new(
-        store,
-        embedder,
-        llm.clone(),
-        synthesis_timeout_secs,
-        context_tokens,
-        cached.unwrap_or(ceiling),
-    );
-
-    let benchmark = cached.is_none().then(|| {
-        let handle = server.generation_permits_handle();
-        let granted_capacity = server.granted_capacity_handle();
-        tokio::spawn(async move {
-            let result = tuning::cold_start_benchmark(&*llm, ceiling, &handle).await;
-            tuning::save_cache(
-                &cache_dir,
-                &model_fingerprint,
-                &backend,
-                result,
-                context_tokens,
-            );
-            tuning::reconcile_capacity(&handle, &granted_capacity, ceiling, result);
-        })
-    });
-
-    (server, benchmark)
 }
 
 /// The socket daemon: resolve the listener (activated by launchd, or bound
@@ -623,8 +514,7 @@ fn spawn_gc(config: &Config, job: Arc<ConsolidationJob>, run_now: bool) -> JoinH
 
 /// The tick's steps without the consolidation envelope, for tests of a single
 /// step. Replay the log, sweep, repair, refresh clusters, then resynthesize stale
-/// entities unless `skip_resynthesis` is set (the run-on-start tick of an
-/// autotuning server, which cannot yet spare generation permits for it). The
+/// entities unless `skip_resynthesis` is set. The
 /// tick stops after any step that left the daemon stopping, as a poisoned log
 /// does: the later steps would only be refused, and resynthesis would spend a
 /// model call on a write that cannot land.
@@ -868,45 +758,6 @@ mod tests {
         relation, FixedClock, GraphConfig, Millis, NewEdge, NewNode, RetentionPolicy,
     };
 
-    /// Sets a flag when its task is dropped, which a task only is once the
-    /// runtime has handled its abort.
-    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
-
-    impl Drop for SetOnDrop {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    #[tokio::test]
-    async fn shutdown_waits_for_the_aborted_autotune_task_to_end() {
-        // Arrange
-        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let guard = SetOnDrop(Arc::clone(&ended));
-        let autotune = tokio::spawn(async move {
-            let _guard = guard;
-            std::future::pending::<()>().await;
-        });
-        let maintenance = tokio::spawn(async {});
-        let (_sink, compactor) = idle_compactor();
-        // Let the benchmark start, so the abort has a running task to end.
-        tokio::task::yield_now().await;
-
-        // Act
-        stop_background_tasks(
-            &Shutdown::default(),
-            None,
-            maintenance,
-            None,
-            Some(autotune),
-            compactor,
-        )
-        .await;
-
-        // Assert
-        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
     /// A compactor with nothing queued whose sender is still alive, as at a
     /// real shutdown: its channel never closes on its own.
     fn idle_compactor() -> (liam_log::compactor::ChannelSink, CompactorTask) {
@@ -924,15 +775,7 @@ mod tests {
         let started = tokio::time::Instant::now();
 
         // Act
-        stop_background_tasks(
-            &Shutdown::default(),
-            None,
-            maintenance,
-            None,
-            None,
-            compactor,
-        )
-        .await;
+        stop_background_tasks(&Shutdown::default(), None, maintenance, compactor).await;
 
         // Assert: the paused clock only advances when every task is idle, so a
         // wait for the deadline would show here.
@@ -994,14 +837,7 @@ mod tests {
     /// never touch a real embedder or LLM: enough for
     /// `maintenance_tick` to reach the store it holds, nothing else.
     fn test_server(store: Arc<DefaultGraph>) -> MemoryServer {
-        MemoryServer::new(
-            store,
-            Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::MockLlm),
-            30,
-            8192,
-            1,
-        )
+        MemoryServer::new(store, Arc::new(liam_model::MockEmbedder::new(8)), 30)
     }
 
     #[tokio::test]
@@ -1106,134 +942,6 @@ mod tests {
         let did_work = refresh_clusters(&store).await;
 
         assert!(!did_work, "an unchanged store must report no work");
-    }
-
-    /// `Llm` double counting `complete_capped` calls, blocked on a `Notify`
-    /// the test never fires, so a benchmark using it starts but never finishes.
-    struct GatedCountingLlm {
-        release: Arc<tokio::sync::Notify>,
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    impl GatedCountingLlm {
-        fn new(release: Arc<tokio::sync::Notify>) -> Self {
-            Self {
-                release,
-                calls: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        fn calls(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Llm for GatedCountingLlm {
-        async fn complete(&self, system: &str, prompt: &str) -> liam_model::Result<String> {
-            self.complete_capped(system, prompt, usize::MAX).await
-        }
-
-        async fn complete_capped(
-            &self,
-            _system: &str,
-            _prompt: &str,
-            _max_new_tokens: usize,
-        ) -> liam_model::Result<String> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.release.notified().await;
-            Ok("gated".to_string())
-        }
-    }
-
-    async fn autotune_store() -> Arc<DefaultGraph> {
-        Arc::new(
-            DefaultGraph::open(":memory:", GraphConfig::new(8))
-                .await
-                .expect("open in-memory store"),
-        )
-    }
-
-    #[tokio::test]
-    async fn autotuned_server_accepts_requests_up_to_the_memory_ceiling_before_the_benchmark_completes(
-    ) {
-        // Given no cache file, so a benchmark runs, gated so it never
-        // resolves in this test
-        let dir = tempfile::tempdir().expect("tempdir");
-        let cache_dir = dir.path().to_str().expect("utf8 path").to_string();
-        let release = Arc::new(tokio::sync::Notify::new());
-        let llm_double = Arc::new(GatedCountingLlm::new(release));
-        let llm: Arc<dyn Llm> = llm_double.clone();
-        let ceiling = tuning::memory_ceiling(8192);
-
-        // When the server is built
-        let (server, benchmark) = build_autotuned_server(
-            autotune_store().await,
-            Arc::new(liam_model::MockEmbedder::new(8)),
-            llm,
-            30,
-            8192,
-            cache_dir,
-            "model/quant".to_string(),
-            "cpu".to_string(),
-        );
-
-        // Then it is already usable up to the memory-safe ceiling before the
-        // benchmark resolves, and the benchmark has genuinely started in the
-        // background, holding one of those same permits for its own probe
-        assert_eq!(
-            server.generation_permits_handle().available_permits(),
-            ceiling
-        );
-        tokio::task::yield_now().await;
-        assert_eq!(
-            llm_double.calls(),
-            1,
-            "the background benchmark must have started"
-        );
-        assert_eq!(
-            server.generation_permits_handle().available_permits(),
-            ceiling - 1,
-            "the benchmark's own probe must hold a real permit from the shared semaphore"
-        );
-        // And its task is handed back so shutdown can stop it.
-        let benchmark = benchmark.expect("a cache miss returns the benchmark task");
-        benchmark.abort();
-        assert!(benchmark.await.unwrap_err().is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn autotuned_server_skips_the_benchmark_on_a_cache_hit() {
-        // Given a cache entry matching the fingerprint used below
-        let dir = tempfile::tempdir().expect("tempdir");
-        let cache_dir = dir.path().to_str().expect("utf8 path").to_string();
-        tuning::save_cache(&cache_dir, "model/quant", "cpu", 4, 8192);
-        let release = Arc::new(tokio::sync::Notify::new());
-        let llm_double = Arc::new(GatedCountingLlm::new(release));
-        let llm: Arc<dyn Llm> = llm_double.clone();
-
-        // When the server is built with the same cache dir/model/backend
-        let (server, benchmark) = build_autotuned_server(
-            autotune_store().await,
-            Arc::new(liam_model::MockEmbedder::new(8)),
-            llm,
-            30,
-            8192,
-            cache_dir,
-            "model/quant".to_string(),
-            "cpu".to_string(),
-        );
-
-        // Then the semaphore is sized from the cache immediately, and no
-        // benchmark ever runs
-        assert!(benchmark.is_none());
-        assert_eq!(server.generation_permits_handle().available_permits(), 4);
-        tokio::task::yield_now().await;
-        assert_eq!(
-            llm_double.calls(),
-            0,
-            "a cache hit must spawn no benchmark at all"
-        );
     }
 
     /// Captures everything written to it, so a test can assert on log text
@@ -1353,7 +1061,7 @@ mod tests {
         store: Arc<DefaultGraph>,
         embedder: Arc<dyn liam_model::Embedder>,
     ) -> MemoryServer {
-        MemoryServer::new(store, embedder, Arc::new(liam_model::MockLlm), 30, 8192, 1)
+        MemoryServer::new(store, embedder, 30)
     }
 
     /// An embedder that moves the store's clock when it is called, so the
@@ -1892,7 +1600,7 @@ mod tests {
         let store = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
             .await
             .unwrap();
-        let stale_entity = entity_with_a_mention(&store, "Autotune Guy").await;
+        let stale_entity = entity_with_a_mention(&store, "Skipped Guy").await;
         let citing_entity = store
             .insert(NewNode::entity("person", "Cited By"))
             .await
@@ -1916,7 +1624,7 @@ mod tests {
         let captured = CapturedLogs::default();
         let _guard = install_captured_logs(captured.clone());
 
-        // When the autotuning run-on-start tick fires with resynthesis skipped
+        // When a tick fires with resynthesis skipped
         maintenance_tick(&server, &policy, 5, 30, true).await;
 
         // Then repair still ran (its own log line is still present) ...

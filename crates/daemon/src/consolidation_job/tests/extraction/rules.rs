@@ -45,7 +45,7 @@ async fn ada_store(harness: &Harness, mentions: usize) -> DefaultGraph {
 
 pub(super) async fn with_ada(harness: &Harness, mentions: usize) -> MemoryServer {
     let store = ada_store(harness, mentions).await;
-    harness.server(store, Arc::new(liam_model::MockLlm))
+    harness.server(store)
 }
 
 fn ctx_of<'a>(store: &'a DefaultGraph, run: &str) -> ExtractCtx<'a> {
@@ -185,7 +185,7 @@ async fn a_rules_cursor_moved_by_another_writer_makes_the_step_partial_and_keeps
     // Arrange
     let harness = Harness::new();
     let store = Arc::new(ada_store(&harness, 2).await);
-    let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
+    let server = harness.server_arc(store.clone());
     let provider = ProviderDouble::new();
     let mut part = extraction_part(&harness, &provider, config());
     part.reader = Arc::new(rules_cursor_bumped(&harness, &store));

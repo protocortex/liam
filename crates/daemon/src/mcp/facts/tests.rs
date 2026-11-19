@@ -47,10 +47,7 @@ impl Env {
         let server = MemoryServer::new(
             Arc::new(store),
             Arc::new(liam_model::MockEmbedder::new(DIMS)),
-            Arc::new(liam_model::MockLlm),
             30,
-            8192,
-            1,
         );
         Self {
             _dir: dir,

@@ -31,11 +31,9 @@
 
 pub mod config;
 pub mod consolidation;
-pub mod devices;
 pub mod embedder_fingerprint;
 pub mod event_log;
 pub mod fetch;
-pub mod lazy_llm;
 pub mod models;
 pub mod retrieval_eval;
 pub mod state_dir;

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use liam_daemon::config::SummaryConfig;
 use liam_daemon::consolidation::hooks::{SummaryCtx, SummaryHook};
 use liam_daemon::consolidation::maintenance::refresh_clusters;
-use liam_model::{MockEmbedder, MockLlm};
+use liam_model::MockEmbedder;
 use liam_store::{
     relation, ContentEmbedder, DefaultGraph, EmbedError, EventRole, GraphConfig, Millis, NewNode,
     NodeId,
@@ -23,8 +23,7 @@ use crate::log_startup::test_support::{database_in, log_dir_in, standalone_log, 
 use crate::mcp::summaries::SummariesArgs;
 use crate::mcp::{ClustersArgs, MemoryServer, RecallArgs, TimelineArgs};
 use crate::summary::hooks::SummaryHooks;
-use crate::summary::summariser::LocalSummariser;
-use crate::summary::test_support::{MemoryCache, ScriptedLlm};
+use crate::summary::test_support::{MemoryCache, ScriptedReplies, ScriptedSummariser};
 
 const FACT_SENTINEL: &str = "fxsentinel7";
 const PAGE_SENTINEL: &str = "pgsentinel7";
@@ -34,7 +33,6 @@ const GROUP_NAMES: [&str; 3] = ["alpha", "beta", "gamma"];
 const GROUP_SIZE: usize = 4;
 const SOURCE: &str = "consolidation:test";
 const SYNTHESIS_TIMEOUT_SECS: u64 = 30;
-const CONTEXT_TOKENS: usize = 8192;
 const LEVEL_ONE_REPLY: &str =
     "These ledger notes cover quarterly forecasts for the team smsentinel7.";
 const LEVEL_TWO_REPLY: &str =
@@ -427,10 +425,7 @@ impl World {
         let server = MemoryServer::new(
             Arc::new(store),
             Arc::new(MockEmbedder::new(DIMS)),
-            Arc::new(MockLlm),
             SYNTHESIS_TIMEOUT_SECS,
-            CONTEXT_TOKENS,
-            1,
         );
         Self {
             _dir: dir,
@@ -515,8 +510,8 @@ async fn summarize(store: &DefaultGraph) {
             enabled: true,
             ..SummaryConfig::default()
         },
-        summariser: Arc::new(LocalSummariser::new(
-            Arc::new(ScriptedLlm::replying(&[
+        summariser: Arc::new(ScriptedSummariser::new(
+            Arc::new(ScriptedReplies::replying(&[
                 LEVEL_ONE_REPLY,
                 LEVEL_ONE_REPLY,
                 LEVEL_ONE_REPLY,
@@ -531,7 +526,6 @@ async fn summarize(store: &DefaultGraph) {
         permits: Arc::new(Semaphore::new(1)),
         cache: Arc::new(MemoryCache::default()),
         embedder: Arc::new(FirstAxisEmbedder),
-        context_tokens: CONTEXT_TOKENS,
     };
     let report = hooks
         .summarize(&SummaryCtx {

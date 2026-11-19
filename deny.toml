@@ -25,7 +25,7 @@ ignore = [
 [licenses]
 version = 2
 # Allowlist tuned to the current dependency tree; extend as `cargo deny check`
-# reports new licenses (llama.cpp / fastembed deps may surface additional ones).
+# reports new licenses (fastembed deps may surface additional ones).
 #
 # This allowlist governs DEPENDENCIES, what LIAM consumes. LIAM's own license
 # is Apache-2.0 (see LICENSE), already present in `allow` below, so the
@@ -64,14 +64,9 @@ allow = [
 confidence-threshold = 0.9
 
 # cargo-deny reads Cargo metadata only, so it cannot see C or C++ link-time
-# dependencies at all. The vendored llama.cpp/ggml C++ sources, libstdc++,
-# and OpenMP are invisible to every check in this file. Two things therefore
-# need manual review whenever the llama dependency changes, because nothing
-# here or in CI can catch either:
-# - `llama-cpp-2` must always be declared with `default-features = false`.
-#   `openmp` is in ITS default feature set, and enabling it links libgomp
-#   (GPL, with a linking exception) on *-gnu targets.
-# - `static-stdcxx` must never be enabled.
+# dependencies at all. The native libraries a dependency links, such as the ONNX
+# Runtime that fastembed loads, are invisible to every check in this file and
+# need manual review whenever such a dependency changes.
 
 [bans]
 multiple-versions = "warn"

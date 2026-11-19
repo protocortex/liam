@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use liam_model::{Embedder, MockEmbedder, MockLlm};
+use liam_model::{Embedder, MockEmbedder};
 use liam_store::{
     EventRef, GraphConfig, Millis, NewNode, NewSummary, PutOutcome, SummaryChild, SummaryEntry,
 };
@@ -24,15 +24,8 @@ async fn server() -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .unwrap();
-    MemoryServer::new(
-        Arc::new(store),
-        Arc::new(MockEmbedder::new(DIMS)),
-        Arc::new(MockLlm),
-        30,
-        8192,
-        1,
-    )
-    .with_min_summary_similarity(STRICT_SIMILARITY)
+    MemoryServer::new(Arc::new(store), Arc::new(MockEmbedder::new(DIMS)), 30)
+        .with_min_summary_similarity(STRICT_SIMILARITY)
 }
 
 /// A summary of `children` with `text`, embedded the way a pass would embed it.

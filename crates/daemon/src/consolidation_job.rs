@@ -23,9 +23,9 @@ use liam_daemon::store_open::LogReopener;
 use liam_log::archive::{archive_partitions, ArchiveFault, ArchivePolicy, ArchiveReport, NoFault};
 use liam_model::Embedder;
 use liam_store::{Clock, DefaultGraph, RetentionPolicy, SharedLog, SystemClock};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::extraction::client::ModelIdentity;
 use liam_log::crypto::KeyRegistry;
 
 use crate::extraction::gate::ProviderGate;
@@ -39,7 +39,7 @@ use crate::metrics::sources::RunSources;
 use crate::shutdown::Shutdown;
 use crate::summary::file_cache::{summary_cache_path, FileSummaryCache};
 use crate::summary::hooks::SummaryHooks;
-use crate::summary::summariser::{LocalSummariser, Summariser};
+use crate::summary::summariser::Summariser;
 use crate::tiering::hooks::TierHooks;
 use crate::{maintenance_steps, Resynthesis};
 
@@ -87,19 +87,24 @@ pub struct JobSetup<'a> {
     pub metrics: Option<Arc<Metrics>>,
 }
 
+/// Model calls the hooks may have in flight at once. The extraction server, the
+/// summary requests and the tier step's embeddings take turns on one permit.
+const MODEL_CALL_PERMITS: usize = 1;
+
 /// The hook parts a run calls: extraction, summaries and tiering, each when the config
 /// turns it on. A model server an earlier daemon left behind is cleared first,
 /// whether extraction is on or off, when the server's path is configured.
 fn hooks_for(setup: &JobSetup<'_>) -> anyhow::Result<ConsolidationHookSet> {
     sweep_stale_sidecar(&setup.config.extraction, setup.database_path);
+    let permits = Arc::new(Semaphore::new(MODEL_CALL_PERMITS));
     Ok(ConsolidationHookSet {
-        extraction: extraction_hook(setup)?,
-        summary: summary_hook(setup)?,
-        tiering: tiering_hook(setup),
+        extraction: extraction_hook(setup, &permits)?,
+        summary: summary_hook(setup, &permits)?,
+        tiering: tiering_hook(setup, &permits),
     })
 }
 
-fn tiering_hook(setup: &JobSetup<'_>) -> Option<Arc<dyn TierHook>> {
+fn tiering_hook(setup: &JobSetup<'_>, permits: &Arc<Semaphore>) -> Option<Arc<dyn TierHook>> {
     let config = &setup.config.tiering;
     config.enabled.then(|| {
         Arc::new(TierHooks {
@@ -107,7 +112,7 @@ fn tiering_hook(setup: &JobSetup<'_>) -> Option<Arc<dyn TierHook>> {
             extraction: setup.config.extraction.clone(),
             unknown_producer: setup.config.producers.unknown_id.clone(),
             embedder: setup.embedder.clone(),
-            permits: setup.server.generation_permits_handle(),
+            permits: permits.clone(),
             free_ram: Arc::new(SystemRam),
             clock: Arc::new(SystemClock),
             metrics: setup.metrics.clone(),
@@ -115,7 +120,10 @@ fn tiering_hook(setup: &JobSetup<'_>) -> Option<Arc<dyn TierHook>> {
     })
 }
 
-fn extraction_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn ExtractionHook>>> {
+fn extraction_hook(
+    setup: &JobSetup<'_>,
+    permits: &Arc<Semaphore>,
+) -> anyhow::Result<Option<Arc<dyn ExtractionHook>>> {
     let config = &setup.config.extraction;
     if !config.enabled {
         return Ok(None);
@@ -124,7 +132,7 @@ fn extraction_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn Extrac
         database_path: setup.database_path,
         log_dir: setup.log_dir,
         keys: setup.keys.clone(),
-        permits: setup.server.generation_permits_handle(),
+        permits: permits.clone(),
         stopping: setup.shutdown.token(),
     };
     let hooks = match config.provider {
@@ -153,50 +161,34 @@ fn hosted_summariser(
     crate::hosted::summariser(setup.config, provider, metrics)
 }
 
-fn summary_hook(setup: &JobSetup<'_>) -> anyhow::Result<Option<Arc<dyn SummaryHook>>> {
+/// `None` while summaries are off, which they are for the removed local
+/// provider: only a hosted one writes them.
+fn summary_hook(
+    setup: &JobSetup<'_>,
+    permits: &Arc<Semaphore>,
+) -> anyhow::Result<Option<Arc<dyn SummaryHook>>> {
     let config = &setup.config.summary;
-    if !config.enabled {
+    if !config.enabled || config.provider == Provider::Local {
         return Ok(None);
     }
-    let llm = &setup.config.llm;
-    let summariser: Arc<dyn Summariser> = match config.provider {
-        Provider::Local => Arc::new(local_summariser(setup)),
-        hosted => hosted_summariser(setup, hosted)?,
-    };
+    let summariser = hosted_summariser(setup, config.provider)?;
     let cache = FileSummaryCache::open(
         summary_cache_path(setup.database_path),
         summariser.identity().clone(),
     )
     .context("could not open the summary cache")?;
-    let gate = (config.provider != Provider::Local).then(|| {
-        Arc::new(ProviderGate::new(
-            setup.config.hosted.privacy.clone(),
-            config.provider,
-        ))
-    });
+    let gate = Arc::new(ProviderGate::new(
+        setup.config.hosted.privacy.clone(),
+        config.provider,
+    ));
     Ok(Some(Arc::new(SummaryHooks {
         config: config.clone(),
         summariser,
-        gate,
-        permits: setup.server.generation_permits_handle(),
+        gate: Some(gate),
+        permits: permits.clone(),
         cache: Arc::new(cache),
         embedder: Arc::new(StoreEmbedder(setup.embedder.clone())),
-        context_tokens: llm.context_tokens,
     })))
-}
-
-fn local_summariser(setup: &JobSetup<'_>) -> LocalSummariser {
-    let llm = &setup.config.llm;
-    // The in-process model is named by its repository and file, and not hashed.
-    let identity = ModelIdentity {
-        model_id: format!("{}:{}/{}", llm.provider, llm.model, llm.gguf_file),
-        model_sha256: String::new(),
-    };
-    let summariser = LocalSummariser::new(setup.server.llm_handle(), identity);
-    match &setup.metrics {
-        Some(metrics) => summariser.with_metrics(metrics.clone()),
-        None => summariser,
-    }
 }
 
 /// Why a run asked for by hand did not finish.

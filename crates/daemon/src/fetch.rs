@@ -27,7 +27,7 @@ use tracing::debug;
 
 use crate::config::{Config, ExtractionConfig};
 use crate::models;
-use crate::models::{LLAMA_PROVIDER, LOCAL_PROVIDER, MOCK_PROVIDER};
+use crate::models::{LOCAL_PROVIDER, MOCK_PROVIDER};
 
 pub use curl::CurlFetcher;
 
@@ -134,7 +134,6 @@ pub struct ExtractionTargets {
 #[derive(Debug, PartialEq, Eq)]
 pub struct FetchPlan {
     pub embedder: bool,
-    pub llm: bool,
     pub extraction: Option<ExtractionTargets>,
 }
 
@@ -153,13 +152,12 @@ impl FetchPlan {
         }
         Ok(Self {
             embedder: config.embedder.provider == LOCAL_PROVIDER,
-            llm: config.llm.provider == LLAMA_PROVIDER,
             extraction,
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        !self.embedder && !self.llm && self.extraction.is_none()
+        !self.embedder && self.extraction.is_none()
     }
 }
 
@@ -173,11 +171,6 @@ fn check_providers(config: &Config) -> anyhow::Result<()> {
         ),
         "embedder.provider = {:?} is not one of {LOCAL_PROVIDER:?}, {MOCK_PROVIDER:?}",
         config.embedder.provider
-    );
-    anyhow::ensure!(
-        matches!(config.llm.provider.as_str(), LLAMA_PROVIDER | MOCK_PROVIDER),
-        "llm.provider = {:?} is not one of {LLAMA_PROVIDER:?}, {MOCK_PROVIDER:?}",
-        config.llm.provider
     );
     Ok(())
 }

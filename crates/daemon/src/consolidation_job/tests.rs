@@ -15,7 +15,6 @@ use liam_daemon::consolidation::probes::{run_probes, Probe, ProbeError, ProbeRep
 use liam_daemon::consolidation::run::{ProbeRunner, StoreReopener};
 use liam_daemon::consolidation::settings::identity;
 use liam_daemon::store_open::{open_database, open_store_on_log};
-use liam_model::Llm;
 use liam_store::{DefaultGraph, FixedClock, GraphConfig, Millis, NewEdge, NewNode};
 
 use super::*;
@@ -76,27 +75,19 @@ impl Harness {
         (store, clock)
     }
 
-    fn server(&self, store: DefaultGraph, llm: Arc<dyn Llm>) -> MemoryServer {
-        self.server_arc(Arc::new(store), llm)
+    fn server(&self, store: DefaultGraph) -> MemoryServer {
+        self.server_arc(Arc::new(store))
     }
 
     /// A server over `store` that embeds with `embedder`, for the tests that
     /// need one which is gated or counts.
     fn server_embedding(&self, store: DefaultGraph, embedder: Arc<dyn Embedder>) -> MemoryServer {
-        MemoryServer::new(
-            Arc::new(store),
-            embedder,
-            Arc::new(liam_model::MockLlm),
-            30,
-            8192,
-            1,
-        )
-        .with_shutdown(self.shutdown.token())
+        MemoryServer::new(Arc::new(store), embedder, 30).with_shutdown(self.shutdown.token())
     }
 
     /// A server over a store the test also holds, which a rollback cannot take.
-    fn server_arc(&self, store: Arc<DefaultGraph>, llm: Arc<dyn Llm>) -> MemoryServer {
-        MemoryServer::new(store, embedder(), llm, 30, 8192, 1).with_shutdown(self.shutdown.token())
+    fn server_arc(&self, store: Arc<DefaultGraph>) -> MemoryServer {
+        MemoryServer::new(store, embedder(), 30).with_shutdown(self.shutdown.token())
     }
 
     fn job(&self, server: &MemoryServer, probes: Arc<dyn ProbeRunner>) -> ConsolidationJob {
@@ -203,7 +194,7 @@ async fn the_tick_refreshes_clusters_after_the_sweep_through_a_consolidation_run
     let (store, _clock) = harness.store_at(Millis(1000)).await;
     linked_pair(&store, "fact").await;
     let store = Arc::new(store);
-    let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
+    let server = harness.server_arc(store.clone());
     let job = harness.job(&server, honest());
 
     // Act
@@ -227,7 +218,7 @@ async fn the_refresh_runs_after_the_sweep_not_before_through_a_consolidation_run
     keep_one_fact(&store).await;
     clock.set(Millis(100 * DAY));
     let store = Arc::new(store);
-    let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
+    let server = harness.server_arc(store.clone());
     let job = harness.job(&server, honest());
 
     // Act
@@ -248,7 +239,7 @@ async fn refresh_clusters_reports_no_work_on_an_idle_store_through_a_consolidati
     let (store, _clock) = harness.store_at(Millis(1000)).await;
     linked_pair(&store, "fact").await;
     let store = Arc::new(store);
-    let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
+    let server = harness.server_arc(store.clone());
     let job = harness.job(&server, honest());
     assert!(refresh_clusters(&store).await, "first call always has work");
     store
@@ -350,13 +341,12 @@ async fn page_builds_run_one_at_a_time_through_a_consolidation_run() {
 
 #[tokio::test]
 async fn the_first_run_after_start_builds_the_stale_pages_like_any_other() {
-    // Arrange: an autotuning server with a stale entity
-    let mut harness = Harness::new();
-    harness.config.llm.max_concurrent_generations = 0;
+    // Arrange: a server with a stale entity
+    let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
     entity_with_a_mention(&store, "Kim").await;
     let store = Arc::new(store);
-    let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
+    let server = harness.server_arc(store.clone());
     let job = harness.job(&server, honest());
 
     // Act
@@ -374,7 +364,7 @@ async fn a_start_with_nothing_to_do_runs_nothing() {
     // Arrange
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = harness.job(&server, honest());
 
     // Act
@@ -389,7 +379,7 @@ async fn a_crashed_run_waiting_to_resume_asks_for_a_run_at_start() {
     // Arrange: nothing asks for a run on start, but a crashed run is waiting
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = harness.job(&server, honest());
     interrupted_manifest(&harness, &[]);
 
@@ -414,7 +404,7 @@ async fn a_rolled_back_run_undoes_its_sweep_and_the_server_keeps_serving() {
         .await
         .unwrap();
     clock.set(Millis(100 * DAY));
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = harness.job(&server, regresses());
 
     // Act
@@ -441,7 +431,7 @@ async fn a_committed_run_keeps_its_sweep() {
         .insert(NewNode::now("fact", "f", "a live fact"))
         .await
         .unwrap();
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = harness.job(&server, honest());
 
     // Act
@@ -458,7 +448,6 @@ fn interrupted_manifest(harness: &Harness, steps: &[&str]) {
         "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_owned(),
         7,
         identity(&harness.config).embedder,
-        identity(&harness.config).llm_model,
         Millis(1),
     );
     manifest.save(&harness.manifest_path()).unwrap();
@@ -502,7 +491,7 @@ async fn startup_finishes_a_rollback_a_real_crash_left_pending() {
         let (store, _clock) = harness.store_at(Millis(1000)).await;
         linked_pair(&store, "fact").await;
         edges_before_the_run = store.edge_fingerprint().await.unwrap().edge_count;
-        let server = harness.server(store, Arc::new(liam_model::MockLlm));
+        let server = harness.server(store);
         let probes = Arc::new(FailsThenBreaksTheLog {
             log_refuses: refuses,
             calls: AtomicUsize::new(0),
@@ -536,7 +525,7 @@ async fn startup_finishes_a_rollback_a_real_crash_left_pending() {
     )
     .await
     .unwrap();
-    let server = restarted.server(store, Arc::new(liam_model::MockLlm));
+    let server = restarted.server(store);
     let job = restarted.job(&server, honest());
 
     // Act
@@ -565,7 +554,7 @@ async fn startup_leaves_a_forward_run_for_the_first_tick_to_resume() {
         .insert(NewNode::now("fact", "f", "a live fact"))
         .await
         .unwrap();
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = harness.job(&server, honest());
     interrupted_manifest(&harness, &[]);
 
@@ -583,7 +572,7 @@ async fn a_tick_after_the_daemon_began_stopping_runs_nothing() {
     // Arrange
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = harness.job(&server, honest());
     job.stopping().cancel();
 
@@ -602,7 +591,7 @@ async fn swept_pair(harness: &Harness) -> (Arc<DefaultGraph>, MemoryServer, Cons
     keep_one_fact(&store).await;
     clock.set(Millis(100 * DAY));
     let store = Arc::new(store);
-    let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
+    let server = harness.server_arc(store.clone());
     let job = harness.job(&server, honest());
     (store, server, job)
 }
@@ -683,7 +672,7 @@ async fn a_rollback_that_cannot_reopen_the_store_stops_the_daemon_with_a_failure
         .insert(NewNode::now("fact", "f", "a live fact"))
         .await
         .unwrap();
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = harness.job_reopening(&server, regresses(), Some(Arc::new(BrokenReopener)));
 
     // Act
@@ -704,7 +693,7 @@ async fn a_run_that_fails_with_the_store_in_place_does_not_stop_the_daemon() {
     // Arrange: a failure that leaves the slot full, here a refused new run
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = harness.job(&server, honest());
     restore_failed_manifest(&harness);
 
@@ -721,7 +710,6 @@ fn restore_failed_manifest(harness: &Harness) -> RunManifest {
         "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_owned(),
         7,
         identity(&harness.config).embedder,
-        identity(&harness.config).llm_model,
         Millis(1),
     );
     manifest.outcome = Some(RunOutcome::RestoreFailed);
@@ -734,7 +722,7 @@ async fn a_new_run_is_refused_while_the_last_one_ended_restore_failed_and_its_sn
     // Arrange
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = harness.job(&server, honest());
     let failed = restore_failed_manifest(&harness);
     let kept = harness
@@ -773,7 +761,7 @@ async fn the_maintenance_step_reports_a_stopping_daemon_so_it_is_not_recorded_do
     // Arrange
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let maintenance = DaemonMaintenance {
         server: server.clone(),
         policy: harness.config.gc_policy(),
@@ -795,7 +783,7 @@ async fn the_maintenance_step_reports_a_stopping_daemon_so_it_is_not_recorded_do
 async fn the_maintenance_step_is_done_when_the_daemon_keeps_running() {
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let maintenance = DaemonMaintenance {
         server: server.clone(),
         policy: harness.config.gc_policy(),
@@ -820,7 +808,7 @@ const ADMIN: &str = "ops";
 async fn admin_server(harness: &Harness) -> (MemoryServer, Arc<ConsolidationJob>) {
     let (store, _clock) = harness.store_at(Millis(100 * DAY)).await;
     keep_one_fact(&store).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let job = Arc::new(harness.job(&server, honest()));
     let admin = server
         .with_admin(crate::config::AdminConfig {
@@ -972,7 +960,7 @@ async fn archiving_fixture(
 ) {
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(DAY)).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let log = tempfile::tempdir().unwrap();
     let archive = tempfile::tempdir().unwrap();
     old_partitions(log.path()).await;

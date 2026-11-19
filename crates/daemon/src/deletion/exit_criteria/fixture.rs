@@ -391,8 +391,7 @@ impl Fixture {
             dims: DIMS,
             prompt_scheme: 1,
         };
-        let mut manifest =
-            RunManifest::new("run-tier".to_owned(), SEED, embedder, "llm".to_owned(), NOW);
+        let mut manifest = RunManifest::new("run-tier".to_owned(), SEED, embedder, NOW);
         manifest.tier_moved_lineages = vec![self.alice_lineage.as_str().to_owned()];
         manifest.save(&self.manifest_file()).unwrap();
         let history = TierHistory {

@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Which hooks a job builds from the config, and what stops it building them.
 
-use liam_daemon::config::Provider;
+use std::os::unix::fs::PermissionsExt;
+
+use liam_daemon::config::{HostedConfig, PricesConfig, Provider};
 use liam_store::FixedClock;
 
 use super::*;
+use crate::hosted::test_support::price;
 use crate::metrics::sink::MemorySink;
 
 const MIN_PAIRS: usize = 2;
 const HOSTED: Provider = Provider::Anthropic;
+const HOSTED_HOST: &str = "api.anthropic.com";
+const HOSTED_MODEL: &str = "claude-sonnet-4-5-20250929";
+const KEY_FILE_MODE: u32 = 0o600;
 
 fn metrics() -> Arc<Metrics> {
     let clock = Arc::new(FixedClock::new(Millis(1_000)));
@@ -18,7 +24,7 @@ fn metrics() -> Arc<Metrics> {
 
 async fn server_for(harness: &Harness) -> MemoryServer {
     let (store, _clock) = harness.store_at(Millis(1_000)).await;
-    harness.server(store, Arc::new(liam_model::MockLlm))
+    harness.server(store)
 }
 
 struct Paths {
@@ -117,7 +123,7 @@ async fn the_tiering_hook_exists_only_when_tiering_is_enabled() {
 }
 
 #[tokio::test]
-async fn local_summaries_are_built_with_or_without_a_metrics_recorder() {
+async fn the_removed_local_summary_provider_builds_no_summary_part() {
     // Arrange
     let harness = Harness::new();
     let server = server_for(&harness).await;
@@ -131,6 +137,41 @@ async fn local_summaries_are_built_with_or_without_a_metrics_recorder() {
     let unmeasured = hooks_for(&setup(&harness, &paths, &config, &server, None)).unwrap();
 
     // Assert
-    assert!(measured.summary.is_some());
-    assert!(unmeasured.summary.is_some());
+    assert!(measured.summary.is_none());
+    assert!(unmeasured.summary.is_none());
+}
+
+#[tokio::test]
+async fn hosted_summaries_are_built_only_when_the_config_turns_them_on() {
+    // Arrange
+    let harness = Harness::new();
+    let server = server_for(&harness).await;
+    let paths = Paths::of(&harness);
+    let key = harness.root.join("anthropic.key");
+    std::fs::write(&key, "sk-test-key\n").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(KEY_FILE_MODE)).unwrap();
+    let mut on = harness.config.clone();
+    on.hosted = HostedConfig {
+        enabled: true,
+        allowed_hosts: vec![HOSTED_HOST.to_owned()],
+        models: [(HOSTED.name().to_owned(), HOSTED_MODEL.to_owned())].into(),
+        prices: PricesConfig {
+            version: "test".to_owned(),
+            models: [(HOSTED_MODEL.to_owned(), price())].into(),
+        },
+        key_files: [(HOSTED.name().to_owned(), key.to_string_lossy().into_owned())].into(),
+        ..HostedConfig::default()
+    };
+    on.summary.enabled = true;
+    on.summary.provider = HOSTED;
+    let mut off = on.clone();
+    off.summary.enabled = false;
+
+    // Act
+    let built = hooks_for(&setup(&harness, &paths, &on, &server, Some(metrics()))).unwrap();
+    let skipped = hooks_for(&setup(&harness, &paths, &off, &server, Some(metrics()))).unwrap();
+
+    // Assert
+    assert!(built.summary.is_some());
+    assert!(skipped.summary.is_none());
 }

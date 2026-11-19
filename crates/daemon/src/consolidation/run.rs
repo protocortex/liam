@@ -75,7 +75,6 @@ pub struct RunSettings {
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub embedder: EmbedderFingerprint,
-    pub llm_model: String,
 }
 
 /// The existing maintenance steps (sweep, provenance repair, cluster refresh,
@@ -267,11 +266,7 @@ impl Consolidator {
         if let Some(unfinished) = self.unfinished_run()? {
             let extraction_model = self.parts.hooks.extraction_model().await;
             let refused = unfinished
-                .check_resumable(
-                    &self.identity.embedder,
-                    &self.identity.llm_model,
-                    extraction_model.as_ref(),
-                )
+                .check_resumable(&self.identity.embedder, extraction_model.as_ref())
                 .err();
             tracing::info!(run_id = %unfinished.run_id, done = ?unfinished.completed_steps, refused = refused.is_some(), "consolidation: an unfinished run found");
             return Ok((unfinished, refused));
@@ -282,7 +277,6 @@ impl Consolidator {
             id.to_string(),
             self.seed.unwrap_or(id.random() as u64),
             self.identity.embedder.clone(),
-            self.identity.llm_model.clone(),
             Millis::now(),
         );
         manifest.save(&self.manifest_path())?;

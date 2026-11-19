@@ -348,11 +348,7 @@ impl Generator<'_> {
         if Instant::now() >= deadline {
             return Generation::Failed(DEADLINE_PASSED.to_string());
         }
-        let prompt = build_summary_prompt(items, self.settings.context_tokens, |text| {
-            self.summariser
-                .count_tokens(text)
-                .unwrap_or_else(|| estimate_tokens(text))
-        });
+        let prompt = build_summary_prompt(items, self.settings.context_tokens, estimate_tokens);
         let events_fed = prompt.events_fed();
         let key = summary_cache_key(
             SUMMARY_PROMPT_VERSION,

@@ -4,6 +4,11 @@
 
 use liam_store::ClusterMember;
 
+/// The most characters a `clusters` listing may hold. It is a tenth of an
+/// 8,192-token context at four characters a token, the share of a window a
+/// listing tool is allowed to take.
+pub const CLUSTERS_BUDGET_CHARS: usize = 3_276;
+
 /// Resolve a caller's `k`/`members` argument: absent means "no narrowing",
 /// `0` is clamped to `1` (an explicit "show nothing" request is not
 /// meaningful for a listing tool). Never widens past what the store
@@ -40,6 +45,10 @@ fn render_member(m: &ClusterMember) -> String {
     format!("[{} {}] {}", m.kind, m.id.handle(), m.label)
 }
 
+fn chars(text: &str) -> usize {
+    text.chars().count()
+}
+
 fn render_group(g: &[ClusterMember]) -> String {
     g.iter().map(render_member).collect::<Vec<_>>().join("\n")
 }
@@ -58,18 +67,11 @@ fn render_header(shown: usize, total: usize) -> String {
 }
 
 /// Render `groups` (already narrowed by the caller's `k`/`members`, see
-/// `narrow_groups`) largest-first, keeping as many as fit `budget`, but
-/// never fewer than one when any exist. Mirrors `fit_texts_to_budget`'s
+/// `narrow_groups`) largest-first, keeping as many as fit `budget` characters,
+/// but never fewer than one when any exist. Mirrors `fit_texts_to_budget`'s
 /// floor: a header with zero clusters reads identically to a
 /// genuinely empty store, so a misconfigured or tiny budget still shows one.
-///
-/// `count` is injected so this stays testable without a model; see
-/// `fit_texts_to_budget` for the same pattern.
-pub fn render_clusters(
-    groups: &[Vec<ClusterMember>],
-    budget: usize,
-    count: impl Fn(&str) -> usize,
-) -> String {
+pub fn render_clusters(groups: &[Vec<ClusterMember>], budget: usize) -> String {
     if groups.is_empty() {
         return "no clusters yet".to_string();
     }
@@ -82,7 +84,7 @@ pub fn render_clusters(
             .collect::<Vec<_>>()
             .join("\n\n");
         let header = render_header(kept, total);
-        if count(&header) + count(&body) <= budget || kept <= 1 {
+        if chars(&header) + chars(&body) <= budget || kept <= 1 {
             return format!("{header}\n\n{body}");
         }
         kept -= 1;
@@ -102,10 +104,6 @@ mod tests {
         }
     }
 
-    fn chars(s: &str) -> usize {
-        s.chars().count()
-    }
-
     #[test]
     fn render_clusters_format_is_pinned() {
         // Arrange: one cluster, two members, budget with plenty of room.
@@ -115,7 +113,7 @@ mod tests {
         ]];
 
         // Act
-        let out = render_clusters(&groups, 10_000, chars);
+        let out = render_clusters(&groups, 10_000);
 
         // Assert: exact shape, so a future change to it is a deliberate edit.
         assert_eq!(
@@ -127,7 +125,7 @@ mod tests {
     #[test]
     fn a_genuinely_empty_store_says_so_distinctly_from_a_too_small_budget() {
         // Arrange / Act
-        let out = render_clusters(&[], 10_000, chars);
+        let out = render_clusters(&[], 10_000);
 
         // Assert: distinct from the too-small-budget floor message below, so
         // a client can tell "nothing to group" from "budget too tight".
@@ -140,7 +138,7 @@ mod tests {
         let groups = vec![vec![member("01ABCDEFGHJKMNPQRST0000A", "fact", "solo")]];
 
         // Act
-        let out = render_clusters(&groups, 1, chars);
+        let out = render_clusters(&groups, 1);
 
         // Assert: the floor from `fit_texts_to_budget` applies here too:
         // never zero clusters when any exist, even though the budget is
@@ -193,7 +191,7 @@ mod tests {
         let budget = chars(&two);
 
         // Act
-        let out = render_clusters(&groups, budget, chars);
+        let out = render_clusters(&groups, budget);
 
         // Assert: fits within budget, and it's exactly the 2-cluster render.
         assert!(chars(&out) <= budget, "{out}");
@@ -208,12 +206,12 @@ mod tests {
             vec![member("01BBBBBBBBBBBBBBBBBBBBBBB", "fact", "b1")],
             vec![member("01CCCCCCCCCCCCCCCCCCCCCCC", "fact", "c1")],
         ];
-        let full = render_clusters(&groups, usize::MAX, chars);
-        let small_budget = chars(&render_clusters(&groups[..1], usize::MAX, chars));
+        let full = render_clusters(&groups, usize::MAX);
+        let small_budget = chars(&render_clusters(&groups[..1], usize::MAX));
 
         // Act
-        let small = render_clusters(&groups, small_budget, chars);
-        let large = render_clusters(&groups, usize::MAX, chars);
+        let small = render_clusters(&groups, small_budget);
+        let large = render_clusters(&groups, usize::MAX);
 
         // Assert
         assert!(
@@ -231,10 +229,10 @@ mod tests {
             vec![member("01BBBBBBBBBBBBBBBBBBBBBBB", "fact", "b1")],
             vec![member("01CCCCCCCCCCCCCCCCCCCCCCC", "fact", "c1")],
         ];
-        let budget = chars(&render_clusters(&groups[..1], usize::MAX, chars));
+        let budget = chars(&render_clusters(&groups[..1], usize::MAX));
 
         // Act
-        let out = render_clusters(&groups, budget, chars);
+        let out = render_clusters(&groups, budget);
 
         // Assert
         assert!(out.contains("1 of 3"), "{out}");
@@ -251,7 +249,7 @@ mod tests {
         ];
 
         // Act
-        let out = render_clusters(&groups, usize::MAX, chars);
+        let out = render_clusters(&groups, usize::MAX);
 
         // Assert: no "Group 0"/"Group 1"/"community"-style label anywhere.
         let lower = out.to_lowercase();

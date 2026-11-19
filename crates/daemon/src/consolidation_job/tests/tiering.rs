@@ -52,7 +52,7 @@ async fn aged(harness: &Harness) -> Aged {
         .unwrap();
     clock.set(Millis(clock.now().0 + OBSERVED_DAYS * DAY));
     Aged {
-        server: harness.server(store, Arc::new(liam_model::MockLlm)),
+        server: harness.server(store),
         clock,
         lineages,
         ids,

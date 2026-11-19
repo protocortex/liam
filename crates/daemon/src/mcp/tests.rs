@@ -16,7 +16,6 @@ mod entity_page_build;
 mod entity_pages_and_modes;
 mod entity_pages_in_timeline;
 mod error_replies;
-mod generation_limit;
 mod query_limits_and_embed_kinds;
 mod recall_filters_and_format;
 mod relate;
@@ -41,32 +40,16 @@ async fn live_row(store: &DefaultGraph, name: &str, scope: Option<&str>) -> Opti
         .map(|hit| Found { hit })
 }
 
-/// Fresh in-memory server wired with the given llm, a 30s synthesis
-/// timeout, and the shipped default 8192-token context budget. Dims 8 to
-/// match `MockEmbedder::new(8)`.
-async fn server_with(llm: Arc<dyn Llm>) -> MemoryServer {
-    server_with_generation_limit(llm, 30, 8192, 1).await
-}
-
-/// As `server_with`, plus an explicit synthesis timeout, context budget and
-/// `max_concurrent_generations`, for the tests that exercise the generation
-/// semaphore itself; every other test goes through `server_with`'s fixed 1.
-async fn server_with_generation_limit(
-    llm: Arc<dyn Llm>,
-    synthesis_timeout_secs: u64,
-    context_tokens: usize,
-    max_concurrent_generations: usize,
-) -> MemoryServer {
+/// Fresh in-memory server with a 30s synthesis timeout. Dims 8 to match
+/// `MockEmbedder::new(8)`.
+async fn plain_server() -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
         .await
         .expect("open in-memory store");
     MemoryServer::new(
         Arc::new(store),
         Arc::new(liam_model::MockEmbedder::new(8)),
-        llm,
-        synthesis_timeout_secs,
-        context_tokens,
-        max_concurrent_generations,
+        30,
     )
 }
 
@@ -101,12 +84,6 @@ async fn seed_scoped(
     out.trim_start_matches("remembered ").to_string()
 }
 
-/// Server with the neutral doubles used by the filter tests: the store's
-/// ordering and the echo llm.
-async fn plain_server() -> MemoryServer {
-    server_with(Arc::new(liam_model::MockLlm)).await
-}
-
 /// Server backed by a `FixedClock`-driven store instead of the real
 /// clock `plain_server` uses. WHY: the `as_of`
 /// tests need to pin exact millisecond instants across two writes, and a
@@ -120,10 +97,7 @@ async fn server_with_clock(clock: Arc<FixedClock>) -> MemoryServer {
     MemoryServer::new(
         Arc::new(store),
         Arc::new(liam_model::MockEmbedder::new(8)),
-        Arc::new(liam_model::MockLlm),
         30,
-        8192,
-        1,
     )
 }
 
@@ -195,14 +169,7 @@ async fn server_with_embedder(embedder: Arc<dyn Embedder>) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
         .await
         .expect("open in-memory store");
-    MemoryServer::new(
-        Arc::new(store),
-        embedder,
-        Arc::new(liam_model::MockLlm),
-        30,
-        8192,
-        1,
-    )
+    MemoryServer::new(Arc::new(store), embedder, 30)
 }
 
 fn recall_args_for(query: &str) -> RecallArgs {

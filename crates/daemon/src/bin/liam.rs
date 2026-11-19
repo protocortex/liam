@@ -31,7 +31,6 @@ use liam_store::{
 use liam_daemon::config::{resolve_config_source, Config};
 use liam_daemon::consolidation::manifest::RunOutcome;
 use liam_daemon::consolidation::offline::{print_status, run_offline};
-use liam_daemon::devices;
 use liam_daemon::embedder_fingerprint::{self, EmbedderFingerprint};
 use liam_daemon::event_log;
 use liam_daemon::fetch;
@@ -66,9 +65,6 @@ enum Command {
     /// Download and load every model liam.toml asks for, so the first daemon
     /// start is not also the first download.
     FetchModels,
-    /// Show the cores, the compute backends this build has, and what `auto`
-    /// resolves to for the LLM under the config.
-    Devices(DevicesArgs),
     /// Rebuild a store's nodes and edges from its event log, then check the
     /// result against the log row by row. Refuses while a daemon holds the
     /// store.
@@ -80,13 +76,6 @@ enum Command {
     /// merge near-duplicates, maintain, then commit or roll back. An unfinished
     /// run is resumed. Resynthesis is left to the daemon's scheduled runs.
     Consolidate(ConsolidateArgs),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Args)]
-struct DevicesArgs {
-    /// Print JSON instead of text.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -174,18 +163,6 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::FetchModels => fetch_models(&config, &config_path),
-        Command::Devices(args) => {
-            let report = devices::report(&devices::SystemProbe, &config);
-            println!(
-                "{}",
-                if args.json {
-                    devices::format_json(&report)
-                } else {
-                    devices::format_text(&report)
-                }
-            );
-            Ok(())
-        }
         Command::Rebuild(args) => {
             let runtime = tokio::runtime::Runtime::new()?;
             let code = runtime.block_on(rebuild(
@@ -690,7 +667,7 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
 
     if plan.is_empty() {
         // `Config::load` falls back to built-in defaults when the file is
-        // absent, and both of those defaults are mock. So a mistyped
+        // absent, and that default is mock. So a mistyped
         // `--config` arrives here looking exactly like a deliberately mock
         // config. Saying which one it was is the difference between a
         // one-character fix and an afternoon.
@@ -704,34 +681,17 @@ fn fetch_models(config: &Config, config_path: &Path) -> anyhow::Result<()> {
             )
         };
         anyhow::bail!(
-            "nothing to fetch: embedder.provider = {:?} and llm.provider = {:?} are both \
-             mock providers, and mocks load no weights. Mock embeddings are random and the \
-             mock LLM invents answers, so set embedder.provider = \"local\" and \
-             llm.provider = \"llama-cpp\" before fetching, or enable [extraction] to fetch \
-             its server and model.{note}",
-            config.embedder.provider,
-            config.llm.provider
+            "nothing to fetch: embedder.provider = {:?} is the mock provider, and mocks \
+             load no weights. Mock embeddings are random, so set embedder.provider = \
+             \"local\" before fetching, or enable [extraction] to fetch its server and \
+             model.{note}",
+            config.embedder.provider
         );
     }
     if plan.embedder {
         println!("embedder: {}", config.embedder.model);
         let _embedder = models::build_embedder_for(config, liam_model::NoticeCaller::FetchModels)?;
         println!("embedder: ready");
-    }
-
-    if plan.llm {
-        let cache_dir =
-            models::resolve_path_with_home("llm.cache_dir", &config.llm.cache_dir, &home)?;
-        println!(
-            "llm: {} ({}) -> {cache_dir}",
-            config.llm.model, config.llm.gguf_file
-        );
-        // Goes through `build_llm`, not the loader underneath it, so the
-        // macOS check that a backend actually resolved to Metal runs here as
-        // well. A fetch that quietly verified a CPU-only load would promise
-        // a start the daemon then refuses.
-        let _llm = models::build_llm_for(config, liam_model::NoticeCaller::FetchModels)?;
-        println!("llm: ready");
     }
 
     if plan.extraction.is_some() {
@@ -767,18 +727,6 @@ mod tests {
         assert_eq!(
             parse(&["liam", "fetch-models"]).command,
             Command::FetchModels
-        );
-    }
-
-    #[test]
-    fn devices_takes_an_optional_json_flag() {
-        assert_eq!(
-            parse(&["liam", "devices"]).command,
-            Command::Devices(DevicesArgs { json: false })
-        );
-        assert_eq!(
-            parse(&["liam", "devices", "--json"]).command,
-            Command::Devices(DevicesArgs { json: true })
         );
     }
 

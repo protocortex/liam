@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Prompt helpers shared by entity synthesis and summaries: fence neutralising,
-//! text caps, token estimates and trimming a list of items to a context budget.
+//! Prompt helpers for summaries: fence neutralising, text caps, token
+//! estimates and trimming a list of items to a context budget.
 
-/// Cap on per-item text fed to the LLM. One oversized node must not blow a
-/// small local model's context window.
+/// Cap on per-item text fed to a model. One oversized node must not blow a
+/// model's context window.
 pub(crate) const MAX_EVIDENCE_CHARS: usize = 2000;
 
 /// Break the triple-angle-bracket fence syntax inside untrusted text, so
@@ -24,14 +24,12 @@ pub fn truncate(s: &str, max: usize) -> String {
     truncated
 }
 
-/// Rough token estimate for text a real model cannot count, i.e. whenever
-/// `Llm::count_tokens` returns `None` (the mock, and any provider without a
-/// tokenizer). WHY divide by 4: a commonly cited average for English subword
-/// tokenizers, good enough because a wrong estimate here only changes a
+/// Rough token estimate for text sent to a hosted model, whose tokenizer the
+/// daemon does not carry. WHY divide by 4: a commonly cited average for English
+/// subword tokenizers, good enough because a wrong estimate here only changes a
 /// safety margin, not correctness. The budget that calls this reserves room
 /// for the generated text regardless, so over- or under-estimating shifts how
-/// much slack remains, not whether the prompt fits. Prefer `count_tokens`
-/// whenever it returns `Some`; this exists only for the case where it does not.
+/// much slack remains, not whether the prompt fits.
 ///
 /// Counts chars, not bytes: `str::len()` counts UTF-8 bytes, so it over-counts
 /// every non-ASCII character, and remembered notes are user text that may be
@@ -45,11 +43,8 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// Tokens reserved for the model's generated text inside a context `budget`.
 /// WHY: the context window holds the prompt AND the generated tokens, so
 /// sizing the prompt allowance to the full window would let generation alone
-/// overflow it. 512 matches the engine's `MAX_NEW_TOKENS` cap, but that
-/// constant lives in `liam-model`, a different crate: if it changes, this
-/// only becomes a smaller or larger safety margin, never a correctness bug,
-/// because it is a floor on free space, not a promise about how many tokens
-/// generation actually uses.
+/// overflow it. It is a floor on free space, not a promise about how many
+/// tokens generation actually uses.
 pub(crate) const GENERATION_TOKEN_RESERVE: usize = 512;
 
 /// Trim `items` from the tail until the prompt `render` builds from them (system
@@ -66,9 +61,8 @@ pub(crate) const GENERATION_TOKEN_RESERVE: usize = 512;
 /// single item can never be unbounded. Do not change this to return nothing
 /// when nothing fits.
 ///
-/// `count` is injected so this stays testable without a model: the real
-/// caller passes `Llm::count_tokens`/`estimate_tokens`, tests pass a plain
-/// closure such as counting characters.
+/// `count` is injected so this stays testable: the real caller passes
+/// `estimate_tokens`, tests pass a plain closure such as counting characters.
 pub fn fit_texts_to_budget<T>(
     render: impl Fn(&[T]) -> (String, String),
     items: &[T],

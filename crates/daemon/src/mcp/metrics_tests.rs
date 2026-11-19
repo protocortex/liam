@@ -51,14 +51,7 @@ async fn server(metrics: Option<Arc<Metrics>>) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .unwrap();
-    let server = MemoryServer::new(
-        Arc::new(store),
-        embedder(),
-        Arc::new(liam_model::MockLlm),
-        30,
-        8192,
-        1,
-    );
+    let server = MemoryServer::new(Arc::new(store), embedder(), 30);
     let server = server.with_recall_timeout(RECALL_TIMEOUT_SECS);
     match metrics {
         Some(metrics) => server.with_metrics(metrics),
