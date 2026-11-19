@@ -11,27 +11,46 @@ use super::*;
 const DAY_MS: i64 = 86_400_000;
 const DIMS: usize = 8;
 
-/// An embedder that fails on the text of a page, which starts with the entity
-/// name and kind, and works for everything else.
-struct PageFailingEmbedder {
+/// The text of a memory that has no stored vector and that the embedder refuses,
+/// which is how a page build fails: only such a mention is embedded.
+const REFUSED_MENTION: &str = "a mention the embedder refuses";
+
+/// An embedder that fails on `REFUSED_MENTION` and works for everything else.
+struct MentionFailingEmbedder {
     inner: MockEmbedder,
-    failing_name: &'static str,
 }
 
 #[async_trait::async_trait]
-impl Embedder for PageFailingEmbedder {
+impl Embedder for MentionFailingEmbedder {
     fn dims(&self) -> usize {
         self.inner.dims()
     }
     async fn embed(&self, text: &str, kind: TextKind) -> liam_model::Result<Vec<f32>> {
-        if text.starts_with(self.failing_name) && text.contains(" (person)\n") {
+        if text == REFUSED_MENTION {
             return Err(liam_model::ModelError::embed_failed(
-                "page refused",
+                "mention refused",
                 "refused",
             ));
         }
         self.inner.embed(text, kind).await
     }
+}
+
+/// A server whose embedder refuses `REFUSED_MENTION`, and the id of a memory
+/// with that text and no vector.
+async fn server_with_a_refused_mention() -> (MemoryServer, NodeId) {
+    let server = server_with_embedder(Arc::new(MentionFailingEmbedder {
+        inner: MockEmbedder::new(DIMS),
+    }))
+    .await;
+    let refused = server
+        .store()
+        .await
+        .unwrap()
+        .insert(NewNode::now("fact", "note", REFUSED_MENTION))
+        .await
+        .unwrap();
+    (server, refused)
 }
 
 /// A unit vector along `axis`, so two mentions on different axes are never
@@ -75,13 +94,9 @@ fn soon() -> tokio::time::Instant {
 }
 
 /// The live page labelled `name`.
-async fn page_named(store: &DefaultGraph, name: &str) -> liam_store::ExplainedHit {
-    let hits = store
-        .query_explained(&Query::text(name).with_inferred(true))
+async fn page_named(store: &DefaultGraph, name: &str) -> Found {
+    live_row(store, name, None)
         .await
-        .unwrap();
-    hits.into_iter()
-        .find(|h| h.hit.label == name)
         .unwrap_or_else(|| panic!("no page labelled {name}"))
 }
 
@@ -107,7 +122,7 @@ async fn page_with_three_mentions(store: &DefaultGraph) -> NodeId {
 }
 
 #[tokio::test]
-async fn the_page_is_embedded_as_a_document_and_stored_vectors_are_reused() {
+async fn the_page_is_not_embedded_and_stored_mention_vectors_are_reused() {
     // Arrange: the one mention already has a vector
     let (server, embedder) = server_with_recording_embedder().await;
     let store = server.store().await.unwrap();
@@ -120,15 +135,14 @@ async fn the_page_is_embedded_as_a_document_and_stored_vectors_are_reused() {
         .await
         .expect("the page should be built");
 
-    // Assert: one embed call, for the page, and the page row holds that text
-    let calls = embedder.calls();
-    assert_eq!(calls.len(), 1, "{calls:?}");
-    assert_eq!(calls[0].1, TextKind::Document);
-    assert_eq!(calls[0].0, "Kim (person)\n1970-01-04: Kim likes tea.");
+    // Assert: no embed call at all, and the page row holds the text and no vector
+    assert!(embedder.calls().is_empty(), "{:?}", embedder.calls());
+    let written = page_named(&store, "Kim").await;
     assert_eq!(
-        page_named(&store, "Kim").await.hit.retrieved.as_text(),
-        calls[0].0
+        written.hit.retrieved.as_text(),
+        "Kim (person)\n1970-01-04: Kim likes tea."
     );
+    assert!(store.embedding(&written.hit.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -152,11 +166,9 @@ async fn a_mention_without_a_stored_vector_is_embedded_as_a_document() {
         .await
         .expect("the page should be built");
 
-    // Assert: the mention first, then the page
+    // Assert: the mention is embedded, and the page is not
     let calls = embedder.calls();
-    assert_eq!(calls.len(), 2, "{calls:?}");
-    assert_eq!(calls[0], ("Kim likes tea.".to_string(), TextKind::Document));
-    assert_eq!(calls[1].1, TextKind::Document);
+    assert_eq!(calls, [("Kim likes tea.".to_string(), TextKind::Document)]);
 }
 
 #[tokio::test]
@@ -322,25 +334,14 @@ async fn the_page_keeps_the_attributes_and_the_scope_of_the_entity() {
 
     // Assert: the old row is superseded, and the new one is still in the scope
     assert!(store.resolve_handle(page.as_str()).await.is_err());
-    let hits = |scope: &'static str| {
-        let store = &store;
-        async move {
-            store
-                .query_explained(&Query::text("Kim").with_scope(scope).with_inferred(true))
-                .await
-                .unwrap()
-        }
-    };
-    let own = hits("proj-x").await;
-    let written = own
-        .iter()
-        .find(|h| h.hit.label == "Kim")
+    let written = live_row(&store, "Kim", Some("proj-x"))
+        .await
         .expect("page in scope");
     assert_eq!(
         written.hit.attributes,
         crate::entity_page::stamped(json!({"role": "engineer"}))
     );
-    assert!(hits("proj-y").await.iter().all(|h| h.hit.label != "Kim"));
+    assert!(live_row(&store, "Kim", Some("proj-y")).await.is_none());
 }
 
 #[tokio::test]
@@ -375,30 +376,6 @@ async fn building_honors_the_deadline_it_is_given_not_a_fresh_one() {
         error.contains("timed out embedding the mentions"),
         "{error}"
     );
-}
-
-#[tokio::test]
-async fn a_page_that_cannot_be_embedded_before_the_deadline_is_reported() {
-    // Arrange: mentions have vectors, so only the page embed waits on the gate
-    let gate = Arc::new(tokio::sync::Mutex::new(()));
-    let server = server_with_embedder(Arc::new(GatedEmbedder::new(DIMS, gate.clone()))).await;
-    let store = server.store().await.unwrap();
-    let page = entity(&store, "Kim").await;
-    mention(&store, &page, "Kim likes tea.", 3, axis(0)).await;
-    let _held = gate.lock().await;
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-
-    // Act
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(5),
-        server.resynthesize_entity_as(&store, page, deadline, None),
-    )
-    .await
-    .expect("must stop at the passed deadline, not hang");
-
-    // Assert
-    let error = outcome.expect_err("the page embed cannot finish before the deadline");
-    assert!(error.contains("timed out embedding the page"), "{error}");
 }
 
 #[tokio::test]
@@ -441,13 +418,10 @@ async fn remember_builds_one_page_holding_both_facts_of_a_twice_mentioned_entity
     // Assert
     assert!(!out.contains("synthesis failed"), "{out}");
     let store = server.store().await.unwrap();
-    let hits = store
-        .query_explained(&Query::text("Dedup Entity").with_inferred(true))
+    let pages: Vec<_> = live_row(&store, "Dedup Entity", None)
         .await
-        .unwrap();
-    let pages: Vec<_> = hits
-        .iter()
-        .filter(|h| h.hit.label == "Dedup Entity" && !h.hit.retrieved.as_text().is_empty())
+        .into_iter()
+        .filter(|h| !h.hit.retrieved.as_text().is_empty())
         .collect();
     assert_eq!(pages.len(), 1, "{out}");
     assert!(pages[0]
@@ -501,12 +475,8 @@ async fn remember_builds_every_freshly_mentioned_entity_before_returning() {
 
 #[tokio::test]
 async fn remember_still_commits_the_episode_when_a_page_cannot_be_built() {
-    // Arrange: the embedder refuses the page of "Failing Entity"
-    let server = server_with_embedder(Arc::new(PageFailingEmbedder {
-        inner: MockEmbedder::new(DIMS),
-        failing_name: "Failing Entity",
-    }))
-    .await;
+    // Arrange: "Failing Entity" mentions a memory the embedder refuses
+    let (server, refused) = server_with_a_refused_mention().await;
 
     // Act
     let out = server
@@ -514,7 +484,7 @@ async fn remember_still_commits_the_episode_when_a_page_cannot_be_built() {
             episode: Some(EpisodeArgs {
                 facts: vec![],
                 entities: vec![episode_entity("person", "Failing Entity")],
-                edges: vec![episode_edge("entity:0", "fact:0", "mentions")],
+                edges: vec![episode_edge("entity:0", refused.as_str(), "mentions")],
             }),
             ..remember_args("synthesis failure top content")
         }))
@@ -541,12 +511,8 @@ async fn remember_still_commits_the_episode_when_a_page_cannot_be_built() {
 
 #[tokio::test]
 async fn remember_records_both_outcomes_when_one_of_two_pages_fails() {
-    // Arrange: only the page of "Mixed One" is refused
-    let server = server_with_embedder(Arc::new(PageFailingEmbedder {
-        inner: MockEmbedder::new(DIMS),
-        failing_name: "Mixed One",
-    }))
-    .await;
+    // Arrange: only "Mixed One" mentions the memory the embedder refuses
+    let (server, refused) = server_with_a_refused_mention().await;
 
     // Act
     let out = server
@@ -558,7 +524,7 @@ async fn remember_records_both_outcomes_when_one_of_two_pages_fails() {
                     episode_entity("person", "Mixed Two"),
                 ],
                 edges: vec![
-                    episode_edge("entity:0", "fact:0", "mentions"),
+                    episode_edge("entity:0", refused.as_str(), "mentions"),
                     episode_edge("entity:1", "fact:0", "mentions"),
                 ],
             }),
@@ -695,12 +661,9 @@ async fn a_scoped_entity_page_holds_only_mentions_inside_its_scope() {
         .unwrap();
 
     // Assert
-    let written = store
-        .query_explained(&Query::text("Kim").with_scope("proj-x").with_inferred(true))
+    let written = live_row(&store, "Kim", Some("proj-x"))
         .await
-        .unwrap()
-        .into_iter()
-        .find(|hit| hit.hit.label == "Kim" && hit.hit.retrieved.is_inferred())
+        .filter(|found| found.hit.retrieved.is_inferred())
         .expect("a page in scope");
     let text = written.hit.retrieved.as_text();
     assert!(text.contains("Kim likes tea."), "{text}");

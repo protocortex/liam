@@ -89,8 +89,9 @@ impl LogReader for BoundedScansOnly {
 
 #[tokio::test]
 async fn rules_only_extraction_writes_mention_facts_and_starts_no_model() {
-    // Arrange
-    let harness = Harness::new();
+    // Arrange: no page is built in the run, so the log ends with the notes
+    let mut harness = Harness::new();
+    harness.config.gc.max_resynth_per_tick = 0;
     let server = with_ada(&harness, 2).await;
     let store = server.store().await.unwrap();
     let last_event = store.last_applied_offset().await.unwrap();

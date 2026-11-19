@@ -26,7 +26,13 @@ const MAX_PAGE_CHARS: usize = 600;
 
 /// Characters the header may take, so a long entity name cannot leave no room
 /// for the newest mention.
-const MAX_HEADER_CHARS: usize = MAX_PAGE_CHARS / 3;
+const MAX_HEADER_CHARS: usize = MAX_PAGE_CHARS / HEADER_SHARE;
+
+/// The header may take at most one part in this many of a page.
+const HEADER_SHARE: usize = 3;
+
+/// Characters the newline after a line takes.
+const NEWLINE_CHARS: usize = 1;
 
 /// Marks where a header or the newest mention was cut to fit the page.
 const CUT_MARKER: &str = "...";
@@ -159,14 +165,14 @@ pub fn build_page(kind: &str, name: &str, mentions: &[Mention]) -> EntityPage {
     for mention in selection(&without_near_duplicates(mentions)) {
         let mut text = line(mention);
         // The separating newline counts as one character.
-        let cost = text.chars().count() + 1;
+        let cost = text.chars().count() + NEWLINE_CHARS;
         if used + cost > MAX_PAGE_CHARS {
             if !shown.is_empty() {
                 continue;
             }
-            text = cut_to(&text, MAX_PAGE_CHARS - used - 1);
+            text = cut_to(&text, MAX_PAGE_CHARS - used - NEWLINE_CHARS);
         }
-        used += text.chars().count() + 1;
+        used += text.chars().count() + NEWLINE_CHARS;
         shown.push(mention);
         lines.push(text);
     }

@@ -1096,7 +1096,11 @@ impl MemoryServer {
             .await
             .map_err(|_| "timed out embedding the mentions".to_string())??;
         let page = entity_page::build_page(&candidate.kind, &candidate.label, &mentions);
-        if page.source_ids.is_empty() {
+        // A page a model wrote is replaced even when no mention is left to build
+        // from, by an entity row with no text, so it is not tried again.
+        let legacy = candidate.retrieved.is_inferred()
+            && entity_page::is_legacy_page(candidate.retrieved.as_text(), &candidate.attributes);
+        if page.source_ids.is_empty() && !legacy {
             tracing::debug!(entity = %label, "the entity has no mention, so it gets no page");
             return Ok(());
         }
@@ -1107,16 +1111,10 @@ impl MemoryServer {
         let basis = mention_basis(store, &sources)
             .await
             .map_err(|e| e.to_string())?;
-        let embedding = tokio::time::timeout_at(
-            deadline,
-            self.embedder.embed(&page.text, TextKind::Document),
-        )
-        .await
-        .map_err(|_| "timed out embedding the page".to_string())?
-        .map_err(|e| e.to_string())?;
+        // The page is not embedded: it is read through `timeline` and kept out
+        // of the vector index, so it cannot take a place in a search.
         let mut node = NewNode::entity(candidate.kind, candidate.label)
             .with_attributes(entity_page::stamped(candidate.attributes))
-            .with_embedding(embedding)
             .with_basis(basis)
             .with_producer(write_source.map_or_else(|| self.producer(), str::to_owned));
         if let Some(scope) = candidate.scope.clone() {

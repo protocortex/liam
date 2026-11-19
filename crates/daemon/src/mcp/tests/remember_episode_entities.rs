@@ -377,15 +377,9 @@ async fn remember_with_a_full_mixed_episode_round_trips_through_mcp() {
             .is_err(),
         "Henry's original id should have been superseded by its own resynthesis"
     );
-    let resynthesized_henry = server
-        .store()
-        .await
-        .unwrap()
-        .query_explained(&Query::text("Henry").with_inferred(true))
-        .await
-        .unwrap();
+    let resynthesized_henry = live_row(&server.store().await.unwrap(), "Henry", None).await;
     assert!(
-        resynthesized_henry.iter().any(|h| h.hit.label == "Henry"),
+        resynthesized_henry.is_some_and(|h| h.hit.label == "Henry"),
         "expected a resynthesized, still-live Henry entity: {out}"
     );
     assert!(

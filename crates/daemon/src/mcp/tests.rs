@@ -27,6 +27,20 @@ mod removed_ask;
 mod store_swap;
 mod timing_samples;
 
+/// A live row found by its subject, which is how a test reads an entity page: a
+/// page is kept out of the text index, so a search does not find it.
+struct Found {
+    hit: liam_store::Candidate,
+}
+
+async fn live_row(store: &DefaultGraph, name: &str, scope: Option<&str>) -> Option<Found> {
+    store
+        .live_by_subject(&name.trim().to_lowercase(), scope, Millis::now())
+        .await
+        .unwrap()
+        .map(|hit| Found { hit })
+}
+
 /// Fresh in-memory server wired with the given llm, a 30s synthesis
 /// timeout, and the shipped default 8192-token context budget. Dims 8 to
 /// match `MockEmbedder::new(8)`.

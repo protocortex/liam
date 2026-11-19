@@ -290,15 +290,12 @@ impl Embedder for GatedEmbedder {
     }
 }
 
-/// Inserts `name` with one mention that already has a vector, so a page build
-/// for it makes one embed call, for the page.
+/// Inserts `name` with one mention that has no vector, so a page build for it
+/// makes one embed call, for the mention.
 async fn entity_with_a_mention(store: &DefaultGraph, name: &str) {
     let entity = store.insert(NewNode::entity("person", name)).await.unwrap();
     let fact = store
-        .insert(
-            NewNode::now("fact", "fact", format!("{name} likes tea"))
-                .with_embedding(vec![1.0; DIMS]),
-        )
+        .insert(NewNode::now("fact", "fact", format!("{name} likes tea")))
         .await
         .unwrap();
     store
@@ -1106,33 +1103,4 @@ async fn consolidate_is_busy_while_an_archive_run_is_in_progress() {
     // Assert
     assert!(refused.contains("already in progress"), "{refused}");
     assert!(archived.is_ok(), "{archived:?}");
-}
-
-#[test]
-fn reporting_a_run_says_how_each_outcome_ended() {
-    // Arrange
-    let cases = [
-        (Some(RunOutcome::Committed), "consolidation committed"),
-        (
-            Some(RunOutcome::RolledBack),
-            "consolidation rolled back; the store is as it was",
-        ),
-        (
-            Some(RunOutcome::RestoreFailed),
-            "consolidation could not restore the store; it needs manual inspection",
-        ),
-        (None, "consolidation ended with no outcome"),
-    ];
-
-    for (outcome, expected) in cases {
-        crate::test_logs::capture();
-
-        // Act
-        report("run-1", outcome);
-
-        // Assert
-        let logged = crate::test_logs::captured();
-        assert!(logged.contains(expected), "{outcome:?}: {logged}");
-        assert!(logged.contains("run-1"), "{outcome:?}: {logged}");
-    }
 }

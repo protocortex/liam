@@ -699,17 +699,17 @@ async fn carry_mentions_to_the_new_page(store: &DefaultGraph, write_source: Opti
     }
 }
 
-/// Records the mention count a fresh page was built from. It reads the clock
-/// again because the page write superseded the entity at the real wall clock,
-/// strictly later than the instant the tick began; resolving the entity at the
-/// earlier instant would find the closed row and the entity would look stale
-/// again on every following tick.
+/// Records the mention count a fresh page was built from. It reads the store's
+/// clock again because the page write superseded the entity at a later instant
+/// than the one the tick began; resolving the entity at the earlier instant
+/// would find the closed row and the entity would look stale again on every
+/// following tick.
 async fn record_fingerprint(
     store: &DefaultGraph,
     subject: &str,
     scope: Option<&str>,
 ) -> liam_store::Result<()> {
-    let now = liam_store::Millis::now();
+    let now = store.now();
     let fingerprint = store
         .entity_mentions_fingerprint(subject, scope, now)
         .await?;
@@ -719,19 +719,29 @@ async fn record_fingerprint(
 }
 
 /// Up to `limit` entities whose page is due: the stale ones, oldest first, then
-/// entities whose page an earlier version wrote, which `recall` ignores until a
-/// new page replaces it.
+/// entities whose page an earlier version wrote, which `timeline` does not show
+/// until a new page replaces it. `marker` is the attribute that tells the new
+/// pages from the old. A failed lookup of the old pages is logged and leaves the
+/// stale ones due.
 async fn due_for_rebuild(
     store: &DefaultGraph,
     limit: usize,
     now: liam_store::Millis,
+    marker: &str,
 ) -> liam_store::Result<Vec<(liam_store::NodeId, String, Option<String>)>> {
     let mut due = store.stale_entities(limit, now).await?;
     let room = limit.saturating_sub(due.len());
     if room > 0 {
-        let legacy = store
-            .pages_without_marker(entity_page::PAGE_MARKER_KEY, room + due.len(), now)
-            .await?;
+        let legacy = match store
+            .pages_without_marker(marker, room + due.len(), now)
+            .await
+        {
+            Ok(legacy) => legacy,
+            Err(e) => {
+                tracing::warn!(error = %e, "lookup of the pages an earlier version wrote failed");
+                Vec::new()
+            }
+        };
         let already: Vec<liam_store::NodeId> = due.iter().map(|(id, _, _)| id.clone()).collect();
         due.extend(
             legacy
@@ -752,8 +762,15 @@ async fn resynthesize_stale(
     resynthesis: &Resynthesis,
     write_source: Option<&str>,
 ) {
-    let now = liam_store::Millis::now();
-    let stale = match due_for_rebuild(store, resynthesis.max_per_tick, now).await {
+    let now = store.now();
+    let stale = match due_for_rebuild(
+        store,
+        resynthesis.max_per_tick,
+        now,
+        entity_page::PAGE_MARKER_KEY,
+    )
+    .await
+    {
         Ok(stale) => stale,
         Err(e) => {
             tracing::warn!(error = %e, "stale entity lookup failed");
@@ -1280,29 +1297,29 @@ mod tests {
         MemoryServer::new(store, embedder, Arc::new(liam_model::MockLlm), 30, 8192, 1)
     }
 
-    /// An embedder that waits, without sleeping, until the wall clock has moved
-    /// on from the instant it was called, so the instant a page write
-    /// supersedes at is later than the one `resynthesize_stale` captured before
-    /// its loop began. `Millis::now` reads the system clock directly, so no
-    /// fake clock can supply that gap; a fresh-fingerprint regression test needs
-    /// it to be certain rather than a coin flip on how fast the test runs.
-    struct DelayedEmbedder(liam_model::MockEmbedder);
+    /// An embedder that moves the store's clock when it is called, so the
+    /// instant a page write supersedes at is later than the one
+    /// `resynthesize_stale` captured before its loop began. A fresh-fingerprint
+    /// regression test needs that gap, and a fake clock supplies it without
+    /// waiting.
+    struct ClockAdvancingEmbedder {
+        inner: liam_model::MockEmbedder,
+        clock: Arc<FixedClock>,
+        to: Millis,
+    }
 
     #[async_trait::async_trait]
-    impl liam_model::Embedder for DelayedEmbedder {
+    impl liam_model::Embedder for ClockAdvancingEmbedder {
         fn dims(&self) -> usize {
-            self.0.dims()
+            self.inner.dims()
         }
         async fn embed(
             &self,
             text: &str,
             kind: liam_model::TextKind,
         ) -> liam_model::Result<Vec<f32>> {
-            let called_at = Millis::now();
-            while Millis::now() == called_at {
-                tokio::task::yield_now().await;
-            }
-            self.0.embed(text, kind).await
+            self.clock.set(self.to);
+            self.inner.embed(text, kind).await
         }
     }
 
@@ -1322,20 +1339,6 @@ mod tests {
         ) -> liam_model::Result<Vec<f32>> {
             Err(liam_model::ModelError::embed_failed("embed", "refused"))
         }
-    }
-
-    #[test]
-    fn the_test_embedders_report_the_dimension_of_the_vectors_they_return() {
-        // Arrange
-        use liam_model::Embedder as _;
-        let delayed = DelayedEmbedder(liam_model::MockEmbedder::new(8));
-        let gated = GatedEmbedder::new(Arc::new(tokio::sync::Notify::new()));
-
-        // Act
-        let dims = [delayed.dims(), FailingEmbedder.dims(), gated.dims()];
-
-        // Assert
-        assert_eq!(dims, [8, 8, 8]);
     }
 
     /// Blocks inside `embed()` on a `Notify` the test controls, tracking the
@@ -1389,6 +1392,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn the_test_embedders_report_the_width_of_the_vectors_they_return() {
+        // Arrange
+        let release = Arc::new(tokio::sync::Notify::new());
+        release.notify_one();
+        let gated = GatedEmbedder::new(release);
+        let clock = ClockAdvancingEmbedder {
+            inner: liam_model::MockEmbedder::new(8),
+            clock: Arc::new(FixedClock::new(Millis(1))),
+            to: Millis(2),
+        };
+
+        // Act
+        let gated_vector = liam_model::Embedder::embed(&gated, "x", liam_model::TextKind::Document)
+            .await
+            .unwrap();
+        let clock_vector = liam_model::Embedder::embed(&clock, "x", liam_model::TextKind::Document)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(gated_vector.len(), liam_model::Embedder::dims(&gated));
+        assert_eq!(clock_vector.len(), liam_model::Embedder::dims(&clock));
+        assert_eq!(liam_model::Embedder::dims(&FailingEmbedder), 8);
+    }
+
     /// Cooperatively yields until `condition()` is true, bounded so a real bug
     /// panics the test instead of hanging the suite.
     async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -1401,15 +1430,16 @@ mod tests {
         panic!("condition never became true; the two tasks likely deadlocked");
     }
 
-    /// Inserts `entity` with one mention that already has a vector, so a page
-    /// build for it makes a single embed call, for the page.
+    /// Inserts `entity` with one mention that has no vector, so a page build for
+    /// it makes a single embed call, for the mention.
     async fn entity_with_a_mention(store: &DefaultGraph, name: &str) -> liam_store::NodeId {
         let entity = store.insert(NewNode::entity("person", name)).await.unwrap();
         let fact = store
-            .insert(
-                NewNode::now("fact", "some fact", format!("{name} likes tea"))
-                    .with_embedding(vec![1.0; 8]),
-            )
+            .insert(NewNode::now(
+                "fact",
+                "some fact",
+                format!("{name} likes tea"),
+            ))
             .await
             .unwrap();
         store
@@ -1417,6 +1447,36 @@ mod tests {
             .await
             .unwrap();
         entity
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_of_old_pages_keeps_the_stale_entities_due_and_is_logged() {
+        // Given a stale entity, a page an earlier version wrote, and a marker
+        // the store cannot read as a JSON path, so the lookup of old pages fails
+        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+            .await
+            .expect("open in-memory store");
+        entity_with_a_mention(&store, "Stale One").await;
+        let mut legacy = NewNode::entity("person", "Old Page");
+        legacy.content = "a profile a model wrote".to_string();
+        store.insert(legacy).await.unwrap();
+        let captured = CapturedLogs::default();
+        let _guard = install_captured_logs(captured.clone());
+
+        // When the due entities are listed
+        let due = due_for_rebuild(&store, 5, Millis::now(), "[")
+            .await
+            .expect("the stale list survives the failed lookup");
+
+        // Then the stale entity is still due, and the failure was logged
+        let subjects: Vec<&str> = due.iter().map(|(_, subject, _)| subject.as_str()).collect();
+        assert_eq!(subjects, ["stale one"]);
+        let log = String::from_utf8(captured.0.lock().expect("captured logs lock").clone())
+            .expect("log output is utf8");
+        assert!(
+            log.contains("lookup of the pages an earlier version wrote failed"),
+            "{log}"
+        );
     }
 
     #[tokio::test]
@@ -1521,13 +1581,11 @@ mod tests {
             .unwrap()
             .is_empty());
         let page = store
-            .query_explained(&liam_store::Query::text("Grows").with_inferred(true))
+            .live_by_subject("grows", None, Millis::now())
             .await
             .unwrap()
-            .into_iter()
-            .find(|h| h.hit.label == "Grows")
             .expect("the first tick built a page");
-        assert!(!page.hit.retrieved.as_text().contains("moved to Porto"));
+        assert!(!page.retrieved.as_text().contains("moved to Porto"));
 
         // When a new fact mentions the entity
         let fact = store
@@ -1538,7 +1596,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .relate(&page.hit.id, &fact, relation::MENTIONS)
+            .relate(&page.id, &fact, relation::MENTIONS)
             .await
             .unwrap();
 
@@ -1547,13 +1605,11 @@ mod tests {
         assert_eq!(stale.len(), 1, "{stale:?}");
         maintenance_tick(&server, &policy, 5, 30, false).await;
         let rebuilt = store
-            .query_explained(&liam_store::Query::text("Grows").with_inferred(true))
+            .live_by_subject("grows", None, Millis::now())
             .await
             .unwrap()
-            .into_iter()
-            .find(|h| h.hit.label == "Grows")
             .expect("the page is still there");
-        assert!(rebuilt.hit.retrieved.as_text().contains("moved to Porto"));
+        assert!(rebuilt.retrieved.as_text().contains("moved to Porto"));
         assert!(store
             .stale_entities(10, Millis::now())
             .await
@@ -1565,11 +1621,12 @@ mod tests {
     async fn a_rebuilt_entity_with_a_live_mention_is_not_reported_stale_again_next_tick() {
         // Given an entity with one live mentions edge of its own, so the old
         // and new node fingerprint differently (1 mention vs. 0, since a
-        // supersede never carries a node's own edges over on its own), and a
-        // slow embedder so the real wall clock has visibly moved by the time
-        // the page write supersedes the entity, past the `now`
-        // `resynthesize_stale` captured before its loop began
-        let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
+        // supersede never carries a node's own edges over on its own), and an
+        // embedder that moves the store's clock forward, so the page write
+        // supersedes the entity later than the `now` `resynthesize_stale`
+        // captured before its loop began
+        let clock = Arc::new(FixedClock::new(Millis(5_000)));
+        let store = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
             .await
             .expect("open in-memory store");
         let entity = entity_with_a_mention(&store, "Mentioned Stale").await;
@@ -1577,7 +1634,11 @@ mod tests {
         let store = Arc::new(store);
         let server = test_server_with_embedder(
             Arc::clone(&store),
-            Arc::new(DelayedEmbedder(liam_model::MockEmbedder::new(8))),
+            Arc::new(ClockAdvancingEmbedder {
+                inner: liam_model::MockEmbedder::new(8),
+                clock,
+                to: Millis(6_000),
+            }),
         );
 
         // When the tick fires and rebuilds it
