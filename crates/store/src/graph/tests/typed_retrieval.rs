@@ -16,11 +16,17 @@ async fn open() -> DefaultGraph {
         .unwrap()
 }
 
-/// An entity page whose text carries `words`, so a text query finds it.
+/// An entity page whose text carries `words`. A page is kept out of the text
+/// index, so a test that must find one gives it a vector and queries by vector.
 fn page(name: &str, words: &str) -> NewNode {
     let mut page = NewNode::entity("person", name);
     page.content = words.to_string();
     page
+}
+
+/// A vector all queries of these tests share, so whatever holds it matches.
+fn shared() -> Vec<f32> {
+    vec![1.0; DIMS]
 }
 
 fn texts(hits: &[ExplainedHit]) -> Vec<&str> {
@@ -33,9 +39,13 @@ fn texts(hits: &[ExplainedHit]) -> Vec<&str> {
 async fn a_strict_query_returns_the_fact_and_an_inferring_one_returns_the_page_as_inferred() {
     // Arrange
     let g = open().await;
-    g.insert(fact("zorbnax met the team")).await.unwrap();
-    g.insert(page("Zorbnax", "zorbnax profile")).await.unwrap();
-    let query = Query::text("zorbnax");
+    g.insert(fact("zorbnax met the team").with_embedding(shared()))
+        .await
+        .unwrap();
+    g.insert(page("Zorbnax", "zorbnax profile").with_embedding(shared()))
+        .await
+        .unwrap();
+    let query = Query::vector(shared());
 
     // Act
     let strict = g.query_explained(&query).await.unwrap();
@@ -78,10 +88,13 @@ async fn a_strict_vector_query_leaves_out_the_page_that_is_nearest() {
 async fn a_page_that_matches_the_query_does_not_pull_in_its_mentions_when_strict() {
     // Arrange: only the page matches, and it mentions a fact that does not
     let g = open().await;
-    let page = g.insert(page("Zorbnax", "zorbnax profile")).await.unwrap();
+    let page = g
+        .insert(page("Zorbnax", "zorbnax profile").with_embedding(shared()))
+        .await
+        .unwrap();
     let unrelated = g.insert(fact("quiet unrelated note")).await.unwrap();
     g.relate(&page, &unrelated, MENTIONS).await.unwrap();
-    let query = Query::text("zorbnax");
+    let query = Query::vector(shared());
 
     // Act
     let strict = g.query_explained(&query).await.unwrap();
@@ -135,16 +148,20 @@ async fn an_inferred_hit_reads_its_basis_or_unknown_when_none_is_listed() {
     let g = open().await;
     let mention = g.insert(fact("zorbnax note")).await.unwrap();
     let basis = g.node_event_ids(&mention, EventRole::Origin).await.unwrap();
-    g.insert(page("Zorbnax", "zorbnax with basis").with_basis(basis.clone()))
-        .await
-        .unwrap();
-    g.insert(page("Legacy", "zorbnax without basis"))
+    g.insert(
+        page("Zorbnax", "zorbnax with basis")
+            .with_basis(basis.clone())
+            .with_embedding(shared()),
+    )
+    .await
+    .unwrap();
+    g.insert(page("Legacy", "zorbnax without basis").with_embedding(shared()))
         .await
         .unwrap();
 
     // Act
     let hits = g
-        .query_explained(&Query::text("zorbnax").with_inferred(true))
+        .query_explained(&Query::vector(shared()).with_inferred(true))
         .await
         .unwrap();
 

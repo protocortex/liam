@@ -717,6 +717,7 @@ impl<B: Backend> Graph<B> {
         )
         .await?;
         crate::migrate::backfill_derivation(&backend, clock.now()).await?;
+        crate::migrate::keep_pages_out_of_the_text_index(&backend).await?;
         // Gives an existing database the ON DELETE CASCADE that the DDL above
         // only grants a fresh one, by rebuilding the referencing tables
         // (ADR-0003). Detects and no-ops on a database that already has it.
@@ -1052,6 +1053,28 @@ impl<B: Backend> Graph<B> {
             .await?
             .into_iter()
             .next())
+    }
+
+    /// The instant on the store's clock, which stamps its writes.
+    pub fn now(&self) -> Millis {
+        self.clock.now()
+    }
+
+    /// The live node with `subject` in `scope` as of `as_of`, which is the entity
+    /// row or its page: a page is kept out of the text index, so a search does
+    /// not find it.
+    pub async fn live_by_subject(
+        &self,
+        subject: &str,
+        scope: Option<&str>,
+        as_of: Millis,
+    ) -> Result<Option<Candidate>> {
+        let (sql, params) = live_by_subject_query(subject, as_of, scope, None);
+        let rows = self.backend.query(&sql, &params).await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        self.get(&NodeId::from_raw(row.get_string(0)?), as_of).await
     }
 
     /// The vector stored for `id`, or `None` when the node has none. A closed

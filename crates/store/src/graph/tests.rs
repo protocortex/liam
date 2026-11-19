@@ -52,6 +52,7 @@ mod summaries;
 mod summary_log;
 mod support;
 mod swept_by;
+mod text_index;
 mod tier_apply;
 mod tier_log;
 mod tier_race;

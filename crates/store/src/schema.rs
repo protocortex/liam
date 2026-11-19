@@ -4,7 +4,33 @@
 //! intervals use the FOREVER sentinel so every currency check is positive.
 
 use crate::ids::FOREVER;
-use crate::types::GraphConfig;
+use crate::types::{Derivation, GraphConfig};
+
+/// The three triggers that keep `nodes_fts` in step with `nodes`. A written
+/// entity page is read through `timeline` only, so it stays out of the text
+/// index: it cannot move the ranking statistics of recorded memory. An entity
+/// row with no text is indexed as before. `guard` is `IF NOT EXISTS` when the
+/// schema is applied and empty when `migrate` replaces an older definition.
+pub(crate) fn text_index_triggers(guard: &str) -> Vec<String> {
+    let inferred = Derivation::Inferred.as_str();
+    let new_row = format!("new.derivation != '{inferred}' OR new.content = ''");
+    let old_row = format!("old.derivation != '{inferred}' OR old.content = ''");
+    let delete_old = format!(
+        "INSERT INTO nodes_fts(nodes_fts, rowid, label, content)
+    SELECT 'delete', old.rowid, old.label, old.content WHERE {old_row};"
+    );
+    let insert_new = format!(
+        "INSERT INTO nodes_fts(rowid, label, content)
+    SELECT new.rowid, new.label, new.content WHERE {new_row};"
+    );
+    vec![
+        format!("CREATE TRIGGER {guard}nodes_ai AFTER INSERT ON nodes BEGIN\n  {insert_new}\nEND"),
+        format!("CREATE TRIGGER {guard}nodes_ad AFTER DELETE ON nodes BEGIN\n  {delete_old}\nEND"),
+        format!(
+            "CREATE TRIGGER {guard}nodes_au AFTER UPDATE ON nodes BEGIN\n  {delete_old}\n  {insert_new}\nEND"
+        ),
+    ]
+}
 
 pub fn schema(_config: &GraphConfig) -> String {
     let mut sql = String::from(
@@ -47,17 +73,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
   tokenize = 'porter unicode61'
 );
 
-CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-  INSERT INTO nodes_fts(rowid, label, content) VALUES (new.rowid, new.label, new.content);
-END;
-CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-  INSERT INTO nodes_fts(nodes_fts, rowid, label, content) VALUES ('delete', old.rowid, old.label, old.content);
-END;
-CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-  INSERT INTO nodes_fts(nodes_fts, rowid, label, content) VALUES ('delete', old.rowid, old.label, old.content);
-  INSERT INTO nodes_fts(rowid, label, content) VALUES (new.rowid, new.label, new.content);
-END;
-
+",
+    );
+    for trigger in text_index_triggers("IF NOT EXISTS ") {
+        sql.push_str(&trigger);
+        sql.push_str(";\n");
+    }
+    sql.push_str(
+        "
 -- The REFERENCES below are ENFORCED, not decoration. libSQL turns foreign keys
 -- on by default, unlike stock SQLite, and no `PRAGMA foreign_keys` is needed or
 -- present.

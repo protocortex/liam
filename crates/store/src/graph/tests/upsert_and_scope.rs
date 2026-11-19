@@ -846,11 +846,7 @@ async fn a_written_entity_page_is_superseded_by_the_next_upsert_not_duplicated()
     // Assert: the first page is closed, and only the second is live
     assert!(!g.exists_as_of(&first, Millis(2000)).await.unwrap());
     assert!(g.exists_as_of(&second, Millis(2000)).await.unwrap());
-    let live = g
-        .query(&Query::text("Kim").with_inferred(true).with_k(10))
-        .await
-        .unwrap();
-    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live_pages_named(&g, "Kim", Millis(2000)).await, [second]);
 }
 
 #[tokio::test]
@@ -878,19 +874,22 @@ fn written_page(name: &str, text: &str) -> NewNode {
     page
 }
 
+/// The live pages of the entity `name` at `at`, read from the table: a page is
+/// kept out of the text index, so a query cannot list them.
 async fn live_pages_named(g: &DefaultGraph, name: &str, at: Millis) -> Vec<NodeId> {
-    g.query_explained(
-        &Query::text(name)
-            .with_inferred(true)
-            .with_k(10)
-            .with_as_of(at),
-    )
-    .await
-    .unwrap()
-    .into_iter()
-    .filter(|hit| hit.hit.label == name)
-    .map(|hit| hit.hit.id)
-    .collect()
+    let rows = g
+        .backend
+        .query(
+            "SELECT id FROM nodes
+             WHERE derivation = 'inferred' AND subject = ?1 AND tx_from <= ?2 AND tx_to > ?2
+             ORDER BY rowid",
+            &[name.to_lowercase().as_str().into(), at.into()],
+        )
+        .await
+        .unwrap();
+    rows.iter()
+        .map(|row| NodeId::from_raw(row.get_string(0).unwrap()))
+        .collect()
 }
 
 #[tokio::test]

@@ -714,9 +714,13 @@ impl Backend for LibsqlBackend {
                 "SELECT n.id FROM nodes n
                  LEFT JOIN node_vectors v ON v.node_id = n.id
                  WHERE n.tx_to = ?1 AND v.node_id IS NULL
-                   AND TRIM(n.content, ?2) != ''
+                   AND TRIM(n.content, ?2) != '' AND n.derivation != ?3
                  ORDER BY n.id",
-                &[FOREVER.into(), CONTENT_WHITESPACE.into()],
+                &[
+                    FOREVER.into(),
+                    CONTENT_WHITESPACE.into(),
+                    Derivation::Inferred.as_str().into(),
+                ],
             )
             .await?;
         rows.iter()
