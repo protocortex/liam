@@ -20,8 +20,11 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
-- **Breaking:** the `ask` tool is removed. Use `recall`: it returns the same evidence, and the calling agent
-  writes its own answer from the recalled memories. There was no `liam ask` command to remove. The local
+- **Breaking:** the `ask` tool is removed. In strict mode `ask` ranked recorded memory like `recall` and added a
+  written answer. In infer mode, its default, it also ranked entity pages and summaries beside recorded memory.
+  Use `recall` for recorded memory: it returns recorded memory only, as it did before, and the calling agent
+  writes its own answer. Entity pages are now read through `timeline` and summaries through `summaries`; no
+  query ranks them any more. There was no `liam ask` command to remove. The local
   1.5B model stays for entity pages and local summaries. `ask_sufficiency_check` is removed too: an old line is
   ignored and logs one warning. `ask_timeout_secs` stays, now bounding one batch of entity-page syntheses.
   The `ask_latency_*` metrics and the `synthesis_unavailable` degraded reason are gone, and `recall` no

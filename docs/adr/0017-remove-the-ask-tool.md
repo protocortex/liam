@@ -12,8 +12,10 @@ model write a short cited answer from it.
 - **The caller is an agent.** Every client of LIAM is an agent with a far
   stronger model than the 1.5B one. It can write its own answer from what
   `recall` returns.
-- **Same evidence.** `recall` returns the same ranked memories, with their
-  handles and provenance. `ask` only added a written answer on top.
+- **Mostly the same evidence.** In strict mode `ask` ranked recorded memory
+  only, as `recall` does, and added a written answer on top. In infer mode, its
+  default, `ask` also ranked entity pages and summaries beside recorded memory.
+  `recall` is strict only and refuses infer, so it never returned them.
 - **A weak last step.** The answer came from a small local model, so it needed
   a sufficiency pre-pass, a grounding check and a fallback to raw evidence to
   stay safe. Without the model, `ask` would be the same tool as `recall`.
@@ -58,9 +60,15 @@ The owner decided on 2026-11-19 to keep `recall` as the only read-by-query tool.
 
 - **No written answer.** A caller with no model of its own gets recalled
   memories and writes nothing.
-- **Entity pages are read through `timeline` only.** `ask` in infer mode was
-  the one tool that ranked entity pages and summaries next to recorded memory.
-  `recall` leaves them out, so `timeline` and `summaries` show them.
+- **Entity pages and summaries are no longer ranked by a query.** `ask` in
+  infer mode was the one tool that ranked them next to recorded memory. Read
+  entity pages through `timeline` and summaries through `summaries`. `recall`
+  returns recorded memory only, as it did before.
+- **The store keeps its ranking of inferred rows.** The query option
+  `include_inferred` and the `as_of` argument of `summaries_within` stay, with
+  their tests, though no daemon tool sets them now.
+- **Open decision.** Whether `recall` gains a reading mode that ranks entity
+  pages and summaries is not decided.
 - **A breaking change for clients that called `ask`.** The call returns the
   standard unknown-tool error. They use `recall`.
 - **Less to test.** The answer eval, the sufficiency pre-pass and the answer
