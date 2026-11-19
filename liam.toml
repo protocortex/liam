@@ -12,7 +12,7 @@
 database_path  = "liam.db"
 log_filter     = "info,liam=debug"   # RUST_LOG overrides when set
 embedding_dims = 384              # MRL truncation length; fixed at DB creation
-ask_timeout_secs = 30             # one batch of entity-page syntheses stops past this; the name predates removing ask
+ask_timeout_secs = 30             # one batch of entity-page builds stops past this; the name predates removing ask
 recall_timeout_secs = 10          # recall replies with a timeout if retrieval runs past this
 socket_path    = "~/.liam/liamd.sock"   # multi-client listener; ~ is expanded before binding
 read_pool_size = 4                # independent read connections liam-store holds open
@@ -23,9 +23,7 @@ episode_retention_days = 30
 interval_hours         = 6
 reclaim                = true
 run_on_start           = false
-max_resynth_per_tick   = 5      # entities re-synthesized per maintenance tick, at most
-full_synthesis_mention_threshold = 8    # live mentions at which a resynthesis gets the full token budget
-full_synthesis_max_new_tokens    = 512  # output token budget for a full-tier resynthesis
+max_resynth_per_tick   = 5      # entity pages rebuilt per maintenance tick, at most
 
 # Every write is recorded in an event log before it reaches the database. The
 # database is a projection of that log and `liam rebuild` can recreate it.
@@ -200,7 +198,7 @@ cache_dir       = "~/.liam/models"
 device          = "auto"   # auto | metal | cuda | cpu; auto = fastest compiled in, else cpu
 warmup          = false    # true loads the model at start and pays Metal's ~10s first-call kernel compile then; false loads it on first use
 idle_unload_secs = 300     # unload the model after this many idle seconds to free its memory; 0 never unloads
-context_tokens  = 8192     # sizes both the llama.cpp context and entity synthesis's mention trimming
+context_tokens  = 8192     # sizes the llama.cpp context and the budget of clusters
 max_concurrent_generations = 0   # 0 = auto-tune from a one-time benchmark; set a fixed number to disable
 
 # Derives subject/predicate/object facts from the log. Off until enabled.

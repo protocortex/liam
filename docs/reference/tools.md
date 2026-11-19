@@ -30,7 +30,7 @@ documented in the pages linked here:
 | `scope` | no | Partition by project or agent. Trimmed; ASCII letters, digits, `-`, `_`, `/`; up to 200 characters; no leading/trailing `/` or empty segment (`//`). |
 | `subject` | no | Identity. A new value with the same subject supersedes the old. |
 
-`recall` retrieves the best matches in store order.
+`recall` retrieves the best matches in store order: recorded memories and entity pages, which are marked as pages (see [Reading modes](../concepts/reading-modes.md#entity-pages)). It never returns summaries.
 
 | Field | Required | Notes |
 |---|---|---|
@@ -38,6 +38,27 @@ documented in the pages linked here:
 | `kind` | no | Restrict to one kind. |
 | `scope` | no | Restrict to one partition. Same format as `remember`'s `scope`. |
 | `k` | no | How many hits to return (default 8, range 1 to 32; larger values are clamped to 32). Recall fuses a pool of twice `k`, at least 16 and at most 32, then returns the first `k`. |
+
+## Result kinds
+
+Each result opens with its bracket `[kind handle]` and ends with a `provenance:` line. A result that is an entity page, not a memory, has one more line before the provenance line:
+
+```text
+[person 01M7TB30K3M8N] Kim
+Kim (person)
+1970-01-02: Kim lives in Lisbon.
+1970-01-03: Kim moved to Porto in May.
+kind: entity_page
+provenance: derivation: inferred; basis: 01a1f4b1...
+```
+
+The structured content of the reply lists the pages among the results, next to `degraded`. The `pages` list is left out when no result is a page.
+
+| Field of a `pages` item | Meaning |
+|---|---|
+| `handle` | The handle in the page's bracket. |
+| `kind` | Always `entity_page`. |
+| `basis` | Ids of the events of the memories the page was built from. A memory lists the same ids as its `events`. |
 
 ## Degraded replies
 

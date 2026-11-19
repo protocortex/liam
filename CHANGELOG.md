@@ -20,6 +20,18 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- Entity pages are built from the stored sentences of an entity without a model, and `recall` returns them. A
+  page lists the entity's memories oldest first with their dates, drops near duplicates and keeps at most four
+  lines, so it cannot state a fact no memory states. `recall` marks a page with a `kind: entity_page` line and a
+  `pages` list in its structured reply, each with the `basis` of the memories it was built from. Every other
+  field is unchanged, `mode: infer` is still refused, and summaries are still not returned. A page also fixes
+  two faults it exposed: a written page is now superseded when the entity is rebuilt, where it used to leave a
+  second live row, and the consolidation probes no longer draw pages or summaries. See
+  [ADR 0018](docs/adr/0018-build-entity-pages-without-a-model-and-return-them-from-recall.md).
+- `gc.full_synthesis_mention_threshold` and `gc.full_synthesis_max_new_tokens` are removed with the
+  model-written pages. An old line for either is ignored and logs one warning at start. The generation tuner
+  no longer adjusts its permits while the daemon runs, because entity pages were its only input; the start-up
+  benchmark stays.
 - **Breaking:** the `ask` tool is removed. In strict mode `ask` ranked recorded memory like `recall` and added a
   written answer. In infer mode, its default, it also ranked entity pages and summaries beside recorded memory.
   Use `recall` for recorded memory: it returns recorded memory only, as it did before, and the calling agent

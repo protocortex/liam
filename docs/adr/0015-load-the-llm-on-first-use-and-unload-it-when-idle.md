@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Note, 2026-11-19:** the `ask` tool named here was removed by [ADR-0017](0017-remove-the-ask-tool.md). `recall` stays.
+- **Note, 2026-11-20:** entity pages no longer use the model, see [ADR-0018](0018-build-entity-pages-without-a-model-and-return-them-from-recall.md). Local summaries still do.
 - **Date created:** 2026-11-18
 - **Date modified:** 2026-11-18
 
