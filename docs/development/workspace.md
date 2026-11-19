@@ -8,7 +8,7 @@ Four crates, each usable on its own.
 |---|---|
 | `liam-store` | The core. Bitemporal graph, hybrid retrieval, GC, clustering. Backend-generic over libSQL or SQLite. No ML. |
 | `liam-log` | The append-only event log: write-ahead segments, Parquet compaction, encryption and archive. The store rebuilds from it. |
-| `liam-model` | In-process embedding via `fastembed`. The mock providers stay available for tests and dev. |
+| `liam-model` | In-process embedding with arctic-embed-m-v2.0 (ONNX, through `fastembed`) and generation on llama.cpp. The mock providers stay available for tests and dev. |
 | `liam-daemon` | The MCP server (binary `liamd`). Wires store and model, serves `remember` and `recall` over stdio, runs GC in the background. |
 
 ```
