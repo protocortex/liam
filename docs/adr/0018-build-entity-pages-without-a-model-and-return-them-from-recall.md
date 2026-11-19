@@ -1,6 +1,6 @@
 # ADR-0018: build entity pages without a model and return them from recall
 
-- **Status:** Accepted. Supersedes in part [ADR-0017](0017-remove-the-ask-tool.md) where it says entity pages use the local model and where it leaves open whether `recall` ranks pages.
+- **Status:** Proposed. The many-mention gate failed after pages were capped and ranked apart from recorded memory (see Context), so this is not ready to ship. It would supersede in part [ADR-0017](0017-remove-the-ask-tool.md) where it says entity pages use the local model and where it leaves open whether `recall` ranks pages.
 - **Date created:** 2026-11-20
 - **Date modified:** 2026-11-20
 
@@ -49,22 +49,32 @@ near-duplicate memories, and 40 questions (16 single fact, 8 aggregate, 16
 latest state), hand written. The rule was fixed before the run: C must not lose
 to A on nDCG@10 in any language by more than 0.01, and must beat A on the
 latest-state questions overall. With arctic, through the same `recall` the daemon
-serves:
+serves, run twice.
 
-| Language | nDCG@10 A | nDCG@10 C | Latest-state nDCG@10 A | Latest-state nDCG@10 C |
-|---|---|---|---|---|
-| English | 0.773 | 0.771 | 0.601 | 0.615 |
-| Portuguese | 0.766 | 0.772 | 0.577 | 0.605 |
-| Spanish | 0.790 | 0.800 | 0.620 | 0.638 |
+*Run 1: pages join the fused ranking of recorded memory, count toward `k` and
+have no cap.* The rule passed, with a small gain (nDCG@10 A and C: English
+0.773 and 0.771, Portuguese 0.766 and 0.772, Spanish 0.790 and 0.800). Pages
+could take a slot a recorded memory held on main, so the recorded results of a
+query changed when a page existed.
 
-Over the 120 questions, A scored 0.776 and C 0.781 (C won 23, tied 82 and lost
-15). On the latest-state questions the share that had the newest value among the
-first three results and no stale-only result above it was 0.312 for A and 0.333
-for C. The gain is small and the rule passed: no language lost more than 0.01,
-and C won on the latest-state questions. A page keeps at most four of 20 or 30
-memories, so it cannot answer an aggregate question over many of them, and
-aggregate nDCG@10 was 0.766 for A and 0.759 for C overall. The sets are
-synthetic and small, and a gain of this size would not survive a different set.
+*Run 2: the design below.* Recorded memory is ranked as on main, pages are
+ranked on their own, and at most two are added. nDCG@10 is measured over the
+first ten results of the reply:
+
+| Language | nDCG@10 A | nDCG@10 C | Change | Latest-state nDCG@10 A | Latest-state nDCG@10 C | Latest-ok A | Latest-ok C |
+|---|---|---|---|---|---|---|---|
+| English | 0.773 | 0.752 | -0.021 | 0.601 | 0.599 | 0.312 | 0.438 |
+| Portuguese | 0.767 | 0.762 | -0.005 | 0.577 | 0.642 | 0.250 | 0.562 |
+| Spanish | 0.790 | 0.763 | -0.027 | 0.620 | 0.640 | 0.375 | 0.500 |
+
+Latest-ok is the share of latest-state questions that had the newest value among
+the first three results and no stale-only result above it. Across the three
+languages the means are nDCG@10 0.777 for A and 0.759 for C, latest-state
+nDCG@10 0.599 for A and 0.627 for C, latest-ok 0.312 for A and 0.500 for C.
+**The rule failed:** C loses to A by more than 0.01 in English (0.021) and in
+Spanish (0.027). C still wins on the latest-state questions overall. The cause
+of the loss was not investigated. The aggregate figures of run 1 were not
+measured again. The sets are synthetic and small.
 
 ## Considered Alternatives
 
@@ -79,9 +89,10 @@ synthetic and small, and a gain of this size would not survive a different set.
 
 ### Build pages from the memories and rank them in recall (effort: M, chosen)
 
-- Trade-offs: no model, no invented claim, a few microseconds to build and one
-  embedding of the page. A page shows several dated lines and does not say which
-  is current.
+- Trade-offs: no model, no invented claim, and a cost of 10 to 30 microseconds
+  of selection per entity plus 27 to 58 ms to embed the page with arctic (the
+  first measurement). A page shows several dated lines and does not say which is
+  current.
 
 ### Build no pages (effort: S)
 
@@ -104,12 +115,19 @@ synthetic and small, and a gain of this size would not survive a different set.
    events of the memories on the page, as before, and `stale_entities` and
    `mark_entity_synthesized` are unchanged. An entity with no recorded mention
    gets no page.
-4. **`recall` returns pages.** It asks the store for inferred rows, leaves out
-   summaries and entities with no page yet, and marks a page: a
+4. **`recall` returns pages beside recorded memory, never in place of it.**
+   Recorded rows are ranked exactly as before pages existed: the first query
+   leaves out inferred rows from the ranking, from neighbour expansion and from
+   the `same_as` closure, so for any query the recorded rows and their order do
+   not depend on whether a page exists. Pages are ranked by a second query over
+   inferred rows alone. At most `MAX_PAGES_IN_RECALL` (2) pages are added, each
+   placed before the first recorded row it outscores and after one it ties. A
+   reply therefore holds up to `k` recorded rows plus up to 2 pages. Summaries,
+   entities with no page yet and legacy pages are left out. A page is marked: a
    `kind: entity_page` line in the text and a `pages` list in the structured
    reply, each with the `basis` of the memories it was built from. Every
    existing field keeps its meaning, the input schema is unchanged, and
-   `mode: infer` is refused as before. Summaries are not added to `recall`.
+   `mode: infer` is refused as before.
 5. **Config keys.** `gc.full_synthesis_mention_threshold` and
    `gc.full_synthesis_max_new_tokens` are removed: an old line is ignored and
    logs one warning at start. `gc.max_resynth_per_tick` and `ask_timeout_secs`
@@ -118,7 +136,27 @@ synthetic and small, and a gain of this size would not survive a different set.
    derivation and no longer by empty content, so a rebuild supersedes the page
    instead of leaving a second live row, and the staleness check can see it. The
    consolidation probes no longer draw a page or a summary, which a strict query
-   cannot find and a rebuild supersedes.
+   cannot find and a rebuild supersedes. Rewriting a page closes every live row
+   of the entity, not only the newest, so a store that already holds several
+   leaves one.
+7. **Legacy pages.** A page this builder writes carries the attribute
+   `page_builder` in its row, which `recall` hides from the reader. A page an
+   earlier version wrote, which the Qwen model composed, lacks it. `recall`
+   never returns a page without the attribute. The maintenance tick treats such
+   a page as stale after the stale entities, up to `gc.max_resynth_per_tick`
+   entities in all, and replaces it with a new page. The old row, and any
+   further live row of that entity, is closed. A legacy page of an entity with
+   no recorded mention in its scope stays closed to readers and is tried again
+   each tick, because no new page can replace it.
+8. **Scope.** A scoped entity's page is built only from mentions whose scope is
+   the entity's scope or inside it, the same hierarchy a scoped read uses. An
+   entity with no mention in its scope gets no page. An unscoped entity's page
+   may hold mentions of any scope.
+9. **Readers.** `recall` has no producer filter, for memories or for pages: the
+   only filters are `kind` and `scope`, applied the same way to both. A scoped
+   read sees a page only when the page's scope is inside the read's scope, and
+   an unscoped read sees every page. A page is therefore visible to the readers
+   who can already see the memories it quotes.
 
 ## Consequences
 
@@ -126,9 +164,10 @@ synthetic and small, and a gain of this size would not survive a different set.
 - **A page does not merge or resolve.** Where a value changed, the reader sees
   both dated lines and takes the newer. A page can also leave out a memory that
   matters, so `recall` returns the memories too.
-- **A page takes result slots.** In the first set a page was among the first
-  three results for 99% of questions. A caller reading three results sees one
-  page and two memories.
+- **A reply can hold extra entries.** A reply holds up to `k` recorded rows plus
+  up to 2 entries of kind `entity_page`. A caller that counted on `k` entries
+  exactly, or that treats every entry as a memory, must change: this is a
+  breaking change to `recall`.
 - **The store keeps its support for inferred rows.** `include_inferred` and the
   `as_of` argument of `summaries_within` stay.
 - **Summaries still are not in `recall`.** Whether they should be is open.
@@ -137,6 +176,6 @@ synthetic and small, and a gain of this size would not survive a different set.
   the permits the summaries use, the `Llm` trait, llama.cpp and the `[llm]`
   section stay. The local model is still used for local summaries, until the
   next change removes it.
-- **Old pages are rebuilt.** Entities whose pages the model wrote are rebuilt
-  when a mention makes them stale. A page the model wrote stays until then.
+- **Old pages are ignored and rebuilt.** `recall` never returns a page the
+  model wrote. The next maintenance ticks rebuild them, a few per tick.
 - **A way back.** A model-written page can return through a new ADR.

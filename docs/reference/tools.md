@@ -30,14 +30,14 @@ documented in the pages linked here:
 | `scope` | no | Partition by project or agent. Trimmed; ASCII letters, digits, `-`, `_`, `/`; up to 200 characters; no leading/trailing `/` or empty segment (`//`). |
 | `subject` | no | Identity. A new value with the same subject supersedes the old. |
 
-`recall` retrieves the best matches in store order: recorded memories and entity pages, which are marked as pages (see [Reading modes](../concepts/reading-modes.md#entity-pages)). It never returns summaries.
+`recall` retrieves the best matches in store order: recorded memories, then entity pages added among them, which are marked as pages (see [Reading modes](../concepts/reading-modes.md#entity-pages)). A reply holds up to `k` recorded memories plus up to 2 pages, so it can hold more than `k` entries. It never returns summaries.
 
 | Field | Required | Notes |
 |---|---|---|
 | `query` | yes | Text; embedded for the vector channel too. Up to 4000 characters; empty, whitespace-only and NUL-containing queries are rejected. Only the first 64 distinct words (case-insensitive) reach the lexical channel; words past the 64th distinct one reach only the vector arm. |
 | `kind` | no | Restrict to one kind. |
 | `scope` | no | Restrict to one partition. Same format as `remember`'s `scope`. |
-| `k` | no | How many hits to return (default 8, range 1 to 32; larger values are clamped to 32). Recall fuses a pool of twice `k`, at least 16 and at most 32, then returns the first `k`. |
+| `k` | no | How many recorded memories to return (default 8, range 1 to 32; larger values are clamped to 32), not counting the up to 2 pages added to them. Recall fuses a pool of twice `k`, at least 16 and at most 32, then returns the first `k`. |
 
 ## Result kinds
 
@@ -51,6 +51,8 @@ Kim (person)
 kind: entity_page
 provenance: derivation: inferred; basis: 01a1f4b1...
 ```
+
+`feedback` takes the handle of a page as it does that of a memory: the verdict is recorded against the page's entity.
 
 The structured content of the reply lists the pages among the results, next to `degraded`. The `pages` list is left out when no result is a page.
 

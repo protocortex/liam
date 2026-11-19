@@ -10,12 +10,14 @@ derivations:
 - `inferred`: text that is not a client's own record: entity pages, which are
   cut from recorded memories without a model, and summaries, which a model wrote.
 
-Reads come in two modes. `strict` is the default: it never returns a summary or
-anything else a model wrote. `infer` may add summaries, always labelled.
+Reads come in two modes. `strict` is the default. It returns recorded memory,
+and for `recall` also entity pages, which are built from stored sentences and
+never contain text a model wrote. It never returns a summary. `infer` may add
+summaries, always labelled.
 
 | Tool | Default | `infer` |
 |---|---|---|
-| `recall` | `strict` | Refused. `recall` returns entity pages in every call, marked as pages, and never summaries. |
+| `recall` | `strict` | Refused. `recall` returns recorded memory and up to 2 entity pages in every call, marked as pages, and never summaries. |
 | `clusters` | `strict` | Refused. |
 | `timeline` | `strict` | Refused. The entity page heading the output is the one inferred item, and it is labelled so. |
 | `summaries` | not applicable | Lists summaries, which are always inferred. |
@@ -41,10 +43,17 @@ resolve: where a value changed, the page shows both lines and the dates say
 which is newer. Because a page keeps only a few lines, it can leave out a memory
 that matters; `recall` returns the memories too.
 
-`recall` ranks a page beside recorded memory and marks it: the result has a
-`kind: entity_page` line before its provenance line, and the structured reply
-lists it under `pages` with its `basis`, the events of the memories it was
-built from. Those ids are the `events` of those memories. `timeline` shows a
+`recall` adds up to 2 pages to its recorded memories and marks each: the result
+has a `kind: entity_page` line before its provenance line, and the structured
+reply lists it under `pages` with its `basis`, the events of the memories it was
+built from. Those ids are the `events` of those memories. A page never takes
+the place of a memory: the recorded memories are ranked as if no page existed,
+and a page is placed among them by its score, so a reply can hold `k` memories
+plus up to 2 pages. Pages are ranked on their own, and a page an older version
+of LIAM wrote with a model is never returned; the maintenance tick replaces it.
+A page of a scoped entity quotes only memories inside that scope. A page is
+visible to the readers who can see the memories it quotes: `recall` filters
+pages by `kind` and `scope` as it does memories, and by nothing else. `timeline` shows a
 page too, as the item heading its output. Clusters leave pages out. A page is
 rebuilt when a new mention makes its entity stale, on `remember` or on the next
 maintenance tick.
