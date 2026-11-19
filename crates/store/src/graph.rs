@@ -317,10 +317,14 @@ fn by_subject_query(
         params.push(p.into());
         filters.push_str(&format!(" AND producer = ?{next}"));
     } else {
-        // Producer-blind collision: only an entity page (content is always
-        // empty, per `NewNode::entity`) may collide here, never a fact that
-        // happens to share the same subject and scope.
-        filters.push_str(" AND content = ''");
+        // Producer-blind collision: only an entity page may collide here, never
+        // a fact that happens to share the same subject and scope. A page is
+        // told by its derivation and not by empty content, because a page that
+        // has been written holds text.
+        filters.push_str(&format!(
+            " AND derivation = '{}'",
+            Derivation::Inferred.as_str()
+        ));
     }
     // If two nodes ever share a subject+scope, pick the newest
     // deterministically (tie-break by id) rather than an arbitrary row.
@@ -1048,6 +1052,12 @@ impl<B: Backend> Graph<B> {
             .await?
             .into_iter()
             .next())
+    }
+
+    /// The vector stored for `id`, or `None` when the node has none. A closed
+    /// node keeps its vector.
+    pub async fn embedding(&self, id: &NodeId) -> Result<Option<Vec<f32>>> {
+        self.backend.vector_get(id.as_str(), self.dims).await
     }
 
     /// Nodes `entity_id` mentions, live at `as_of`, most-recently mentioned

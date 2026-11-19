@@ -825,3 +825,47 @@ async fn upsert_by_supersedes_when_same_producer_writes_twice() {
         "the second agent-a write stays live"
     );
 }
+
+#[tokio::test]
+async fn a_written_entity_page_is_superseded_by_the_next_upsert_not_duplicated() {
+    // Arrange: an entity page that already holds text
+    let clock = Arc::new(FixedClock::new(Millis(1000)));
+    let g = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+        .await
+        .unwrap();
+    let mut first = NewNode::entity("person", "Kim");
+    first.content = "Kim (person)\n1970-01-01: Kim likes tea.".to_string();
+    let first = g.upsert_by(first).await.unwrap();
+
+    // Act
+    clock.set(Millis(2000));
+    let mut second = NewNode::entity("person", "Kim");
+    second.content = "Kim (person)\n1970-01-01: Kim likes coffee.".to_string();
+    let second = g.upsert_by(second).await.unwrap();
+
+    // Assert: the first page is closed, and only the second is live
+    assert!(!g.exists_as_of(&first, Millis(2000)).await.unwrap());
+    assert!(g.exists_as_of(&second, Millis(2000)).await.unwrap());
+    let live = g
+        .query(&Query::text("Kim").with_inferred(true).with_k(10))
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 1, "{live:?}");
+}
+
+#[tokio::test]
+async fn a_fact_sharing_the_subject_of_an_entity_page_is_not_taken_for_it() {
+    // Arrange: a recorded fact whose subject is the lowercased name of a page
+    let g = graph_at(Millis(1000)).await;
+    let fact = g
+        .upsert_by(NewNode::now("fact", "note", "kim is tall").with_subject("kim"))
+        .await
+        .unwrap();
+
+    // Act
+    let page = g.upsert_by(NewNode::entity("person", "Kim")).await.unwrap();
+
+    // Assert: the page did not supersede the fact
+    assert_ne!(page, fact);
+    assert!(g.exists_as_of(&fact, Millis(1000)).await.unwrap());
+}

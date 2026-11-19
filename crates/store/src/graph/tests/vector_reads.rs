@@ -236,3 +236,27 @@ async fn a_scoped_vector_search_still_leaves_inferred_nodes_out() {
     assert_eq!(all, HashSet::from([recorded, inferred]));
     assert!(!all.contains(&elsewhere));
 }
+
+#[tokio::test]
+async fn the_graph_reads_back_the_vector_of_a_node_and_none_for_one_without() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    let g = open(&dir).await;
+    let stored = vector(0.3);
+    let with = g
+        .insert(embedded(Derivation::Recorded, "with", stored.clone()))
+        .await
+        .unwrap();
+    let without = g
+        .insert(NewNode::now("fact", "without", "text"))
+        .await
+        .unwrap();
+
+    // Act
+    let read = g.embedding(&with).await.unwrap();
+    let none = g.embedding(&without).await.unwrap();
+
+    // Assert
+    assert_eq!(read, Some(stored));
+    assert_eq!(none, None);
+}
