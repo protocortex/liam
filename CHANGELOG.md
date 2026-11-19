@@ -23,8 +23,8 @@ All notable changes to LIAM are recorded here. The format follows
 - **Breaking:** Snowflake arctic-embed-m-v2.0 is now the only embedder. Any other `embedder.model`, for
   example `Qwen/Qwen3-Embedding-0.6B-GGUF` or `BAAI/bge-m3`, stops `liamd` and `liam` at start with a message
   that names the value and says to delete the line, and a store built with another embedder is refused until
-  `liam rebuild`. The other embedders had no user and their loaders were mostly untested code, so one model
-  gives a lighter daemon and a smaller build. Arctic matches or beats Qwen3 on English, Portuguese and Spanish
+  `liam rebuild`. The other embedders were not the default and the owner chose to keep one, so one model
+  gives a lighter daemon and a smaller build. Removing them raised line coverage from 95.69% to 96.47%. Arctic matches or beats Qwen3 on English, Portuguese and Spanish
   and is weaker on Arabic and Chinese.
   Removed with them: the `embedder.device` key (an old `device` line is ignored and logs one warning), the
   `--model` and `--device` flags of `liam eval retrieval` and `liam eval embedder`, the embedder line of

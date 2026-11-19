@@ -13,11 +13,12 @@ and F16), Qwen3 on candle, BGE-M3 on candle, and seven small ONNX models.
 - **Quality and cost.** On English, Portuguese and Spanish, arctic matched or
   beat Qwen3 Q8. It answers a query in about 8 ms against 37 ms, and its file is
   311 MB against about 640 MB.
-- **No user.** Nobody selects the alternatives. They stayed in the code only
-  because ADR-0013 left them selectable.
-- **Untested code.** Their loaders are most of the lines no default test runs,
-  and their tests are most of the `#[ignore]`d ones. Those tests need
-  downloads of several GB, so they rarely run.
+- **Not the default.** The alternatives were not the default, and the owner
+  chose to keep one embedder. They stayed in the code only because ADR-0013
+  left them selectable.
+- **Cost to test.** Removing them raised line coverage from 95.69% to 96.47%
+  and cut the missed lines from 2,766 to 2,214. Of the 30 `#[ignore]`d tests,
+  7 existed only for the deleted embedders, and each needed a model download.
 - **A heavy build.** The candle models pull in candle and its GPU crates, which
   the one remaining embedder does not use.
 
