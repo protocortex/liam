@@ -45,8 +45,8 @@ use crate::ids::{EdgeId, Millis, NodeId, FOREVER};
 use crate::schema::schema;
 use crate::types::{
     Basis, Change, ClusterMember, ClusterState, Derivation, EpisodeEdge, EpisodeRef, EpisodeResult,
-    ExplainedHit, Fingerprint, GraphConfig, Hit, InferredHit, InferredRows, InferredText, NewEdge,
-    NewNode, Query, RecordedHit, RecordedText, Retrieved,
+    ExplainedHit, Fingerprint, GraphConfig, Hit, InferredHit, InferredText, NewEdge, NewNode,
+    Query, RecordedHit, RecordedText, Retrieved,
 };
 use crate::value::{Row, Value};
 
@@ -1110,7 +1110,7 @@ impl<B: Backend> Graph<B> {
                 let filter = Filter {
                     kind,
                     scope,
-                    inferred: q.inferred,
+                    include_inferred: q.include_inferred,
                 };
                 self.lexical(text, filter, now, pool).await?
             }
@@ -1121,7 +1121,7 @@ impl<B: Backend> Graph<B> {
         let vector = match q.embedding.as_deref() {
             Some(embedding) => {
                 self.backend
-                    .vector_search(embedding, pool, kind, scope, now, q.inferred)
+                    .vector_search(embedding, pool, kind, scope, now, q.include_inferred)
                     .await?
             }
             None => Vec::new(),
@@ -1136,7 +1136,7 @@ impl<B: Backend> Graph<B> {
                     kind,
                     scope,
                     as_of: now,
-                    inferred: q.inferred,
+                    include_inferred: q.include_inferred,
                 };
                 self.cold_probe(embedding, arm).await?
             }
@@ -1162,12 +1162,15 @@ impl<B: Backend> Graph<B> {
             .map(|id| NodeId::from_raw(id.clone()))
             .collect();
         for seed_id in &seed_ids {
-            for n in self.neighbors_where(seed_id, now, q.inferred).await? {
+            for n in self
+                .neighbors_where(seed_id, now, q.include_inferred)
+                .await?
+            {
                 expanded.insert(n.as_str().to_string());
             }
         }
         let same_as_ids: HashSet<String> = self
-            .same_as_closure(&seed_ids, now, q.inferred)
+            .same_as_closure(&seed_ids, now, q.include_inferred)
             .await?
             .into_iter()
             .map(|n| n.as_str().to_string())
@@ -1202,10 +1205,8 @@ impl<B: Backend> Graph<B> {
         }
         // Backstop for the filters above: an inferred row must not take a ranked
         // slot, so it goes before the cut to `k`.
-        match q.inferred {
-            InferredRows::Exclude => rows.retain(|c| !c.retrieved.is_inferred()),
-            InferredRows::Only => rows.retain(|c| c.retrieved.is_inferred()),
-            InferredRows::Include => {}
+        if !q.include_inferred {
+            rows.retain(|c| !c.retrieved.is_inferred());
         }
 
         let out = score_and_rank(
@@ -1222,18 +1223,20 @@ impl<B: Backend> Graph<B> {
     }
 
     pub async fn neighbors(&self, seed: &NodeId, as_of: Millis) -> Result<Vec<NodeId>> {
-        self.neighbors_where(seed, as_of, InferredRows::Include)
-            .await
+        self.neighbors_where(seed, as_of, true).await
     }
 
-    /// `neighbors`, stepping only onto the derivations `inferred` allows.
+    /// `neighbors`, leaving out inferred nodes unless `include_inferred`.
     async fn neighbors_where(
         &self,
         seed: &NodeId,
         as_of: Millis,
-        inferred: InferredRows,
+        include_inferred: bool,
     ) -> Result<Vec<NodeId>> {
-        let (dst_ok, src_ok) = (not_inferred("dst", inferred), not_inferred("src", inferred));
+        let (dst_ok, src_ok) = (
+            not_inferred("dst", include_inferred),
+            not_inferred("src", include_inferred),
+        );
         let rows = self
             .backend
             .query(
@@ -1254,14 +1257,17 @@ impl<B: Backend> Graph<B> {
     /// seeds at once still pays for at most a handful of round trips rather
     /// than one per seed.
     ///
-    /// Steps only onto the derivations `inferred` allows.
+    /// Does not step onto an inferred node unless `include_inferred`.
     pub(crate) async fn same_as_closure(
         &self,
         seeds: &[NodeId],
         as_of: Millis,
-        inferred: InferredRows,
+        include_inferred: bool,
     ) -> Result<HashSet<NodeId>> {
-        let (dst_ok, src_ok) = (not_inferred("dst", inferred), not_inferred("src", inferred));
+        let (dst_ok, src_ok) = (
+            not_inferred("dst", include_inferred),
+            not_inferred("src", include_inferred),
+        );
         let mut visited: HashSet<NodeId> = seeds.iter().cloned().collect();
         let mut frontier: Vec<NodeId> = seeds.to_vec();
         while !frontier.is_empty() {
@@ -1300,7 +1306,7 @@ impl<B: Backend> Graph<B> {
         let Filter {
             kind,
             scope,
-            inferred,
+            include_inferred,
         } = filter;
         // FTS5 parses the MATCH value as its own query expression, so a raw
         // question (`?`, apostrophes, bare operators) is a syntax error that
@@ -1323,7 +1329,7 @@ impl<B: Backend> Graph<B> {
             filters.push_str(&format!(" AND {}", scope_within("n.scope", next)));
             params.push(scope.into());
         }
-        filters.push_str(&row_derivation("n", inferred));
+        filters.push_str(&row_not_inferred("n", include_inferred));
         let sql = format!(
             "SELECT n.id FROM nodes_fts
              JOIN nodes n ON n.rowid = nodes_fts.rowid
@@ -2275,7 +2281,7 @@ impl<B: Backend> Graph<B> {
               WHERE {live}{strict}
               ORDER BY nc.community, n.id",
             live = live_at("n", 1),
-            strict = row_derivation("n", include_inferred.into()),
+            strict = row_not_inferred("n", include_inferred),
         );
         let rows = self.backend.query(&sql, &[now.into()]).await?;
 
@@ -2316,33 +2322,29 @@ impl<B: Backend> Graph<B> {
 struct Filter<'a> {
     kind: Option<&'a str>,
     scope: Option<&'a str>,
-    inferred: InferredRows,
+    include_inferred: bool,
 }
 
-/// A predicate on the derivation of the node named by `column`, an edge end:
-/// none when `inferred` allows both kinds. The derivation is a store constant,
-/// so it is written into the statement rather than bound.
-fn not_inferred(column: &str, inferred: InferredRows) -> String {
-    let membership = match inferred {
-        InferredRows::Include => return String::new(),
-        InferredRows::Exclude => "NOT IN",
-        InferredRows::Only => "IN",
-    };
+/// A predicate that leaves out an inferred node named by `column`, an edge end,
+/// or nothing when inferred nodes are wanted. The derivation is a store
+/// constant, so it is written into the statement rather than bound.
+fn not_inferred(column: &str, include_inferred: bool) -> String {
+    if include_inferred {
+        return String::new();
+    }
     format!(
-        " AND {column} {membership} (SELECT id FROM nodes WHERE derivation = '{}')",
+        " AND {column} NOT IN (SELECT id FROM nodes WHERE derivation = '{}')",
         Derivation::Inferred.as_str()
     )
 }
 
 /// `not_inferred` for a query that already reads the `nodes` row as `alias`.
-fn row_derivation(alias: &str, inferred: InferredRows) -> String {
-    let comparison = match inferred {
-        InferredRows::Include => return String::new(),
-        InferredRows::Exclude => "!=",
-        InferredRows::Only => "=",
-    };
+fn row_not_inferred(alias: &str, include_inferred: bool) -> String {
+    if include_inferred {
+        return String::new();
+    }
     format!(
-        " AND {alias}.derivation {comparison} '{}'",
+        " AND {alias}.derivation != '{}'",
         Derivation::Inferred.as_str()
     )
 }

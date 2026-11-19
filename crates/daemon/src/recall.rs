@@ -34,37 +34,48 @@ pub(crate) fn candidate_pool(k: usize) -> usize {
     (k * 2).clamp(CANDIDATE_POOL_FLOOR, MAX_RECALL_K)
 }
 
-/// The pages `recall` may show, best first. The store hands back every
+/// Whether `hit` is a page `recall` may show. The store hands back every
 /// inferred row, so this leaves out a summary, which `recall` does not carry,
 /// an entity whose page was never written, which is a row with no text, and a
 /// page an earlier version wrote, which a model composed.
-fn current_pages(hits: Vec<ExplainedHit>) -> impl Iterator<Item = ExplainedHit> {
-    hits.into_iter().filter(|hit| match &hit.hit.retrieved {
+fn is_current_page(hit: &ExplainedHit) -> bool {
+    match &hit.hit.retrieved {
         Retrieved::Recorded(_) => false,
         Retrieved::Inferred(page) => {
             page.summary_level.is_none()
                 && !page.text.as_str().is_empty()
                 && entity_page::is_stamped(&hit.hit.attributes)
         }
-    })
+    }
 }
 
 /// The first `k` recorded memories in the order given, and up to
-/// `MAX_PAGES_IN_RECALL` pages, each placed by its score before the first
-/// memory it outscores. A page is added to the memories and never replaces
-/// one, so the memories are those `recall` returns without pages.
+/// `MAX_PAGES_IN_RECALL` pages from `joint`, a ranking of recorded and
+/// inferred rows together. A page goes after as many recorded memories as
+/// `joint` puts above it, so its place depends on how it ranks against
+/// memories and never on a score from a ranking of pages alone, which gives
+/// the best page of any query the top score. A page is added to the memories
+/// and never replaces one, so the memories are those `recall` returns without
+/// pages.
 pub(crate) fn with_pages(
     recorded: Vec<ExplainedHit>,
-    pages: Vec<ExplainedHit>,
+    joint: Vec<ExplainedHit>,
     k: usize,
 ) -> Vec<ExplainedHit> {
     let mut shown: Vec<ExplainedHit> = recorded.into_iter().take(k).collect();
-    for page in current_pages(pages).take(MAX_PAGES_IN_RECALL) {
-        let at = shown
-            .iter()
-            .position(|hit| hit.hit.score < page.hit.score)
-            .unwrap_or(shown.len());
-        shown.insert(at, page);
+    let mut recorded_above = 0;
+    let mut added = 0;
+    for hit in joint {
+        if added == MAX_PAGES_IN_RECALL {
+            break;
+        }
+        if is_current_page(&hit) {
+            let at = (recorded_above + added).min(shown.len());
+            shown.insert(at, hit);
+            added += 1;
+        } else if matches!(hit.hit.retrieved, Retrieved::Recorded(_)) {
+            recorded_above += 1;
+        }
     }
     shown
 }
@@ -155,22 +166,17 @@ mod tests {
         })
     }
 
-    fn scored(mut hit: ExplainedHit, id: &str, score: f64) -> ExplainedHit {
+    fn scored(mut hit: ExplainedHit, id: &str) -> ExplainedHit {
         hit.hit.id = NodeId::from_raw(id);
-        hit.hit.score = score;
         hit
     }
 
-    fn page(id: &str, score: f64) -> ExplainedHit {
-        scored(
-            hit(inferred("Kim (person)\n1970-01-01: tea.", None)),
-            id,
-            score,
-        )
+    fn page(id: &str) -> ExplainedHit {
+        scored(hit(inferred("Kim (person)\n1970-01-01: tea.", None)), id)
     }
 
-    fn memory(id: &str, score: f64) -> ExplainedHit {
-        scored(hit(recorded()), id, score)
+    fn memory(id: &str) -> ExplainedHit {
+        scored(hit(recorded()), id)
     }
 
     fn ids(hits: &[ExplainedHit]) -> Vec<&str> {
@@ -180,70 +186,100 @@ mod tests {
     #[test]
     fn only_current_pages_are_added_never_summaries_empty_rows_legacy_pages_or_memories() {
         // Arrange
-        let mut legacy = scored(hit(inferred("old profile", None)), "legacy", 0.9);
+        let mut legacy = scored(hit(inferred("old profile", None)), "legacy");
         legacy.hit.attributes = serde_json::json!({});
-        let candidates = vec![
+        let joint = vec![
             legacy,
-            scored(hit(inferred("a summary", Some(1))), "summary", 0.9),
-            scored(hit(inferred("", None)), "empty", 0.9),
-            memory("memory", 0.9),
-            page("page", 0.9),
+            scored(hit(inferred("a summary", Some(1))), "summary"),
+            scored(hit(inferred("", None)), "empty"),
+            page("page"),
         ];
 
         // Act
-        let shown = with_pages(Vec::new(), candidates, 8);
+        let shown = with_pages(vec![memory("m")], joint, 8);
 
         // Assert
-        assert_eq!(ids(&shown), ["page"]);
+        assert_eq!(ids(&shown), ["page", "m"]);
     }
 
     #[test]
-    fn a_page_goes_before_the_first_memory_it_outscores_and_after_a_tie() {
+    fn a_page_goes_after_the_memories_the_joint_ranking_puts_above_it() {
         // Arrange
-        let recorded = vec![memory("a", 0.9), memory("b", 0.5), memory("c", 0.2)];
-        let pages = vec![page("hi", 0.7), page("tie", 0.5)];
+        let recorded = vec![memory("a"), memory("b"), memory("c")];
+        let joint = vec![memory("a"), page("p0"), memory("b"), memory("c")];
 
         // Act
-        let shown = with_pages(recorded, pages, 8);
+        let shown = with_pages(recorded, joint, 8);
 
         // Assert
-        assert_eq!(ids(&shown), ["a", "hi", "b", "tie", "c"]);
+        assert_eq!(ids(&shown), ["a", "p0", "b", "c"]);
+    }
+
+    #[test]
+    fn a_page_the_joint_ranking_puts_first_goes_first_and_one_ranked_last_goes_last() {
+        // Arrange
+        let recorded = vec![memory("a"), memory("b")];
+        let joint = vec![page("hi"), memory("a"), memory("b"), page("lo")];
+
+        // Act
+        let shown = with_pages(recorded, joint, 8);
+
+        // Assert
+        assert_eq!(ids(&shown), ["hi", "a", "b", "lo"]);
     }
 
     #[test]
     fn at_most_the_page_cap_is_added_and_the_best_pages_are_the_ones_kept() {
         // Arrange
-        let pages: Vec<ExplainedHit> = (0..=MAX_PAGES_IN_RECALL)
-            .map(|n| page(&format!("p{n}"), 0.9 - n as f64 * 0.1))
+        let joint: Vec<ExplainedHit> = (0..=MAX_PAGES_IN_RECALL)
+            .map(|n| page(&format!("p{n}")))
             .collect();
 
         // Act
-        let shown = with_pages(vec![memory("m", 0.1)], pages, 8);
+        let shown = with_pages(vec![memory("m")], joint, 8);
 
         // Assert
-        assert_eq!(shown.len(), MAX_PAGES_IN_RECALL + 1);
         assert_eq!(ids(&shown), ["p0", "p1", "m"]);
     }
 
     #[test]
-    fn pages_never_push_a_memory_out_of_the_first_k() {
+    fn pages_never_push_a_memory_out_of_the_first_k_and_the_memories_keep_their_order() {
         // Arrange
-        let recorded = vec![memory("a", 0.4), memory("b", 0.3), memory("c", 0.2)];
-        let pages = vec![page("p0", 0.9), page("p1", 0.8)];
+        let recorded = vec![memory("a"), memory("b"), memory("c")];
+        let joint = vec![
+            page("p0"),
+            page("p1"),
+            memory("a"),
+            memory("b"),
+            memory("c"),
+        ];
 
         // Act
-        let shown = with_pages(recorded, pages, 2);
+        let shown = with_pages(recorded, joint, 2);
 
-        // Assert: both memories of the first two stay, and the third is cut by k alone
+        // Assert
         assert_eq!(ids(&shown), ["p0", "p1", "a", "b"]);
+    }
+
+    #[test]
+    fn a_page_the_joint_ranking_puts_below_every_memory_is_still_added_after_them() {
+        // Arrange: the joint ranking holds more memories than the first k shown
+        let recorded = vec![memory("a")];
+        let joint = vec![memory("a"), memory("b"), memory("c"), page("p")];
+
+        // Act
+        let shown = with_pages(recorded, joint, 8);
+
+        // Assert
+        assert_eq!(ids(&shown), ["a", "p"]);
     }
 
     #[test]
     fn a_page_is_shown_without_the_builder_marker_and_a_memory_keeps_its_attributes() {
         // Arrange
-        let mut recorded = memory("m", 0.1);
+        let mut recorded = memory("m");
         recorded.hit.attributes = entity_page::stamped(serde_json::json!({"k": 1}));
-        let mut stamped = page("p", 0.9);
+        let mut stamped = page("p");
         stamped.hit.attributes = entity_page::stamped(serde_json::json!({"k": 2}));
 
         // Act

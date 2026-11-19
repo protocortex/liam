@@ -713,14 +713,7 @@ async fn log_write_vector_upsert_runs_after_commit_not_inside_the_transaction() 
     assert_eq!(node_writes(&appended).len(), 1);
     let hits = g
         .backend
-        .vector_search(
-            &embedding,
-            5,
-            None,
-            None,
-            Millis(1000),
-            InferredRows::Include,
-        )
+        .vector_search(&embedding, 5, None, None, Millis(1000), true)
         .await
         .unwrap();
     assert!(hits.contains(&id));
@@ -770,14 +763,7 @@ async fn log_write_a_retry_after_a_vector_failure_repairs_the_vector_on_the_firs
     assert_eq!(retried.unwrap(), first);
     let hits = g
         .backend
-        .vector_search(
-            &embedding,
-            5,
-            None,
-            None,
-            Millis(1000),
-            InferredRows::Include,
-        )
+        .vector_search(&embedding, 5, None, None, Millis(1000), true)
         .await
         .unwrap();
     assert!(hits.contains(&first));

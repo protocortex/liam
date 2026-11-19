@@ -682,13 +682,14 @@ impl MemoryServer {
         Ok(hits)
     }
 
-    /// The pages `q` finds: the same query over inferred rows alone.
-    async fn explained_pages(
+    /// The ranking of recorded and inferred rows together for `q`, which says
+    /// where a page stands against the memories.
+    async fn explained_with_pages(
         &self,
         q: &Query,
     ) -> Result<Vec<liam_store::ExplainedHit>, liam_store::Error> {
-        let pages = q.clone().inferred_only();
-        on_store!(self, |store| store.query_explained(&pages))
+        let joint = q.clone().with_inferred(true);
+        on_store!(self, |store| store.query_explained(&joint))
     }
 
     /// Makes the results a client is shown ones it can give a verdict on.
@@ -1240,12 +1241,12 @@ impl MemoryServer {
                 embedding,
                 args.as_of,
             );
-            // Pages are ranked on their own, so they cannot change which
-            // recorded memories the first query returns or in what order.
+            // The memories come from a query that never ranks a page, so a
+            // page cannot change which memories are returned or in what order.
             let recorded = self.explained(&q).await;
             let found = match recorded {
                 Ok(recorded) => self
-                    .explained_pages(&q)
+                    .explained_with_pages(&q)
                     .await
                     .map(|pages| (recorded, pages)),
                 Err(e) => Err(e),

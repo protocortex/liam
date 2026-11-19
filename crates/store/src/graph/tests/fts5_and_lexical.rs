@@ -237,7 +237,7 @@ async fn lexical_scope_filter_matches_true_descendants_not_string_prefixes() {
             Filter {
                 kind: None,
                 scope: Some("work"),
-                inferred: InferredRows::Include,
+                include_inferred: true,
             },
             Millis(1000),
             10,

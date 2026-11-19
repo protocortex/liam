@@ -42,7 +42,7 @@ fn arm(pool: usize) -> ColdQuery<'static> {
         kind: None,
         scope: None,
         as_of: Millis(1000),
-        inferred: InferredRows::Exclude,
+        include_inferred: false,
     }
 }
 

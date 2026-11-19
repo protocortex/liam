@@ -708,28 +708,6 @@ impl NewEdge {
     }
 }
 
-/// Which derivations a read may rank.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum InferredRows {
-    /// Only what a client recorded.
-    #[default]
-    Exclude,
-    /// Recorded and inferred rows together.
-    Include,
-    /// Inferred rows alone, such as entity pages and summaries.
-    Only,
-}
-
-impl From<bool> for InferredRows {
-    fn from(include: bool) -> Self {
-        if include {
-            Self::Include
-        } else {
-            Self::Exclude
-        }
-    }
-}
-
 /// A retrieval request. Present signals are fused; absent ones are skipped.
 #[derive(Clone, Debug)]
 pub struct Query {
@@ -742,9 +720,9 @@ pub struct Query {
     pub as_of: Option<Millis>,
     /// When set, older facts are down-weighted with this half-life.
     pub half_life: Option<Millis>,
-    /// Which inferred rows, such as entity pages, may be retrieved. Excluded
-    /// by default: a strict read returns only what a client recorded.
-    pub inferred: InferredRows,
+    /// Whether inferred rows, such as entity pages, may be retrieved. Off by
+    /// default: a strict read returns only what a client recorded.
+    pub include_inferred: bool,
 }
 
 impl Query {
@@ -763,7 +741,7 @@ impl Query {
             k: 8,
             as_of: None,
             half_life: None,
-            inferred: InferredRows::Exclude,
+            include_inferred: false,
         }
     }
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
@@ -795,15 +773,9 @@ impl Query {
         self
     }
     /// Also ranks inferred rows (entity pages and summaries) beside recorded
-    /// memory.
+    /// memory. No daemon tool sets it today, so a query is recorded-only.
     pub fn with_inferred(mut self, include_inferred: bool) -> Self {
-        self.inferred = include_inferred.into();
-        self
-    }
-    /// Ranks inferred rows alone, so recorded memory neither fills the
-    /// candidate pool nor takes part in neighbour expansion.
-    pub fn inferred_only(mut self) -> Self {
-        self.inferred = InferredRows::Only;
+        self.include_inferred = include_inferred;
         self
     }
 }

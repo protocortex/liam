@@ -7,9 +7,9 @@ use std::collections::HashSet;
 use super::quantize;
 use crate::backend::Backend;
 use crate::error::Result;
-use crate::graph::{live_at, row_derivation, scope_within, Graph};
+use crate::graph::{live_at, row_not_inferred, scope_within, Graph};
 use crate::ids::{Millis, NodeId};
-use crate::types::{GraphConfig, InferredRows, Tier};
+use crate::types::{GraphConfig, Tier};
 use crate::value::Value;
 
 /// Times the index is asked for twice as many candidates when the filters
@@ -47,7 +47,7 @@ pub(in crate::graph) struct ColdQuery<'a> {
     pub kind: Option<&'a str>,
     pub scope: Option<&'a str>,
     pub as_of: Millis,
-    pub inferred: InferredRows,
+    pub include_inferred: bool,
 }
 
 impl<B: Backend> Graph<B> {
@@ -127,7 +127,7 @@ impl<B: Backend> Graph<B> {
                 params.push(scope.into());
                 filters.push_str(&format!(" AND {}", scope_within("n.scope", params.len())));
             }
-            filters.push_str(&row_derivation("n", query.inferred));
+            filters.push_str(&row_not_inferred("n", query.include_inferred));
             let sql = format!(
                 "SELECT n.id FROM nodes n
                  JOIN node_lineage l ON l.node_id = n.id

@@ -16,14 +16,14 @@ use super::fact_write::OpenWrite;
 use super::logged_plan::{event, STORE_TRUST};
 use super::logged_write::{abandon, commit_or_abandon};
 use super::projection::{steps_for, Step};
-use super::{live_at, row_derivation, scope_within, Graph};
+use super::{live_at, row_not_inferred, scope_within, Graph};
 use crate::backend::{Backend, BackendTx};
 use crate::error::{Error, Result};
 use crate::ids::{Millis, NodeId, FOREVER};
 use crate::types::{
-    ChildKind, ClosureReport, Derivation, EventRef, EventRole, InferredRows, InferredText,
-    NewSummary, PutOutcome, RecordedText, Summary, SummaryChild, SummaryEntry, SummaryFailure,
-    SummaryInput, SummaryInputs, TreeState,
+    ChildKind, ClosureReport, Derivation, EventRef, EventRole, InferredText, NewSummary,
+    PutOutcome, RecordedText, Summary, SummaryChild, SummaryEntry, SummaryFailure, SummaryInput,
+    SummaryInputs, TreeState,
 };
 use crate::value::{Row, Value};
 
@@ -625,7 +625,7 @@ impl<B: Backend> Graph<B> {
                      UNION SELECT scope FROM summaries WHERE tx_to = ?2
                      ORDER BY 1",
                     live = live_at("nodes", 1),
-                    recorded = row_derivation("nodes", InferredRows::Exclude),
+                    recorded = row_not_inferred("nodes", false),
                 ),
                 &[self.clock.now().into(), FOREVER.into()],
             )
@@ -647,7 +647,7 @@ impl<B: Backend> Graph<B> {
                      WHERE COALESCE(scope, '') = ?2 AND {live}{recorded}
                      ORDER BY rowid",
                     live = live_at("nodes", 1),
-                    recorded = row_derivation("nodes", InferredRows::Exclude),
+                    recorded = row_not_inferred("nodes", false),
                 ),
                 &[self.clock.now().into(), scope.into()],
             )
