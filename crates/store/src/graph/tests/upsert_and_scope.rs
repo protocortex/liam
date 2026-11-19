@@ -554,7 +554,7 @@ async fn query_trims_scope_before_filtering() {
 
 #[tokio::test]
 async fn query_explained_carries_valid_from() {
-    // The daemon's `ask` tool renders `valid_from` as a date, so
+    // A caller can render `valid_from` as a date, so
     // `ExplainedHit` must carry the raw instant, not just the decay
     // computed from it.
     // Arrange

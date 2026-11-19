@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use liam_daemon::config::SummaryConfig;
 use liam_daemon::consolidation::hooks::{SummaryCtx, SummaryHook};
 use liam_daemon::consolidation::maintenance::refresh_clusters;
-use liam_model::{Llm, MockEmbedder};
+use liam_model::{MockEmbedder, MockLlm};
 use liam_store::{
     relation, ContentEmbedder, DefaultGraph, EmbedError, EventRole, GraphConfig, Millis, NewNode,
     NodeId,
@@ -21,7 +21,7 @@ use super::*;
 use crate::extraction::client::ModelIdentity;
 use crate::log_startup::test_support::{database_in, log_dir_in, standalone_log, DIMS};
 use crate::mcp::summaries::SummariesArgs;
-use crate::mcp::{AskArgs, ClustersArgs, MemoryServer, RecallArgs, TimelineArgs};
+use crate::mcp::{ClustersArgs, MemoryServer, RecallArgs, TimelineArgs};
 use crate::summary::hooks::SummaryHooks;
 use crate::summary::summariser::LocalSummariser;
 use crate::summary::test_support::{MemoryCache, ScriptedLlm};
@@ -33,11 +33,8 @@ const SUMMARY_MARKER: &str = "summary/level";
 const GROUP_NAMES: [&str; 3] = ["alpha", "beta", "gamma"];
 const GROUP_SIZE: usize = 4;
 const SOURCE: &str = "consolidation:test";
-const ASK_REPLY: &str = "The ledger notes cover quarterly forecasts [1].";
-const ASK_TIMEOUT_SECS: u64 = 30;
+const SYNTHESIS_TIMEOUT_SECS: u64 = 30;
 const CONTEXT_TOKENS: usize = 8192;
-/// Any summary is close enough, so the question need not resemble its text.
-const MATCH_ANY_SUMMARY: f32 = -1.0;
 const LEVEL_ONE_REPLY: &str =
     "These ledger notes cover quarterly forecasts for the team smsentinel7.";
 const LEVEL_TWO_REPLY: &str =
@@ -361,16 +358,6 @@ fn a_label_belongs_to_its_own_item_and_not_to_the_next_one() {
     assert_eq!(result, Ok(()));
 }
 
-/// Answers every prompt with the same text.
-struct FixedLlm;
-
-#[async_trait]
-impl Llm for FixedLlm {
-    async fn complete(&self, _system: &str, _prompt: &str) -> liam_model::Result<String> {
-        Ok(ASK_REPLY.to_string())
-    }
-}
-
 struct FirstAxisEmbedder;
 
 #[async_trait]
@@ -439,13 +426,11 @@ impl World {
         let server = MemoryServer::new(
             Arc::new(store),
             Arc::new(MockEmbedder::new(DIMS)),
-            Arc::new(FixedLlm),
-            ASK_TIMEOUT_SECS,
-            false,
+            Arc::new(MockLlm),
+            SYNTHESIS_TIMEOUT_SECS,
             CONTEXT_TOKENS,
             1,
-        )
-        .with_min_summary_similarity(MATCH_ANY_SUMMARY);
+        );
         Self {
             _dir: dir,
             server,
@@ -519,20 +504,6 @@ impl World {
                 derivation: Derivation::Inferred,
             },
         ]
-    }
-
-    async fn ask(&self, mode: Mode) -> String {
-        let question = format!("{FACT_SENTINEL} {PAGE_SENTINEL}");
-        self.server
-            .ask(Parameters(AskArgs {
-                question,
-                kind: None,
-                scope: None,
-                k: None,
-                as_of: None,
-                mode: Some(mode),
-            }))
-            .await
     }
 }
 
@@ -623,14 +594,12 @@ async fn strict_output_of_every_tool_holds_no_inferred_content_and_shows_the_rec
             mode: Some(Mode::Strict),
         }))
         .await;
-    let ask = world.ask(Mode::Strict).await;
 
     // Act
     let outputs = [
         ("recall", &recall),
         ("timeline", &timeline),
         ("clusters", &clusters),
-        ("ask", &ask),
     ];
     let results: Vec<_> = outputs
         .iter()
@@ -641,23 +610,21 @@ async fn strict_output_of_every_tool_holds_no_inferred_content_and_shows_the_rec
     for (tool, result) in results {
         assert_eq!(result, Ok(()), "{tool}");
     }
-    for (tool, out) in [("recall", &recall), ("timeline", &timeline), ("ask", &ask)] {
+    for (tool, out) in [("recall", &recall), ("timeline", &timeline)] {
         assert!(out.contains(FACT_SENTINEL), "{tool} lost the fact: {out}");
     }
     assert!(clusters.contains("[fact "), "{clusters}");
     assert!(timeline.contains(world.page.handle()), "{timeline}");
     assert!(!recall.contains(world.page.handle()), "{recall}");
-    assert!(!ask.contains(SUMMARY_MARKER), "{ask}");
 }
 
 #[tokio::test]
-async fn infer_output_labels_the_page_and_the_summaries_inferred() {
+async fn the_summaries_listing_labels_every_summary_inferred() {
     // Arrange
     let world = World::build().await;
     let truth = world.truth().await;
 
     // Act
-    let ask = world.ask(Mode::Infer).await;
     let listing = world
         .server
         .summaries(Parameters(SummariesArgs {
@@ -670,16 +637,10 @@ async fn infer_output_labels_the_page_and_the_summaries_inferred() {
         .await;
 
     // Assert
-    for (tool, out) in [("ask", &ask), ("summaries", &listing)] {
-        assert_eq!(
-            check_separation(out, Mode::Infer, &truth, &[]),
-            Ok(()),
-            "{tool}: {out}"
-        );
-    }
-    assert!(ask.starts_with("answer (inferred):"), "{ask}");
-    assert!(ask.contains(PAGE_SENTINEL), "{ask}");
-    assert!(ask.contains(SUMMARY_MARKER), "{ask}");
-    assert!(ask.contains(FACT_SENTINEL), "{ask}");
+    assert_eq!(
+        check_separation(&listing, Mode::Infer, &truth, &[]),
+        Ok(()),
+        "summaries: {listing}"
+    );
     assert!(listing.contains(SUMMARY_SENTINEL), "{listing}");
 }

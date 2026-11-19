@@ -10,7 +10,7 @@ use liam_store::TierBytes;
 const AT: Millis = Millis(1_000);
 const DAY_MS: i64 = 86_400_000;
 const MB: u64 = 1 << 20;
-const P_METRICS: [MetricId; 2] = [MetricId::AskLatencyP50Ms, MetricId::AskLatencyP95Ms];
+const P_METRICS: [MetricId; 2] = [MetricId::RecallLatencyP50Ms, MetricId::RecallLatencyP95Ms];
 
 fn value_of(samples: &[Sample], metric: MetricId) -> Option<f64> {
     samples
@@ -54,8 +54,8 @@ fn the_nearest_rank_percentiles_of_ten_timings_are_the_fifth_and_the_tenth() {
     let samples = window.samples(P_METRICS, Labels::None, AT);
 
     // Assert
-    assert_eq!(value_of(&samples, MetricId::AskLatencyP50Ms), Some(5.0));
-    assert_eq!(value_of(&samples, MetricId::AskLatencyP95Ms), Some(10.0));
+    assert_eq!(value_of(&samples, MetricId::RecallLatencyP50Ms), Some(5.0));
+    assert_eq!(value_of(&samples, MetricId::RecallLatencyP95Ms), Some(10.0));
 }
 
 #[test]
@@ -79,8 +79,8 @@ fn one_timing_is_every_percentile_so_the_alert_rule_must_wait_for_more() {
     let samples = window.samples(P_METRICS, Labels::None, AT);
 
     // Assert
-    assert_eq!(value_of(&samples, MetricId::AskLatencyP50Ms), Some(7.0));
-    assert_eq!(value_of(&samples, MetricId::AskLatencyP95Ms), Some(7.0));
+    assert_eq!(value_of(&samples, MetricId::RecallLatencyP50Ms), Some(7.0));
+    assert_eq!(value_of(&samples, MetricId::RecallLatencyP95Ms), Some(7.0));
 }
 
 #[test]

@@ -4,9 +4,26 @@
 //! label, and every item can carry the provenance line that says where it came
 //! from.
 
-use liam_store::{Basis, EventRef, NodeId, Retrieved};
+use liam_store::{Basis, EventRef, Retrieved};
 
-use crate::ask::fmt_millis;
+/// Render epoch-ms as an ISO-8601 UTC date (YYYY-MM-DD). WHY manual y-m-d: keeps
+/// the `time` dep at default features. Out-of-range falls back to the raw
+/// integer string so a bad timestamp can never panic a reply. WHY
+/// `div_euclid`: truncating division rounds toward zero, so a pre-1970
+/// instant with a sub-second remainder (e.g. -500ms) would floor to the wrong
+/// day (1970-01-01 instead of 1969-12-31); `div_euclid` always floors toward
+/// negative infinity, matching calendar semantics.
+pub fn fmt_millis(ms: i64) -> String {
+    match time::OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000)) {
+        Ok(dt) => format!(
+            "{:04}-{:02}-{:02}",
+            dt.year(),
+            u8::from(dt.month()),
+            dt.day()
+        ),
+        Err(_) => ms.to_string(),
+    }
+}
 
 /// The derivation a variant stands for.
 pub fn derivation_label(retrieved: &Retrieved) -> &'static str {
@@ -22,11 +39,6 @@ pub fn derivation_label(retrieved: &Retrieved) -> &'static str {
 pub fn bracket_head(kind: &str, handle: &str, label: &str, known_since_ms: Option<i64>) -> String {
     let head = format!("[{kind} {handle}] {label}");
     with_known_since(head, known_since_ms)
-}
-
-/// `handle: {handle}`, the name `feedback` accepts for a node-backed result.
-pub fn handle_text(node: &NodeId) -> String {
-    format!("handle: {}", node.handle())
 }
 
 /// `[{n}] ({kind}) {label} — known since {date}`, the head of an evidence block.
@@ -127,6 +139,29 @@ mod tests {
             derivation: Derivation::Inferred,
             summary_level,
         })
+    }
+
+    #[test]
+    fn fmt_millis_formats_known_epochs() {
+        // Arrange / Act / Assert
+        assert_eq!(fmt_millis(0), "1970-01-01");
+        assert_eq!(fmt_millis(1_700_000_000_000), "2023-11-14");
+    }
+
+    #[test]
+    fn fmt_millis_falls_back_on_out_of_range_without_panicking() {
+        // Arrange / Act / Assert: out-of-range renders as the raw integer
+        // string, never panics.
+        assert_eq!(fmt_millis(i64::MAX), i64::MAX.to_string());
+        // Negative-side boundary that div_euclid specifically targets.
+        assert_eq!(fmt_millis(i64::MIN), i64::MIN.to_string());
+    }
+
+    #[test]
+    fn fmt_millis_floors_pre_1970_toward_negative_infinity() {
+        // Arrange / Act / Assert: -500ms is 0.5s before the epoch, which must
+        // floor into the prior day, not truncate up to 1970-01-01.
+        assert_eq!(fmt_millis(-500), "1969-12-31");
     }
 
     #[test]

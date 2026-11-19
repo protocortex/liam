@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MCP tool surface: `remember`, `recall`, `relate`, `ask`, `clusters`,
+//! MCP tool surface: `remember`, `recall`, `relate`, `clusters`,
 //! `timeline`, `facts`, `feedback`, `summaries`, `delete`, `consolidate` and
 //! `metrics`, wiring the store and the model.
 //!
@@ -60,10 +60,6 @@ use self::feedback::{Feedback, FeedbackArgs};
 use self::metrics::MetricsArgs;
 use self::reply::ToolReply;
 use self::summaries::SummariesArgs;
-use crate::ask::{
-    self, build_ask_prompt, clamp_ask_k, estimate_tokens, fallback_answer, fit_evidence_to_budget,
-    format_answer,
-};
 use crate::clusters::{narrow_groups, render_clusters};
 use crate::config::{
     resolve_vocabulary, AdminConfig, ExtractionConfig, DEFAULT_MAX_BASIS_IDS_RENDERED,
@@ -74,10 +70,12 @@ use crate::degraded::Degraded;
 use crate::deletion::DeletePreview;
 use crate::metrics::recorder::{Metrics, ToolTimer};
 use crate::metrics::sink::{Stage, Tool};
+use crate::prompt::estimate_tokens;
+use crate::recall::{candidate_pool, clamp_recall_k};
 use crate::render;
-use crate::synthesis;
+use crate::synthesis::{self, Evidence};
 use crate::tiering::usage::UsageRecorder;
-use crate::tuning::{record_and_maybe_evaluate, AimdHandles, RollingWindow};
+use crate::tuning::{AimdHandles, RollingWindow};
 
 /// Runs one store call under a read guard that lasts only for that call, and
 /// yields the call's `Result` (or the error of the store being unavailable).
@@ -93,11 +91,6 @@ macro_rules! on_store {
 // Declared after `on_store!` so the module can use the macro.
 pub mod episode;
 
-/// Token budget for the sufficiency pre-pass. Only "YES"/"NO" is wanted, with a
-/// little slack for models that add punctuation or a stray word; anything longer
-/// is not a verdict and `ask::parse_sufficiency` rejects it anyway.
-const SUFFICIENCY_MAX_TOKENS: usize = 8;
-
 /// Producer id a `MemoryServer` reads until something calls
 /// `set_producer`. That is every stdio connection
 /// (`main.rs` never calls it) and a socket connection during the brief
@@ -109,7 +102,7 @@ const SUFFICIENCY_MAX_TOKENS: usize = 8;
 const DEFAULT_PRODUCER: &str = "unknown";
 
 /// Cap on serialized `attributes` size for `remember`. Deliberately a
-/// distinct constant from `ask::MAX_EVIDENCE_CHARS`, not a reuse of it:
+/// distinct constant from `prompt::MAX_EVIDENCE_CHARS`, not a reuse of it:
 /// this bounds write-time input, that bounds a read-time prompt budget.
 /// Same value by consistency, not by coupling.
 const MAX_ATTRIBUTES_CHARS: usize = 2000;
@@ -124,7 +117,7 @@ const MAX_ATTRIBUTES_CHARS: usize = 2000;
 /// truncation downstream.
 const MAX_CONTENT_CHARS: usize = 16_000;
 
-/// Cap on `recall`'s `query` and `ask`'s `question`, in characters.
+/// Cap on `recall`'s `query`, in characters.
 const MAX_QUERY_CHARS: usize = 4000;
 
 /// Cap on distinct words handed to the lexical arm of a query.
@@ -162,17 +155,15 @@ pub(crate) const ENTITY_SYNTHESIS_MAX_NEW_TOKENS: usize = 256;
 /// Default and upper bound on the number of mentions `timeline` shows.
 /// WHY: caller-supplied `limit` is otherwise unbounded, and each mention's
 /// full content lands in the response, so a large `limit` on a well-mentioned
-/// entity would blow the response size. Mirrors `ask`'s `clamp_ask_k`
-/// (see `ask.rs`): default keeps `timeline`'s existing behavior when `limit`
-/// is omitted, and the cap bounds a single response regardless of how many
-/// mentions the entity has.
+/// entity would blow the response size. The default keeps `timeline`'s
+/// existing behavior when `limit` is omitted, and the cap bounds a single
+/// response regardless of how many mentions the entity has.
 const DEFAULT_TIMELINE_LIMIT: usize = 50;
 const MAX_TIMELINE_LIMIT: usize = 200;
 
 /// Resolve the caller's `limit` into the usable range: absent means
 /// `DEFAULT_TIMELINE_LIMIT`, and anything else is clamped to
-/// `1..=MAX_TIMELINE_LIMIT`. WHY clamp the bottom too: mirrors `clamp_ask_k`'s
-/// reasoning, a `limit = 0` would render no mentions, which reads as a claim
+/// `1..=MAX_TIMELINE_LIMIT`. WHY clamp the bottom too: a `limit = 0` would render no mentions, which reads as a claim
 /// that the entity has none rather than a claim about the argument.
 fn clamp_timeline_limit(limit: Option<usize>) -> usize {
     limit
@@ -180,9 +171,8 @@ fn clamp_timeline_limit(limit: Option<usize>) -> usize {
         .clamp(1, MAX_TIMELINE_LIMIT)
 }
 
-/// Shared embed→build-`Query` sequence for `recall` and `ask`. WHY: both
-/// handlers apply the same k/embedding/kind/scope/as_of shape to a `Query`;
-/// keeping it in one place means a future filter only needs to change here.
+/// Builds the `Query` a `recall` runs from its k, embedding, kind, scope and
+/// as_of.
 fn build_query(
     text: &str,
     k: Option<usize>,
@@ -190,11 +180,8 @@ fn build_query(
     scope: Option<String>,
     embedding: Option<Vec<f32>>,
     as_of: Option<i64>,
-    include_inferred: bool,
 ) -> Query {
-    let mut q = Query::text(text.to_string())
-        .with_k(k.unwrap_or(8))
-        .with_inferred(include_inferred);
+    let mut q = Query::text(text.to_string()).with_k(k.unwrap_or(8));
     if let Some(e) = embedding {
         q = q.with_embedding(e);
     }
@@ -253,7 +240,7 @@ fn content_problem(content: &str) -> Option<String> {
     }
 }
 
-/// Validates a `recall` query or `ask` question: `None` when usable.
+/// Validates a `recall` query: `None` when usable.
 fn query_problem(query: &str) -> Option<String> {
     if query.trim().is_empty() {
         Some("query is empty".to_string())
@@ -392,28 +379,6 @@ pub struct RelateArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct AskArgs {
-    pub question: String,
-    pub kind: Option<String>,
-    /// Optional partition filter; matches memories written with this scope
-    /// or any descendant scope (for example `work` also matches
-    /// `work/liam`, but not `work-archive`). Trimmed; rejected if empty
-    /// after trimming, over 200 characters, contains a character outside
-    /// ASCII letters, digits, `-`, `_`, `/`, or has a leading/trailing `/`
-    /// or an empty segment (`//`).
-    pub scope: Option<String>,
-    pub k: Option<usize>,
-    /// Optional point-in-time recall, epoch milliseconds. Omitted means
-    /// "now"; a past instant retrieves the version of each subject that was
-    /// live then.
-    pub as_of: Option<i64>,
-    /// `infer` (the default) may compose the answer from entity pages and
-    /// summaries as well as recorded memory and labels what it used. `strict`
-    /// returns recorded evidence only and makes no model call.
-    pub mode: Option<Mode>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClustersArgs {
     /// Number of clusters to show, largest first. Narrows within the token
     /// budget; cannot widen past it.
@@ -445,35 +410,30 @@ pub struct MemoryServer {
     store: Arc<SharedStore>,
     embedder: Arc<dyn Embedder>,
     llm: Arc<dyn Llm>,
-    /// Wall-clock deadline for the `ask` stages after retrieval (permit acquire,
-    /// sufficiency pre-pass, synthesis); `synthesize_entity` shares it too.
-    /// Retrieval has its own `recall_timeout_secs` budget.
-    ask_timeout_secs: u64,
-    /// Seconds `recall` and `ask` may spend retrieving; see `retrieval_deadline`.
+    /// Wall-clock deadline for one entity-page synthesis batch (permit acquire,
+    /// model load, generation); see `config::Config::ask_timeout_secs`, whose
+    /// name predates the removal of `ask`.
+    synthesis_timeout_secs: u64,
+    /// Seconds `recall` may spend retrieving; see `retrieval_deadline`.
     recall_timeout_secs: u64,
-    /// Whether `ask` runs the yes/no sufficiency pre-pass before synthesizing;
-    /// see `config::Config::ask_sufficiency_check`.
-    ask_sufficiency_check: bool,
-    /// Token budget `ask` trims retrieved evidence to before either prompt is
-    /// built; see `config::LlmConfig::context_tokens`, which this must match so
+    /// Token budget entity synthesis trims mentions to before it builds its
+    /// prompt; see `config::LlmConfig::context_tokens`, which this must match so
     /// a full-size prompt never overflows the model's own context window.
-    /// `clusters` reads this too, as one tenth of it (ADR-0002 S4): same
-    /// underlying config value, not an `ask`-only budget despite the name.
-    ask_context_tokens: usize,
+    /// `clusters` reads this too, as one tenth of it (ADR-0002 S4).
+    context_tokens: usize,
     /// Event ids a provenance line lists before it counts the rest; see
     /// `config::SummaryConfig::max_basis_ids_rendered`.
     max_basis_ids_rendered: usize,
-    /// Least similarity of a question to a summary for `ask` to use it; see
+    /// Least similarity of a query to a summary for `summaries` to list it; see
     /// `config::SummaryConfig::min_summary_similarity`.
     min_summary_similarity: f32,
-    /// Bounds how many `ask` calls may be inside a model call (sufficiency
-    /// pre-pass or synthesis) at once; see
+    /// Bounds how many entity syntheses may be inside a model call at once; see
     /// `config::LlmConfig::max_concurrent_generations`. A semaphore, not a
     /// lock, so an operator with memory headroom can raise the limit above 1
     /// instead of every request serializing permanently.
     generation_permits: Arc<Semaphore>,
-    /// AIMD latency samples from every `ask` and entity-synthesis call,
-    /// shared process-wide: `Arc`-wrapped since `MemoryServer` clones per connection.
+    /// AIMD latency samples from every entity-synthesis call, shared
+    /// process-wide: `Arc`-wrapped since `MemoryServer` clones per connection.
     rolling_window: Arc<Mutex<RollingWindow>>,
     /// Authoritative total permit count AIMD grows/shrinks against, distinct
     /// from `generation_permits.available_permits()`.
@@ -523,7 +483,7 @@ pub struct MemoryServer {
     /// Tells `facts` which predicates hold one value, so it can mark competing
     /// claims. Shared across connections like the other process-wide state.
     vocabulary: Arc<Vocabulary>,
-    /// Counts the results `recall` and `ask` return, when tiering is on.
+    /// Counts the results `recall` returns, when tiering is on.
     usage: Option<Arc<UsageRecorder>>,
     /// The verdict budget and this connection's issued handles, when tiering
     /// is on. A clone starts with no handles issued.
@@ -534,48 +494,9 @@ pub struct MemoryServer {
     delete_preview: Option<Arc<DeletePreview>>,
     /// What `consolidate` runs.
     consolidator: Option<Arc<ConsolidationJob>>,
-    /// Where `recall` and `ask` report their timings, when metrics are on.
+    /// Where `recall` reports its timings, when metrics are on.
     metrics: Option<Arc<Metrics>>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
-}
-
-/// RAII guard: records `ask`'s permit-held duration on drop, covering every
-/// one of its early-return branches without a record call at each site.
-struct PermitTimer {
-    window: Arc<Mutex<RollingWindow>>,
-    aimd: AimdHandles,
-    queue_wait: Duration,
-    start: tokio::time::Instant,
-    context_tokens: usize,
-}
-
-impl PermitTimer {
-    fn new(
-        window: Arc<Mutex<RollingWindow>>,
-        aimd: AimdHandles,
-        queue_wait: Duration,
-        context_tokens: usize,
-    ) -> Self {
-        Self {
-            window,
-            aimd,
-            queue_wait,
-            start: tokio::time::Instant::now(),
-            context_tokens,
-        }
-    }
-}
-
-impl Drop for PermitTimer {
-    fn drop(&mut self) {
-        record_and_maybe_evaluate(
-            &self.window,
-            self.aimd.clone(),
-            self.queue_wait,
-            self.start.elapsed(),
-            self.context_tokens,
-        );
-    }
 }
 
 /// Why a retrieval stage stopped before it finished.
@@ -641,20 +562,19 @@ fn with_reasons(
 #[tool_router]
 impl MemoryServer {
     // Each argument is a distinct config field threaded straight through, the
-    // established pattern in this constructor (see `ask_timeout_secs`,
-    // `ask_sufficiency_check`, `ask_context_tokens` above); a config struct
+    // established pattern in this constructor (see `synthesis_timeout_secs`
+    // and `context_tokens` above); a config struct
     // parameter would hide which fields `MemoryServer` actually depends on.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<DefaultGraph>,
         embedder: Arc<dyn Embedder>,
         llm: Arc<dyn Llm>,
-        ask_timeout_secs: u64,
-        ask_sufficiency_check: bool,
-        ask_context_tokens: usize,
+        synthesis_timeout_secs: u64,
+        context_tokens: usize,
         max_concurrent_generations: usize,
     ) -> Self {
-        // `Semaphore::new(0)` would deadlock every `ask` call forever. `0` means
+        // `Semaphore::new(0)` would deadlock every entity synthesis forever. `0` means
         // auto-tune (see `main.rs::build_autotuned_server`); this floor only
         // matters for a direct explicit-`0` construction that bypasses it.
         let max_concurrent_generations = max_concurrent_generations.max(1);
@@ -662,10 +582,9 @@ impl MemoryServer {
             store: Arc::new(SharedStore::from_arc(store)),
             embedder,
             llm,
-            ask_timeout_secs,
+            synthesis_timeout_secs,
             recall_timeout_secs: DEFAULT_RECALL_TIMEOUT_SECS,
-            ask_sufficiency_check,
-            ask_context_tokens,
+            context_tokens,
             max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
             min_summary_similarity: DEFAULT_MIN_SUMMARY_SIMILARITY,
             generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
@@ -693,7 +612,7 @@ impl MemoryServer {
         self
     }
 
-    /// Sets the seconds `recall` and `ask` may spend retrieving. Stored as at
+    /// Sets the seconds `recall` may spend retrieving. Stored as at
     /// least one, so a configured `0` cannot time every request out at once.
     pub(crate) fn with_recall_timeout(mut self, secs: u64) -> Self {
         self.recall_timeout_secs = secs.max(1);
@@ -706,7 +625,7 @@ impl MemoryServer {
         self
     }
 
-    /// Uses summaries at least this close to a question in `ask`.
+    /// Lists summaries at least this close to a query in `summaries`.
     pub(crate) fn with_min_summary_similarity(mut self, min: f32) -> Self {
         self.min_summary_similarity = min;
         self
@@ -718,7 +637,7 @@ impl MemoryServer {
         self
     }
 
-    /// Counts the results of `recall` and `ask` in `recorder`.
+    /// Counts the results of `recall` in `recorder`.
     pub(crate) fn with_usage_recorder(mut self, recorder: Arc<UsageRecorder>) -> Self {
         self.usage = Some(recorder);
         self
@@ -749,7 +668,7 @@ impl MemoryServer {
         self
     }
 
-    /// Reports the timings of `recall` and `ask` to `metrics`.
+    /// Reports the timings of `recall` to `metrics`.
     pub(crate) fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
         self
@@ -801,15 +720,6 @@ impl MemoryServer {
             recorder.record(&self.producer(), nodes, Millis::now());
             self.stage_end(Stage::RecordUsage, started);
         }
-    }
-
-    fn record_evidence_usage(&self, evidence: &[ask::Evidence]) {
-        self.record_usage(
-            evidence
-                .iter()
-                .filter(|e| !e.expanded)
-                .filter_map(|e| e.node_id.as_ref()),
-        );
     }
 
     pub(crate) fn shutdown_token(&self) -> CancellationToken {
@@ -897,8 +807,8 @@ impl MemoryServer {
         }
     }
 
-    /// Test-only: exposes the shared window so a test can confirm `ask` and
-    /// entity synthesis land in the same one, not two independent copies.
+    /// Test-only: exposes the shared window so a test can confirm entity
+    /// synthesis lands in the same one the tuner reads, not an independent copy.
     #[cfg(test)]
     pub(crate) fn rolling_window_handle(&self) -> Arc<Mutex<RollingWindow>> {
         self.rolling_window.clone()
@@ -1109,9 +1019,9 @@ impl MemoryServer {
 
                 if !triggered.is_empty() {
                     // One shared deadline for the whole triggered batch,
-                    // mirroring `ask`'s "one deadline for the whole request" pattern.
+                    // so one slow entity cannot stretch the whole request.
                     let entity_synthesis_deadline = tokio::time::Instant::now()
-                        + Duration::from_secs(self.ask_timeout_secs.max(1));
+                        + Duration::from_secs(self.synthesis_timeout_secs.max(1));
                     // Spawned to run concurrently; collection stays
                     // sequential so no outcome is ever dropped.
                     let mut handles = Vec::with_capacity(triggered.len());
@@ -1155,7 +1065,7 @@ impl MemoryServer {
         deadline: tokio::time::Instant,
         max_new_tokens: usize,
     ) -> Result<(), String> {
-        // Held through the model call: a rollback waits for it, as for an `ask`.
+        // Held through the model call: a rollback waits for it.
         let store = self
             .store()
             .await
@@ -1193,7 +1103,7 @@ impl MemoryServer {
             Ok(rows) => rows,
             Err(e) => return Err(format!("{label}: {e}")),
         };
-        let mentions: Vec<ask::Evidence> = rows.iter().map(ask::Evidence::from_candidate).collect();
+        let mentions: Vec<Evidence> = rows.iter().map(Evidence::from_candidate).collect();
         let synthesized = match synthesis::synthesize_entity(
             &*self.llm,
             &self.aimd_handles(),
@@ -1202,7 +1112,7 @@ impl MemoryServer {
             &candidate.kind,
             &candidate.label,
             &mentions,
-            self.ask_context_tokens,
+            self.context_tokens,
             max_new_tokens,
         )
         .await
@@ -1295,17 +1205,16 @@ impl MemoryServer {
             return ToolReply::ok(cancelled_reply("recall"));
         }
         let deadline = self.retrieval_deadline();
-        let k = crate::ask::clamp_recall_k(args.k);
+        let k = clamp_recall_k(args.k);
         let retrieve = async {
             let (embedding, embed_degraded) = self.embed_or_degrade("recall", &args.query).await;
             let q = build_query(
                 &lexical_text(&args.query),
-                Some(crate::ask::candidate_pool(k)),
+                Some(candidate_pool(k)),
                 args.kind,
                 args.scope,
                 embedding,
                 args.as_of,
-                false,
             );
             (self.explained(&q).await, embed_degraded)
         };
@@ -1424,7 +1333,7 @@ impl MemoryServer {
         // One tenth of the configured context (ADR-0002 S4): the operator's
         // declared "how much text is reasonable on this machine", not a
         // promise about the MCP client's own context.
-        let budget = self.ask_context_tokens / 10;
+        let budget = self.context_tokens / 10;
         render_clusters(&narrowed, budget, |s| {
             self.llm
                 .count_tokens(s)
@@ -1507,7 +1416,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Say whether a result recall or ask returned was correct, using its handle. \
+        description = "Say whether a result recall returned was correct, using its handle. \
                        Verdicts decide which memories stay fast to search."
     )]
     pub(crate) async fn feedback(&self, Parameters(args): Parameters<FeedbackArgs>) -> String {
@@ -1547,313 +1456,6 @@ impl MemoryServer {
     )]
     pub(crate) async fn metrics(&self, Parameters(args): Parameters<MetricsArgs>) -> String {
         metrics::read(self, args).await
-    }
-
-    /// Acquires one slot from `generation_permits`, racing the shared request
-    /// `deadline` rather than a fresh timeout of its own: see the `deadline`
-    /// comment in `ask` for why every stage has to share one instant. Returns
-    /// the exact reason text `ask` hands to `fallback_answer` on either
-    /// failure path.
-    async fn acquire_generation_permit(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<OwnedSemaphorePermit, &'static str> {
-        match tokio::time::timeout_at(deadline, self.generation_permits.clone().acquire_owned())
-            .await
-        {
-            Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) => Err("no generation slot is available"),
-            // Without this timeout, the k-th queued caller would wait up to
-            // k * ask_timeout_secs before its own generation budget even
-            // started, so a queue would turn one slow request into a pile of
-            // requests that each look like a hang. The shared deadline is
-            // what keeps that wait from silently eating into budget the
-            // later stages never get back.
-            Err(_) => Err("timed out waiting for a generation slot"),
-        }
-    }
-
-    /// Loads the model within the shared `deadline`, so the token count and the
-    /// generation timer that follow start on a ready model. The error is the
-    /// reason text `ask` hands to `fallback_answer`.
-    async fn ensure_llm_loaded(&self, deadline: tokio::time::Instant) -> Result<(), &'static str> {
-        match tokio::time::timeout_at(deadline, self.llm.ensure_loaded()).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err("the model could not be loaded"),
-            Err(_) => Err("timed out loading the model"),
-        }
-    }
-
-    /// Runs the sufficiency pre-pass against the shared `deadline`: does the
-    /// evidence actually contain the answer? `true` means proceed to
-    /// synthesis; only an explicit parsed "no" returns `false`, so a
-    /// timeout, an LLM error, or an unparseable reply fails open rather than
-    /// denying memory the store really holds.
-    async fn passes_sufficiency_check(
-        &self,
-        question: &str,
-        evidence: &[ask::Evidence],
-        deadline: tokio::time::Instant,
-    ) -> bool {
-        let (system, user) = ask::build_sufficiency_prompt(question, evidence);
-        let verdict = tokio::time::timeout_at(
-            deadline,
-            // Capped hard: the verdict is one word, and an uncapped pre-pass
-            // let a rambling model spend 50s per question (see eval.rs).
-            self.llm
-                .complete_capped(&system, &user, SUFFICIENCY_MAX_TOKENS),
-        )
-        .await;
-        if let Ok(Ok(reply)) = verdict {
-            ask::parse_sufficiency(&reply) != Some(false)
-        } else {
-            true
-        }
-    }
-
-    /// Builds the answer prompt, synthesizes against the shared `deadline`,
-    /// and dispatches to the grounded answer or one of the fallback
-    /// variants: the natural end of `ask`'s orchestration.
-    async fn synthesize_answer(
-        &self,
-        question: &str,
-        evidence: &[ask::Evidence],
-        deadline: tokio::time::Instant,
-    ) -> (String, Option<Degraded>) {
-        let (system, user) = build_ask_prompt(question, evidence);
-        let synth = tokio::time::timeout_at(deadline, self.llm.complete(&system, &user)).await;
-        let unavailable = |reason: &str| {
-            (
-                fallback_answer(reason, evidence, self.max_basis_ids_rendered),
-                Some(Degraded::SynthesisUnavailable),
-            )
-        };
-        match synth {
-            Ok(Ok(a)) if !a.trim().is_empty() => {
-                let answer = a.trim();
-                // Last line of defence against prompt injection and free-running
-                // fabrication: an answer that shares almost no vocabulary with the
-                // evidence is not a synthesis of it, whatever the model intended.
-                // Unlike the prompt rules, this does not depend on the model
-                // cooperating. See `ask::is_grounded`.
-                if ask::is_grounded(answer, question, evidence) {
-                    (
-                        format_answer(answer, evidence, self.max_basis_ids_rendered),
-                        None,
-                    )
-                } else {
-                    unavailable("the answer was not grounded in the evidence")
-                }
-            }
-            Ok(Ok(_)) => unavailable("the model returned an empty answer"),
-            Ok(Err(_)) => unavailable("the model failed"),
-            Err(_) => unavailable("synthesis timed out"),
-        }
-    }
-
-    // `pub(crate)` so the grounding eval (see `eval.rs`) drives the same code
-    // path an MCP client hits, rather than a re-implementation of it.
-    #[tool(
-        name = "ask",
-        description = "Answer a question from long-term memory, synthesized and cited.",
-        output_schema = reply::output_schema()
-    )]
-    async fn ask_tool(
-        &self,
-        Parameters(args): Parameters<AskArgs>,
-        cancel: CancellationToken,
-    ) -> rmcp::model::CallToolResult {
-        let reply = self.ask_with(args, cancel).await;
-        self.count_degraded(Tool::Ask, &reply);
-        reply.into_call_result()
-    }
-
-    // Test-only: the server routes through the token-taking wrapper above.
-    #[cfg(test)]
-    pub(crate) async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> String {
-        self.ask_with(args, CancellationToken::new())
-            .await
-            .text()
-            .to_string()
-    }
-
-    pub(crate) async fn ask_with(&self, args: AskArgs, cancel: CancellationToken) -> ToolReply {
-        if let Some(problem) = query_problem(&args.question) {
-            return ToolReply::failed(format!("ask failed: {problem}"));
-        }
-        let _timer = self.time(Tool::Ask);
-        if cancel.is_cancelled() {
-            return ToolReply::ok(cancelled_reply("ask"));
-        }
-        let retrieval_deadline = self.retrieval_deadline();
-        let mode = args.mode.unwrap_or(Mode::Infer);
-        let k = clamp_ask_k(args.k);
-        let retrieve = async {
-            let (embedding, embed_degraded) = self.embed_or_degrade("ask", &args.question).await;
-            let q = build_query(
-                &lexical_text(&args.question),
-                Some(ask::candidate_pool(k)),
-                args.kind,
-                args.scope.clone(),
-                embedding.clone(),
-                args.as_of,
-                mode == Mode::Infer,
-            );
-            let hits = match self.explained(&q).await {
-                Ok(hits) => hits,
-                Err(e) => return Err(ToolReply::failed(format!("ask failed: {e}"))),
-            };
-            // Summaries are model-written, so only infer mode looks for them.
-            let summaries = match (&embedding, mode) {
-                (Some(question), Mode::Infer) => {
-                    summaries::matching(self, question, &args.scope, args.as_of).await
-                }
-                _ => Vec::new(),
-            };
-            Ok((hits, summaries, embed_degraded))
-        };
-        let (hits, summaries, embed_degraded) =
-            match until_interrupted(retrieval_deadline, &cancel, retrieve).await {
-                Ok(Ok(found)) => found,
-                Ok(Err(reply)) => return reply,
-                Err(why) => return self.interruption_reply("ask", why),
-            };
-        if hits.is_empty() && summaries.is_empty() {
-            return with_reasons(ToolReply::ok("no relevant memory"), [embed_degraded]);
-        }
-        let candidates: Vec<ask::Evidence> = hits
-            .iter()
-            .map(ask::Evidence::from_hit)
-            .chain(summaries)
-            .collect();
-        let retrieval_reasons = [embed_degraded];
-        // Candidates list the store hits first, so an index below `hit_count`
-        // is a store hit. Keep k of them plus every summary.
-        let hit_count = hits.len();
-        let mut kept_hits = 0;
-        let evidence: Vec<ask::Evidence> = candidates
-            .into_iter()
-            .enumerate()
-            .filter(|&(i, _)| {
-                if i >= hit_count {
-                    return true;
-                }
-                kept_hits += 1;
-                kept_hits <= k
-            })
-            .map(|(_, candidate)| candidate)
-            .collect();
-        if mode == Mode::Strict {
-            self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
-            self.record_evidence_usage(&evidence);
-            return with_reasons(
-                ToolReply::ok(ask::strict_answer(&evidence, self.max_basis_ids_rendered)),
-                retrieval_reasons,
-            );
-        }
-        // One deadline for the stages after retrieval (retrieval has its own
-        // `recall_timeout_secs` budget): the permit acquire, the
-        // sufficiency pre-pass, and synthesis below all race against this
-        // same instant instead of each getting its own fresh
-        // `ask_timeout_secs`, so a slow stage eats into the budget the later
-        // stages get rather than tripling the wall-clock cap. `max(1)` guards
-        // against an operator typo of `ask_timeout_secs = 0`, which would
-        // otherwise make the whole request time out immediately.
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(self.ask_timeout_secs.max(1));
-
-        // Trim ONCE, before the sufficiency pre-pass, and reuse this same
-        // slice for both prompts below. Trimming twice, or only for the
-        // answer prompt, would let the pre-pass vouch for evidence the answer
-        // never sees. The model loads first, inside the request deadline, so
-        // the count below is the real one. The closure prefers the model's
-        // real count and only falls back to the estimate when the provider
-        // cannot count.
-        let loaded = self.ensure_llm_loaded(deadline).await;
-        let evidence = fit_evidence_to_budget(
-            |slice| build_ask_prompt(&args.question, slice),
-            &evidence,
-            self.ask_context_tokens,
-            |s| {
-                self.llm
-                    .count_tokens(s)
-                    .unwrap_or_else(|| estimate_tokens(s))
-            },
-        );
-
-        // Every reply from here on shows these results, with their handles.
-        self.issue_handles(evidence.iter().filter_map(|e| e.node_id.as_ref()));
-        if let Err(reason) = loaded {
-            return with_reasons(
-                ToolReply::ok(fallback_answer(
-                    reason,
-                    evidence,
-                    self.max_basis_ids_rendered,
-                )),
-                retrieval_reasons
-                    .into_iter()
-                    .chain([Some(Degraded::SynthesisUnavailable)]),
-            );
-        }
-
-        // Bound concurrent generation before either model call below: both
-        // the sufficiency pre-pass and synthesis hit the model, so a permit
-        // held only across synthesis would let N sufficiency calls pile onto
-        // the GPU while only synthesis was bounded. `acquire_owned` on a
-        // clone of the `Arc` keeps the permit's lifetime independent of any
-        // borrow of `self` across the awaits below; it drops, releasing the
-        // slot, when `ask` returns.
-        let acquire_start = tokio::time::Instant::now();
-        let _generation_permit = match self.acquire_generation_permit(deadline).await {
-            Ok(permit) => permit,
-            Err(reason) => {
-                return with_reasons(
-                    ToolReply::ok(fallback_answer(
-                        reason,
-                        evidence,
-                        self.max_basis_ids_rendered,
-                    )),
-                    retrieval_reasons
-                        .into_iter()
-                        .chain([Some(Degraded::SynthesisUnavailable)]),
-                )
-            }
-        };
-        // Covers every return path below, not just one model call.
-        let _permit_timer = PermitTimer::new(
-            self.rolling_window.clone(),
-            self.aimd_handles(),
-            acquire_start.elapsed(),
-            self.ask_context_tokens,
-        );
-
-        // Sufficiency pre-pass: ask whether the evidence answers the question at
-        // all, and refuse outright if it does not. See
-        // `ask::build_sufficiency_prompt` for why this is a separate call.
-        if self.ask_sufficiency_check
-            && !self
-                .passes_sufficiency_check(&args.question, evidence, deadline)
-                .await
-        {
-            return with_reasons(
-                ToolReply::ok(ask::insufficient_answer(
-                    evidence,
-                    self.max_basis_ids_rendered,
-                )),
-                retrieval_reasons,
-            );
-        }
-        // From here the model sees the evidence, so it counts even if the
-        // answer then fails.
-        self.record_evidence_usage(evidence);
-
-        let (answer, synthesis_degraded) = self
-            .synthesize_answer(&args.question, evidence, deadline)
-            .await;
-        with_reasons(
-            ToolReply::ok(answer),
-            retrieval_reasons.into_iter().chain([synthesis_degraded]),
-        )
     }
 }
 

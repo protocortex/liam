@@ -44,8 +44,8 @@ async fn lexical_query_tolerates_question_punctuation() {
     // FTS5 parses a raw MATCH value as its own query language; a natural
     // question's trailing `?` or an embedded apostrophe previously raised
     // "fts5: syntax error" and aborted the whole hybrid query. The terms
-    // must still match. Regression pin for the ask tool's primary input
-    // shape. Quoting is what protects this, so it must hold regardless of
+    // must still match. Regression pin for a natural-language
+    // question as the query. Quoting is what protects this, so it must hold regardless of
     // how the quoted terms are joined.
     // Arrange
     let g = graph_at(Millis(1000)).await;

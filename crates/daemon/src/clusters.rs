@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Pure formatting for the `clusters` tool. Sync + dependency-light, like
-//! `ask.rs`, so the budget fit and the format are unit-testable without a
+//! Pure formatting for the `clusters` tool. Sync + dependency-light, so the budget fit and the format are unit-testable without a
 //! store or model.
 
 use liam_store::ClusterMember;
@@ -60,12 +59,12 @@ fn render_header(shown: usize, total: usize) -> String {
 
 /// Render `groups` (already narrowed by the caller's `k`/`members`, see
 /// `narrow_groups`) largest-first, keeping as many as fit `budget`, but
-/// never fewer than one when any exist. Mirrors `fit_evidence_to_budget`'s
-/// floor for `ask`: a header with zero clusters reads identically to a
+/// never fewer than one when any exist. Mirrors `fit_texts_to_budget`'s
+/// floor: a header with zero clusters reads identically to a
 /// genuinely empty store, so a misconfigured or tiny budget still shows one.
 ///
 /// `count` is injected so this stays testable without a model; see
-/// `fit_evidence_to_budget` for the same pattern.
+/// `fit_texts_to_budget` for the same pattern.
 pub fn render_clusters(
     groups: &[Vec<ClusterMember>],
     budget: usize,
@@ -143,7 +142,7 @@ mod tests {
         // Act
         let out = render_clusters(&groups, 1, chars);
 
-        // Assert: the floor from `fit_evidence_to_budget` applies here too:
+        // Assert: the floor from `fit_texts_to_budget` applies here too:
         // never zero clusters when any exist, even though the budget is
         // exceeded.
         assert!(out.contains("solo"), "{out}");

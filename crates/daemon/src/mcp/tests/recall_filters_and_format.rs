@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `recall` and `ask` filters, the pool they read, and how a hit is rendered.
+//! `recall` filters, the pool it reads, and how a hit is rendered.
 
 use super::*;
 
@@ -75,6 +75,60 @@ async fn recall_filters_by_scope() {
     assert!(!out.contains("runs weekly"), "scope filter leaked: {out}");
 }
 
+async fn recall_in(server: &MemoryServer, scope: &str) -> String {
+    server
+        .recall(Parameters(RecallArgs {
+            query: "zorbnax queue".to_string(),
+            kind: None,
+            scope: Some(scope.to_string()),
+            k: None,
+            as_of: None,
+            mode: None,
+        }))
+        .await
+}
+
+#[tokio::test]
+async fn recall_for_each_of_two_producers_returns_only_what_its_scope_allows() {
+    // Arrange: two connections over one store, each writing in its own
+    // child of a shared parent scope.
+    let template = plain_server().await;
+    let server_a = template.clone();
+    server_a.set_producer("agent-a");
+    let server_b = template.clone();
+    server_b.set_producer("agent-b");
+    seed_scoped(
+        &server_a,
+        "fact",
+        "From a",
+        "the zorbnax queue is drained by a",
+        Some("team/a"),
+    )
+    .await;
+    seed_scoped(
+        &server_b,
+        "fact",
+        "From b",
+        "the zorbnax queue is drained by b",
+        Some("team/b"),
+    )
+    .await;
+    // Act
+    let own_a = recall_in(&server_a, "team/a").await;
+    let own_b = recall_in(&server_b, "team/b").await;
+    let parent = recall_in(&server_a, "team").await;
+
+    // Assert: a child scope shows only its own writes, the parent shows both.
+    assert!(own_a.contains("drained by a"), "missing a: {own_a}");
+    assert!(!own_a.contains("drained by b"), "scope leaked: {own_a}");
+    assert!(own_b.contains("drained by b"), "missing b: {own_b}");
+    assert!(!own_b.contains("drained by a"), "scope leaked: {own_b}");
+    assert!(
+        parent.contains("drained by a") && parent.contains("drained by b"),
+        "the parent scope must read its descendants: {parent}"
+    );
+}
+
 #[tokio::test]
 async fn recall_respects_k() {
     // Arrange: three nodes all matching the query term.
@@ -121,7 +175,6 @@ fn server_over(store: &Arc<DefaultGraph>) -> MemoryServer {
         Arc::new(liam_model::MockEmbedder::new(STORE_DIMS)),
         Arc::new(liam_model::MockLlm),
         30,
-        false,
         8192,
         1,
     )
@@ -140,7 +193,7 @@ async fn recall_query(text: &str, k: usize) -> Query {
         .embed(text, TextKind::Query)
         .await
         .ok();
-    build_query(text, Some(k), None, None, embedding, None, false)
+    build_query(text, Some(k), None, None, embedding, None)
 }
 
 fn recall_k(query: &str, k: usize) -> RecallArgs {
@@ -222,7 +275,7 @@ async fn recall_returns_the_first_k_of_the_wide_pool_in_store_order() {
     let k = 3;
     let server = server_over(&store);
     let pool = store
-        .query_explained(&recall_query("zorbnax", crate::ask::candidate_pool(k)).await)
+        .query_explained(&recall_query("zorbnax", crate::recall::candidate_pool(k)).await)
         .await
         .unwrap();
     let expected: Vec<String> = pool
@@ -242,8 +295,8 @@ async fn recall_returns_the_first_k_of_the_wide_pool_in_store_order() {
 }
 
 #[tokio::test]
-async fn ask_filters_by_kind_and_scope() {
-    // Arrange: one node matches both filters, three others miss one each.
+async fn recall_filters_by_kind_and_scope_together() {
+    // Arrange: one node matches both filters, two others miss one each.
     let server = plain_server().await;
     seed_scoped(
         &server,
@@ -271,9 +324,9 @@ async fn ask_filters_by_kind_and_scope() {
     .await;
 
     // Act
-    let answer = server
-        .ask(Parameters(AskArgs {
-            question: "When does the zorbnax gizmo ship?".to_string(),
+    let out = server
+        .recall(Parameters(RecallArgs {
+            query: "When does the zorbnax gizmo ship?".to_string(),
             kind: Some("decision".to_string()),
             scope: Some("proj-a".to_string()),
             k: None,
@@ -282,51 +335,10 @@ async fn ask_filters_by_kind_and_scope() {
         }))
         .await;
 
-    // Assert: filters reach the store on the `ask` path too, so the model
-    // only ever sees evidence the caller asked for.
-    assert!(answer.contains("ships in June"), "missing match: {answer}");
-    assert!(!answer.contains("ships in July"), "kind leaked: {answer}");
-    assert!(
-        !answer.contains("ships in August"),
-        "scope leaked: {answer}"
-    );
-}
-
-#[tokio::test]
-async fn ask_respects_k() {
-    // Arrange: three matching nodes, but the caller wants one piece of
-    // evidence. The canned reply is grounded so the synthesized path (and
-    // therefore the `Sources:` index this asserts on) is the one taken.
-    let server = server_with(Arc::new(RecordingLlm::new(
-        "The zorbnax report says one [1].",
-    )))
-    .await;
-    seed(&server, "fact", "One", "zorbnax report one").await;
-    seed(&server, "fact", "Two", "zorbnax report two").await;
-    seed(&server, "fact", "Three", "zorbnax report three").await;
-
-    // Act
-    let answer = server
-        .ask(Parameters(AskArgs {
-            question: "What do the zorbnax reports say?".to_string(),
-            kind: None,
-            scope: None,
-            k: Some(1),
-            as_of: None,
-            mode: None,
-        }))
-        .await;
-
-    // Assert on the `Sources:` index rather than the body: the echo llm
-    // repeats the prompt, so the body would contain evidence markers either
-    // way. One source line means one evidence item was cited.
-    let sources = answer
-        .split_once("Sources:\n")
-        .map(|(_, s)| s.to_string())
-        .unwrap_or_else(|| panic!("answer has no sources section: {answer}"));
-    let numbered = sources.lines().filter(|l| l.starts_with('[')).count();
-    assert_eq!(numbered, 1, "expected 1 source: {sources}");
-    assert!(sources.starts_with("[1] fact/"), "sources: {sources}");
+    // Assert
+    assert!(out.contains("ships in June"), "missing match: {out}");
+    assert!(!out.contains("ships in July"), "kind leaked: {out}");
+    assert!(!out.contains("ships in August"), "scope leaked: {out}");
 }
 
 #[tokio::test]

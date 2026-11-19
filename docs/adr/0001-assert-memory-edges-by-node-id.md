@@ -1,6 +1,7 @@
 # ADR-0001: Assert memory edges by node id
 
 - **Status:** Accepted
+- **Note, 2026-11-19:** the `ask` tool named here was removed by [ADR-0017](0017-remove-the-ask-tool.md). `recall` stays.
 - **Date created:** 2026-08-17
 - **Date modified:** 2026-08-22
 - **Supersedes scope:** the clustering cadence, the `cluster` Cargo feature, and the

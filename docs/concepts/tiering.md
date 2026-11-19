@@ -40,15 +40,14 @@ promoted item is protected for `min_residency_days`, and an item younger than
 
 ## What counts as use
 
-Only `recall` and `ask` results count, and only the ranked results the client
+Only `recall` results count, and only the ranked results the client
 was shown, not the neighbours pulled in beside them. Counts are kept in memory
 and written to the log every `usage_flush_secs`, so a crash loses up to that
 many seconds of counts. A store that has not been counting for a whole
 `window_days` demotes nothing, because every item would look unused.
 
 Clients can say whether a result was right with the `feedback` tool, using the
-handle `recall` or `ask` printed for it (on `Sources:` lines and in evidence
-blocks too). A handle works on the connection that was given it. One producer
+handle `recall` printed for it. A handle works on the connection that was given it. One producer
 may give `feedback_per_producer_per_hour` verdicts an hour, counted in memory,
 so the limit starts over when the daemon restarts. Clients that do not name
 themselves share one producer, and so one budget. One producer's verdicts on

@@ -89,7 +89,6 @@ async fn a_cold_item_found_by_a_paraphrase_is_counted_and_promoted_with_its_vect
         Arc::new(embedding_of("target", TARGET_PATTERN)),
         Arc::new(MockLlm),
         1,
-        false,
         8192,
         1,
     )

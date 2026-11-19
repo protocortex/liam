@@ -33,19 +33,19 @@ fn ms(millis: u64) -> Duration {
 }
 
 #[test]
-fn a_timed_tool_call_lands_in_its_own_percentiles_only() {
+fn a_timed_tool_call_lands_in_the_tool_percentiles_and_no_stage() {
     // Arrange
     let (metrics, sink) = recorder();
 
     // Act
     for millis in 1..=10 {
-        metrics.record_tool(Tool::Ask, ms(millis));
+        metrics.record_tool(Tool::Recall, ms(millis));
     }
 
     // Assert
-    let p95 = reading(&sink, MetricId::AskLatencyP95Ms, Labels::None).unwrap();
+    let p95 = reading(&sink, MetricId::RecallLatencyP95Ms, Labels::None).unwrap();
     assert_eq!(p95.value, 10.0);
-    assert!(reading(&sink, MetricId::RecallLatencyP95Ms, Labels::None).is_none());
+    assert!(reading(&sink, MetricId::StageEmbedP95Ms, Labels::None).is_none());
 }
 
 #[test]

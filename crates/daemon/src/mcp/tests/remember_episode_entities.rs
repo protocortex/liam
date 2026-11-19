@@ -16,7 +16,6 @@ async fn remember_with_episode_entities_get_no_embedding() {
         embedder.clone(),
         Arc::new(liam_model::MockLlm),
         30,
-        false,
         8192,
         1,
     );

@@ -772,6 +772,8 @@ impl Query {
         self.half_life = Some(half_life);
         self
     }
+    /// Also ranks inferred rows (entity pages and summaries) beside recorded
+    /// memory. No daemon tool sets it today, so a query is recorded-only.
     pub fn with_inferred(mut self, include_inferred: bool) -> Self {
         self.include_inferred = include_inferred;
         self
@@ -906,7 +908,7 @@ pub struct ExplainedHit {
     pub confidence: f64,
     pub decay: f64,
     /// The raw "known since" instant `decay` was computed from, so callers
-    /// (e.g. the daemon's `ask` tool) can render a date instead of a factor.
+    /// can render a date instead of a factor.
     pub valid_from: Millis,
     pub expanded: bool,
 }

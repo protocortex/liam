@@ -17,7 +17,6 @@ nothing a model wrote. `infer` may add inferred content, always labelled.
 | `recall` | `strict` | Refused. |
 | `clusters` | `strict` | Refused. |
 | `timeline` | `strict` | Refused. The entity page heading the output is the one inferred item, and it is labelled so. |
-| `ask` | `infer` | The default. Evidence may include entity pages and summaries. `strict` returns the recorded evidence and makes no model call. |
 | `summaries` | not applicable | Lists summaries, which are always inferred. |
 
 Entity pages are labelled `inferred` and left out of every strict read, both

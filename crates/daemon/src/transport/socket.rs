@@ -408,7 +408,6 @@ mod tests {
             Arc::new(liam_model::MockEmbedder::new(8)),
             Arc::new(liam_model::MockLlm),
             30,
-            false,
             8192,
             1,
         )
@@ -431,7 +430,6 @@ mod tests {
             Arc::new(liam_model::MockEmbedder::new(8)),
             Arc::new(liam_model::MockLlm),
             30,
-            false,
             8192,
             1,
         )

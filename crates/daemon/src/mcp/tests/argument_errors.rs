@@ -35,13 +35,13 @@ async fn remember_without_a_kind_names_the_field_and_the_accepted_kinds() {
 }
 
 #[tokio::test]
-async fn ask_without_a_question_names_the_field() {
+async fn recall_without_a_query_names_the_field() {
     // Arrange / Act
-    let (text, is_error) = call("ask", json!({"query": "what do I work on"})).await;
+    let (text, is_error) = call("recall", json!({"kind": "fact"})).await;
 
     // Assert
     assert!(is_error, "{text}");
-    assert!(text.contains("`question`"), "{text}");
+    assert!(text.contains("`query`"), "{text}");
 }
 
 #[tokio::test]

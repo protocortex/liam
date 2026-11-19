@@ -55,8 +55,8 @@ pub struct ApplyDeps<'a> {
     pub store: &'a DefaultGraph,
     pub verifier: &'a dyn TierVerifier,
     pub embedder: &'a dyn Embedder,
-    /// The generation permits, shared with `ask`, because the embedder shares
-    /// the model host with it.
+    /// The generation permits, shared with entity synthesis, because the
+    /// embedder shares the model host with it.
     pub permits: &'a Semaphore,
     pub free_ram: &'a (dyn FreeRam + Sync),
     /// The write source the moves are logged under, naming the run.

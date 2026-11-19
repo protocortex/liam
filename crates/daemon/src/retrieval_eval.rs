@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Retrieval-quality benchmark for `Graph::query`/`query_core`.
 //!
-//! Where `eval.rs` scores whether the LLM's ANSWER stays grounded, this module
-//! scores whether RETRIEVAL surfaces the right memories in the first place:
+//! This module scores whether RETRIEVAL surfaces the right memories in the
+//! first place:
 //! precision, recall, and reciprocal rank over a fixed corpus and question
 //! set, broken down by the eight query features the pipeline supports:
 //! `Lexical`, `VectorSemantic`, `GraphExpansion`, `KindFilter`, `ScopeFilter`,
@@ -18,7 +18,7 @@
 //! - **Real-embedder, `#[ignore]`d:** `run_retrieval_eval` loads the actual
 //!   local embedder and scores `VectorSemantic` too. `evaluate_embedder` is the same run
 //!   over any `Embedder`, which the mock-embedder test uses. Downloads model
-//!   weights on first run and is slow, like `eval.rs`'s own gated tier, so
+//!   weights on first run and is slow, so
 //!   its test is `#[ignore]`d rather than part of plain
 //!   `cargo test -p liam-daemon`:
 //!
@@ -51,8 +51,7 @@
 //! (labels exist, every answer appears in its fact, Decay and AsOf pairs are
 //! ordered in time). The numbers are printed via `format_report` for a
 //! maintainer to read and, when they change meaningfully, hand-transcribe
-//! into a dated table here, the same convention `eval.rs` uses for its own
-//! baselines.
+//! into a dated table here.
 //!
 //! # Golden set
 //!

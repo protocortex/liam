@@ -112,7 +112,7 @@ async fn resynthesize_entity_lists_each_mentions_origin_event_once_as_the_pages_
 async fn resynthesize_entity_leaves_a_mention_the_budget_dropped_out_of_the_basis() {
     // Arrange: a context budget that keeps only the first mention
     let llm = Arc::new(CountingLlm::new());
-    let server = server_with_timeout(llm, 30, false, 1).await;
+    let server = server_with_timeout(llm, 30, 1).await;
     let store = server.store().await.unwrap();
     let page = page_with_three_mentions(&store).await;
     let mentions = store
@@ -408,9 +408,9 @@ async fn resynthesize_entity_preserves_the_original_entitys_scope() {
 #[tokio::test]
 async fn resynthesize_entity_honors_the_deadline_it_is_given_not_a_fresh_one() {
     // Given an already-elapsed deadline, a sole permit held all test long,
-    // and an hour-long `ask_timeout_secs` a fresh deadline would never miss.
+    // and an hour-long synthesis timeout a fresh deadline would never miss.
     let llm = Arc::new(CountingLlm::new());
-    let server = server_with_generation_limit(llm, 3600, false, 8192, 1).await;
+    let server = server_with_generation_limit(llm, 3600, 8192, 1).await;
     let _held = server
         .generation_permits
         .clone()
@@ -503,8 +503,8 @@ async fn remember_runs_entity_synthesis_concurrently_not_sequentially() {
     // 2 permits, not the shipped default of 1: only then can peak
     // reach 2, proving true concurrency, not just bounded queuing.
     let release = Arc::new(tokio::sync::Notify::new());
-    let llm = Arc::new(GatedLlm::new_grounded(release.clone()));
-    let server = Arc::new(server_with_generation_limit(llm.clone(), 30, false, 8192, 2).await);
+    let llm = Arc::new(GatedLlm::new(release.clone()));
+    let server = Arc::new(server_with_generation_limit(llm.clone(), 30, 8192, 2).await);
 
     // When remember runs an episode mentioning 2 distinct fresh
     // entities, spawned since the gated llm blocks until released

@@ -40,11 +40,10 @@ pub fn build(config: &MetricsConfig, database_path: &Path, deadline_days: u32) -
 const DELETION_WARNING_SHARE: f64 = 0.8;
 
 /// The metrics that alert on a relative move between runs.
-const DELTA_METRICS: [MetricId; 6] = [
+const DELTA_METRICS: [MetricId; 5] = [
     MetricId::ProbeRecallAt10,
     MetricId::ArmLatencyP95Ms,
     MetricId::RecallLatencyP95Ms,
-    MetricId::AskLatencyP95Ms,
     MetricId::Ece,
     MetricId::BloomFalsePositiveRate,
 ];

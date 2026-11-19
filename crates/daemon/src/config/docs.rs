@@ -11,7 +11,7 @@ use super::Config;
 const ROOT_SECTION: &str = "";
 
 /// Keys kept only so an old `liam.toml` still loads, so no page documents them.
-const REMOVED_KEYS: [&str; 2] = ["reranker", "embedder.device"];
+const REMOVED_KEYS: [&str; 3] = ["reranker", "embedder.device", "ask_sufficiency_check"];
 
 /// Sections whose keys a concept page documents and its own test guards.
 const SECTIONS_ON_OWN_PAGES: [&str; 3] = ["extraction", "summary", "tiering"];

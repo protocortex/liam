@@ -11,21 +11,22 @@ use serde_json::json;
 
 mod argument_errors;
 mod as_of_and_round_trips;
-mod ask_tool;
 mod clusters_and_timeline;
 mod entity_pages_and_modes;
 mod entity_synthesis;
 mod error_replies;
+mod generation_limit;
 mod query_limits_and_embed_kinds;
 mod recall_filters_and_format;
 mod relate;
 mod remember;
 mod remember_episode;
 mod remember_episode_entities;
+mod removed_ask;
 mod store_swap;
 mod timing_samples;
 
-/// Always-errors `Llm`, so `ask` must fall back to the retrieved evidence.
+/// Always-errors `Llm`, so a synthesis must report the failure.
 struct FailingLlm;
 #[async_trait::async_trait]
 impl liam_model::Llm for FailingLlm {
@@ -34,23 +35,10 @@ impl liam_model::Llm for FailingLlm {
     }
 }
 
-/// Sleeps past any short test timeout, so `ask` must fall back instead of
-/// waiting on synthesis. Used to exercise the `tokio::time::timeout` arm
-/// without a real 30s test.
-struct SlowLlm;
-#[async_trait::async_trait]
-impl liam_model::Llm for SlowLlm {
-    async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        Ok("too late".to_string())
-    }
-}
-
 /// Records what reached the model and replies with a canned answer. WHY not
-/// `MockLlm` for the synthesized-path tests: its echo repeats the system
-/// rules, which `ask::is_grounded` correctly rejects as not derived from the
-/// evidence. Recording the prompt asserts prompt delivery directly instead of
-/// inferring it from an echo.
+/// `MockLlm`: its echo repeats the system rules, which the grounding check of
+/// entity synthesis rejects as not derived from the mentions. Recording the
+/// prompt asserts prompt delivery directly instead of inferring it from an echo.
 struct RecordingLlm {
     reply: &'static str,
     seen: std::sync::Mutex<Vec<String>>,
@@ -85,47 +73,6 @@ impl liam_model::Llm for RecordingLlm {
     }
 }
 
-/// Answers with fluent text that shares nothing with the evidence: what a
-/// model does when it answers from its own priors instead of the retrieved
-/// facts.
-struct UngroundedLlm;
-#[async_trait::async_trait]
-impl liam_model::Llm for UngroundedLlm {
-    async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
-        Ok("Kubernetes clusters orchestrate containerized microservice deployments.".to_string())
-    }
-}
-
-/// Answers the sufficiency pre-pass and the synthesis call differently, so a
-/// test can drive one without the other. Told apart by the pre-pass prompt's
-/// own wording rather than call order, which would break the moment the
-/// handler reorders its calls.
-struct SufficiencyLlm {
-    verdict: &'static str,
-    answer: &'static str,
-}
-
-#[async_trait::async_trait]
-impl liam_model::Llm for SufficiencyLlm {
-    async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
-        if prompt.contains("Reply YES or NO") {
-            Ok(self.verdict.to_string())
-        } else {
-            Ok(self.answer.to_string())
-        }
-    }
-}
-
-/// Succeeds but with a blank answer, so `ask` must fall back to evidence
-/// instead of returning whitespace as if it were a real synthesis.
-struct EmptyLlm;
-#[async_trait::async_trait]
-impl liam_model::Llm for EmptyLlm {
-    async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
-        Ok("   ".to_string())
-    }
-}
-
 /// Blocks inside `complete()` on a `Notify` the test controls, so the test
 /// decides exactly when a call may finish. Tracks the PEAK number of
 /// concurrent `complete()` calls it has ever seen (fetch_add, compare
@@ -136,7 +83,6 @@ struct GatedLlm {
     release: Arc<tokio::sync::Notify>,
     in_flight: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
-    grounded: bool,
 }
 
 impl GatedLlm {
@@ -145,19 +91,6 @@ impl GatedLlm {
             release,
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             peak: std::sync::atomic::AtomicUsize::new(0),
-            grounded: false,
-        }
-    }
-
-    /// As `new`, but replies with `grounded_entity_reply(prompt)` instead
-    /// of the fixed literal, for the one call site that gates entity
-    /// synthesis rather than `ask`.
-    fn new_grounded(release: Arc<tokio::sync::Notify>) -> Self {
-        Self {
-            release,
-            in_flight: std::sync::atomic::AtomicUsize::new(0),
-            peak: std::sync::atomic::AtomicUsize::new(0),
-            grounded: true,
         }
     }
 
@@ -182,11 +115,7 @@ impl liam_model::Llm for GatedLlm {
         self.release.notified().await;
         self.in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if self.grounded {
-            Ok(grounded_entity_reply(prompt))
-        } else {
-            Ok("the wibbleflux service runs nightly [1].".to_string())
-        }
+        Ok(grounded_entity_reply(prompt))
     }
 }
 
@@ -274,30 +203,22 @@ impl liam_model::Llm for FirstCallErrorsLlm {
     }
 }
 
-/// Fresh in-memory server wired with the given llm, a 30s ask
+/// Fresh in-memory server wired with the given llm, a 30s synthesis
 /// timeout, and the shipped default 8192-token context budget. Dims 8 to
 /// match `MockEmbedder::new(8)`.
 async fn server_with(llm: Arc<dyn Llm>) -> MemoryServer {
-    server_with_timeout(llm, 30, false, 8192).await
+    server_with_timeout(llm, 30, 8192).await
 }
 
-/// Fresh in-memory server wired with the given llm/ask
+/// Fresh in-memory server wired with the given llm/synthesis
 /// timeout/context budget, generation capped to 1 concurrent call (the
 /// shipped default). Dims 8 to match `MockEmbedder::new(8)`.
 async fn server_with_timeout(
     llm: Arc<dyn Llm>,
-    ask_timeout_secs: u64,
-    ask_sufficiency_check: bool,
-    ask_context_tokens: usize,
+    synthesis_timeout_secs: u64,
+    context_tokens: usize,
 ) -> MemoryServer {
-    server_with_generation_limit(
-        llm,
-        ask_timeout_secs,
-        ask_sufficiency_check,
-        ask_context_tokens,
-        1,
-    )
-    .await
+    server_with_generation_limit(llm, synthesis_timeout_secs, context_tokens, 1).await
 }
 
 /// As `server_with_timeout`, plus an explicit `max_concurrent_generations`
@@ -305,9 +226,8 @@ async fn server_with_timeout(
 /// itself; every other test goes through `server_with_timeout`'s fixed 1.
 async fn server_with_generation_limit(
     llm: Arc<dyn Llm>,
-    ask_timeout_secs: u64,
-    ask_sufficiency_check: bool,
-    ask_context_tokens: usize,
+    synthesis_timeout_secs: u64,
+    context_tokens: usize,
     max_concurrent_generations: usize,
 ) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
@@ -317,9 +237,8 @@ async fn server_with_generation_limit(
         Arc::new(store),
         Arc::new(liam_model::MockEmbedder::new(8)),
         llm,
-        ask_timeout_secs,
-        ask_sufficiency_check,
-        ask_context_tokens,
+        synthesis_timeout_secs,
+        context_tokens,
         max_concurrent_generations,
     )
 }
@@ -356,8 +275,7 @@ async fn seed_scoped(
 }
 
 /// Server with the neutral doubles used by the filter tests: the store's
-/// ordering and the echo llm (so `ask`'s answer contains
-/// whatever evidence reached the prompt, which is what they assert on).
+/// ordering and the echo llm.
 async fn plain_server() -> MemoryServer {
     server_with(Arc::new(liam_model::MockLlm)).await
 }
@@ -377,7 +295,6 @@ async fn server_with_clock(clock: Arc<FixedClock>) -> MemoryServer {
         Arc::new(liam_model::MockEmbedder::new(8)),
         Arc::new(liam_model::MockLlm),
         30,
-        false,
         8192,
         1,
     )
@@ -452,24 +369,13 @@ async fn server_with_recording_embedder_and_llm(
         .await
         .expect("open in-memory store");
     let embedder = Arc::new(CountingEmbedder::new(8));
-    let server = MemoryServer::new(Arc::new(store), embedder.clone(), llm, 30, false, 8192, 1);
+    let server = MemoryServer::new(Arc::new(store), embedder.clone(), llm, 30, 8192, 1);
     (server, embedder)
 }
 
 fn recall_args_for(query: &str) -> RecallArgs {
     RecallArgs {
         query: query.to_string(),
-        kind: None,
-        scope: None,
-        k: None,
-        as_of: None,
-        mode: None,
-    }
-}
-
-fn ask_args_for(question: &str) -> AskArgs {
-    AskArgs {
-        question: question.to_string(),
         kind: None,
         scope: None,
         k: None,

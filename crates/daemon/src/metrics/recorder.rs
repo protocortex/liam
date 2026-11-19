@@ -23,7 +23,7 @@ use super::sink::{
 use crate::degraded::Degraded;
 use crate::tiering::AppliedMoves;
 
-/// Timings kept per window, the size `ask` already keeps for its own.
+/// Timings kept per window.
 const LATENCY_WINDOW: usize = 50;
 
 const ARM_METRICS: [MetricId; 2] = [MetricId::ArmLatencyP50Ms, MetricId::ArmLatencyP95Ms];
@@ -189,7 +189,7 @@ impl Metrics {
         self.windows.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// One finished `recall` or `ask`.
+    /// One finished `recall`.
     pub fn record_tool(&self, tool: Tool, elapsed: Duration) {
         let now = self.clock.now();
         let mut windows = self.windows();
@@ -228,7 +228,7 @@ impl Metrics {
         }
     }
 
-    /// One degraded `recall` or `ask` reply. The count only grows.
+    /// One degraded `recall` reply. The count only grows.
     pub fn record_degraded(&self, tool: Tool, reason: Degraded) {
         // A panic while counting leaves a total one reply short at worst.
         let mut counts = self.degraded.lock().unwrap_or_else(PoisonError::into_inner);

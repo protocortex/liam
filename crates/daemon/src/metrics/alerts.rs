@@ -67,12 +67,24 @@ pub struct AlertState {
 pub struct LoadedState {
     pub state: AlertState,
     pub warnings: u32,
+    /// Names in the file that match no current metric, left out of `state`.
+    pub skipped_metrics: Vec<String>,
+}
+
+/// The file as written, with metric names still plain text so one unknown
+/// name does not fail the whole file.
+#[derive(Deserialize)]
+struct RawState {
+    version: u32,
+    values: BTreeMap<String, Previous>,
 }
 
 impl AlertState {
     /// The state saved at `path`. A missing file is a first run. A file that
     /// cannot be read or is of another version is dropped for a fresh state
     /// and counted as a warning, because an alert state must never stop a run.
+    /// An entry that names a metric that no longer exists is skipped and the
+    /// rest is kept, so one removed metric does not reset every baseline.
     pub fn load(path: &Path) -> LoadedState {
         let fresh = |warnings| LoadedState {
             state: Self {
@@ -80,6 +92,7 @@ impl AlertState {
                 values: BTreeMap::new(),
             },
             warnings,
+            skipped_metrics: Vec::new(),
         };
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -89,16 +102,37 @@ impl AlertState {
                 return fresh(1);
             }
         };
-        match serde_json::from_str::<Self>(&text) {
-            Ok(state) if state.version == FORMAT_VERSION => LoadedState { state, warnings: 0 },
-            Ok(state) => {
-                tracing::warn!(path = %path.display(), version = state.version, "the metrics state is of another version");
+        match serde_json::from_str::<RawState>(&text) {
+            Ok(raw) if raw.version == FORMAT_VERSION => Self::keep_known(raw),
+            Ok(raw) => {
+                tracing::warn!(path = %path.display(), version = raw.version, "the metrics state is of another version");
                 fresh(1)
             }
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "the metrics state is corrupt");
                 fresh(1)
             }
+        }
+    }
+
+    fn keep_known(raw: RawState) -> LoadedState {
+        let mut values = BTreeMap::new();
+        let mut skipped_metrics = Vec::new();
+        for (name, previous) in raw.values {
+            match serde_json::from_value::<MetricId>(serde_json::Value::String(name.clone())) {
+                Ok(metric) => {
+                    values.insert(metric, previous);
+                }
+                Err(_) => skipped_metrics.push(name),
+            }
+        }
+        LoadedState {
+            state: Self {
+                version: FORMAT_VERSION,
+                values,
+            },
+            warnings: 0,
+            skipped_metrics,
         }
     }
 
@@ -206,7 +240,14 @@ pub fn evaluate_run(
     let LoadedState {
         mut state,
         warnings,
+        skipped_metrics,
     } = AlertState::load(state_path);
+    if !skipped_metrics.is_empty() {
+        tracing::warn!(
+            metrics = %skipped_metrics.join(", "),
+            "the metrics state names metrics that belong to a removed metric, so they were skipped"
+        );
+    }
     if warnings > 0 {
         tracing::warn!("the alert state was reset, so this run raises no relative alerts");
     }

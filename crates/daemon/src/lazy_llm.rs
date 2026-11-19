@@ -4,7 +4,7 @@
 //! model it uses a few times a day; the first call after an unload pays the
 //! load instead.
 //!
-//! The load runs as its own task, so a caller that gives up (an `ask` deadline,
+//! The load runs as its own task, so a caller that gives up (a synthesis deadline,
 //! a client that went away) does not cancel it: the model finishes loading and
 //! the next call finds it ready. A call in flight holds its own handle to the
 //! model, so an unload never pulls the model out from under it.

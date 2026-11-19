@@ -35,7 +35,7 @@ records them in `<database>.hosted-batches.json`, and a later run collects the
 answers into the response cache before it writes any fact. Events whose request
 is still with the provider are not passed, so the cursor waits for them. A
 request that expires is sent once more, and a second expiry fails it. Summaries
-are asked directly. `ask` and entity synthesis stay on the local model whatever
+are asked directly. Entity synthesis stays on the local model whatever
 the setting.
 
 Every request, batch or direct, is first noted in `<database>.hosted-sends.jsonl`

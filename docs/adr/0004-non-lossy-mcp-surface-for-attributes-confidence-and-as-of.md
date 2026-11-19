@@ -1,6 +1,7 @@
 # ADR-0004: Non-lossy MCP surface for attributes, confidence, and as_of
 
 - **Status:** Accepted
+- **Note, 2026-11-19:** the `ask` tool named here was removed by [ADR-0017](0017-remove-the-ask-tool.md). `recall` stays.
 - **Date created:** 2026-08-25
 - **Date modified:** 2026-08-25
 

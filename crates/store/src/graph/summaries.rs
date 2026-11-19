@@ -273,7 +273,8 @@ impl<B: Backend> Graph<B> {
     /// The open summaries within `scope` (that scope and its descendants; every
     /// scope when `None`), at `level` when given, each with its vector, ordered
     /// by level then id. With `as_of`, only those known by then: stored at or
-    /// before it and not covering any later time.
+    /// before it and not covering any later time. No daemon tool passes
+    /// `as_of` today; `None` reads the summaries as they stand now.
     pub async fn summaries_within(
         &self,
         scope: Option<&str>,

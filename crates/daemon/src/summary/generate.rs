@@ -18,11 +18,11 @@ use tokio::time::{timeout_at, Instant};
 use tracing::{debug, warn};
 
 use super::summariser::{Summariser, SummaryRequest};
-use crate::ask::{
-    estimate_tokens, fit_texts_to_budget, neutralize_fence, truncate, MAX_EVIDENCE_CHARS,
-};
 use crate::extraction::cache::{cache_key, KeyParts};
 use crate::extraction::client::{ExtractRequest, ModelIdentity};
+use crate::prompt::{
+    estimate_tokens, fit_texts_to_budget, neutralize_fence, truncate, MAX_EVIDENCE_CHARS,
+};
 
 /// Bumped on any change to the prompt or to the grounding rules, so a cached
 /// summary and a recorded failure never outlive the rules that made them.

@@ -19,7 +19,7 @@ Keys, all under `[summary]` in `liam.toml`:
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | `false` makes the whole step a no-op. |
-| `provider` | `"local"` | Who writes summaries: `local`, or `anthropic`, `openai` or `gemini` (these need `[hosted]`). `ask` and entity synthesis stay local. |
+| `provider` | `"local"` | Who writes summaries: `local`, or `anthropic`, `openai` or `gemini` (these need `[hosted]`). Entity synthesis stays local. |
 | `knn` | `8` | Nearest neighbours considered for each item. |
 | `min_similarity` | `0.5` | Least cosine similarity at which two items are linked. |
 | `time_window_hours` | `720` | Items further apart than this are not linked. |
@@ -34,25 +34,20 @@ Keys, all under `[summary]` in `liam.toml`:
 | `run_deadline_secs` | `600` | Bounds the generation of one run. |
 | `min_grounded_share` | `0.5` | Least share of a summary's content words its items must hold. |
 | `max_summary_failures` | `3` | Failures of one child set after which it is skipped. |
-| `min_summary_similarity` | `0.5` | Least similarity of a question to a summary for `ask` to use it. |
+| `min_summary_similarity` | `0.5` | Least similarity of a `summaries` query to a summary for the tool to list it. |
 | `dissolve_grace_runs` | `3` | Runs a summary whose cluster is gone waits for a replacement before it is closed. |
 | `dissolve_overlap` | `0.5` | Share of its items a stored summary must hold to replace it. |
 | `max_basis_ids_rendered` | `8` | Event ids a provenance line lists before it counts the rest. |
 
 ## Reading summaries
 
-`ask` in infer mode adds up to three summaries to its evidence: the live ones in
-the question's scope (that scope and its descendants) that are at least
-`summary.min_summary_similarity` close to it. Strict `ask` never reads them.
-
-`summaries` lists them, ranked and cut by `query` when one is given, and takes
+`summaries` lists them, ranked and cut by `query` when one is given (a summary
+must be at least `summary.min_summary_similarity` close to it), and takes
 `level`, `scope` and `limit` (default 20, at most 100). With `id` it shows one
 summary, open or closed, then each child as it stood when the summary was
 written, with the events behind it. A child that no longer exists is named.
 
-Time travel reads live summaries only. `ask` with `as_of` uses a summary that
-was stored by then and does not cover a later time, and a summary closed after
-`as_of` is not eligible, because closed summaries are not read.
+`recall` never returns a summary. A summary is read only through `summaries`.
 
 ## What the exit criteria prove
 

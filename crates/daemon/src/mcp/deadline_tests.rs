@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The retrieval deadline and cancellation of `recall` and `ask`, on a paused
+//! The retrieval deadline and cancellation of `recall`, on a paused
 //! clock. Every sleeping double sleeps with `tokio::time::sleep`, so the
 //! clock can advance past it; a `std::thread::sleep` would stall the test.
 
@@ -20,19 +20,12 @@ const QUERY: &str = "quarterly forecasts for the finance team";
 const SLOW: Duration = Duration::from_secs(30);
 const FACT_COUNT: usize = 5;
 const K: usize = 2;
+const SYNTHESIS_TIMEOUT_SECS: u64 = 30;
 const NO_REASONS: &[&str] = &[];
 const CANCELLED_TEXT: &str = "recall cancelled";
 const TIMEOUT_TEXT: &str = "recall failed: retrieval took longer than 1 s";
 const NO_MEMORY_TEXT: &str = "no relevant memory";
 const HIT_PREFIX: &str = "[fact ";
-const ASK_CANCELLED_TEXT: &str = "ask cancelled";
-const PRE_PASS_REFUSAL: &str = "NO";
-const ASK_TIMEOUT_TEXT: &str = "ask failed: retrieval took longer than 1 s";
-const ASK_TIMEOUT_SECS: u64 = 1;
-const MARKER_PREFIX: &str = "(degraded: ";
-const GROUNDED_ANSWER: &str = "The finance team has quarterly forecasts [1].";
-const UNGROUNDED_ANSWER: &str =
-    "Kubernetes clusters orchestrate containerized microservice deployments.";
 
 /// Embeds like `MockEmbedder` after sleeping `delay`, counting its calls.
 struct SleepingEmbedder {
@@ -67,43 +60,8 @@ impl Embedder for SleepingEmbedder {
     }
 }
 
-/// Answers every call with `reply`, or fails when it is `None`.
-struct CannedLlm {
-    reply: Option<&'static str>,
-}
-
-#[async_trait::async_trait]
-impl Llm for CannedLlm {
-    async fn complete(&self, _system: &str, _prompt: &str) -> liam_model::Result<String> {
-        self.reply
-            .map(str::to_string)
-            .ok_or_else(|| liam_model::ModelError::Llm("boom".into()))
-    }
-}
-
-/// Never answers within any test budget.
-struct SleepingLlm;
-
-#[async_trait::async_trait]
-impl Llm for SleepingLlm {
-    async fn complete(&self, _system: &str, _prompt: &str) -> liam_model::Result<String> {
-        tokio::time::sleep(SLOW).await;
-        Ok(GROUNDED_ANSWER.to_string())
-    }
-}
-
-/// Fresh in-memory server over the given doubles, with a 30 s ask timeout and
-/// no sufficiency pre-pass.
+/// Fresh in-memory server over the given doubles.
 async fn server_with_models(embedder: Arc<dyn Embedder>, llm: Arc<dyn Llm>) -> MemoryServer {
-    server_with_ask_timeout(embedder, llm, 30).await
-}
-
-/// As `server_with_models`, with the given ask timeout in seconds.
-async fn server_with_ask_timeout(
-    embedder: Arc<dyn Embedder>,
-    llm: Arc<dyn Llm>,
-    ask_timeout_secs: u64,
-) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .expect("open in-memory store");
@@ -111,8 +69,7 @@ async fn server_with_ask_timeout(
         Arc::new(store),
         embedder,
         llm,
-        ask_timeout_secs,
-        false,
+        SYNTHESIS_TIMEOUT_SECS,
         8192,
         1,
     )
@@ -135,17 +92,6 @@ async fn seed_facts(server: &MemoryServer) {
 fn recall_args() -> RecallArgs {
     RecallArgs {
         query: QUERY.to_string(),
-        kind: None,
-        scope: None,
-        k: Some(K),
-        as_of: None,
-        mode: None,
-    }
-}
-
-fn ask_args() -> AskArgs {
-    AskArgs {
-        question: QUERY.to_string(),
         kind: None,
         scope: None,
         k: Some(K),
@@ -179,7 +125,6 @@ fn wire_text(reply: ToolReply, degraded: &[&str], is_error: bool) -> String {
 fn marker_for(reason: &str) -> String {
     let hint = match reason {
         "embed_failed" => "searched by keyword only",
-        "synthesis_unavailable" => "showing the retrieved evidence",
         other => panic!("no hint known for {other}"),
     };
     format!("(degraded: {reason}, {hint})")
@@ -236,36 +181,6 @@ async fn recall_replies_cancelled_without_embedding_when_the_token_is_already_ca
 
     // Assert
     assert_eq!(wire_text(out, NO_REASONS, false), CANCELLED_TEXT);
-    assert_eq!(embedder.call_count(), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn ask_replies_with_the_timeout_when_the_embedder_outlasts_the_deadline() {
-    // Arrange
-    let server = server_with_models(SleepingEmbedder::new(SLOW), Arc::new(MockLlm))
-        .await
-        .with_recall_timeout(1);
-
-    // Act
-    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
-
-    // Assert
-    assert_eq!(wire_text(out, NO_REASONS, true), ASK_TIMEOUT_TEXT);
-}
-
-#[tokio::test(start_paused = true)]
-async fn ask_replies_cancelled_without_embedding_when_the_token_is_already_cancelled() {
-    // Arrange
-    let embedder = SleepingEmbedder::new(Duration::ZERO);
-    let server = server_with_models(embedder.clone(), Arc::new(MockLlm))
-        .await
-        .with_recall_timeout(1);
-
-    // Act
-    let out = server.ask_with(ask_args(), cancelled()).await;
-
-    // Assert
-    assert_eq!(wire_text(out, NO_REASONS, false), ASK_CANCELLED_TEXT);
     assert_eq!(embedder.call_count(), 0);
 }
 
@@ -436,320 +351,4 @@ async fn a_recall_cancelled_while_waiting_on_the_embedder_never_takes_the_gate()
     );
     assert_eq!(embedder.call_count(), 1, "only the second recall embeds");
     wire_text(second, NO_REASONS, false);
-}
-
-#[tokio::test(start_paused = true)]
-async fn ask_marks_each_fallback_as_synthesis_unavailable_and_keeps_the_evidence() {
-    // Arrange
-    let cases: [(&str, Arc<dyn Llm>, bool); 5] = [
-        ("synthesis timeout", Arc::new(SleepingLlm), false),
-        ("model error", Arc::new(CannedLlm { reply: None }), false),
-        (
-            "empty answer",
-            Arc::new(CannedLlm { reply: Some("   ") }),
-            false,
-        ),
-        (
-            "ungrounded answer",
-            Arc::new(CannedLlm {
-                reply: Some(UNGROUNDED_ANSWER),
-            }),
-            false,
-        ),
-        (
-            "permit wait timeout",
-            Arc::new(CannedLlm {
-                reply: Some(GROUNDED_ANSWER),
-            }),
-            true,
-        ),
-    ];
-
-    for (name, llm, hold_permit) in cases {
-        let server =
-            server_with_ask_timeout(Arc::new(MockEmbedder::new(DIMS)), llm, ASK_TIMEOUT_SECS).await;
-        seed_facts(&server).await;
-        let _held = hold_permit.then(|| {
-            server
-                .generation_permits_handle()
-                .try_acquire_owned()
-                .expect("the sole permit is free")
-        });
-
-        // Act
-        let out = server.ask_with(ask_args(), CancellationToken::new()).await;
-
-        // Assert
-        let text = wire_text(out, &["synthesis_unavailable"], false);
-        assert_eq!(
-            text.lines().next(),
-            Some(marker_for("synthesis_unavailable").as_str()),
-            "{name}"
-        );
-        assert_eq!(text.matches(" note ").count(), K, "{name}: {text}");
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn ask_marks_the_embed_error_and_still_answers() {
-    // Arrange
-    let server = server_with_models(
-        Arc::new(ErroringEmbedder::new(DIMS)),
-        Arc::new(CannedLlm {
-            reply: Some(GROUNDED_ANSWER),
-        }),
-    )
-    .await;
-    seed_facts(&server).await;
-
-    // Act
-    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
-
-    // Assert
-    let text = wire_text(out, &["embed_failed"], false);
-    assert_eq!(
-        text.lines().next(),
-        Some(marker_for("embed_failed").as_str())
-    );
-    assert!(text.contains(GROUNDED_ANSWER), "{text}");
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_healthy_ask_has_no_degraded_reasons_and_no_marker() {
-    // Arrange
-    let server = server_with_models(
-        Arc::new(MockEmbedder::new(DIMS)),
-        Arc::new(CannedLlm {
-            reply: Some(GROUNDED_ANSWER),
-        }),
-    )
-    .await;
-    seed_facts(&server).await;
-
-    // Act
-    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
-
-    // Assert
-    let text = wire_text(out, NO_REASONS, false);
-    assert!(!text.starts_with(MARKER_PREFIX), "{text}");
-    assert!(text.contains(GROUNDED_ANSWER), "{text}");
-}
-
-#[tokio::test(start_paused = true)]
-async fn ask_fails_without_degraded_reasons_when_the_question_is_empty() {
-    // Arrange
-    let server = server_with_models(Arc::new(MockEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
-    let args = AskArgs {
-        question: String::new(),
-        ..ask_args()
-    };
-
-    // Act
-    let out = server.ask_with(args, CancellationToken::new()).await;
-
-    // Assert
-    let text = wire_text(out, NO_REASONS, true);
-    assert!(text.starts_with("ask failed:"), "{text}");
-}
-
-#[tokio::test(start_paused = true)]
-async fn ask_fails_without_degraded_reasons_when_the_store_is_unavailable() {
-    // Arrange
-    let server = server_with_models(Arc::new(MockEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
-    *server.shared_store().exclusive().await = None;
-
-    // Act
-    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
-
-    // Assert
-    let text = wire_text(out, NO_REASONS, true);
-    assert!(text.starts_with("ask failed:"), "{text}");
-}
-
-#[tokio::test(start_paused = true)]
-async fn ask_names_keyword_only_search_when_the_embedder_errors_and_nothing_matches() {
-    // Arrange
-    let server = server_with_models(Arc::new(ErroringEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
-
-    // Act
-    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
-
-    // Assert
-    let text = wire_text(out, &["embed_failed"], false);
-    assert_eq!(
-        text,
-        format!("{}\n{NO_MEMORY_TEXT}", marker_for("embed_failed"))
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn an_ask_cancelled_while_waiting_on_the_embedder_replies_cancelled() {
-    // Arrange
-    let gate = Arc::new(tokio::sync::Mutex::new(()));
-    let embedder = Arc::new(GatedEmbedder::new(DIMS, gate.clone()));
-    let server = server_with_models(embedder.clone(), Arc::new(MockLlm)).await;
-    let _held = gate.lock().await;
-    let token = CancellationToken::new();
-    let mut pending = std::pin::pin!(server.ask_with(ask_args(), token.clone()));
-    tokio::select! {
-        biased;
-        _ = &mut pending => panic!("the ask finished while the gate was held"),
-        _ = std::future::ready(()) => {}
-    }
-
-    // Act
-    token.cancel();
-    let out = pending.await;
-
-    // Assert
-    assert_eq!(wire_text(out, NO_REASONS, false), ASK_CANCELLED_TEXT);
-    assert_eq!(
-        embedder.call_count(),
-        0,
-        "the embed never got past the gate"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn ask_keeps_the_embed_reason_in_strict_mode() {
-    // Arrange
-    let server = server_with_models(Arc::new(ErroringEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
-    seed_facts(&server).await;
-    let args = AskArgs {
-        mode: Some(Mode::Strict),
-        ..ask_args()
-    };
-
-    // Act
-    let out = server.ask_with(args, CancellationToken::new()).await;
-
-    // Assert
-    let text = wire_text(out, &["embed_failed"], false);
-    assert_eq!(
-        text.lines().next(),
-        Some(marker_for("embed_failed").as_str())
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn ask_keeps_the_embed_reason_when_the_pre_pass_refuses() {
-    // Arrange
-    let server = server_with_models(
-        Arc::new(ErroringEmbedder::new(DIMS)),
-        Arc::new(CannedLlm {
-            reply: Some(PRE_PASS_REFUSAL),
-        }),
-    )
-    .await;
-    let server = MemoryServer {
-        ask_sufficiency_check: true,
-        ..server
-    };
-    seed_facts(&server).await;
-
-    // Act
-    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
-
-    // Assert
-    let text = wire_text(out, &["embed_failed"], false);
-    assert_eq!(
-        text.lines().next(),
-        Some(marker_for("embed_failed").as_str())
-    );
-    assert!(text.contains("does not contain an answer"), "{text}");
-}
-
-#[tokio::test(start_paused = true)]
-async fn an_ask_whose_deadline_passes_during_the_model_load_takes_the_synthesis_fallback() {
-    // Arrange: a lazy model whose load stays blocked until the gate closes.
-    // The paused clock does not advance while a blocking load runs, so the
-    // test moves it by hand once the load has started.
-    let (open, gate) = std::sync::mpsc::channel::<()>();
-    let (started_tx, started) = std::sync::mpsc::channel::<()>();
-    let gate = std::sync::Mutex::new(gate);
-    let loader: liam_daemon::lazy_llm::Loader = Arc::new(move || {
-        started_tx.send(()).ok();
-        gate.lock().unwrap().recv().ok();
-        Ok(Arc::new(CannedLlm {
-            reply: Some(GROUNDED_ANSWER),
-        }) as Arc<dyn Llm>)
-    });
-    let lazy = Arc::new(liam_daemon::lazy_llm::LazyLlm::new(loader, "test"));
-    let server = server_with_ask_timeout(
-        Arc::new(MockEmbedder::new(DIMS)),
-        lazy.clone(),
-        ASK_TIMEOUT_SECS,
-    )
-    .await;
-    seed_facts(&server).await;
-
-    // Act: the first ask times out inside the load, then the load finishes.
-    let (slow, ()) = tokio::join!(
-        server.ask_with(ask_args(), CancellationToken::new()),
-        async {
-            tokio::task::spawn_blocking(move || started.recv().unwrap())
-                .await
-                .unwrap();
-            tokio::time::advance(Duration::from_secs(ASK_TIMEOUT_SECS + 1)).await;
-        }
-    );
-    drop(open);
-    lazy.warmup()
-        .await
-        .expect("the load finishes after the deadline");
-    let ready = server.ask_with(ask_args(), CancellationToken::new()).await;
-
-    // Assert
-    let text = wire_text(slow, &["synthesis_unavailable"], false);
-    assert_eq!(
-        text.lines().next(),
-        Some(marker_for("synthesis_unavailable").as_str())
-    );
-    assert_eq!(text.matches(" note ").count(), K, "{text}");
-    wire_text(ready, NO_REASONS, false);
-}
-
-const EXACT_TOKENS_PER_CHAR: usize = 20;
-const NOTE_MARKER: &str = " note ";
-
-/// Counts far more tokens per character than the chars/4 estimate and keeps
-/// the prompts it receives.
-struct ExactCountLlm {
-    prompts: std::sync::Mutex<Vec<String>>,
-}
-
-#[async_trait::async_trait]
-impl Llm for ExactCountLlm {
-    async fn complete(&self, _system: &str, prompt: &str) -> liam_model::Result<String> {
-        self.prompts.lock().unwrap().push(prompt.to_string());
-        Ok(GROUNDED_ANSWER.to_string())
-    }
-
-    fn count_tokens(&self, text: &str) -> Option<usize> {
-        Some(text.len() * EXACT_TOKENS_PER_CHAR)
-    }
-}
-
-#[tokio::test]
-async fn the_first_ask_on_an_unloaded_model_trims_with_the_exact_count() {
-    // Arrange: a lazy model that has not loaded yet, over a counting double.
-    let inner = Arc::new(ExactCountLlm {
-        prompts: std::sync::Mutex::new(Vec::new()),
-    });
-    let loader: liam_daemon::lazy_llm::Loader = {
-        let inner = Arc::clone(&inner);
-        Arc::new(move || Ok(Arc::clone(&inner) as Arc<dyn Llm>))
-    };
-    let lazy = Arc::new(liam_daemon::lazy_llm::LazyLlm::new(loader, "test"));
-    let server = server_with_models(Arc::new(MockEmbedder::new(DIMS)), lazy).await;
-    seed_facts(&server).await;
-
-    // Act
-    let out = server.ask_with(ask_args(), CancellationToken::new()).await;
-
-    // Assert: the exact count leaves room for one item, the estimate for K.
-    wire_text(out, NO_REASONS, false);
-    let prompts = inner.prompts.lock().unwrap();
-    assert_eq!(prompts.len(), 1);
-    assert_eq!(prompts[0].matches(NOTE_MARKER).count(), 1, "{}", prompts[0]);
 }

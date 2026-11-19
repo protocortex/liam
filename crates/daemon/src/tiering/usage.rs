@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Counting the results `recall` and `ask` return, and writing the counts to
+//! Counting the results `recall` returns, and writing the counts to
 //! the log in batches, off the request path.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};

@@ -70,7 +70,7 @@ impl Llm for MockLlm {
 
 /// Cooperative cancellation signal for a single `complete` call. WHY: a local
 /// decode loop runs on a blocking thread, and dropping the caller's future (the
-/// daemon's `ask` timeout firing) cannot stop a blocking thread. Without a
+/// daemon's synthesis timeout firing) cannot stop a blocking thread. Without a
 /// signal the abandoned generation keeps the model lock until it finishes, so
 /// every later call queues behind work whose result nobody will read.
 #[derive(Clone, Default)]
@@ -225,7 +225,7 @@ mod tests {
         let flag = CancelFlag::new();
 
         // Act: the guard's scope stands in for the caller's future being
-        // dropped, e.g. `ask`'s timeout firing.
+        // dropped, e.g. a synthesis timeout firing.
         {
             let _guard = flag.cancel_on_drop();
             assert!(!flag.is_cancelled(), "cancelled while the caller is alive");

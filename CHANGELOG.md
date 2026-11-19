@@ -20,6 +20,16 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- **Breaking:** the `ask` tool is removed. In strict mode `ask` ranked recorded memory like `recall` and added a
+  written answer. In infer mode, its default, it also ranked entity pages and summaries beside recorded memory.
+  Use `recall` for recorded memory: it returns recorded memory only, as it did before, and the calling agent
+  writes its own answer. Entity pages are now read through `timeline` and summaries through `summaries`; no
+  query ranks them any more. There was no `liam ask` command to remove. The local
+  1.5B model stays for entity pages and local summaries. `ask_sufficiency_check` is removed too: an old line is
+  ignored and logs one warning. `ask_timeout_secs` stays, now bounding one batch of entity-page syntheses.
+  The `ask_latency_*` metrics and the `synthesis_unavailable` degraded reason are gone, and `recall` no
+  longer lists `synthesis_unavailable` in its output schema, which it never produced. The recall bench no
+  longer measures recall during an `ask`. See [ADR 0017](docs/adr/0017-remove-the-ask-tool.md).
 - **Breaking:** Snowflake arctic-embed-m-v2.0 is now the only embedder. Any other `embedder.model`, for
   example `Qwen/Qwen3-Embedding-0.6B-GGUF` or `BAAI/bge-m3`, stops `liamd` and `liam` at start with a message
   that names the value and says to delete the line, and a store built with another embedder is refused until

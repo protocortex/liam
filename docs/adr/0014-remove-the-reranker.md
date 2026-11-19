@@ -1,6 +1,7 @@
 # ADR-0014: remove the reranker
 
 - **Status:** Accepted. Supersedes in part [ADR-0013](0013-arctic-default-embedder-and-reranker-off.md): the embedder decision stands, and the reranker decision and its 2026-11-17 addendum are superseded.
+- **Note, 2026-11-19:** the `ask` tool named here was removed by [ADR-0017](0017-remove-the-ask-tool.md). `recall` stays.
 - **Date created:** 2026-11-18
 - **Date modified:** 2026-11-18
 

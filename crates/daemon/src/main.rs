@@ -4,20 +4,18 @@
 //! A thin shell wiring `liam-store` (retrieval) and `liam-model`
 //! (embedding). `provider = "local"` loads the embedder in-process, no server.
 
-mod ask;
 mod cli;
 mod clusters;
 mod consolidation_job;
 mod degraded;
 mod deletion;
-/// Grounding eval for `ask`; test-only, see the module docs to run it.
-#[cfg(test)]
-mod eval;
 mod extraction;
 mod hosted;
 mod log_startup;
 mod mcp;
 mod metrics;
+mod prompt;
+mod recall;
 /// Recall latency and nDCG@10 benchmark; test-only, see the module docs to run it.
 #[cfg(test)]
 mod recall_bench;
@@ -48,7 +46,7 @@ use liam_store::DefaultGraph;
 // `crate::config::...` paths keep resolving now that the module itself lives
 // in the library both binaries share. The call sites are in the submodules,
 // not the files above them: `mcp/producer.rs`, `transport/activation.rs`,
-// `transport/socket.rs`, and `eval.rs`.
+// and `transport/socket.rs`.
 pub use liam_daemon::config;
 
 use config::Config;
@@ -228,6 +226,9 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
     if let Some(warning) = config.embedder.removed_device_warning() {
         tracing::warn!("{warning}");
     }
+    if let Some(warning) = config.removed_ask_sufficiency_check_warning() {
+        tracing::warn!("{warning}");
+    }
     if let Some(warning) = config.missing_config_warning() {
         tracing::warn!("{warning}");
     }
@@ -270,7 +271,6 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
             embedder,
             llm,
             config.ask_timeout_secs,
-            config.ask_sufficiency_check,
             config.llm.context_tokens,
             cache_dir,
             model_fingerprint,
@@ -282,7 +282,6 @@ async fn serve_until(mode: cli::Mode, config: Config, shutdown: Shutdown) -> any
             embedder,
             llm,
             config.ask_timeout_secs,
-            config.ask_sufficiency_check,
             config.llm.context_tokens,
             config.llm.max_concurrent_generations,
         );
@@ -506,22 +505,20 @@ fn build_autotuned_server(
     store: Arc<DefaultGraph>,
     embedder: Arc<dyn Embedder>,
     llm: Arc<dyn Llm>,
-    ask_timeout_secs: u64,
-    ask_sufficiency_check: bool,
-    ask_context_tokens: usize,
+    synthesis_timeout_secs: u64,
+    context_tokens: usize,
     cache_dir: String,
     model_fingerprint: String,
     backend: String,
 ) -> (MemoryServer, Option<JoinHandle<()>>) {
-    let ceiling = tuning::memory_ceiling(ask_context_tokens);
-    let cached = tuning::load_cached(&cache_dir, &model_fingerprint, &backend, ask_context_tokens);
+    let ceiling = tuning::memory_ceiling(context_tokens);
+    let cached = tuning::load_cached(&cache_dir, &model_fingerprint, &backend, context_tokens);
     let server = MemoryServer::new(
         store,
         embedder,
         llm.clone(),
-        ask_timeout_secs,
-        ask_sufficiency_check,
-        ask_context_tokens,
+        synthesis_timeout_secs,
+        context_tokens,
         cached.unwrap_or(ceiling),
     );
 
@@ -535,7 +532,7 @@ fn build_autotuned_server(
                 &model_fingerprint,
                 &backend,
                 result,
-                ask_context_tokens,
+                context_tokens,
             );
             tuning::reconcile_capacity(&handle, &granted_capacity, ceiling, result);
         })
@@ -632,14 +629,14 @@ async fn maintenance_tick(
     server: &MemoryServer,
     policy: &liam_store::RetentionPolicy,
     max_resynth_per_tick: usize,
-    ask_timeout_secs: u64,
+    synthesis_timeout_secs: u64,
     skip_resynthesis: bool,
     full_synthesis_mention_threshold: usize,
     full_synthesis_max_new_tokens: usize,
 ) {
     let resynthesis = (!skip_resynthesis).then_some(Resynthesis {
         max_per_tick: max_resynth_per_tick,
-        ask_timeout_secs,
+        synthesis_timeout_secs,
         full_mention_threshold: full_synthesis_mention_threshold,
         full_max_new_tokens: full_synthesis_max_new_tokens,
     });
@@ -655,7 +652,7 @@ async fn maintenance_tick(
 #[derive(Clone, Copy)]
 pub(crate) struct Resynthesis {
     max_per_tick: usize,
-    ask_timeout_secs: u64,
+    synthesis_timeout_secs: u64,
     full_mention_threshold: usize,
     full_max_new_tokens: usize,
 }
@@ -664,7 +661,7 @@ impl Resynthesis {
     pub(crate) fn from_config(config: &Config) -> Self {
         Self {
             max_per_tick: config.gc.max_resynth_per_tick,
-            ask_timeout_secs: config.ask_timeout_secs,
+            synthesis_timeout_secs: config.ask_timeout_secs,
             full_mention_threshold: config.gc.full_synthesis_mention_threshold,
             full_max_new_tokens: config.gc.full_synthesis_max_new_tokens,
         }
@@ -695,7 +692,7 @@ pub(crate) async fn maintenance_steps(
 
 /// Resynthesizes up to `max_resynth_per_tick` stale entities, oldest first.
 /// Entities are processed one at a time, never concurrently: `resynthesize_entity`
-/// draws from the same shared generation-permit pool `ask` uses, so firing them
+/// draws from the same shared generation-permit pool every synthesis uses, so firing them
 /// all at once would starve concurrent user requests instead of yielding to them
 /// between entities.
 async fn resynthesize_stale(
@@ -730,7 +727,7 @@ async fn resynthesize_stale(
             mcp::ENTITY_SYNTHESIS_MAX_NEW_TOKENS,
         );
         let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(resynthesis.ask_timeout_secs.max(1));
+            + std::time::Duration::from_secs(resynthesis.synthesis_timeout_secs.max(1));
         match server
             .resynthesize_entity_as(store, node_id, deadline, max_new_tokens, write_source)
             .await
@@ -929,7 +926,6 @@ mod tests {
             Arc::new(liam_model::MockEmbedder::new(8)),
             Arc::new(liam_model::MockLlm),
             30,
-            false,
             8192,
             1,
         )
@@ -1103,7 +1099,6 @@ mod tests {
             Arc::new(liam_model::MockEmbedder::new(8)),
             llm,
             30,
-            false,
             8192,
             cache_dir,
             "model/quant".to_string(),
@@ -1150,7 +1145,6 @@ mod tests {
             Arc::new(liam_model::MockEmbedder::new(8)),
             llm,
             30,
-            false,
             8192,
             cache_dir,
             "model/quant".to_string(),
@@ -1289,7 +1283,6 @@ mod tests {
             Arc::new(liam_model::MockEmbedder::new(8)),
             llm,
             30,
-            false,
             8192,
             1,
         )

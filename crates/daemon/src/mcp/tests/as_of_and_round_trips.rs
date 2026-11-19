@@ -30,40 +30,6 @@ async fn recall_as_of_returns_only_the_version_live_at_that_instant() {
 }
 
 #[tokio::test]
-async fn ask_as_of_reflects_only_the_version_live_at_that_instant() {
-    // Arrange: same two-version setup, checked through ask's evidence
-    // rather than recall's rendered text.
-    let clock = Arc::new(FixedClock::new(Millis(1000)));
-    let server = server_with_clock(clock.clone()).await;
-    remember_version(&server, "v1", "zorbnax price is 10").await;
-    clock.set(Millis(2000));
-    remember_version(&server, "v2", "zorbnax price is 20").await;
-
-    // Act: as_of pinned to the first write's instant.
-    let answer = server
-        .ask(Parameters(AskArgs {
-            question: "What is the zorbnax price?".to_string(),
-            kind: None,
-            scope: None,
-            k: None,
-            as_of: Some(1000),
-            mode: None,
-        }))
-        .await;
-
-    // Assert: only the first version's content reached the model as
-    // evidence (the echo llm repeats whatever it was handed).
-    assert!(
-        answer.contains("price is 10"),
-        "missing first version: {answer}"
-    );
-    assert!(
-        !answer.contains("price is 20"),
-        "second version leaked: {answer}"
-    );
-}
-
-#[tokio::test]
 async fn recall_as_of_before_the_first_write_returns_no_hits() {
     // Arrange: one node written at t0.
     let clock = Arc::new(FixedClock::new(Millis(1000)));
@@ -212,38 +178,6 @@ async fn remember_then_recall_round_trips_confidence_and_attributes_through_the_
 }
 
 #[tokio::test]
-async fn remember_then_ask_round_trips_confidence_and_attributes_through_the_tool_call() {
-    // Same fixture as the recall round trip above, checked through `ask`
-    // instead: `plain_server`'s echo llm repeats whatever evidence
-    // reached the prompt, so this proves the same fields survive that
-    // tool-call boundary too, not just recall's.
-    let server = plain_server().await;
-    let out = server
-        .remember(Parameters(RememberArgs {
-            attributes: Some(json!({"hue": "blue"})),
-            valid_from: Some(1_700_000_000_000),
-            confidence: Some(0.42),
-            ..remember_args("full round trip via ask content")
-        }))
-        .await;
-    assert!(out.starts_with("remembered "), "{out}");
-
-    let answer = server
-        .ask(Parameters(AskArgs {
-            question: "full round trip via ask content".to_string(),
-            kind: None,
-            scope: None,
-            k: None,
-            as_of: None,
-            mode: None,
-        }))
-        .await;
-
-    assert!(answer.contains("confidence: 0.42"), "{answer}");
-    assert!(answer.contains(r#"attributes: {"hue":"blue"}"#), "{answer}");
-}
-
-#[tokio::test]
 async fn recall_as_of_round_trip_through_remember_and_recall_tool_calls() {
     // Given a subject remembered twice through the real `remember` tool
     // call, the second superseding the first exactly as `upsert_by`
@@ -281,7 +215,7 @@ async fn recall_as_of_round_trip_through_remember_and_recall_tool_calls() {
 }
 
 #[tokio::test]
-async fn remember_recall_ask_are_registered_with_the_argument_names_clients_send() {
+async fn remember_and_recall_are_registered_with_the_argument_names_clients_send() {
     // As `relate_is_registered_with_the_argument_names_clients_send`:
     // every other test in this module calls these tools directly, so
     // none would notice a tool falling out of the router, or one of
@@ -295,7 +229,6 @@ async fn remember_recall_ask_are_registered_with_the_argument_names_clients_send
             vec!["\"attributes\"", "\"valid_from\"", "\"confidence\""],
         ),
         ("recall", vec!["\"as_of\""]),
-        ("ask", vec!["\"as_of\""]),
     ] {
         assert!(server.tool_router.has_route(name), "{name} not routed");
         let tool = tools

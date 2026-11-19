@@ -51,6 +51,10 @@ pub use tiering::TieringConfig;
 /// Producer ids starting with this are reserved for consolidation writes.
 pub const RESERVED_PRODUCER_PREFIX: &str = "consolidation";
 
+const REMOVED_ASK_SUFFICIENCY_CHECK_WARNING: &str =
+    "ask_sufficiency_check was removed with the ask tool and is ignored: delete it from your \
+     liam.toml";
+
 const REMOVED_RERANKER_WARNING: &str =
     "the reranker was removed and the [reranker] section is ignored: delete it from your liam.toml";
 
@@ -64,15 +68,16 @@ pub struct Config {
     pub gc: GcConfig,
     pub embedder: EmbedderConfig,
     pub llm: LlmConfig,
-    /// Wall-clock cap on `ask` synthesis before falling back to ranked evidence.
+    /// Wall-clock cap on one batch of entity-page syntheses. The key keeps the
+    /// name it had when `ask` shared it, so an existing `liam.toml` still loads.
     pub ask_timeout_secs: u64,
-    /// Seconds `recall` and `ask` may spend retrieving before they answer with a timeout.
+    /// Seconds `recall` may spend retrieving before it answers with a timeout.
     pub recall_timeout_secs: u64,
-    /// Whether `ask` runs a yes/no sufficiency pre-pass before synthesizing. On
-    /// by default: without it no local model tested will decline to answer a
-    /// question its evidence cannot answer. Costs one extra short model call per
-    /// `ask`, so turn it off if latency matters more than refusals.
-    pub ask_sufficiency_check: bool,
+    /// The removed `ask_sufficiency_check` key. Kept so an old `liam.toml` still
+    /// loads, since `deny_unknown_fields` would reject it. Its value is
+    /// ignored, see `removed_ask_sufficiency_check_warning`.
+    #[doc(hidden)]
+    pub ask_sufficiency_check: Option<toml::Value>,
     /// Unix socket path for the multi-client listener (WU-6). `~` is not
     /// meaningful to the socket API, so resolve it with `expand_tilde`
     /// before binding rather than passing this literally.
@@ -190,8 +195,8 @@ pub struct LlmConfig {
     /// its memory back; the next call loads it again. `0` never unloads.
     pub idle_unload_secs: u64,
     /// The model's context window. Sizes both the llama.cpp context and the
-    /// evidence trimming in `ask`, because those two have to agree: if they
-    /// disagreed a full-size prompt would overflow the context and decode
+    /// mention trimming in entity synthesis, because those two have to agree: if
+    /// they disagreed a full-size prompt would overflow the context and decode
     /// would fail.
     pub context_tokens: usize,
     /// Each concurrent context costs about 110MB of KV cache. `0`, the
@@ -228,7 +233,7 @@ impl Default for Config {
             llm: LlmConfig::default(),
             ask_timeout_secs: 30,
             recall_timeout_secs: DEFAULT_RECALL_TIMEOUT_SECS,
-            ask_sufficiency_check: true,
+            ask_sufficiency_check: None,
             socket_path: "~/.liam/liamd.sock".into(),
             read_pool_size: 4,
             max_connections: 16,
@@ -362,10 +367,8 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             provider: "mock".into(),
-            // Chosen by measurement, not by size: on the grounding eval
-            // (crates/daemon/src/eval.rs) 1.5B scored 3/4 judged cases at
-            // ~4.8s per answer, against 2/4 for 0.5B, 3/4 for Gemma-3-1B at ~9.3s,
-            // and 2/4 for Qwen3-1.7B. Apache-2.0 at this size (the 3B is not).
+            // Small enough to load on a CPU-only machine, and Apache-2.0 at
+            // this size (the 3B is not).
             model: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".into(),
             gguf_file: "qwen2.5-1.5b-instruct-q4_k_m.gguf".into(),
             cache_dir: "~/.liam/models".into(),
@@ -426,7 +429,7 @@ const SECS_PER_HOUR: u64 = 3600;
 /// `docs/specs/2026-11-06-embedder-speed-evaluation.md`.
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
-/// Default seconds `recall` and `ask` may spend retrieving.
+/// Default seconds `recall` may spend retrieving.
 pub const DEFAULT_RECALL_TIMEOUT_SECS: u64 = 10;
 
 /// Default seconds the LLM may sit unused before it is unloaded.
@@ -539,6 +542,14 @@ impl Config {
     /// section, which no longer does anything.
     pub fn removed_reranker_warning(&self) -> Option<&'static str> {
         self.reranker.as_ref().map(|_| REMOVED_RERANKER_WARNING)
+    }
+
+    /// The warning to log at start when the config still has the removed
+    /// `ask_sufficiency_check` key.
+    pub fn removed_ask_sufficiency_check_warning(&self) -> Option<&'static str> {
+        self.ask_sufficiency_check
+            .as_ref()
+            .map(|_| REMOVED_ASK_SUFFICIENCY_CHECK_WARNING)
     }
 
     /// The warning to log at start when no config file was found, so the
@@ -682,6 +693,38 @@ mod tests {
         let warning = config.removed_reranker_warning().unwrap();
         assert!(warning.contains("reranker was removed"), "{warning}");
         assert!(warning.contains("delete it"), "{warning}");
+    }
+
+    #[test]
+    fn a_removed_ask_sufficiency_check_key_loads_and_yields_one_removal_warning() {
+        for value in ["true", "false"] {
+            // Arrange
+            let text = format!("ask_sufficiency_check = {value}\n");
+
+            // Act
+            let config = load_text(&text, "/home/alice").unwrap();
+
+            // Assert
+            let warning = config.removed_ask_sufficiency_check_warning().unwrap();
+            assert!(
+                warning.contains("ask_sufficiency_check was removed"),
+                "{warning}"
+            );
+            assert!(warning.contains("delete it"), "{warning}");
+        }
+    }
+
+    #[test]
+    fn a_config_without_the_ask_sufficiency_check_key_has_no_removal_warning() {
+        // Act
+        let loaded = load_text("[gc]\n", "/home/alice").unwrap();
+
+        // Assert
+        assert_eq!(loaded.removed_ask_sufficiency_check_warning(), None);
+        assert_eq!(
+            Config::default().removed_ask_sufficiency_check_warning(),
+            None
+        );
     }
 
     #[test]
@@ -889,7 +932,7 @@ mod tests {
         let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../liam.toml"));
         let c = Config::load(path).expect("shipped liam.toml must parse");
         assert_eq!(c.ask_timeout_secs, 30);
-        assert!(c.ask_sufficiency_check);
+        assert!(c.removed_ask_sufficiency_check_warning().is_none());
         assert_eq!(c.llm.context_tokens, 8192);
         assert_eq!(c.llm.max_concurrent_generations, 0);
         assert_eq!(c.socket_path, "~/.liam/liamd.sock");

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::ask::estimate_tokens;
+use crate::prompt::estimate_tokens;
 use crate::sync::lock;
 
 /// Entries a `RollingWindow` keeps before the oldest is evicted.
@@ -310,8 +310,8 @@ async fn shrink(handles: &AimdHandles) {
     }
 }
 
-/// Sane cap on benchmarked concurrency regardless of RAM, same "generous but
-/// bounded" shape as `ask::MAX_ASK_EVIDENCE`.
+/// Sane cap on benchmarked concurrency regardless of RAM, a generous but
+/// bounded cap.
 const MAX_CONCURRENCY_CEILING: usize = 8;
 
 /// Minimum throughput gain the next level must clear to be worth the memory.
@@ -836,7 +836,7 @@ pub(crate) mod tests {
     }
 
     /// Drives `count` concurrent acquire-generate-record cycles, the same
-    /// shape `ask`'s `PermitTimer` and its permit acquire drive in production.
+    /// shape entity synthesis drives in production.
     async fn drive_window(
         llm: &SequencedLatencyLlm,
         permits: &Arc<Semaphore>,

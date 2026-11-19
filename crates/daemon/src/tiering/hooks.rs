@@ -29,8 +29,8 @@ pub struct TierHooks {
     /// The fallback producer id, whose trust `unknown_trust_ceiling` bounds.
     pub unknown_producer: String,
     pub embedder: Arc<dyn Embedder>,
-    /// The generation permits, shared with `ask`, because the embedder shares
-    /// the model host with it.
+    /// The generation permits, shared with entity synthesis, because the
+    /// embedder shares the model host with it.
     pub permits: Arc<Semaphore>,
     pub free_ram: Arc<dyn FreeRam + Send + Sync>,
     pub clock: Arc<dyn Clock>,
