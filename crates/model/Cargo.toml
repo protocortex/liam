@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 license.workspace = true
-description = "In-process embedding and generation for liam, via fastembed-rs and llama.cpp."
+description = "In-process embedding for liam, via fastembed-rs and ONNX Runtime."
 
 [dependencies]
 async-trait = "0.1"
@@ -13,22 +13,16 @@ thiserror = "2"
 
 # In-process ONNX embedder. No server, offline after the model is present.
 fastembed = "5"
-# "rt" for spawn_blocking: the embedder and llama.cpp provider both
-# run blocking model calls on it instead of the async runtime.
+# "rt" for spawn_blocking: the embedder runs blocking model calls on it
+# instead of the async runtime.
 tokio = { version = "1", features = ["rt", "sync"] }
 tracing = { workspace = true }
 
-# hf-hub downloads the pinned embedder files and the GGUF weights. Version
+# hf-hub downloads the pinned embedder files. Version
 # matches what fastembed 5.17 already pulls in (hf-hub 0.5), so it does not
 # duplicate the dep tree.
 hf-hub = "0.5"
 
-# llama.cpp bindings for the Llm trait. `encoding_rs`
-# because `token_to_piece` streams bytes through a decoder of that crate's type.
-llama-cpp-2 = { version = "0.1.161", default-features = false, features = ["common"] }
-encoding_rs = { version = "0.8" }
-# sysctl for the core counts `liam devices` reports.
-libc = "0.2"
 # Hashes a pinned embedder file once before the ONNX session reads it.
 sha2 = { version = "0.11.0", default-features = false }
 

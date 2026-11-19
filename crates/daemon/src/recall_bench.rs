@@ -9,7 +9,7 @@
 //!
 //! # Two tiers
 //!
-//! - **Mock tier, always-on:** `MockEmbedder` and `MockLlm`, no network and
+//! - **Mock tier, always-on:** `MockEmbedder`, no network and
 //!   never `~/.liam`. Runs under
 //!   `cargo test -p liam-daemon --bin liamd recall_bench`.
 //! - **Real tier, `#[ignore]`d:** the local embedder, downloading
@@ -206,14 +206,7 @@ async fn open_server(dir: &Path, embedder: Arc<dyn Embedder>) -> anyhow::Result<
         .context("opening the benchmark store")?;
     let defaults = Config::default();
     // Without these the record_usage and issue_handles stages would never run.
-    let server = MemoryServer::new(
-        Arc::new(store),
-        embedder,
-        Arc::new(liam_model::MockLlm),
-        SYNTHESIS_TIMEOUT_SECS,
-        defaults.llm.context_tokens,
-        defaults.llm.max_concurrent_generations,
-    );
+    let server = MemoryServer::new(Arc::new(store), embedder, SYNTHESIS_TIMEOUT_SECS);
     Ok(server
         .with_usage_recorder(Arc::new(UsageRecorder::new(
             defaults.tiering.max_tracked_items,

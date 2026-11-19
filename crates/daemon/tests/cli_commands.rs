@@ -31,7 +31,7 @@ fn with_config(dir: &Path) {
 }
 
 #[test]
-fn devices_prints_the_platform_and_says_mock_providers_load_no_model() {
+fn the_removed_devices_command_is_an_unknown_subcommand() {
     // Arrange
     let dir = tempfile::tempdir().unwrap();
 
@@ -39,39 +39,12 @@ fn devices_prints_the_platform_and_says_mock_providers_load_no_model() {
     let output = liam(dir.path(), &["devices"]);
 
     // Assert
-    let stdout = text(&output.stdout);
-    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(output.status.code(), Some(USAGE_EXIT));
     assert!(
-        stdout.contains(&format!(
-            "platform: {} {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        )),
-        "{stdout}"
+        text(&output.stderr).contains("unrecognized subcommand 'devices'"),
+        "{}",
+        text(&output.stderr)
     );
-    assert!(!stdout.contains("embedder.device"), "{stdout}");
-    assert!(
-        stdout.contains("llm.device auto resolves to not used (provider mock)"),
-        "{stdout}"
-    );
-}
-
-#[test]
-fn devices_as_json_is_one_document_naming_the_platform_and_the_llm_resolution() {
-    // Arrange
-    let dir = tempfile::tempdir().unwrap();
-
-    // Act
-    let output = liam(dir.path(), &["devices", "--json"]);
-
-    // Assert
-    assert!(output.status.success(), "{}", text(&output.stderr));
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("one JSON document");
-    assert_eq!(report["os"], std::env::consts::OS);
-    assert_eq!(report["arch"], std::env::consts::ARCH);
-    assert!(report.get("embedder").is_none());
-    assert_eq!(report["llm"]["configured"], "auto");
 }
 
 #[test]

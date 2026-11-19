@@ -73,7 +73,7 @@ pub struct ExtractionDeps<'a> {
     pub cache: Arc<CacheStore>,
     pub store: &'a DefaultGraph,
     pub config: &'a ExtractionConfig,
-    /// The daemon's shared generation permits.
+    /// The daemon's shared model-call permits.
     pub permits: &'a Semaphore,
     pub free_ram: &'a (dyn FreeRam + Sync),
     /// The log source the facts are written under.
@@ -635,11 +635,11 @@ impl<'a> Run<'a> {
             return Ok(Generation::Stop(Attempt::Halted));
         };
         let Ok(_permit) = permit else {
-            bail!("the generation permits are closed");
+            bail!("the model-call permits are closed");
         };
         // The wait for a permit can be long; the model may have died in it.
         if !alive() {
-            warn!("the model died while the run waited for a generation permit");
+            warn!("the model died while the run waited for a model-call permit");
             self.report.sidecar_lost = true;
             return Ok(Generation::Stop(Attempt::Halted));
         }

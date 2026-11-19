@@ -52,7 +52,7 @@ pub struct ExtractionHooks {
     /// a model file replaced between runs is noticed.
     pub identity: Arc<dyn IdentitySource>,
     pub cache: Arc<CacheStore>,
-    /// The daemon's generation permits, shared with the other model users.
+    /// The daemon's model-call permits, shared with the other model users.
     pub permits: Arc<Semaphore>,
     pub free_ram: Arc<dyn FreeRam + Sync>,
     /// Set for a hosted provider: what it may be sent.

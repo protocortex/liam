@@ -541,22 +541,6 @@ async fn a_resume_under_another_embedder_rolls_the_unfinished_run_back() {
 }
 
 #[tokio::test]
-async fn a_resume_under_another_llm_rolls_the_unfinished_run_back() {
-    // Arrange
-    let env = Env::new();
-    let (shared, before) = crash_after_dedup(&env).await;
-    let mut other = env.consolidator(maintenance(), honest());
-    other.identity.llm_model = "llm/other.gguf".into();
-
-    // Act
-    let refused = other.consolidate(&shared).await.unwrap();
-
-    // Assert
-    assert_eq!(refused.outcome, Some(RunOutcome::RolledBack));
-    assert_eq!(state(&shared).await, before);
-}
-
-#[tokio::test]
 async fn a_finished_run_is_followed_by_a_fresh_one() {
     // Arrange
     let env = Env::new();

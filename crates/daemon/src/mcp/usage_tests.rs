@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use liam_model::{MockEmbedder, MockLlm};
+use liam_model::MockEmbedder;
 use liam_store::{DefaultGraph, GraphConfig, NewEdge, NewNode, NodeId, Query, HANDLE_LEN};
 use rmcp::handler::server::wrapper::Parameters;
 
@@ -28,15 +28,8 @@ async fn fixture() -> Fixture {
             .unwrap(),
     );
     let usage = Arc::new(UsageRecorder::new(TRACKED));
-    let server = MemoryServer::new(
-        store.clone(),
-        Arc::new(MockEmbedder::new(DIMS)),
-        Arc::new(MockLlm),
-        1,
-        8192,
-        1,
-    )
-    .with_usage_recorder(usage.clone());
+    let server = MemoryServer::new(store.clone(), Arc::new(MockEmbedder::new(DIMS)), 1)
+        .with_usage_recorder(usage.clone());
     Fixture {
         server,
         store,

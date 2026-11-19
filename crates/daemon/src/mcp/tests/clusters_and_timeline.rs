@@ -2,6 +2,7 @@
 //! `clusters` and `timeline`.
 
 use super::*;
+use crate::clusters::CLUSTERS_BUDGET_CHARS;
 
 #[tokio::test]
 async fn clusters_on_an_empty_store_says_so_and_does_not_panic() {
@@ -19,11 +20,9 @@ async fn clusters_on_an_empty_store_says_so_and_does_not_panic() {
 }
 
 #[tokio::test]
-async fn clusters_budget_is_a_fraction_of_the_configured_context_not_all_of_it() {
+async fn a_large_cluster_listing_is_cut_to_the_character_budget() {
     // Enough groups, each with a label long enough to matter, that the
-    // real (one tenth) budget forces truncation while the full 8192
-    // context would not: catches the handler passing the whole context
-    // through un-scaled.
+    // budget forces truncation: catches the handler passing no cap at all.
     let server = plain_server().await;
     let pad = "x".repeat(300);
     for i in 0..15 {
@@ -47,6 +46,7 @@ async fn clusters_budget_is_a_fraction_of_the_configured_context_not_all_of_it()
         .await;
 
     assert!(out.contains("withheld"), "{out}");
+    assert!(out.chars().count() <= CLUSTERS_BUDGET_CHARS, "{out}");
 }
 
 #[tokio::test]

@@ -121,7 +121,7 @@ fi
 if [ "$SKIP_MODELS" -eq 1 ]; then
     echo "skipping model download; run '${PREFIX}/liam fetch-models --config ${CONFIG}' before starting the daemon"
 else
-    echo "fetching models; the first run downloads several gigabytes and loads each one to verify it"
+    echo "fetching models; the first run downloads the embedding model and loads it to verify it"
     echo "  (with [extraction] enabled it also fetches the pinned llama-server and its model, each sha256 checked)"
     "${PREFIX}/liam" fetch-models --config "$CONFIG"
 fi

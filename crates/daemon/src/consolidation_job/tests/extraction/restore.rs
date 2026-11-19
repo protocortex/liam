@@ -53,7 +53,7 @@ async fn history(harness: &Harness) -> (MemoryServer, Arc<FixedClock>) {
     let moved = client_note(&employment("ada", "Initech"));
     store.insert(moved).await.unwrap();
     store.insert(employment_note("bob")).await.unwrap();
-    (harness.server(store, Arc::new(liam_model::MockLlm)), clock)
+    (harness.server(store), clock)
 }
 
 /// Ada moves again, Cy joins, and one event the model cannot read.

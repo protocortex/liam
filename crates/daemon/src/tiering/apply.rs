@@ -55,8 +55,8 @@ pub struct ApplyDeps<'a> {
     pub store: &'a DefaultGraph,
     pub verifier: &'a dyn TierVerifier,
     pub embedder: &'a dyn Embedder,
-    /// The generation permits, shared with entity synthesis, because the
-    /// embedder shares the model host with it.
+    /// The model-call permits, shared with the other hooks, because the
+    /// embedder shares the model host with them.
     pub permits: &'a Semaphore,
     pub free_ram: &'a (dyn FreeRam + Sync),
     /// The write source the moves are logged under, naming the run.
@@ -249,7 +249,7 @@ enum Embedding {
 }
 
 /// The vectors of the nodes of a lineage that have none, embedded one at a
-/// time behind the generation permits.
+/// time behind the model-call permits.
 async fn embed_missing(
     item: &PlannedMove,
     deps: &ApplyDeps<'_>,

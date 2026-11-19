@@ -42,7 +42,7 @@ mod tests {
             dims: 8,
             prompt_scheme: 1,
         };
-        RunManifest::new("run".into(), seed, embedder, "llm".into(), Millis(1))
+        RunManifest::new("run".into(), seed, embedder, Millis(1))
     }
 
     fn draws(manifest: &RunManifest) -> Vec<u64> {

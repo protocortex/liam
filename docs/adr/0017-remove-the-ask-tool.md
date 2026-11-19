@@ -1,6 +1,7 @@
 # ADR-0017: remove the ask tool
 
 - **Status:** Accepted. Supersedes in part [ADR-0001](0001-assert-memory-edges-by-node-id.md), [ADR-0004](0004-non-lossy-mcp-surface-for-attributes-confidence-and-as-of.md), [ADR-0014](0014-remove-the-reranker.md) and [ADR-0015](0015-load-the-llm-on-first-use-and-unload-it-when-idle.md) where they describe `ask` as part of the tool surface.
+- **Note, 2026-11-20:** the local model that this ADR keeps for local summaries was removed by [ADR-0019](0019-remove-the-local-generation-model.md).
 - **Note, 2026-11-20:** entity pages no longer use the local model, and only `timeline` shows them. See [ADR-0018](0018-build-entity-pages-without-a-model-and-show-them-in-timeline.md).
 - **Date created:** 2026-11-19
 - **Date modified:** 2026-11-19

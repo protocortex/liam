@@ -28,7 +28,6 @@ pub fn run_settings(config: &Config, database: &Path) -> anyhow::Result<RunSetti
 pub fn identity(config: &Config) -> Identity {
     Identity {
         embedder: EmbedderFingerprint::from_config(config),
-        llm_model: format!("{}/{}", config.llm.model, config.llm.gguf_file),
     }
 }
 
@@ -37,7 +36,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_identity_names_the_configured_embedder_and_llm() {
+    fn the_identity_names_the_configured_embedder() {
         // Arrange
         let config = Config::default();
 
@@ -46,10 +45,6 @@ mod tests {
 
         // Assert
         assert_eq!(identity.embedder, EmbedderFingerprint::from_config(&config));
-        assert_eq!(
-            identity.llm_model,
-            format!("{}/{}", config.llm.model, config.llm.gguf_file)
-        );
     }
 
     #[test]

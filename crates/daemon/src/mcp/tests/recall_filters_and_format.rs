@@ -173,10 +173,7 @@ fn server_over(store: &Arc<DefaultGraph>) -> MemoryServer {
     MemoryServer::new(
         store.clone(),
         Arc::new(liam_model::MockEmbedder::new(STORE_DIMS)),
-        Arc::new(liam_model::MockLlm),
         30,
-        8192,
-        1,
     )
 }
 
@@ -347,7 +344,7 @@ async fn recall_format_is_pinned() {
     // `[{kind} {handle}] {label}\n{content}\nprovenance: ...`. The handle was added by
     // ADR-0001 so an agent can name what it recalled and pass it to
     // `relate`; before that, `recall` dropped `Hit::id` entirely.
-    let server = server_with(Arc::new(liam_model::MockLlm)).await;
+    let server = plain_server().await;
     let id = seed(&server, "decision", "Use libSQL", "single file db").await;
 
     let out = server

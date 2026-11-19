@@ -376,10 +376,19 @@ fn a_serving_daemon_stops_cleanly_on_sigterm_and_removes_its_socket() {
 }
 
 #[test]
-fn a_daemon_with_tiering_and_a_tuned_generation_limit_also_stops_cleanly() {
-    // A generation limit of zero asks the daemon to measure its own capacity.
+fn a_daemon_with_tiering_also_stops_cleanly() {
+    let scratch = Scratch::with_config("[tiering]\nenabled = true\n");
+
+    serve_then_stop_with_sigterm(&scratch);
+}
+
+#[test]
+fn a_daemon_started_on_an_old_config_with_an_llm_section_and_local_summaries_stops_cleanly() {
+    // The removed generation model and the removed local summary provider must
+    // not stop the daemon: both are ignored with a warning.
     let scratch = Scratch::with_config(
-        "[llm]\nmax_concurrent_generations = 0\n\n[tiering]\nenabled = true\n",
+        "[llm]\nprovider = \"llama-cpp\"\nwarmup = true\n\n\
+         [summary]\nenabled = true\nprovider = \"local\"\n",
     );
 
     serve_then_stop_with_sigterm(&scratch);

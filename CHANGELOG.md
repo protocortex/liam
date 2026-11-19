@@ -20,6 +20,36 @@ All notable changes to LIAM are recorded here. The format follows
 
 ### Changed
 
+- **Breaking:** the local generation model is removed, and with it llama.cpp from the daemon. LIAM now holds one
+  model, the arctic embedder. The model was Qwen2.5 1.5B on llama.cpp, and its last jobs were local summaries and
+  counting tokens for `clusters`. The daemon is smaller and builds without the vendored C++ code, with no Metal or
+  GPU build path. What to do:
+  - Delete the `[llm]` section from `liam.toml`. An old `[llm]` section is accepted and ignored, and the daemon
+    logs one warning at start.
+  - Summaries need a hosted provider and are off otherwise. A config with `summary.provider = "local"`, or with
+    `summary.enabled = true` and no provider, still loads: summaries are off and the daemon logs one warning at
+    start. To write summaries, set `summary.provider` to `anthropic`, `openai` or `gemini` and configure `[hosted]`
+    and `metrics.enabled`, as [Summaries](docs/concepts/summaries.md) describes.
+  - `liam devices` is removed, because nothing chooses a device any more: the embedder runs on the CPU. The
+    `docs/reference/devices.md` page is gone with it.
+  - `liam fetch-models` no longer fetches the generation GGUF. It fetches the embedder, and the extraction server
+    and model when `[extraction]` is on.
+  - `~/.liam/models` may hold the folder `models--Qwen--Qwen2.5-1.5B-Instruct-GGUF`, the old generation model.
+    LIAM no longer reads it, and you may delete it. Keep `extraction.gguf` and the embedder's own folder. LIAM
+    deletes nothing itself.
+  - `clusters` cuts its listing at 3,276 characters instead of a tenth of `llm.context_tokens` counted in model
+    tokens. A very large listing can show a different number of clusters, and still never fewer than one.
+  - Consolidation runs no longer record an LLM identity, so a run is no longer refused for a changed generation
+    model. A saved run that still holds the old field loads.
+  - The permit that sidecar extraction, tiering and summary calls share is now fixed at 1 (`MODEL_CALL_PERMITS`).
+    The old default autotuned and could grow, so this is a lower ceiling on a machine that had tuned up: those
+    calls take turns.
+  - A daemon older than this version cannot resume an extraction or consolidation run saved by this version,
+    because the manifest lost `llm_model_fingerprint`. Old manifests still load.
+  - Summaries the local model already wrote stay stored and the `summaries` tool still returns them. No new ones
+    are written unless a hosted provider is configured.
+  - The extraction sidecar is unchanged: it runs its own `llama-server` and model, and is off by default.
+  See [ADR 0019](docs/adr/0019-remove-the-local-generation-model.md).
 - Entity pages are built from the stored sentences of an entity without a model, and `timeline` shows them as
   before. A page lists the entity's memories oldest first with their dates, drops near duplicates and keeps at
   most four lines, so it cannot state a fact no memory states. `recall` is unchanged: it still returns recorded
@@ -32,13 +62,13 @@ All notable changes to LIAM are recorded here. The format follows
   `gc.full_synthesis_max_new_tokens` from `liam.toml`. An old line for either is ignored and logs one warning at
   start. See [ADR 0018](docs/adr/0018-build-entity-pages-without-a-model-and-show-them-in-timeline.md).
 - The generation tuner no longer adjusts its permits while the daemon runs, because entity pages were its only
-  input; the start-up benchmark stays.
+  input. The whole tuner is removed with the local model, see the entry on removing it.
 - **Breaking:** the `ask` tool is removed. In strict mode `ask` ranked recorded memory like `recall` and added a
   written answer. In infer mode, its default, it also ranked entity pages and summaries beside recorded memory.
   Use `recall` for recorded memory: it returns recorded memory only, as it did before, and the calling agent
   writes its own answer. Entity pages are now read through `timeline` and summaries through `summaries`; no
   query ranks them any more. There was no `liam ask` command to remove. The local
-  1.5B model stays for local summaries. `ask_sufficiency_check` is removed too: an old line is
+  1.5B model stayed for local summaries then and is removed in a later entry. `ask_sufficiency_check` is removed too: an old line is
   ignored and logs one warning. `ask_timeout_secs` stays, now bounding one batch of entity-page builds.
   The `ask_latency_*` metrics and the `synthesis_unavailable` degraded reason are gone, and `recall` no
   longer lists `synthesis_unavailable` in its output schema, which it never produced. The recall bench no

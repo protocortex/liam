@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Model-side errors: embedding and generation failures.
+//! Model-side errors: embedding failures.
 //! `Display` includes the cause on purpose, because most callers print the plain form.
 
 use std::sync::Arc;
@@ -16,20 +16,9 @@ pub enum ModelError {
     #[error("embedder: {0}")]
     Embed(String),
 
-    #[error("llm: {0}")]
-    Llm(String),
-
     /// An embedding step failed on an underlying error, kept as the source.
     #[error("embedder: {context}: {source}")]
     EmbedFailed {
-        context: String,
-        #[source]
-        source: Cause,
-    },
-
-    /// A generation step failed on an underlying error, kept as the source.
-    #[error("llm: {context}: {source}")]
-    LlmFailed {
         context: String,
         #[source]
         source: Cause,
@@ -43,17 +32,6 @@ impl ModelError {
         source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
     ) -> Self {
         Self::EmbedFailed {
-            context: context.into(),
-            source: Arc::from(source.into()),
-        }
-    }
-
-    /// A generation failure that keeps `source`. `context` says which step failed.
-    pub fn llm_failed(
-        context: impl Into<String>,
-        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-    ) -> Self {
-        Self::LlmFailed {
             context: context.into(),
             source: Arc::from(source.into()),
         }
@@ -97,13 +75,13 @@ mod tests {
     #[test]
     fn a_cloned_failure_still_reaches_the_same_cause() {
         // Arrange
-        let error = ModelError::llm_failed("load", std::io::Error::other("no memory"));
+        let error = ModelError::embed_failed("load", std::io::Error::other("no memory"));
 
         // Act
         let copy = error.clone();
 
         // Assert
         assert!(copy.source().unwrap().to_string().contains("no memory"));
-        assert_eq!(copy.to_string(), "llm: load: no memory");
+        assert_eq!(copy.to_string(), "embedder: load: no memory");
     }
 }

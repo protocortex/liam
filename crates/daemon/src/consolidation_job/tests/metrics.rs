@@ -29,7 +29,7 @@ async fn a_committed_run_reports_its_duration_the_probe_recall_and_the_disk_size
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
     keep_one_fact(&store).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let (metrics, sink) = measured();
     let job = harness.job_measured(
         &server,
@@ -56,7 +56,7 @@ async fn a_rolled_back_run_adds_one_to_the_rollback_count() {
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(100 * DAY)).await;
     keep_one_fact(&store).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let (metrics, sink) = measured();
     let job = harness.job_measured(
         &server,
@@ -81,7 +81,7 @@ async fn a_real_rollback_raises_the_rollback_alert_without_an_injected_sample() 
     harness.config.metrics.rollback_ceiling = 1.0;
     let (store, _clock) = harness.store_at(Millis(100 * DAY)).await;
     keep_one_fact(&store).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let metrics = crate::metrics::build(
         &harness.config.metrics,
         &database_in(&harness.root),
@@ -115,7 +115,7 @@ async fn a_committed_first_run_raises_no_alert() {
     let harness = Harness::new();
     let (store, _clock) = harness.store_at(Millis(1000)).await;
     keep_one_fact(&store).await;
-    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let server = harness.server(store);
     let metrics = crate::metrics::build(
         &harness.config.metrics,
         &database_in(&harness.root),

@@ -11,8 +11,9 @@ use super::Config;
 const ROOT_SECTION: &str = "";
 
 /// Keys kept only so an old `liam.toml` still loads, so no page documents them.
-const REMOVED_KEYS: [&str; 5] = [
+const REMOVED_KEYS: [&str; 6] = [
     "reranker",
+    "llm",
     "embedder.device",
     "ask_sufficiency_check",
     "gc.full_synthesis_mention_threshold",

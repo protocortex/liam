@@ -9,8 +9,7 @@ use liam_store::{EmbedError, GraphConfig, NewNode, NodeId};
 use super::*;
 use crate::extraction::client::ModelIdentity;
 use crate::extraction::gate::ProviderGate;
-use crate::summary::summariser::LocalSummariser;
-use crate::summary::test_support::{MemoryCache, ScriptedLlm};
+use crate::summary::test_support::{MemoryCache, ScriptedReplies, ScriptedSummariser};
 
 const DIMS: usize = 8;
 const GROUP_NAMES: [&str; 3] = ["alpha", "beta", "gamma"];
@@ -36,12 +35,12 @@ impl ContentEmbedder for FixedEmbedder {
 
 struct Rig {
     store: DefaultGraph,
-    llm: Arc<ScriptedLlm>,
+    llm: Arc<ScriptedReplies>,
     cache: Arc<MemoryCache>,
 }
 
 impl Rig {
-    async fn new(llm: ScriptedLlm) -> Self {
+    async fn new(llm: ScriptedReplies) -> Self {
         Self {
             store: DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
                 .await
@@ -53,7 +52,7 @@ impl Rig {
 
     /// The model answers three level one summaries and then the one above.
     async fn answering_a_tree() -> Self {
-        Self::new(ScriptedLlm::replying(&[
+        Self::new(ScriptedReplies::replying(&[
             LEVEL_ONE_REPLY,
             LEVEL_ONE_REPLY,
             LEVEL_ONE_REPLY,
@@ -136,7 +135,7 @@ impl Rig {
     fn hooks(&self, config: SummaryConfig) -> SummaryHooks {
         SummaryHooks {
             config,
-            summariser: Arc::new(LocalSummariser::new(
+            summariser: Arc::new(ScriptedSummariser::new(
                 self.llm.clone(),
                 ModelIdentity {
                     model_id: "model".to_string(),
@@ -147,7 +146,6 @@ impl Rig {
             permits: Arc::new(Semaphore::new(1)),
             cache: self.cache.clone(),
             embedder: Arc::new(FixedEmbedder),
-            context_tokens: 8192,
         }
     }
 
@@ -236,7 +234,11 @@ async fn twelve_items_in_three_groups_get_three_summaries_and_one_above_them() {
 #[tokio::test]
 async fn each_scope_gets_summaries_of_its_own() {
     // Arrange
-    let rig = Rig::new(ScriptedLlm::replying(&[LEVEL_ONE_REPLY, LEVEL_ONE_REPLY])).await;
+    let rig = Rig::new(ScriptedReplies::replying(&[
+        LEVEL_ONE_REPLY,
+        LEVEL_ONE_REPLY,
+    ]))
+    .await;
     for n in 0..GROUP_SIZE {
         rig.add(0, n, Some("work")).await;
         rig.add(1, n, Some("home")).await;
@@ -291,7 +293,7 @@ async fn a_second_pass_over_the_same_items_asks_the_model_nothing_and_writes_not
 #[tokio::test]
 async fn a_failed_summary_is_reported_partial_and_the_others_are_still_written() {
     // Arrange
-    let rig = Rig::new(ScriptedLlm::scripted(vec![
+    let rig = Rig::new(ScriptedReplies::scripted(vec![
         Ok(LEVEL_ONE_REPLY.to_string()),
         Err("the model fell over".to_string()),
         Ok(LEVEL_ONE_REPLY.to_string()),
@@ -317,7 +319,10 @@ async fn a_failed_summary_is_reported_partial_and_the_others_are_still_written()
 #[tokio::test]
 async fn a_reply_that_is_not_grounded_in_its_items_is_dropped() {
     // Arrange
-    let rig = Rig::new(ScriptedLlm::replying(&["Paris sounds lovely in spring."])).await;
+    let rig = Rig::new(ScriptedReplies::replying(&[
+        "Paris sounds lovely in spring.",
+    ]))
+    .await;
     for n in 0..GROUP_SIZE {
         rig.add(0, n, None).await;
     }
@@ -372,7 +377,7 @@ async fn a_cluster_that_gained_a_member_replaces_its_summary_in_one_step() {
     let before = rig.live_ids().await;
     let replies = [LEVEL_ONE_REPLY, LEVEL_TWO_REPLY];
     let rig_again = Rig {
-        llm: Arc::new(ScriptedLlm::replying(&replies)),
+        llm: Arc::new(ScriptedReplies::replying(&replies)),
         ..rig
     };
     rig_again.add(1, GROUP_SIZE, None).await;
@@ -410,7 +415,7 @@ async fn rig_with_a_gone_group(grace: u32) -> (Rig, SummaryConfig) {
         rig.store.supersede(id, bare).await.unwrap();
     }
     let rig = Rig {
-        llm: Arc::new(ScriptedLlm::replying(&[])),
+        llm: Arc::new(ScriptedReplies::replying(&[])),
         ..rig
     };
     let config = SummaryConfig {
@@ -451,7 +456,7 @@ async fn a_summary_with_no_replacement_stays_open_until_its_grace_runs_out() {
 
 /// Eight items on one axis, summarized earlier as two halves.
 async fn rig_with_two_summaries_of_one_cluster(
-    model: ScriptedLlm,
+    model: ScriptedReplies,
 ) -> (Rig, [String; 2], [Vec<NodeId>; 2]) {
     let rig = Rig::new(model).await;
     let mut halves = [Vec::new(), Vec::new()];
@@ -471,7 +476,7 @@ async fn rig_with_two_summaries_of_one_cluster(
 async fn a_merge_closes_the_second_old_summary_once_the_new_one_is_stored() {
     // Arrange
     let (rig, old, _) =
-        rig_with_two_summaries_of_one_cluster(ScriptedLlm::replying(&[LEVEL_ONE_REPLY])).await;
+        rig_with_two_summaries_of_one_cluster(ScriptedReplies::replying(&[LEVEL_ONE_REPLY])).await;
 
     // Act
     let report = rig.run(enabled()).await;
@@ -486,7 +491,8 @@ async fn a_merge_closes_the_second_old_summary_once_the_new_one_is_stored() {
 #[tokio::test]
 async fn a_merge_whose_summary_cannot_be_written_leaves_both_old_summaries_open() {
     // Arrange
-    let (rig, old, _) = rig_with_two_summaries_of_one_cluster(ScriptedLlm::failing("down")).await;
+    let (rig, old, _) =
+        rig_with_two_summaries_of_one_cluster(ScriptedReplies::failing("down")).await;
 
     // Act
     let report = rig.run(enabled()).await;
@@ -500,7 +506,7 @@ async fn a_merge_whose_summary_cannot_be_written_leaves_both_old_summaries_open(
 #[tokio::test]
 async fn a_dissolved_summary_is_closed_when_its_grace_runs_out_without_a_replacement() {
     // Arrange
-    let (rig, old, _) = rig_with_two_summaries_of_one_cluster(ScriptedLlm::scripted(vec![
+    let (rig, old, _) = rig_with_two_summaries_of_one_cluster(ScriptedReplies::scripted(vec![
         Err("down".to_string()),
         Err("down".to_string()),
     ]))
@@ -524,7 +530,8 @@ async fn a_replacement_closes_an_old_summary_only_when_it_holds_enough_of_its_it
     for (overlap, closed) in [(0.5, 0), (0.25, 1)] {
         // Arrange: of the first half's four items only one is left in the new cluster
         let (rig, _old, halves) =
-            rig_with_two_summaries_of_one_cluster(ScriptedLlm::replying(&[LEVEL_ONE_REPLY])).await;
+            rig_with_two_summaries_of_one_cluster(ScriptedReplies::replying(&[LEVEL_ONE_REPLY]))
+                .await;
         for id in &halves[0][1..] {
             let bare = NewNode::now("fact", "gone", "left without a vector");
             rig.store.supersede(id, bare).await.unwrap();
@@ -621,7 +628,7 @@ async fn a_summary_text_that_cannot_be_embedded_is_not_written() {
             Err(EmbedError::from("the embedder is down".to_string()))
         }
     }
-    let rig = Rig::new(ScriptedLlm::replying(&[LEVEL_ONE_REPLY])).await;
+    let rig = Rig::new(ScriptedReplies::replying(&[LEVEL_ONE_REPLY])).await;
     for n in 0..GROUP_SIZE {
         rig.add(0, n, None).await;
     }

@@ -31,7 +31,7 @@ pub struct DaemonFiles<'a> {
     pub log_dir: &'a Path,
     /// The key registry of a sealed log.
     pub keys: Option<Arc<KeyRegistry>>,
-    /// The daemon's generation permits, shared with the other model users.
+    /// The daemon's model-call permits, shared with the other model users.
     pub permits: Arc<Semaphore>,
     pub stopping: CancellationToken,
 }

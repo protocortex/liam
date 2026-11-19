@@ -118,13 +118,13 @@ fn config() -> ExtractionConfig {
 /// A store with `PEOPLE` employment notes and one note the double reads nothing
 /// from, so the run has a probe.
 async fn seeded(harness: &Harness, people: usize) -> MemoryServer {
-    harness.server(filled(harness, people).await, Arc::new(liam_model::MockLlm))
+    harness.server(filled(harness, people).await)
 }
 
 /// Like `seeded`, over a store the test also holds, which a rollback cannot take.
 async fn seeded_shared(harness: &Harness, people: usize) -> (MemoryServer, Arc<DefaultGraph>) {
     let store = Arc::new(filled(harness, people).await);
-    let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
+    let server = harness.server_arc(store.clone());
     (server, store)
 }
 

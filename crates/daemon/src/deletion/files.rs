@@ -528,7 +528,7 @@ mod tests {
             dims: 8,
             prompt_scheme: 1,
         };
-        let mut manifest = RunManifest::new("run".into(), 1, embedder, "llm".into(), Millis(1));
+        let mut manifest = RunManifest::new("run".into(), 1, embedder, Millis(1));
         manifest.tier_moved_lineages = lineages.iter().map(|key| (*key).into()).collect();
         manifest
     }

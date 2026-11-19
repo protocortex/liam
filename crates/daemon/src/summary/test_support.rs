@@ -1,27 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Doubles for the summary tests. `MockLlm` echoes its whole prompt, which would
-//! make the grounding and injection tests meaningless, so replies are scripted.
+//! Doubles for the summary tests. Replies are scripted, so the grounding and
+//! injection tests control exactly what the model said.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use liam_model::{Llm, ModelError, Result};
 
 use super::generate::SummaryCache;
+use super::summariser::{Summariser, SummaryRequest, SummaryResponse};
+use crate::extraction::client::ModelIdentity;
 
 /// Replies in order, counts its calls and keeps every prompt it was given.
 #[derive(Default)]
-pub struct ScriptedLlm {
+pub struct ScriptedReplies {
     replies: Mutex<VecDeque<std::result::Result<String, String>>>,
     calls: AtomicUsize,
     prompts: Mutex<Vec<(String, String)>>,
-    count_chars: bool,
 }
 
-impl ScriptedLlm {
+impl ScriptedReplies {
     pub fn replying(replies: &[&str]) -> Self {
         Self {
             replies: Mutex::new(replies.iter().map(|r| Ok((*r).to_string())).collect()),
@@ -44,12 +45,6 @@ impl ScriptedLlm {
         }
     }
 
-    /// Counts tokens as characters, so a test can size a budget exactly.
-    pub fn counting_chars(mut self) -> Self {
-        self.count_chars = true;
-        self
-    }
-
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
@@ -60,23 +55,37 @@ impl ScriptedLlm {
     }
 }
 
+/// A [`Summariser`] that answers from a [`ScriptedReplies`].
+pub struct ScriptedSummariser {
+    replies: std::sync::Arc<ScriptedReplies>,
+    identity: ModelIdentity,
+}
+
+impl ScriptedSummariser {
+    pub fn new(replies: std::sync::Arc<ScriptedReplies>, identity: ModelIdentity) -> Self {
+        Self { replies, identity }
+    }
+}
+
 #[async_trait]
-impl Llm for ScriptedLlm {
-    async fn complete(&self, system: &str, prompt: &str) -> Result<String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.prompts
+impl Summariser for ScriptedSummariser {
+    async fn summarise(&self, req: &SummaryRequest) -> Result<SummaryResponse> {
+        let replies = &self.replies;
+        replies.calls.fetch_add(1, Ordering::SeqCst);
+        replies
+            .prompts
             .lock()
             .unwrap()
-            .push((system.to_string(), prompt.to_string()));
-        match self.replies.lock().unwrap().pop_front() {
-            Some(Ok(reply)) => Ok(reply),
-            Some(Err(error)) => Err(ModelError::Llm(error)),
-            None => Err(ModelError::Llm("no scripted reply left".to_string())),
+            .push((req.system.clone(), req.prompt.clone()));
+        match replies.replies.lock().unwrap().pop_front() {
+            Some(Ok(text)) => Ok(SummaryResponse { text, usage: None }),
+            Some(Err(error)) => Err(anyhow!(error)),
+            None => Err(anyhow!("no scripted reply left")),
         }
     }
 
-    fn count_tokens(&self, text: &str) -> Option<usize> {
-        self.count_chars.then(|| text.chars().count())
+    fn identity(&self) -> &ModelIdentity {
+        &self.identity
     }
 }
 

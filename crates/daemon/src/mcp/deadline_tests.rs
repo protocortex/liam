@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use liam_model::{Embedder, Llm, MockEmbedder, MockLlm, TextKind};
+use liam_model::{Embedder, MockEmbedder, TextKind};
 use liam_store::{GraphConfig, NewNode};
 use tokio_util::sync::CancellationToken;
 
@@ -61,18 +61,11 @@ impl Embedder for SleepingEmbedder {
 }
 
 /// Fresh in-memory server over the given doubles.
-async fn server_with_models(embedder: Arc<dyn Embedder>, llm: Arc<dyn Llm>) -> MemoryServer {
+async fn server_with_embedder(embedder: Arc<dyn Embedder>) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .expect("open in-memory store");
-    MemoryServer::new(
-        Arc::new(store),
-        embedder,
-        llm,
-        SYNTHESIS_TIMEOUT_SECS,
-        8192,
-        1,
-    )
+    MemoryServer::new(Arc::new(store), embedder, SYNTHESIS_TIMEOUT_SECS)
 }
 
 async fn seed_facts(server: &MemoryServer) {
@@ -138,9 +131,7 @@ fn block_count(out: &str) -> usize {
 async fn recall_replies_with_the_timeout_when_the_embedder_outlasts_the_deadline() {
     // Arrange
     let embedder = SleepingEmbedder::new(SLOW);
-    let server = server_with_models(embedder, Arc::new(MockLlm))
-        .await
-        .with_recall_timeout(1);
+    let server = server_with_embedder(embedder).await.with_recall_timeout(1);
 
     // Act
     let out = server
@@ -155,9 +146,7 @@ async fn recall_replies_with_the_timeout_when_the_embedder_outlasts_the_deadline
 async fn a_zero_recall_timeout_gives_a_one_second_deadline() {
     // Arrange
     let embedder = SleepingEmbedder::new(SLOW);
-    let server = server_with_models(embedder, Arc::new(MockLlm))
-        .await
-        .with_recall_timeout(0);
+    let server = server_with_embedder(embedder).await.with_recall_timeout(0);
 
     // Act
     let out = server
@@ -172,7 +161,7 @@ async fn a_zero_recall_timeout_gives_a_one_second_deadline() {
 async fn recall_replies_cancelled_without_embedding_when_the_token_is_already_cancelled() {
     // Arrange
     let embedder = SleepingEmbedder::new(Duration::ZERO);
-    let server = server_with_models(embedder.clone(), Arc::new(MockLlm))
+    let server = server_with_embedder(embedder.clone())
         .await
         .with_recall_timeout(1);
 
@@ -187,7 +176,7 @@ async fn recall_replies_cancelled_without_embedding_when_the_token_is_already_ca
 #[tokio::test(start_paused = true)]
 async fn recall_returns_lexical_hits_with_a_marker_when_the_embedder_errors() {
     // Arrange
-    let server = server_with_models(Arc::new(ErroringEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
+    let server = server_with_embedder(Arc::new(ErroringEmbedder::new(DIMS))).await;
     seed_facts(&server).await;
 
     // Act
@@ -206,7 +195,7 @@ async fn recall_returns_lexical_hits_with_a_marker_when_the_embedder_errors() {
 #[tokio::test(start_paused = true)]
 async fn recall_names_keyword_only_search_when_the_embedder_errors_and_nothing_matches() {
     // Arrange
-    let server = server_with_models(Arc::new(ErroringEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
+    let server = server_with_embedder(Arc::new(ErroringEmbedder::new(DIMS))).await;
 
     // Act
     let out = server
@@ -225,7 +214,7 @@ async fn recall_names_keyword_only_search_when_the_embedder_errors_and_nothing_m
 async fn recall_does_not_call_an_erroring_embedder_when_already_cancelled() {
     // Arrange
     let embedder = Arc::new(ErroringEmbedder::new(DIMS));
-    let server = server_with_models(embedder.clone(), Arc::new(MockLlm)).await;
+    let server = server_with_embedder(embedder.clone()).await;
 
     // Act
     let out = server.recall_with(recall_args(), cancelled()).await;
@@ -238,7 +227,7 @@ async fn recall_does_not_call_an_erroring_embedder_when_already_cancelled() {
 #[tokio::test(start_paused = true)]
 async fn recall_refuses_infer_mode_as_an_error() {
     // Arrange
-    let server = server_with_models(Arc::new(MockEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
+    let server = server_with_embedder(Arc::new(MockEmbedder::new(DIMS))).await;
     let args = RecallArgs {
         mode: Some(Mode::Infer),
         ..recall_args()
@@ -255,7 +244,7 @@ async fn recall_refuses_infer_mode_as_an_error() {
 #[tokio::test(start_paused = true)]
 async fn a_healthy_recall_has_no_degraded_reasons_and_opens_with_a_hit() {
     // Arrange
-    let server = server_with_models(Arc::new(MockEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
+    let server = server_with_embedder(Arc::new(MockEmbedder::new(DIMS))).await;
     seed_facts(&server).await;
 
     // Act
@@ -271,7 +260,7 @@ async fn a_healthy_recall_has_no_degraded_reasons_and_opens_with_a_hit() {
 #[tokio::test]
 async fn the_recall_tool_declares_an_output_schema_requiring_degraded() {
     // Arrange
-    let server = server_with_models(Arc::new(MockEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
+    let server = server_with_embedder(Arc::new(MockEmbedder::new(DIMS))).await;
     let expected = serde_json::Value::Object((*super::reply::output_schema()).clone());
 
     // Act
@@ -291,7 +280,7 @@ async fn the_recall_tool_declares_an_output_schema_requiring_degraded() {
 #[tokio::test(start_paused = true)]
 async fn recall_fails_without_degraded_reasons_when_the_store_is_unavailable() {
     // Arrange
-    let server = server_with_models(Arc::new(MockEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
+    let server = server_with_embedder(Arc::new(MockEmbedder::new(DIMS))).await;
     *server.shared_store().exclusive().await = None;
 
     // Act
@@ -307,7 +296,7 @@ async fn recall_fails_without_degraded_reasons_when_the_store_is_unavailable() {
 #[tokio::test(start_paused = true)]
 async fn recall_fails_without_degraded_reasons_when_the_query_is_too_long() {
     // Arrange
-    let server = server_with_models(Arc::new(MockEmbedder::new(DIMS)), Arc::new(MockLlm)).await;
+    let server = server_with_embedder(Arc::new(MockEmbedder::new(DIMS))).await;
     let args = RecallArgs {
         query: "a".repeat(MAX_QUERY_CHARS + 1),
         ..recall_args()
@@ -326,7 +315,7 @@ async fn a_recall_cancelled_while_waiting_on_the_embedder_never_takes_the_gate()
     // Arrange
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     let embedder = Arc::new(GatedEmbedder::new(DIMS, gate.clone()));
-    let server = server_with_models(embedder.clone(), Arc::new(MockLlm)).await;
+    let server = server_with_embedder(embedder.clone()).await;
     let held = gate.lock().await;
     let token = CancellationToken::new();
     let mut first = std::pin::pin!(server.recall_with(recall_args(), token.clone()));

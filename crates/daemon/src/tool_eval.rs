@@ -9,7 +9,7 @@
 //!
 //! # Two tiers
 //!
-//! - **Mock tier, always-on:** `MockEmbedder` and `MockLlm`, no model
+//! - **Mock tier, always-on:** `MockEmbedder`, no model
 //!   download. A plain `#[tokio::test]`, runs under
 //!   `cargo test -p liam-daemon --bin liamd tool_eval`.
 //! - **Real-tier, gated + `#[ignore]`d:** the actual local embedder, built by
@@ -44,7 +44,7 @@ type Fact = (&'static str, &'static str, &'static str);
 const SYNTHESIS_TIMEOUT_SECS: u64 = 300;
 
 /// Opens a fresh in-memory store and wires it into a `MemoryServer` with the
-/// given embedder and a `MockLlm`. Each test needs a fresh store (`seed`
+/// given embedder. Each test needs a fresh store (`seed`
 /// mutates it) and the embedder varies across tiers, mock (`mod tests` below)
 /// and real (`mod real_tier` below), so the construction is a reusable function.
 async fn build_server(embedder: Arc<dyn liam_model::Embedder>, dims: usize) -> mcp::MemoryServer {
@@ -53,16 +53,7 @@ async fn build_server(embedder: Arc<dyn liam_model::Embedder>, dims: usize) -> m
             .await
             .expect("open in-memory store"),
     );
-    mcp::MemoryServer::new(
-        store,
-        embedder,
-        Arc::new(liam_model::MockLlm),
-        SYNTHESIS_TIMEOUT_SECS,
-        crate::config::Config::default().llm.context_tokens,
-        crate::config::Config::default()
-            .llm
-            .max_concurrent_generations,
-    )
+    mcp::MemoryServer::new(store, embedder, SYNTHESIS_TIMEOUT_SECS)
 }
 
 /// Remembers every fact in `facts` into `server`.

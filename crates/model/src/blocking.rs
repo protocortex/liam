@@ -65,13 +65,13 @@ mod tests {
 
         // Act
         let err = with_model_blocking(model, ModelError::Embed, |_| -> Result<()> {
-            Err(ModelError::Llm("boom".into()))
+            Err(ModelError::Embed("boom".into()))
         })
         .await
         .unwrap_err();
 
         // Assert
-        assert_eq!(err.to_string(), "llm: boom");
+        assert_eq!(err.to_string(), "embedder: boom");
     }
 
     #[tokio::test]

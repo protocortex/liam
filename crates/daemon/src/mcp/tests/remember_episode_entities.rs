@@ -11,14 +11,7 @@ async fn remember_with_episode_entities_get_no_embedding() {
         .await
         .expect("open in-memory store");
     let embedder = Arc::new(CountingEmbedder::new(8));
-    let server = MemoryServer::new(
-        Arc::new(store),
-        embedder.clone(),
-        Arc::new(liam_model::MockLlm),
-        30,
-        8192,
-        1,
-    );
+    let server = MemoryServer::new(Arc::new(store), embedder.clone(), 30);
 
     // When remember is called with 1 nested fact and 2 entities
     let out = server

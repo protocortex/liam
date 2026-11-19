@@ -406,10 +406,7 @@ mod tests {
         MemoryServer::new(
             Arc::new(store),
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::MockLlm),
             30,
-            8192,
-            1,
         )
     }
 
@@ -428,10 +425,7 @@ mod tests {
         MemoryServer::new(
             Arc::new(store),
             Arc::new(liam_model::MockEmbedder::new(8)),
-            Arc::new(liam_model::MockLlm),
             30,
-            8192,
-            1,
         )
     }
 

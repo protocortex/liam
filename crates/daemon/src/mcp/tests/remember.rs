@@ -16,10 +16,7 @@ async fn remember_stamps_the_servers_producer_on_the_written_node() {
     let server = MemoryServer::new(
         Arc::new(store),
         Arc::new(liam_model::MockEmbedder::new(8)),
-        Arc::new(liam_model::MockLlm),
         30,
-        8192,
-        1,
     );
     server.set_producer("agent-a");
 
@@ -72,10 +69,7 @@ async fn remember_collapses_entity_pages_across_producers_via_episode() {
     let template = MemoryServer::new(
         Arc::new(store),
         Arc::new(liam_model::MockEmbedder::new(8)),
-        Arc::new(liam_model::MockLlm),
         30,
-        8192,
-        1,
     );
     let server_a = template.clone();
     server_a.set_producer("agent-a");

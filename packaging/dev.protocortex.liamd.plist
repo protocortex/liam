@@ -84,8 +84,7 @@
 
     <!--
       Start on demand, then STAY resident. There is deliberately no
-      idle-exit key here: a cold start pays llama.cpp's Metal kernel
-      compile, measured at roughly 10 seconds against a 0.81s warm load, so
+      idle-exit key here: every start loads the embedding model again, so
       activation decides when the daemon first starts, never how often it
       dies.
     -->
