@@ -15,6 +15,7 @@ mod hosted;
 mod log_startup;
 mod mcp;
 mod metrics;
+mod page_retry;
 mod prompt;
 mod recall;
 /// Recall latency and nDCG@10 benchmark; test-only, see the module docs to run it.
@@ -763,9 +764,11 @@ async fn resynthesize_stale(
     write_source: Option<&str>,
 ) {
     let now = store.now();
+    forget_retries_with_new_mentions(server, store, now).await;
+    let paused = server.page_retries().paused(now);
     let stale = match due_for_rebuild(
         store,
-        resynthesis.max_per_tick,
+        resynthesis.max_per_tick + paused.len(),
         now,
         entity_page::PAGE_MARKER_KEY,
     )
@@ -777,15 +780,20 @@ async fn resynthesize_stale(
             return;
         }
     };
+    let stale = stale
+        .into_iter()
+        .filter(|(id, _, _)| !paused.contains(id))
+        .take(resynthesis.max_per_tick);
 
     for (node_id, subject, scope) in stale {
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(resynthesis.synthesis_timeout_secs.max(1));
         match server
-            .resynthesize_entity_as(store, node_id, deadline, write_source)
+            .resynthesize_entity_as(store, node_id.clone(), deadline, write_source)
             .await
         {
             Ok(()) => {
+                server.page_retries().clear(&node_id);
                 carry_mentions_to_the_new_page(store, write_source).await;
                 match record_fingerprint(store, &subject, scope.as_deref()).await {
                     Ok(()) => tracing::info!(subject, "entity resynthesized"),
@@ -795,9 +803,60 @@ async fn resynthesize_stale(
                 }
             }
             Err(e) => {
-                tracing::warn!(subject, error = %e, "entity resynthesis failed");
+                note_failed_build(server, store, &node_id, &subject, scope.as_deref(), &e, now)
+                    .await;
             }
         }
+    }
+}
+
+/// Drops the failures of an entity that has had a mention added or removed
+/// since, so new input gets a fresh set of attempts. An entity whose mentions
+/// cannot be read keeps its failures.
+async fn forget_retries_with_new_mentions(
+    server: &MemoryServer,
+    store: &DefaultGraph,
+    now: liam_store::Millis,
+) {
+    for (id, subject, scope, seen) in server.page_retries().recorded() {
+        let current = store
+            .entity_mentions_fingerprint(&subject, scope.as_deref(), now)
+            .await;
+        if current.as_ref().is_ok_and(|current| *current != seen) {
+            server.page_retries().clear(&id);
+        }
+    }
+}
+
+/// Logs a failed page build and remembers it: a warning the first time and
+/// again when the entity is given up on for now, a debug line between.
+async fn note_failed_build(
+    server: &MemoryServer,
+    store: &DefaultGraph,
+    id: &liam_store::NodeId,
+    subject: &str,
+    scope: Option<&str>,
+    error: &str,
+    now: liam_store::Millis,
+) {
+    let failure = match store.entity_mentions_fingerprint(subject, scope, now).await {
+        Ok(seen) => server
+            .page_retries()
+            .record_failure(id, subject, scope, seen, now),
+        // Nothing to compare a later mention set with, so it is not recorded.
+        Err(_) => page_retry::Failure::First,
+    };
+    match failure {
+        page_retry::Failure::First => {
+            tracing::warn!(subject, %error, "entity resynthesis failed");
+        }
+        page_retry::Failure::Again => {
+            tracing::debug!(subject, %error, "entity resynthesis failed again");
+        }
+        page_retry::Failure::GivenUp => tracing::warn!(
+            subject, %error,
+            "entity resynthesis failed again; giving up on it until it changes or the pause ends"
+        ),
     }
 }
 
@@ -1723,6 +1782,69 @@ mod tests {
                 .is_err(),
             "the other entity's own build must still succeed independently"
         );
+    }
+
+    #[tokio::test]
+    async fn a_build_that_keeps_failing_is_retried_with_backoff_then_given_up_until_a_mention_arrives(
+    ) {
+        const MINUTE: i64 = 60_000;
+        // Given a stale entity whose page build always fails
+        let clock = Arc::new(FixedClock::new(Millis(1000)));
+        let store = DefaultGraph::open_with_clock(":memory:", GraphConfig::new(8), clock.clone())
+            .await
+            .unwrap();
+        let entity = entity_with_a_mention(&store, "Broken Guy").await;
+        let policy = RetentionPolicy::keep("nonexistent-kind", Millis(1));
+        let store = Arc::new(store);
+        let server = test_server_with_embedder(Arc::clone(&store), Arc::new(FailingEmbedder));
+        let captured = CapturedLogs::default();
+        let _guard = install_captured_logs(captured.clone());
+        let warnings = || {
+            let log = captured.0.lock().expect("captured logs lock").clone();
+            String::from_utf8(log)
+                .unwrap()
+                .matches("entity resynthesis failed")
+                .count()
+        };
+        let tick_at = |minutes: i64| {
+            clock.set(Millis(1000 + minutes * MINUTE));
+            maintenance_tick(&server, &policy, 5, 30, false)
+        };
+
+        // When it fails the first time, then a tick comes before the delay is over
+        tick_at(0).await;
+        tick_at(1).await;
+
+        // Then one warning, and the entity waits
+        assert_eq!(warnings(), 1);
+        assert_eq!(
+            server.page_retries().paused(store.now()),
+            std::slice::from_ref(&entity)
+        );
+
+        // When the delays pass, the later failures stay quiet until the last
+        tick_at(11).await;
+        assert_eq!(warnings(), 1);
+        tick_at(40).await;
+
+        // Then the entity is given up on, with a second warning, and left alone
+        assert_eq!(warnings(), 2);
+        tick_at(100).await;
+        assert_eq!(warnings(), 2);
+
+        // When a new mention arrives
+        let fact = store
+            .insert(NewNode::now("fact", "more", "Broken Guy likes coffee"))
+            .await
+            .unwrap();
+        store
+            .relate(&entity, &fact, relation::MENTIONS)
+            .await
+            .unwrap();
+        tick_at(101).await;
+
+        // Then the count starts again with a fresh first warning
+        assert_eq!(warnings(), 3);
     }
 
     #[tokio::test]

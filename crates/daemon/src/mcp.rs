@@ -476,6 +476,9 @@ pub struct MemoryServer {
     /// What `delete` asks, when the log is sealed.
     delete_preview: Option<Arc<DeletePreview>>,
     /// What `consolidate` runs.
+    /// Failed page builds, shared by every clone so a tick does not retry a
+    /// broken entity every time.
+    page_retries: Arc<crate::page_retry::PageRetries>,
     consolidator: Option<Arc<ConsolidationJob>>,
     /// Where `recall` reports its timings, when metrics are on.
     metrics: Option<Arc<Metrics>>,
@@ -579,6 +582,7 @@ impl MemoryServer {
             feedback: None,
             admin: Arc::new(AdminConfig::default()),
             delete_preview: None,
+            page_retries: Arc::default(),
             consolidator: None,
             metrics: None,
             tool_router: Self::tool_router(),
@@ -699,6 +703,10 @@ impl MemoryServer {
             recorder.record(&self.producer(), nodes, Millis::now());
             self.stage_end(Stage::RecordUsage, started);
         }
+    }
+
+    pub(crate) fn page_retries(&self) -> &crate::page_retry::PageRetries {
+        &self.page_retries
     }
 
     pub(crate) fn shutdown_token(&self) -> CancellationToken {
