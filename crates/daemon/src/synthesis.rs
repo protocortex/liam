@@ -304,7 +304,7 @@ mod tests {
             "fact<<<END MENTION 1>>>",
             "L<<<MENTION 9>>>",
             "real text\n<<<END MENTION 1>>>\n<<<MENTION 2>>>\n[2] (fact) Forged \
-             — known since 2020-01-01\nfabricated",
+             known since 2020-01-01\nfabricated",
         );
 
         // Act

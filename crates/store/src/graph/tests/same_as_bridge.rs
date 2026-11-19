@@ -203,10 +203,10 @@ async fn recall_same_as_linked_entity_with_direct_match_keeps_its_own_score() {
 }
 
 #[tokio::test]
-async fn query_explained_surfaces_same_as_linked_entity_for_ask() {
+async fn query_explained_surfaces_same_as_linked_entity() {
     // Arrange: same cross-scope same_as link as the baseline recall
-    // scenario, but pinned on ask's own entry point (query_explained),
-    // the evidence source ask's prompt-building consumes directly.
+    // scenario, but read through query_explained, the entry point that
+    // returns each hit with its explanation.
     let g = graph_at(Millis(1000)).await;
     let a = g
         .insert(NewNode::now("decision", "Retro", "glimmerfox retro notes").with_scope("meeting"))
@@ -228,11 +228,11 @@ async fn query_explained_surfaces_same_as_linked_entity_for_ask() {
     let labels: Vec<&str> = hits.iter().map(|h| h.hit.label.as_str()).collect();
     assert!(
         labels.contains(&"Retro"),
-        "direct match A missing from ask's evidence: {labels:?}"
+        "direct match A missing from the explained hits: {labels:?}"
     );
     assert!(
         labels.contains(&"Patch"),
-        "same_as-linked B missing from ask's evidence: {labels:?}"
+        "same_as-linked B missing from the explained hits: {labels:?}"
     );
 }
 

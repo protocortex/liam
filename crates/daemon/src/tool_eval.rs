@@ -3,8 +3,9 @@
 //! back OUT intact, findable under the label it was written with.
 //!
 //! Where `retrieval_eval.rs` scores whether `Graph::query` surfaces the right
-//! memories by category, this module scores the write/read tools themselves: does a fact survive `remember`, and does
-//! `recall` return it under a query that shares vocabulary with its content.
+//! memories by category, this module scores the write/read tools themselves:
+//! does a fact survive `remember`, and does `recall` return it under a query
+//! that shares vocabulary with its content.
 //!
 //! # Two tiers
 //!
