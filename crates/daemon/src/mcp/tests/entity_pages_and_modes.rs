@@ -10,7 +10,8 @@ const PAGE_LABEL: &str = "Zorbnax";
 async fn fact_and_page(server: &MemoryServer) -> liam_store::NodeId {
     let fact = seed(server, "fact", "Preference", "zorbnax likes green tea").await;
     let store = server.store().await.unwrap();
-    let mut page = NewNode::entity("person", PAGE_LABEL);
+    let mut page = NewNode::entity("person", PAGE_LABEL)
+        .with_attributes(crate::entity_page::stamped(json!({})));
     page.content = "zorbnax profile: likes green tea".to_string();
     let page = store.upsert_by(page).await.unwrap();
     let fact = store.resolve_handle(&fact).await.unwrap();

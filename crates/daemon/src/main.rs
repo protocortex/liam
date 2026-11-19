@@ -718,6 +718,31 @@ async fn record_fingerprint(
         .await
 }
 
+/// Up to `limit` entities whose page is due: the stale ones, oldest first, then
+/// entities whose page an earlier version wrote, which `recall` ignores until a
+/// new page replaces it.
+async fn due_for_rebuild(
+    store: &DefaultGraph,
+    limit: usize,
+    now: liam_store::Millis,
+) -> liam_store::Result<Vec<(liam_store::NodeId, String, Option<String>)>> {
+    let mut due = store.stale_entities(limit, now).await?;
+    let room = limit.saturating_sub(due.len());
+    if room > 0 {
+        let legacy = store
+            .pages_without_marker(entity_page::PAGE_MARKER_KEY, room + due.len(), now)
+            .await?;
+        let already: Vec<liam_store::NodeId> = due.iter().map(|(id, _, _)| id.clone()).collect();
+        due.extend(
+            legacy
+                .into_iter()
+                .filter(|(id, _, _)| !already.contains(id))
+                .take(room),
+        );
+    }
+    Ok(due)
+}
+
 /// Resynthesizes up to `max_resynth_per_tick` stale entities, oldest first.
 /// Entities are processed one at a time, never concurrently, so a tick's page
 /// builds do not crowd out the embedder calls of concurrent user requests.
@@ -728,7 +753,7 @@ async fn resynthesize_stale(
     write_source: Option<&str>,
 ) {
     let now = liam_store::Millis::now();
-    let stale = match store.stale_entities(resynthesis.max_per_tick, now).await {
+    let stale = match due_for_rebuild(store, resynthesis.max_per_tick, now).await {
         Ok(stale) => stale,
         Err(e) => {
             tracing::warn!(error = %e, "stale entity lookup failed");
@@ -1255,11 +1280,12 @@ mod tests {
         MemoryServer::new(store, embedder, Arc::new(liam_model::MockLlm), 30, 8192, 1)
     }
 
-    /// An embedder that sleeps on the real clock first, so the wall-clock
-    /// instant a page write supersedes at is measurably later than the one
-    /// `resynthesize_stale` captured before its loop began: the gap a
-    /// fresh-fingerprint regression test needs to be reproducible rather than a
-    /// coin flip on how fast the test happens to run.
+    /// An embedder that waits, without sleeping, until the wall clock has moved
+    /// on from the instant it was called, so the instant a page write
+    /// supersedes at is later than the one `resynthesize_stale` captured before
+    /// its loop began. `Millis::now` reads the system clock directly, so no
+    /// fake clock can supply that gap; a fresh-fingerprint regression test needs
+    /// it to be certain rather than a coin flip on how fast the test runs.
     struct DelayedEmbedder(liam_model::MockEmbedder);
 
     #[async_trait::async_trait]
@@ -1272,7 +1298,10 @@ mod tests {
             text: &str,
             kind: liam_model::TextKind,
         ) -> liam_model::Result<Vec<f32>> {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let called_at = Millis::now();
+            while Millis::now() == called_at {
+                tokio::task::yield_now().await;
+            }
             self.0.embed(text, kind).await
         }
     }

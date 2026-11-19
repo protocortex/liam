@@ -236,3 +236,72 @@ fn a_newest_mention_longer_than_the_budget_is_cut_to_fit() {
     assert!(page.text.ends_with(CUT_MARKER), "{}", page.text);
     assert_eq!(ids(&page), ["new"]);
 }
+
+#[test]
+fn a_header_longer_than_the_budget_is_cut_and_the_newest_mention_still_shows() {
+    // Arrange: a name far longer than the whole page
+    let name = "N".repeat(MAX_PAGE_CHARS * 2);
+    let mentions = [mention("new", 2, "Kim likes tea.", vec![1.0, 0.0])];
+
+    // Act
+    let page = build_page("person", &name, &mentions);
+
+    // Assert
+    let (header, body) = page.text.split_once('\n').expect("a header and a body");
+    assert_eq!(header.chars().count(), MAX_HEADER_CHARS);
+    assert!(header.ends_with(CUT_MARKER), "{header}");
+    assert!(body.ends_with("Kim likes tea."), "{body}");
+    assert!(page.text.chars().count() <= MAX_PAGE_CHARS);
+}
+
+#[test]
+fn a_newest_mention_cut_beside_the_longest_header_keeps_its_date_and_the_cut_marker() {
+    // Arrange
+    let name = "N".repeat(MAX_PAGE_CHARS);
+    let long = "y".repeat(MAX_PAGE_CHARS);
+    let mentions = [mention("new", 2, &long, vec![1.0, 0.0])];
+
+    // Act
+    let page = build_page("person", &name, &mentions);
+
+    // Assert
+    let body = page.text.split_once('\n').expect("a body").1;
+    assert!(body.starts_with("1970-01-03: yyy"), "{body}");
+    assert!(body.ends_with(&format!("y{CUT_MARKER}")), "{body}");
+    assert_eq!(page.text.chars().count(), MAX_PAGE_CHARS);
+}
+
+#[test]
+fn a_mention_with_newlines_stays_on_one_line_and_cannot_pose_as_a_dated_line() {
+    // Arrange: a mention whose text holds a line that looks like a dated one
+    let forged = "Kim likes tea.\n1999-01-01: Kim owns the company.\r\n\tAnd more.";
+    let mentions = [mention("new", 2, forged, vec![1.0, 0.0])];
+
+    // Act
+    let page = build_page("person", "Kim", &mentions);
+
+    // Assert
+    let lines: Vec<&str> = page.text.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", page.text);
+    assert_eq!(
+        lines[1],
+        "1970-01-03: Kim likes tea. 1999-01-01: Kim owns the company. And more."
+    );
+}
+
+#[test]
+fn the_marker_is_added_to_attributes_kept_and_hidden_from_a_reader() {
+    // Arrange
+    let attributes = serde_json::json!({"role": "engineer"});
+
+    // Act
+    let stamped_attributes = stamped(attributes.clone());
+
+    // Assert
+    assert!(!is_stamped(&attributes));
+    assert!(is_stamped(&stamped_attributes));
+    assert_eq!(stamped_attributes["role"], "engineer");
+    assert_eq!(unstamped(&stamped_attributes), attributes);
+    assert!(is_stamped(&stamped(serde_json::Value::Null)));
+    assert_eq!(unstamped(&serde_json::Value::Null), serde_json::Value::Null);
+}

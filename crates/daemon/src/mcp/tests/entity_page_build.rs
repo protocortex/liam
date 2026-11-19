@@ -336,7 +336,10 @@ async fn the_page_keeps_the_attributes_and_the_scope_of_the_entity() {
         .iter()
         .find(|h| h.hit.label == "Kim")
         .expect("page in scope");
-    assert_eq!(written.hit.attributes, json!({"role": "engineer"}));
+    assert_eq!(
+        written.hit.attributes,
+        crate::entity_page::stamped(json!({"role": "engineer"}))
+    );
     assert!(hits("proj-y").await.iter().all(|h| h.hit.label != "Kim"));
 }
 
@@ -646,4 +649,116 @@ async fn the_page_of_a_remembered_entity_carries_the_real_content_of_its_mention
         "{}",
         page.hit.retrieved.as_text()
     );
+}
+
+/// Writes a fact in `scope`, linked from the entity `page`.
+async fn scoped_mention(
+    store: &DefaultGraph,
+    page: &NodeId,
+    text: &str,
+    scope: Option<&str>,
+    embedding: Vec<f32>,
+) {
+    let mut fact = NewNode::now("fact", "note", text).with_embedding(embedding);
+    if let Some(scope) = scope {
+        fact = fact.with_scope(scope);
+    }
+    let id = store.insert(fact).await.unwrap();
+    store.relate(page, &id, relation::MENTIONS).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_scoped_entity_page_holds_only_mentions_inside_its_scope() {
+    // Arrange: mentions in the scope, in a child scope, in another scope, and in none
+    let server = plain_server().await;
+    let store = server.store().await.unwrap();
+    let page = store
+        .upsert_by(NewNode::entity("person", "Kim").with_scope("proj-x"))
+        .await
+        .unwrap();
+    for (n, (text, scope)) in [
+        ("Kim likes tea.", Some("proj-x")),
+        ("Kim runs the build.", Some("proj-x/ci")),
+        ("Kim plans a secret move.", Some("proj-y")),
+        ("Kim has an unscoped note.", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        scoped_mention(&store, &page, text, scope, axis(n)).await;
+    }
+
+    // Act
+    server
+        .resynthesize_entity_as(&store, page, soon(), None)
+        .await
+        .unwrap();
+
+    // Assert
+    let written = store
+        .query_explained(&Query::text("Kim").with_scope("proj-x").with_inferred(true))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|hit| hit.hit.label == "Kim" && hit.hit.retrieved.is_inferred())
+        .expect("a page in scope");
+    let text = written.hit.retrieved.as_text();
+    assert!(text.contains("Kim likes tea."), "{text}");
+    assert!(text.contains("Kim runs the build."), "{text}");
+    assert!(!text.contains("secret move"), "{text}");
+    assert!(!text.contains("unscoped note"), "{text}");
+}
+
+#[tokio::test]
+async fn a_scoped_entity_whose_mentions_are_all_outside_its_scope_gets_no_page() {
+    // Arrange
+    let server = plain_server().await;
+    let store = server.store().await.unwrap();
+    let page = store
+        .upsert_by(NewNode::entity("person", "Kim").with_scope("proj-x"))
+        .await
+        .unwrap();
+    scoped_mention(
+        &store,
+        &page,
+        "Kim plans a secret move.",
+        Some("proj-y"),
+        axis(0),
+    )
+    .await;
+
+    // Act
+    server
+        .resynthesize_entity_as(&store, page.clone(), soon(), None)
+        .await
+        .unwrap();
+
+    // Assert: the entity row is untouched
+    assert!(store.resolve_handle(page.as_str()).await.is_ok());
+}
+
+#[tokio::test]
+async fn an_unscoped_entity_page_may_hold_mentions_of_every_scope() {
+    // Arrange: an unscoped page is only read by a reader who sees every scope
+    let server = plain_server().await;
+    let store = server.store().await.unwrap();
+    let page = entity(&store, "Kim").await;
+    scoped_mention(&store, &page, "Kim likes tea.", Some("proj-x"), axis(0)).await;
+    scoped_mention(&store, &page, "Kim runs the build.", None, axis(1)).await;
+
+    // Act
+    server
+        .resynthesize_entity_as(&store, page, soon(), None)
+        .await
+        .unwrap();
+
+    // Assert
+    let text = page_named(&store, "Kim")
+        .await
+        .hit
+        .retrieved
+        .as_text()
+        .to_string();
+    assert!(text.contains("Kim likes tea."), "{text}");
+    assert!(text.contains("Kim runs the build."), "{text}");
 }

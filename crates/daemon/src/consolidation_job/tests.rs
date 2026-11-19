@@ -1109,17 +1109,30 @@ async fn consolidate_is_busy_while_an_archive_run_is_in_progress() {
 }
 
 #[test]
-fn reporting_a_run_handles_every_outcome_including_none() {
+fn reporting_a_run_says_how_each_outcome_ended() {
     // Arrange
-    let outcomes = [
-        Some(RunOutcome::Committed),
-        Some(RunOutcome::RolledBack),
-        Some(RunOutcome::RestoreFailed),
-        None,
+    let cases = [
+        (Some(RunOutcome::Committed), "consolidation committed"),
+        (
+            Some(RunOutcome::RolledBack),
+            "consolidation rolled back; the store is as it was",
+        ),
+        (
+            Some(RunOutcome::RestoreFailed),
+            "consolidation could not restore the store; it needs manual inspection",
+        ),
+        (None, "consolidation ended with no outcome"),
     ];
 
-    // Act / Assert: each outcome is reported without panicking
-    for outcome in outcomes {
+    for (outcome, expected) in cases {
+        crate::test_logs::capture();
+
+        // Act
         report("run-1", outcome);
+
+        // Assert
+        let logged = crate::test_logs::captured();
+        assert!(logged.contains(expected), "{outcome:?}: {logged}");
+        assert!(logged.contains("run-1"), "{outcome:?}: {logged}");
     }
 }

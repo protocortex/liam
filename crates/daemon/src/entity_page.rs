@@ -4,6 +4,7 @@
 //! state anything a memory did not.
 
 use liam_store::NodeId;
+use serde_json::{Map, Value};
 
 use crate::render::fmt_millis;
 use crate::summary::tree::cosine;
@@ -20,11 +21,19 @@ const KEEP_NEWEST: usize = 2;
 const KEEP_CENTRAL: usize = 2;
 
 /// Characters a page may hold, header included. A mention that would pass it
-/// is left out, except the newest, which is cut to fit.
+/// is left out, except the first shown, which is cut to fit.
 const MAX_PAGE_CHARS: usize = 600;
 
-/// Marks where the newest mention was cut to fit the page.
+/// Characters the header may take, so a long entity name cannot leave no room
+/// for the newest mention.
+const MAX_HEADER_CHARS: usize = MAX_PAGE_CHARS / 3;
+
+/// Marks where a header or the newest mention was cut to fit the page.
 const CUT_MARKER: &str = "...";
+
+/// The attribute that tells a page this builder wrote from one an earlier
+/// version wrote, which a model composed and which is never shown or trusted.
+pub const PAGE_MARKER_KEY: &str = "page_builder";
 
 /// One mention of an entity with the vector its text is stored under.
 pub struct Mention {
@@ -73,9 +82,50 @@ fn centrality(target: &Mention, all: &[&Mention]) -> f32 {
     others.iter().sum::<f32>() / others.len().max(1) as f32
 }
 
-/// The dated line a mention takes on the page.
+/// `attributes` of an entity with the page marker added.
+pub fn stamped(attributes: Value) -> Value {
+    let mut map = match attributes {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    map.insert(PAGE_MARKER_KEY.to_string(), Value::Bool(true));
+    Value::Object(map)
+}
+
+/// True when the page with these `attributes` was written by this builder.
+pub fn is_stamped(attributes: &Value) -> bool {
+    attributes.get(PAGE_MARKER_KEY).is_some()
+}
+
+/// `attributes` of a page as a reader sees them, without the marker.
+pub fn unstamped(attributes: &Value) -> Value {
+    let mut shown = attributes.clone();
+    if let Value::Object(map) = &mut shown {
+        map.remove(PAGE_MARKER_KEY);
+    }
+    shown
+}
+
+/// `text` cut to at most `limit` characters, ending in the cut marker when
+/// something was removed.
+fn cut_to(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let room = limit.saturating_sub(CUT_MARKER.len());
+    text.chars().take(room).collect::<String>() + CUT_MARKER
+}
+
+/// The dated line a mention takes on the page. Whitespace runs, newlines
+/// included, become one space so a mention stays on its own line and cannot
+/// pose as another dated line.
 fn line(mention: &Mention) -> String {
-    format!("{}: {}", fmt_millis(mention.valid_from_ms), mention.text)
+    let text = mention
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{}: {text}", fmt_millis(mention.valid_from_ms))
 }
 
 /// The mentions to show, newest first, then the most central of the rest.
@@ -105,7 +155,7 @@ pub fn build_page(kind: &str, name: &str, mentions: &[Mention]) -> EntityPage {
             source_ids: Vec::new(),
         };
     }
-    let header = format!("{name} ({kind})");
+    let header = cut_to(&format!("{name} ({kind})"), MAX_HEADER_CHARS);
     let mut used = header.chars().count();
     let mut shown: Vec<&Mention> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
@@ -117,8 +167,7 @@ pub fn build_page(kind: &str, name: &str, mentions: &[Mention]) -> EntityPage {
             if !shown.is_empty() {
                 continue;
             }
-            let room = MAX_PAGE_CHARS.saturating_sub(used + 1 + CUT_MARKER.len());
-            text = text.chars().take(room).collect::<String>() + CUT_MARKER;
+            text = cut_to(&text, MAX_PAGE_CHARS - used - 1);
         }
         used += text.chars().count() + 1;
         shown.push(mention);

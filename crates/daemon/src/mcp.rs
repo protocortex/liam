@@ -682,6 +682,15 @@ impl MemoryServer {
         Ok(hits)
     }
 
+    /// The pages `q` finds: the same query over inferred rows alone.
+    async fn explained_pages(
+        &self,
+        q: &Query,
+    ) -> Result<Vec<liam_store::ExplainedHit>, liam_store::Error> {
+        let pages = q.clone().inferred_only();
+        on_store!(self, |store| store.query_explained(&pages))
+    }
+
     /// Makes the results a client is shown ones it can give a verdict on.
     fn issue_handles<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
         if let Some(feedback) = &self.feedback {
@@ -1082,6 +1091,15 @@ impl MemoryServer {
         // A summary or an earlier page that mentions the entity is derived
         // text, so a page built from it would state a statement twice removed.
         rows.retain(|row| !row.retrieved.is_inferred());
+        // A scoped entity is read inside its scope, so its page may quote only
+        // memories a reader of that scope can already see.
+        if let Some(scope) = &candidate.scope {
+            rows.retain(|row| {
+                row.scope
+                    .as_deref()
+                    .is_some_and(|s| liam_store::scope_is_within(s, scope))
+            });
+        }
         tracing::debug!(entity = %label, mentions = rows.len(), "building the entity page");
         let mentions = tokio::time::timeout_at(deadline, self.page_mentions(store, &rows))
             .await
@@ -1106,7 +1124,7 @@ impl MemoryServer {
         .map_err(|_| "timed out embedding the page".to_string())?
         .map_err(|e| e.to_string())?;
         let mut node = NewNode::entity(candidate.kind, candidate.label)
-            .with_attributes(candidate.attributes)
+            .with_attributes(entity_page::stamped(candidate.attributes))
             .with_embedding(embedding)
             .with_basis(basis)
             .with_producer(write_source.map_or_else(|| self.producer(), str::to_owned));
@@ -1221,19 +1239,30 @@ impl MemoryServer {
                 args.scope,
                 embedding,
                 args.as_of,
-            )
-            .with_inferred(true);
-            (self.explained(&q).await, embed_degraded)
+            );
+            // Pages are ranked on their own, so they cannot change which
+            // recorded memories the first query returns or in what order.
+            let recorded = self.explained(&q).await;
+            let found = match recorded {
+                Ok(recorded) => self
+                    .explained_pages(&q)
+                    .await
+                    .map(|pages| (recorded, pages)),
+                Err(e) => Err(e),
+            };
+            (found, embed_degraded)
         };
-        let (hits, embed_degraded) = match until_interrupted(deadline, &cancel, retrieve).await {
-            Ok((Ok(h), degraded)) => (recall::only_recalled(h), degraded),
+        let (shown, embed_degraded) = match until_interrupted(deadline, &cancel, retrieve).await {
+            Ok((Ok((recorded, pages)), degraded)) => {
+                (recall::with_pages(recorded, pages, k), degraded)
+            }
             Ok((Err(e), _)) => return ToolReply::failed(format!("recall failed: {e}")),
             Err(why) => return self.interruption_reply("recall", why),
         };
-        if hits.is_empty() {
+        if shown.is_empty() {
             return with_reasons(ToolReply::ok("no relevant memory"), [embed_degraded]);
         }
-        let shown = &hits[..hits.len().min(k)];
+        let shown = &shown[..];
         // Usage and handles cover only the hits returned, not the wider pool.
         self.record_usage(shown.iter().filter(|h| !h.expanded).map(|h| &h.hit.id));
         self.issue_handles(shown.iter().map(|h| &h.hit.id));
@@ -1254,9 +1283,10 @@ impl MemoryServer {
                 if hit.confidence != 1.0 {
                     trailing.push(format!("confidence: {:.2}", hit.confidence));
                 }
-                if let serde_json::Value::Object(map) = &hit.hit.attributes {
+                let attributes = recall::shown_attributes(hit);
+                if let serde_json::Value::Object(map) = &attributes {
                     if !map.is_empty() {
-                        trailing.push(format!("attributes: {}", hit.hit.attributes));
+                        trailing.push(format!("attributes: {attributes}"));
                     }
                 }
                 if hit.hit.retrieved.is_inferred() {
