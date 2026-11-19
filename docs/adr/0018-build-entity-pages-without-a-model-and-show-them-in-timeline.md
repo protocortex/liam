@@ -1,6 +1,7 @@
 # ADR-0018: build entity pages without a model and show them in timeline only
 
 - **Status:** Accepted. Supersedes in part [ADR-0017](0017-remove-the-ask-tool.md) where it says entity pages use the local model and where it leaves open whether `recall` ranks pages.
+- **Note, 2026-11-20:** the `Llm` trait, llama.cpp, the `[llm]` section and the start-up benchmark that this ADR keeps were removed by [ADR-0019](0019-remove-the-local-generation-model.md).
 - **Date created:** 2026-11-20
 - **Date modified:** 2026-11-20
 

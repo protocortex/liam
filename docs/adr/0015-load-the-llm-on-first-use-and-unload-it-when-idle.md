@@ -1,6 +1,7 @@
 # ADR-0015: load the LLM on first use and unload it when idle
 
-- **Status:** Accepted
+- **Status:** Accepted. Superseded in part by [ADR-0019](0019-remove-the-local-generation-model.md): the generation model is removed.
+- **Note, 2026-11-20:** superseded: the generation model this ADR loads lazily was removed by [ADR-0019](0019-remove-the-local-generation-model.md).
 - **Note, 2026-11-19:** the `ask` tool named here was removed by [ADR-0017](0017-remove-the-ask-tool.md). `recall` stays.
 - **Note, 2026-11-20:** entity pages no longer use the model, see [ADR-0018](0018-build-entity-pages-without-a-model-and-show-them-in-timeline.md). Local summaries still do.
 - **Date created:** 2026-11-18

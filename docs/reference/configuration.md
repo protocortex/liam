@@ -21,15 +21,6 @@ unknown key fails loudly.
 | `embedder.provider` | `mock` | `local` for the in-process arctic ONNX model, or `mock` for tests and dev. The shipped `liam.toml` sets `local`; the built-in default is `mock`. Part of the embedder fingerprint. |
 | `embedder.model` | `Snowflake/snowflake-arctic-embed-m-v2.0` | The embedding model, and the only one: Snowflake arctic-embed-m-v2.0 as an int8 ONNX file (311 MB, Apache-2.0) on the CPU, with CLS pooling, the `query: ` prefix on queries and 512 input tokens. It is pinned to one revision and `liam fetch-models` checks its size and sha256. Its native width is 768 and `embedding_dims` (384 by default) cuts it and normalises again. Leave the key out. Any other value stops the daemon at start with a message that names it, see [ADR 0016](../adr/0016-arctic-is-the-only-embedder.md). A store built with another model is refused at start until `liam rebuild`. Part of the embedder fingerprint. |
 | `embedder.cache_dir` | `~/.liam/models` | Files for the embedder, each model under its own `models--Org--Name` subdirectory. |
-| `llm.provider` | `mock` | `llama-cpp` for in-process llama.cpp, or `mock` for tests and dev. The shipped `liam.toml` sets `llama-cpp`; the built-in default is `mock`. `local`, the retired candle provider, is no longer accepted. |
-| `llm.model` | `Qwen/Qwen2.5-1.5B-Instruct-GGUF` | Hugging Face id of the GGUF repo the local model comes from. |
-| `llm.gguf_file` | `qwen2.5-1.5b-instruct-q4_k_m.gguf` | The GGUF file to load from that repo. A repo holds several quantisations, so the file is named explicitly. |
-| `llm.cache_dir` | `~/.liam/models` | Where the local model's files live. They are used offline after the first fetch. |
-| `llm.device` | `auto` | Where the local model runs: `auto`, `cpu`, `metal` or `cuda`. `auto` takes the fastest backend built into the binary and falls back to the CPU. macOS builds include Metal. `cuda` is not built, so it is refused with a message. |
-| `llm.warmup` | `false` | Load the local model and generate one token at start. Off by default: the model loads on the first call that needs it (an entity page or a local summary), so that first call is slower by the load time (on Metal this includes the first-call kernel compile, about 10 s). Set `true` to pay that cost at start and to stop the daemon at start when the model cannot load. With `false`, a model that cannot load is reported on the first call that needs it, and at start only as one warning when the model file is missing from the cache. See [ADR 0015](../adr/0015-load-the-llm-on-first-use-and-unload-it-when-idle.md). |
-| `llm.idle_unload_secs` | `300` | Seconds without a generation after which the local model is unloaded, which returns its 1.0 to 1.3 GB to the system. The next call loads it again. `0` never unloads. An unload happens at most 30 s late. The embedder is never unloaded. For the behaviour of earlier versions set `llm.warmup = true` and `llm.idle_unload_secs = 0`. |
-| `llm.context_tokens` | `8192` | The local model's context window. It sizes the llama.cpp context and the budget of `clusters`. |
-| `llm.max_concurrent_generations` | `0` | Generations that may run at once. Each one costs about 110 MB of KV cache. `0` tunes the number from a one-time benchmark; a fixed number turns that off. |
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
 | `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
 | `read_pool_size` | `4` | Read connections. Ignored for an in-memory database. |
@@ -84,6 +75,10 @@ ai-notetaker = "notetaker"
 ```
 
 The reranker was removed. A `[reranker]` section from an older `liam.toml` is ignored, and the daemon logs one warning at start. You can delete it.
+
+The local generation model was removed, and with it the whole `[llm]` section. An old `[llm]` section, whatever keys it holds, is ignored, and the daemon logs one warning at start. You can delete it. The old model, in the folder `models--Qwen--Qwen2.5-1.5B-Instruct-GGUF` of `~/.liam/models`, stays there. LIAM no longer reads it, and you may delete it. `ask_timeout_secs` stays, because entity pages still use it.
+
+`summary.provider = "local"` no longer works, because the local model that wrote the summaries is gone. An old config that says so, or that turns `summary.enabled` on and leaves the provider at its old default, still loads: summaries are off, and the daemon logs one warning at start. To write summaries, set `summary.provider` to a hosted provider, as [Summaries](../concepts/summaries.md) describes.
 
 `embedder.device` was removed, because the embedder always runs on the CPU. An old `device` line under `[embedder]` is ignored, and the daemon logs one warning at start. You can delete it.
 

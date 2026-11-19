@@ -4,8 +4,9 @@
 
 Summaries are model-written overviews of clusters of recorded memory, built level
 by level into a tree: level 1 summarizes clusters of memories, and level 2 and 3
-summarize clusters of the level below. They are off by default and need a real
-`llm` provider, not the mock. A `summarize` step in each consolidation run writes
+summarize clusters of the level below. They are off by default and only a hosted
+provider writes them: the local model that used to is gone, so with no hosted
+provider configured summaries stay off. A `summarize` step in each consolidation run writes
 the missing or out of date ones for every scope, and closes the ones whose
 cluster is gone. A rolled back run leaves none of its summaries behind.
 
@@ -19,7 +20,7 @@ Keys, all under `[summary]` in `liam.toml`:
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | `false` makes the whole step a no-op. |
-| `provider` | `"local"` | Who writes summaries: `local`, or `anthropic`, `openai` or `gemini` (these need `[hosted]`). Entity pages use no model. |
+| `provider` | `"local"` | Who writes summaries: `anthropic`, `openai` or `gemini`, which need `[hosted]` and `metrics.enabled = true`. The default `local` is the removed in-process model: it keeps summaries off, and a config that sets it with summaries on logs one warning at start. Entity pages use no model. |
 | `knn` | `8` | Nearest neighbours considered for each item. |
 | `min_similarity` | `0.5` | Least cosine similarity at which two items are linked. |
 | `time_window_hours` | `720` | Items further apart than this are not linked. |

@@ -1,6 +1,7 @@
 # ADR-0016: arctic-embed-m-v2.0 is the only embedder
 
 - **Status:** Accepted. Supersedes in part [ADR-0013](0013-arctic-default-embedder-and-reranker-off.md) and [ADR-0012](0012-llama-cpp-default-embedder-and-hardware-support.md): arctic stays the embedder, and the other embedders they kept selectable are removed.
+- **Note, 2026-11-20:** llama.cpp no longer runs generation in the daemon, see [ADR-0019](0019-remove-the-local-generation-model.md).
 - **Date created:** 2026-11-19
 - **Date modified:** 2026-11-19
 
