@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use super::log_write::{race, within_deadline};
-use super::quant::{column, indexed_ids, lineages, node, open_at, quant_ids, DIMS};
+use super::quant::{column, indexed_ids, lineages, node, open_at, quant_ids, signed, DIMS};
 use super::support::count;
 use super::*;
 use crate::types::{
@@ -984,4 +984,65 @@ async fn a_closed_summary_no_longer_exempts_its_children() {
     // Assert
     assert!(exempt.is_empty(), "{exempt:?}");
     assert_eq!(quant_ids(&g).await.len(), 1);
+}
+
+/// A page about `ada`, written with no vector, in the lineage of `subject_node`.
+fn ada_page(text: &str) -> NewNode {
+    let mut page = NewNode::entity("person", "ada")
+        .with_subject("ada")
+        .with_producer("agent-a");
+    page.content = text.to_string();
+    page
+}
+
+#[tokio::test]
+async fn a_written_page_is_not_reported_as_having_a_vector() {
+    // Arrange: a lineage holding only a page, which is never embedded
+    let g = open_at(Millis(1000)).await;
+    let page = g.insert(ada_page("ada profile")).await.unwrap();
+    let key = lineage_of_node(&g, &page).await;
+
+    // Act
+    let snapshot = g.usage_snapshot(Millis(2000), 30).await.unwrap();
+    let nodes = g.lineage_nodes(&key).await.unwrap();
+
+    // Assert
+    assert_eq!(snapshot.items.len(), 1);
+    assert!(!snapshot.items[0].has_vector);
+    assert!(nodes.len() == 1 && !nodes[0].has_vector);
+}
+
+#[tokio::test]
+async fn reconciling_a_cold_page_lineage_counts_no_vector_for_the_page() {
+    // Arrange: a cold lineage holding only a page, which has no vector
+    let g = open_at(Millis(1000)).await;
+    let page = g.insert(ada_page("ada profile")).await.unwrap();
+    let key = lineage_of_node(&g, &page).await;
+    g.set_tier(&cold_at(&key, 2000), None).await.unwrap();
+
+    // Act
+    let report = g.reconcile_tier_vectors().await.unwrap();
+
+    // Assert: nothing to delete, and nothing counted as held without a signature
+    assert_eq!(report, ReconcileReport::default());
+}
+
+#[tokio::test]
+async fn an_older_page_that_still_has_a_vector_row_is_reported_with_it() {
+    // Arrange: a page from before pages stopped being embedded
+    let g = open_at(Millis(1000)).await;
+    let page = g
+        .insert(ada_page("ada profile").with_embedding(signed(3)))
+        .await
+        .unwrap();
+    let key = lineage_of_node(&g, &page).await;
+
+    // Act
+    let nodes = g.lineage_nodes(&key).await.unwrap();
+
+    // Assert: the vector row exists, so the cold tier may delete it
+    assert!(nodes[0].has_vector);
+    g.set_tier(&cold_at(&key, 2000), None).await.unwrap();
+    let report = g.reconcile_tier_vectors().await.unwrap();
+    assert_eq!(report.deleted + report.skipped_unsigned, 1);
 }
