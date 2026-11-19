@@ -19,7 +19,7 @@ Keys, all under `[summary]` in `liam.toml`:
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | `false` makes the whole step a no-op. |
-| `provider` | `"local"` | Who writes summaries: `local`, or `anthropic`, `openai` or `gemini` (these need `[hosted]`). Entity synthesis stays local. |
+| `provider` | `"local"` | Who writes summaries: `local`, or `anthropic`, `openai` or `gemini` (these need `[hosted]`). Entity pages use no model. |
 | `knn` | `8` | Nearest neighbours considered for each item. |
 | `min_similarity` | `0.5` | Least cosine similarity at which two items are linked. |
 | `time_window_hours` | `720` | Items further apart than this are not linked. |

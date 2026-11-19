@@ -14,7 +14,7 @@ as it finishes:
 3. Link near-duplicates, those whose embeddings reach
    `consolidation.dedup_similarity_threshold`. Both rows stay; the merge adds an edge.
 4. Run the maintenance steps: replay the log, sweep, repair provenance, refresh
-   clusters, and (in the daemon only) resynthesize stale entities.
+   clusters, and (in the daemon only) rebuild the pages of stale entities.
 5. Score the probes again. A probe whose recall drops by `consolidation.probe_recall_margin`
    or more fails the run. A probe whose node the run's own sweep removed on purpose is
    not counted, but a probe that lost its node any other way fails the run, and so does a
@@ -31,8 +31,8 @@ liam consolidate [--database PATH]          # run, or resume an unfinished run
 liam consolidate status [--database PATH]   # show the last run
 ```
 
-`liam consolidate` needs the store to itself, so stop `liamd` first. It runs no
-model, so resynthesis waits for the daemon's next scheduled run. `status` reads
+`liam consolidate` needs the store to itself, so stop `liamd` first. It runs
+no model, and it leaves the rebuild of entity pages to the daemon's next scheduled run. `status` reads
 one file and works while the daemon runs.
 
 | Exit code | Meaning |

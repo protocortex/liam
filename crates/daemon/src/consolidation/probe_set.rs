@@ -42,10 +42,12 @@ pub fn probe_set_path_for(database_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Picks up to `count` live nodes with content, in an order set by `rng` alone,
+/// Picks up to `count` live recorded nodes with content, in an order set by `rng` alone,
 /// and makes a probe of each. Candidates are ordered by content before the draw
 /// so that stores holding the same content pick the same probes whatever ids
-/// their nodes were given.
+/// their nodes were given. A page or a summary is never picked: a strict query
+/// cannot find one, and the run's own page rebuild supersedes a page, which a
+/// probe would report as a loss.
 ///
 /// # Errors
 ///
@@ -68,7 +70,7 @@ pub async fn pick_probes(
     for id in &ids {
         if let Some(node) = store.get(id, as_of).await? {
             let text = node.retrieved.as_text();
-            if !text.is_empty() {
+            if !text.is_empty() && !node.retrieved.is_inferred() {
                 candidates.push((text.to_string(), node.id));
             }
         }
@@ -283,6 +285,26 @@ mod tests {
         // Assert
         assert_eq!(first.len(), PICKED);
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn an_entity_page_is_never_picked_as_a_probe() {
+        // Arrange: a store holding recorded notes and one written page
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(&dir, "pages.db", &contents(3)).await;
+        let mut page = NewNode::entity("person", "Kim");
+        page.content = "Kim (person)\n1970-01-01: Kim likes tea.".to_string();
+        store.upsert_by(page).await.unwrap();
+
+        // Act: ask for more probes than there are recorded notes
+        let picked = queries(&store, SEED, NODES).await;
+
+        // Assert
+        assert_eq!(picked.len(), 3, "{picked:?}");
+        assert!(
+            picked.iter().all(|query| !query.contains("Kim")),
+            "{picked:?}"
+        );
     }
 
     #[tokio::test]

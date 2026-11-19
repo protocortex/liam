@@ -231,31 +231,20 @@ impl<B: Backend> Graph<B> {
             .collect()
     }
 
-    /// The ids of the live nodes that have a vector. A node with no text to
-    /// embed has none.
+    /// The ids of the live nodes that have a vector row. A node with no text
+    /// to embed is left out. Read from `node_vectors` itself, so a written
+    /// page, which is never embedded, is not reported as having a vector,
+    /// while an older page that still has a stored vector is.
     async fn live_vector_ids(&self) -> Result<HashSet<String>> {
-        let embeddable = self
+        let rows = self
             .backend
             .query(
-                "SELECT id FROM nodes WHERE tx_to = ?1 AND trim(content) != ''",
+                "SELECT n.id FROM nodes n JOIN node_vectors v ON v.node_id = n.id
+                 WHERE n.tx_to = ?1 AND trim(n.content) != ''",
                 &[FOREVER.into()],
             )
             .await?;
-        let missing: HashSet<String> = self
-            .backend
-            .nodes_missing_vectors()
-            .await?
-            .into_iter()
-            .map(|id| id.as_str().to_string())
-            .collect();
-        let mut with_vector = HashSet::with_capacity(embeddable.len());
-        for row in &embeddable {
-            let id = row.get_string(0)?;
-            if !missing.contains(&id) {
-                with_vector.insert(id);
-            }
-        }
-        Ok(with_vector)
+        rows.iter().map(|row| row.get_string(0)).collect()
     }
 
     /// Makes the vectors agree with the tier rows, which decide: every live node

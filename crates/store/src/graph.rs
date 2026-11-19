@@ -317,16 +317,20 @@ fn by_subject_query(
         params.push(p.into());
         filters.push_str(&format!(" AND producer = ?{next}"));
     } else {
-        // Producer-blind collision: only an entity page (content is always
-        // empty, per `NewNode::entity`) may collide here, never a fact that
-        // happens to share the same subject and scope.
-        filters.push_str(" AND content = ''");
+        // Producer-blind collision: only an entity page may collide here, never
+        // a fact that happens to share the same subject and scope. A page is
+        // told by its derivation and not by empty content, because a page that
+        // has been written holds text.
+        filters.push_str(&format!(
+            " AND derivation = '{}'",
+            Derivation::Inferred.as_str()
+        ));
     }
     // If two nodes ever share a subject+scope, pick the newest
     // deterministically (tie-break by id) rather than an arbitrary row.
     let sql = format!(
         "SELECT id, tx_from FROM nodes WHERE subject = ?1 AND {liveness}{filters}
-         ORDER BY tx_from DESC, id DESC LIMIT 1",
+         ORDER BY tx_from DESC, id DESC",
     );
     (sql, params)
 }
@@ -713,6 +717,7 @@ impl<B: Backend> Graph<B> {
         )
         .await?;
         crate::migrate::backfill_derivation(&backend, clock.now()).await?;
+        crate::migrate::keep_pages_out_of_the_text_index(&backend).await?;
         // Gives an existing database the ON DELETE CASCADE that the DDL above
         // only grants a fresh one, by rebuilding the referencing tables
         // (ADR-0003). Detects and no-ops on a database that already has it.
@@ -1048,6 +1053,34 @@ impl<B: Backend> Graph<B> {
             .await?
             .into_iter()
             .next())
+    }
+
+    /// The instant on the store's clock, which stamps its writes.
+    pub fn now(&self) -> Millis {
+        self.clock.now()
+    }
+
+    /// The live node with `subject` in `scope` as of `as_of`, which is the entity
+    /// row or its page: a page is kept out of the text index, so a search does
+    /// not find it.
+    pub async fn live_by_subject(
+        &self,
+        subject: &str,
+        scope: Option<&str>,
+        as_of: Millis,
+    ) -> Result<Option<Candidate>> {
+        let (sql, params) = live_by_subject_query(subject, as_of, scope, None);
+        let rows = self.backend.query(&sql, &params).await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        self.get(&NodeId::from_raw(row.get_string(0)?), as_of).await
+    }
+
+    /// The vector stored for `id`, or `None` when the node has none. A closed
+    /// node keeps its vector.
+    pub async fn embedding(&self, id: &NodeId) -> Result<Option<Vec<f32>>> {
+        self.backend.vector_get(id.as_str(), self.dims).await
     }
 
     /// Nodes `entity_id` mentions, live at `as_of`, most-recently mentioned
@@ -1750,6 +1783,45 @@ impl<B: Backend> Graph<B> {
             .take(limit)
             .map(|c| (c.id, c.subject, c.scope))
             .collect())
+    }
+
+    /// The live entity pages whose attributes lack the key `marker`, one per
+    /// `(subject, scope)` and the newest of its rows, oldest first, up to
+    /// `limit`. A page with no text is not listed: it was never written.
+    pub async fn pages_without_marker(
+        &self,
+        marker: &str,
+        limit: usize,
+        as_of: Millis,
+    ) -> Result<Vec<(NodeId, String, Option<String>)>> {
+        let sql = format!(
+            "SELECT n.id, n.subject, n.scope FROM nodes n
+             WHERE n.derivation = '{inferred}' AND n.subject IS NOT NULL AND n.content != ''
+               AND json_type(n.attributes, ?2) IS NULL AND {live}
+               AND n.id = (SELECT m.id FROM nodes m
+                           WHERE m.subject = n.subject AND m.scope IS n.scope
+                             AND m.derivation = '{inferred}' AND {live_m}
+                           ORDER BY m.tx_from DESC, m.id DESC LIMIT 1)
+             ORDER BY n.rowid LIMIT ?3",
+            inferred = Derivation::Inferred.as_str(),
+            live = live_at("n", 1),
+            live_m = live_at("m", 1),
+        );
+        let path = format!("$.{marker}");
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self
+            .backend
+            .query(&sql, &[as_of.into(), path.into(), limit.into()])
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    NodeId::from_raw(row.get_string(0)?),
+                    row.get_string(1)?,
+                    opt_string(row, 2)?,
+                ))
+            })
+            .collect()
     }
 
     /// Reattach mentions still pointing at a superseded node, and the

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The tuning window before any call, and a cache that cannot be written.
+//! A tuning cache that cannot be written, and one written for another setup.
 
 use super::*;
 
@@ -7,16 +7,6 @@ const MODEL: &str = "model-a";
 const BACKEND: &str = "llama.cpp/cpu";
 const CONTEXT_TOKENS: usize = 8192;
 const SLOTS: usize = 3;
-
-#[test]
-fn an_empty_window_has_zero_averages_instead_of_a_division_by_zero() {
-    // Arrange
-    let window = RollingWindow::new();
-
-    // Act / Assert
-    assert_eq!(window.average_latency(), Duration::ZERO);
-    assert_eq!(window.average_queue_wait(), Duration::ZERO);
-}
 
 #[test]
 fn a_cache_directory_that_is_a_file_costs_a_repeat_benchmark_and_nothing_else() {

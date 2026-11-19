@@ -1,6 +1,7 @@
 # ADR-0017: remove the ask tool
 
 - **Status:** Accepted. Supersedes in part [ADR-0001](0001-assert-memory-edges-by-node-id.md), [ADR-0004](0004-non-lossy-mcp-surface-for-attributes-confidence-and-as-of.md), [ADR-0014](0014-remove-the-reranker.md) and [ADR-0015](0015-load-the-llm-on-first-use-and-unload-it-when-idle.md) where they describe `ask` as part of the tool surface.
+- **Note, 2026-11-20:** entity pages no longer use the local model, and only `timeline` shows them. See [ADR-0018](0018-build-entity-pages-without-a-model-and-show-them-in-timeline.md).
 - **Date created:** 2026-11-19
 - **Date modified:** 2026-11-19
 
@@ -67,8 +68,8 @@ The owner decided on 2026-11-19 to keep `recall` as the only read-by-query tool.
 - **The store keeps its ranking of inferred rows.** The query option
   `include_inferred` and the `as_of` argument of `summaries_within` stay, with
   their tests, though no daemon tool sets them now.
-- **Open decision.** Whether `recall` gains a reading mode that ranks entity
-  pages and summaries is not decided.
+- **Open decision, resolved on 2026-11-20.** `recall` gains no reading mode: it
+  ranks neither entity pages nor summaries, see [ADR-0018](0018-build-entity-pages-without-a-model-and-show-them-in-timeline.md).
 - **A breaking change for clients that called `ask`.** The call returns the
   standard unknown-tool error. They use `recall`.
 - **Less to test.** The answer eval, the sufficiency pre-pass and the answer

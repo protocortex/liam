@@ -80,6 +80,20 @@ impl Harness {
         self.server_arc(Arc::new(store), llm)
     }
 
+    /// A server over `store` that embeds with `embedder`, for the tests that
+    /// need one which is gated or counts.
+    fn server_embedding(&self, store: DefaultGraph, embedder: Arc<dyn Embedder>) -> MemoryServer {
+        MemoryServer::new(
+            Arc::new(store),
+            embedder,
+            Arc::new(liam_model::MockLlm),
+            30,
+            8192,
+            1,
+        )
+        .with_shutdown(self.shutdown.token())
+    }
+
     /// A server over a store the test also holds, which a rollback cannot take.
     fn server_arc(&self, store: Arc<DefaultGraph>, llm: Arc<dyn Llm>) -> MemoryServer {
         MemoryServer::new(store, embedder(), llm, 30, 8192, 1).with_shutdown(self.shutdown.token())
@@ -251,22 +265,43 @@ async fn refresh_clusters_reports_no_work_on_an_idle_store_through_a_consolidati
     assert!(!did_work, "the run left the store with nothing to refresh");
 }
 
-/// Counts the calls resynthesis makes and blocks each until released.
-struct GatedLlm {
+/// Counts the embeds page builds make and blocks each until released.
+struct GatedEmbedder {
     release: Arc<tokio::sync::Notify>,
     in_flight: AtomicUsize,
     peak: AtomicUsize,
 }
 
 #[async_trait]
-impl Llm for GatedLlm {
-    async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
+impl Embedder for GatedEmbedder {
+    fn dims(&self) -> usize {
+        DIMS
+    }
+    async fn embed(
+        &self,
+        _text: &str,
+        _kind: liam_model::TextKind,
+    ) -> liam_model::Result<Vec<f32>> {
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
         self.release.notified().await;
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        Ok("gated reply".to_string())
+        Ok(vec![1.0; DIMS])
     }
+}
+
+/// Inserts `name` with one mention that has no vector, so a page build for it
+/// makes one embed call, for the mention.
+async fn entity_with_a_mention(store: &DefaultGraph, name: &str) {
+    let entity = store.insert(NewNode::entity("person", name)).await.unwrap();
+    let fact = store
+        .insert(NewNode::now("fact", "fact", format!("{name} likes tea")))
+        .await
+        .unwrap();
+    store
+        .relate(&entity, &fact, liam_store::relation::MENTIONS)
+        .await
+        .unwrap();
 }
 
 /// Polls until `condition` holds, long enough for the run's file work.
@@ -281,126 +316,88 @@ async fn until(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test]
-async fn resynthesis_processes_entities_one_at_a_time_through_a_consolidation_run() {
-    // Arrange: two stale entities, a cap covering both, and a gated llm
+async fn page_builds_run_one_at_a_time_through_a_consolidation_run() {
+    // Arrange: two stale entities, a cap covering both, and a gated embedder
     let mut harness = Harness::new();
     harness.config.gc.max_resynth_per_tick = 2;
     let (store, _clock) = harness.store_at(Millis(1000)).await;
-    store
-        .insert(NewNode::entity("person", "Gated One"))
-        .await
-        .unwrap();
-    store
-        .insert(NewNode::entity("person", "Gated Two"))
-        .await
-        .unwrap();
+    entity_with_a_mention(&store, "Gated One").await;
+    entity_with_a_mention(&store, "Gated Two").await;
     let release = Arc::new(tokio::sync::Notify::new());
-    let llm = Arc::new(GatedLlm {
+    let embedder = Arc::new(GatedEmbedder {
         release: release.clone(),
         in_flight: AtomicUsize::new(0),
         peak: AtomicUsize::new(0),
     });
-    let server = harness.server(store, llm.clone());
+    let server = harness.server_embedding(store, embedder.clone());
     let job = Arc::new(harness.job(&server, honest()));
 
-    // Act: spawned, since the gated llm blocks until released
+    // Act: spawned, since the gated embedder blocks until released
     let running = tokio::spawn({
         let job = job.clone();
         async move { job.tick().await }
     });
-    until(|| llm.in_flight.load(Ordering::SeqCst) == 1).await;
+    until(|| embedder.in_flight.load(Ordering::SeqCst) == 1).await;
     release.notify_one();
-    until(|| llm.in_flight.load(Ordering::SeqCst) == 1).await;
+    until(|| embedder.in_flight.load(Ordering::SeqCst) == 1).await;
     release.notify_one();
     let outcome = running.await.unwrap();
 
     // Assert
     assert_eq!(outcome, Some(RunOutcome::Committed));
-    assert_eq!(llm.peak.load(Ordering::SeqCst), 1);
-}
-
-/// Counts calls to `complete`.
-#[derive(Default)]
-struct CountingLlm(AtomicUsize);
-
-#[async_trait]
-impl Llm for CountingLlm {
-    async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok("reply".to_string())
-    }
-}
-
-/// A harness whose server is autotuning, with a stale entity for resynthesis.
-async fn autotuning_harness() -> (Harness, MemoryServer, Arc<CountingLlm>) {
-    let mut harness = Harness::new();
-    harness.config.llm.max_concurrent_generations = 0;
-    let (store, _clock) = harness.store_at(Millis(1000)).await;
-    store
-        .insert(NewNode::entity("person", "Kim"))
-        .await
-        .unwrap();
-    let llm = Arc::new(CountingLlm::default());
-    let server = harness.server(store, llm.clone());
-    (harness, server, llm)
+    assert_eq!(embedder.peak.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn resynthesis_is_skipped_for_the_run_made_at_start_of_an_autotuning_server_only() {
-    // Arrange
-    let (harness, server, llm) = autotuning_harness().await;
+async fn the_first_run_after_start_builds_the_stale_pages_like_any_other() {
+    // Arrange: an autotuning server with a stale entity
+    let mut harness = Harness::new();
+    harness.config.llm.max_concurrent_generations = 0;
+    let (store, _clock) = harness.store_at(Millis(1000)).await;
+    entity_with_a_mention(&store, "Kim").await;
+    let store = Arc::new(store);
+    let server = harness.server_arc(store.clone(), Arc::new(liam_model::MockLlm));
     let job = harness.job(&server, honest());
 
     // Act
     let run_now = job.start(true).await.unwrap();
     job.tick().await;
-    let during_first = llm.0.load(Ordering::SeqCst);
-    job.tick().await;
 
-    // Assert
+    // Assert: the page was written, so the entity is no longer stale
     assert!(run_now);
-    assert_eq!(
-        during_first, 0,
-        "the first run leaves the permits to calibration"
-    );
-    assert!(
-        llm.0.load(Ordering::SeqCst) > 0,
-        "the next run resynthesizes"
-    );
+    let stale = store.stale_entities(10, Millis::now()).await.unwrap();
+    assert!(stale.is_empty(), "{stale:?}");
 }
 
 #[tokio::test]
-async fn the_run_that_resumes_a_crashed_one_at_start_also_skips_resynthesis_while_autotuning() {
+async fn a_start_with_nothing_to_do_runs_nothing() {
+    // Arrange
+    let harness = Harness::new();
+    let (store, _clock) = harness.store_at(Millis(1000)).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
+    let job = harness.job(&server, honest());
+
+    // Act
+    let run_now = job.start(false).await.unwrap();
+
+    // Assert
+    assert!(!run_now);
+}
+
+#[tokio::test]
+async fn a_crashed_run_waiting_to_resume_asks_for_a_run_at_start() {
     // Arrange: nothing asks for a run on start, but a crashed run is waiting
-    let (harness, server, llm) = autotuning_harness().await;
+    let harness = Harness::new();
+    let (store, _clock) = harness.store_at(Millis(1000)).await;
+    let server = harness.server(store, Arc::new(liam_model::MockLlm));
     let job = harness.job(&server, honest());
     interrupted_manifest(&harness, &[]);
 
     // Act
     let run_now = job.start(false).await.unwrap();
-    job.tick().await;
 
     // Assert
     assert!(run_now);
-    assert_eq!(llm.0.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn a_start_with_nothing_to_do_runs_nothing_and_leaves_resynthesis_on() {
-    // Arrange
-    let (harness, server, llm) = autotuning_harness().await;
-    let job = harness.job(&server, honest());
-
-    // Act
-    let run_now = job.start(false).await.unwrap();
-    job.tick().await;
-
-    // Assert
-    assert!(!run_now);
-    assert!(
-        llm.0.load(Ordering::SeqCst) > 0,
-        "a later scheduled run resynthesizes"
-    );
 }
 
 #[tokio::test]
@@ -781,7 +778,6 @@ async fn the_maintenance_step_reports_a_stopping_daemon_so_it_is_not_recorded_do
         server: server.clone(),
         policy: harness.config.gc_policy(),
         resynthesis: Resynthesis::from_config(&harness.config),
-        skip_resynthesis_once: Arc::new(AtomicBool::new(false)),
     };
     harness.shutdown.token().cancel();
 
@@ -804,7 +800,6 @@ async fn the_maintenance_step_is_done_when_the_daemon_keeps_running() {
         server: server.clone(),
         policy: harness.config.gc_policy(),
         resynthesis: Resynthesis::from_config(&harness.config),
-        skip_resynthesis_once: Arc::new(AtomicBool::new(false)),
     };
 
     let result = maintenance

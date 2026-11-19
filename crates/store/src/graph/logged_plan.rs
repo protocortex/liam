@@ -225,9 +225,15 @@ impl Plan {
     /// Writes `row` and links it to `old`, which the link closes. The batch
     /// carries the `supersedes` edge so the log alone says which row the new one
     /// replaced.
-    fn supersede(mut row: NodeRow, old: &OpenRow, now: Millis) -> Self {
-        let edge = succeed(&mut row, old, now);
-        let effects = vec![RowEffect::Node(row.clone()), RowEffect::Edge(edge)];
+    fn supersede(row: NodeRow, old: &OpenRow, now: Millis) -> Self {
+        Self::supersede_all(row, std::slice::from_ref(old), now)
+    }
+
+    /// `supersede` for several open rows at once, each closed by its own edge.
+    fn supersede_all(mut row: NodeRow, olds: &[OpenRow], now: Millis) -> Self {
+        let edges = succeed_all(&mut row, olds, now);
+        let mut effects = vec![RowEffect::Node(row.clone())];
+        effects.extend(edges.into_iter().map(RowEffect::Edge));
         Self::new(node_event(&row, now, LogPayload::EpisodeBatch(effects)))
     }
 
@@ -316,7 +322,17 @@ pub(super) struct OpenRow {
 /// the row it closes. The row, the edge, and the close, which replay takes from
 /// the edge, share that one time.
 fn succeed(row: &mut NodeRow, old: &OpenRow, now: Millis) -> EdgeRow {
-    row.tx_from = now.0.max(old.tx_from);
+    succeed_all(row, std::slice::from_ref(old), now).remove(0)
+}
+
+/// `succeed` for every row of `olds`: `row` starts no earlier than the latest
+/// of them, and each gets its own `supersedes` edge at that one time.
+fn succeed_all(row: &mut NodeRow, olds: &[OpenRow], now: Millis) -> Vec<EdgeRow> {
+    row.tx_from = olds.iter().fold(now.0, |at, old| at.max(old.tx_from));
+    olds.iter().map(|old| supersedes_edge(row, old)).collect()
+}
+
+fn supersedes_edge(row: &NodeRow, old: &OpenRow) -> EdgeRow {
     EdgeRow {
         id: EdgeId::new().as_str().to_string(),
         src: row.id.clone(),
@@ -355,22 +371,39 @@ impl Collision {
             }
     }
 
-    /// The newest open row this collides with, as the transaction sees it.
-    async fn find_open(&self, tx: &mut dyn BackendTx) -> Result<Option<OpenRow>> {
+    /// Every open row this collides with, newest first, as the transaction
+    /// sees it.
+    async fn find_all_open(&self, tx: &mut dyn BackendTx) -> Result<Vec<OpenRow>> {
         let (sql, params) = open_by_subject_query(
             &self.subject,
             self.scope.as_deref(),
             self.producer.as_deref(),
         );
         let rows = tx.query(&sql, &params).await?;
-        rows.first()
+        rows.iter()
             .map(|row| {
                 Ok(OpenRow {
                     id: row.get_string(0)?,
                     tx_from: row.get_i64(1)?,
                 })
             })
-            .transpose()
+            .collect()
+    }
+
+    /// The rows a new node closes. A fact replaces the newest open row of its
+    /// key. A page replaces every one, because an older store wrote pages that
+    /// left several open for one entity, and the rewrite leaves a single row.
+    async fn find_replaced(&self, tx: &mut dyn BackendTx) -> Result<Vec<OpenRow>> {
+        let mut open = self.find_all_open(tx).await?;
+        if self.producer.is_some() {
+            open.truncate(1);
+        }
+        Ok(open)
+    }
+
+    /// The newest open row this collides with.
+    async fn find_open(&self, tx: &mut dyn BackendTx) -> Result<Option<OpenRow>> {
+        Ok(self.find_all_open(tx).await?.into_iter().next())
     }
 }
 
@@ -382,9 +415,10 @@ async fn plan_upsert(
     collision: Collision,
     now: Millis,
 ) -> Result<Plan> {
-    let plan = match collision.find_open(tx).await? {
-        Some(old) => Plan::supersede(row, &old, now).deduplicated(Table::Nodes, None),
-        None => Plan::node_write(row, now),
+    let olds = collision.find_replaced(tx).await?;
+    let plan = match olds.is_empty() {
+        false => Plan::supersede_all(row, &olds, now).deduplicated(Table::Nodes, None),
+        true => Plan::node_write(row, now),
     };
     Ok(plan)
 }

@@ -55,6 +55,14 @@ const REMOVED_ASK_SUFFICIENCY_CHECK_WARNING: &str =
     "ask_sufficiency_check was removed with the ask tool and is ignored: delete it from your \
      liam.toml";
 
+const REMOVED_FULL_SYNTHESIS_MENTION_THRESHOLD_WARNING: &str =
+    "gc.full_synthesis_mention_threshold was removed with the model-written entity pages and is \
+     ignored: delete it from your liam.toml";
+
+const REMOVED_FULL_SYNTHESIS_MAX_NEW_TOKENS_WARNING: &str =
+    "gc.full_synthesis_max_new_tokens was removed with the model-written entity pages and is \
+     ignored: delete it from your liam.toml";
+
 const REMOVED_RERANKER_WARNING: &str =
     "the reranker was removed and the [reranker] section is ignored: delete it from your liam.toml";
 
@@ -157,13 +165,16 @@ pub struct GcConfig {
     pub interval_hours: u64,
     pub reclaim: bool,
     pub run_on_start: bool,
-    /// Ceiling on entities re-synthesized per maintenance tick.
+    /// Ceiling on entity pages rebuilt per maintenance tick.
     pub max_resynth_per_tick: usize,
-    /// Live-mention threshold at or above which the next resynthesis uses
-    /// the full-tier token budget instead of the baseline.
-    pub full_synthesis_mention_threshold: usize,
-    /// Output token budget for a full-tier resynthesis.
-    pub full_synthesis_max_new_tokens: usize,
+    /// The removed `full_synthesis_mention_threshold` key. Kept so an old
+    /// `liam.toml` still loads, since `deny_unknown_fields` would reject it. Its
+    /// value is ignored, see `Config::removed_gc_page_warnings`.
+    #[doc(hidden)]
+    pub full_synthesis_mention_threshold: Option<toml::Value>,
+    /// The removed `full_synthesis_max_new_tokens` key, kept for the same reason.
+    #[doc(hidden)]
+    pub full_synthesis_max_new_tokens: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -357,8 +368,8 @@ impl Default for GcConfig {
             reclaim: true,
             run_on_start: false,
             max_resynth_per_tick: 5,
-            full_synthesis_mention_threshold: 8,
-            full_synthesis_max_new_tokens: 512,
+            full_synthesis_mention_threshold: None,
+            full_synthesis_max_new_tokens: None,
         }
     }
 }
@@ -550,6 +561,24 @@ impl Config {
         self.ask_sufficiency_check
             .as_ref()
             .map(|_| REMOVED_ASK_SUFFICIENCY_CHECK_WARNING)
+    }
+
+    /// The warnings to log at start for each removed `[gc]` key the config
+    /// still sets, one per key, in a fixed order.
+    pub fn removed_gc_page_warnings(&self) -> Vec<&'static str> {
+        [
+            (
+                &self.gc.full_synthesis_mention_threshold,
+                REMOVED_FULL_SYNTHESIS_MENTION_THRESHOLD_WARNING,
+            ),
+            (
+                &self.gc.full_synthesis_max_new_tokens,
+                REMOVED_FULL_SYNTHESIS_MAX_NEW_TOKENS_WARNING,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(value, warning)| value.as_ref().map(|_| warning))
+        .collect()
     }
 
     /// The warning to log at start when no config file was found, so the
@@ -1006,45 +1035,46 @@ mod tests {
     }
 
     #[test]
-    fn full_synthesis_mention_threshold_defaults_to_eight() {
-        // Given no explicit override in the [gc] table
-        let path = write_temp_toml("[gc]\n");
+    fn removed_page_keys_load_and_each_yields_one_removal_warning() {
+        // Arrange
+        let text =
+            "[gc]\nfull_synthesis_mention_threshold = 16\nfull_synthesis_max_new_tokens = 1024\n";
 
-        // When loaded
-        let c = Config::load(&path).expect("config with gc defaults must parse");
+        // Act
+        let config = load_text(text, "/home/alice").unwrap();
 
-        // Then the default value is used
-        assert_eq!(c.gc.full_synthesis_mention_threshold, 8);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn full_synthesis_max_new_tokens_defaults_to_512() {
-        // Given no explicit override in the [gc] table
-        let path = write_temp_toml("[gc]\n");
-
-        // When loaded
-        let c = Config::load(&path).expect("config with gc defaults must parse");
-
-        // Then the default value is used
-        assert_eq!(c.gc.full_synthesis_max_new_tokens, 512);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn full_synthesis_overrides_are_used() {
-        // Given explicit overrides in the [gc] table
-        let path = write_temp_toml(
-            "[gc]\nfull_synthesis_mention_threshold = 16\nfull_synthesis_max_new_tokens = 1024\n",
+        // Assert
+        let warnings = config.removed_gc_page_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("gc.full_synthesis_mention_threshold was removed"));
+        assert!(warnings[1].contains("gc.full_synthesis_max_new_tokens was removed"));
+        assert!(
+            warnings.iter().all(|w| w.contains("delete it")),
+            "{warnings:?}"
         );
+    }
 
-        // When loaded
-        let c = Config::load(&path).expect("config with gc overrides must parse");
+    #[test]
+    fn a_single_removed_page_key_yields_only_its_own_warning() {
+        // Arrange / Act
+        let config =
+            load_text("[gc]\nfull_synthesis_max_new_tokens = 64\n", "/home/alice").unwrap();
 
-        // Then the configured values are used
-        assert_eq!(c.gc.full_synthesis_mention_threshold, 16);
-        assert_eq!(c.gc.full_synthesis_max_new_tokens, 1024);
-        let _ = std::fs::remove_file(&path);
+        // Assert
+        let warnings = config.removed_gc_page_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("gc.full_synthesis_max_new_tokens"));
+    }
+
+    #[test]
+    fn a_config_without_the_removed_page_keys_has_no_removal_warning() {
+        // Arrange / Act
+        let loaded = load_text("[gc]\nmax_resynth_per_tick = 3\n", "/home/alice").unwrap();
+
+        // Assert
+        assert!(loaded.removed_gc_page_warnings().is_empty());
+        assert!(Config::default().removed_gc_page_warnings().is_empty());
+        assert_eq!(loaded.gc.max_resynth_per_tick, 3);
     }
 
     #[test]

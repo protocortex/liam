@@ -118,6 +118,7 @@ async fn opening_a_database_without_the_column_adds_it_and_marks_only_the_pages(
     let seeded = {
         let g = open_unlogged(&dir).await;
         let seeded = seed(&g).await;
+        super::text_index::use_old_triggers(&g).await;
         for sql in [
             "ALTER TABLE nodes DROP COLUMN derivation",
             "DROP TABLE derivation_backfill_state",

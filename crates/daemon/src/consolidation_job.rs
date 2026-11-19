@@ -3,7 +3,6 @@
 //! inside a snapshot, the reopen after a rollback, and the scheduled tick.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -50,19 +49,19 @@ struct DaemonMaintenance {
     server: MemoryServer,
     policy: RetentionPolicy,
     resynthesis: Resynthesis,
-    /// Set for the run made at start of an autotuning server, which is still
-    /// calibrating its generation permits: that one run skips resynthesis so it
-    /// does not compete for them.
-    skip_resynthesis_once: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl Maintenance for DaemonMaintenance {
     async fn run(&self, store: &DefaultGraph, source: &str) -> anyhow::Result<()> {
-        let skip = self.skip_resynthesis_once.swap(false, Ordering::SeqCst);
-        let resynthesis = (!skip).then_some(self.resynthesis);
-        let finished =
-            maintenance_steps(&self.server, store, &self.policy, resynthesis, Some(source)).await;
+        let finished = maintenance_steps(
+            &self.server,
+            store,
+            &self.policy,
+            Some(self.resynthesis),
+            Some(source),
+        )
+        .await;
         // A step cut short must not be recorded as done: the run resumes at it.
         anyhow::ensure!(
             finished,
@@ -247,8 +246,6 @@ pub struct ConsolidationJob {
     consolidator: Consolidator,
     store: Arc<SharedStore>,
     shutdown: Shutdown,
-    skip_resynthesis_once: Arc<AtomicBool>,
-    autotuning: bool,
     metrics: Option<RunMetrics>,
 }
 
@@ -302,12 +299,10 @@ impl ConsolidationJob {
             shutdown,
             metrics,
         } = setup;
-        let skip_resynthesis_once = Arc::new(AtomicBool::new(false));
         let maintenance = DaemonMaintenance {
             server: server.clone(),
             policy: config.gc_policy(),
             resynthesis: Resynthesis::from_config(config),
-            skip_resynthesis_once: skip_resynthesis_once.clone(),
         };
         let reopener = reopener.unwrap_or_else(|| {
             Arc::new(LogReopener {
@@ -357,8 +352,6 @@ impl ConsolidationJob {
             consolidator,
             store: server.shared_store(),
             shutdown: shutdown.clone(),
-            skip_resynthesis_once,
-            autotuning: config.llm.max_concurrent_generations == 0,
             metrics,
         })
     }
@@ -370,8 +363,6 @@ impl ConsolidationJob {
     /// What the daemon does before it serves: finishes a rollback a crash cut
     /// short, then says whether a run should start now, which it should when
     /// the config asks for one at start or a crashed run is waiting to resume.
-    /// That first run leaves resynthesis out when the server is still
-    /// calibrating its generation permits.
     ///
     /// # Errors
     ///
@@ -379,11 +370,7 @@ impl ConsolidationJob {
     /// the next start's resume point.
     pub async fn start(&self, run_on_start: bool) -> anyhow::Result<bool> {
         self.finish_pending_rollback().await?;
-        let run_now = run_on_start || self.has_unfinished_run();
-        if run_now && self.autotuning {
-            self.skip_resynthesis_once.store(true, Ordering::SeqCst);
-        }
-        Ok(run_now)
+        Ok(run_on_start || self.has_unfinished_run())
     }
 
     async fn finish_pending_rollback(&self) -> anyhow::Result<()> {

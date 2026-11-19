@@ -122,9 +122,9 @@ pub trait Backend: Send + Sync + Sized {
 
     /// Read. Ids of the live nodes (not superseded or closed) that have no
     /// stored vector, in id order. A node whose content is empty or only
-    /// whitespace is left out: an entity page has nothing to embed. Does not
-    /// serialize with writes or with
-    /// other reads; see the trait's concurrency contract above.
+    /// whitespace is left out, and so is an inferred row: an entity page has
+    /// nothing to embed. Does not serialize with writes or with other reads;
+    /// see the trait's concurrency contract above.
     async fn nodes_missing_vectors(&self) -> Result<Vec<NodeId>>;
 
     /// Write. Remove stored vectors whose node no longer exists (post-GC

@@ -312,6 +312,57 @@ pub async fn normalize_scope_column<B: Backend>(backend: &B) -> Result<()> {
     Ok(())
 }
 
+/// Takes the written entity pages out of the text index of a store whose
+/// triggers still index every row: removes each page's entry, then replaces the
+/// three triggers with the ones `schema::text_index_triggers` defines, in one
+/// transaction. The old triggers are recognised by their text not naming the
+/// derivation, so a store already migrated is left alone, and the entries are
+/// removed exactly once. Runs after the derivation backfill, which is what
+/// marks a page from before the column.
+pub(crate) async fn keep_pages_out_of_the_text_index<B: Backend>(backend: &B) -> Result<()> {
+    let old = backend
+        .query(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'nodes_ai' AND sql NOT LIKE '%derivation%'",
+            &[],
+        )
+        .await?;
+    if old.is_empty() {
+        return Ok(());
+    }
+    remove_pages_and_replace_triggers(backend).await?;
+    tracing::info!("entity pages taken out of the text index");
+    Ok(())
+}
+
+/// The transaction behind `keep_pages_out_of_the_text_index`. Its first
+/// statement is a write, so the transaction holds the write lock before the
+/// old-trigger test inside it runs: an opener that lost a race sees the new
+/// triggers, deletes nothing and re-creates the same triggers. FTS5 corrupts
+/// its index when told to delete entries that are not in it, so the delete
+/// must never run twice.
+pub(crate) async fn remove_pages_and_replace_triggers<B: Backend>(backend: &B) -> Result<()> {
+    let mut statements: Vec<(String, Vec<Value>)> = vec![(
+        "INSERT INTO nodes_fts(nodes_fts, rowid, label, content)
+         SELECT 'delete', rowid, label, content FROM nodes
+         WHERE derivation = ?1 AND content != ''
+           AND EXISTS (SELECT 1 FROM sqlite_master
+                       WHERE type = 'trigger' AND name = 'nodes_ai'
+                         AND sql NOT LIKE '%derivation%')"
+            .to_string(),
+        vec![Derivation::Inferred.as_str().into()],
+    )];
+    for name in ["nodes_ai", "nodes_ad", "nodes_au"] {
+        statements.push((format!("DROP TRIGGER IF EXISTS {name}"), Vec::new()));
+    }
+    statements.extend(
+        crate::schema::text_index_triggers("")
+            .into_iter()
+            .map(|sql| (sql, Vec::new())),
+    );
+    backend.execute_atomic(&statements).await
+}
+
 /// Ids per `UPDATE`, so the write lock is held for one small statement at a
 /// time and never for the whole set of pages.
 const BACKFILL_CHUNK: usize = 200;

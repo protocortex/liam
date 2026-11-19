@@ -61,7 +61,8 @@ Each degraded reason also adds one to the `degraded_replies` metric, labelled wi
 the tool and the reason. See [Metrics and alerts](../operations/metrics-and-alerts.md).
 
 `timeline` shows an entity's compiled page and the mentions behind it, most
-recent first.
+recent first. The page is built from the stored sentences about the entity, never
+from text a model wrote (see [Reading modes](../concepts/reading-modes.md#entity-pages)).
 
 | Field | Required | Notes |
 |---|---|---|

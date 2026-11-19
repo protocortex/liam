@@ -12,14 +12,12 @@ unknown key fails loudly.
 | `log_filter` | `info,liam=debug` | tracing filter. `RUST_LOG` overrides it. |
 | `embedding_dims` | `384` | Vector width. Fixed when the DB is created; changing it needs `liam rebuild` (see [The embedder fingerprint](../concepts/embedder-fingerprint.md)). |
 | `recall_timeout_secs` | `10` | Seconds `recall` may spend retrieving (embedding and store query). Past it `recall` replies `retrieval took longer than N s`. A value of `0` is read as `1`. |
-| `ask_timeout_secs` | `30` | Seconds one batch of entity-page syntheses may spend on the model, from the permit wait to the last generation. The key keeps the name it had when `ask` used it, so an existing `liam.toml` still loads. |
+| `ask_timeout_secs` | `30` | Seconds one batch of entity-page builds may spend embedding the mentions and the page, which the `remember` call waits for. The key keeps the name it had when `ask` used it, so an existing `liam.toml` still loads. |
 | `gc.episode_retention_days` | `30` | Age out `episode` nodes older than this. Must be between `1` and `36500` (100 years): a value outside that range is refused at load, because `0` or less would delete every episode. For the longest retention set `36500`. |
 | `gc.interval_hours` | `6` | Sweep interval in hours, from `1` to `8760`. `0` and larger values are refused at load. |
 | `gc.reclaim` | `true` | Run incremental vacuum after a sweep. |
 | `gc.run_on_start` | `false` | Sweep once at boot. |
-| `gc.max_resynth_per_tick` | `5` | Ceiling on entities re-synthesized per maintenance tick. |
-| `gc.full_synthesis_mention_threshold` | `8` | Live-mention count at or above which the next resynthesis uses the full-tier token budget. |
-| `gc.full_synthesis_max_new_tokens` | `512` | Output token budget for a full-tier resynthesis. |
+| `gc.max_resynth_per_tick` | `5` | Ceiling on entity pages rebuilt per maintenance tick. |
 | `embedder.provider` | `mock` | `local` for the in-process arctic ONNX model, or `mock` for tests and dev. The shipped `liam.toml` sets `local`; the built-in default is `mock`. Part of the embedder fingerprint. |
 | `embedder.model` | `Snowflake/snowflake-arctic-embed-m-v2.0` | The embedding model, and the only one: Snowflake arctic-embed-m-v2.0 as an int8 ONNX file (311 MB, Apache-2.0) on the CPU, with CLS pooling, the `query: ` prefix on queries and 512 input tokens. It is pinned to one revision and `liam fetch-models` checks its size and sha256. Its native width is 768 and `embedding_dims` (384 by default) cuts it and normalises again. Leave the key out. Any other value stops the daemon at start with a message that names it, see [ADR 0016](../adr/0016-arctic-is-the-only-embedder.md). A store built with another model is refused at start until `liam rebuild`. Part of the embedder fingerprint. |
 | `embedder.cache_dir` | `~/.liam/models` | Files for the embedder, each model under its own `models--Org--Name` subdirectory. |
@@ -30,7 +28,7 @@ unknown key fails loudly.
 | `llm.device` | `auto` | Where the local model runs: `auto`, `cpu`, `metal` or `cuda`. `auto` takes the fastest backend built into the binary and falls back to the CPU. macOS builds include Metal. `cuda` is not built, so it is refused with a message. |
 | `llm.warmup` | `false` | Load the local model and generate one token at start. Off by default: the model loads on the first call that needs it (an entity page or a local summary), so that first call is slower by the load time (on Metal this includes the first-call kernel compile, about 10 s). Set `true` to pay that cost at start and to stop the daemon at start when the model cannot load. With `false`, a model that cannot load is reported on the first call that needs it, and at start only as one warning when the model file is missing from the cache. See [ADR 0015](../adr/0015-load-the-llm-on-first-use-and-unload-it-when-idle.md). |
 | `llm.idle_unload_secs` | `300` | Seconds without a generation after which the local model is unloaded, which returns its 1.0 to 1.3 GB to the system. The next call loads it again. `0` never unloads. An unload happens at most 30 s late. The embedder is never unloaded. For the behaviour of earlier versions set `llm.warmup = true` and `llm.idle_unload_secs = 0`. |
-| `llm.context_tokens` | `8192` | The local model's context window. It sizes both the llama.cpp context and how entity synthesis trims its mentions, so the two always agree. |
+| `llm.context_tokens` | `8192` | The local model's context window. It sizes the llama.cpp context and the budget of `clusters`. |
 | `llm.max_concurrent_generations` | `0` | Generations that may run at once. Each one costs about 110 MB of KV cache. `0` tunes the number from a one-time benchmark; a fixed number turns that off. |
 | `socket_path` | `~/.liam/liamd.sock` | Where `serve` listens and `proxy` connects. |
 | `max_connections` | `16` | Concurrent socket sessions. Further clients wait in the kernel backlog. |
@@ -90,6 +88,8 @@ The reranker was removed. A `[reranker]` section from an older `liam.toml` is ig
 `embedder.device` was removed, because the embedder always runs on the CPU. An old `device` line under `[embedder]` is ignored, and the daemon logs one warning at start. You can delete it.
 
 `ask_sufficiency_check` was removed with the `ask` tool. An old `ask_sufficiency_check` line is ignored, and the daemon logs one warning at start. You can delete it.
+
+`gc.full_synthesis_mention_threshold` and `gc.full_synthesis_max_new_tokens` were removed, because entity pages are no longer written by a model. An old line for either under `[gc]` is ignored, and the daemon logs one warning at start for each. You can delete them.
 
 Logs go to stderr. Stdout carries the MCP JSON-RPC stream, so it stays clean.
 
