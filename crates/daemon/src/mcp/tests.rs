@@ -12,8 +12,8 @@ use serde_json::json;
 mod argument_errors;
 mod as_of_and_round_trips;
 mod clusters_and_timeline;
+mod entity_page_build;
 mod entity_pages_and_modes;
-mod entity_synthesis;
 mod error_replies;
 mod generation_limit;
 mod query_limits_and_embed_kinds;
@@ -26,204 +26,16 @@ mod removed_ask;
 mod store_swap;
 mod timing_samples;
 
-/// Always-errors `Llm`, so a synthesis must report the failure.
-struct FailingLlm;
-#[async_trait::async_trait]
-impl liam_model::Llm for FailingLlm {
-    async fn complete(&self, _s: &str, _p: &str) -> liam_model::Result<String> {
-        Err(liam_model::ModelError::Llm("boom".into()))
-    }
-}
-
-/// Records what reached the model and replies with a canned answer. WHY not
-/// `MockLlm`: its echo repeats the system rules, which the grounding check of
-/// entity synthesis rejects as not derived from the mentions. Recording the
-/// prompt asserts prompt delivery directly instead of inferring it from an echo.
-struct RecordingLlm {
-    reply: &'static str,
-    seen: std::sync::Mutex<Vec<String>>,
-}
-
-impl RecordingLlm {
-    fn new(reply: &'static str) -> Self {
-        Self {
-            reply,
-            seen: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    fn last_prompt(&self) -> String {
-        self.seen
-            .lock()
-            .expect("prompt log")
-            .last()
-            .cloned()
-            .expect("the llm was never called")
-    }
-}
-
-#[async_trait::async_trait]
-impl liam_model::Llm for RecordingLlm {
-    async fn complete(&self, system: &str, prompt: &str) -> liam_model::Result<String> {
-        self.seen
-            .lock()
-            .expect("prompt log")
-            .push(format!("{system}\n{prompt}"));
-        Ok(self.reply.to_string())
-    }
-}
-
-/// Blocks inside `complete()` on a `Notify` the test controls, so the test
-/// decides exactly when a call may finish. Tracks the PEAK number of
-/// concurrent `complete()` calls it has ever seen (fetch_add, compare
-/// against a running max, fetch_sub on exit), because a final count of 0
-/// proves nothing: every call reaches 0 eventually whether or not two of
-/// them were ever in flight together.
-struct GatedLlm {
-    release: Arc<tokio::sync::Notify>,
-    in_flight: std::sync::atomic::AtomicUsize,
-    peak: std::sync::atomic::AtomicUsize,
-}
-
-impl GatedLlm {
-    fn new(release: Arc<tokio::sync::Notify>) -> Self {
-        Self {
-            release,
-            in_flight: std::sync::atomic::AtomicUsize::new(0),
-            peak: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    fn in_flight(&self) -> usize {
-        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn peak(&self) -> usize {
-        self.peak.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-#[async_trait::async_trait]
-impl liam_model::Llm for GatedLlm {
-    async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
-        let now = self
-            .in_flight
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        self.peak
-            .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
-        self.release.notified().await;
-        self.in_flight
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(grounded_entity_reply(prompt))
-    }
-}
-
-/// Cooperatively yields until `condition()` is true, bounded so a real bug
-/// panics the test instead of hanging the suite. No sleeps: progress here
-/// depends only on the single-threaded test runtime getting a chance to
-/// poll the other spawned task, which `yield_now` grants deterministically
-/// (no wall-clock wait, real or paused).
-async fn wait_until(mut condition: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if condition() {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!("condition never became true; the two tasks likely deadlocked");
-}
-
-/// Extracts "(kind) label" from a synthesis prompt's "Entity: (kind) label" line and
-/// echoes it back verbatim, which `is_grounded` always accepts (the reply is a subset
-/// of its own vocabulary seed) regardless of which entity or how short its label is.
-fn grounded_entity_reply(prompt: &str) -> String {
-    let line = prompt
-        .lines()
-        .find(|l| l.starts_with("Entity: ("))
-        .expect("synthesis prompt must have an Entity line");
-    let rest = line.trim_start_matches("Entity: (");
-    let close = rest
-        .find(')')
-        .expect("Entity line must have a closing paren");
-    format!("{} {}", &rest[..close], rest[close + 1..].trim())
-}
-
-/// Counts calls and always succeeds with a reply grounded in the
-/// entity's own kind/label, for entity synthesis tests that assert on
-/// call count.
-struct CountingLlm {
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-impl CountingLlm {
-    fn new() -> Self {
-        Self {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    fn call_count(&self) -> usize {
-        self.calls.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-#[async_trait::async_trait]
-impl liam_model::Llm for CountingLlm {
-    async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(grounded_entity_reply(prompt))
-    }
-}
-
-/// Errors on its first call only, succeeds after with a reply grounded
-/// in the entity's own kind/label: pins that one entity's failure must
-/// not drop another entity's success.
-struct FirstCallErrorsLlm {
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-impl FirstCallErrorsLlm {
-    fn new() -> Self {
-        Self {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl liam_model::Llm for FirstCallErrorsLlm {
-    async fn complete(&self, _s: &str, prompt: &str) -> liam_model::Result<String> {
-        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if n == 0 {
-            Err(liam_model::ModelError::Llm("boom".into()))
-        } else {
-            Ok(grounded_entity_reply(prompt))
-        }
-    }
-}
-
 /// Fresh in-memory server wired with the given llm, a 30s synthesis
 /// timeout, and the shipped default 8192-token context budget. Dims 8 to
 /// match `MockEmbedder::new(8)`.
 async fn server_with(llm: Arc<dyn Llm>) -> MemoryServer {
-    server_with_timeout(llm, 30, 8192).await
+    server_with_generation_limit(llm, 30, 8192, 1).await
 }
 
-/// Fresh in-memory server wired with the given llm/synthesis
-/// timeout/context budget, generation capped to 1 concurrent call (the
-/// shipped default). Dims 8 to match `MockEmbedder::new(8)`.
-async fn server_with_timeout(
-    llm: Arc<dyn Llm>,
-    synthesis_timeout_secs: u64,
-    context_tokens: usize,
-) -> MemoryServer {
-    server_with_generation_limit(llm, synthesis_timeout_secs, context_tokens, 1).await
-}
-
-/// As `server_with_timeout`, plus an explicit `max_concurrent_generations`
-/// for the tests in this module that exercise the generation semaphore
-/// itself; every other test goes through `server_with_timeout`'s fixed 1.
+/// As `server_with`, plus an explicit synthesis timeout, context budget and
+/// `max_concurrent_generations`, for the tests that exercise the generation
+/// semaphore itself; every other test goes through `server_with`'s fixed 1.
 async fn server_with_generation_limit(
     llm: Arc<dyn Llm>,
     synthesis_timeout_secs: u64,
@@ -281,7 +93,7 @@ async fn plain_server() -> MemoryServer {
 }
 
 /// Server backed by a `FixedClock`-driven store instead of the real
-/// clock `plain_server`/`server_with_timeout` use. WHY: the `as_of`
+/// clock `plain_server` uses. WHY: the `as_of`
 /// tests need to pin exact millisecond instants across two writes, and a
 /// real clock on an in-memory store is flaky at that resolution; the
 /// clock is handed back so a test can `.set()` it between writes. Same
@@ -359,18 +171,23 @@ fn remember_args(content: &str) -> RememberArgs {
 
 /// In-memory server over a recording embedder, plus that embedder.
 async fn server_with_recording_embedder() -> (MemoryServer, Arc<CountingEmbedder>) {
-    server_with_recording_embedder_and_llm(Arc::new(liam_model::MockLlm)).await
+    let embedder = Arc::new(CountingEmbedder::new(8));
+    (server_with_embedder(embedder.clone()).await, embedder)
 }
 
-async fn server_with_recording_embedder_and_llm(
-    llm: Arc<dyn Llm>,
-) -> (MemoryServer, Arc<CountingEmbedder>) {
+/// In-memory server over `embedder`, with the neutral llm.
+async fn server_with_embedder(embedder: Arc<dyn Embedder>) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(8))
         .await
         .expect("open in-memory store");
-    let embedder = Arc::new(CountingEmbedder::new(8));
-    let server = MemoryServer::new(Arc::new(store), embedder.clone(), llm, 30, 8192, 1);
-    (server, embedder)
+    MemoryServer::new(
+        Arc::new(store),
+        embedder,
+        Arc::new(liam_model::MockLlm),
+        30,
+        8192,
+        1,
+    )
 }
 
 fn recall_args_for(query: &str) -> RecallArgs {

@@ -35,8 +35,8 @@ mod test_doubles;
 #[cfg(test)]
 mod usage_tests;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use liam_daemon::consolidation::shared_store::SharedStore;
@@ -50,7 +50,7 @@ use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use self::delete::DeleteArgs;
@@ -58,7 +58,7 @@ use self::episode::{resolved_id, validate_episode, EpisodeArgs};
 use self::facts::FactsArgs;
 use self::feedback::{Feedback, FeedbackArgs};
 use self::metrics::MetricsArgs;
-use self::reply::ToolReply;
+use self::reply::{RecalledPage, ToolReply, PAGE_KIND};
 use self::summaries::SummariesArgs;
 use crate::clusters::{narrow_groups, render_clusters};
 use crate::config::{
@@ -68,14 +68,13 @@ use crate::config::{
 use crate::consolidation_job::ConsolidationJob;
 use crate::degraded::Degraded;
 use crate::deletion::DeletePreview;
+use crate::entity_page;
 use crate::metrics::recorder::{Metrics, ToolTimer};
 use crate::metrics::sink::{Stage, Tool};
 use crate::prompt::estimate_tokens;
-use crate::recall::{candidate_pool, clamp_recall_k};
+use crate::recall::{self, candidate_pool, clamp_recall_k};
 use crate::render;
-use crate::synthesis::{self, Evidence};
 use crate::tiering::usage::UsageRecorder;
-use crate::tuning::{AimdHandles, RollingWindow};
 
 /// Runs one store call under a read guard that lasts only for that call, and
 /// yields the call's `Result` (or the error of the store being unavailable).
@@ -147,10 +146,6 @@ async fn mention_basis(
     }
     Ok(basis.into_iter().collect())
 }
-
-/// Cap on entity-page synthesis output: a short compiled profile, not a
-/// full answer. Measured real output was ~55 tokens / ~270 chars.
-pub(crate) const ENTITY_SYNTHESIS_MAX_NEW_TOKENS: usize = 256;
 
 /// Default and upper bound on the number of mentions `timeline` shows.
 /// WHY: caller-supplied `limit` is otherwise unbounded, and each mention's
@@ -410,16 +405,14 @@ pub struct MemoryServer {
     store: Arc<SharedStore>,
     embedder: Arc<dyn Embedder>,
     llm: Arc<dyn Llm>,
-    /// Wall-clock deadline for one entity-page synthesis batch (permit acquire,
-    /// model load, generation); see `config::Config::ask_timeout_secs`, whose
+    /// Wall-clock deadline for one batch of entity-page builds (embedding the
+    /// mentions and the page); see `config::Config::ask_timeout_secs`, whose
     /// name predates the removal of `ask`.
     synthesis_timeout_secs: u64,
     /// Seconds `recall` may spend retrieving; see `retrieval_deadline`.
     recall_timeout_secs: u64,
-    /// Token budget entity synthesis trims mentions to before it builds its
-    /// prompt; see `config::LlmConfig::context_tokens`, which this must match so
-    /// a full-size prompt never overflows the model's own context window.
-    /// `clusters` reads this too, as one tenth of it (ADR-0002 S4).
+    /// The model's context window in tokens, see `config::LlmConfig::context_tokens`.
+    /// `clusters` takes one tenth of it as its output budget (ADR-0002 S4).
     context_tokens: usize,
     /// Event ids a provenance line lists before it counts the rest; see
     /// `config::SummaryConfig::max_basis_ids_rendered`.
@@ -427,24 +420,14 @@ pub struct MemoryServer {
     /// Least similarity of a query to a summary for `summaries` to list it; see
     /// `config::SummaryConfig::min_summary_similarity`.
     min_summary_similarity: f32,
-    /// Bounds how many entity syntheses may be inside a model call at once; see
+    /// Bounds how many generations may be inside a model call at once; see
     /// `config::LlmConfig::max_concurrent_generations`. A semaphore, not a
     /// lock, so an operator with memory headroom can raise the limit above 1
     /// instead of every request serializing permanently.
     generation_permits: Arc<Semaphore>,
-    /// AIMD latency samples from every entity-synthesis call, shared
-    /// process-wide: `Arc`-wrapped since `MemoryServer` clones per connection.
-    rolling_window: Arc<Mutex<RollingWindow>>,
-    /// Authoritative total permit count AIMD grows/shrinks against, distinct
+    /// Authoritative total permit count the cold-start benchmark sets, distinct
     /// from `generation_permits.available_permits()`.
     granted_capacity: Arc<AtomicUsize>,
-    /// The single shrink slot: `Some` while one permit is held back.
-    held_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
-    /// Single-flight guard so only one AIMD evaluation runs at a time.
-    evaluating: Arc<AtomicBool>,
-    /// The prior evaluation's window average, `None` until a second
-    /// evaluation has one to compare against.
-    previous_window_average: Arc<Mutex<Option<Duration>>>,
     /// Producer id stamped on every node this connection's `remember` calls
     /// write. Per-CONNECTION, unlike every field above it, which is set once
     /// for the process's whole lifetime: that mismatch is why this is not a
@@ -588,11 +571,7 @@ impl MemoryServer {
             max_basis_ids_rendered: DEFAULT_MAX_BASIS_IDS_RENDERED,
             min_summary_similarity: DEFAULT_MIN_SUMMARY_SIMILARITY,
             generation_permits: Arc::new(Semaphore::new(max_concurrent_generations)),
-            rolling_window: Arc::new(Mutex::new(RollingWindow::new())),
             granted_capacity: Arc::new(AtomicUsize::new(max_concurrent_generations)),
-            held_permit: Arc::new(Mutex::new(None)),
-            evaluating: Arc::new(AtomicBool::new(false)),
-            previous_window_average: Arc::new(Mutex::new(None)),
             producer: OnceLock::new(),
             shutdown: CancellationToken::new(),
             vocabulary: Arc::new(resolve_vocabulary(&ExtractionConfig::default())),
@@ -794,24 +773,6 @@ impl MemoryServer {
             .get()
             .await
             .map_err(|error| liam_store::Error::Backend(error.to_string()))
-    }
-
-    /// Bundles this connection's AIMD state for one evaluation to use.
-    fn aimd_handles(&self) -> AimdHandles {
-        AimdHandles {
-            generation_permits: self.generation_permits.clone(),
-            granted_capacity: self.granted_capacity.clone(),
-            held_permit: self.held_permit.clone(),
-            evaluating: self.evaluating.clone(),
-            previous_window_average: self.previous_window_average.clone(),
-        }
-    }
-
-    /// Test-only: exposes the shared window so a test can confirm entity
-    /// synthesis lands in the same one the tuner reads, not an independent copy.
-    #[cfg(test)]
-    pub(crate) fn rolling_window_handle(&self) -> Arc<Mutex<RollingWindow>> {
-        self.rolling_window.clone()
     }
 
     /// The producer id to stamp on this connection's writes right now:
@@ -1029,13 +990,7 @@ impl MemoryServer {
                         let server = self.clone();
                         let deadline = entity_synthesis_deadline;
                         handles.push(tokio::spawn(async move {
-                            server
-                                .resynthesize_entity(
-                                    entity_id,
-                                    deadline,
-                                    ENTITY_SYNTHESIS_MAX_NEW_TOKENS,
-                                )
-                                .await
+                            server.resynthesize_entity(entity_id, deadline).await
                         }));
                     }
                     for handle in handles {
@@ -1057,20 +1012,19 @@ impl MemoryServer {
         }
     }
 
-    /// Recompiles one entity's page from its mentions using `remember`'s
-    /// shared batch deadline; a failure is reported, never panicked.
+    /// Rebuilds one entity's page from its mentions within `remember`'s shared
+    /// batch deadline; a failure is reported, never panicked.
     pub(crate) async fn resynthesize_entity(
         &self,
         entity_id: liam_store::NodeId,
         deadline: tokio::time::Instant,
-        max_new_tokens: usize,
     ) -> Result<(), String> {
-        // Held through the model call: a rollback waits for it.
+        // Held through the embedder calls: a rollback waits for them.
         let store = self
             .store()
             .await
             .map_err(|e| format!("{}: {e}", entity_id.as_str()))?;
-        self.resynthesize_entity_as(&store, entity_id, deadline, max_new_tokens, None)
+        self.resynthesize_entity_as(&store, entity_id, deadline, None)
             .await
     }
 
@@ -1079,12 +1033,15 @@ impl MemoryServer {
     /// cancels the write and the supersession that comes with it. Works on the
     /// caller's `store`, never locking the slot again: a second read behind a
     /// queued restore would deadlock.
+    ///
+    /// The steps: read the entity and its recorded mentions, give each a
+    /// vector, build the page, embed it, write it. An entity with no mention
+    /// gets no page.
     pub(crate) async fn resynthesize_entity_as(
         &self,
         store: &DefaultGraph,
         entity_id: liam_store::NodeId,
         deadline: tokio::time::Instant,
-        max_new_tokens: usize,
         write_source: Option<&str>,
     ) -> Result<(), String> {
         let now = liam_store::Millis::now();
@@ -1092,43 +1049,62 @@ impl MemoryServer {
             Ok(Some(c)) => c,
             Ok(None) => {
                 return Err(format!(
-                    "{}: entity vanished before synthesis could run",
+                    "{}: entity vanished before its page could be built",
                     entity_id.as_str()
                 ))
             }
             Err(e) => return Err(format!("{}: {e}", entity_id.as_str())),
         };
         let label = candidate.label.clone();
-        let rows = match store.mentions(&entity_id, now, MENTIONS_FETCH_LIMIT).await {
-            Ok(rows) => rows,
-            Err(e) => return Err(format!("{label}: {e}")),
-        };
-        let mentions: Vec<Evidence> = rows.iter().map(Evidence::from_candidate).collect();
-        let synthesized = match synthesis::synthesize_entity(
-            &*self.llm,
-            &self.aimd_handles(),
-            &self.rolling_window,
+        self.write_page(store, candidate, deadline, write_source)
+            .await
+            .map_err(|e| format!("{label}: {e}"))
+    }
+
+    /// The steps after the entity is read; an error carries no entity label,
+    /// the caller adds it.
+    async fn write_page(
+        &self,
+        store: &DefaultGraph,
+        candidate: liam_store::Candidate,
+        deadline: tokio::time::Instant,
+        write_source: Option<&str>,
+    ) -> Result<(), String> {
+        let label = candidate.label.clone();
+        let mut rows = store
+            .mentions(
+                &candidate.id,
+                liam_store::Millis::now(),
+                MENTIONS_FETCH_LIMIT,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        // A summary or an earlier page that mentions the entity is derived
+        // text, so a page built from it would state a statement twice removed.
+        rows.retain(|row| !row.retrieved.is_inferred());
+        tracing::debug!(entity = %label, mentions = rows.len(), "building the entity page");
+        let mentions = tokio::time::timeout_at(deadline, self.page_mentions(store, &rows))
+            .await
+            .map_err(|_| "timed out embedding the mentions".to_string())??;
+        let page = entity_page::build_page(&candidate.kind, &candidate.label, &mentions);
+        if page.source_ids.is_empty() {
+            tracing::debug!(entity = %label, "the entity has no mention, so it gets no page");
+            return Ok(());
+        }
+        let sources: Vec<liam_store::Candidate> = rows
+            .into_iter()
+            .filter(|row| page.source_ids.contains(&row.id))
+            .collect();
+        let basis = mention_basis(store, &sources)
+            .await
+            .map_err(|e| e.to_string())?;
+        let embedding = tokio::time::timeout_at(
             deadline,
-            &candidate.kind,
-            &candidate.label,
-            &mentions,
-            self.context_tokens,
-            max_new_tokens,
+            self.embedder.embed(&page.text, TextKind::Document),
         )
         .await
-        {
-            Ok(synthesized) => synthesized,
-            Err(e) => return Err(format!("{label}: {e}")),
-        };
-        let new_content = synthesized.profile;
-        let basis = match mention_basis(store, &rows[..synthesized.mentions_kept]).await {
-            Ok(basis) => basis,
-            Err(e) => return Err(format!("{label}: {e}")),
-        };
-        let embedding = match self.embedder.embed(&new_content, TextKind::Document).await {
-            Ok(v) => v,
-            Err(e) => return Err(format!("{label}: {e}")),
-        };
+        .map_err(|_| "timed out embedding the page".to_string())?
+        .map_err(|e| e.to_string())?;
         let mut node = NewNode::entity(candidate.kind, candidate.label)
             .with_attributes(candidate.attributes)
             .with_embedding(embedding)
@@ -1137,11 +1113,41 @@ impl MemoryServer {
         if let Some(scope) = candidate.scope.clone() {
             node = node.with_scope(scope);
         }
-        node.content = new_content;
-        match store.upsert_by(node).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("{label}: {e}")),
+        node.content = page.text;
+        store
+            .upsert_by(node)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Each row as a page mention: with the vector the store holds for it, or
+    /// one from the embedder when the store holds none (a demoted memory).
+    async fn page_mentions(
+        &self,
+        store: &DefaultGraph,
+        rows: &[liam_store::Candidate],
+    ) -> Result<Vec<entity_page::Mention>, String> {
+        let mut mentions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let text = row.retrieved.as_text().to_string();
+            let stored = store.embedding(&row.id).await.map_err(|e| e.to_string())?;
+            let embedding = match stored {
+                Some(vector) => vector,
+                None => self
+                    .embedder
+                    .embed(&text, TextKind::Document)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            };
+            mentions.push(entity_page::Mention {
+                id: row.id.clone(),
+                valid_from_ms: row.valid_from.0,
+                text,
+                embedding,
+            });
         }
+        Ok(mentions)
     }
 
     // `pub(crate)` so the tool-eval grounding harness (see `tool_eval.rs`) drives
@@ -1215,11 +1221,12 @@ impl MemoryServer {
                 args.scope,
                 embedding,
                 args.as_of,
-            );
+            )
+            .with_inferred(true);
             (self.explained(&q).await, embed_degraded)
         };
         let (hits, embed_degraded) = match until_interrupted(deadline, &cancel, retrieve).await {
-            Ok((Ok(h), degraded)) => (h, degraded),
+            Ok((Ok(h), degraded)) => (recall::only_recalled(h), degraded),
             Ok((Err(e), _)) => return ToolReply::failed(format!("recall failed: {e}")),
             Err(why) => return self.interruption_reply("recall", why),
         };
@@ -1252,6 +1259,9 @@ impl MemoryServer {
                         trailing.push(format!("attributes: {}", hit.hit.attributes));
                     }
                 }
+                if hit.hit.retrieved.is_inferred() {
+                    trailing.push(format!("kind: {PAGE_KIND}"));
+                }
                 let head =
                     render::bracket_head(&hit.hit.kind, hit.hit.id.handle(), &hit.hit.label, None);
                 render::render_item(
@@ -1263,7 +1273,11 @@ impl MemoryServer {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        with_reasons(ToolReply::ok(text), [embed_degraded])
+        let pages = shown
+            .iter()
+            .filter_map(|hit| RecalledPage::of(hit.hit.id.handle(), &hit.hit.retrieved))
+            .collect();
+        with_reasons(ToolReply::ok(text).with_pages(pages), [embed_degraded])
     }
 
     #[tool(

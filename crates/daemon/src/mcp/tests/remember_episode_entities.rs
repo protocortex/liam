@@ -103,10 +103,8 @@ async fn remember_with_episode_edge_references_the_correct_entity_among_several(
     // mentions edge from "entity:1" to "fact:1". Combined indices: 0 =
     // top-level fact, 1 = the nested fact, 2 = entity 0, 3 = entity 1, so
     // this exercises the nontrivial `1 + fact_count + j` arithmetic on
-    // the entity side. Uses `CountingLlm` instead of `plain_server`'s
-    // `MockLlm` because this episode triggers entity synthesis, which
-    // `MockLlm`'s echo cannot pass `is_grounded`.
-    let server = server_with(Arc::new(CountingLlm::new())).await;
+    // the entity side.
+    let server = plain_server().await;
 
     // When remember is called
     let out = server
@@ -258,11 +256,8 @@ async fn remember_with_a_full_mixed_episode_round_trips_through_mcp() {
     // Given a prior, separate `remember` call establishing entity
     // "Grace" as live, and a separate fact remembered before this
     // episode, so this episode's third edge can reference it by its
-    // handle string rather than an episode-local index. Uses
-    // `CountingLlm` instead of `plain_server`'s `MockLlm` because this
-    // episode triggers entity synthesis, which `MockLlm`'s echo cannot
-    // pass `is_grounded`.
-    let server = server_with(Arc::new(CountingLlm::new())).await;
+    // handle string rather than an episode-local index.
+    let server = plain_server().await;
 
     let prior_entity_out = server
         .remember(Parameters(RememberArgs {

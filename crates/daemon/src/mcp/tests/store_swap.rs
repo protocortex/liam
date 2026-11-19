@@ -27,8 +27,7 @@ const BOUND: Duration = Duration::from_secs(10);
 #[tokio::test]
 async fn resynthesis_on_the_callers_store_finishes_while_a_restore_is_queued() {
     // Arrange: the caller holds a read guard and a writer queues behind it
-    let (server, _embedder) =
-        server_with_recording_embedder_and_llm(Arc::new(CountingLlm::new())).await;
+    let server = plain_server().await;
     let shared = server.shared_store();
     let guard = server.store().await.unwrap();
     let entity_id = guard
@@ -45,7 +44,7 @@ async fn resynthesis_on_the_callers_store_finishes_while_a_restore_is_queued() {
     // Act: a second read behind the queued writer would never return
     let resynthesized = tokio::time::timeout(
         BOUND,
-        server.resynthesize_entity_as(&guard, entity_id, deadline, 64, None),
+        server.resynthesize_entity_as(&guard, entity_id, deadline, None),
     )
     .await;
     drop(guard);

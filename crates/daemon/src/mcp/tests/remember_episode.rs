@@ -756,3 +756,23 @@ async fn remember_with_episode_entities_upserts_by_name_across_calls() {
         "second entity's id should be live"
     );
 }
+
+#[tokio::test]
+async fn remember_with_episode_names_an_edge_handle_that_matches_no_memory() {
+    // Arrange: an edge whose far end is a handle no memory has
+    let server = plain_server().await;
+    let args = RememberArgs {
+        episode: Some(EpisodeArgs {
+            facts: vec![episode_fact("episode unknown handle content")],
+            entities: vec![],
+            edges: vec![episode_edge("fact:1", "ZZZZZZZZ", "relates_to")],
+        }),
+        ..remember_args("episode unknown handle top content")
+    };
+
+    // Act
+    let out = server.remember(Parameters(args)).await;
+
+    // Assert: the call fails and says which side of which edge did not resolve
+    assert!(out.starts_with("remember failed: edge 0: to:"), "{out}");
+}

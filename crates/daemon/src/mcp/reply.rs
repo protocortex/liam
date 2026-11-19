@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use liam_store::{Basis, EventRef, Retrieved};
 use rmcp::handler::server::common::schema_for_type;
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject};
 use schemars::JsonSchema;
@@ -15,21 +16,59 @@ pub const DEGRADED_MARKER_PREFIX: &str = "(degraded: ";
 const MARKER_SUFFIX: &str = ")";
 const REASON_SEPARATOR: &str = "; ";
 
-/// Shape of the structured content a `recall` reply carries.
+/// The `kind` an entity page carries in a `recall` reply. A memory has none.
+pub const PAGE_KIND: &str = "entity_page";
+
+/// An entity page among the results of a `recall`: dated lines cut from the
+/// recorded memories of one entity, never rewritten, and not itself a memory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct RecalledPage {
+    /// The handle in the page's bracket.
+    pub handle: String,
+    /// Always `entity_page`.
+    pub kind: String,
+    /// Ids of the events of the memories the page was built from, the same ids
+    /// those memories list as their events.
+    pub basis: Vec<String>,
+}
+
+impl RecalledPage {
+    /// The page for a hit with this `handle`, or `None` for a recorded memory.
+    pub fn of(handle: &str, retrieved: &Retrieved) -> Option<Self> {
+        let Retrieved::Inferred(hit) = retrieved else {
+            return None;
+        };
+        let events: &[EventRef] = match &hit.basis {
+            Basis::Known(events) => events,
+            Basis::Unknown => &[],
+        };
+        Some(Self {
+            handle: handle.to_string(),
+            kind: PAGE_KIND.to_string(),
+            basis: events.iter().map(|event| event.event_id.clone()).collect(),
+        })
+    }
+}
+
+/// Shape of the structured content a `recall` reply carries. `pages` is left
+/// out when no result is an entity page, so a reply of memories keeps its shape.
 #[derive(Serialize, JsonSchema)]
-struct DegradedOutput {
+struct RecallOutput {
     degraded: Vec<Degraded>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pages: Vec<RecalledPage>,
 }
 
 /// The JSON schema advertised as the output schema of `recall`.
 pub fn output_schema() -> Arc<JsonObject> {
-    schema_for_type::<DegradedOutput>()
+    schema_for_type::<RecallOutput>()
 }
 
 /// A tool's text body with the reasons it is degraded and whether it failed.
 pub struct ToolReply {
     text: String,
     degraded: Vec<Degraded>,
+    pages: Vec<RecalledPage>,
     is_error: bool,
 }
 
@@ -39,6 +78,7 @@ impl ToolReply {
         Self {
             text: text.into(),
             degraded: Vec::new(),
+            pages: Vec::new(),
             is_error: false,
         }
     }
@@ -56,6 +96,13 @@ impl ToolReply {
         if !self.degraded.contains(&reason) {
             self.degraded.push(reason);
         }
+        self
+    }
+
+    /// Lists the entity pages among the results the text shows, for a client
+    /// that reads structure.
+    pub fn with_pages(mut self, pages: Vec<RecalledPage>) -> Self {
+        self.pages = pages;
         self
     }
 
@@ -85,8 +132,9 @@ impl ToolReply {
         };
         let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
         result.structured_content = Some(
-            serde_json::to_value(DegradedOutput {
+            serde_json::to_value(RecallOutput {
                 degraded: self.degraded,
+                pages: self.pages,
             })
             .expect("a list of reason names always serializes"),
         );
@@ -219,5 +267,73 @@ mod tests {
             );
             assert_eq!(result.structured_content, Some(json!({"degraded": [name]})));
         }
+    }
+
+    #[test]
+    fn a_reply_with_pages_lists_them_and_one_without_keeps_its_shape() {
+        // Arrange
+        let page = RecalledPage {
+            handle: "h1".to_string(),
+            kind: PAGE_KIND.to_string(),
+            basis: vec!["e1".to_string()],
+        };
+
+        // Act
+        let with = ToolReply::ok(BODY)
+            .with_pages(vec![page])
+            .into_call_result();
+        let without = ToolReply::ok(BODY).into_call_result();
+
+        // Assert
+        assert_eq!(
+            with.structured_content,
+            Some(json!({
+                "degraded": [],
+                "pages": [{"handle": "h1", "kind": "entity_page", "basis": ["e1"]}]
+            }))
+        );
+        assert_eq!(without.structured_content, Some(json!({"degraded": []})));
+    }
+
+    #[test]
+    fn output_schema_describes_pages_without_requiring_them() {
+        // Arrange / Act
+        let schema = serde_json::Value::Object((*output_schema()).clone());
+
+        // Assert
+        assert_eq!(schema["required"], json!(["degraded"]));
+        assert_eq!(schema["properties"]["pages"]["type"], json!("array"));
+    }
+
+    #[test]
+    fn only_an_inferred_hit_is_a_page_and_its_basis_is_its_event_ids() {
+        // Arrange
+        let recorded = Retrieved::Recorded(liam_store::RecordedHit {
+            content: liam_store::RecordedText::for_test("said so"),
+            events: Vec::new(),
+            derivation: liam_store::Derivation::Recorded,
+        });
+        let page = |basis| {
+            Retrieved::Inferred(liam_store::InferredHit {
+                text: liam_store::InferredText::for_test("page"),
+                basis,
+                derivation: liam_store::Derivation::Inferred,
+                summary_level: None,
+            })
+        };
+        let event = |id: &str| EventRef {
+            event_id: id.to_string(),
+            synthetic: false,
+        };
+
+        // Act
+        let none = RecalledPage::of("h", &recorded);
+        let known = RecalledPage::of("h", &page(Basis::Known(vec![event("e1"), event("e2")])));
+        let unknown = RecalledPage::of("h", &page(Basis::Unknown));
+
+        // Assert
+        assert_eq!(none, None);
+        assert_eq!(known.unwrap().basis, ["e1", "e2"]);
+        assert!(unknown.unwrap().basis.is_empty());
     }
 }

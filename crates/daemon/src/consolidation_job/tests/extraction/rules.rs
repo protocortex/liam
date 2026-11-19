@@ -93,7 +93,7 @@ async fn rules_only_extraction_writes_mention_facts_and_starts_no_model() {
     let harness = Harness::new();
     let server = with_ada(&harness, 2).await;
     let store = server.store().await.unwrap();
-    let last_event = store.last_applied_offset().await.unwrap();
+    let last_note = store.last_applied_offset().await.unwrap();
     let provider = ProviderDouble::new();
     let part = extraction_part(
         &harness,
@@ -108,10 +108,11 @@ async fn rules_only_extraction_writes_mention_facts_and_starts_no_model() {
     // Act
     let outcome = job.tick().await;
 
-    // Assert
+    // Assert: the rules read through the notes, and through the pages the
+    // run wrote before them
     assert_eq!(outcome, Some(RunOutcome::Committed));
     assert_eq!(mention_facts(&store).await.len(), 2);
-    assert_eq!(rules_cursor_of(&store).await, last_event);
+    assert!(rules_cursor_of(&store).await > last_note);
     assert_eq!(cursor_of(&store).await, None);
     assert_eq!(provider.opens(), 0);
 }

@@ -41,11 +41,6 @@ pub fn bracket_head(kind: &str, handle: &str, label: &str, known_since_ms: Optio
     with_known_since(head, known_since_ms)
 }
 
-/// `[{n}] ({kind}) {label} — known since {date}`, the head of an evidence block.
-pub fn evidence_head(n: usize, kind: &str, label: &str, known_since_ms: i64) -> String {
-    with_known_since(format!("[{n}] ({kind}) {label}"), Some(known_since_ms))
-}
-
 fn with_known_since(head: String, known_since_ms: Option<i64>) -> String {
     match known_since_ms {
         Some(ms) => format!("{head} — known since {}", fmt_millis(ms)),
