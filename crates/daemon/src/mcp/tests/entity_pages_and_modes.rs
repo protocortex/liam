@@ -23,7 +23,7 @@ async fn fact_and_page(server: &MemoryServer) -> liam_store::NodeId {
 }
 
 #[tokio::test]
-async fn recall_returns_an_entity_page_marked_as_one_and_still_refuses_infer_mode() {
+async fn recall_leaves_out_an_entity_page_and_refuses_infer_mode() {
     // Arrange
     let server = plain_server().await;
     fact_and_page(&server).await;
@@ -39,167 +39,11 @@ async fn recall_returns_an_entity_page_marked_as_one_and_still_refuses_infer_mod
 
     // Assert
     assert!(default.contains("green tea"), "{default}");
-    let page = default
-        .split("\n\n")
-        .find(|block| block.contains("zorbnax profile"))
-        .unwrap_or_else(|| panic!("no page in {default}"));
-    assert!(page.contains("kind: entity_page"), "{page}");
-    assert!(page.contains("derivation: inferred"), "{page}");
+    assert!(!default.contains("profile"), "{default}");
     assert!(
         infer.starts_with("recall failed") && infer.contains("mode infer"),
         "{infer}"
     );
-}
-
-const AXES: usize = 8;
-
-fn axis(axis: usize) -> Vec<f32> {
-    let mut vector = vec![0.0; AXES];
-    vector[axis] = 1.0;
-    vector
-}
-
-/// The recall text split into its result blocks.
-fn blocks(text: &str) -> Vec<&str> {
-    text.split("\n\n").collect()
-}
-
-#[tokio::test]
-async fn a_page_outranks_the_stale_memory_for_a_latest_state_question_and_names_its_sources() {
-    // Arrange: an older and a newer memory of one entity, a page built from both
-    let server = plain_server().await;
-    let store = server.store().await.unwrap();
-    let kim = store
-        .upsert_by(NewNode::entity("person", "Kim"))
-        .await
-        .unwrap();
-    let day = 86_400_000;
-    let mut origins = Vec::new();
-    for (index, (text, days)) in [
-        ("Kim lives in Lisbon.", 1),
-        ("Kim moved to Porto in May.", 2),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let id = store
-            .insert(
-                NewNode::now("fact", "Home", text)
-                    .with_valid_from(liam_store::Millis(days * day))
-                    .with_embedding(axis(index)),
-            )
-            .await
-            .unwrap();
-        store.relate(&kim, &id, relation::MENTIONS).await.unwrap();
-        origins.extend(
-            store
-                .node_event_ids(&id, liam_store::EventRole::Origin)
-                .await
-                .unwrap(),
-        );
-    }
-    server
-        .resynthesize_entity_as(
-            &store,
-            kim,
-            tokio::time::Instant::now() + Duration::from_secs(5),
-            None,
-        )
-        .await
-        .unwrap();
-    drop(store);
-
-    // Act
-    let reply = server
-        .recall_with(
-            RecallArgs {
-                query: "Kim lives Lisbon moved Porto May".to_string(),
-                ..recall_args()
-            },
-            CancellationToken::new(),
-        )
-        .await;
-    let result = reply.into_call_result();
-
-    // Assert: the page comes before the stale memory and says what it is
-    let text = result.content[0].as_text().unwrap().text.clone();
-    let shown = blocks(&text);
-    let page = shown
-        .iter()
-        .position(|b| b.contains("kind: entity_page"))
-        .unwrap_or_else(|| panic!("no page in {text}"));
-    let stale = shown
-        .iter()
-        .position(|b| b.lines().nth(1) == Some("Kim lives in Lisbon."))
-        .unwrap_or_else(|| panic!("no stale memory in {text}"));
-    assert!(page < stale, "{text}");
-    assert!(
-        shown[page].contains("1970-01-02: Kim lives in Lisbon."),
-        "{text}"
-    );
-    assert!(
-        shown[page].contains("1970-01-03: Kim moved to Porto in May."),
-        "{text}"
-    );
-    let structured = result.structured_content.unwrap();
-    let pages = structured["pages"].as_array().expect("pages");
-    assert_eq!(pages.len(), 1, "{structured}");
-    assert_eq!(pages[0]["kind"], "entity_page");
-    assert_eq!(
-        pages[0]["basis"],
-        json!(origins
-            .iter()
-            .map(|e| e.event_id.clone())
-            .collect::<Vec<_>>())
-    );
-}
-
-#[tokio::test]
-async fn a_recall_of_memories_alone_keeps_its_text_and_structure() {
-    // Arrange
-    let server = plain_server().await;
-    seed(&server, "fact", "Tea", "recall shape probe likes green tea").await;
-
-    // Act
-    let result = server
-        .recall_with(
-            RecallArgs {
-                query: "green tea".to_string(),
-                ..recall_args()
-            },
-            CancellationToken::new(),
-        )
-        .await
-        .into_call_result();
-
-    // Assert
-    let text = result.content[0].as_text().unwrap().text.clone();
-    assert!(!text.contains("kind:"), "{text}");
-    assert_eq!(result.structured_content, Some(json!({"degraded": []})));
-}
-
-#[tokio::test]
-async fn an_entity_with_no_page_yet_is_not_shown_by_recall() {
-    // Arrange: an entity row with no text, found by its label
-    let server = plain_server().await;
-    server
-        .store()
-        .await
-        .unwrap()
-        .upsert_by(NewNode::entity("person", "Zorbnax"))
-        .await
-        .unwrap();
-
-    // Act
-    let out = server
-        .recall(Parameters(RecallArgs {
-            query: "zorbnax".to_string(),
-            ..recall_args()
-        }))
-        .await;
-
-    // Assert
-    assert_eq!(out, "no relevant memory");
 }
 
 #[tokio::test]

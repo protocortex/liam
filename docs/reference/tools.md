@@ -30,37 +30,14 @@ documented in the pages linked here:
 | `scope` | no | Partition by project or agent. Trimmed; ASCII letters, digits, `-`, `_`, `/`; up to 200 characters; no leading/trailing `/` or empty segment (`//`). |
 | `subject` | no | Identity. A new value with the same subject supersedes the old. |
 
-`recall` retrieves the best matches in store order: recorded memories, then entity pages added among them, which are marked as pages (see [Reading modes](../concepts/reading-modes.md#entity-pages)). A reply holds up to `k` recorded memories plus up to 2 pages, so it can hold more than `k` entries. It never returns summaries.
+`recall` retrieves the best matches in store order.
 
 | Field | Required | Notes |
 |---|---|---|
 | `query` | yes | Text; embedded for the vector channel too. Up to 4000 characters; empty, whitespace-only and NUL-containing queries are rejected. Only the first 64 distinct words (case-insensitive) reach the lexical channel; words past the 64th distinct one reach only the vector arm. |
 | `kind` | no | Restrict to one kind. |
 | `scope` | no | Restrict to one partition. Same format as `remember`'s `scope`. |
-| `k` | no | How many recorded memories to return (default 8, range 1 to 32; larger values are clamped to 32), not counting the up to 2 pages added to them. Recall fuses a pool of twice `k`, at least 16 and at most 32, then returns the first `k`. |
-
-## Result kinds
-
-Each result opens with its bracket `[kind handle]` and ends with a `provenance:` line. A result that is an entity page, not a memory, has one more line before the provenance line:
-
-```text
-[person 01M7TB30K3M8N] Kim
-Kim (person)
-1970-01-02: Kim lives in Lisbon.
-1970-01-03: Kim moved to Porto in May.
-kind: entity_page
-provenance: derivation: inferred; basis: 01a1f4b1...
-```
-
-`feedback` takes the handle of a page as it does that of a memory: the verdict is recorded against the page's entity.
-
-The structured content of the reply lists the pages among the results, next to `degraded`. The `pages` list is left out when no result is a page.
-
-| Field of a `pages` item | Meaning |
-|---|---|
-| `handle` | The handle in the page's bracket. |
-| `kind` | Always `entity_page`. |
-| `basis` | Ids of the events of the memories the page was built from. A memory lists the same ids as its `events`. |
+| `k` | no | How many hits to return (default 8, range 1 to 32; larger values are clamped to 32). Recall fuses a pool of twice `k`, at least 16 and at most 32, then returns the first `k`. |
 
 ## Degraded replies
 
@@ -84,7 +61,8 @@ Each degraded reason also adds one to the `degraded_replies` metric, labelled wi
 the tool and the reason. See [Metrics and alerts](../operations/metrics-and-alerts.md).
 
 `timeline` shows an entity's compiled page and the mentions behind it, most
-recent first.
+recent first. The page is built from the stored sentences about the entity, never
+from text a model wrote (see [Reading modes](../concepts/reading-modes.md#entity-pages)).
 
 | Field | Required | Notes |
 |---|---|---|

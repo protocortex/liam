@@ -290,7 +290,7 @@ fn a_mention_with_newlines_stays_on_one_line_and_cannot_pose_as_a_dated_line() {
 }
 
 #[test]
-fn the_marker_is_added_to_attributes_kept_and_hidden_from_a_reader() {
+fn the_marker_is_added_to_attributes_and_a_legacy_page_is_text_without_it() {
     // Arrange
     let attributes = serde_json::json!({"role": "engineer"});
 
@@ -301,7 +301,8 @@ fn the_marker_is_added_to_attributes_kept_and_hidden_from_a_reader() {
     assert!(!is_stamped(&attributes));
     assert!(is_stamped(&stamped_attributes));
     assert_eq!(stamped_attributes["role"], "engineer");
-    assert_eq!(unstamped(&stamped_attributes), attributes);
     assert!(is_stamped(&stamped(serde_json::Value::Null)));
-    assert_eq!(unstamped(&serde_json::Value::Null), serde_json::Value::Null);
+    assert!(is_legacy_page("old profile", &attributes));
+    assert!(!is_legacy_page("old profile", &stamped_attributes));
+    assert!(!is_legacy_page("", &attributes));
 }

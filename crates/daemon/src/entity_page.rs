@@ -97,13 +97,10 @@ pub fn is_stamped(attributes: &Value) -> bool {
     attributes.get(PAGE_MARKER_KEY).is_some()
 }
 
-/// `attributes` of a page as a reader sees them, without the marker.
-pub fn unstamped(attributes: &Value) -> Value {
-    let mut shown = attributes.clone();
-    if let Value::Object(map) = &mut shown {
-        map.remove(PAGE_MARKER_KEY);
-    }
-    shown
+/// True for a row that holds page text the builder did not write: an earlier
+/// version had a model compose it.
+pub fn is_legacy_page(text: &str, attributes: &Value) -> bool {
+    !text.is_empty() && !is_stamped(attributes)
 }
 
 /// `text` cut to at most `limit` characters, ending in the cut marker when
@@ -187,7 +184,5 @@ pub fn build_page(kind: &str, name: &str, mentions: &[Mention]) -> EntityPage {
     }
 }
 
-#[cfg(test)]
-mod evaluation;
 #[cfg(test)]
 mod tests;

@@ -414,7 +414,8 @@ impl World {
             }
         }
         let fact = notes[0].clone();
-        let mut page = NewNode::entity("person", PAGE_SENTINEL);
+        let mut page = NewNode::entity("person", PAGE_SENTINEL)
+            .with_attributes(crate::entity_page::stamped(serde_json::json!({})));
         page.content = format!("{PAGE_SENTINEL} profile: ledger notes cover quarterly forecasts");
         let page = store.upsert_by(page).await.unwrap();
         store

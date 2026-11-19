@@ -14,7 +14,7 @@ mod as_of_and_round_trips;
 mod clusters_and_timeline;
 mod entity_page_build;
 mod entity_pages_and_modes;
-mod entity_pages_in_recall;
+mod entity_pages_in_timeline;
 mod error_replies;
 mod generation_limit;
 mod query_limits_and_embed_kinds;

@@ -145,7 +145,8 @@ async fn timeline_returns_compiled_content_and_mentions_most_recent_first() {
     // at two different instants
     let clock = Arc::new(FixedClock::new(Millis(1000)));
     let server = server_with_clock(clock.clone()).await;
-    let mut entity_node = NewNode::entity("person", "Ada Lovelace");
+    let mut entity_node = NewNode::entity("person", "Ada Lovelace")
+        .with_attributes(crate::entity_page::stamped(json!({})));
     entity_node.content = "compiled bio of ada".to_string();
     let entity_id = server
         .store()

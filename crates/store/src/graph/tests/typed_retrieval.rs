@@ -201,21 +201,3 @@ async fn cluster_groups_leave_out_a_page_when_strict_and_keep_the_stored_assignm
     assert!(strict.iter().flatten().all(|m| m.id != page));
     assert_eq!(g.communities().await.unwrap(), before);
 }
-
-#[tokio::test]
-async fn a_strict_query_does_not_pull_in_a_page_that_mentions_a_matched_fact() {
-    // Arrange: a page that mentions the fact the query matches
-    let g = open().await;
-    let matched = g.insert(fact("zorbnax likes tea")).await.unwrap();
-    let page = g.insert(page("Kim", "kim profile")).await.unwrap();
-    g.relate(&page, &matched, MENTIONS).await.unwrap();
-    let query = Query::text("zorbnax");
-
-    // Act
-    let strict = g.query_explained(&query).await.unwrap();
-    let inferring = g.query_explained(&query.with_inferred(true)).await.unwrap();
-
-    // Assert
-    assert_eq!(texts(&strict), ["zorbnax likes tea"]);
-    assert_eq!(texts(&inferring), ["kim profile", "zorbnax likes tea"]);
-}

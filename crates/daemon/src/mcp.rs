@@ -58,7 +58,7 @@ use self::episode::{resolved_id, validate_episode, EpisodeArgs};
 use self::facts::FactsArgs;
 use self::feedback::{Feedback, FeedbackArgs};
 use self::metrics::MetricsArgs;
-use self::reply::{RecalledPage, ToolReply, PAGE_KIND};
+use self::reply::ToolReply;
 use self::summaries::SummariesArgs;
 use crate::clusters::{narrow_groups, render_clusters};
 use crate::config::{
@@ -72,7 +72,7 @@ use crate::entity_page;
 use crate::metrics::recorder::{Metrics, ToolTimer};
 use crate::metrics::sink::{Stage, Tool};
 use crate::prompt::estimate_tokens;
-use crate::recall::{self, candidate_pool, clamp_recall_k};
+use crate::recall::{candidate_pool, clamp_recall_k};
 use crate::render;
 use crate::tiering::usage::UsageRecorder;
 
@@ -682,16 +682,6 @@ impl MemoryServer {
         Ok(hits)
     }
 
-    /// The ranking of recorded and inferred rows together for `q`, which says
-    /// where a page stands against the memories.
-    async fn explained_with_pages(
-        &self,
-        q: &Query,
-    ) -> Result<Vec<liam_store::ExplainedHit>, liam_store::Error> {
-        let joint = q.clone().with_inferred(true);
-        on_store!(self, |store| store.query_explained(&joint))
-    }
-
     /// Makes the results a client is shown ones it can give a verdict on.
     fn issue_handles<'a>(&self, nodes: impl IntoIterator<Item = &'a NodeId>) {
         if let Some(feedback) = &self.feedback {
@@ -1241,29 +1231,17 @@ impl MemoryServer {
                 embedding,
                 args.as_of,
             );
-            // The memories come from a query that never ranks a page, so a
-            // page cannot change which memories are returned or in what order.
-            let recorded = self.explained(&q).await;
-            let found = match recorded {
-                Ok(recorded) => self
-                    .explained_with_pages(&q)
-                    .await
-                    .map(|pages| (recorded, pages)),
-                Err(e) => Err(e),
-            };
-            (found, embed_degraded)
+            (self.explained(&q).await, embed_degraded)
         };
-        let (shown, embed_degraded) = match until_interrupted(deadline, &cancel, retrieve).await {
-            Ok((Ok((recorded, pages)), degraded)) => {
-                (recall::with_pages(recorded, pages, k), degraded)
-            }
+        let (hits, embed_degraded) = match until_interrupted(deadline, &cancel, retrieve).await {
+            Ok((Ok(h), degraded)) => (h, degraded),
             Ok((Err(e), _)) => return ToolReply::failed(format!("recall failed: {e}")),
             Err(why) => return self.interruption_reply("recall", why),
         };
-        if shown.is_empty() {
+        if hits.is_empty() {
             return with_reasons(ToolReply::ok("no relevant memory"), [embed_degraded]);
         }
-        let shown = &shown[..];
+        let shown = &hits[..hits.len().min(k)];
         // Usage and handles cover only the hits returned, not the wider pool.
         self.record_usage(shown.iter().filter(|h| !h.expanded).map(|h| &h.hit.id));
         self.issue_handles(shown.iter().map(|h| &h.hit.id));
@@ -1284,14 +1262,10 @@ impl MemoryServer {
                 if hit.confidence != 1.0 {
                     trailing.push(format!("confidence: {:.2}", hit.confidence));
                 }
-                let attributes = recall::shown_attributes(hit);
-                if let serde_json::Value::Object(map) = &attributes {
+                if let serde_json::Value::Object(map) = &hit.hit.attributes {
                     if !map.is_empty() {
-                        trailing.push(format!("attributes: {attributes}"));
+                        trailing.push(format!("attributes: {}", hit.hit.attributes));
                     }
-                }
-                if hit.hit.retrieved.is_inferred() {
-                    trailing.push(format!("kind: {PAGE_KIND}"));
                 }
                 let head =
                     render::bracket_head(&hit.hit.kind, hit.hit.id.handle(), &hit.hit.label, None);
@@ -1304,11 +1278,7 @@ impl MemoryServer {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        let pages = shown
-            .iter()
-            .filter_map(|hit| RecalledPage::of(hit.hit.id.handle(), &hit.hit.retrieved))
-            .collect();
-        with_reasons(ToolReply::ok(text).with_pages(pages), [embed_degraded])
+        with_reasons(ToolReply::ok(text), [embed_degraded])
     }
 
     #[tool(
@@ -1420,12 +1390,18 @@ impl MemoryServer {
         if truncated {
             mentions.truncate(limit);
         }
-        let header = render::render_item(
-            &render::bracket_head(&entity.kind, id.handle(), &entity.label, None),
-            &entity.retrieved,
-            &[],
-            self.max_basis_ids_rendered,
-        );
+        let head = render::bracket_head(&entity.kind, id.handle(), &entity.label, None);
+        // A page a model composed is never shown, so the header carries no text
+        // until the next maintenance tick replaces it.
+        let header = if entity.retrieved.is_inferred()
+            && entity_page::is_legacy_page(entity.retrieved.as_text(), &entity.attributes)
+        {
+            let provenance =
+                render::provenance_line(&entity.retrieved, self.max_basis_ids_rendered);
+            format!("{head}\n\n{provenance}")
+        } else {
+            render::render_item(&head, &entity.retrieved, &[], self.max_basis_ids_rendered)
+        };
         let mentions_section = if mentions.is_empty() {
             "no mentions yet".to_string()
         } else {
