@@ -4,9 +4,6 @@
 - **Date created:** 2026-11-20
 - **Date modified:** 2026-11-20
 
-The file name keeps the working title from the first draft, which proposed
-returning pages from `recall`. That was tried and is not shipped.
-
 ## Context
 
 An entity page was a short profile the in-process 1.5B model wrote from the
@@ -99,15 +96,18 @@ memories per entity, and the owner chose not to ship pages in `recall`.
    collapsed to one space so it stays on its own line. The builder is a pure
    function of the memories, their dates and their vectors.
 2. **Vectors.** The builder uses the vector the store holds for each memory and
-   asks the embedder only for a memory with none, as a demoted one has.
+   asks the embedder only for a memory with none, as a demoted one has. The page
+   itself is not embedded.
 3. **The page row keeps its basis and staleness.** The row records the origin
    events of the memories on the page. An entity with no recorded mention gets
    no page.
 4. **`timeline` shows pages and `recall` is unchanged.** `recall`, its input and
    output schemas and its ranking are as before: it never returns a page or a
-   summary. The store keeps its ability to rank inferred rows through
-   `include_inferred`. Whether pages come to `recall` later needs a new
-   measurement and a new ADR.
+   summary. A written page is not indexed for text search and has no vector, so
+   it cannot move the ranking statistics of recorded memory or take a place in a
+   search. The store keeps its ability to rank inferred rows through
+   `include_inferred`, by vector only. Whether pages come to `recall` later
+   needs a new measurement and a new ADR.
 5. **Config keys.** `gc.full_synthesis_mention_threshold` and
    `gc.full_synthesis_max_new_tokens` are removed: an old line is ignored and
    logs one warning at start. `gc.max_resynth_per_tick` and `ask_timeout_secs`
@@ -124,8 +124,10 @@ memories per entity, and the owner chose not to ship pages in `recall`.
    treats it as stale, after the stale entities and within
    `gc.max_resynth_per_tick`, and replaces it with a new page. The old row, and
    any further live row of that entity, is closed. A legacy page of an entity
-   with no recorded mention in its scope stays, shows no text, and is tried
-   again each tick, because no page can replace it.
+   with no recorded mention in its scope is replaced by an entity row with no
+   text, so it is not tried again and cannot fill the slots of the pages that
+   can be rebuilt. A failed lookup of legacy pages is logged and leaves the
+   stale entities due.
 8. **Scope.** A scoped entity's page is built only from mentions whose scope is
    the entity's scope or inside it, the same hierarchy a scoped read uses. An
    entity with no mention in its scope gets no page. An unscoped entity's page
@@ -133,6 +135,17 @@ memories per entity, and the owner chose not to ship pages in `recall`.
 
 ## Consequences
 
+- **Pages are isolated from recall.** The triggers that keep the text index in
+  step with `nodes` skip a row that is inferred and holds text, and the page
+  write sets no vector. A store that indexed pages is migrated once at open:
+  the page entries are removed from the index and the triggers are replaced.
+  The store tests `a_strict_query_ranks_the_same_with_a_page_written_and_without_for_pt_and_es`
+  (same ordered texts and scores) and `a_written_page_is_not_indexed_for_text_and_has_no_vector`
+  check this, and `a_store_that_indexed_pages_has_them_removed_once_and_gets_the_new_triggers`
+  checks the migration. An entity row with no text stays indexed by its label, as
+  before.
+- **Pages cannot be found by search.** A test or tool that needs the live page of
+  an entity reads it by subject, not by query.
 - **A page cannot invent a fact.** It states only what a memory states.
 - **A page does not merge or resolve.** Where a value changed, the reader sees
   both dated lines and takes the newer. A page can also leave out a memory that

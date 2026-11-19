@@ -1,7 +1,7 @@
 # ADR-0005: AIMD decide() falls through to the ordinary decision on a failed ceiling correction
 
 - **Status:** Accepted
-- **Note, 2026-11-20:** the AIMD loop this describes was fed only by entity-page synthesis, which no longer uses a model, so the loop is removed. See [ADR-0018](0018-build-entity-pages-without-a-model-and-return-them-from-recall.md).
+- **Note, 2026-11-20:** the AIMD loop this describes was fed only by entity-page synthesis, which no longer uses a model, so the loop is removed. See [ADR-0018](0018-build-entity-pages-without-a-model-and-show-them-in-timeline.md).
 - **Date created:** 2026-09-07
 - **Date modified:** 2026-09-07
 
