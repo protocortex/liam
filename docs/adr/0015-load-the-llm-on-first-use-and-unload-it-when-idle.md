@@ -1,6 +1,7 @@
 # ADR-0015: load the LLM on first use and unload it when idle
 
 - **Status:** Accepted
+- **Note, 2026-11-19:** the `ask` tool named here was removed by [ADR-0017](0017-remove-the-ask-tool.md). `recall` stays.
 - **Date created:** 2026-11-18
 - **Date modified:** 2026-11-18
 
