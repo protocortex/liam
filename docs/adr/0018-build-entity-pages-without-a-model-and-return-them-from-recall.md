@@ -1,6 +1,6 @@
 # ADR-0018: build entity pages without a model and return them from recall
 
-- **Status:** Proposed. The many-mention gate failed after pages were capped and ranked apart from recorded memory (see Context), so this is not ready to ship. It would supersede in part [ADR-0017](0017-remove-the-ask-tool.md) where it says entity pages use the local model and where it leaves open whether `recall` ranks pages.
+- **Status:** Proposed. The many-mention gate passes with the placement rule below, on synthetic sets. It would supersede in part [ADR-0017](0017-remove-the-ask-tool.md) where it says entity pages use the local model and where it leaves open whether `recall` ranks pages.
 - **Date created:** 2026-11-20
 - **Date modified:** 2026-11-20
 
@@ -57,24 +57,57 @@ have no cap.* The rule passed, with a small gain (nDCG@10 A and C: English
 could take a slot a recorded memory held on main, so the recorded results of a
 query changed when a page existed.
 
-*Run 2: the design below.* Recorded memory is ranked as on main, pages are
-ranked on their own, and at most two are added. nDCG@10 is measured over the
-first ten results of the reply:
+*Run 2: pages ranked in a query of their own, merged by score, at most two.*
+Recorded rows were ranked as on main. nDCG@10 A and C: English 0.773 and 0.752,
+Portuguese 0.767 and 0.762, Spanish 0.790 and 0.763. The rule failed: English
+lost 0.021 and Spanish 0.027.
 
-| Language | nDCG@10 A | nDCG@10 C | Change | Latest-state nDCG@10 A | Latest-state nDCG@10 C | Latest-ok A | Latest-ok C |
-|---|---|---|---|---|---|---|---|
-| English | 0.773 | 0.752 | -0.021 | 0.601 | 0.599 | 0.312 | 0.438 |
-| Portuguese | 0.767 | 0.762 | -0.005 | 0.577 | 0.642 | 0.250 | 0.562 |
-| Spanish | 0.790 | 0.763 | -0.027 | 0.620 | 0.640 | 0.375 | 0.500 |
+*The cause, measured on the 120 questions.* A page ranked alone gets the top
+fused score whatever it is about, because the best of a few pages is rank 1 in
+every arm: the best page scored 0.03279 on average against 0.03262 for the best
+recorded row, beat it on 38 questions and tied on 78. So the two pages landed in
+the first three results for all 120 questions, and held the answer for 28 of
+them (23%). On the worst questions a page at rank 1 or 2 without the answer
+moved the gold memory down by one or two places (for example a single gold
+memory from rank 2 to 3, or the three gold memories of an aggregate question
+from ranks 3, 4, 5 to 5, 8, 6). The score of a page in a ranking of pages is
+not comparable with the score of a memory in a ranking of memories.
 
-Latest-ok is the share of latest-state questions that had the newest value among
-the first three results and no stale-only result above it. Across the three
-languages the means are nDCG@10 0.777 for A and 0.759 for C, latest-state
-nDCG@10 0.599 for A and 0.627 for C, latest-ok 0.312 for A and 0.500 for C.
-**The rule failed:** C loses to A by more than 0.01 in English (0.021) and in
-Spanish (0.027). C still wins on the latest-state questions overall. The cause
-of the loss was not investigated. The aggregate figures of run 1 were not
-measured again. The sets are synthetic and small.
+Variants tried on the same data, nDCG@10 for A and the variant in English,
+Portuguese and Spanish (latest-state nDCG@10 in brackets):
+
+| Variant | en | pt | es | Passes the rule |
+|---|---|---|---|---|
+| A, no pages | 0.773 (0.601) | 0.767 (0.577) | 0.790 (0.620) | |
+| Run 2, cap 2 by score | 0.752 (0.599) | 0.762 (0.642) | 0.763 (0.640) | no |
+| V1, cap 1 by score | 0.761 (0.611) | 0.774 (0.663) | 0.773 (0.652) | no, es loses 0.017 |
+| V2, cap 2 after rank 3 | 0.758 (0.593) | 0.755 (0.584) | 0.772 (0.611) | no, loses latest state |
+| V3, cap 2 after all `k` memories | 0.724 (0.548) | 0.716 (0.525) | 0.738 (0.550) | no |
+| Run 3, placed by the joint ranking | 0.771 (0.615) | 0.766 (0.602) | 0.797 (0.634) | yes |
+
+V3 scores below A, not equal to it, because of how the harness counts: a page
+that holds the answer joins the relevant set when it is in the reply, so the
+ideal ranking grows by one, and a page after the tenth result earns nothing.
+Scored on the memories alone, V3 equals A. A page placed beyond the cutoff is
+therefore penalised by the harness and cannot show a gain in it. In every
+variant the answer was present somewhere in the reply for 97.5% of questions
+and the newest value for 100%, the same as without pages in each language, so a
+reader of the whole reply sees no difference in what is present. A variant that
+ranks pages only for questions about the latest state was not tried, because
+telling those questions apart needs a word list per language or a model.
+
+*Run 3, the design below.* The rule passed, with the figures above: English
+loses 0.002, Portuguese 0.001, Spanish gains 0.007, and latest-state nDCG@10 is
+0.617 for C against 0.599 for A. The share of latest-state questions with the
+newest value among the first three results was 0.312 for A and 0.312 for C in
+English, 0.250 and 0.250 in Portuguese, 0.375 and 0.312 in Spanish: pages did
+not improve that figure. The recorded rows of a store with pages are not
+byte-identical to those of a store without: the pages are in the text index, so
+the statistics it ranks by shift, and 54 of 120 questions had a different order
+of the ten memories, and 13 of those a different set. Scored on the memories alone the
+two stores are equal (0.773 and 0.773, 0.767 and 0.767, 0.790 and 0.789). The
+page logic itself never reorders the memories. The sets are synthetic and
+small.
 
 ## Considered Alternatives
 
@@ -116,18 +149,18 @@ measured again. The sets are synthetic and small.
    `mark_entity_synthesized` are unchanged. An entity with no recorded mention
    gets no page.
 4. **`recall` returns pages beside recorded memory, never in place of it.**
-   Recorded rows are ranked exactly as before pages existed: the first query
-   leaves out inferred rows from the ranking, from neighbour expansion and from
-   the `same_as` closure, so for any query the recorded rows and their order do
-   not depend on whether a page exists. Pages are ranked by a second query over
-   inferred rows alone. At most `MAX_PAGES_IN_RECALL` (2) pages are added, each
-   placed before the first recorded row it outscores and after one it ties. A
-   reply therefore holds up to `k` recorded rows plus up to 2 pages. Summaries,
-   entities with no page yet and legacy pages are left out. A page is marked: a
-   `kind: entity_page` line in the text and a `pages` list in the structured
-   reply, each with the `basis` of the memories it was built from. Every
-   existing field keeps its meaning, the input schema is unchanged, and
-   `mode: infer` is refused as before.
+   The memories come from a query that leaves out inferred rows from the
+   ranking, from neighbour expansion and from the `same_as` closure, as before
+   pages existed, so the memories the page logic returns are those of that
+   query, in its order. A second query ranks recorded and inferred rows
+   together. Up to `MAX_PAGES_IN_RECALL` (2) current pages are taken from it in
+   its order, and each is placed after as many memories as that ranking puts
+   above it. A reply therefore holds up to `k` recorded rows plus up to 2
+   pages. Summaries, entities with no page yet and legacy pages are left out. A
+   page is marked: a `kind: entity_page` line in the text and a `pages` list in
+   the structured reply, each with the `basis` of the memories it was built
+   from. Every existing field keeps its meaning, the input schema is unchanged,
+   and `mode: infer` is refused as before.
 5. **Config keys.** `gc.full_synthesis_mention_threshold` and
    `gc.full_synthesis_max_new_tokens` are removed: an old line is ignored and
    logs one warning at start. `gc.max_resynth_per_tick` and `ask_timeout_secs`

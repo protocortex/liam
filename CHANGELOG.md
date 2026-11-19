@@ -23,7 +23,7 @@ All notable changes to LIAM are recorded here. The format follows
 - **Breaking:** entity pages are built from the stored sentences of an entity without a model, and `recall`
   returns them. What changed for the caller: a reply can hold up to `k` recorded memories plus up to 2 extra
   entries of kind `entity_page` (the cap is `MAX_PAGES_IN_RECALL`). The recorded memories, and their order, are
-  those `recall` returned before pages existed; pages never take their place. `recall` marks a page with a
+  those `recall` returned before pages existed; pages never take their place. A page goes after as many memories as a ranking of memories and pages together puts above it. `recall` marks a page with a
   `kind: entity_page` line and a `pages` list in its structured reply, each with the `basis` of the memories it
   was built from. A page lists the entity's memories oldest first with their dates, drops near duplicates and
   keeps at most four lines, so it cannot state a fact no memory states. Every other field is unchanged,

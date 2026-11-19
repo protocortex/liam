@@ -48,8 +48,8 @@ has a `kind: entity_page` line before its provenance line, and the structured
 reply lists it under `pages` with its `basis`, the events of the memories it was
 built from. Those ids are the `events` of those memories. A page never takes
 the place of a memory: the recorded memories are ranked as if no page existed,
-and a page is placed among them by its score, so a reply can hold `k` memories
-plus up to 2 pages. Pages are ranked on their own, and a page an older version
+and a page goes after as many of them as a ranking of memories and pages
+together puts above it, so a reply can hold `k` memories plus up to 2 pages. A page an older version
 of LIAM wrote with a model is never returned; the maintenance tick replaces it.
 A page of a scoped entity quotes only memories inside that scope. A page is
 visible to the readers who can see the memories it quotes: `recall` filters
