@@ -2,10 +2,8 @@
 //! Grounding eval for `remember`/`recall`/`relate`: whether what goes IN comes
 //! back OUT intact, findable under the label it was written with.
 //!
-//! Where `eval.rs` scores whether the LLM's synthesized ANSWER stays grounded
-//! in its evidence, and `retrieval_eval.rs` scores whether `Graph::query`
-//! surfaces the right memories by category, this module scores the
-//! write/read tools themselves: does a fact survive `remember`, and does
+//! Where `retrieval_eval.rs` scores whether `Graph::query` surfaces the right
+//! memories by category, this module scores the write/read tools themselves: does a fact survive `remember`, and does
 //! `recall` return it under a query that shares vocabulary with its content.
 //!
 //! # Two tiers
@@ -40,24 +38,14 @@ use crate::mcp::{self, RememberArgs};
 /// One seeded memory: kind, label, content.
 type Fact = (&'static str, &'static str, &'static str);
 
-/// Wall-clock deadline `MemoryServer::new` requires; this module never calls
-/// `ask`, but the constructor still needs a value. Matches `eval.rs`'s own
-/// constant.
-const ASK_TIMEOUT_SECS: u64 = 300;
+/// Wall-clock deadline `MemoryServer::new` requires for entity synthesis; this
+/// module never triggers one, but the constructor still needs a value.
+const SYNTHESIS_TIMEOUT_SECS: u64 = 300;
 
 /// Opens a fresh in-memory store and wires it into a `MemoryServer` with the
-/// given embedder and a `MockLlm` (this module never exercises
-/// `ask`).
-///
-/// WHY this doesn't reuse `eval.rs`'s server construction: `eval.rs` builds
-/// its server once, inline, inside a single `#[ignore]`d test behind a fixed
-/// real LLM, because it only ever measures answer synthesis.
-/// This module's tests each need a fresh store per test (`seed` mutates it)
-/// and vary the embedder across tiers, mock now (`mod tests` below)
-/// and a real embedder (`mod real_tier` below), both in this file, so the
-/// construction has to be a reusable function rather than one inline block;
-/// there being no third caller yet, that function stays here instead of
-/// becoming a shared helper across the eval modules.
+/// given embedder and a `MockLlm`. Each test needs a fresh store (`seed`
+/// mutates it) and the embedder varies across tiers, mock (`mod tests` below)
+/// and real (`mod real_tier` below), so the construction is a reusable function.
 async fn build_server(embedder: Arc<dyn liam_model::Embedder>, dims: usize) -> mcp::MemoryServer {
     let store = Arc::new(
         liam_store::DefaultGraph::open(":memory:", liam_store::GraphConfig::new(dims))
@@ -68,8 +56,7 @@ async fn build_server(embedder: Arc<dyn liam_model::Embedder>, dims: usize) -> m
         store,
         embedder,
         Arc::new(liam_model::MockLlm),
-        ASK_TIMEOUT_SECS,
-        crate::config::Config::default().ask_sufficiency_check,
+        SYNTHESIS_TIMEOUT_SECS,
         crate::config::Config::default().llm.context_tokens,
         crate::config::Config::default()
             .llm
@@ -220,12 +207,12 @@ mod real_tier {
 }
 
 /// Real-model ranking regression: a twelve-fact store with the real embedder
-/// alone, one `#[ignore]`d test per (question, tool, k) case so a
+/// alone, one `#[ignore]`d test per (question, k) case so a
 /// failure does not hide the others. Run with
 /// `cargo test --release -p liam-daemon --bin liamd -- --ignored --nocapture embedder_ranking_regression`.
 mod embedder_ranking_regression {
     use super::*;
-    use crate::mcp::{AskArgs, Mode, RecallArgs};
+    use crate::mcp::RecallArgs;
 
     const DOG_LABEL: &str = "Alice dog";
     const DOG_CONTENT: &str = "Alice has a golden retriever named Biscuit.";
@@ -268,9 +255,6 @@ mod embedder_ranking_regression {
 
     /// Real embedder, built by the daemon's own loader so the test ranks with
     /// the model production uses, over a freshly seeded in-memory store.
-    ///
-    /// The LLM stays `MockLlm`: strict `ask` makes no model call, so the
-    /// evidence it returns is what the ask cases assert on.
     async fn real_server() -> mcp::MemoryServer {
         let mut config = crate::config::Config::default();
         config.embedder.provider = liam_daemon::models::LOCAL_PROVIDER.into();
@@ -307,44 +291,12 @@ mod embedder_ranking_regression {
         );
     }
 
-    async fn assert_strict_ask_only(question: &str, expected_content: &str) {
-        // Arrange
-        let server = real_server().await;
-
-        // Act
-        let out = server
-            .ask(Parameters(AskArgs {
-                question: question.to_string(),
-                kind: None,
-                scope: None,
-                k: Some(1),
-                as_of: None,
-                mode: Some(Mode::Strict),
-            }))
-            .await;
-        println!("strict ask k=1 {question:?} -> {out}");
-
-        // Assert
-        assert!(out.contains(expected_content), "{out}");
-        assert_eq!(out.matches("] (fact) ").count(), 1, "{out}");
-    }
-
     macro_rules! recall_cases {
         ($($name:ident: $question:expr, $label:expr, $k:expr;)*) => {$(
             #[tokio::test]
             #[ignore = "downloads model weights; see the module doc for the run command"]
             async fn $name() {
                 assert_recall_first($question, $label, $k).await;
-            }
-        )*};
-    }
-
-    macro_rules! ask_cases {
-        ($($name:ident: $question:expr, $content:expr;)*) => {$(
-            #[tokio::test]
-            #[ignore = "downloads model weights; see the module doc for the run command"]
-            async fn $name() {
-                assert_strict_ask_only($question, $content).await;
             }
         )*};
     }
@@ -356,11 +308,6 @@ mod embedder_ranking_regression {
         recall_backup_k1: BACKUP_QUESTION, BACKUP_LABEL, 1;
         recall_backup_k3: BACKUP_QUESTION, BACKUP_LABEL, 3;
         recall_backup_k8: BACKUP_QUESTION, BACKUP_LABEL, 8;
-    }
-
-    ask_cases! {
-        strict_ask_dog_k1: DOG_QUESTION, DOG_CONTENT;
-        strict_ask_backup_k1: BACKUP_QUESTION, BACKUP_CONTENT;
     }
 }
 

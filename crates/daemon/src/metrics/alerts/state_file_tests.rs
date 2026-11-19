@@ -42,6 +42,28 @@ fn a_state_of_another_version_gives_a_fresh_state_and_one_warning() {
 }
 
 #[test]
+fn a_state_that_names_the_removed_ask_latency_metric_gives_a_fresh_state_and_one_warning() {
+    // Arrange: what an earlier version saved, with a metric that no longer exists
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"version":{FORMAT_VERSION},"values":{{"AskLatencyP95Ms":{{"value":5.0,"at":1}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    // Act
+    let loaded = AlertState::load(&path);
+
+    // Assert: the run goes on from a fresh state instead of stopping
+    assert_eq!(loaded.warnings, 1);
+    assert_eq!(loaded.state.version, FORMAT_VERSION);
+    assert!(loaded.state.values.is_empty());
+}
+
+#[test]
 fn a_state_that_cannot_be_saved_names_its_path() {
     // Arrange
     let dir = tempfile::tempdir().unwrap();

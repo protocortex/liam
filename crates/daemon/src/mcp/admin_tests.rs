@@ -46,7 +46,6 @@ impl Fixture {
             embedder(),
             Arc::new(liam_model::MockLlm),
             30,
-            false,
             8192,
             1,
         )
@@ -214,7 +213,6 @@ async fn the_tool_set_is_the_existing_tools_plus_delete_consolidate_and_metrics(
         "facts",
         "feedback",
         "summaries",
-        "ask",
         "delete",
         "consolidate",
         "metrics",

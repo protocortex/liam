@@ -7,7 +7,7 @@ use std::time::Duration;
 use liam_store::GraphConfig;
 
 use super::*;
-use crate::ask::ANSWER_TOKEN_RESERVE;
+use crate::prompt::GENERATION_TOKEN_RESERVE;
 use crate::summary::summariser::LocalSummariser;
 use crate::summary::test_support::{MemoryCache, ScriptedLlm};
 
@@ -266,7 +266,7 @@ fn a_budget_that_drops_the_last_item_leaves_it_out_of_the_prompt_and_the_event_c
     ));
     let count = |text: &str| text.chars().count();
     let (system, user) = render_prompt(&all[..2]);
-    let budget = ANSWER_TOKEN_RESERVE + count(&system) + count(&user);
+    let budget = GENERATION_TOKEN_RESERVE + count(&system) + count(&user);
 
     // Act
     let prompt = build_summary_prompt(&all, budget, count);
@@ -286,7 +286,7 @@ async fn grounding_runs_against_the_included_items_only() {
     let count = |text: &str| text.chars().count();
     let (system, user) = render_prompt(&all[..2]);
     let mut tight = rig;
-    tight.settings.context_tokens = ANSWER_TOKEN_RESERVE + count(&system) + count(&user);
+    tight.settings.context_tokens = GENERATION_TOKEN_RESERVE + count(&system) + count(&user);
     let llm = Arc::new(
         ScriptedLlm::replying(&["The team ships the Berlin release at the Oslo office."])
             .counting_chars(),

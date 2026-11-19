@@ -82,8 +82,7 @@ impl Harness {
 
     /// A server over a store the test also holds, which a rollback cannot take.
     fn server_arc(&self, store: Arc<DefaultGraph>, llm: Arc<dyn Llm>) -> MemoryServer {
-        MemoryServer::new(store, embedder(), llm, 30, false, 8192, 1)
-            .with_shutdown(self.shutdown.token())
+        MemoryServer::new(store, embedder(), llm, 30, 8192, 1).with_shutdown(self.shutdown.token())
     }
 
     fn job(&self, server: &MemoryServer, probes: Arc<dyn ProbeRunner>) -> ConsolidationJob {

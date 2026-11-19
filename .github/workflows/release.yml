@@ -182,7 +182,7 @@ jobs:
       # The repo's liam.toml names the real providers, so the release ships it
       # as is. The assertions below fail the release if a mock provider ever
       # lands in it, because that is silent: the daemon starts, `recall`
-      # returns noise from random vectors, and `ask` fabricates.
+      # returns noise from random vectors.
       - name: Stage the release config
         run: |
           set -euo pipefail

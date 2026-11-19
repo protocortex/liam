@@ -53,7 +53,7 @@ fn every_label_is_copy_and_none_holds_text() {
             ..
         } => 3,
         Labels::Degraded {
-            tool: Tool::Recall | Tool::Ask,
+            tool: Tool::Recall,
             reason: _,
         } => 4,
     };

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The `feedback` tool: a producer's verdict on a result `recall` or `ask`
+//! The `feedback` tool: a producer's verdict on a result `recall`
 //! gave it, which the utility score reads as how often the item was right.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -19,7 +19,7 @@ const THROTTLE_WINDOW: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FeedbackArgs {
-    /// The handle `recall` or `ask` printed for the result, as shown.
+    /// The handle `recall` printed for the result, as shown.
     pub result_id: String,
     /// True when the result was right and useful, false when it was wrong.
     pub correct: bool,
@@ -53,7 +53,7 @@ impl fmt::Display for FeedbackError {
             Self::Disabled => write!(f, "tiering is not enabled, so verdicts are not kept"),
             Self::InvalidHandle => write!(
                 f,
-                "the handle must be letters and digits, as recall and ask print it"
+                "the handle must be letters and digits, as recall prints it"
             ),
             Self::NotIssued(handle) => write!(
                 f,

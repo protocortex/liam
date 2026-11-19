@@ -16,26 +16,23 @@ use crate::degraded::Degraded;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tool {
     Recall,
-    Ask,
 }
 
 impl Tool {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Recall => "recall",
-            Self::Ask => "ask",
         }
     }
 
     pub(crate) const fn metrics(self) -> [MetricId; 2] {
         match self {
             Self::Recall => [MetricId::RecallLatencyP50Ms, MetricId::RecallLatencyP95Ms],
-            Self::Ask => [MetricId::AskLatencyP50Ms, MetricId::AskLatencyP95Ms],
         }
     }
 }
 
-/// A step of `recall` and `ask` that is timed on its own.
+/// A step of `recall` that is timed on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Stage {
     Embed,
@@ -92,8 +89,6 @@ pub enum MetricId {
     ArmLatencyP95Ms,
     RecallLatencyP50Ms,
     RecallLatencyP95Ms,
-    AskLatencyP50Ms,
-    AskLatencyP95Ms,
     TierBytes,
     LogBytes,
     ArchiveBytes,
@@ -124,14 +119,12 @@ pub enum MetricId {
 
 impl MetricId {
     /// Every metric, in declaration order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 31] = [
         Self::ProbeRecallAt10,
         Self::ArmLatencyP50Ms,
         Self::ArmLatencyP95Ms,
         Self::RecallLatencyP50Ms,
         Self::RecallLatencyP95Ms,
-        Self::AskLatencyP50Ms,
-        Self::AskLatencyP95Ms,
         Self::TierBytes,
         Self::LogBytes,
         Self::ArchiveBytes,
@@ -172,8 +165,6 @@ impl MetricId {
             Self::ArmLatencyP95Ms => "arm_latency_p95_ms",
             Self::RecallLatencyP50Ms => "recall_latency_p50_ms",
             Self::RecallLatencyP95Ms => "recall_latency_p95_ms",
-            Self::AskLatencyP50Ms => "ask_latency_p50_ms",
-            Self::AskLatencyP95Ms => "ask_latency_p95_ms",
             Self::TierBytes => "tier_bytes",
             Self::LogBytes => "log_bytes",
             Self::ArchiveBytes => "archive_bytes",

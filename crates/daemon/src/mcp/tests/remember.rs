@@ -18,7 +18,6 @@ async fn remember_stamps_the_servers_producer_on_the_written_node() {
         Arc::new(liam_model::MockEmbedder::new(8)),
         Arc::new(liam_model::MockLlm),
         30,
-        false,
         8192,
         1,
     );
@@ -75,7 +74,6 @@ async fn remember_collapses_entity_pages_across_producers_via_episode() {
         Arc::new(liam_model::MockEmbedder::new(8)),
         Arc::new(liam_model::MockLlm),
         30,
-        false,
         8192,
         1,
     );

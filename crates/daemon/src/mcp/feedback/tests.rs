@@ -8,7 +8,7 @@ use liam_store::{CountedFeedback, DefaultGraph, FixedClock, Millis, NewNode, Nod
 use rmcp::handler::server::wrapper::Parameters;
 
 use super::*;
-use crate::mcp::{AskArgs, Mode, RecallArgs};
+use crate::mcp::RecallArgs;
 use crate::tiering::test_support::logged_store;
 
 const DIMS: usize = 8;
@@ -33,7 +33,6 @@ async fn fixture(per_hour: Option<u32>) -> Fixture {
         Arc::new(MockEmbedder::new(DIMS)),
         Arc::new(MockLlm),
         30,
-        false,
         8192,
         1,
     );
@@ -287,39 +286,6 @@ async fn a_connection_cannot_use_a_handle_issued_to_another() {
 
     // Assert
     assert!(out.contains("was returned on this connection"), "{out}");
-}
-
-#[tokio::test]
-async fn every_handle_ask_shows_can_be_given_a_verdict() {
-    // Arrange
-    let fixture = fixture(Some(PER_HOUR)).await;
-    fixture
-        .store
-        .insert(NewNode::now("fact", "Mascot", "a wombat named Pixel"))
-        .await
-        .unwrap();
-
-    // Act
-    let strict = fixture
-        .server
-        .ask(Parameters(AskArgs {
-            question: "wombat Pixel".to_string(),
-            kind: None,
-            scope: None,
-            k: None,
-            as_of: None,
-            mode: Some(Mode::Strict),
-        }))
-        .await;
-    let shown = strict
-        .lines()
-        .find_map(|line| line.strip_prefix("handle: "))
-        .expect("a handle on the evidence block")
-        .to_string();
-    let out = give(&fixture.server, verdict(&shown, true)).await;
-
-    // Assert
-    assert_eq!(out, "feedback recorded");
 }
 
 #[tokio::test]

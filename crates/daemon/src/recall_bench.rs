@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Recall benchmark: drives the real `MemoryServer` over an isolated store and
 //! reports per-stage p50 and p95 latency (read from the metrics sink) and
-//! nDCG@10 for a labelled pair file, once on an idle server and once while an
-//! `ask` is in flight.
+//! nDCG@10 for a labelled pair file on an idle server.
 //!
 //! The pair file is tab separated, one pair per line: `query<TAB>relevant fact`.
 //! Every distinct fact is remembered; the pair's fact is the one relevant
@@ -10,8 +9,8 @@
 //!
 //! # Two tiers
 //!
-//! - **Mock tier, always-on:** `MockEmbedder` and a gated
-//!   fake model, no network and never `~/.liam`. Runs under
+//! - **Mock tier, always-on:** `MockEmbedder` and `MockLlm`, no network and
+//!   never `~/.liam`. Runs under
 //!   `cargo test -p liam-daemon --bin liamd recall_bench`.
 //! - **Real tier, `#[ignore]`d:** the local embedder, downloading
 //!   weights on first run. Reads the pair file named by `LIAM_RECALL_BENCH_PAIRS`
@@ -28,21 +27,18 @@
 //! The metrics sink keeps the latest 50 samples per stage, so percentiles
 //! describe the last 50 recalls of a phase however many runs are asked for.
 
+use anyhow::Context as _;
+use liam_daemon::retrieval_eval::ndcg_at_10;
+use liam_model::Embedder;
+use liam_store::{DefaultGraph, GraphConfig, SystemClock};
+use rmcp::handler::server::wrapper::Parameters;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::Context as _;
-use liam_daemon::retrieval_eval::ndcg_at_10;
-use liam_model::{Embedder, Llm};
-use liam_store::{DefaultGraph, GraphConfig, SystemClock};
-use rmcp::handler::server::wrapper::Parameters;
-use tokio::sync::{Notify, Semaphore};
 
 use crate::config::Config;
-use crate::mcp::{AskArgs, MemoryServer, RecallArgs, RememberArgs};
+use crate::mcp::{MemoryServer, RecallArgs, RememberArgs};
 use crate::metrics::monotonic::Monotonic;
 use crate::metrics::recorder::Metrics;
 use crate::metrics::sink::{MemorySink, MetricsSink, Stage, Tool};
@@ -64,11 +60,9 @@ const FACT_KIND: &str = "fact";
 const DB_FILE: &str = "recall-bench.db";
 /// Results requested per recall, the depth nDCG@10 scores.
 const RECALL_K: usize = 10;
-/// Deadline `MemoryServer::new` requires for `ask`.
-const ASK_TIMEOUT_SECS: u64 = 300;
-/// How long the in-flight `ask` may take to reach the model before the bench
-/// gives up on it.
-const ASK_ENTRY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline `MemoryServer::new` requires for entity synthesis, which the bench
+/// never triggers.
+const SYNTHESIS_TIMEOUT_SECS: u64 = 300;
 /// Alert minimum sample count; the bench raises no alerts.
 const MIN_SAMPLES: usize = 1;
 
@@ -109,8 +103,6 @@ pub struct RecallBenchReport {
     pub store_dir: PathBuf,
     /// Recalls on an otherwise idle server.
     pub idle: PhaseReport,
-    /// Recalls while one `ask` is held in flight.
-    pub during_ask: PhaseReport,
 }
 
 impl RecallBenchReport {
@@ -121,15 +113,13 @@ impl RecallBenchReport {
             self.runs,
             self.store_dir.display()
         );
-        for (name, phase) in [("idle", &self.idle), ("during ask", &self.during_ask)] {
-            let _ = writeln!(out, "[{name}] nDCG@10 {:.4}", phase.ndcg_at_10);
-            for stage in &phase.stages {
-                let _ = writeln!(
-                    out,
-                    "  {:<14} p50 {:>9.3} ms  p95 {:>9.3} ms  ({} samples)",
-                    stage.stage, stage.p50_ms, stage.p95_ms, stage.samples
-                );
-            }
+        let _ = writeln!(out, "nDCG@10 {:.4}", self.idle.ndcg_at_10);
+        for stage in &self.idle.stages {
+            let _ = writeln!(
+                out,
+                "  {:<14} p50 {:>9.3} ms  p95 {:>9.3} ms  ({} samples)",
+                stage.stage, stage.p50_ms, stage.p95_ms, stage.samples
+            );
         }
         out
     }
@@ -140,31 +130,13 @@ struct Pair {
     fact: String,
 }
 
-/// A model that parks inside `complete` until released, so an `ask` stays in
-/// flight for as long as the bench needs. Releasing closes the gate for good,
-/// because `ask` may call the model more than once.
-struct GatedLlm {
-    entered: Notify,
-    gate: Semaphore,
-}
-
-#[async_trait::async_trait]
-impl Llm for GatedLlm {
-    async fn complete(&self, _system: &str, _prompt: &str) -> liam_model::Result<String> {
-        self.entered.notify_one();
-        let _ = self.gate.acquire().await;
-        Ok("released".to_string())
-    }
-}
-
-/// Runs the benchmark with the given models and timer. The timer measures the
+/// Runs the benchmark with the given embedder and timer. The timer measures the
 /// stages, so a real run passes `InstantSource` and a test passes a ticking one.
 ///
 /// # Errors
 ///
 /// Fails when `runs` is zero, the store path is under the forbidden root, the
-/// pair file cannot be read or parsed, a seed fails, or the `ask` never
-/// reaches the model.
+/// pair file cannot be read or parsed, or a seed fails.
 pub async fn run_recall_bench(
     config: &RecallBenchConfig,
     embedder: Arc<dyn Embedder>,
@@ -185,24 +157,16 @@ pub async fn run_recall_bench(
     let pairs = read_pairs(&config.pairs)?;
 
     tracing::debug!(pairs = pairs.len(), "recall bench: seeding the store");
-    let llm = Arc::new(GatedLlm {
-        entered: Notify::new(),
-        gate: Semaphore::new(0),
-    });
-    let server = open_server(&config.store_dir, embedder, llm.clone()).await?;
+    let server = open_server(&config.store_dir, embedder).await?;
     seed(&server, &pairs).await?;
 
     tracing::debug!("recall bench: idle phase");
     let idle = run_phase(&server, &pairs, config.runs, &timer).await?;
 
-    tracing::debug!("recall bench: phase with an ask in flight");
-    let during_ask = run_phase_during_ask(&server, &llm, &pairs, config.runs, &timer).await?;
-
     Ok(RecallBenchReport {
         runs: config.runs,
         store_dir: config.store_dir.clone(),
         idle,
-        during_ask,
     })
 }
 
@@ -233,11 +197,7 @@ fn read_pairs(path: &Path) -> anyhow::Result<Vec<Pair>> {
     Ok(pairs)
 }
 
-async fn open_server(
-    dir: &Path,
-    embedder: Arc<dyn Embedder>,
-    llm: Arc<dyn Llm>,
-) -> anyhow::Result<MemoryServer> {
+async fn open_server(dir: &Path, embedder: Arc<dyn Embedder>) -> anyhow::Result<MemoryServer> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating the store directory {}", dir.display()))?;
     let db = dir.join(DB_FILE);
@@ -249,9 +209,8 @@ async fn open_server(
     let server = MemoryServer::new(
         Arc::new(store),
         embedder,
-        llm,
-        ASK_TIMEOUT_SECS,
-        defaults.ask_sufficiency_check,
+        Arc::new(liam_model::MockLlm),
+        SYNTHESIS_TIMEOUT_SECS,
         defaults.llm.context_tokens,
         defaults.llm.max_concurrent_generations,
     );
@@ -325,42 +284,6 @@ async fn run_phase(
         stages: read_stages(sink.as_ref()),
         ndcg_at_10: total / runs as f64,
     })
-}
-
-/// As `run_phase`, with one `ask` parked inside the model for its duration.
-async fn run_phase_during_ask(
-    server: &MemoryServer,
-    llm: &Arc<GatedLlm>,
-    pairs: &[Pair],
-    runs: usize,
-    timer: &Arc<dyn Monotonic>,
-) -> anyhow::Result<PhaseReport> {
-    let asker = server.clone();
-    let question = pairs[0].query.clone();
-    let ask = tokio::spawn(async move {
-        asker
-            .ask(Parameters(AskArgs {
-                question,
-                kind: None,
-                scope: None,
-                k: None,
-                as_of: None,
-                mode: None,
-            }))
-            .await
-    });
-    let entered = tokio::time::timeout(ASK_ENTRY_TIMEOUT, llm.entered.notified()).await;
-
-    // The ask is released whatever happened above, so it never outlives the bench.
-    let phase = match entered {
-        Ok(()) => run_phase(server, pairs, runs, timer).await,
-        Err(_) => Err(anyhow::anyhow!(
-            "the in-flight ask never reached the model within {ASK_ENTRY_TIMEOUT:?}"
-        )),
-    };
-    llm.gate.close();
-    ask.await.context("the in-flight ask panicked")?;
-    phase
 }
 
 fn read_stages(sink: &MemorySink) -> Vec<StageLatency> {
@@ -439,15 +362,13 @@ mod tests {
             .map(|stage| stage.name())
             .chain([TOTAL_STAGE])
             .collect();
-        for phase in [&report.idle, &report.during_ask] {
-            let names: Vec<&str> = phase.stages.iter().map(|s| s.stage).collect();
-            assert_eq!(names, expected);
-            for s in &phase.stages {
-                assert!(s.p50_ms > 0.0, "{} p50", s.stage);
-                assert!(s.p95_ms >= s.p50_ms, "{} p95 below p50", s.stage);
-            }
-            assert!(phase.ndcg_at_10 > 0.0 && phase.ndcg_at_10 <= 1.0);
+        let names: Vec<&str> = report.idle.stages.iter().map(|s| s.stage).collect();
+        assert_eq!(names, expected);
+        for s in &report.idle.stages {
+            assert!(s.p50_ms > 0.0, "{} p50", s.stage);
+            assert!(s.p95_ms >= s.p50_ms, "{} p95 below p50", s.stage);
         }
+        assert!(report.idle.ndcg_at_10 > 0.0 && report.idle.ndcg_at_10 <= 1.0);
         let text = report.render();
         assert!(text.contains("p50") && text.contains("p95") && text.contains("nDCG@10"));
     }
@@ -503,20 +424,6 @@ mod tests {
             assert!(stage(&report.idle, name).samples > 0, "{name}");
         }
         assert_eq!(stage(&report.idle, "total").samples, RUNS as u64);
-    }
-
-    #[tokio::test]
-    async fn recalls_still_complete_while_an_ask_is_in_flight() {
-        // Arrange
-        let dir = tempfile::tempdir().unwrap();
-        let config = config(dir.path(), RUNS);
-
-        // Act
-        let report = run(&config).await.unwrap();
-
-        // Assert
-        assert_eq!(stage(&report.during_ask, "total").samples, RUNS as u64);
-        assert!(stage(&report.during_ask, "record_usage").samples > 0);
     }
 
     /// Real tier: prints the report for the local embedder. See

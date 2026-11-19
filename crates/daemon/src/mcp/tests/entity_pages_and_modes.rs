@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Entity pages in the reads, and the strict and infer modes.
+//! Entity pages in the reads, and the refusal of infer mode.
 
 use super::*;
-
-// ---- strict and infer modes ----
 
 const PAGE_LABEL: &str = "Zorbnax";
 
@@ -21,17 +19,6 @@ async fn fact_and_page(server: &MemoryServer) -> liam_store::NodeId {
         .await
         .unwrap();
     page
-}
-
-fn ask_args(mode: Option<Mode>) -> AskArgs {
-    AskArgs {
-        question: "What does zorbnax like?".to_string(),
-        kind: None,
-        scope: None,
-        k: None,
-        as_of: None,
-        mode,
-    }
 }
 
 #[tokio::test]
@@ -56,65 +43,6 @@ async fn recall_leaves_out_an_entity_page_and_refuses_infer_mode() {
         infer.starts_with("recall failed") && infer.contains("mode infer"),
         "{infer}"
     );
-}
-
-#[tokio::test]
-async fn ask_defaults_to_infer_with_labelled_evidence_and_an_inferred_answer() {
-    // Arrange
-    let llm = Arc::new(RecordingLlm::new("Zorbnax likes green tea [1]."));
-    let server = server_with(llm.clone()).await;
-    fact_and_page(&server).await;
-
-    // Act
-    let answer = server.ask(Parameters(ask_args(None))).await;
-
-    // Assert: the model's block is marked, the page is among the sources
-    // labelled inferred, and the prompt carries derivations but no ids
-    assert!(answer.starts_with("answer (inferred):\n"), "{answer}");
-    assert!(
-        answer.contains("provenance: derivation: inferred; basis: unknown"),
-        "{answer}"
-    );
-    let prompt = llm.last_prompt();
-    assert!(prompt.contains("derivation: inferred"), "{prompt}");
-    assert!(prompt.contains("derivation: recorded"), "{prompt}");
-    assert!(!prompt.contains("provenance:"), "{prompt}");
-}
-
-#[tokio::test]
-async fn ask_in_strict_mode_makes_no_model_call_and_shows_no_inferred_row() {
-    // Arrange
-    let llm = Arc::new(RecordingLlm::new("Zorbnax likes green tea [1]."));
-    let server = server_with(llm.clone()).await;
-    fact_and_page(&server).await;
-
-    // Act
-    let answer = server.ask(Parameters(ask_args(Some(Mode::Strict)))).await;
-
-    // Assert
-    assert!(llm.seen.lock().unwrap().is_empty(), "the model was called");
-    assert!(answer.starts_with("(strict mode:"), "{answer}");
-    assert!(answer.contains("zorbnax likes green tea"), "{answer}");
-    assert!(!answer.contains("answer (inferred)"), "{answer}");
-    assert!(!answer.contains("profile"), "{answer}");
-    assert!(!answer.contains("derivation: inferred"), "{answer}");
-}
-
-#[tokio::test]
-async fn the_ask_fallback_labels_every_evidence_block() {
-    // Arrange
-    let server = server_with(Arc::new(FailingLlm)).await;
-    fact_and_page(&server).await;
-
-    // Act
-    let answer = server.ask(Parameters(ask_args(None))).await;
-
-    // Assert
-    let blocks = answer.matches("<<<EVIDENCE ").count();
-    let labelled = answer.matches("provenance: derivation: ").count();
-    assert_eq!(blocks, 2, "{answer}");
-    assert_eq!(labelled, blocks, "{answer}");
-    assert!(answer.contains("derivation: inferred"), "{answer}");
 }
 
 #[tokio::test]

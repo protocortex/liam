@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The reply of `recall` and `ask`: a text body plus the reasons it is degraded.
+//! The reply of `recall`: a text body plus the reasons it is degraded.
 
 use std::sync::Arc;
 
@@ -15,13 +15,13 @@ pub const DEGRADED_MARKER_PREFIX: &str = "(degraded: ";
 const MARKER_SUFFIX: &str = ")";
 const REASON_SEPARATOR: &str = "; ";
 
-/// Shape of the structured content a `recall` or `ask` reply carries.
+/// Shape of the structured content a `recall` reply carries.
 #[derive(Serialize, JsonSchema)]
 struct DegradedOutput {
     degraded: Vec<Degraded>,
 }
 
-/// The JSON schema advertised as the output schema of `recall` and `ask`.
+/// The JSON schema advertised as the output schema of `recall`.
 pub fn output_schema() -> Arc<JsonObject> {
     schema_for_type::<DegradedOutput>()
 }
@@ -138,28 +138,6 @@ mod tests {
     }
 
     #[test]
-    fn two_reasons_are_marked_in_insertion_order_and_structured_in_snake_case() {
-        // Arrange
-        let reply = ToolReply::ok(BODY)
-            .with_degraded(Degraded::EmbedFailed)
-            .with_degraded(Degraded::SynthesisUnavailable);
-
-        // Act
-        let result = reply.into_call_result();
-
-        // Assert
-        let expected_text = format!(
-            "{DEGRADED_MARKER_PREFIX}embed_failed, searched by keyword only; \
-             synthesis_unavailable, showing the retrieved evidence)\n{BODY}"
-        );
-        assert_eq!(text_of(&result), expected_text);
-        assert_eq!(
-            result.structured_content,
-            Some(json!({"degraded": ["embed_failed", "synthesis_unavailable"]}))
-        );
-    }
-
-    #[test]
     fn failed_reply_is_an_error_with_unchanged_text() {
         // Arrange
         let reply = ToolReply::failed(FAILURE_TEXT);
@@ -221,18 +199,11 @@ mod tests {
     #[test]
     fn each_reason_renders_its_own_marker_line_and_hint() {
         // Arrange
-        let cases = [
-            (
-                Degraded::EmbedFailed,
-                "embed_failed",
-                "searched by keyword only",
-            ),
-            (
-                Degraded::SynthesisUnavailable,
-                "synthesis_unavailable",
-                "showing the retrieved evidence",
-            ),
-        ];
+        let cases = [(
+            Degraded::EmbedFailed,
+            "embed_failed",
+            "searched by keyword only",
+        )];
         assert_eq!(cases.len(), Degraded::ALL.len());
 
         for (reason, name, hint) in cases {

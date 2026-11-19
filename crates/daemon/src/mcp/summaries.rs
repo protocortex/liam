@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Summaries as the read side sees them: the ones `ask` adds to its evidence in
-//! infer mode, and the `summaries` tool that lists them and walks one down to
-//! what it was built from. Every summary is model-written, so every one is
-//! rendered with its inferred label and the events it rests on.
+//! Summaries as the read side sees them: the `summaries` tool that lists them
+//! and walks one down to what it was built from. Every summary is
+//! model-written, so every one is rendered with its inferred label and the
+//! events it rests on.
 
 use liam_model::TextKind;
-use liam_store::{validate_scope, ChildKind, DefaultGraph, Millis, NodeId, Summary, SummaryEntry};
+use liam_store::{validate_scope, ChildKind, DefaultGraph, NodeId, Summary, SummaryEntry};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tracing::warn;
 
 use super::MemoryServer;
-use crate::ask::Evidence;
 use crate::render;
 use crate::summary::as_retrieved;
 use crate::summary::tree::cosine;
@@ -21,9 +19,6 @@ pub(super) const DEFAULT_SUMMARIES_LIMIT: usize = 20;
 
 /// Most rows one call returns, whatever `limit` asks for.
 pub(super) const MAX_SUMMARIES_LIMIT: usize = 100;
-
-/// Most summaries `ask` adds to the evidence it composes an answer from.
-const MAX_ASK_SUMMARIES: usize = 3;
 
 const NO_SUMMARIES: &str = "no matching summaries";
 
@@ -60,40 +55,6 @@ fn rank(entries: Vec<SummaryEntry>, question: &[f32], min_similarity: f32) -> Ve
         .collect();
     scored.sort_by(|(a, left), (b, right)| b.total_cmp(a).then_with(|| left.id.cmp(&right.id)));
     scored.into_iter().map(|(_, summary)| summary).collect()
-}
-
-/// The evidence `ask` adds in infer mode: the live summaries of the question's
-/// scope that are close enough to it, and, with `as_of`, known by then. A read
-/// that fails leaves them out, so the answer is composed from what was recorded.
-pub(super) async fn matching(
-    server: &MemoryServer,
-    question: &[f32],
-    scope: &Option<String>,
-    as_of: Option<i64>,
-) -> Vec<Evidence> {
-    let Ok(scope) = validate_scope(scope) else {
-        return Vec::new();
-    };
-    let found = async {
-        let store = server.store().await?;
-        let entries = store
-            .summaries_within(scope.as_deref(), None, as_of.map(Millis))
-            .await?;
-        let mut evidence = Vec::new();
-        for summary in rank(entries, question, server.min_summary_similarity)
-            .into_iter()
-            .take(MAX_ASK_SUMMARIES)
-        {
-            let sources = store.summary_sources(&summary.id).await?;
-            evidence.push(Evidence::from_summary(&summary, sources));
-        }
-        Ok::<_, liam_store::Error>(evidence)
-    }
-    .await;
-    found.unwrap_or_else(|error| {
-        warn!(%error, "ask: summaries could not be read and are left out");
-        Vec::new()
-    })
 }
 
 pub(super) async fn read(server: &MemoryServer, args: SummariesArgs) -> String {

@@ -88,13 +88,13 @@ mod tests {
     #[test]
     fn another_missing_field_is_named_without_a_value_list() {
         // Arrange
-        let raw = raw_error("failed to deserialize parameters: missing field `question`");
+        let raw = raw_error("failed to deserialize parameters: missing field `query`");
 
         // Act
-        let text = text_of(&clarify("ask", raw));
+        let text = text_of(&clarify("recall", raw));
 
         // Assert
-        assert!(text.contains("ask needs the field `question`"), "{text}");
+        assert!(text.contains("recall needs the field `query`"), "{text}");
     }
 
     #[test]

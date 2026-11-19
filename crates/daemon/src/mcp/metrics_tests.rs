@@ -4,14 +4,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use liam_model::Llm;
 use liam_store::{DefaultGraph, FixedClock, GraphConfig, Millis, NewNode};
 use rmcp::handler::server::wrapper::Parameters;
 use tokio_util::sync::CancellationToken;
 
 use super::metrics::{label_suffix, MetricsArgs, MAX_LIMIT};
 use super::test_doubles::ErroringEmbedder;
-use super::{AskArgs, MemoryServer, RecallArgs};
+use super::{MemoryServer, RecallArgs};
 use crate::degraded::Degraded;
 use crate::log_startup::test_support::{embedder, DIMS};
 use crate::metrics::alerts::{Alert, Rule};
@@ -48,24 +47,18 @@ impl liam_model::Embedder for SleepingEmbedder {
     }
 }
 
-struct FailingLlm;
-
-#[async_trait::async_trait]
-impl Llm for FailingLlm {
-    async fn complete(&self, _system: &str, _prompt: &str) -> liam_model::Result<String> {
-        Err(liam_model::ModelError::Llm("boom".into()))
-    }
-}
-
 async fn server(metrics: Option<Arc<Metrics>>) -> MemoryServer {
-    server_with(metrics, Arc::new(liam_model::MockLlm)).await
-}
-
-async fn server_with(metrics: Option<Arc<Metrics>>, llm: Arc<dyn Llm>) -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .unwrap();
-    let server = MemoryServer::new(Arc::new(store), embedder(), llm, 30, false, 8192, 1);
+    let server = MemoryServer::new(
+        Arc::new(store),
+        embedder(),
+        Arc::new(liam_model::MockLlm),
+        30,
+        8192,
+        1,
+    );
     let server = server.with_recall_timeout(RECALL_TIMEOUT_SECS);
     match metrics {
         Some(metrics) => server.with_metrics(metrics),
@@ -98,17 +91,6 @@ fn recall_args() -> RecallArgs {
     }
 }
 
-fn ask_args() -> AskArgs {
-    AskArgs {
-        question: QUERY.to_string(),
-        kind: None,
-        scope: None,
-        k: None,
-        as_of: None,
-        mode: None,
-    }
-}
-
 async fn recall_reply(server: &MemoryServer) -> rmcp::model::CallToolResult {
     server
         .recall_tool(Parameters(recall_args()), CancellationToken::new())
@@ -117,7 +99,7 @@ async fn recall_reply(server: &MemoryServer) -> rmcp::model::CallToolResult {
 
 /// The `metrics` tool's lines for `degraded_replies`.
 async fn degraded_lines(server: &MemoryServer) -> String {
-    ask(server, Some(DEGRADED_REPLIES), None).await
+    read_metrics(server, Some(DEGRADED_REPLIES), None).await
 }
 
 fn recorder() -> (Arc<Metrics>, Arc<MemorySink>) {
@@ -137,7 +119,7 @@ fn record(sink: &MemorySink, metric: MetricId, value: f64) {
     });
 }
 
-async fn ask(server: &MemoryServer, metric: Option<&str>, limit: Option<usize>) -> String {
+async fn read_metrics(server: &MemoryServer, metric: Option<&str>, limit: Option<usize>) -> String {
     server
         .metrics(Parameters(MetricsArgs {
             metric: metric.map(str::to_owned),
@@ -160,7 +142,7 @@ async fn the_tool_lists_each_reading_and_the_active_alerts() {
     let server = server(Some(metrics)).await;
 
     // Act
-    let text = ask(&server, None, None).await;
+    let text = read_metrics(&server, None, None).await;
 
     // Assert
     assert!(text.contains("probe_recall_at_10 = 0.5"), "{text}");
@@ -185,7 +167,7 @@ async fn a_filter_shows_only_that_metric_and_its_alerts() {
     let server = server(Some(metrics)).await;
 
     // Act
-    let text = ask(&server, Some("probe_recall_at_10"), None).await;
+    let text = read_metrics(&server, Some("probe_recall_at_10"), None).await;
 
     // Assert
     assert!(text.contains("probe_recall_at_10"), "{text}");
@@ -200,7 +182,7 @@ async fn an_unknown_metric_is_named_with_the_known_ones() {
     let server = server(Some(metrics)).await;
 
     // Act
-    let text = ask(&server, Some("speed"), None).await;
+    let text = read_metrics(&server, Some("speed"), None).await;
 
     // Assert
     assert!(
@@ -220,9 +202,9 @@ async fn a_limit_of_zero_returns_nothing_and_a_large_one_is_capped() {
     let server = server(Some(metrics)).await;
 
     // Act
-    let none = ask(&server, None, Some(0)).await;
-    let capped = ask(&server, None, Some(MAX_LIMIT * 10)).await;
-    let two = ask(&server, None, Some(2)).await;
+    let none = read_metrics(&server, None, Some(0)).await;
+    let capped = read_metrics(&server, None, Some(MAX_LIMIT * 10)).await;
+    let two = read_metrics(&server, None, Some(2)).await;
 
     // Assert
     assert_eq!(none, "no readings requested: limit is 0");
@@ -239,14 +221,14 @@ async fn a_server_without_metrics_says_so() {
     let server = server(None).await;
 
     // Act
-    let text = ask(&server, None, None).await;
+    let text = read_metrics(&server, None, None).await;
 
     // Assert
     assert!(text.starts_with("metrics failed:"), "{text}");
 }
 
 #[tokio::test(start_paused = true)]
-async fn degraded_recalls_and_asks_are_counted_by_tool_and_reason() {
+async fn degraded_recalls_are_counted_by_tool_and_reason() {
     // Arrange
     let (metrics, _sink) = recorder();
     let recalling = MemoryServer {
@@ -254,28 +236,16 @@ async fn degraded_recalls_and_asks_are_counted_by_tool_and_reason() {
         ..server(Some(metrics.clone())).await
     };
     seed_facts(&recalling).await;
-    let asking = MemoryServer {
-        llm: Arc::new(FailingLlm),
-        embedder: embedder(),
-        ..recalling.clone()
-    };
 
     // Act
     for _ in 0..DEGRADED_RECALLS {
         recall_reply(&recalling).await;
     }
-    asking
-        .ask_tool(Parameters(ask_args()), CancellationToken::new())
-        .await;
     let text = degraded_lines(&recalling).await;
 
     // Assert
     assert!(
         text.contains("degraded_replies{tool=recall,reason=embed_failed} = 3"),
-        "{text}"
-    );
-    assert!(
-        text.contains("degraded_replies{tool=ask,reason=synthesis_unavailable} = 1"),
         "{text}"
     );
 }
@@ -367,23 +337,20 @@ async fn a_server_without_metrics_replies_the_same_for_a_degraded_recall() {
 
 #[test]
 fn a_degraded_label_renders_its_tool_and_reason() {
-    for tool in [Tool::Recall, Tool::Ask] {
-        for reason in Degraded::ALL {
-            // Arrange
-            let labels = Labels::Degraded { tool, reason };
-            let tool_name = match tool {
-                Tool::Recall => "recall",
-                Tool::Ask => "ask",
-            };
+    for reason in Degraded::ALL {
+        // Arrange
+        let labels = Labels::Degraded {
+            tool: Tool::Recall,
+            reason,
+        };
 
-            // Act
-            let suffix = label_suffix(labels);
+        // Act
+        let suffix = label_suffix(labels);
 
-            // Assert
-            assert_eq!(
-                suffix,
-                format!("{{tool={tool_name},reason={}}}", reason.as_str())
-            );
-        }
+        // Assert
+        assert_eq!(
+            suffix,
+            format!("{{tool=recall,reason={}}}", reason.as_str())
+        );
     }
 }

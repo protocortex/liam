@@ -315,7 +315,7 @@ pub fn missing_model_warning(config: &Config) -> Option<String> {
     );
     cached.is_none().then(|| {
         format!(
-            "llm model {} file {} is not in the cache {}; ask will fail until `liam fetch-models` runs",
+            "llm model {} file {} is not in the cache {}; entity pages cannot be written until `liam fetch-models` runs",
             config.llm.model, config.llm.gguf_file, settings.cache_dir
         )
     })

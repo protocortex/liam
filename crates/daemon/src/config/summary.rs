@@ -25,7 +25,7 @@ const DEFAULT_MAX_SUMMARIES_PER_RUN: usize = 20;
 const DEFAULT_RUN_DEADLINE_SECS: u64 = 600;
 const DEFAULT_MIN_GROUNDED_SHARE: f64 = 0.5;
 const DEFAULT_MAX_SUMMARY_FAILURES: u32 = 3;
-/// Cosine similarity of a question to a summary below which `ask` leaves the
+/// Cosine similarity of a query to a summary below which `summaries` leaves the
 /// summary out.
 pub const DEFAULT_MIN_SUMMARY_SIMILARITY: f32 = 0.5;
 const DEFAULT_DISSOLVE_GRACE_RUNS: u32 = 3;
@@ -45,7 +45,7 @@ pub struct SummaryConfig {
     /// False makes the whole hook a no-op.
     pub enabled: bool,
     /// Who writes the summaries: the local model, or a hosted provider (which
-    /// also needs `[hosted]`). `ask` and entity synthesis always stay local.
+    /// also needs `[hosted]`). Entity synthesis always stays local.
     pub provider: Provider,
     /// Nearest neighbours considered for each item.
     pub knn: usize,
@@ -75,7 +75,7 @@ pub struct SummaryConfig {
     pub min_grounded_share: f64,
     /// Failures of one child set after which it is skipped.
     pub max_summary_failures: u32,
-    /// Least cosine similarity of a question to a summary for `ask` to use it.
+    /// Least cosine similarity of a query to a summary for `summaries` to list it.
     pub min_summary_similarity: f32,
     /// Runs a summary whose cluster is gone waits for a replacement before it is closed.
     pub dissolve_grace_runs: u32,

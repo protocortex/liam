@@ -27,30 +27,6 @@ async fn recall_embeds_the_query_as_a_query() {
     );
 }
 
-#[tokio::test]
-async fn ask_embeds_the_question_as_a_query() {
-    // Arrange
-    let (server, embedder) = server_with_recording_embedder().await;
-
-    // Act
-    server
-        .ask(Parameters(AskArgs {
-            question: "where do I live".to_string(),
-            kind: None,
-            scope: None,
-            k: None,
-            as_of: None,
-            mode: None,
-        }))
-        .await;
-
-    // Assert
-    assert_eq!(
-        embedder.calls(),
-        vec![("where do I live".to_string(), TextKind::Query)]
-    );
-}
-
 fn hundred_words() -> String {
     (0..100)
         .map(|i| format!("w{i}"))
@@ -59,7 +35,7 @@ fn hundred_words() -> String {
 }
 
 #[tokio::test]
-async fn recall_and_ask_reject_invalid_queries_with_exact_replies() {
+async fn recall_rejects_invalid_queries_with_exact_replies() {
     // Arrange
     let server = server_with_recording_embedder().await.0;
     let cases: Vec<(String, &str)> = vec![
@@ -76,16 +52,14 @@ async fn recall_and_ask_reject_invalid_queries_with_exact_replies() {
     for (text, problem) in cases {
         // Act
         let recall = server.recall(Parameters(recall_args_for(&text))).await;
-        let ask = server.ask(Parameters(ask_args_for(&text))).await;
 
         // Assert
         assert_eq!(recall, format!("recall failed: {problem}"));
-        assert_eq!(ask, format!("ask failed: {problem}"));
     }
 }
 
 #[tokio::test]
-async fn recall_and_ask_accept_queries_at_the_character_limit() {
+async fn recall_accepts_queries_at_the_character_limit() {
     // Arrange
     let server = server_with_recording_embedder().await.0;
     let cases = ["x".repeat(4000), "\u{e9}".repeat(4000)];
@@ -95,11 +69,9 @@ async fn recall_and_ask_accept_queries_at_the_character_limit() {
 
         // Act
         let recall = server.recall(Parameters(recall_args_for(&text))).await;
-        let ask = server.ask(Parameters(ask_args_for(&text))).await;
 
         // Assert
         assert!(!recall.starts_with("recall failed"), "recall: {recall}");
-        assert!(!ask.starts_with("ask failed"), "ask: {ask}");
     }
 }
 
@@ -130,18 +102,17 @@ fn lexical_text_treats_case_variants_as_one_term() {
 }
 
 #[tokio::test]
-async fn recall_and_ask_embed_the_full_question_while_lexical_text_is_capped() {
+async fn recall_embeds_the_full_query_while_lexical_text_is_capped() {
     // Arrange
     let question = hundred_words();
     let (server, embedder) = server_with_recording_embedder().await;
 
     // Act
     server.recall(Parameters(recall_args_for(&question))).await;
-    server.ask(Parameters(ask_args_for(&question))).await;
 
     // Assert
     let calls = embedder.calls();
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 1);
     for (text, kind) in &calls {
         assert_eq!(text, &question);
         assert_eq!(*kind, TextKind::Query);

@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::MemoryServer;
-use crate::ask::fmt_millis;
+use crate::render::fmt_millis;
 
 /// Rows returned when the caller gives no `limit`.
 pub(super) const DEFAULT_FACTS_LIMIT: usize = 20;

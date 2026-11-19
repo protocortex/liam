@@ -42,7 +42,6 @@ async fn server_over(embedder: Arc<dyn Embedder>) -> MemoryServer {
         embedder,
         Arc::new(liam_model::MockLlm),
         30,
-        false,
         8192,
         1,
     )

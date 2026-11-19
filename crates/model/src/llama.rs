@@ -226,7 +226,7 @@ impl LlamaCppLlm {
         for step in 0..max_new_tokens as i32 {
             // Checked once per token: a blocking decode loop cannot be
             // stopped from outside except by looking at this flag, and the
-            // daemon's `ask` timeout drops the caller's future without
+            // daemon's synthesis timeout drops the caller's future without
             // stopping this thread. What was generated so far is returned
             // rather than an error, since the caller is already gone and
             // would discard either result.
@@ -259,7 +259,7 @@ impl LlamaCppLlm {
     /// since nothing else can stop a blocking thread from outside.
     async fn generate(&self, system: &str, user: &str, max_new_tokens: usize) -> Result<String> {
         let cancel = CancelFlag::new();
-        // Dropping this future (the daemon's ask timeout firing, a client
+        // Dropping this future (the daemon's synthesis timeout firing, a client
         // going away) drops the guard, which flips the flag; the decode loop
         // notices within one token and hands the thread back.
         let _cancel_guard = cancel.cancel_on_drop();

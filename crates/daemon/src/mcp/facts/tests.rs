@@ -49,7 +49,6 @@ impl Env {
             Arc::new(liam_model::MockEmbedder::new(DIMS)),
             Arc::new(liam_model::MockLlm),
             30,
-            false,
             8192,
             1,
         );
@@ -71,7 +70,7 @@ impl Env {
             .unwrap();
     }
 
-    async fn ask(&self, args: FactsArgs) -> String {
+    async fn read(&self, args: FactsArgs) -> String {
         self.server.facts(Parameters(args)).await
     }
 }
@@ -128,7 +127,7 @@ async fn the_default_output_is_the_facts_valid_now_with_their_provenance() {
     moved_city(&env).await;
 
     // Act
-    let answer = env.ask(query("alice")).await;
+    let answer = env.read(query("alice")).await;
 
     // Assert
     assert!(answer.contains("alice lives_in Melbourne"), "{answer}");
@@ -151,7 +150,7 @@ async fn the_subject_is_matched_after_trimming_and_lower_casing() {
     moved_city(&env).await;
 
     // Act
-    let answer = env.ask(query("  ALICE ")).await;
+    let answer = env.read(query("  ALICE ")).await;
 
     // Assert
     assert!(answer.contains("alice lives_in Melbourne"), "{answer}");
@@ -175,7 +174,7 @@ async fn as_of_believed_at_and_both_together_give_the_matching_reads() {
     for (as_of, believed_at, expected) in cases {
         // Act
         let answer = env
-            .ask(FactsArgs {
+            .read(FactsArgs {
                 as_of,
                 believed_at,
                 ..query("alice")
@@ -206,7 +205,7 @@ async fn an_unknown_subject_is_an_empty_result_not_an_error() {
     moved_city(&env).await;
 
     // Act
-    let answer = env.ask(query("nobody")).await;
+    let answer = env.read(query("nobody")).await;
 
     // Assert
     assert_eq!(answer, "no matching facts");
@@ -245,7 +244,7 @@ async fn invalid_input_is_refused_with_a_clear_error() {
 
     for (args, expected) in cases {
         // Act
-        let answer = env.ask(args).await;
+        let answer = env.read(args).await;
 
         // Assert
         assert!(answer.starts_with("facts failed:"), "{answer}");
@@ -270,15 +269,15 @@ async fn the_limit_defaults_to_twenty_caps_at_the_maximum_and_zero_is_empty() {
     }
 
     // Act
-    let by_default = env.ask(query("alice")).await;
+    let by_default = env.read(query("alice")).await;
     let over_cap = env
-        .ask(FactsArgs {
+        .read(FactsArgs {
             limit: Some(10_000),
             ..query("alice")
         })
         .await;
     let zero = env
-        .ask(FactsArgs {
+        .read(FactsArgs {
             limit: Some(0),
             ..query("alice")
         })
@@ -299,7 +298,7 @@ async fn a_complete_result_carries_no_truncation_note() {
     moved_city(&env).await;
 
     // Act
-    let answer = env.ask(query("alice")).await;
+    let answer = env.read(query("alice")).await;
 
     // Assert
     assert!(!answer.contains("more"), "{answer}");
@@ -313,7 +312,7 @@ async fn a_fact_with_two_sources_shows_the_count_and_both_ids() {
         .await;
 
     // Act
-    let answer = env.ask(query("alice")).await;
+    let answer = env.read(query("alice")).await;
 
     // Assert
     assert!(answer.contains("sources: 2 (e1, e2)"), "{answer}");
@@ -331,7 +330,7 @@ async fn a_fact_with_more_sources_than_the_store_lists_says_so() {
         .await;
 
     // Act
-    let answer = env.ask(query("alice")).await;
+    let answer = env.read(query("alice")).await;
 
     // Assert
     assert!(answer.contains(MORE_SOURCES_NOTE), "{answer}");
@@ -351,7 +350,7 @@ async fn competing_single_valued_facts_are_both_listed_and_marked() {
         .await;
 
     // Act
-    let answer = env.ask(query("alice")).await;
+    let answer = env.read(query("alice")).await;
 
     // Assert
     assert_eq!(rows_of(&answer, "alice lives_in"), 2, "{answer}");
@@ -371,7 +370,7 @@ async fn several_live_facts_of_a_many_valued_predicate_are_not_competing() {
         .await;
 
     // Act
-    let answer = env.ask(query("alice")).await;
+    let answer = env.read(query("alice")).await;
 
     // Assert
     assert_eq!(rows_of(&answer, "alice knows"), 2, "{answer}");
@@ -393,12 +392,12 @@ async fn a_scope_narrows_to_itself_and_its_descendants() {
 
     // Act
     let narrowed = env
-        .ask(FactsArgs {
+        .read(FactsArgs {
             scope: Some("team".into()),
             ..query("alice")
         })
         .await;
-    let everything = env.ask(query("alice")).await;
+    let everything = env.read(query("alice")).await;
 
     // Assert
     assert!(
@@ -429,7 +428,7 @@ async fn a_multi_line_object_is_rendered_on_one_line() {
     .await;
 
     // Act
-    let answer = env.ask(query("alice")).await;
+    let answer = env.read(query("alice")).await;
 
     // Assert
     assert!(
@@ -518,7 +517,7 @@ async fn limit_zero_with_a_bad_scope_is_still_an_error() {
     };
 
     // Act
-    let answer = env.ask(args).await;
+    let answer = env.read(args).await;
 
     // Assert
     assert!(answer.starts_with("facts failed:"), "{answer}");
@@ -534,7 +533,7 @@ async fn the_store_is_free_for_a_swap_as_soon_as_a_call_returns() {
 
     // Act: several calls, then a restore asking for the slot
     for _ in 0..3 {
-        env.ask(query("alice")).await;
+        env.read(query("alice")).await;
     }
     let swap = tokio::time::timeout(BOUND, shared.exclusive()).await;
 
@@ -551,11 +550,11 @@ async fn store_errors_name_no_sql_or_file_paths() {
         let mut swap = shared.exclusive().await;
         *swap = None;
         drop(swap);
-        env.ask(query("alice")).await
+        env.read(query("alice")).await
     };
     let bad_scope = Env::new()
         .await
-        .ask(FactsArgs {
+        .read(FactsArgs {
             scope: Some("bad scope!".into()),
             ..query("alice")
         })

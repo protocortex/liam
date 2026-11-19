@@ -63,7 +63,6 @@ async fn staged() -> Staged {
         embedder(),
         Arc::new(liam_model::MockLlm),
         30,
-        false,
         8192,
         1,
     )

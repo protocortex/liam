@@ -1,63 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `ask` over summaries in infer and strict mode, and the `summaries` tool:
-//! which summaries are read, how they are labelled, and how one is walked down.
+//! The `summaries` tool: which summaries are read, how they are labelled, and
+//! how one is walked down.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use liam_model::{Embedder, Llm, MockEmbedder};
+use liam_model::{Embedder, MockEmbedder, MockLlm};
 use liam_store::{
     EventRef, GraphConfig, Millis, NewNode, NewSummary, PutOutcome, SummaryChild, SummaryEntry,
 };
 use rmcp::handler::server::wrapper::Parameters;
 
 use super::*;
-use crate::mcp::{AskArgs, Mode};
 use crate::summary::generate::SUMMARY_PROMPT_VERSION;
 
 const DIMS: usize = 8;
 const QUESTION: &str = "quarterly forecasts for the finance team";
 const SUMMARY_TEXT: &str = "quarterly forecasts for the finance team";
-const REPLY: &str = "The finance team has quarterly forecasts [1].";
 const EVENT: &str = "event-one";
 /// Close enough that only a text equal to the question passes.
 const STRICT_SIMILARITY: f32 = 0.999;
 
-/// A model with a fixed reply, counting its calls and keeping the last prompt.
-#[derive(Default)]
-struct SpyLlm {
-    calls: AtomicUsize,
-    prompt: Mutex<String>,
-}
-
-#[async_trait::async_trait]
-impl Llm for SpyLlm {
-    async fn complete(&self, system: &str, prompt: &str) -> liam_model::Result<String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        *self.prompt.lock().unwrap() = prompt.to_string();
-        let _ = system;
-        Ok(REPLY.to_string())
-    }
-}
-
-async fn server_with(llm: Arc<dyn Llm>) -> MemoryServer {
+async fn server() -> MemoryServer {
     let store = DefaultGraph::open(":memory:", GraphConfig::new(DIMS))
         .await
         .unwrap();
     MemoryServer::new(
         Arc::new(store),
         Arc::new(MockEmbedder::new(DIMS)),
-        llm,
+        Arc::new(MockLlm),
         30,
-        false,
         8192,
         1,
     )
     .with_min_summary_similarity(STRICT_SIMILARITY)
-}
-
-async fn server() -> MemoryServer {
-    server_with(Arc::new(SpyLlm::default())).await
 }
 
 /// A summary of `children` with `text`, embedded the way a pass would embed it.
@@ -115,17 +90,6 @@ async fn seed(server: &MemoryServer, seed: Seed<'_>) -> String {
     }
 }
 
-fn ask_args(mode: Option<Mode>) -> AskArgs {
-    AskArgs {
-        question: QUESTION.to_string(),
-        kind: None,
-        scope: None,
-        k: None,
-        as_of: None,
-        mode,
-    }
-}
-
 fn tool_args() -> SummariesArgs {
     SummariesArgs {
         query: None,
@@ -134,251 +98,6 @@ fn tool_args() -> SummariesArgs {
         id: None,
         limit: None,
     }
-}
-
-#[tokio::test]
-async fn an_ask_in_infer_mode_uses_the_matching_summary_and_labels_it_inferred() {
-    // Arrange
-    let llm = Arc::new(SpyLlm::default());
-    let server = server_with(llm.clone()).await;
-    seed(&server, Seed::default()).await;
-    seed(
-        &server,
-        Seed {
-            text: "an unrelated note about holiday rotas",
-            children: vec![("other".to_string(), ChildKind::Node)],
-            ..Seed::default()
-        },
-    )
-    .await;
-
-    // Act
-    let answer = server.ask(Parameters(ask_args(None))).await;
-
-    // Assert
-    assert!(answer.starts_with("answer (inferred):\n"), "{answer}");
-    assert!(
-        answer.contains(&format!(
-            "[1] summary/level 1 — known since {}",
-            crate::ask::fmt_millis(summary_known_since(&server).await)
-        )),
-        "{answer}"
-    );
-    assert!(
-        answer.contains(&format!(
-            "provenance: derivation: inferred; basis: {EVENT}; summary: 1"
-        )),
-        "{answer}"
-    );
-    assert!(!answer.contains("holiday rotas"), "{answer}");
-    let prompt = llm.prompt.lock().unwrap().clone();
-    assert!(prompt.contains("derivation: inferred"), "{prompt}");
-    assert!(!prompt.contains(EVENT), "{prompt}");
-}
-
-const FACT_COUNT: usize = 5;
-const ASK_K: usize = 2;
-const SUMMARY_CAP: usize = 3;
-
-async fn seed_facts(server: &MemoryServer, count: usize) {
-    let store = server.store().await.unwrap();
-    for index in 0..count {
-        store
-            .insert(NewNode::now(
-                "fact",
-                format!("forecast {index}"),
-                SUMMARY_TEXT,
-            ))
-            .await
-            .unwrap();
-    }
-}
-
-async fn seed_summaries(server: &MemoryServer, count: usize) {
-    for index in 0..count {
-        seed(
-            server,
-            Seed {
-                children: vec![(format!("child-{index}"), ChildKind::Node)],
-                ..Seed::default()
-            },
-        )
-        .await;
-    }
-}
-
-/// How many store hits and summaries the model's prompt carried.
-fn evidence_counts(prompt: &str) -> (usize, usize) {
-    (
-        prompt.matches("] (fact) ").count(),
-        prompt.matches("] (summary) ").count(),
-    )
-}
-
-#[tokio::test]
-async fn an_infer_ask_keeps_k_store_hits_and_every_matching_summary() {
-    // Arrange
-    let llm = Arc::new(SpyLlm::default());
-    let server = server_with(llm.clone()).await;
-    seed_facts(&server, FACT_COUNT).await;
-    seed_summaries(&server, SUMMARY_CAP).await;
-    let args = AskArgs {
-        k: Some(ASK_K),
-        ..ask_args(None)
-    };
-
-    // Act
-    server.ask(Parameters(args)).await;
-
-    // Assert
-    let prompt = llm.prompt.lock().unwrap().clone();
-    assert_eq!(evidence_counts(&prompt), (ASK_K, SUMMARY_CAP), "{prompt}");
-}
-
-#[tokio::test]
-async fn an_infer_ask_with_no_matching_summary_keeps_k_store_hits() {
-    // Arrange
-    let llm = Arc::new(SpyLlm::default());
-    let server = server_with(llm.clone()).await;
-    seed_facts(&server, FACT_COUNT).await;
-    let args = AskArgs {
-        k: Some(ASK_K),
-        ..ask_args(None)
-    };
-
-    // Act
-    server.ask(Parameters(args)).await;
-
-    // Assert
-    let prompt = llm.prompt.lock().unwrap().clone();
-    assert_eq!(evidence_counts(&prompt), (ASK_K, 0), "{prompt}");
-}
-
-#[tokio::test]
-async fn an_infer_ask_caps_summaries_and_still_keeps_k_store_hits() {
-    // Arrange
-    let llm = Arc::new(SpyLlm::default());
-    let server = server_with(llm.clone()).await;
-    seed_facts(&server, FACT_COUNT).await;
-    seed_summaries(&server, SUMMARY_CAP + 1).await;
-    let args = AskArgs {
-        k: Some(ASK_K),
-        ..ask_args(None)
-    };
-
-    // Act
-    server.ask(Parameters(args)).await;
-
-    // Assert
-    let prompt = llm.prompt.lock().unwrap().clone();
-    assert_eq!(evidence_counts(&prompt), (ASK_K, SUMMARY_CAP), "{prompt}");
-}
-
-async fn summary_known_since(server: &MemoryServer) -> i64 {
-    let store = server.store().await.unwrap();
-    let entries = store.summaries_within(None, None, None).await.unwrap();
-    entries[0].summary.tx_from.0
-}
-
-#[tokio::test]
-async fn an_ask_in_strict_mode_shows_no_summary_and_makes_no_model_call() {
-    // Arrange
-    let llm = Arc::new(SpyLlm::default());
-    let server = server_with(llm.clone()).await;
-    seed(&server, Seed::default()).await;
-
-    // Act
-    let answer = server.ask(Parameters(ask_args(Some(Mode::Strict)))).await;
-
-    // Assert
-    assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(answer, "no relevant memory");
-}
-
-#[tokio::test]
-async fn an_ask_leaves_out_a_summary_from_another_scope_and_takes_one_from_a_child_scope() {
-    for (asked, summary_scope, used) in [
-        ("work/liam", "personal", false),
-        ("work", "work/liam", true),
-        ("work/liam", "work/liam", true),
-    ] {
-        // Arrange
-        let server = server().await;
-        seed(
-            &server,
-            Seed {
-                scope: summary_scope,
-                ..Seed::default()
-            },
-        )
-        .await;
-        let args = AskArgs {
-            scope: Some(asked.to_string()),
-            ..ask_args(None)
-        };
-
-        // Act
-        let answer = server.ask(Parameters(args)).await;
-
-        // Assert
-        assert_eq!(
-            answer.contains("derivation: inferred; basis"),
-            used,
-            "asked {asked}, summary in {summary_scope}: {answer}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn an_ask_as_of_an_instant_takes_only_summaries_known_and_finished_by_then() {
-    // Arrange
-    let server = server().await;
-    let now = Millis::now().0;
-    seed(
-        &server,
-        Seed {
-            valid_max: Millis(now + 1_000_000),
-            ..Seed::default()
-        },
-    )
-    .await;
-    let as_of = |ms| AskArgs {
-        as_of: Some(ms),
-        ..ask_args(None)
-    };
-
-    // Act
-    let before_it_was_stored = server.ask(Parameters(as_of(1))).await;
-    let while_it_still_ran = server.ask(Parameters(as_of(now + 10))).await;
-    let after_it_ended = server.ask(Parameters(as_of(now + 2_000_000))).await;
-
-    // Assert
-    assert_eq!(before_it_was_stored, "no relevant memory");
-    assert_eq!(while_it_still_ran, "no relevant memory");
-    assert!(
-        after_it_ended.contains("derivation: inferred; basis"),
-        "{after_it_ended}"
-    );
-}
-
-#[tokio::test]
-async fn a_summary_that_is_not_close_to_the_question_is_not_injected() {
-    // Arrange
-    let server = server().await;
-    seed(
-        &server,
-        Seed {
-            text: "an unrelated note about holiday rotas",
-            ..Seed::default()
-        },
-    )
-    .await;
-
-    // Act
-    let answer = server.ask(Parameters(ask_args(None))).await;
-
-    // Assert
-    assert_eq!(answer, "no relevant memory");
 }
 
 #[test]
